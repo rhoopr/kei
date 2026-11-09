@@ -1769,6 +1769,62 @@ impl SqliteStateDb {
         }).await
     }
 
+    /// Read a bounded, unique list of compatible retained roots in durable
+    /// rotation order. This is a source-root window only; it does not admit,
+    /// retire, or consume decision ownership.
+    pub(crate) async fn retained_selection_roots(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        config_hash: String,
+        current: String,
+        compatible_profile: Option<Value>,
+        limit: u32,
+    ) -> Result<Vec<ActiveGeneration>, StateError> {
+        self.with_conn("reading retained selection root window", move |conn| {
+            let profile = compatible_profile
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+            account::validate_authenticated(conn, &owner)?;
+            let ids: Vec<String> = conn
+                .prepare(
+                    "SELECT g.id FROM provider_active_generations g
+                     WHERE g.scope=?1 AND g.id<>?3
+                       AND (g.config_hash=?2
+                         OR (?5 IS NOT NULL
+                           AND json_extract(CAST(g.specification AS TEXT),'$.format')=2
+                           AND (json_extract(CAST(g.specification AS TEXT),'$.profile')=json(?5)
+                             OR (length(json_extract(?5,'$.admitted_retry_policy'))=64
+                               AND json_extract(?5,'$.admitted_retry_policy') NOT GLOB '*[^0-9a-f]*'
+                               AND json_extract(CAST(g.specification AS TEXT),'$.profile.admitted_retry_policy')=json_extract(?5,'$.admitted_retry_policy')))))
+                     ORDER BY g.last_replayed_at,g.created_at,g.id LIMIT ?6",
+                )?
+                .query_map(
+                    params![scope, config_hash, current, 0_i64, profile, i64::from(limit)],
+                    |row| row.get(0),
+                )?
+                .collect::<Result<_, _>>()?;
+            let mut roots = Vec::new();
+            for id in ids {
+                let root = load_generation(conn, &id)?;
+                if root.spec.config_hash != config_hash
+                    && root.spec.format != 1
+                    && (root.spec.format != 2
+                        || !compatible_profile.as_ref().is_some_and(|profile| {
+                            retained_profiles_compatible(&root.spec.profile, profile)
+                        }))
+                {
+                    return invalid();
+                }
+                roots.push(root);
+            }
+            Ok(roots)
+        })
+        .await
+    }
+
     pub(crate) async fn rotate_retained_selection_root(
         &self,
         owner: account::AccountOwner,
@@ -1969,6 +2025,7 @@ impl SqliteStateDb {
         owner: account::AccountOwner,
         generation: String,
         max_asset_attempts: u32,
+        limit: u32,
     ) -> Result<DueAdmittedMediaWindow, StateError> {
         self.with_conn("reading due admitted media window", move |conn| {
             account::validate_authenticated(conn, &owner)?;
@@ -2000,7 +2057,7 @@ impl SqliteStateDb {
                            AND EXISTS(SELECT 1 FROM assets a
                              WHERE a.library=w.library AND a.id=w.asset_id AND a.version_size=w.version_size
                                AND (?5=0 OR a.download_attempts<?5)))
-                     ORDER BY d.pass_key,d.child LIMIT 64",
+                     ORDER BY d.pass_key,d.child LIMIT ?6",
                 )?
                 .query_map(
                     params![
@@ -2008,7 +2065,8 @@ impl SqliteStateDb {
                         after.map(|value| &value.0),
                         after.map(|value| &value.1),
                         Utc::now().timestamp(),
-                        max_asset_attempts
+                        max_asset_attempts,
+                        i64::from(limit)
                     ],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )?

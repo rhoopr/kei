@@ -1291,7 +1291,6 @@ impl SelectionRun {
                 target: "kei::download::pipeline",
                 cause = ?failure.cause,
                 generation = %captured.generation,
-                child = %captured.child,
                 "Recording admitted media failure backoff"
             );
             if !seen.insert((
@@ -1322,7 +1321,6 @@ impl SelectionRun {
                 tracing::debug!(
                     target: "kei::download::pipeline",
                     generation = %captured.generation,
-                    child = %captured.child,
                     "Captured media failure owner is stale; backoff refused"
                 );
             }
@@ -2420,6 +2418,56 @@ pub(crate) async fn has_due(
     Ok(Some(false))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DueMediaRefusal {
+    MissingConfirmation,
+    MissingMaster,
+    InvalidConfirmation,
+    ProviderFactsChanged,
+    NotCurrentlySelected,
+    MissingSelectorWitness,
+    InvalidRendition,
+    MissingRendition,
+    ResourceChanged,
+    SessionError,
+    ConfirmationRefused,
+}
+
+impl DueMediaRefusal {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingConfirmation => "missing_confirmation",
+            Self::MissingMaster => "missing_master",
+            Self::InvalidConfirmation => "invalid_confirmation",
+            Self::ProviderFactsChanged => "provider_facts_changed",
+            Self::NotCurrentlySelected => "not_currently_selected",
+            Self::MissingSelectorWitness => "missing_selector_witness",
+            Self::InvalidRendition => "invalid_rendition",
+            Self::MissingRendition => "missing_rendition",
+            Self::ResourceChanged => "resource_changed",
+            Self::SessionError => "session_error",
+            Self::ConfirmationRefused => "confirmation_refused",
+        }
+    }
+}
+
+fn classify_due_media_error(error: &anyhow::Error) -> DueMediaRefusal {
+    if crate::icloud::photos::session::is_session_error(error) {
+        DueMediaRefusal::SessionError
+    } else {
+        DueMediaRefusal::ConfirmationRefused
+    }
+}
+
+fn log_due_media_refusal(generation: &str, refusal: DueMediaRefusal) {
+    tracing::debug!(
+        target: "kei::download::pipeline",
+        generation,
+        refusal = refusal.as_str(),
+        "Due admitted media refused by current proof"
+    );
+}
+
 async fn due_media_task(
     identity: &crate::state::db::provider_generations::SelectionRetryIdentity,
     destination: &SelectionDestination,
@@ -2428,26 +2476,27 @@ async fn due_media_task(
     config: &DownloadConfig,
     zone_name: &str,
     zone: &Value,
-) -> Result<filter::DownloadTask> {
+) -> Result<filter::DownloadTask, DueMediaRefusal> {
     let body = identity
         .confirmation
         .as_deref()
-        .context("Due admitted media has no stored confirmation")?;
+        .ok_or(DueMediaRefusal::MissingConfirmation)?;
     let master = identity
         .master
         .as_deref()
-        .context("Due admitted media has no stored master")?;
-    let stored = current_asset(body, &identity.child, master, zone)?;
+        .ok_or(DueMediaRefusal::MissingMaster)?;
+    let stored = current_asset(body, &identity.child, master, zone)
+        .map_err(|_error| DueMediaRefusal::InvalidConfirmation)?;
     let current = album
         .confirm_layout_asset(&identity.child, zone_name)
-        .await?;
-    anyhow::ensure!(
-        same_selected_facts(&stored, &current.asset),
-        "Current provider facts differ from the admitted media"
-    );
+        .await
+        .map_err(|error| classify_due_media_error(&error))?;
+    if !same_selected_facts(&stored, &current.asset) {
+        return Err(DueMediaRefusal::ProviderFactsChanged);
+    }
     let pass_config = config.with_pass(pass);
     if filter::is_asset_filtered(&current.asset, &pass_config).is_some() {
-        anyhow::bail!("Admitted media is not currently selected");
+        return Err(DueMediaRefusal::NotCurrentlySelected);
     }
     if config
         .selection_context
@@ -2457,13 +2506,14 @@ async fn due_media_task(
         let witness = stored
             .selector_membership()
             .cloned()
-            .context("Missing current selecting relation witness")?;
+            .ok_or(DueMediaRefusal::MissingSelectorWitness)?;
         album
             .confirm_selector_membership(&witness, &identity.child)
-            .await?;
+            .await
+            .map_err(|error| classify_due_media_error(&error))?;
     }
     let version = crate::state::VersionSizeKey::from_str(&destination.version_size)
-        .context("Invalid admitted rendition key")?;
+        .ok_or(DueMediaRefusal::InvalidRendition)?;
     let provider_version =
         filter::provider_version_for_selected(&current.asset, &pass_config, version);
     let version_facts = current
@@ -2472,12 +2522,12 @@ async fn due_media_task(
         .iter()
         .find(|(size, _)| crate::state::VersionSizeKey::from(*size) == provider_version)
         .map(|(_, facts)| facts)
-        .context("Current provider lacks the admitted rendition")?;
-    anyhow::ensure!(
-        version_facts.checksum.as_ref() == destination.checksum
-            && version_facts.size == destination.size,
-        "Current provider resource differs from the admitted destination"
-    );
+        .ok_or(DueMediaRefusal::MissingRendition)?;
+    if version_facts.checksum.as_ref() != destination.checksum
+        || version_facts.size != destination.size
+    {
+        return Err(DueMediaRefusal::ResourceChanged);
+    }
     let metadata = filter::build_selected_payload(&current.asset, &pass_config, version);
     Ok(filter::DownloadTask {
         require_created_entry: !config.allows_existing_mutation(),
@@ -2524,42 +2574,54 @@ pub(crate) async fn replay_due_admitted_selection(
     if let Some(root) = context.current().await? {
         roots.push(root);
     }
-    let mut exclude = roots
+    let current_id = roots
         .first()
         .map(|root| root.id.clone())
         .unwrap_or_default();
-    for _ in 0..8 {
-        let Some(root) = context
+    roots.extend(
+        context
             .capture
             .db
-            .retained_selection_root(
+            .retained_selection_roots(
                 owner.clone(),
                 context.scope.clone(),
                 context.config_hash.clone(),
-                exclude.clone(),
+                current_id,
                 (context.format == 2).then(|| context.profile.clone()),
+                7,
             )
-            .await?
-        else {
-            break;
-        };
-        exclude = root.id.clone();
-        roots.push(root);
-    }
+            .await?,
+    );
 
     let mut combined = SyncStats::default();
     let mut attempted = false;
     let mut failed_count = 0usize;
     let mut session_expired = false;
+    let mut remaining_decisions = MAX_REPLAY_DECISIONS;
     for root in roots {
+        if remaining_decisions == 0 {
+            break;
+        }
         let window = context
             .capture
             .db
-            .due_admitted_media_window(owner.clone(), root.id.clone(), config.max_download_attempts)
+            .due_admitted_media_window(
+                owner.clone(),
+                root.id.clone(),
+                config.max_download_attempts,
+                remaining_decisions.min(MAX_REPLAY_DECISIONS),
+            )
             .await?;
         if window.identities.is_empty() {
+            context
+                .capture
+                .db
+                .rotate_retained_selection_root(owner.clone(), root.id.clone())
+                .await?;
             continue;
         }
+        remaining_decisions = remaining_decisions
+            .saturating_sub(u32::try_from(window.identities.len()).unwrap_or(remaining_decisions));
         let zone_name = root
             .spec
             .zone
@@ -2595,15 +2657,9 @@ pub(crate) async fn replay_due_admitted_selection(
                 .await
                 {
                     Ok(task) => tasks.push(task),
-                    Err(error) => {
+                    Err(refusal) => {
                         refused = true;
-                        tracing::debug!(
-                            target: "kei::download::pipeline",
-                            generation = %root.id,
-                            child = %identity.child,
-                            %error,
-                            "Due admitted media refused by current proof"
-                        );
+                        log_due_media_refusal(&root.id, refusal);
                         break;
                     }
                 }
@@ -4215,5 +4271,32 @@ mod tests {
             proof_matches: false,
             ..base
         }));
+    }
+}
+
+#[cfg(test)]
+mod fairness_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn due_media_refusal_classification_drops_provider_identity() {
+        let error = anyhow::anyhow!("provider child RAW-PROVIDER-CHILD-SENTINEL failed");
+        let refusal = classify_due_media_error(&error);
+        assert_eq!(refusal, DueMediaRefusal::ConfirmationRefused);
+        assert!(!refusal.as_str().contains("RAW-PROVIDER-CHILD-SENTINEL"));
+    }
+
+    #[test]
+    fn due_media_refusal_log_emits_only_safe_category() {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+        log_due_media_refusal("local-generation", DueMediaRefusal::ConfirmationRefused);
+        let events = capture.events();
+        assert!(events.iter().any(|event| {
+            event.message() == Some("Due admitted media refused by current proof")
+                && event.field("refusal") == Some("confirmation_refused")
+        }));
+        let rendered = format!("{events:?}");
+        assert!(!rendered.contains("RAW-PROVIDER-CHILD-SENTINEL"));
+        assert!(!rendered.contains("provider child"));
     }
 }

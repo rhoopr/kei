@@ -916,7 +916,7 @@ async fn stock36_media_failure_backoff_and_window_fences() {
     assert_eq!(decision_state(&db, "asset-fail").1, 2);
 
     let window = db
-        .due_admitted_media_window(baseline_owner(), identity.generation.clone(), 10)
+        .due_admitted_media_window(baseline_owner(), identity.generation.clone(), 10, 64)
         .await
         .unwrap();
     assert!(window.identities.is_empty(), "future item is not due");
@@ -925,7 +925,7 @@ async fn stock36_media_failure_backoff_and_window_fences() {
         .await
         .unwrap();
     let window = db
-        .due_admitted_media_window(baseline_owner(), identity.generation.clone(), 10)
+        .due_admitted_media_window(baseline_owner(), identity.generation.clone(), 10, 64)
         .await
         .unwrap();
     assert_eq!(window.identities.len(), 1);
@@ -976,7 +976,7 @@ async fn stock36_media_failure_backoff_and_window_fences() {
         )
         .unwrap();
     let exhausted = db
-        .due_admitted_media_window(baseline_owner(), identity.generation.clone(), 10)
+        .due_admitted_media_window(baseline_owner(), identity.generation.clone(), 10, 64)
         .await
         .unwrap();
     assert!(
@@ -1540,4 +1540,123 @@ async fn new_reader_accepts_and_preserves_download_failed_across_replay_and_two_
         assert!(current.5.is_none(), "ordinary replay must not compact it");
         assert_eq!(current.6, 0, "ordinary replay must not complete it");
     }
+}
+
+#[tokio::test]
+async fn retained_root_window_is_unique_and_rotates() {
+    use std::sync::Arc;
+
+    use super::{ZONE, baseline_owner};
+    use crate::state::SqliteStateDb;
+    use crate::state::db::provider_generations::GenerationSpec;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let zone = json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"});
+    let scope = json!({
+        "container":"com.apple.photos.cloud","database":"private",
+        "environment":"production","format":1,"realm":"com","zone":zone
+    })
+    .to_string();
+    let pass_scope = json!({
+        "container_id":null,"cross_zone_sources":[],
+        "list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
+        "name":"","obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted",
+        "query_filter":null,"zone":zone
+    });
+    let profile = json!({
+        "format":2,"coverage":"selected_downloads","excludes":[],
+        "passes":[{"key":"a".repeat(64),"kind":"Unfiled","scope":pass_scope,"excludes":[]}]
+    });
+    let spec = GenerationSpec {
+        format: 2,
+        scope,
+        zone,
+        config_hash: "b".repeat(64),
+        basis: "b".repeat(64),
+        profile: profile.clone(),
+        metadata_enabled: false,
+        metadata_flags: 0,
+    };
+    let root1 = db
+        .begin_selection_generation(
+            baseline_owner(),
+            spec.clone(),
+            crate::state::db::provider_generations::MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap();
+    let keep = |root: &crate::state::db::provider_generations::ActiveGeneration| {
+        db.acquire_lock("keep test root alive")
+            .unwrap()
+            .execute(
+                "INSERT INTO provider_active_decisions(generation,pass_key,child,manifest,manifest_hash,outcome,admission,reason,attempts,next_retry_at,charged_bytes) VALUES(?1,'pass','child',x'5b5d','hash','deferred','deferred','test',1,?2,1)",
+                rusqlite::params![root.id, chrono::Utc::now().timestamp() + 3600],
+            )
+            .unwrap();
+    };
+    keep(&root1);
+    let root2 = db
+        .begin_selection_generation(
+            baseline_owner(),
+            spec.clone(),
+            crate::state::db::provider_generations::MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap();
+    keep(&root2);
+    let root3 = db
+        .begin_selection_generation(
+            baseline_owner(),
+            spec.clone(),
+            crate::state::db::provider_generations::MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap();
+    keep(&root3);
+    {
+        let conn = db.acquire_lock("order root window").unwrap();
+        for (id, order) in [(&root1.id, 1_i64), (&root2.id, 2_i64), (&root3.id, 3_i64)] {
+            conn.execute(
+                "UPDATE provider_active_generations SET last_replayed_at=?2 WHERE id=?1",
+                rusqlite::params![id, order],
+            )
+            .unwrap();
+        }
+    }
+    let roots = db
+        .retained_selection_roots(
+            baseline_owner(),
+            spec.scope.clone(),
+            spec.config_hash.clone(),
+            root1.id.clone(),
+            Some(profile.clone()),
+            7,
+        )
+        .await
+        .unwrap();
+    let ids: Vec<_> = roots.iter().map(|root| root.id.clone()).collect();
+    assert_eq!(ids, vec![root2.id.clone(), root3.id.clone()]);
+    assert_eq!(
+        ids.len(),
+        ids.iter().collect::<std::collections::HashSet<_>>().len()
+    );
+    let rotated = db
+        .retained_selection_roots(
+            baseline_owner(),
+            spec.scope,
+            spec.config_hash,
+            root2.id.clone(),
+            Some(profile),
+            7,
+        )
+        .await
+        .unwrap();
+    let rotated_ids: Vec<_> = rotated.iter().map(|root| root.id.clone()).collect();
+    assert_eq!(rotated_ids, vec![root1.id.clone(), root3.id.clone()]);
+    assert!(!rotated_ids.contains(&root2.id));
 }
