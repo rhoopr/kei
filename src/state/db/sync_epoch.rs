@@ -858,6 +858,11 @@ pub(crate) fn reserve_indexing_qualification(
         return Ok(QualificationReserve::StaleFence);
     }
     let record_key = library_key(library);
+    for required in [indexing_key, replay_key] {
+        if !expected_metadata.iter().any(|(key, _)| key == required) {
+            return Ok(QualificationReserve::StaleFence);
+        }
+    }
     if expected_metadata.iter().any(|(key, _)| key == &record_key) {
         // The owner adds the exact reserved record itself.
         return Ok(QualificationReserve::StaleFence);
@@ -2431,6 +2436,18 @@ mod tests {
     fn qualification_stale_fence_refuses_finish_and_reentry() {
         let conn = qualification_db();
         let fence = qualification_fence(&conn);
+        let mut missing_epoch = fence.clone();
+        missing_epoch.retain(|(key, _)| key != SYNC_EPOCH_KEY);
+        assert_eq!(
+            reserve_qualification(&conn, &missing_epoch, 10_000),
+            QualificationReserve::StaleFence
+        );
+        let mut missing_hold = fence.clone();
+        missing_hold.retain(|(key, _)| key != TEST_INDEXING_KEY);
+        assert_eq!(
+            reserve_qualification(&conn, &missing_hold, 10_000),
+            QualificationReserve::StaleFence
+        );
         let reservation = reserved_or_panic(reserve_qualification(&conn, &fence, 10_000));
         let reserved = stored_record(&conn);
         conn.execute(
