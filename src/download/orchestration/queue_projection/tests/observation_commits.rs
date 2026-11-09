@@ -1,8 +1,12 @@
 //! Observation certificates share the checkpoint transaction and policy fences.
 use super::owner;
 use super::retirement::{BUDGET, admission, spec};
-use crate::state::db::provider_generations::observation::ObservationProof;
+use crate::state::db::provider_generations::observation::{
+    ObservationProof, attach_revalidation_round_for_test,
+};
+use crate::state::db::source_revalidation::quarantine_all_rounds;
 use crate::state::{CheckpointTransition, SqliteStateDb};
+use serde_json::Value;
 use std::sync::Arc;
 
 const TOKEN: &str = "sync_token:v27:PrimarySync";
@@ -314,7 +318,7 @@ async fn observation_commit_staged_proof_activates_only_with_configuration() {
     ];
     promote
         .expected_metadata
-        .push((staged.into(), Some("after".into())));
+        .push((staged.into(), Some("quiet".into())));
     db.commit_observation_transition(promote, None, true)
         .await
         .unwrap();
@@ -1140,4 +1144,419 @@ async fn old_writer_baseline_key_aba_leaves_observing_catalog_origin_indistingui
         after.2
     );
     assert_eq!(compatible, 1);
+}
+
+#[tokio::test]
+async fn catalog_v2_linked_staged_promotion_reopen_rollback_and_quarantine() {
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
+    db.set_metadata("pending_enum_config_hash", "next-enum")
+        .await
+        .unwrap();
+    db.set_metadata("pending_download_config_hash", "next-path")
+        .await
+        .unwrap();
+    let mut selected = spec();
+    selected.profile["current_download_metadata"] = serde_json::json!(1);
+    let boundary = format!("{:x}", Sha256::digest(b"before"));
+    let catalog = format!(
+        "catalog:v2:{}:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:33333333-3333-3333-3333-333333333333",
+        "a".repeat(64)
+    );
+    {
+        let conn = db
+            .acquire_lock("seed linked staged catalog origin")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_rounds VALUES('catalog','PrimarySync',?1,'next-enum',?2,'','','observing')",
+            rusqlite::params![catalog, boundary],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id) VALUES('catalog','asset')",
+            [],
+        )
+        .unwrap();
+    }
+    let root = db
+        .begin_selection_generation(owner(), selected, BUDGET)
+        .await
+        .unwrap();
+    admission(&db, &root.id, &dir.path().join("media"), 0, false, BUDGET).await;
+    let receipt = db
+        .seal_observed_selection(owner(), root.id, true, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let receipt_for_delta = receipt.clone();
+    let baseline = ObservationProof::inventory(vec![receipt.clone()])
+        .unwrap()
+        .bridge(
+            ObservationProof::delivery(receipt)
+                .delta("before", "after")
+                .unwrap(),
+            "before",
+        )
+        .unwrap();
+    let staged = "pending_sync_token:v27:next-enum:PrimarySync";
+    let mut save = transition(&db, "after").await;
+    save.metadata_updates[0].0 = staged.into();
+    save.expected_metadata.push((staged.into(), None));
+    db.commit_observation_transition(save, Some(baseline), false)
+        .await
+        .unwrap();
+    let staged_proof = "observed_selection_staged:v27:next-enum:PrimarySync";
+    {
+        let conn = db
+            .acquire_lock("attach catalog link to staged proof")
+            .unwrap();
+        assert!(
+            attach_revalidation_round_for_test(&conn, staged_proof, "after", "catalog").unwrap()
+        );
+    }
+    drop(db);
+
+    let db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
+    let staged_json: Value =
+        serde_json::from_str(&db.get_metadata(staged_proof).await.unwrap().unwrap()).unwrap();
+    assert_eq!(staged_json["revalidation_round"], "catalog");
+
+    let delta = ObservationProof::delivery(receipt_for_delta)
+        .delta("after", "quiet")
+        .unwrap();
+    let mut advance = transition(&db, "quiet").await;
+    advance.metadata_updates[0].0 = staged.into();
+    advance
+        .expected_metadata
+        .push((staged.into(), Some("after".into())));
+    db.commit_observation_transition(advance, Some(delta), false)
+        .await
+        .unwrap();
+    let staged_json: Value =
+        serde_json::from_str(&db.get_metadata(staged_proof).await.unwrap().unwrap()).unwrap();
+    assert_eq!(staged_json["revalidation_round"], "catalog");
+
+    // A SQL error during activation must roll back the whole promotion.
+    {
+        let conn = db.acquire_lock("install activation failure").unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_catalog_activation BEFORE UPDATE ON source_revalidation_rounds \
+             WHEN NEW.phase='active' BEGIN SELECT RAISE(ABORT,'synthetic catalog activation'); END;",
+        )
+        .unwrap();
+    }
+    let mut promote = transition(&db, "quiet").await;
+    promote.metadata_updates.extend([
+        ("enum_config_hash".into(), "next-enum".into()),
+        ("config_hash".into(), "next-path".into()),
+    ]);
+    promote.metadata_deletes = vec![
+        "pending_enum_config_hash".into(),
+        "pending_download_config_hash".into(),
+        staged.into(),
+    ];
+    promote
+        .expected_metadata
+        .push((staged.into(), Some("quiet".into())));
+    assert!(
+        db.commit_observation_transition(promote.clone(), None, true)
+            .await
+            .is_err(),
+        "catalog activation SQL failure must surface"
+    );
+    {
+        let conn = db
+            .acquire_lock("verify rollback after activation failure")
+            .unwrap();
+        let (phase, debt): (String, i64) = conn
+            .query_row(
+                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id='catalog'),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round='catalog')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((phase.as_str(), debt), ("observing", 1));
+        assert!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key='observed_selection:v27:PrimarySync'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap()
+                == 0
+        );
+        conn.execute_batch("DROP TRIGGER fail_catalog_activation;")
+            .unwrap();
+    }
+
+    // Reopen and promote through the ordinary staged -> ACTIVE path.
+    drop(db);
+    let db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
+    let mut promote = transition(&db, "quiet").await;
+    promote.metadata_updates.extend([
+        ("enum_config_hash".into(), "next-enum".into()),
+        ("config_hash".into(), "next-path".into()),
+    ]);
+    promote.metadata_deletes = vec![
+        "pending_enum_config_hash".into(),
+        "pending_download_config_hash".into(),
+        staged.into(),
+    ];
+    promote
+        .expected_metadata
+        .push((staged.into(), Some("quiet".into())));
+    db.commit_observation_transition(promote, None, true)
+        .await
+        .unwrap();
+    let active_raw = db
+        .get_metadata("observed_selection:v27:PrimarySync")
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let conn = db.acquire_lock("verify linked staged promotion").unwrap();
+        let (phase, debt): (String, i64) = conn
+            .query_row(
+                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id='catalog'),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round='catalog')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let active: Value = serde_json::from_str(&active_raw).unwrap();
+        assert_eq!((phase.as_str(), debt), ("active", 1));
+        assert_eq!(active["revalidation_round"], "catalog");
+        let quarantined = quarantine_all_rounds(&conn).unwrap();
+        assert_eq!(quarantined.0, 1);
+    }
+    {
+        let conn = db.acquire_lock("verify quarantine retained debt").unwrap();
+        let (phase, debt): (String, i64) = conn
+            .query_row(
+                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id='catalog'),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round='catalog')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((phase.as_str(), debt), ("abandoned", 1));
+    }
+}
+
+#[tokio::test]
+async fn catalog_v2_linked_active_delta_keeps_debt_and_ordinary_producer_cannot_retire() {
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let (db, baseline) = fixture(dir.path()).await;
+    let save = transition(&db, "after").await;
+    eprintln!("B-ACTIVE-BASELINE-COMMIT");
+    db.commit_observation_transition(save.clone(), Some(baseline), false)
+        .await
+        .unwrap();
+    eprintln!("B-ACTIVE-BASELINE-COMMIT-OK");
+    let boundary = format!("{:x}", Sha256::digest(b"before"));
+    let catalog = format!(
+        "catalog:v2:{}:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:44444444-4444-4444-4444-444444444444",
+        "b".repeat(64)
+    );
+    {
+        let conn = db
+            .acquire_lock("seed linked active catalog origin")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_rounds VALUES('active-catalog','PrimarySync',?1,'policy',?2,'','','active')",
+            rusqlite::params![catalog, boundary],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id) VALUES('active-catalog','asset')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            attach_revalidation_round_for_test(
+                &conn,
+                "observed_selection:v27:PrimarySync",
+                "after",
+                "active-catalog"
+            )
+            .unwrap()
+        );
+    }
+    drop(db);
+    let db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
+    let active: Value = serde_json::from_str(
+        &db.get_metadata("observed_selection:v27:PrimarySync")
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(active["revalidation_round"], "active-catalog");
+
+    let mut selected = spec();
+    selected.profile["current_download_metadata"] = serde_json::json!(1);
+    let root = db
+        .begin_selection_generation(owner(), selected, BUDGET)
+        .await
+        .unwrap();
+    admission(&db, &root.id, &dir.path().join("media"), 0, false, BUDGET).await;
+    let receipt = db
+        .seal_observed_selection(owner(), root.id, true, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let delta = ObservationProof::delivery(receipt)
+        .delta("after", "quiet")
+        .unwrap();
+    let advance = transition(&db, "quiet").await;
+    eprintln!(
+        "B-ACTIVE-DELTA updates={:?} expected={:?}",
+        advance.metadata_updates, advance.expected_metadata
+    );
+    db.commit_observation_transition(advance.clone(), Some(delta), false)
+        .await
+        .unwrap();
+    {
+        let conn = db.acquire_lock("verify linked active delta").unwrap();
+        let (phase, debt): (String, i64) = conn
+            .query_row(
+                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id='active-catalog'),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round='active-catalog')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((phase.as_str(), debt), ("active", 1));
+    }
+    let active: Value = serde_json::from_str(
+        &db.get_metadata("observed_selection:v27:PrimarySync")
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    // A current catalog link is carried through ordinary ACTIVE deltas.
+    // Debt survives, and no deletion authority is inferred from the tag.
+    eprintln!(
+        "B-LINKED-ACTIVE-DELTA link={:?}",
+        active.get("revalidation_round")
+    );
+    assert_eq!(active["revalidation_round"], "active-catalog");
+    db.source_revalidation_seen(
+        owner(),
+        "PrimarySync".into(),
+        "ordinary-selected-scope".into(),
+        "asset".into(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        db.due_source_revalidation(
+            owner(),
+            "PrimarySync".into(),
+            "ordinary-selected-scope".into()
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+    {
+        let conn = db.acquire_lock("linked active debt retained").unwrap();
+        let debt_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_revalidation_debt WHERE round='active-catalog'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(debt_after, 1);
+    }
+}
+
+#[tokio::test]
+async fn catalog_v2_missing_link_old_guard_conservatively_blocks_checkpoint() {
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    db.set_metadata("enum_config_hash", "policy").await.unwrap();
+    let baseline_key = "baseline_cursor:v27:synthetic:policy:";
+    db.set_metadata(baseline_key, "before").await.unwrap();
+    let mut selected = spec();
+    selected.profile["current_download_metadata"] = serde_json::json!(1);
+    let root = db
+        .begin_selection_generation(owner(), selected, BUDGET)
+        .await
+        .unwrap();
+    admission(&db, &root.id, &dir.path().join("media"), 0, false, BUDGET).await;
+    let receipt = db
+        .seal_observed_selection(owner(), root.id, true, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let baseline = ObservationProof::inventory(vec![receipt.clone()])
+        .unwrap()
+        .bridge(
+            ObservationProof::delivery(receipt)
+                .delta("before", "after")
+                .unwrap(),
+            "before",
+        )
+        .unwrap();
+    let boundary = format!("{:x}", Sha256::digest(b"before"));
+    let catalog = format!(
+        "catalog:v2:{}:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:55555555-5555-5555-5555-555555555555",
+        "c".repeat(64)
+    );
+    {
+        let conn = db.acquire_lock("seed missing-link catalog origin").unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_rounds VALUES('missing-link','PrimarySync',?1,'policy',?2,'','','observing')",
+            rusqlite::params![catalog, boundary],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id) VALUES('missing-link','asset')",
+            [],
+        )
+        .unwrap();
+    }
+    let mut attempt = transition(&db, "after").await;
+    attempt
+        .expected_metadata
+        .push((baseline_key.into(), Some("before".into())));
+    let error = db
+        .commit_observation_transition(attempt, Some(baseline), false)
+        .await
+        .expect_err("old reader must conservatively block a checkpoint without a matching link");
+    eprintln!("B-MISSING-LINK-BLOCK error={error}");
+    {
+        let conn = db
+            .acquire_lock("verify conservative missing-link block")
+            .unwrap();
+        let (phase, debt, key): (String, i64, String) = conn
+            .query_row(
+                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id='missing-link'),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round='missing-link'),
+                        (SELECT value FROM metadata WHERE key=?1)",
+                [baseline_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (phase.as_str(), debt, key.as_str()),
+            ("observing", 1, "before")
+        );
+    }
 }

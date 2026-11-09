@@ -456,6 +456,21 @@ pub(in crate::state::db) fn revalidation_scope_current(
     Ok(saved.policy[0].as_deref() == Some(enum_hash)
         && saved.plans.iter().any(|p| p.scope == scope))
 }
+#[cfg(test)]
+pub(crate) fn attach_revalidation_round_for_test(
+    conn: &Connection,
+    key: &str,
+    token: &str,
+    round: &str,
+) -> Result<bool, StateError> {
+    let Some(mut value) = valid(conn, key, token)? else {
+        return Ok(false);
+    };
+    value.revalidation_round = Some(round.to_owned());
+    store(conn, key, value)?;
+    Ok(true)
+}
+
 fn store(conn: &Connection, key: &str, mut value: Descriptor) -> Result<(), StateError> {
     value.proof_hash.clear();
     value.proof_hash = digest(&encode(&value)?);
@@ -504,7 +519,7 @@ impl Prepared {
                     continue;
                 };
                 let hash = digest(boundary.as_bytes());
-                let candidates: Vec<String> = conn.prepare("SELECT r.id FROM source_revalidation_rounds r WHERE r.library=?1 AND r.boundary=?2 AND r.enum_hash=COALESCE((SELECT value FROM metadata WHERE key='pending_enum_config_hash'),(SELECT value FROM metadata WHERE key='enum_config_hash')) AND (r.phase='marking' OR (r.phase='observing' AND EXISTS(SELECT 1 FROM source_revalidation_debt d WHERE d.round=r.id)))")?
+                let candidates: Vec<String> = conn.prepare("SELECT r.id FROM source_revalidation_rounds r WHERE r.library=?1 AND r.boundary=?2 AND r.enum_hash=COALESCE((SELECT value FROM metadata WHERE key='pending_enum_config_hash'),(SELECT value FROM metadata WHERE key='enum_config_hash')) AND r.scope NOT LIKE 'catalog:v2:%' AND (r.phase='marking' OR (r.phase='observing' AND EXISTS(SELECT 1 FROM source_revalidation_debt d WHERE d.round=r.id)))")?
                     .query_map(params![zone,hash], |r| r.get(0))?.collect::<Result<_,_>>()?;
                 if !candidates.is_empty()
                     && !self.0.iter().any(|(_, d)| {
@@ -616,18 +631,46 @@ pub(in crate::state::db) fn prepare(
                     && saved.plans == plans
                 {
                     predecessor = true;
+                    let saved_round = saved.revalidation_round.clone();
                     if old_key == target
                         && target.starts_with(STAGED)
-                        && let Some(saved_round) = saved.revalidation_round
+                        && let Some(saved_round) = saved_round.clone()
                     {
-                        let observing: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND phase='observing')", params![saved_round,zone], |r| r.get(0))?;
-                        if !observing {
-                            return Err(StateError::Invariant {
-                                operation: "commit_checkpoint_transition",
-                                detail: "staged baseline source revalidation round changed".into(),
-                            });
+                        let catalog: bool = conn.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND scope LIKE 'catalog:v2:%')",
+                            params![saved_round, zone],
+                            |r| r.get(0),
+                        )?;
+                        eprintln!(
+                            "B-PREPARE-STAGED saved_round={saved_round} old_key={old_key} target={target} catalog={catalog}"
+                        );
+                        if catalog {
+                            if round.is_none() {
+                                round = Some(saved_round);
+                            }
+                        } else {
+                            let observing: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND phase='observing')", params![saved_round,zone], |r| r.get(0))?;
+                            if !observing {
+                                return Err(StateError::Invariant {
+                                    operation: "commit_checkpoint_transition",
+                                    detail: "staged baseline source revalidation round changed"
+                                        .into(),
+                                });
+                            }
+                            round = Some(saved_round);
                         }
-                        round = Some(saved_round);
+                    }
+                    if round.is_none()
+                        && let Some(saved_round) = saved_round
+                    {
+                        let current: bool = conn.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND phase!='abandoned' AND scope LIKE 'catalog:v2:%')",
+                            params![saved_round, zone],
+                            |r| r.get(0),
+                        )?;
+                        if current {
+                            round = Some(saved_round);
+                        }
                     }
                 }
             }
