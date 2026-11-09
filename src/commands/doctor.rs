@@ -364,7 +364,7 @@ async fn check_state_db(username: &str, cookie_dir: &Path, realm: &str) -> Docto
         Err(e) => DoctorCheck {
             name: "state_db",
             status: CheckStatus::Error,
-            message: format!("state DB read failed at {}: {e}", path.display()),
+            message: format!("state DB read failed: {e}"),
         },
     }
 }
@@ -613,6 +613,73 @@ mod tests {
         assert_eq!(check.name, "state_db");
         assert_eq!(check.status, CheckStatus::Ok);
         assert!(check.message.contains("0 assets"));
+    }
+
+    #[tokio::test]
+    async fn state_db_owner_mismatch_reason_survives_private_path_redaction() {
+        let dir = tempfile::Builder::new()
+            .prefix("private-doctor-")
+            .tempdir()
+            .expect("private temp dir");
+        let username = "requesting-doctor@example.invalid";
+        let original_username = "owning-doctor@example.invalid";
+        let provider = "synthetic-doctor-provider";
+        let password = "synthetic-doctor-password";
+        let path = state_db_path(username, dir.path(), "com").expect("state db path");
+        let owner = state::db::account::AccountOwner::authenticated(
+            original_username,
+            "com",
+            &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":provider}})).unwrap(),
+        )
+        .expect("synthetic owner");
+        let db = state::SqliteStateDb::open_owned(&path, &owner)
+            .await
+            .expect("create wrong-owner state db");
+        drop(db);
+        assert!(matches!(
+            state::SqliteStateDb::open_owned(
+                &path,
+                &state::db::account::AccountOwner::configured(username, "com"),
+            )
+            .await,
+            Err(state::error::StateError::AccountOwnerMismatch)
+        ));
+
+        let check = check_state_db(username, dir.path(), "com").await;
+        assert_eq!(check.name, "state_db");
+        assert_eq!(check.status, CheckStatus::Error);
+        assert!(check.message.contains("account ownership does not match"));
+        let report = DoctorReport {
+            version: "test",
+            install_method: "unknown",
+            config_path: dir
+                .path()
+                .join(format!("{username}.toml"))
+                .display()
+                .to_string(),
+            data_dir: dir.path().display().to_string(),
+            report_path: Some(format!("password={password}")),
+            checks: vec![check],
+        };
+        let mut redactor = Redactor::default();
+        redactor.add(username);
+        redactor.add(password);
+        let report = redactor.redact_report(report);
+        assert_eq!(report.checks[0].status, CheckStatus::Error);
+        assert!(
+            report.checks[0]
+                .message
+                .contains("account ownership does not match"),
+            "{}",
+            report.checks[0].message
+        );
+        let json = serde_json::to_string(&report).expect("serialize redacted report");
+        for secret in [username, original_username, provider, password] {
+            assert!(
+                !json.contains(secret),
+                "unredacted synthetic identity or secret"
+            );
+        }
     }
 
     #[tokio::test]

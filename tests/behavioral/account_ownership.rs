@@ -213,7 +213,10 @@ async fn account_ownership_overlapping_state_isolated_through_every_cli_path() {
         &["reset", "state", "--yes"],
     ];
     for args in paths {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("private-account-ownership-")
+            .tempdir()
+            .unwrap();
         let root = directory.path();
         let a = seed(root, ACCOUNTS[0], "A", &server.uri());
         let b = seed(root, ACCOUNTS[1], "B", &server.uri());
