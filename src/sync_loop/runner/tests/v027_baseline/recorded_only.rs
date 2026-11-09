@@ -446,7 +446,7 @@ async fn stock36_only_failed_media_keeps_validated_baseline_token_accounted() {
 /// make legitimate progress. This is a deadline-boundary control, not a
 /// configured-watch cadence claim.
 #[tokio::test]
-#[ignore = "admitted-only retry lane gated on PO predicates"]
+#[ignore = "explicit slow held-epoch qualification; run with --ignored"]
 async fn stock36_held_identity_baseline_replays_due_admitted_media_without_inventory_or_promotion()
 {
     use std::sync::Arc;
