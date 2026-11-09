@@ -1,6 +1,7 @@
 //! Indexing qualification must not resume obsolete archive layout convergence.
 use super::{
-    BaselineSession, MEDIA, OLD_TOKEN, ZONE, baseline_owner, pair, seed_existing_upgrade_db, zone,
+    BaselineSession, MEDIA, OLD_TOKEN, ResetCycleSession, ZONE, baseline_owner, pair,
+    seed_existing_upgrade_db, zone,
 };
 use crate::commands::{AlbumPass, PassKind};
 use crate::download;
@@ -13,7 +14,7 @@ use crate::sync_cycle::{
     sync_token_key,
 };
 use crate::sync_loop::test_support::{
-    make_run_cycle_config, make_run_cycle_download_config_builder,
+    full_album_page_with_download, make_run_cycle_config, make_run_cycle_download_config_builder,
     make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle,
 };
 use base64::Engine as _;
@@ -300,6 +301,18 @@ fn pending_upgrade_session(cycle: usize, inventory: Arc<Vec<Value>>) -> Baseline
     }
 }
 
+fn pending_upgrade_quiet_session() -> ResetCycleSession {
+    ResetCycleSession {
+        zone: ZONE,
+        inventory: Arc::new(Vec::new()),
+        full_queries: Arc::new(AtomicUsize::new(0)),
+        changes: Arc::new(AtomicUsize::new(0)),
+        fail_full: false,
+        auth_expired: false,
+        boundary: "quiet",
+    }
+}
+
 async fn run_pending_upgrade_indexing_cycle(
     db: Arc<SqliteStateDb>,
     session: BaselineSession,
@@ -312,6 +325,17 @@ async fn run_pending_upgrade_indexing_cycle(
         .unwrap()
 }
 
+async fn run_pending_upgrade_quiet_cycle(
+    db: Arc<SqliteStateDb>,
+    session: ResetCycleSession,
+    root: &std::path::Path,
+    shared: &crate::auth::SharedSession,
+) -> crate::sync_cycle::CycleResult {
+    try_run_pending_upgrade_indexing_cycle_with_session(db, Box::new(session), root, shared)
+        .await
+        .unwrap()
+}
+
 async fn try_run_pending_upgrade_indexing_cycle(
     db: Arc<SqliteStateDb>,
     session: BaselineSession,
@@ -319,32 +343,42 @@ async fn try_run_pending_upgrade_indexing_cycle(
     root: &std::path::Path,
     shared: &crate::auth::SharedSession,
 ) -> anyhow::Result<crate::sync_cycle::CycleResult> {
-    let mut library = PhotoLibrary::new(
-        "https://synthetic.example/database/1/photos/production/private".into(),
-        Arc::new(std::collections::HashMap::new()),
+    try_run_pending_upgrade_indexing_cycle_with_session(
+        db,
         Box::new(PendingUpgradeIndexingView {
             session,
             indexing_running,
         }),
-        Arc::new(zone()),
-        "private".into(),
-        crate::retry::RetryConfig::default(),
+        root,
+        shared,
     )
     .await
-    .unwrap();
-    library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
-        db.clone(),
-        baseline_owner(),
-        "com",
-    ));
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: library.all(),
-        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
-    }];
-    let mut selected =
-        make_run_cycle_library_state_with_passes(ZONE, &sync_token_key(ZONE), passes);
-    selected.library = library;
+}
+
+async fn try_run_pending_upgrade_indexing_cycle_with_session(
+    db: Arc<SqliteStateDb>,
+    session: Box<dyn PhotosSession>,
+    root: &std::path::Path,
+    shared: &crate::auth::SharedSession,
+) -> anyhow::Result<crate::sync_cycle::CycleResult> {
+    try_run_pending_upgrade_indexing_cycle_with_shutdown(
+        db,
+        session,
+        root,
+        shared,
+        &CancellationToken::new(),
+    )
+    .await
+}
+
+async fn try_run_pending_upgrade_indexing_cycle_with_shutdown(
+    db: Arc<SqliteStateDb>,
+    session: Box<dyn PhotosSession>,
+    root: &std::path::Path,
+    shared: &crate::auth::SharedSession,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<crate::sync_cycle::CycleResult> {
+    let selected = pending_upgrade_library_state(db.clone(), ZONE, session).await;
     let base = make_run_cycle_download_config_builder(root, db.clone());
     let builder = |mode, exclude, groups, zone| {
         let mut config = (*base(mode, exclude, groups, zone)).clone();
@@ -360,9 +394,97 @@ async fn try_run_pending_upgrade_indexing_cycle(
         &builder,
         download::DownloadControls::download_hidden(),
         shared,
+        shutdown,
+    )
+    .await
+}
+
+async fn pending_upgrade_library_state(
+    db: Arc<SqliteStateDb>,
+    zone_name: &'static str,
+    session: Box<dyn PhotosSession>,
+) -> crate::sync_cycle::LibraryState {
+    let mut library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/private".into(),
+        Arc::new(std::collections::HashMap::new()),
+        session,
+        Arc::new(json!({"zoneName":zone_name,"ownerRecordName":"_defaultOwner"})),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db,
+        baseline_owner(),
+        "com",
+    ));
+    let passes = vec![AlbumPass {
+        kind: PassKind::Unfiled,
+        album: library.all(),
+        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+    }];
+    let mut selected =
+        make_run_cycle_library_state_with_passes(zone_name, &sync_token_key(zone_name), passes);
+    selected.library = library;
+    selected
+}
+
+const PEER: &str = "SharedSync-v027-peer";
+
+fn pair_for_zone(zone_name: &str, id: &str, filename: &str, url: &str, tag: u8) -> Vec<Value> {
+    let generation = base64::engine::general_purpose::STANDARD.encode([tag; 32]);
+    let mut records = full_album_page_with_download(
+        zone_name,
+        id,
+        "unused",
+        url,
+        MEDIA.len() as u64,
+        &generation,
+    )["records"]
+        .as_array()
+        .unwrap()
+        .clone();
+    records[0]["fields"]["filenameEnc"] = json!({"value":filename,"type":"STRING"});
+    records[1]["fields"]["masterRef"]["value"]["zoneID"] =
+        json!({"zoneName":zone_name,"ownerRecordName":"_defaultOwner"});
+    records
+}
+
+async fn run_pending_upgrade_two_library_cycle(
+    db: Arc<SqliteStateDb>,
+    primary_session: Box<dyn PhotosSession>,
+    peer_session: Box<dyn PhotosSession>,
+    root: &std::path::Path,
+    shared: &crate::auth::SharedSession,
+    primary_first: bool,
+) -> crate::sync_cycle::CycleResult {
+    let primary = pending_upgrade_library_state(db.clone(), ZONE, primary_session).await;
+    let peer = pending_upgrade_library_state(db.clone(), PEER, peer_session).await;
+    let base = make_run_cycle_download_config_builder(root, db.clone());
+    let builder = |mode, exclude, groups, zone| {
+        let mut config = (*base(mode, exclude, groups, zone)).clone();
+        config.folder_structure = "none".into();
+        config.edited_naming = crate::types::EditedNaming::Primary;
+        Arc::new(config)
+    };
+    let states: Vec<&crate::sync_cycle::LibraryState> = if primary_first {
+        vec![&primary, &peer]
+    } else {
+        vec![&peer, &primary]
+    };
+    run_cycle(
+        &states,
+        &make_run_cycle_config(),
+        Some(db.as_ref()),
+        false,
+        &builder,
+        download::DownloadControls::download_hidden(),
+        shared,
         &CancellationToken::new(),
     )
     .await
+    .unwrap()
 }
 
 fn assert_released_catalog_preserved(
@@ -416,9 +538,11 @@ fn assert_released_catalog_preserved(
 #[tokio::test]
 #[ignore = "requires L1 D cycle seam integration"]
 async fn pending_upgrade_qualification_process_death_worker() {
-    let root = std::path::PathBuf::from(
-        std::env::var_os("KEI_TEST_PROCESS_DEATH_ROOT").expect("process death root"),
-    );
+    let Some(root) = std::env::var_os("KEI_TEST_PROCESS_DEATH_ROOT") else {
+        // Standalone ignored runs are not acceptance failures.
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
     let db_path = seed_process_death_fixture(&root);
     let photos = root.join("child/photos");
     let server = wiremock::MockServer::start().await;
@@ -479,7 +603,6 @@ fn seed_process_death_fixture(root: &std::path::Path) -> std::path::PathBuf {
 /// inventory and does not extend the persisted floor.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "requires L1 D cycle seam integration"]
 async fn pending_upgrade_qualification_process_death_persists_guard_and_early_wake_defers() {
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Command, Stdio};
@@ -866,14 +989,13 @@ async fn v027_pending_existing_upgrade_running_then_finished_qualifies_then_base
             .await
             .unwrap(),
     );
-    let session_quiet = pending_upgrade_session(1, Arc::clone(&inventory));
-    let quiet_counters = session_quiet.clone();
+    let session_quiet = pending_upgrade_quiet_session();
+    let quiet_full = Arc::clone(&session_quiet.full_queries);
     let quiet =
-        run_pending_upgrade_indexing_cycle(Arc::clone(&db), session_quiet, false, &root, &shared)
-            .await;
+        run_pending_upgrade_quiet_cycle(Arc::clone(&db), session_quiet, &root, &shared).await;
     assert_eq!(quiet.stats.downloaded, 0, "{quiet:?}");
-    assert_eq!(quiet_counters.inventory_queries.load(Ordering::SeqCst), 0);
-    assert_eq!(quiet_counters.boundaries.load(Ordering::SeqCst), 0);
+    assert_eq!(quiet_full.load(Ordering::SeqCst), 0);
+    assert!(quiet.stats.full_enumeration_reason.is_none());
     assert_released_catalog_preserved(&db, &old_path, &provider_checksum, old_bytes.len() as i64);
     assert_eq!(std::fs::read(&old).unwrap(), old_bytes);
     drop(db);
@@ -883,30 +1005,18 @@ async fn v027_pending_existing_upgrade_running_then_finished_qualifies_then_base
             .await
             .unwrap(),
     );
-    let session_quiet_again = pending_upgrade_session(2, Arc::clone(&inventory));
-    let quiet_again_counters = session_quiet_again.clone();
-    let quiet_again = run_pending_upgrade_indexing_cycle(
-        Arc::clone(&db),
-        session_quiet_again,
-        false,
-        &root,
-        &shared,
-    )
-    .await;
+    let session_quiet_again = pending_upgrade_quiet_session();
+    let quiet_again_full = Arc::clone(&session_quiet_again.full_queries);
+    let quiet_again =
+        run_pending_upgrade_quiet_cycle(Arc::clone(&db), session_quiet_again, &root, &shared).await;
     assert_eq!(quiet_again.stats.downloaded, 0, "{quiet_again:?}");
-    assert_eq!(
-        quiet_again_counters
-            .inventory_queries
-            .load(Ordering::SeqCst),
-        0
-    );
-    assert_eq!(quiet_again_counters.boundaries.load(Ordering::SeqCst), 0);
+    assert_eq!(quiet_again_full.load(Ordering::SeqCst), 0);
+    assert!(quiet_again.stats.full_enumeration_reason.is_none());
     assert_released_catalog_preserved(&db, &old_path, &provider_checksum, old_bytes.len() as i64);
     assert_eq!(std::fs::read(&old).unwrap(), old_bytes);
 }
 
 #[tokio::test]
-#[ignore = "requires L1 D cycle seam integration"]
 async fn pending_upgrade_qualification_transition_write_fault_retains_guard() {
     let server = wiremock::MockServer::start().await;
     Mock::given(method("GET"))
@@ -1606,4 +1716,316 @@ async fn pending_upgrade_qualification_failed_transfer_keeps_attempt_and_floor()
             .unwrap()
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn pending_upgrade_qualification_auth_error_keeps_floor_without_attempt() {
+    let (_dir, root, db_path, _inventory, shared) =
+        seed_running_pending_upgrade("http://synthetic.invalid/current").await;
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let before = {
+        let conn = db
+            .acquire_lock("read pre-auth qualification record")
+            .unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap()
+    };
+    let session = ResetCycleSession {
+        zone: ZONE,
+        inventory: Arc::new(Vec::new()),
+        full_queries: Arc::new(AtomicUsize::new(0)),
+        changes: Arc::new(AtomicUsize::new(0)),
+        fail_full: false,
+        auth_expired: true,
+        boundary: "auth",
+    };
+    let _ = try_run_pending_upgrade_indexing_cycle_with_session(
+        Arc::clone(&db),
+        Box::new(session),
+        &root,
+        &shared,
+    )
+    .await;
+    let after = {
+        let conn = db
+            .acquire_lock("read post-auth qualification record")
+            .unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(after.attempt, before.attempt);
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.state, "pending");
+    assert!(after.binding.is_none());
+    assert!(
+        after.next_attempt_at > before.next_attempt_at,
+        "auth/cancel must keep a bounded floor without consuming an attempt: {after:?}"
+    );
+    assert!(
+        after
+            .last_outcome
+            .as_deref()
+            .is_some_and(|outcome| outcome == "auth_cancel_or_shutdown"
+                || outcome.starts_with("qualification_in_progress:v1:")),
+        "auth must retain the guard or record the auth/cancel outcome: {after:?}"
+    );
+    assert!(
+        db.get_metadata(&indexing_reconciliation_key(ZONE))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        db.get_metadata(&indexing_replay_key(ZONE)).await.unwrap(),
+        None
+    );
+    assert_eq!(db.get_metadata(&sync_token_key(ZONE)).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn pending_upgrade_qualification_early_dispatch_error_retains_guard() {
+    let (_dir, root, db_path, _inventory, shared) =
+        seed_running_pending_upgrade("http://synthetic.invalid/current").await;
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let before = {
+        let conn = db
+            .acquire_lock("read pre-error qualification record")
+            .unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap()
+    };
+    let session = ResetCycleSession {
+        zone: ZONE,
+        inventory: Arc::new(Vec::new()),
+        full_queries: Arc::new(AtomicUsize::new(0)),
+        changes: Arc::new(AtomicUsize::new(0)),
+        fail_full: true,
+        auth_expired: false,
+        boundary: "error",
+    };
+    let _ = try_run_pending_upgrade_indexing_cycle_with_session(
+        Arc::clone(&db),
+        Box::new(session),
+        &root,
+        &shared,
+    )
+    .await;
+    let after = {
+        let conn = db
+            .acquire_lock("read post-error qualification record")
+            .unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(after.attempt, before.attempt);
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.state, "pending");
+    assert!(after.binding.is_none());
+    assert!(
+        after.next_attempt_at > before.next_attempt_at,
+        "early dispatch error must retain a bounded floor: {after:?}"
+    );
+    assert!(
+        db.get_metadata(&indexing_reconciliation_key(ZONE))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        db.get_metadata(&indexing_replay_key(ZONE)).await.unwrap(),
+        None
+    );
+    assert_eq!(db.get_metadata(&sync_token_key(ZONE)).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn pending_upgrade_qualification_cooperative_cancel_prevents_provider_work() {
+    let (_dir, root, db_path, inventory, shared) =
+        seed_running_pending_upgrade("http://synthetic.invalid/current").await;
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let session = pending_upgrade_session(1, inventory);
+    let counters = session.clone();
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    let canceled = try_run_pending_upgrade_indexing_cycle_with_shutdown(
+        Arc::clone(&db),
+        Box::new(PendingUpgradeIndexingView {
+            session,
+            indexing_running: false,
+        }),
+        &root,
+        &shared,
+        &shutdown,
+    )
+    .await
+    .unwrap();
+    assert_eq!(counters.inventory_queries.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.boundaries.load(Ordering::SeqCst), 0);
+    assert_eq!(canceled.stats.downloaded, 0, "{canceled:?}");
+    assert!(
+        db.get_metadata(&indexing_reconciliation_key(ZONE))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        db.get_metadata(&indexing_replay_key(ZONE)).await.unwrap(),
+        None
+    );
+    assert_eq!(db.get_metadata(&sync_token_key(ZONE)).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn pending_upgrade_qualification_healthy_peer_same_media_both_orders() {
+    for primary_first in [true, false] {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/current"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/peer"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, root, db_path, primary_inventory, shared) =
+            seed_running_pending_upgrade(&format!("{}/current", server.uri())).await;
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        let epoch = db.sync_epoch_id().await.unwrap().unwrap();
+        {
+            let conn = db.acquire_lock("seed healthy peer epoch").unwrap();
+            let record = json!({
+                "version": 2,
+                "epoch": epoch,
+                "library": PEER,
+                "state": "complete",
+                "reason": "existing_upgrade",
+                "attempt": "peer-attempt",
+                "attempts": 0,
+                "next_attempt_at": 0,
+                "last_outcome": "complete",
+                "baseline_scope": "peer-scope",
+                "enrolled_at": 0,
+                "completed_at": 0
+            });
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key,value) VALUES(?1,?2)",
+                rusqlite::params![
+                    crate::state::db::sync_epoch::library_key(PEER),
+                    record.to_string()
+                ],
+            )
+            .unwrap();
+        }
+        let peer_inventory = Arc::new(pair_for_zone(
+            PEER,
+            "peer-current",
+            "peer.JPG",
+            &format!("{}/peer", server.uri()),
+            25,
+        ));
+        let primary_session = pending_upgrade_session(1, primary_inventory);
+        let primary_counters = primary_session.clone();
+        let peer_session = ResetCycleSession {
+            zone: PEER,
+            inventory: peer_inventory,
+            full_queries: Arc::new(AtomicUsize::new(0)),
+            changes: Arc::new(AtomicUsize::new(0)),
+            fail_full: false,
+            auth_expired: false,
+            boundary: "peer",
+        };
+        let peer_full = Arc::clone(&peer_session.full_queries);
+        let cycle = run_pending_upgrade_two_library_cycle(
+            Arc::clone(&db),
+            Box::new(PendingUpgradeIndexingView {
+                session: primary_session,
+                indexing_running: false,
+            }),
+            Box::new(peer_session),
+            &root,
+            &shared,
+            primary_first,
+        )
+        .await;
+        assert_eq!(
+            cycle.failed_count, 0,
+            "primary_first={primary_first}: {cycle:?}"
+        );
+        assert!(
+            primary_counters.inventory_queries.load(Ordering::SeqCst) > 0,
+            "primary qualification must inventory"
+        );
+        assert!(
+            peer_full.load(Ordering::SeqCst) > 0,
+            "healthy peer must inventory"
+        );
+        let (primary_record, primary_hold, primary_replay, primary_token, peer_record, peer_token) = {
+            let conn = db
+                .acquire_lock("inspect peer and primary outcomes")
+                .unwrap();
+            let value = |key: &str| -> Option<String> {
+                conn.query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+                    row.get(0)
+                })
+                .ok()
+            };
+            (
+                crate::state::db::sync_epoch::read_library(&conn, ZONE)
+                    .unwrap()
+                    .unwrap(),
+                value(&indexing_reconciliation_key(ZONE)),
+                value(&indexing_replay_key(ZONE)),
+                value(&sync_token_key(ZONE)),
+                crate::state::db::sync_epoch::read_library(&conn, PEER)
+                    .unwrap()
+                    .unwrap(),
+                value(&sync_token_key(PEER)),
+            )
+        };
+        assert_eq!(primary_record.state, "pending");
+        assert_eq!(primary_hold, None);
+        assert_eq!(primary_replay, Some("1".to_owned()));
+        assert_eq!(primary_token, None);
+        assert_eq!(peer_record.state, "complete");
+        assert!(peer_token.is_some());
+
+        let conn = db.acquire_lock("inspect imported media").unwrap();
+        for (library, id) in [(ZONE, "asset-current"), (PEER, "asset-peer-current")] {
+            let (status, local_path): (String, Option<String>) = conn
+                .query_row(
+                    "SELECT status,local_path FROM assets WHERE library=?1 AND id=?2 \
+                     AND version_size='original'",
+                    rusqlite::params![library, id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(status, "downloaded", "{library}");
+            let path = local_path.expect("downloaded media path");
+            assert_eq!(std::fs::read(path).unwrap(), MEDIA);
+        }
+    }
 }
