@@ -3714,3 +3714,831 @@ async fn released_shared_hidden_edited_progress_keeps_old_ambiguity_28() {
         .scope(true, exercise_released_shared_hidden_history())
         .await;
 }
+
+/// Token-agnostic provider that observes one concurrent bridge item.
+#[derive(Clone)]
+struct ConfigReconcileSession {
+    inventory: Arc<Vec<serde_json::Value>>,
+    bridge: Arc<Vec<serde_json::Value>>,
+    cycle: usize,
+    changes: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for ConfigReconcileSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        let request: serde_json::Value = serde_json::from_str(&body)?;
+        if url.contains("/zones/list") {
+            return Ok(json!({"zones":[{"zoneID":zone(),
+                "syncToken":"config-reconcile-boundary","deleted":false}]}));
+        }
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(json!({"records":[{"recordName":"index",
+                "recordType":"CheckIndexingState",
+                "fields":{"state":{"value":"FINISHED"}}}]}));
+        }
+        if url.contains("/internal/records/query/batch") {
+            let total = self.inventory.len() as u64 / 2;
+            let batch = request["batch"].as_array().cloned().unwrap_or_default();
+            let counts: Vec<_> = batch
+                .iter()
+                .map(|_| json!({"records":[{"fields":{"itemCount":{"value":total}}}]}))
+                .collect();
+            return Ok(json!({"batch": counts}));
+        }
+        if url.contains("/records/query?") {
+            self.requests.lock().unwrap().push(request.clone());
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                .unwrap_or(0);
+            let records = if offset == 0 {
+                self.inventory.as_ref().clone()
+            } else {
+                Vec::new()
+            };
+            return Ok(json!({"records":records,"syncToken":"query-not-checkpoint"}));
+        }
+        if url.contains("/records/lookup?") {
+            let requested = request["records"].as_array().cloned().unwrap_or_default();
+            let records: Vec<_> = self
+                .inventory
+                .iter()
+                .chain(self.bridge.iter())
+                .filter(|record| {
+                    requested
+                        .iter()
+                        .any(|query| query["recordName"] == record["recordName"])
+                })
+                .cloned()
+                .collect();
+            return Ok(json!({"records":records}));
+        }
+        if url.contains("/changes/zone?") {
+            self.requests.lock().unwrap().push(request.clone());
+            let change = self
+                .changes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let records = if self.cycle == 0 && change == 0 {
+                self.bridge.as_ref().clone()
+            } else {
+                Vec::new()
+            };
+            return Ok(json!({"zones":[{"zoneID":zone(),
+                "records":records,
+                "syncToken":format!("config-reconcile-after-{}-{change}", self.cycle),
+                "moreComing":false}]}));
+        }
+        anyhow::bail!("unexpected config reconciliation endpoint: {url}")
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+/// C12 initial baseline/config atomicity through the real staged promotion.
+/// The released snapshot has an old active hash/cursor and a pending hash that
+/// already matches the current options, so the normal reconciliation stage is
+/// reachable without a manual deadline or epoch override.
+pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconciliation() {
+    let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    let protected = root.join("protected");
+    std::fs::create_dir_all(&protected).unwrap();
+    let old_path = protected.join("recovered.JPG");
+    let old_sidecar = protected.join("recovered.JPG.xmp");
+    let old_bytes = MEDIA.to_vec();
+    std::fs::write(&old_path, &old_bytes).unwrap();
+    std::fs::write(&old_sidecar, b"recovered historical sidecar").unwrap();
+    let old_mtime = (
+        std::fs::metadata(&old_path).unwrap().modified().unwrap(),
+        std::fs::metadata(&old_sidecar).unwrap().modified().unwrap(),
+    );
+
+    let app_config = make_populated_app_config();
+    let current_enum_hash = crate::download::compute_config_hash(&app_config);
+    let source = dir.path().join("released.db");
+    let db_path = dir.path().join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        crate::state::schema::migrate_genuine_v36(&conn).unwrap();
+        insert_released_asset(
+            &conn,
+            ZONE,
+            "recovered-old-master",
+            "original",
+            "recovered.JPG",
+            &old_path,
+            &old_bytes,
+            &signature(&old_bytes),
+            true,
+        );
+        conn.execute_batch(&format!(
+            "INSERT INTO asset_master_mappings VALUES ('{ZONE}','recovered-old-child','recovered-old-master',1700000000);
+             INSERT INTO asset_metadata_capture_revisions VALUES ('{ZONE}','recovered-old-master',1,1700000000);
+             INSERT INTO metadata VALUES ('enum_config_hash','old-active-enum-hash');
+             INSERT INTO metadata VALUES ('pending_enum_config_hash','{current_enum_hash}');
+             INSERT INTO metadata VALUES ('download_config_hash','old-active-download-hash');
+             INSERT INTO metadata VALUES ('pending_download_config_hash','old-pending-download-hash');
+             INSERT INTO metadata VALUES ('sync_token:v27:{ZONE}','old-active-v27-cursor');"
+        ))
+        .unwrap();
+    }
+    let columns = released_columns(&source);
+    let legacy_rows = released_rows(&source, &columns);
+    crate::state::db::account::adopt_legacy(
+        &source,
+        &db_path,
+        &baseline_owner(),
+        "baseline@example.invalid",
+        "com",
+    )
+    .await
+    .unwrap();
+    assert_eq!(released_rows(&db_path, &columns), legacy_rows);
+
+    let protected_snapshot = || {
+        rows(
+            &db_path,
+            &format!("SELECT * FROM assets WHERE library='{ZONE}' AND id='recovered-old-master' ORDER BY version_size"),
+        )
+        .into_iter()
+        .chain(rows(
+            &db_path,
+            &format!("SELECT * FROM asset_metadata_paths WHERE library='{ZONE}' AND id='recovered-old-master' ORDER BY version_size"),
+        ))
+        .chain(rows(
+            &db_path,
+            &format!("SELECT * FROM asset_master_mappings WHERE library='{ZONE}' AND asset_record_name='recovered-old-child'"),
+        ))
+        .chain(rows(
+            &db_path,
+            &format!("SELECT * FROM asset_metadata_capture_revisions WHERE library='{ZONE}' AND asset_id='recovered-old-master'"),
+        ))
+        .collect::<Vec<_>>()
+    };
+    let protected_before = protected_snapshot();
+
+    let server = crate::test_helpers::start_wiremock_or_skip("released config reconciliation")
+        .await
+        .expect("acceptance server must bind");
+    for endpoint in ["/current-new", "/bridge-new"] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(MEDIA)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let checksum = signature(MEDIA);
+    let mut current = pair(
+        "current-new-master",
+        "current-new.JPG",
+        &format!("{}/current-new", server.uri()),
+        21,
+    );
+    current[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    current[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+    let mut bridge = pair(
+        "bridge-new-master",
+        "bridge-new.JPG",
+        &format!("{}/bridge-new", server.uri()),
+        22,
+    );
+    bridge[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    bridge[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+
+    let token_key = sync_token_key(ZONE);
+    let selection = &app_config.filters.selection;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let changes = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut staged_token: Option<String> = None;
+    let mut active_after_recovery: Option<String> = None;
+    let mut receipts_after_promotion: Option<Vec<Vec<rusqlite::types::Value>>> = None;
+
+    for cycle in 0..4 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        if cycle == 0 {
+            db.acquire_lock("install final promotion fault")
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER fail_promotion_insert BEFORE INSERT ON metadata WHEN NEW.key='enum_config_hash' BEGIN SELECT RAISE(ABORT,'injected promotion failure'); END;
+                     CREATE TRIGGER fail_promotion_update BEFORE UPDATE ON metadata WHEN NEW.key='enum_config_hash' BEGIN SELECT RAISE(ABORT,'injected promotion failure'); END;",
+                )
+                .unwrap();
+        }
+        let session = ConfigReconcileSession {
+            inventory: Arc::new(current.clone()),
+            bridge: Arc::new(bridge.clone()),
+            cycle,
+            changes: Arc::clone(&changes),
+            requests: Arc::clone(&requests),
+        };
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/shared".to_string(),
+            Arc::new(std::collections::HashMap::new()),
+            Box::new(session.clone()),
+            Arc::new(zone()),
+            "shared".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+            db.clone(),
+            baseline_owner(),
+            "com",
+        ));
+        let selected_zones = crate::commands::zone_name_set(std::slice::from_ref(&library));
+        let collection_zones = selected_zones.clone();
+        let resolved_scope = crate::commands::pass_scope_for_zone(
+            selection,
+            ZONE,
+            &selected_zones,
+            &collection_zones,
+        );
+        let collection_context =
+            crate::commands::build_collection_context(selection, std::slice::from_ref(&library))
+                .await
+                .unwrap();
+        let plan = crate::commands::resolve_passes_for_scope(
+            &library,
+            selection,
+            resolved_scope,
+            &collection_context,
+            &[],
+        )
+        .await
+        .unwrap();
+        let mut selected = make_run_cycle_library_state_with_passes(ZONE, &token_key, plan.passes);
+        selected.library = library;
+        let base = make_run_cycle_download_config_builder(&root, db.clone());
+        let builder = |mode, exclude, groups, zone| {
+            let mut config = (*base(mode, exclude, groups, zone)).clone();
+            config.folder_structure = "none".into();
+            config.file_match_policy = crate::types::FileMatchPolicy::NameId7;
+            config.retry.max_retries = 0;
+            Arc::new(config)
+        };
+        let result = run_cycle(
+            &[&selected],
+            &app_config,
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            protected_snapshot(),
+            protected_before,
+            "cycle {cycle}: recovered history changed"
+        );
+        assert_eq!(std::fs::read(&old_path).unwrap(), old_bytes);
+        assert_eq!(
+            std::fs::read(&old_sidecar).unwrap(),
+            b"recovered historical sidecar"
+        );
+        assert_eq!(
+            (
+                std::fs::metadata(&old_path).unwrap().modified().unwrap(),
+                std::fs::metadata(&old_sidecar).unwrap().modified().unwrap(),
+            ),
+            old_mtime,
+            "cycle {cycle}: recovered mtimes"
+        );
+
+        if cycle == 0 {
+            // The real staged/ready publication must exist before the fault.
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let epoch = crate::state::db::sync_epoch::read_library(&conn, ZONE)
+                .unwrap()
+                .expect("the cycle enrolls the library");
+            let active_hash: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='enum_config_hash'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let pending_hash: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='pending_enum_config_hash'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let staged_key = format!("pending_sync_token:v27:{pending_hash}:{ZONE}");
+            let staged: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key=?1",
+                    [&staged_key],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|error| {
+                    for row in rows(&db_path, "SELECT key, value FROM metadata ORDER BY key") {
+                        eprintln!("META {row:?}");
+                    }
+                    eprintln!("CYCLE0 {result:?} EPOCH {epoch:?}");
+                    for event in trace.events() {
+                        if matches!(event.level, tracing::Level::WARN | tracing::Level::ERROR) {
+                            eprintln!("TRACE {:?}", event.fields);
+                        }
+                    }
+                    panic!("staged token missing: {error}");
+                });
+            let staged_observation: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM metadata WHERE key=?1",
+                    [format!(
+                        "observed_selection_staged:v27:{pending_hash}:{ZONE}"
+                    )],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let active_token: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key=?1",
+                    [&token_key],
+                    |row| row.get(0),
+                )
+                .ok();
+            assert_eq!(active_hash, "old-active-enum-hash");
+            assert_eq!(pending_hash, current_enum_hash);
+            assert_eq!(epoch.state, "ready", "valid staged epoch before promotion");
+            assert!(epoch.binding.is_some(), "ready binding retained");
+            assert_eq!(staged_observation, 1);
+            assert!(
+                active_token.as_deref() != Some(staged.as_str()),
+                "the staged token must not become active before promotion"
+            );
+            assert_eq!(
+                epoch
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.token_sha256.as_str()),
+                Some(
+                    data_encoding::HEXLOWER
+                        .encode(&sha2::Sha256::digest(staged.as_bytes()))
+                        .as_str()
+                )
+            );
+            assert!(!result.db_sync_token_advance_safe, "{result:?}");
+            let completed = db.get_downloaded_page(0, 100).await.unwrap();
+            for (id, path) in [
+                (
+                    "asset-current-new-master",
+                    root.join("current-new_YXNzZXQ.JPG"),
+                ),
+                (
+                    "asset-bridge-new-master",
+                    root.join("bridge-new_YXNzZXQ.JPG"),
+                ),
+            ] {
+                let row = completed
+                    .iter()
+                    .find(|row| row.id.as_ref() == id)
+                    .unwrap_or_else(|| panic!("missing durable media {id}"));
+                assert_eq!(
+                    std::fs::read(row.local_path.as_ref().unwrap()).unwrap(),
+                    MEDIA
+                );
+                assert_eq!(row.local_path.as_ref(), Some(&path));
+            }
+            staged_token = Some(staged);
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS fail_promotion_insert; DROP TRIGGER IF EXISTS fail_promotion_update;",
+            )
+            .unwrap();
+        } else if cycle == 1 {
+            // Normal gate promotes the valid staged binding without a deadline.
+            assert_eq!(result.failed_count, 0, "promotion cycle: {result:?}");
+            assert!(result.db_sync_token_advance_safe, "promotion cycle");
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let active_hash: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='enum_config_hash'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let pending: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM metadata WHERE key='pending_enum_config_hash'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let active_token: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key=?1",
+                    [&token_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let active_observation: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM metadata WHERE key=?1",
+                    [format!("observed_selection:v27:{ZONE}")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let epoch = crate::state::db::sync_epoch::read_library(&conn, ZONE)
+                .unwrap()
+                .unwrap();
+            assert_eq!(active_hash, current_enum_hash);
+            assert_eq!(pending, 0);
+            assert_eq!(active_token, staged_token.clone().unwrap());
+            assert_eq!(active_observation, 1);
+            assert_eq!(epoch.state, "complete");
+            assert_eq!(result.stats.downloaded, 0, "promotion cycle");
+            active_after_recovery = Some(active_token);
+            receipts_after_promotion = Some(rows(
+                &db_path,
+                "SELECT * FROM download_receipts ORDER BY id",
+            ));
+        } else {
+            assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
+            assert!(result.db_sync_token_advance_safe, "cycle {cycle}");
+            assert_eq!(result.stats.downloaded, 0, "cycle {cycle}: quiet reopen");
+            assert_eq!(
+                db.get_metadata(&token_key).await.unwrap().as_deref(),
+                active_after_recovery.as_deref()
+            );
+            assert_eq!(
+                rows(&db_path, "SELECT * FROM download_receipts ORDER BY id"),
+                receipts_after_promotion.clone().unwrap(),
+                "cycle {cycle}: receipt churn"
+            );
+        }
+    }
+
+    let requests = requests.lock().unwrap().clone();
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.to_string().contains("old-active-v27-cursor")),
+        "the prior active cursor must not be requested"
+    );
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.get("query").is_some())
+            .count()
+            <= 2,
+        "no inventory after the initial baseline cycle"
+    );
+    let received = server.received_requests().await.unwrap();
+    let count = |path: &str| {
+        received
+            .iter()
+            .filter(|request| request.method.as_str() == "GET" && request.url.path() == path)
+            .count()
+    };
+    assert_eq!(count("/current-new"), 1);
+    assert_eq!(count("/bridge-new"), 1);
+    server.verify().await;
+    eprintln!(
+        "RELEASED_CONFIG_RECONCILE_REACHED protected_rows={} staged_token={} promote_token={}",
+        protected_snapshot().len(),
+        staged_token.as_deref().unwrap_or(""),
+        active_after_recovery.as_deref().unwrap_or("")
+    );
+}
+
+#[ignore = "precise reachability blocker: the per-zone staged reconciliation commit fails with checkpoint planning facts changed before a ready binding or pending token exists; the next gate is the pending baseline floor and must not be forced"]
+#[tokio::test]
+async fn released_config_reconciliation_stages_before_atomic_promotion_36() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(true, exercise_released_config_reconciliation())
+        .await;
+}
+
+/// C09 recovered genuine-36 analogue. Small representative of the reported
+/// 22-class preserved history; reporter provenance remains E and this is not
+/// an official producer output.
+pub(in crate::sync_loop::runner::tests) async fn exercise_released_recovered_36() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    let recovered = root.join("recovered");
+    std::fs::create_dir_all(&recovered).unwrap();
+    let old_still = recovered.join("recovered.JPG");
+    let old_motion = recovered.join("recovered.MOV");
+    let old_sidecar = recovered.join("recovered.JPG.xmp");
+    let custom_sidecar = recovered.join("custom-recovered.xmp");
+    let old_bytes = MEDIA.to_vec();
+    std::fs::write(&old_still, &old_bytes).unwrap();
+    std::fs::write(&old_motion, MOTION).unwrap();
+    std::fs::write(&old_sidecar, b"recovered still sidecar").unwrap();
+    std::fs::write(&custom_sidecar, b"recovered custom opaque xmp").unwrap();
+    let old_mtimes = [
+        std::fs::metadata(&old_still).unwrap().modified().unwrap(),
+        std::fs::metadata(&old_motion).unwrap().modified().unwrap(),
+        std::fs::metadata(&old_sidecar).unwrap().modified().unwrap(),
+        std::fs::metadata(&custom_sidecar)
+            .unwrap()
+            .modified()
+            .unwrap(),
+    ];
+
+    let source = dir.path().join("released.db");
+    let db_path = dir.path().join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        crate::state::schema::migrate_genuine_v36(&conn).unwrap();
+        insert_released_asset(
+            &conn,
+            ZONE,
+            "recovered-master",
+            "original",
+            "recovered.JPG",
+            &old_still,
+            &old_bytes,
+            &signature(&old_bytes),
+            true,
+        );
+        insert_released_asset(
+            &conn,
+            ZONE,
+            "recovered-master",
+            "live_original",
+            "recovered.MOV",
+            &old_motion,
+            MOTION,
+            &signature(MOTION),
+            true,
+        );
+        conn.execute_batch(&format!(
+            "INSERT INTO legacy_master_state_owners VALUES ('{ZONE}','recovered-master','asset-recovered-master',1700000000);
+             INSERT INTO asset_master_mappings VALUES ('{ZONE}','asset-recovered-master','recovered-master',1700000000);
+             INSERT INTO asset_metadata_capture_revisions VALUES ('{ZONE}','recovered-master',1,1700000000);
+             INSERT INTO metadata VALUES ('sync_token:{ZONE}','old-recovered-cursor');"
+        ))
+        .unwrap();
+    }
+    let columns = released_columns(&source);
+    let legacy_rows = released_rows(&source, &columns);
+    crate::state::db::account::adopt_legacy(
+        &source,
+        &db_path,
+        &baseline_owner(),
+        "baseline@example.invalid",
+        "com",
+    )
+    .await
+    .unwrap();
+    assert_eq!(released_rows(&db_path, &columns), legacy_rows);
+    assert!(
+        rows(
+            &db_path,
+            &format!("SELECT * FROM download_receipts WHERE library='{ZONE}'"),
+        )
+        .is_empty(),
+        "the recovered initial state has no current receipts"
+    );
+
+    let recovered_snapshot = || {
+        rows(
+            &db_path,
+            &format!("SELECT id,version_size,checksum,filename,size_bytes,status,local_path,local_checksum,download_checksum,source FROM assets WHERE library='{ZONE}' AND id='recovered-master' ORDER BY version_size"),
+        )
+        .into_iter()
+        .chain(rows(
+            &db_path,
+            &format!("SELECT id,version_size,local_path,local_checksum,download_checksum,source_checksum FROM asset_metadata_paths WHERE library='{ZONE}' AND id='recovered-master' ORDER BY version_size"),
+        ))
+        .chain(rows(
+            &db_path,
+            &format!("SELECT library,asset_record_name,master_record_name FROM asset_master_mappings WHERE library='{ZONE}' AND asset_record_name='asset-recovered-master'"),
+        ))
+        .chain(rows(
+            &db_path,
+            &format!("SELECT * FROM asset_metadata_capture_revisions WHERE library='{ZONE}' AND asset_id='recovered-master'"),
+        ))
+        .collect::<Vec<_>>()
+    };
+    let recovered_before = recovered_snapshot();
+
+    let server = crate::test_helpers::start_wiremock_or_skip("released recovered 36")
+        .await
+        .expect("acceptance server must bind");
+    Mock::given(method("GET"))
+        .and(path("/current-new"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(MEDIA)
+                .insert_header("content-type", "image/jpeg"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let checksum = signature(MEDIA);
+    let mut reused = pair(
+        "recovered-master",
+        "recovered.JPG",
+        &format!("{}/unreused", server.uri()),
+        31,
+    );
+    reused[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    reused[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+    reused[0]["fields"]["resOriginalVidComplRes"] = json!({"value":{
+        "downloadURL":format!("{}/unreused-motion",server.uri()),
+        "size":MOTION.len(),
+        "fileChecksum":signature(MOTION)}});
+    reused[0]["fields"]["resOriginalVidComplFileType"] =
+        json!({"value":"com.apple.quicktime-movie"});
+    let mut current = pair(
+        "current-new-master",
+        "current-new.JPG",
+        &format!("{}/current-new", server.uri()),
+        32,
+    );
+    current[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    current[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+    let mut inventory = reused;
+    inventory.extend(current);
+
+    let token_key = sync_token_key(ZONE);
+    let app_config = make_populated_app_config();
+    let selection = &app_config.filters.selection;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let inventories = Arc::new(AtomicUsize::new(0));
+    for cycle in 0..3 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        let session = ProtectedSession {
+            records: Arc::new(inventory.clone()),
+            incremental: Arc::new(Vec::new()),
+            cycle,
+            inventories: Arc::clone(&inventories),
+        };
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/shared".to_string(),
+            Arc::new(std::collections::HashMap::new()),
+            Box::new(session.clone()),
+            Arc::new(zone()),
+            "shared".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+            db.clone(),
+            baseline_owner(),
+            "com",
+        ));
+        let selected_zones = crate::commands::zone_name_set(std::slice::from_ref(&library));
+        let collection_zones = selected_zones.clone();
+        let resolved_scope = crate::commands::pass_scope_for_zone(
+            selection,
+            ZONE,
+            &selected_zones,
+            &collection_zones,
+        );
+        let collection_context =
+            crate::commands::build_collection_context(selection, std::slice::from_ref(&library))
+                .await
+                .unwrap();
+        let plan = crate::commands::resolve_passes_for_scope(
+            &library,
+            selection,
+            resolved_scope,
+            &collection_context,
+            &[],
+        )
+        .await
+        .unwrap();
+        let mut selected = make_run_cycle_library_state_with_passes(ZONE, &token_key, plan.passes);
+        selected.library = library;
+        let base = make_run_cycle_download_config_builder(&root, db.clone());
+        let builder = |mode, exclude, groups, zone| {
+            let mut config = (*base(mode, exclude, groups, zone)).clone();
+            config.folder_structure = "none".into();
+            config.file_match_policy = crate::types::FileMatchPolicy::NameId7;
+            config.retry.max_retries = 0;
+            Arc::new(config)
+        };
+        let result = run_cycle(
+            &[&selected],
+            &app_config,
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
+        assert!(result.db_sync_token_advance_safe, "cycle {cycle}");
+        assert_eq!(result.stats.downloaded, if cycle == 0 { 1 } else { 0 });
+        assert_eq!(
+            recovered_snapshot(),
+            recovered_before,
+            "cycle {cycle}: recovered rows changed"
+        );
+        assert_eq!(std::fs::read(&old_still).unwrap(), old_bytes);
+        assert_eq!(std::fs::read(&old_motion).unwrap(), MOTION);
+        assert_eq!(
+            std::fs::read(&old_sidecar).unwrap(),
+            b"recovered still sidecar"
+        );
+        assert_eq!(
+            std::fs::read(&custom_sidecar).unwrap(),
+            b"recovered custom opaque xmp"
+        );
+        assert_eq!(
+            [
+                std::fs::metadata(&old_still).unwrap().modified().unwrap(),
+                std::fs::metadata(&old_motion).unwrap().modified().unwrap(),
+                std::fs::metadata(&old_sidecar).unwrap().modified().unwrap(),
+                std::fs::metadata(&custom_sidecar)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+            ],
+            old_mtimes,
+            "cycle {cycle}: recovered mtimes"
+        );
+        if cycle == 0 {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let epoch = crate::state::db::sync_epoch::read_library(&conn, ZONE)
+                .unwrap()
+                .expect("the cycle enrolls the library");
+            assert_eq!(epoch.state, "complete");
+            assert_eq!(epoch.reason, "existing_upgrade");
+            let receipts = rows(
+                &db_path,
+                &format!(
+                    "SELECT child,version_size FROM download_receipts WHERE library='{ZONE}' ORDER BY child,version_size"
+                ),
+            );
+            assert!(
+                receipts
+                    .iter()
+                    .any(|row| row[0]
+                        == rusqlite::types::Value::Text("asset-recovered-master".into())),
+                "the current reuse receipt is produced by the cycle"
+            );
+            assert!(
+                receipts
+                    .iter()
+                    .any(|row| row[0]
+                        == rusqlite::types::Value::Text("asset-current-new-master".into())),
+                "the new current receipt is produced by the cycle"
+            );
+        }
+    }
+    let requests = server.received_requests().await.unwrap();
+    let count = |path: &str| {
+        requests
+            .iter()
+            .filter(|request| request.method.as_str() == "GET" && request.url.path() == path)
+            .count()
+    };
+    assert_eq!(count("/current-new"), 1);
+    assert_eq!(count("/unreused"), 0);
+    assert_eq!(count("/unreused-motion"), 0);
+    server.verify().await;
+    eprintln!(
+        "RELEASED_RECOVERED36_REACHED rows={} inventories={} provenance=E representative=2_of_22",
+        recovered_snapshot().len(),
+        inventories.load(std::sync::atomic::Ordering::SeqCst)
+    );
+}
+
+#[tokio::test]
+async fn released_recovered_36_preserves_initial_history_and_progresses() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(true, exercise_released_recovered_36())
+        .await;
+}
