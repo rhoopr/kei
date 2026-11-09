@@ -1073,3 +1073,165 @@ async fn unchanged_reader_rejects_injected_download_failed_reason_without_mutati
     );
     assert!(attempts > 0 && deadline > 0);
 }
+
+/// The old decoder refusal must survive ordinary replay and two reopens. This
+/// control makes the injected decision due, runs the ordinary cycle twice with
+/// a reopen between, and proves no retirement, compaction or completion.
+#[tokio::test]
+async fn unchanged_reader_preserves_injected_download_failed_across_replay_and_two_reopens() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer};
+
+    use super::{
+        MEDIA, ZONE, baseline_owner, make_run_cycle_config, make_shared_session_for_run_cycle,
+        seed_existing_upgrade_db,
+    };
+    use crate::state::SqliteStateDb;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let db_path = dir.path().join("state.db");
+    seed_existing_upgrade_db(&db_path);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let allow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fail"))
+        .respond_with(GatedBytes {
+            calls: Arc::clone(&calls),
+            allow: Arc::clone(&allow),
+            bytes: Arc::new(MEDIA.to_vec()),
+        })
+        .mount(&server)
+        .await;
+
+    let inventory = media_pair(ZONE, "fail", "fail.JPG", &format!("{}/fail", server.uri()));
+    let full_queries = Arc::new(AtomicUsize::new(0));
+    let changes = Arc::new(AtomicUsize::new(0));
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let selected = stock36_library_state(
+        db.clone(),
+        ZONE,
+        inventory.clone(),
+        Arc::clone(&full_queries),
+        Arc::clone(&changes),
+    )
+    .await;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let mut config = make_run_cycle_config();
+    config.retry.max_retries = 0;
+    run_stock36_cycle(&db, &[&selected], &root, &shared, &config)
+        .await
+        .expect("failed-media baseline must return a result");
+
+    let (generation, key, child, manifest_hash, admission, attempts, _old_deadline) = {
+        let conn = db.acquire_lock("read replay control decision").unwrap();
+        conn.query_row(
+            "SELECT generation,pass_key,child,manifest_hash,admission,attempts,next_retry_at FROM provider_active_decisions WHERE child='asset-fail'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    let injected_deadline = 1;
+    let injected_hash = admission_hash_for(
+        &generation,
+        &key,
+        &child,
+        &manifest_hash,
+        &admission,
+        "download_failed",
+        attempts,
+        injected_deadline,
+    );
+    {
+        let conn = db.acquire_lock("inject due download_failed").unwrap();
+        conn.execute(
+            "UPDATE provider_active_decisions SET reason='download_failed',attempts=?1,next_retry_at=?2,admission_hash=?3 WHERE generation=?4 AND pass_key=?5 AND child=?6",
+            rusqlite::params![attempts, injected_deadline, injected_hash, generation, key, child],
+        )
+        .unwrap();
+    }
+    let snapshot = |db: &SqliteStateDb| -> (String, String, String, i64, i64, Option<String>, i64) {
+        let conn = db.acquire_lock("snapshot replay control").unwrap();
+        let decision: (String, String, String, i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT manifest_hash,admission_hash,reason,attempts,next_retry_at,compacted_hash FROM provider_active_decisions WHERE child='asset-fail'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .unwrap();
+        let verified: i64 = conn
+            .query_row(
+                "SELECT verified_media FROM provider_active_destinations WHERE child='asset-fail'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (
+            decision.0, decision.1, decision.2, decision.3, decision.4, decision.5, verified,
+        )
+    };
+    let injected = snapshot(db.as_ref());
+    assert_eq!(injected.2, "download_failed");
+    assert_eq!(injected.5, None);
+    assert_eq!(injected.6, 0);
+    let calls_before = calls.load(Ordering::SeqCst);
+
+    drop(selected);
+    drop(db);
+    for reopen in 0..2 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        let selected = stock36_library_state(
+            db.clone(),
+            ZONE,
+            inventory.clone(),
+            Arc::clone(&full_queries),
+            Arc::clone(&changes),
+        )
+        .await;
+        let replay = run_stock36_cycle(&db, &[&selected], &root, &shared, &config).await;
+        eprintln!(
+            "L7 old-reader replay reopen={reopen} result={replay:?} calls={} row={:?}",
+            calls.load(Ordering::SeqCst),
+            snapshot(db.as_ref()),
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            calls_before,
+            "the invalid reason must cause no provider GET"
+        );
+        assert_eq!(
+            snapshot(db.as_ref()),
+            injected,
+            "ordinary replay must not retire or complete the injected decision"
+        );
+        assert!(
+            replay.is_err(),
+            "ordinary replay must refuse the invalid reason instead of silently completing it"
+        );
+    }
+}
