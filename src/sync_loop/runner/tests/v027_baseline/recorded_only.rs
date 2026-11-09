@@ -1033,6 +1033,38 @@ async fn unchanged_reader_rejects_injected_download_failed_reason_without_mutati
         attempts,
         deadline,
     );
+    assert_ne!(
+        injected_hash, stored_hash,
+        "the admission hash must bind the reason"
+    );
+    assert_ne!(
+        injected_hash,
+        admission_hash_for(
+            &generation,
+            &key,
+            &child,
+            &manifest_hash,
+            &admission,
+            "download_failed",
+            attempts.saturating_add(1),
+            deadline
+        ),
+        "the admission hash must bind attempts"
+    );
+    assert_ne!(
+        injected_hash,
+        admission_hash_for(
+            &generation,
+            &key,
+            &child,
+            &manifest_hash,
+            &admission,
+            "download_failed",
+            attempts,
+            deadline.saturating_add(1)
+        ),
+        "the admission hash must bind the deadline"
+    );
     {
         let conn = db.acquire_lock("inject download_failed").unwrap();
         conn.execute(
