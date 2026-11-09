@@ -1222,3 +1222,614 @@ fn passed_foreign_rows(database: &Path) -> Vec<Vec<rusqlite::types::Value>> {
     ))
     .collect()
 }
+
+/// Populated released-state scenarios built from the genuine released schema
+/// constructors. Rows are synthetic; no released producer run is claimed.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::sync_loop::runner::tests) enum ReleasedPopulatedCase {
+    /// Schema 28 Shared history whose exact child owns the separated still and
+    /// motion. Both verify from local bytes with no provider GET.
+    SameIdentityReuse28,
+    /// Schema 36 Shared history with a recorded failed live companion. The
+    /// still verifies locally, the companion expires once during the ordinary
+    /// cycle and must settle from the exact fresh URL at the original stem.
+    MotionRefresh36,
+}
+
+/// Wraps the ordinary baseline provider so only the cleanup lookup for the
+/// expired companion receives a fresh URL. The initial inventory keeps the
+/// stale URL, proving the refresh happened instead of a lucky first transfer.
+#[derive(Clone)]
+struct MotionRefreshSession {
+    inner: BaselineSession,
+    stale_motion_url: String,
+    fresh_motion_url: String,
+    lookups: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for MotionRefreshSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        if url.contains("/records/lookup?") {
+            let request: serde_json::Value = serde_json::from_str(&body)?;
+            self.lookups.lock().unwrap().push(request.clone());
+            let requested = request["records"].as_array().cloned().unwrap_or_default();
+            let mut records = Vec::new();
+            for record in self
+                .inner
+                .inventory
+                .iter()
+                .chain(self.inner.concurrent.iter())
+                .chain(self.inner.incremental_addition.iter())
+            {
+                if !requested
+                    .iter()
+                    .any(|query| query["recordName"] == record["recordName"])
+                {
+                    continue;
+                }
+                let mut record = record.clone();
+                if let Some(companion) = record["fields"].get_mut("resOriginalVidComplRes")
+                    && companion["value"]["downloadURL"] == json!(self.stale_motion_url)
+                {
+                    companion["value"]["downloadURL"] = json!(self.fresh_motion_url);
+                }
+                records.push(record);
+            }
+            return Ok(json!({ "records": records }));
+        }
+        self.inner.post(url, body, headers).await
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+pub(in crate::sync_loop::runner::tests) async fn exercise_released_populated(
+    case: ReleasedPopulatedCase,
+) {
+    let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
+    let motion_refresh = matches!(case, ReleasedPopulatedCase::MotionRefresh36);
+    let provider_still = MEDIA.to_vec();
+    let checksum = signature(&provider_still);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let still_path = root.join("shared-only.JPG");
+    let motion_path = root.join("shared-only.MOV");
+    std::fs::write(&still_path, &provider_still).unwrap();
+    if !motion_refresh {
+        std::fs::write(&motion_path, MOTION).unwrap();
+    }
+    let still_mtime = std::fs::metadata(&still_path).unwrap().modified().unwrap();
+    let motion_mtime =
+        (!motion_refresh).then(|| std::fs::metadata(&motion_path).unwrap().modified().unwrap());
+
+    let source = dir.path().join("released.db");
+    let db_path = dir.path().join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        match case {
+            ReleasedPopulatedCase::SameIdentityReuse28 => {
+                crate::state::schema::migrate_genuine_v28(&conn).unwrap();
+                assert_eq!(
+                    conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                        .unwrap(),
+                    28
+                );
+            }
+            ReleasedPopulatedCase::MotionRefresh36 => {
+                crate::state::schema::migrate_genuine_v36(&conn).unwrap();
+                assert_eq!(
+                    conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                        .unwrap(),
+                    36
+                );
+            }
+        }
+        // Synthetic rows in the genuine released schema shape.
+        insert_released_asset(
+            &conn,
+            ZONE,
+            "old-master",
+            "original",
+            "shared-only.JPG",
+            &still_path,
+            &provider_still,
+            &checksum,
+            true,
+        );
+        if motion_refresh {
+            conn.execute(
+                "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,added_at,size_bytes,media_type,status,last_seen_at,download_attempts,last_error,source) \
+                 VALUES (?1,'old-master','live_original',?2,'shared-only.MOV',1700000000,1700000002,?3,'video','failed',1700000004,2,'previous live companion transfer failed','icloud')",
+                rusqlite::params![ZONE, signature(MOTION), MOTION.len() as i64],
+            )
+            .unwrap();
+        } else {
+            insert_released_asset(
+                &conn,
+                ZONE,
+                "old-master",
+                "live_original",
+                "shared-only.MOV",
+                &motion_path,
+                MOTION,
+                &signature(MOTION),
+                true,
+            );
+        }
+        conn.execute_batch(&format!(
+            "INSERT INTO legacy_master_state_owners VALUES ('{ZONE}','old-master','asset-current-master',1700000000);
+             INSERT INTO asset_master_mappings VALUES ('{ZONE}','asset-current-master','current-master',1700000000);
+             INSERT INTO asset_metadata_capture_revisions VALUES ('{ZONE}','old-master',1,1700000000);"
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO metadata VALUES (?1,?2)",
+            rusqlite::params![format!("sync_token:{ZONE}"), OLD_TOKEN],
+        )
+        .unwrap();
+    }
+
+    let columns = released_columns(&source);
+    let legacy_rows = released_rows(&source, &columns);
+    let legacy_bytes = std::fs::read(&source).unwrap();
+    crate::state::db::account::adopt_legacy(
+        &source,
+        &db_path,
+        &baseline_owner(),
+        "baseline@example.invalid",
+        "com",
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(&source).unwrap(), legacy_bytes);
+    assert_eq!(
+        released_rows(&db_path, &columns),
+        legacy_rows,
+        "released rows must survive the documented existing-upgrade adoption"
+    );
+
+    // No test-only epoch marker, completed epoch, v27 token or current receipt.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert!(
+            crate::state::db::sync_epoch::read_library(&conn, ZONE)
+                .unwrap()
+                .is_none(),
+            "enrollment must happen through the production cycle, not setup"
+        );
+        let version = conn
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(version, i64::from(crate::state::schema::SCHEMA_VERSION));
+    }
+    assert!(
+        receipt_rows(&db_path, "asset-current-master").is_empty(),
+        "current selected child starts without a current receipt"
+    );
+    assert!(
+        rows(
+            &db_path,
+            &format!(
+                "SELECT id FROM asset_metadata_paths WHERE library='{ZONE}' AND id='asset-current'"
+            ),
+        )
+        .is_empty(),
+        "current selected child starts without a current path proof"
+    );
+    let identity_snapshot = || {
+        rows(
+            &db_path,
+            &format!(
+                "SELECT * FROM assets WHERE library='{ZONE}' AND id='old-master' AND version_size='original'"
+            ),
+        )
+        .into_iter()
+        .chain(rows(
+            &db_path,
+            &format!(
+                "SELECT version_size,local_path,local_checksum,source_checksum FROM asset_metadata_paths WHERE library='{ZONE}' AND id='old-master' AND version_size='original'"
+            ),
+        ))
+        .chain(rows(
+            &db_path,
+            &format!(
+                "SELECT * FROM legacy_master_state_owners WHERE library='{ZONE}' AND master_record_name='old-master'"
+            ),
+        ))
+        .collect::<Vec<_>>()
+    };
+    let identity_before = identity_snapshot();
+
+    let server = crate::test_helpers::start_wiremock_or_skip("released populated acceptance")
+        .await
+        .expect("acceptance server must bind");
+    Mock::given(method("GET"))
+        .and(path("/existing"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(provider_still.clone())
+                .insert_header("content-type", "image/jpeg"),
+        )
+        .expect(0)
+        .mount(&server)
+        .await;
+    for endpoint in ["/new", "/during"] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(MEDIA)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    if motion_refresh {
+        Mock::given(method("GET"))
+            .and(path("/motion-stale"))
+            .respond_with(ResponseTemplate::new(410))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/motion-fresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(MOTION)
+                    .insert_header("content-type", "video/quicktime"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let mut existing = pair(
+        "current-master",
+        "shared-only.JPG",
+        &format!("{}/existing", server.uri()),
+        1,
+    );
+    existing[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+    existing[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(provider_still.len());
+    existing[0]["fields"]["resOriginalVidComplRes"] = json!({"value":{
+        "downloadURL":if motion_refresh {
+            format!("{}/motion-stale",server.uri())
+        } else {
+            format!("{}/existing-motion-never-requested",server.uri())
+        },
+        "size":MOTION.len(),
+        "fileChecksum":signature(MOTION)}});
+    existing[0]["fields"]["resOriginalVidComplFileType"] =
+        json!({"value":"com.apple.quicktime-movie"});
+    let mut inventory = existing;
+    inventory.extend(pair(
+        "new-master",
+        "new.JPG",
+        &format!("{}/new", server.uri()),
+        2,
+    ));
+    // A genuinely new item arrives on the concurrent bridge rather than the
+    // first inventory page, so the baseline proves current progress as well as
+    // byte-level reuse. The ordinary baseline provider's count side-channel
+    // expects two initial assets and one concurrent addition.
+    let concurrent = pair(
+        "during-master",
+        "during.JPG",
+        &format!("{}/during", server.uri()),
+        3,
+    );
+
+    let token_key = sync_token_key(ZONE);
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let pass_scope = json!({"zone":zone(),"name":"",
+        "list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
+        "obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted",
+        "query_filter":null,"container_id":null,"cross_zone_sources":[]});
+    let lookups = Arc::new(Mutex::new(Vec::new()));
+    let expected_tree = BTreeMap::from([
+        ("shared-only.JPG".to_owned(), provider_still.clone()),
+        ("shared-only.MOV".to_owned(), MOTION.to_vec()),
+        ("new_YXNzZXQ.JPG".to_owned(), MEDIA.to_vec()),
+        ("during_YXNzZXQ.JPG".to_owned(), MEDIA.to_vec()),
+    ]);
+    let mut durable_snapshot = None;
+
+    for cycle in 0..3 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        let inner = BaselineSession {
+            database: "shared",
+            cycle,
+            inventory: Arc::new(inventory.clone()),
+            concurrent: Arc::new(concurrent.clone()),
+            incremental_addition: Arc::new(Vec::new()),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            inventory_queries: Arc::new(AtomicUsize::new(0)),
+            inventory_starts: Arc::new(AtomicUsize::new(0)),
+            boundaries: Arc::new(AtomicUsize::new(0)),
+            changes: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/shared".to_string(),
+            Arc::new(std::collections::HashMap::new()),
+            if motion_refresh {
+                Box::new(MotionRefreshSession {
+                    inner: inner.clone(),
+                    stale_motion_url: format!("{}/motion-stale", server.uri()),
+                    fresh_motion_url: format!("{}/motion-fresh", server.uri()),
+                    lookups: Arc::clone(&lookups),
+                })
+            } else {
+                Box::new(inner.clone())
+            },
+            Arc::new(zone()),
+            "shared".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+            db.clone(),
+            baseline_owner(),
+            "com",
+        ));
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: library.all(),
+            exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+        }];
+        assert_eq!(passes[0].album.selection_scope(), pass_scope);
+        let mut selected = make_run_cycle_library_state_with_passes(ZONE, &token_key, passes);
+        selected.library = library;
+        let base = make_run_cycle_download_config_builder(&root, db.clone());
+        let builder = |mode, exclude, groups, zone| {
+            let mut config = (*base(mode, exclude, groups, zone)).clone();
+            config.folder_structure = "none".into();
+            config.file_match_policy = crate::types::FileMatchPolicy::NameId7;
+            Arc::new(config)
+        };
+        let result = run_cycle(
+            &[&selected],
+            &make_run_cycle_config(),
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let expected_downloaded = match (motion_refresh, cycle) {
+            (true, 0) => 3,
+            (false, 0) => 2,
+            _ => 0,
+        };
+        if result.failed_count != 0 {
+            for event in trace.events() {
+                if matches!(event.level, tracing::Level::WARN | tracing::Level::ERROR) {
+                    eprintln!("TRACE {:?} {:?}", event.level, event.fields);
+                }
+            }
+        }
+        assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
+        assert!(
+            result.db_sync_token_advance_safe,
+            "cycle {cycle}: {result:?}"
+        );
+        assert_eq!(
+            result.stats.downloaded, expected_downloaded,
+            "cycle {cycle}: {result:?}"
+        );
+        assert_eq!(
+            db.get_metadata(&token_key).await.unwrap().as_deref(),
+            Some(format!("v27-after-cycle-{}", cycle + 1).as_str()),
+            "cycle {cycle}: current checkpoint must advance"
+        );
+        assert_eq!(
+            db.get_metadata(&format!("sync_token:{ZONE}"))
+                .await
+                .unwrap(),
+            None,
+            "cycle {cycle}: released cursor must never cross the boundary"
+        );
+
+        if cycle == 0 {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let record = crate::state::db::sync_epoch::read_library(&conn, ZONE)
+                .unwrap()
+                .expect("production cycle enrolls the library");
+            assert_eq!(record.state, "complete", "enrollment must complete");
+            assert_eq!(
+                record.reason, "existing_upgrade",
+                "faithful existing-upgrade enrollment, not a test shortcut"
+            );
+            assert_eq!(
+                record.baseline_scope,
+                selected.library.baseline_scope(),
+                "enrollment scope must match the resolved selection"
+            );
+        }
+
+        assert_eq!(std::fs::read(&still_path).unwrap(), provider_still);
+        assert_eq!(
+            std::fs::metadata(&still_path).unwrap().modified().unwrap(),
+            still_mtime,
+            "cycle {cycle}: reused still mtime changed"
+        );
+        if let Some(mtime) = motion_mtime {
+            assert_eq!(
+                std::fs::metadata(&motion_path).unwrap().modified().unwrap(),
+                mtime,
+                "cycle {cycle}: reused motion mtime changed"
+            );
+        }
+        assert_eq!(
+            identity_snapshot(),
+            identity_before,
+            "cycle {cycle}: exact historical identity mutated"
+        );
+
+        let completed = db.get_downloaded_page(0, 100).await.unwrap();
+        for (id, version, path) in [
+            ("asset-current-master", "original", still_path.as_path()),
+            (
+                "asset-current-master",
+                "live_original",
+                motion_path.as_path(),
+            ),
+            (
+                "asset-new-master",
+                "original",
+                root.join("new_YXNzZXQ.JPG").as_path(),
+            ),
+            (
+                "asset-during-master",
+                "original",
+                root.join("during_YXNzZXQ.JPG").as_path(),
+            ),
+        ] {
+            let row = completed
+                .iter()
+                .find(|row| {
+                    row.library.as_ref() == ZONE
+                        && row.id.as_ref() == id
+                        && row.version_size.as_str() == version
+                })
+                .unwrap_or_else(|| panic!("missing completed {id}/{version}"));
+            assert_eq!(
+                row.local_path.as_ref(),
+                Some(&path.to_path_buf()),
+                "cycle {cycle}: {id}/{version} must keep the original destination"
+            );
+        }
+        let receipts = receipt_rows(&db_path, "asset-current-master");
+        assert_eq!(
+            receipts.len(),
+            2,
+            "cycle {cycle}: still and motion receipts"
+        );
+        let mut versions = std::collections::BTreeSet::new();
+        for receipt in &receipts {
+            let rusqlite::types::Value::Text(version) = &receipt[8] else {
+                panic!("receipt version must be text");
+            };
+            versions.insert(version.clone());
+        }
+        assert_eq!(
+            versions,
+            std::collections::BTreeSet::from(["live_original".to_owned(), "original".to_owned()]),
+            "cycle {cycle}: receipt identities"
+        );
+
+        let mut actual_tree = BTreeMap::new();
+        for entry in std::fs::read_dir(&root).unwrap() {
+            let entry = entry.unwrap();
+            assert!(
+                entry.file_type().unwrap().is_file(),
+                "unexpected non-file tree entry"
+            );
+            let name = entry.file_name().into_string().unwrap();
+            assert!(
+                actual_tree
+                    .insert(name, std::fs::read(entry.path()).unwrap())
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            actual_tree, expected_tree,
+            "cycle {cycle}: media tree gained a suffixed duplicate or lost a name"
+        );
+
+        if let Some(old_receipts) = &durable_snapshot {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let token = crate::state::db::sync_epoch::read_library(&conn, ZONE).unwrap();
+            let receipts = rows(&db_path, "SELECT * FROM download_receipts ORDER BY id");
+            drop(conn);
+            assert_eq!(
+                token.as_ref().map(|record| record.state.as_str()),
+                Some("complete"),
+                "cycle {cycle}: reopen must not disturb the checkpoint"
+            );
+            assert_eq!(&receipts, old_receipts, "cycle {cycle}: receipts churned");
+        } else {
+            durable_snapshot = Some(rows(
+                &db_path,
+                "SELECT * FROM download_receipts ORDER BY id",
+            ));
+        }
+
+        if cycle > 0 {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let record = crate::state::db::sync_epoch::read_library(&conn, ZONE)
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.state, "complete");
+        }
+    }
+
+    if motion_refresh {
+        let lookups = lookups.lock().unwrap();
+        assert_eq!(lookups.len(), 1, "one bounded exact cleanup lookup");
+        let body = lookups[0].to_string();
+        assert!(body.contains("asset-current"), "exact child lookup: {body}");
+        assert!(
+            body.contains("current-master"),
+            "exact master lookup: {body}"
+        );
+    }
+    let requests = server.received_requests().await.unwrap();
+    let count = |path: &str| {
+        requests
+            .iter()
+            .filter(|request| request.method.as_str() == "GET" && request.url.path() == path)
+            .count()
+    };
+    assert_eq!(
+        count("/existing"),
+        0,
+        "proven same-identity still must not GET"
+    );
+    assert_eq!(count("/new"), 1, "the genuinely new item transfers once");
+    assert_eq!(
+        count("/during"),
+        1,
+        "the concurrent new item transfers once"
+    );
+    if motion_refresh {
+        assert_eq!(count("/motion-stale"), 1, "one expired attempt");
+        assert_eq!(count("/motion-fresh"), 1, "one successful refresh");
+    } else {
+        assert_eq!(
+            count("/existing-motion-never-requested"),
+            0,
+            "proven same-identity motion must not GET"
+        );
+    }
+    server.verify().await;
+    eprintln!(
+        "RELEASED_POPULATED_REACHED case={case:?} still_gets={} new_gets={} lookups={}",
+        count("/existing"),
+        count("/new"),
+        if motion_refresh {
+            lookups.lock().unwrap().len()
+        } else {
+            0
+        }
+    );
+}
