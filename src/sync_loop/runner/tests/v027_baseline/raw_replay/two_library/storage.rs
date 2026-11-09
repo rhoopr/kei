@@ -81,6 +81,8 @@ fn old_snapshot(db: &SqliteStateDb) -> Vec<Vec<rusqlite::types::Value>> {
         "SELECT * FROM provider_work_receipts ORDER BY page_id,ordinal,config_hash,confirmation_hash",
         "SELECT * FROM assets WHERE id='old-receipt' ORDER BY library,id,version_size",
         "SELECT * FROM asset_metadata_paths WHERE id='old-receipt' ORDER BY library,id,version_size",
+        "SELECT * FROM assets WHERE id='old-healthy-receipt' ORDER BY library,id,version_size",
+        "SELECT * FROM asset_metadata_paths WHERE id='old-healthy-receipt' ORDER BY library,id,version_size",
     ] {
         let mut stmt = conn.prepare(sql).unwrap();
         let n = stmt.column_count();
@@ -94,7 +96,7 @@ fn old_snapshot(db: &SqliteStateDb) -> Vec<Vec<rusqlite::types::Value>> {
     out
 }
 
-async fn stock(database: &Path, root: &Path, padding: usize) -> u64 {
+async fn stock(database: &Path, root: &Path, padding: usize, genuine_upgrade: bool) -> u64 {
     let db = Arc::new(SqliteStateDb::create_stock_v36_for_test(
         database,
         &baseline_owner(),
@@ -182,6 +184,16 @@ async fn stock(database: &Path, root: &Path, padding: usize) -> u64 {
     db.acquire_lock("seed genuine old downloaded receipt").unwrap().execute(
         "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,local_path,local_checksum,download_checksum) VALUES('OldSync','old-receipt','original','old-provider-generation','original.JPG',1000,?1,'photo','downloaded',1000,?2,?3,?3)",
         rusqlite::params![i64::try_from(MEDIA.len()).unwrap(),file.to_str().unwrap(),hash]).unwrap();
+    if genuine_upgrade {
+        // Genuine existing-upgrade evidence belongs to the affected library.
+        // Keep the separate OldSync row above as unrelated preserved history.
+        let healthy_old = root.join("old-healthy.JPG");
+        std::fs::write(&healthy_old, MEDIA).unwrap();
+        let healthy_hash = download::file::compute_sha256(&healthy_old).await.unwrap();
+        db.acquire_lock("seed affected-library old downloaded receipt").unwrap().execute(
+            "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,local_path,local_checksum,download_checksum) VALUES(?4,'old-healthy-receipt','original','old-healthy-provider-generation','old-healthy.JPG',1001,?1,'photo','downloaded',1001,?2,?3,?3)",
+            rusqlite::params![i64::try_from(MEDIA.len()).unwrap(),healthy_old.to_str().unwrap(),healthy_hash,HEALTHY]).unwrap();
+    }
     let conn = db.acquire_lock("genuine stock capacity").unwrap();
     assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
     assert_eq!(
@@ -190,6 +202,29 @@ async fn stock(database: &Path, root: &Path, padding: usize) -> u64 {
             .unwrap(),
         0
     );
+    if genuine_upgrade {
+        // The generic stock constructor marks itself as already past the
+        // one-time epoch baseline so old fixtures keep their semantics. Remove
+        // only that test marker so the next owned open performs a genuine
+        // v36-existing-upgrade enrollment. No token or receipt is seeded.
+        assert_eq!(
+            conn.execute(
+                "DELETE FROM metadata WHERE key=?1",
+                [crate::state::db::sync_epoch::TEST_PREEXISTING_EPOCH_KEY],
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM metadata WHERE key=?1",
+                [crate::state::db::sync_epoch::TEST_PREEXISTING_EPOCH_KEY],
+                |r| r.get(0)
+            )
+            .unwrap()
+                == 0
+        );
+    }
     u64::try_from(
         conn.query_row::<i64, _, _>(
             "SELECT SUM(charged_bytes) FROM provider_shadow_pages",
@@ -238,6 +273,24 @@ async fn v027_large_stock_inbox_preserves_current_progress() {
         Fault::None,
         crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES - 8192,
         Some(512 * 1024 * 1024),
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn v027_genuine_existing_upgrade_small_budget_preserves_current_progress() {
+    storage_contract_with_stock(Fault::None, 8192, None, true).await;
+}
+
+#[tokio::test]
+#[ignore = "near-512 MiB genuine existing-upgrade qualification; run explicitly on disposable storage"]
+async fn v027_genuine_existing_upgrade_near_full_preserves_current_progress() {
+    storage_contract_with_stock(
+        Fault::None,
+        crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES - 8192,
+        Some(512 * 1024 * 1024),
+        true,
     )
     .await;
 }
@@ -254,6 +307,7 @@ async fn v027_near_full_due_hydration_preserves_independent_current_progress() {
                 Fault::None,
                 crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES - 8192,
                 Some(512 * 1024 * 1024),
+                false,
             ),
         )
         .await;
@@ -325,14 +379,19 @@ fn owner_snapshot(db: &SqliteStateDb) -> Vec<Vec<rusqlite::types::Value>> {
     rows
 }
 async fn storage_contract(fault: Fault) {
-    storage_contract_with_stock(fault, 8192, None).await;
+    storage_contract_with_stock(fault, 8192, None, false).await;
 }
 
 #[allow(
     clippy::print_stdout,
     reason = "synthetic storage measurements are test evidence"
 )]
-async fn storage_contract_with_stock(fault: Fault, padding: usize, capacity: Option<u64>) {
+async fn storage_contract_with_stock(
+    fault: Fault,
+    padding: usize,
+    capacity: Option<u64>,
+    genuine_upgrade: bool,
+) {
     let fairness = ASSESS_FAIRNESS
         .try_with(|enabled| *enabled)
         .unwrap_or(false);
@@ -388,7 +447,7 @@ async fn storage_contract_with_stock(fault: Fault, padding: usize, capacity: Opt
     let mtime = std::fs::metadata(&original).unwrap().modified().unwrap();
     let database = dir.path().join("state.db");
     let setup_started = std::time::Instant::now();
-    let budget = stock(&database, &root, padding).await;
+    let budget = stock(&database, &root, padding, genuine_upgrade).await;
     if let Some(capacity) = capacity {
         assert!(budget > 511 * 1024 * 1024 && budget < capacity);
     }
@@ -424,6 +483,40 @@ async fn storage_contract_with_stock(fault: Fault, padding: usize, capacity: Opt
                 .unwrap(),
         );
         if cycle == 0 {
+            // The same mutex backs async state calls. Do not hold a direct
+            // connection guard across this await or the fixture self-deadlocks
+            // in setup before the production cycle.
+            let seeded_token = if genuine_upgrade {
+                Some(db.get_metadata(&sync_token_key(HEALTHY)).await.unwrap())
+            } else {
+                None
+            };
+            if genuine_upgrade {
+                let conn = db
+                    .acquire_lock("genuine existing upgrade enrollment")
+                    .unwrap();
+                let epoch = crate::state::db::sync_epoch::read_library(&conn, HEALTHY).unwrap();
+                if let Some(epoch) = epoch {
+                    assert_eq!(epoch.state, "pending");
+                    assert_eq!(epoch.reason, "existing_upgrade");
+                    assert!(epoch.completed_at.is_none());
+                    assert!(epoch.binding.is_none());
+                }
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        "SELECT count(*) FROM download_receipts",
+                        [],
+                        |r| r.get(0)
+                    )
+                    .unwrap(),
+                    0,
+                    "genuine upgrade must not seed current receipts"
+                );
+                assert!(
+                    seeded_token.unwrap().is_none(),
+                    "genuine upgrade must not carry a seeded v27 token"
+                );
+            }
             before = Some(old_snapshot(&db));
             let capture = ShadowCapture::new(db.clone(), baseline_owner(), "com");
             let scope = capture.scope("private", &healthy_zone()).unwrap();
@@ -707,6 +800,17 @@ async fn storage_contract_with_stock(fault: Fault, padding: usize, capacity: Opt
             continue;
         }
         let result = result.unwrap();
+        if genuine_upgrade && cycle == 0 {
+            let conn = db
+                .acquire_lock("genuine upgrade completed its first baseline")
+                .unwrap();
+            let epoch = crate::state::db::sync_epoch::read_library(&conn, HEALTHY)
+                .unwrap()
+                .expect("enrolled library must stay durable");
+            assert_eq!(epoch.state, "complete");
+            assert_eq!(epoch.reason, "existing_upgrade");
+            assert!(epoch.completed_at.is_some());
+        }
         if due_hydration {
             let retry: (i64,i64,i64) = db.acquire_lock("due historical retry across reopen").unwrap().query_row(
                 "SELECT attempts,last_attempt_at,next_retry_at FROM provider_work_retries WHERE page_id=1 AND ordinal=1", [],
