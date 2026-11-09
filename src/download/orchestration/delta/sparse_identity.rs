@@ -50,8 +50,15 @@ impl SparseRetryContext {
             .selection_context
             .as_ref()
             .and_then(|c| c.current_sparse_scope());
-        let mut witness =
-            crate::state::db::SparseCurrentWitness::new(&config.library, current_scope);
+        let expected_owner = config
+            .selection_context
+            .as_ref()
+            .and_then(|context| context.current_sparse_owner());
+        let mut witness = crate::state::db::SparseCurrentWitness::new(
+            &config.library,
+            current_scope,
+            expected_owner,
+        );
         let rows = match db.sparse_identities(&config.library).await {
             Ok(rows) => rows,
             Err(_) => {
@@ -67,44 +74,30 @@ impl SparseRetryContext {
             .iter()
             .map(|event| event.record_name.clone())
             .collect();
-        for mut row in rows {
+        for row in rows {
             if current_scope.is_some_and(|scope| !row.matches_scope(scope)) {
                 state_failure(summary);
                 witness.fail();
                 continue;
             }
 
+            // Existing observed-evidence safety guard. This is the only byte
+            // that the ordinary retry path consumes.
+            if SparseShareEvidence::from_durable_key(&row.observed).is_none() {
+                state_failure(summary);
+                witness.fail();
+                continue;
+            }
+            // Original and lookup are not used by ordinary hydration. An
+            // unsupported stored value only makes the H witness ineligible; it
+            // must not add a failure counter or skip otherwise-authorized work.
             if SparseShareEvidence::from_durable_key(&row.original).is_none()
-                || SparseShareEvidence::from_durable_key(&row.observed).is_none()
                 || row
                     .lookup
                     .as_ref()
                     .is_some_and(|key| SparseShareEvidence::from_durable_key(key).is_none())
             {
-                state_failure(summary);
                 witness.fail();
-                continue;
-            }
-            // Actual observation binds unknown work to current scope.
-            // Historical epoch rows never enter this runtime read path.
-            if let Some(scope) = current_scope.filter(|_| seen.contains(row.source.as_str())) {
-                match db
-                    .observe_current_sparse_identity(
-                        &config.library,
-                        &row.source,
-                        &row.observed,
-                        scope,
-                        chrono::Utc::now(),
-                    )
-                    .await
-                {
-                    Ok(current) => row = current,
-                    Err(_) => {
-                        state_failure(summary);
-                        witness.fail();
-                        continue;
-                    }
-                }
             }
             witness.observe(&row);
             // Earlier provisional bridge proof covers only this exact generation.
@@ -664,6 +657,95 @@ mod tests {
             db.record_sparse_attempt(&row, SparseAttemptOutcome::Recovered, Utc::now())
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_original_evidence_fails_witness_without_failure_or_skip() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let config = DownloadConfig {
+            library: "PrimarySync".into(),
+            state_db: Some(db.clone()),
+            ..DownloadConfig::test_default()
+        };
+        let source = SparseSourceId::new("source");
+        db.observe_sparse_identity("PrimarySync", &source, &key(), Utc::now())
+            .await
+            .unwrap();
+        db.acquire_lock("seed unsupported original")
+            .unwrap()
+            .execute(
+                "UPDATE unresolved_sparse_identities SET original_evidence='not-a-key' \
+                 WHERE library='PrimarySync' AND source_record_name='source'",
+                [],
+            )
+            .unwrap();
+        let mut events = Vec::new();
+        let mut summary = IncrementalDeltaSummary::default();
+        let context = SparseRetryContext::prepare(
+            &mut events,
+            &config,
+            &mut summary,
+            DownloadRunMode::Download,
+        )
+        .await;
+        assert!(
+            context.witness().failed(),
+            "H witness must refuse unsupported original"
+        );
+        assert!(
+            context.rows.contains_key(&source),
+            "ordinary hydration must keep the safe row"
+        );
+        assert_eq!(summary.state_transition_failures, 0);
+        assert!(!summary.identity_incomplete);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.record_name.as_ref() == "source")
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_type_event_cannot_promote_retained_origin() {
+        use crate::icloud::photos::asset::ChangeEvent;
+        use crate::types::ChangeReason;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let config = DownloadConfig {
+            library: "PrimarySync".into(),
+            state_db: Some(db.clone()),
+            ..DownloadConfig::test_default()
+        };
+        let source = SparseSourceId::new("source");
+        db.observe_sparse_identity("PrimarySync", &source, &key(), Utc::now())
+            .await
+            .unwrap();
+        let mut events = vec![ChangeEvent {
+            record_name: "source".into(),
+            record_type: Some("CPLContainer".into()),
+            master_record_name: None,
+            sparse_share: Some(
+                SparseShareEvidence::from_durable_key(&key()).expect("valid synthetic key"),
+            ),
+            reason: ChangeReason::Created,
+            asset: None,
+            album: None,
+            relation: None,
+            token_unsafe_reason: None,
+        }];
+        let mut summary = IncrementalDeltaSummary::default();
+        let _ = SparseRetryContext::prepare(
+            &mut events,
+            &config,
+            &mut summary,
+            DownloadRunMode::Download,
+        )
+        .await;
+        let rows = db.sparse_identities("PrimarySync").await.unwrap();
+        assert_eq!(
+            rows[0].origin, None,
+            "a wrong-type or name-only event must not manufacture current origin"
         );
     }
 
