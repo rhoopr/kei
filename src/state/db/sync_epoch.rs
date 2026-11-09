@@ -2475,6 +2475,29 @@ mod tests {
             reserve_qualification(&conn, &qualification_fence(&conn), 200_000),
             QualificationReserve::NotPending
         );
+
+        record.state = "blocked".to_owned();
+        record.binding = None;
+        write_library(&conn, &record).unwrap();
+        assert_eq!(
+            reserve_qualification(&conn, &qualification_fence(&conn), 200_000),
+            QualificationReserve::NotPending
+        );
+
+        record.state = "ready".to_owned();
+        record.binding = Some(BaselineBinding {
+            token_key: "pending_sync_token:v27:enum:PrimarySync".to_owned(),
+            token_sha256: "token-sha".to_owned(),
+            descriptor_key: "observed_selection_staged:v27:enum:PrimarySync".to_owned(),
+            descriptor_proof_hash: "descriptor-sha".to_owned(),
+            baseline_key: "baseline_cursor:v27:epoch:scope:enum:".to_owned(),
+            baseline_sha256: "baseline-sha".to_owned(),
+        });
+        write_library(&conn, &record).unwrap();
+        assert_eq!(
+            reserve_qualification(&conn, &qualification_fence(&conn), 200_000),
+            QualificationReserve::NotPending
+        );
     }
 
     #[test]
