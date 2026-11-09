@@ -316,15 +316,18 @@ impl SparseCurrentWitness {
         }
     }
 
+    #[allow(dead_code, reason = "consumed by the L1 cycle health seam patch")]
     pub(crate) fn bind_epoch(&mut self, epoch: &str, attempt: &str) {
         self.expected_epoch = Some(epoch.to_owned());
         self.expected_attempt = Some(attempt.to_owned());
     }
 
+    #[allow(dead_code, reason = "consumed by the L1 cycle health seam patch")]
     pub(crate) fn bind_baseline_scope(&mut self, baseline_scope: &str) {
         self.baseline_scope = Some(baseline_scope.to_owned());
     }
 
+    #[allow(dead_code, reason = "consumed by the L1 cycle health seam patch")]
     pub(crate) fn baseline_scope(&self) -> Option<&str> {
         self.baseline_scope.as_deref()
     }
@@ -343,6 +346,7 @@ impl SparseCurrentWitness {
         );
     }
 
+    #[allow(dead_code, reason = "consumed by the L1 cycle health seam patch")]
     pub(crate) fn library(&self) -> &str {
         &self.library
     }
@@ -747,7 +751,11 @@ fn attest_current_sparse(
         return Err(SparseAttestationRefusal::MarkerInvalid);
     }
     #[cfg(test)]
-    if let Some(hook) = ATTEST_INTERLEAVE.lock().unwrap().take() {
+    if let Some(hook) = ATTEST_INTERLEAVE
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take())
+    {
         hook();
     }
 
