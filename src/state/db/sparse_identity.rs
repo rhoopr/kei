@@ -320,6 +320,10 @@ impl SparseCurrentWitness {
         );
     }
 
+    pub(crate) fn library(&self) -> &str {
+        &self.library
+    }
+
     /// Any read, scope, evidence or write failure makes the witness unusable.
     pub(crate) fn fail(&mut self) {
         self.failed = true;
@@ -1581,6 +1585,7 @@ mod tests {
             .unwrap();
         let mut witness = SparseCurrentWitness::new("PrimarySync", Some(&scope));
         witness.observe(&row);
+        assert_eq!(witness.library(), "PrimarySync");
         db.attest_current_sparse(&witness).await.unwrap();
 
         let second = db
