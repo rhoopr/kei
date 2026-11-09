@@ -14,7 +14,8 @@ use crate::sync_cycle::{
     sync_token_key,
 };
 use crate::sync_loop::test_support::{
-    full_album_page_with_download, make_run_cycle_config, make_run_cycle_download_config_builder,
+    album_count_response, baseline_zone_response, full_album_page_with_download,
+    make_run_cycle_config, make_run_cycle_download_config_builder,
     make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle,
 };
 use base64::Engine as _;
@@ -325,6 +326,69 @@ impl PhotosSession for ReadinessRegressView {
             );
         }
         self.session.post(url, body, headers).await
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[derive(Clone)]
+struct PartialEnumerationSession {
+    first_page: Arc<Vec<Value>>,
+    queries: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for PartialEnumerationSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        let request: Value = serde_json::from_str(&body)?;
+        if url.ends_with("/zones/list") {
+            return Ok(baseline_zone_response(ZONE));
+        }
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(json!({"records":[{"fields":{"state":{"value":"FINISHED"}}}]}));
+        }
+        if request["query"]["recordType"] == "CPLAlbumByPositionLive" {
+            return Ok(json!({"records":[]}));
+        }
+        if url.contains("/internal/records/query/batch") {
+            return Ok(album_count_response(4));
+        }
+        if url.contains("/changes/zone?") {
+            return Ok(json!({"zones":[{"zoneID":zone(),"records":[],
+                "syncToken":"partial-after","moreComing":false}]}));
+        }
+        if url.contains("/records/lookup?") {
+            return Ok(json!({"records":self.first_page.as_ref()}));
+        }
+        assert!(url.contains("/records/query?"), "{url}");
+        self.queries.fetch_add(1, Ordering::SeqCst);
+        let offset = request["query"]["filterBy"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|filter| filter["fieldName"] == "startRank")
+            .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+            .unwrap_or(0);
+        if offset == 0 {
+            return Ok(json!({
+                "records": self.first_page.as_ref(),
+                "syncToken": "partial-page-1"
+            }));
+        }
+        Ok(json!({
+            "records": [{
+                "recordName": "unsupported-partial-page-record",
+                "recordType": "CPLUnsupported",
+                "fields": {}
+            }],
+            "syncToken": "partial-page-2"
+        }))
     }
     fn clone_box(&self) -> Box<dyn PhotosSession> {
         Box::new(self.clone())
@@ -2217,4 +2281,108 @@ async fn pending_upgrade_qualification_no_active_passes_keeps_deadline() {
         None
     );
     assert_eq!(db.get_metadata(&sync_token_key(ZONE)).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn pending_upgrade_qualification_paged_partial_enumeration_retains_guard() {
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/partial"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .mount(&server)
+        .await;
+    let (_dir, root, db_path, _unused_inventory, shared) =
+        seed_running_pending_upgrade("http://synthetic.invalid/current").await;
+    let first_page = Arc::new(pair(
+        "partial-current",
+        "partial.JPG",
+        &format!("{}/partial", server.uri()),
+        26,
+    ));
+    let queries = Arc::new(AtomicUsize::new(0));
+    let session = PartialEnumerationSession {
+        first_page,
+        queries: Arc::clone(&queries),
+    };
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let before = {
+        let conn = db
+            .acquire_lock("read pre-partial qualification record")
+            .unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap()
+    };
+    let result = try_run_pending_upgrade_indexing_cycle_with_session(
+        Arc::clone(&db),
+        Box::new(session),
+        &root,
+        &shared,
+    )
+    .await;
+    assert!(
+        queries.load(Ordering::SeqCst) >= 2,
+        "the first valid page must be followed by the failing page"
+    );
+    if let Ok(result) = result {
+        assert!(
+            result.stats.enumeration_errors > 0 || result.failed_count > 0,
+            "partial enumeration must not appear complete: {result:?}"
+        );
+        assert!(!result.db_sync_token_advance_safe);
+    }
+    let after = {
+        let conn = db
+            .acquire_lock("read post-partial qualification record")
+            .unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(after.attempt, before.attempt);
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.state, "pending");
+    assert!(after.binding.is_none());
+    assert!(
+        after.next_attempt_at > before.next_attempt_at,
+        "reservation floor must be committed before the first page"
+    );
+    assert!(
+        after.last_outcome.as_deref().is_some_and(|outcome| outcome
+            .starts_with("qualification_in_progress:v1:")
+            || outcome == "qualification_incomplete:v1:enumeration_incomplete"),
+        "partial enumeration must retain the guard or the nonqualified label: {after:?}"
+    );
+    assert!(
+        db.get_metadata(&indexing_reconciliation_key(ZONE))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        db.get_metadata(&indexing_replay_key(ZONE)).await.unwrap(),
+        None
+    );
+    assert_eq!(db.get_metadata(&sync_token_key(ZONE)).await.unwrap(), None);
+
+    let conn = db.acquire_lock("inspect partial page work").unwrap();
+    let (status, local_path): (String, Option<String>) = conn
+        .query_row(
+            "SELECT status,local_path FROM assets WHERE library=?1 AND id='asset-partial-current' \
+             AND version_size='original'",
+            [ZONE],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        matches!(status.as_str(), "downloaded" | "pending" | "failed"),
+        "first-page work must remain durable: {status}"
+    );
+    if let Some(path) = local_path {
+        assert_eq!(std::fs::read(path).unwrap(), MEDIA);
+    }
 }
