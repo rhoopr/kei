@@ -297,6 +297,18 @@ pub(crate) trait ReconciliationStateStore: Send + Sync {
     async fn has_primary_layouts(&self, _library: &str) -> Result<bool, StateError> {
         Ok(false)
     }
+    #[allow(
+        dead_code,
+        reason = "consumed by the later preservation H clause after its PO gate"
+    )]
+    async fn preservation_hold(
+        &self,
+        _request: crate::state::db::PreservationHoldRequest,
+    ) -> Result<crate::state::db::PreservationHoldOutcome, StateError> {
+        Ok(crate::state::db::PreservationHoldOutcome::Refused(
+            crate::state::db::PreservationHoldRefusal::Unsupported,
+        ))
+    }
     async fn guard_primary_slot(
         &self,
         _library: &str,

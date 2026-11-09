@@ -34,7 +34,10 @@ pub(crate) mod provider_inbox;
 pub(crate) mod provider_selection;
 pub(crate) mod provider_work;
 pub(crate) mod trusted_legacy;
-pub(crate) use legacy_preservation::{LegacyActivationProof, LegacyFileEvidence};
+pub(crate) use legacy_preservation::{
+    LegacyActivationProof, LegacyFileEvidence, PreservationHoldOutcome, PreservationHoldRefusal,
+    PreservationHoldRequest,
+};
 pub(crate) mod primary_layout;
 mod reconciliation;
 mod reports;

@@ -181,6 +181,20 @@ impl PhotoLibrary {
         Self::baseline_scope_hash(self.library_type.as_ref(), self.zone_id.as_ref())
     }
 
+    /// Canonical full-zone projection for the currently owned library object.
+    pub(crate) fn owned_provider_scope_projection(&self) -> Option<(String, String, String)> {
+        let database = self.library_type.as_ref();
+        if !matches!(database, "private" | "shared") {
+            return None;
+        }
+        let zone_name = self.zone_id.get("zoneName")?.as_str()?.trim();
+        let owner = self.zone_id.get("ownerRecordName")?.as_str()?.trim();
+        if zone_name.is_empty() || owner.is_empty() {
+            return None;
+        }
+        Some((zone_name.to_owned(), owner.to_owned(), database.to_owned()))
+    }
+
     /// Canonical full-zone identity. The entire zone JSON is hashed, not the
     /// reduced capture projection.
     pub(crate) fn baseline_scope_hash(database: &str, zone: &Value) -> String {

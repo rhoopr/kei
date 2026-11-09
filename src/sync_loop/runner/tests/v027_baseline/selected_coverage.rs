@@ -601,12 +601,12 @@ impl PhotosSession for OldDebtSmartSession {
 
 #[tokio::test]
 async fn format1_unfinished_work_survives_smart_selection_and_quiet_reopen() {
-    format1_old_selection_scenario(false).await;
+    Box::pin(format1_old_selection_scenario(false)).await;
 }
 
 #[tokio::test]
 async fn format1_unfinished_work_survives_unfiled_toggle_with_production_enum_hash() {
-    format1_old_selection_scenario(true).await;
+    Box::pin(format1_old_selection_scenario(true)).await;
 }
 
 async fn format1_old_selection_scenario(production_enum: bool) {

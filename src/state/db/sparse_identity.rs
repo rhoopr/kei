@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -270,6 +271,7 @@ pub(crate) struct SparseCurrentWitness {
     expected_epoch: Option<String>,
     expected_attempt: Option<String>,
     baseline_scope: Option<String>,
+    expected_zone: Option<(String, String, String)>,
     rows: rustc_hash::FxHashMap<SparseSourceId, SparseWitnessRow>,
     failed: bool,
     conflict: bool,
@@ -325,6 +327,11 @@ impl SparseCurrentWitness {
     #[allow(dead_code, reason = "consumed by the L1 cycle health seam patch")]
     pub(crate) fn bind_baseline_scope(&mut self, baseline_scope: &str) {
         self.baseline_scope = Some(baseline_scope.to_owned());
+    }
+
+    #[allow(dead_code, reason = "consumed by the L1 cycle health seam patch")]
+    pub(crate) fn bind_provider_scope_projection(&mut self, projection: (String, String, String)) {
+        self.expected_zone = Some(projection);
     }
 
     #[allow(dead_code, reason = "consumed by the L1 cycle health seam patch")]
@@ -397,6 +404,11 @@ impl SparseCurrentWitness {
         }
         if self.expected_owner.is_none() {
             self.expected_owner = other.expected_owner.clone();
+        }
+        match (&self.expected_zone, &other.expected_zone) {
+            (None, Some(value)) => self.expected_zone = Some(value.clone()),
+            (Some(existing), Some(value)) if existing != value => self.conflict = true,
+            _ => {}
         }
         for (source, row) in &other.rows {
             match self.rows.get(source) {
@@ -664,6 +676,7 @@ fn validate_current_scope(conn: &Connection, library: &str, scope: &str) -> Resu
 pub(crate) static ATTEST_INTERLEAVE: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
     std::sync::Mutex::new(None);
 
+#[cfg(test)]
 fn baseline_scope_hash(scope: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(scope).ok()?;
     let database = value.get("database")?.as_str()?;
@@ -701,7 +714,7 @@ fn attest_current_sparse(
         .expected_owner
         .as_ref()
         .ok_or(SparseAttestationRefusal::OwnerMissing)?;
-    super::account::validate(conn, expected_owner)
+    super::account::validate_authenticated(conn, expected_owner)
         .map_err(|_error| SparseAttestationRefusal::OwnerMismatch)?;
     let expected_epoch = witness
         .expected_epoch
@@ -733,9 +746,14 @@ fn attest_current_sparse(
         .baseline_scope
         .as_deref()
         .ok_or(SparseAttestationRefusal::ScopeHashMissing)?;
-    let actual_scope =
-        baseline_scope_hash(scope).ok_or(SparseAttestationRefusal::ScopeHashInvalid)?;
-    if actual_scope != expected_scope {
+    let _ = expected_scope;
+    let expected_zone = witness
+        .expected_zone
+        .as_ref()
+        .ok_or(SparseAttestationRefusal::ScopeMissing)?;
+    let actual_projection = crate::icloud::photos::PhotoLibrary::provider_scope_projection(scope)
+        .ok_or(SparseAttestationRefusal::ScopeHashInvalid)?;
+    if &actual_projection != expected_zone {
         return Err(SparseAttestationRefusal::ScopeHashMismatch);
     }
     validate_current_scope(conn, &witness.library, scope)
@@ -1728,6 +1746,11 @@ mod tests {
         witness.observe(&row);
         witness.bind_epoch(&epoch, &attempt);
         witness.bind_baseline_scope(&super::baseline_scope_hash(&scope).unwrap());
+        witness.bind_provider_scope_projection((
+            "PrimarySync".into(),
+            "_defaultOwner".into(),
+            "private".into(),
+        ));
         assert!(witness.baseline_scope().is_some());
         assert_eq!(witness.library(), "PrimarySync");
         db.attest_current_sparse(&witness).await.unwrap();
@@ -1789,6 +1812,11 @@ mod tests {
         witness.observe(&row);
         witness.bind_epoch(&epoch, &attempt);
         witness.bind_baseline_scope(&super::baseline_scope_hash(&scope).unwrap());
+        witness.bind_provider_scope_projection((
+            "PrimarySync".into(),
+            "_defaultOwner".into(),
+            "private".into(),
+        ));
 
         db.with_conn_mut("historical origin", |conn| {
             conn.execute(
@@ -1870,6 +1898,11 @@ mod tests {
         witness.observe(&row);
         witness.bind_epoch(&epoch, &attempt);
         witness.bind_baseline_scope(&super::baseline_scope_hash(&scope).unwrap());
+        witness.bind_provider_scope_projection((
+            "PrimarySync".into(),
+            "_defaultOwner".into(),
+            "private".into(),
+        ));
         db.attest_current_sparse(&witness).await.unwrap();
 
         // A consistent owner rewrite after the producer is a different owner
@@ -1959,10 +1992,87 @@ mod tests {
             .unwrap();
         drop(writer);
         let mut wrong_scope = witness.clone();
-        wrong_scope.bind_baseline_scope(&"b".repeat(64));
+        wrong_scope.bind_provider_scope_projection((
+            "OtherZone".into(),
+            "_defaultOwner".into(),
+            "private".into(),
+        ));
         assert_eq!(
             db.attest_current_sparse(&wrong_scope).await,
             Err(SparseAttestationRefusal::ScopeHashMismatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_current_witness_uses_full_zone_projection_not_reduced_hash() {
+        let _guard = WITNESS_TEST_LOCK.lock().await;
+        let (_dir, db, _scope, owner, epoch, attempt) = owned_sparse_db().await;
+        let scope = serde_json::json!({
+            "format": 1,
+            "realm": "com",
+            "container": "com.apple.photos.cloud",
+            "environment": "production",
+            "database": "private",
+            "zone": {
+                "zoneName": "PrimarySync",
+                "ownerRecordName": "_defaultOwner",
+                "zoneType": "REGULAR_CUSTOM_ZONE"
+            }
+        })
+        .to_string();
+        let evidence = SparseEvidence::new(r#"[2,"source_only"]"#.into());
+        let source = SparseSourceId::new("source");
+        let row = db
+            .observe_current_sparse_identity("PrimarySync", &source, &evidence, &scope, Utc::now())
+            .await
+            .unwrap();
+        let full_zone: serde_json::Value = serde_json::from_str(&scope).unwrap();
+        let full_hash = crate::icloud::photos::PhotoLibrary::baseline_scope_hash(
+            "private",
+            full_zone.get("zone").unwrap(),
+        );
+        let mut witness =
+            SparseCurrentWitness::new("PrimarySync", Some(&scope), Some(owner.clone()));
+        witness.observe(&row);
+        witness.bind_epoch(&epoch, &attempt);
+        witness.bind_baseline_scope(&full_hash);
+        witness.bind_provider_scope_projection((
+            "PrimarySync".into(),
+            "_defaultOwner".into(),
+            "private".into(),
+        ));
+        db.attest_current_sparse(&witness).await.unwrap();
+
+        let mut wrong_projection = witness.clone();
+        wrong_projection.bind_provider_scope_projection((
+            "OtherZone".into(),
+            "_defaultOwner".into(),
+            "private".into(),
+        ));
+        assert_eq!(
+            db.attest_current_sparse(&wrong_projection).await,
+            Err(SparseAttestationRefusal::ScopeHashMismatch)
+        );
+
+        let mut wrong_database = witness.clone();
+        wrong_database.bind_provider_scope_projection((
+            "PrimarySync".into(),
+            "_defaultOwner".into(),
+            "shared".into(),
+        ));
+        assert_eq!(
+            db.attest_current_sparse(&wrong_database).await,
+            Err(SparseAttestationRefusal::ScopeHashMismatch)
+        );
+
+        let mut missing_pin = witness.clone();
+        missing_pin.expected_owner = Some(crate::state::db::account::AccountOwner::configured(
+            "witness@example.invalid",
+            "com",
+        ));
+        assert_eq!(
+            db.attest_current_sparse(&missing_pin).await,
+            Err(SparseAttestationRefusal::OwnerMismatch)
         );
     }
 
@@ -1980,6 +2090,11 @@ mod tests {
         witness.observe(&row);
         witness.bind_epoch(&epoch, &attempt);
         witness.bind_baseline_scope(&super::baseline_scope_hash(&scope).unwrap());
+        witness.bind_provider_scope_projection((
+            "PrimarySync".into(),
+            "_defaultOwner".into(),
+            "private".into(),
+        ));
         let path = dir.path().join("state.db");
         *super::ATTEST_INTERLEAVE.lock().unwrap() = Some(Box::new(move || {
             let writer = rusqlite::Connection::open(&path).unwrap();

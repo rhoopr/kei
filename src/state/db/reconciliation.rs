@@ -14,6 +14,12 @@ use crate::state::types::VersionSizeKey;
 
 #[async_trait]
 impl ReconciliationStateStore for SqliteStateDb {
+    async fn preservation_hold(
+        &self,
+        request: super::PreservationHoldRequest,
+    ) -> Result<super::PreservationHoldOutcome, StateError> {
+        self.preservation_hold(request).await
+    }
     #[cfg(test)]
     async fn primary_layout_binding(
         &self,

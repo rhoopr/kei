@@ -3417,6 +3417,9 @@ pub(crate) async fn run_cycle_with_witness(
                     let mut witness = sync_result.checkpoint.sparse_current.clone();
                     witness.bind_epoch(epoch, attempt);
                     witness.bind_baseline_scope(&lib_state.library.baseline_scope());
+                    if let Some(projection) = lib_state.library.owned_provider_scope_projection() {
+                        witness.bind_provider_scope_projection(projection);
+                    }
                     Some(SparseHeldWitness {
                         witness,
                         completed_delta_replay: sync_result.checkpoint.completed_delta_replay,
@@ -3816,18 +3819,23 @@ pub(crate) async fn run_cycle_with_witness(
                     safe = false;
                     break;
                 }
-                let source_holds: Vec<&LibraryHoldFact> = library_holds
+                let mut has_identity_hold = false;
+                let mut has_other_hold = false;
+                for hold in library_holds
                     .iter()
                     .filter(|hold| hold.source == source.zone_name)
-                    .collect();
-                if source_holds
-                    .iter()
-                    .any(|hold| hold.kind != LibraryHoldKind::IdentityUnresolved)
                 {
+                    if hold.kind == LibraryHoldKind::IdentityUnresolved {
+                        has_identity_hold = true;
+                    } else {
+                        has_other_hold = true;
+                    }
+                }
+                if has_other_hold {
                     safe = false;
                     break;
                 }
-                if source_holds.is_empty() {
+                if !has_identity_hold {
                     if !source.ordinary_committed {
                         safe = false;
                         break;
