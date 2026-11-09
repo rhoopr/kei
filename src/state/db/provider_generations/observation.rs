@@ -698,7 +698,7 @@ pub(in crate::state::db) fn prepare(
     Ok(Prepared(out))
 }
 pub(in crate::state::db) fn apply(conn: &Connection, prepared: Prepared) -> Result<(), StateError> {
-    for (key, value) in prepared.0 {
+    for (key, mut value) in prepared.0 {
         if value.policy != policy(conn)? && value.revalidation_round.is_some() {
             return Err(StateError::Invariant {
                 operation: "commit_checkpoint_transition",
@@ -709,12 +709,38 @@ pub(in crate::state::db) fn apply(conn: &Connection, prepared: Prepared) -> Resu
             if key.starts_with(ACTIVE)
                 && let Some(round) = &value.revalidation_round
             {
-                let activated = conn.execute("UPDATE source_revalidation_rounds SET phase='active' WHERE id=?1 AND library=?2 AND phase='observing'", params![round, value.library])?;
-                if activated != 1 {
-                    return Err(StateError::Invariant {
-                        operation: "commit_checkpoint_transition",
-                        detail: "baseline source revalidation round changed".into(),
-                    });
+                let catalog: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND scope LIKE 'catalog:v2:%')",
+                    params![round, value.library],
+                    |row| row.get(0),
+                )?;
+                if catalog {
+                    let phase: Option<String> = conn
+                        .query_row(
+                            "SELECT phase FROM source_revalidation_rounds WHERE id=?1 AND library=?2",
+                            params![round, value.library],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    match phase.as_deref() {
+                        Some("observing") => {
+                            conn.execute("UPDATE source_revalidation_rounds SET phase='active' WHERE id=?1 AND library=?2 AND phase='observing'", params![round, value.library])?;
+                        }
+                        Some("active") => {}
+                        Some(_) | None => {
+                            // A known stale or missing catalog link is an
+                            // optional consumer only. Do not veto the checkpoint.
+                            value.revalidation_round = None;
+                        }
+                    }
+                } else {
+                    let activated = conn.execute("UPDATE source_revalidation_rounds SET phase='active' WHERE id=?1 AND library=?2 AND phase='observing'", params![round, value.library])?;
+                    if activated != 1 {
+                        return Err(StateError::Invariant {
+                            operation: "commit_checkpoint_transition",
+                            detail: "baseline source revalidation round changed".into(),
+                        });
+                    }
                 }
             }
             store(conn, &key, value)?;
