@@ -20,6 +20,7 @@ pub(super) struct SparseRetryContext {
     rows: FxHashMap<SparseSourceId, SparseIdentity>,
     due: FxHashSet<SparseSourceId>,
     checkpoint: Option<SparseDeletionCheckpoint>,
+    witness: crate::state::db::SparseCurrentWitness,
 }
 
 fn state_failure(summary: &mut IncrementalDeltaSummary) {
@@ -45,10 +46,18 @@ impl SparseRetryContext {
         let Some(db) = &config.state_db else {
             return context;
         };
+        let current_scope = config
+            .selection_context
+            .as_ref()
+            .and_then(|c| c.current_sparse_scope());
+        let mut witness =
+            crate::state::db::SparseCurrentWitness::new(&config.library, current_scope);
         let rows = match db.sparse_identities(&config.library).await {
             Ok(rows) => rows,
             Err(_) => {
                 state_failure(summary);
+                witness.fail();
+                context.witness = witness;
                 return context;
             }
         };
@@ -58,13 +67,10 @@ impl SparseRetryContext {
             .iter()
             .map(|event| event.record_name.clone())
             .collect();
-        let current_scope = config
-            .selection_context
-            .as_ref()
-            .and_then(|c| c.current_sparse_scope());
         for mut row in rows {
             if current_scope.is_some_and(|scope| !row.matches_scope(scope)) {
                 state_failure(summary);
+                witness.fail();
                 continue;
             }
 
@@ -76,6 +82,7 @@ impl SparseRetryContext {
                     .is_some_and(|key| SparseShareEvidence::from_durable_key(key).is_none())
             {
                 state_failure(summary);
+                witness.fail();
                 continue;
             }
             // Actual observation binds unknown work to current scope.
@@ -94,10 +101,12 @@ impl SparseRetryContext {
                     Ok(current) => row = current,
                     Err(_) => {
                         state_failure(summary);
+                        witness.fail();
                         continue;
                     }
                 }
             }
+            witness.observe(&row);
             // Earlier provisional bridge proof covers only this exact generation.
             // A newly observed source still follows the normal admission path;
             // the final checkpoint transaction revalidates proof and target.
@@ -149,6 +158,7 @@ impl SparseRetryContext {
                     current_scope.and_then(|_| SparseShareEvidence::SourceOnly.durable_key())
                 })
             else {
+                witness.fail();
                 continue;
             };
             if current_scope.is_none()
@@ -169,11 +179,16 @@ impl SparseRetryContext {
                 };
             match observed {
                 Ok(row) => {
+                    witness.observe(&row);
                     context.rows.insert(source, row);
                 }
-                Err(_) => state_failure(summary),
+                Err(_) => {
+                    state_failure(summary);
+                    witness.fail();
+                }
             }
         }
+        context.witness = witness;
         context
     }
 
@@ -365,11 +380,19 @@ impl SparseRetryContext {
         if let Some(row) = self.rows.get(&source) {
             match db.record_sparse_attempt(row, outcome, now).await {
                 Ok(row) => {
+                    self.witness.observe(&row);
                     self.rows.insert(source, row);
                 }
-                Err(_) => state_failure(summary),
+                Err(_) => {
+                    state_failure(summary);
+                    self.witness.fail();
+                }
             }
         }
+    }
+
+    pub(super) fn witness(&self) -> &crate::state::db::SparseCurrentWitness {
+        &self.witness
     }
 
     pub(super) fn prove_target(

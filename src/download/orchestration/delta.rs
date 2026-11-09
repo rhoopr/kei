@@ -451,6 +451,7 @@ pub(super) struct IncrementalDeltaSummary {
     pub(super) inventory_rank_changed: bool,
     pub(super) sparse_target_stats: crate::download::SyncStats,
     pub(super) sparse_identity_proofs: Vec<SparseIdentityProof>,
+    pub(super) sparse_current: crate::state::db::SparseCurrentWitness,
     pub(super) identity_incomplete: bool,
     pub(super) sync_token: Option<String>,
     pub(super) missing_successor: bool,
@@ -884,11 +885,14 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
     shutdown_token: &CancellationToken,
 ) {
     let mut retry = SparseRetryContext::prepare(events, config, summary, run_mode).await;
+    summary.sparse_current.merge(retry.witness());
     retry
         .revalidate_deletions(pass, config, summary, shutdown_token)
         .await;
+    summary.sparse_current.merge(retry.witness());
     if shutdown_token.is_cancelled() {
         summary.block_identity();
+        summary.sparse_current.merge(retry.witness());
         return;
     }
     hydrate_unpaired_created_asset_deltas_inner(
@@ -901,6 +905,7 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
         shutdown_token,
     )
     .await;
+    summary.sparse_current.merge(retry.witness());
     for event in events.iter().filter(|event| {
         event.asset.is_some()
             || event.reason == ChangeReason::HardDeleted

@@ -258,6 +258,126 @@ pub(crate) enum SparseAttemptOutcome {
     SourceDeleted(SparseDeletionCheckpoint),
 }
 
+/// Producer-decoded retained current source set for one library execution.
+/// This is in-memory evidence only. It never serializes and never replaces the
+/// durable rows or the resolved `SparseIdentityProof`.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct SparseCurrentWitness {
+    library: String,
+    scope: Option<String>,
+    rows: rustc_hash::FxHashMap<SparseSourceId, SparseWitnessRow>,
+    failed: bool,
+    conflict: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SparseWitnessRow {
+    generation: SparseGeneration,
+    original: SparseEvidence,
+    observed: SparseEvidence,
+    lookup: Option<SparseEvidence>,
+    origin: Option<String>,
+}
+
+impl std::fmt::Debug for SparseWitnessRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SparseWitnessRow")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for SparseCurrentWitness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SparseCurrentWitness")
+            .field("rows", &self.rows.len())
+            .field("failed", &self.failed)
+            .field("conflict", &self.conflict)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SparseCurrentWitness {
+    pub(crate) fn new(library: &str, scope: Option<&str>) -> Self {
+        Self {
+            library: library.to_owned(),
+            scope: scope.map(str::to_owned),
+            ..Self::default()
+        }
+    }
+
+    /// Capture the producer's final row generation and decoded durable evidence.
+    pub(crate) fn observe(&mut self, row: &SparseIdentity) {
+        self.rows.insert(
+            row.source.clone(),
+            SparseWitnessRow {
+                generation: row.generation,
+                original: row.original.clone(),
+                observed: row.observed.clone(),
+                lookup: row.lookup.clone(),
+                origin: row.origin.clone(),
+            },
+        );
+    }
+
+    /// Any read, scope, evidence or write failure makes the witness unusable.
+    pub(crate) fn fail(&mut self) {
+        self.failed = true;
+    }
+
+    /// Merge another execution's witness. Only identical rows merge. Different
+    /// libraries, scopes, generations or evidence fail closed.
+    pub(crate) fn merge(&mut self, other: &Self) {
+        if other.library.is_empty() && other.rows.is_empty() && !other.failed && !other.conflict {
+            return;
+        }
+        if self.library.is_empty() && self.rows.is_empty() && !self.failed && !self.conflict {
+            *self = other.clone();
+            return;
+        }
+        if self.library != other.library || self.scope != other.scope {
+            self.conflict = true;
+            return;
+        }
+        self.failed |= other.failed;
+        self.conflict |= other.conflict;
+        for (source, row) in &other.rows {
+            match self.rows.get(source) {
+                None => {
+                    self.rows.insert(source.clone(), row.clone());
+                }
+                Some(existing) if existing == row => {}
+                Some(_) => self.conflict = true,
+            }
+        }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "owner read is consumed by the L1 cycle health seam patch"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SparseAttestationRefusal {
+    MissingWitness,
+    ProducerFailed,
+    WitnessConflict,
+    ScopeMissing,
+    ScopeUnauthenticated,
+    EpochUnavailable,
+    EpochNotComplete,
+    MarkerUnaccounted,
+    MarkerInvalid,
+    MarkerMissing,
+    MarkerWithoutRows,
+    RowNotWitnessed,
+    RowGenerationChanged,
+    RowEvidenceChanged,
+    RowOriginNotCurrentScope,
+    RowMissing,
+    ReadFailed,
+}
+
 #[async_trait]
 pub(crate) trait SparseIdentityStore: Send + Sync {
     async fn sparse_identities(&self, library: &str) -> Result<Vec<SparseIdentity>, StateError>;
@@ -297,6 +417,19 @@ pub(crate) trait SparseIdentityStore: Send + Sync {
         outcome: SparseAttemptOutcome,
         now: DateTime<Utc>,
     ) -> Result<SparseIdentity, StateError>;
+
+    /// Validate the producer's retained current witness against the durable
+    /// owner state in one read transaction. Default stores cannot attest.
+    #[allow(
+        dead_code,
+        reason = "owner read is consumed by the L1 cycle health seam patch"
+    )]
+    async fn attest_current_sparse(
+        &self,
+        _witness: &SparseCurrentWitness,
+    ) -> Result<(), SparseAttestationRefusal> {
+        Err(SparseAttestationRefusal::MissingWitness)
+    }
 }
 
 fn invariant(detail: &'static str) -> StateError {
@@ -457,6 +590,92 @@ fn validate_current_scope(conn: &Connection, library: &str, scope: &str) -> Resu
     super::provider_generations::guard_library_scope(conn, scope, library)
 }
 
+/// One read snapshot of the current auth-owned epoch, owned library scope,
+/// ledger, marker and exact epoch-1 row set. The producer witness contributes
+/// only decoded evidence and final generations; the owner compares bytes.
+#[allow(
+    dead_code,
+    reason = "owner read is consumed by the L1 cycle health seam patch"
+)]
+fn attest_current_sparse(
+    conn: &Connection,
+    witness: &SparseCurrentWitness,
+) -> Result<(), SparseAttestationRefusal> {
+    if witness.library.is_empty() {
+        return Err(SparseAttestationRefusal::MissingWitness);
+    }
+    if witness.failed {
+        return Err(SparseAttestationRefusal::ProducerFailed);
+    }
+    if witness.conflict {
+        return Err(SparseAttestationRefusal::WitnessConflict);
+    }
+    let scope = witness
+        .scope
+        .as_deref()
+        .ok_or(SparseAttestationRefusal::ScopeMissing)?;
+    let epoch = super::sync_epoch::validate_if_present(conn)
+        .map_err(|_error| SparseAttestationRefusal::EpochUnavailable)?
+        .ok_or(SparseAttestationRefusal::EpochUnavailable)?;
+    let record = super::sync_epoch::read_library(conn, &witness.library)
+        .map_err(|_error| SparseAttestationRefusal::EpochUnavailable)?
+        .ok_or(SparseAttestationRefusal::EpochUnavailable)?;
+    if record.epoch != epoch.epoch || record.state != "complete" {
+        return Err(SparseAttestationRefusal::EpochNotComplete);
+    }
+    validate_current_scope(conn, &witness.library, scope)
+        .map_err(|_error| SparseAttestationRefusal::ScopeUnauthenticated)?;
+
+    let marker: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [crate::state::unresolved_identity_key(&witness.library)],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_error| SparseAttestationRefusal::ReadFailed)?;
+    if marker.as_deref() == Some(crate::state::UNACCOUNTED_CURRENT_IDENTITY) {
+        return Err(SparseAttestationRefusal::MarkerUnaccounted);
+    }
+    if let Some(value) = marker.as_deref()
+        && value != "1"
+    {
+        return Err(SparseAttestationRefusal::MarkerInvalid);
+    }
+
+    let rows = read_rows(conn, &witness.library, None)
+        .map_err(|_error| SparseAttestationRefusal::ReadFailed)?;
+    if rows.is_empty() && marker.is_some() {
+        return Err(SparseAttestationRefusal::MarkerWithoutRows);
+    }
+    if !rows.is_empty() && marker.is_none() {
+        return Err(SparseAttestationRefusal::MarkerMissing);
+    }
+    let expected_origin = serde_json::json!(["current-v1", scope]).to_string();
+    for row in &rows {
+        let witnessed = witness
+            .rows
+            .get(&row.source)
+            .ok_or(SparseAttestationRefusal::RowNotWitnessed)?;
+        if row.generation != witnessed.generation {
+            return Err(SparseAttestationRefusal::RowGenerationChanged);
+        }
+        if row.original != witnessed.original
+            || row.observed != witnessed.observed
+            || row.lookup != witnessed.lookup
+        {
+            return Err(SparseAttestationRefusal::RowEvidenceChanged);
+        }
+        if row.origin.as_deref() != Some(expected_origin.as_str()) {
+            return Err(SparseAttestationRefusal::RowOriginNotCurrentScope);
+        }
+    }
+    if rows.len() != witness.rows.len() {
+        return Err(SparseAttestationRefusal::RowMissing);
+    }
+    Ok(())
+}
+
 impl SqliteStateDb {
     async fn observe_sparse_with_origin(
         &self,
@@ -593,6 +812,23 @@ impl SparseIdentityStore for SqliteStateDb {
             Ok(row)
         })
         .await
+    }
+
+    async fn attest_current_sparse(
+        &self,
+        witness: &SparseCurrentWitness,
+    ) -> Result<(), SparseAttestationRefusal> {
+        let witness = witness.clone();
+        let result = self
+            .with_conn("attest_current_sparse", move |conn| {
+                Ok::<_, StateError>(attest_current_sparse(conn, &witness))
+            })
+            .await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(refusal)) => Err(refusal),
+            Err(_) => Err(SparseAttestationRefusal::ReadFailed),
+        }
     }
 }
 
@@ -773,8 +1009,13 @@ fn clear_selected(
 
 #[cfg(test)]
 mod tests {
-    use super::{SparseAttemptOutcome, SparseEvidence, SparseIdentityStore, SparseSourceId};
-    use crate::state::{CheckpointTransition, SqliteStateDb, unresolved_identity_key};
+    use super::{
+        SparseAttemptOutcome, SparseAttestationRefusal, SparseCurrentWitness, SparseEvidence,
+        SparseIdentityStore, SparseSourceId,
+    };
+    use crate::state::{
+        CheckpointTransition, SqliteStateDb, SyncTokenStore, unresolved_identity_key,
+    };
     use chrono::{TimeDelta, Utc};
 
     #[tokio::test]
@@ -1298,6 +1539,167 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("after")
+        );
+    }
+
+    async fn owned_sparse_db() -> (tempfile::TempDir, SqliteStateDb, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let login =
+            serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"witness-test"}})).unwrap();
+        let owner = crate::state::db::account::AccountOwner::authenticated(
+            "witness@example.invalid",
+            "com",
+            &login,
+        )
+        .unwrap();
+        let db = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner)
+            .await
+            .unwrap();
+        db.sync_epoch_enroll(vec![("PrimarySync".to_owned(), "scope".to_owned())])
+            .await
+            .unwrap();
+        let scope = serde_json::json!({
+            "format": 1,
+            "realm": "com",
+            "container": "com.apple.photos.cloud",
+            "environment": "production",
+            "database": "private",
+            "zone": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"}
+        })
+        .to_string();
+        (dir, db, scope)
+    }
+
+    #[tokio::test]
+    async fn sparse_current_witness_attests_exact_current_retained_set() {
+        let (_dir, db, scope) = owned_sparse_db().await;
+        let evidence = SparseEvidence::new(r#"[2,"source_only"]"#.into());
+        let source = SparseSourceId::new("source");
+        let row = db
+            .observe_current_sparse_identity("PrimarySync", &source, &evidence, &scope, Utc::now())
+            .await
+            .unwrap();
+        let mut witness = SparseCurrentWitness::new("PrimarySync", Some(&scope));
+        witness.observe(&row);
+        db.attest_current_sparse(&witness).await.unwrap();
+
+        let second = db
+            .observe_current_sparse_identity(
+                "PrimarySync",
+                &SparseSourceId::new("second"),
+                &evidence,
+                &scope,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        witness.observe(&second);
+        db.attest_current_sparse(&witness).await.unwrap();
+
+        let newer = db
+            .record_sparse_attempt(&row, SparseAttemptOutcome::Inconclusive, Utc::now())
+            .await
+            .unwrap();
+        assert_ne!(newer.generation, row.generation);
+        assert_eq!(
+            db.attest_current_sparse(&witness).await,
+            Err(SparseAttestationRefusal::RowGenerationChanged)
+        );
+        witness.observe(&newer);
+        db.attest_current_sparse(&witness).await.unwrap();
+
+        let third = db
+            .observe_current_sparse_identity(
+                "PrimarySync",
+                &SparseSourceId::new("third"),
+                &evidence,
+                &scope,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.attest_current_sparse(&witness).await,
+            Err(SparseAttestationRefusal::RowNotWitnessed)
+        );
+        witness.observe(&third);
+        db.attest_current_sparse(&witness).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sparse_current_witness_refuses_unaccounted_origin_and_failure() {
+        let (_dir, db, scope) = owned_sparse_db().await;
+        let evidence = SparseEvidence::new(r#"[2,"source_only"]"#.into());
+        let source = SparseSourceId::new("source");
+        let row = db
+            .observe_current_sparse_identity("PrimarySync", &source, &evidence, &scope, Utc::now())
+            .await
+            .unwrap();
+        let mut witness = SparseCurrentWitness::new("PrimarySync", Some(&scope));
+        witness.observe(&row);
+
+        db.with_conn_mut("historical origin", |conn| {
+            conn.execute(
+                "UPDATE unresolved_sparse_identities SET observation_origin='historical-v1' \
+                 WHERE library='PrimarySync' AND source_record_name='source'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.attest_current_sparse(&witness).await,
+            Err(SparseAttestationRefusal::RowOriginNotCurrentScope)
+        );
+        let origin = serde_json::json!(["current-v1", scope]).to_string();
+        db.with_conn_mut("restore origin", move |conn| {
+            conn.execute(
+                "UPDATE unresolved_sparse_identities SET observation_origin=?1 \
+                 WHERE library='PrimarySync' AND source_record_name='source'",
+                [origin],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        db.attest_current_sparse(&witness).await.unwrap();
+
+        db.set_metadata(
+            &unresolved_identity_key("PrimarySync"),
+            crate::state::UNACCOUNTED_CURRENT_IDENTITY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.attest_current_sparse(&witness).await,
+            Err(SparseAttestationRefusal::MarkerUnaccounted)
+        );
+        db.with_conn_mut("clear marker", |conn| {
+            conn.execute(
+                "DELETE FROM metadata WHERE key=?1",
+                [unresolved_identity_key("PrimarySync")],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        db.set_metadata(&unresolved_identity_key("PrimarySync"), "1")
+            .await
+            .unwrap();
+        db.attest_current_sparse(&witness).await.unwrap();
+
+        witness.fail();
+        assert_eq!(
+            db.attest_current_sparse(&witness).await,
+            Err(SparseAttestationRefusal::ProducerFailed)
+        );
+
+        let mut missing_scope = SparseCurrentWitness::new("PrimarySync", None);
+        missing_scope.observe(&row);
+        assert_eq!(
+            db.attest_current_sparse(&missing_scope).await,
+            Err(SparseAttestationRefusal::ScopeMissing)
         );
     }
 }
