@@ -144,6 +144,31 @@ pub(crate) struct CatalogSourceOutcome {
     pub(crate) next_due_at: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogPairEvidence {
+    pub(crate) database: String,
+    pub(crate) zone: serde_json::Value,
+    pub(crate) master: String,
+    pub(crate) child: String,
+    pub(crate) master_type: String,
+    pub(crate) child_type: String,
+    pub(crate) reference_exact: bool,
+    pub(crate) explicit_deleted: bool,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // L1 catalog drain integration is pending; focused owner tests exercise this.
+pub(crate) enum CatalogSettlementAuthority {
+    Deleted {
+        deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+        evidence: CatalogPairEvidence,
+    },
+    Live {
+        evidence: CatalogPairEvidence,
+    },
+    Refused,
+}
+
 #[derive(Clone)]
 #[allow(dead_code)] // L1 catalog cycle integration is pending; focused owner tests exercise this API.
 struct ExistingCatalogRound {
@@ -239,6 +264,34 @@ fn snapshot(
          ) FROM source_revalidation_rounds r WHERE r.id=?1",
         params![round,id,master], |row| row.get(0),
     )?)
+}
+
+fn catalog_owner_protected(
+    conn: &Connection,
+    library: &str,
+    ids_json: &str,
+) -> Result<bool, StateError> {
+    let queries = [
+        "SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id IN (SELECT value FROM json_each(?2)) AND status<>'downloaded')",
+        "SELECT EXISTS(SELECT 1 FROM unattributed_legacy WHERE library=?1 AND asset_id IN (SELECT value FROM json_each(?2)))",
+        "SELECT EXISTS(SELECT 1 FROM asset_verifications WHERE library=?1 AND id IN (SELECT value FROM json_each(?2)))",
+        "SELECT EXISTS(SELECT 1 FROM metadata_capture_retries WHERE library=?1 AND asset_id IN (SELECT value FROM json_each(?2)))",
+        "SELECT EXISTS(SELECT 1 FROM asset_metadata_capture_revisions WHERE library=?1 AND asset_id IN (SELECT value FROM json_each(?2)))",
+        "SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE library=?1 AND (asset_id IN (SELECT value FROM json_each(?2)) OR master IN (SELECT value FROM json_each(?2))) AND ((admitted=1 AND (verified_media=0 OR verified_metadata=0)) OR prepared_hash IS NOT NULL OR prepared_checksum IS NOT NULL OR prepared_size IS NOT NULL))",
+        "SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE child IN (SELECT value FROM json_each(?2)) AND (outcome='deferred' OR admission='deferred'))",
+        "SELECT EXISTS(SELECT 1 FROM provider_work_obligations WHERE library=?1 AND asset_id IN (SELECT value FROM json_each(?2)))",
+        "SELECT EXISTS(SELECT 1 FROM primary_layout_bindings WHERE library=?1 AND (family IN (SELECT value FROM json_each(?2)) OR child IN (SELECT value FROM json_each(?2))))",
+        "SELECT EXISTS(SELECT 1 FROM primary_layout_operations WHERE (library=?1 OR source_library=?1) AND family IN (SELECT value FROM json_each(?2)) AND phase NOT IN ('committed','cancelled'))",
+        "SELECT EXISTS(SELECT 1 FROM primary_layout_claims WHERE library=?1 AND (family IN (SELECT value FROM json_each(?2)) OR child IN (SELECT value FROM json_each(?2))))",
+    ];
+    for query in queries {
+        let protected: bool =
+            conn.query_row(query, params![library, ids_json], |row| row.get(0))?;
+        if protected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn catalog_signals(
@@ -659,6 +712,85 @@ impl SqliteStateDb {
         .await
     }
 
+    #[allow(dead_code)] // L1 catalog drain integration is pending; focused owner tests exercise this.
+    pub(crate) async fn due_catalog_candidates(
+        &self,
+        owner: account::AccountOwner,
+        library: String,
+        origin: CatalogOrigin,
+        enum_hash: String,
+    ) -> Result<Vec<SourceCandidate>, StateError> {
+        self.with_conn("reading due catalog candidates", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            if !super::provider_generations::observation::catalog_origin_current(
+                conn,
+                &library,
+                &origin,
+                &enum_hash,
+            )? {
+                return Ok(Vec::new());
+            }
+            let pairs: Vec<String> = conn
+                .prepare(
+                    "SELECT d.id FROM source_revalidation_debt d
+                     JOIN source_revalidation_rounds r ON r.id=d.round
+                     WHERE r.id=?1 AND r.library=?2 AND r.scope=?3
+                       AND r.phase='active' AND r.mode=?4 AND d.next_retry_at<=?5
+                     ORDER BY d.next_retry_at,d.id LIMIT 64",
+                )?
+                .query_map(
+                    params![
+                        origin.nonce,
+                        library,
+                        origin.scope(),
+                        CATALOG_MODE,
+                        chrono::Utc::now().timestamp()
+                    ],
+                    |row| row.get(0),
+                )?
+                .collect::<Result<_, _>>()?;
+            let mut output = Vec::new();
+            for id in pairs {
+                let mapped: Option<String> = conn
+                    .query_row(
+                        "SELECT master_record_name FROM asset_master_mappings WHERE library=?1 AND asset_record_name=?2",
+                        params![library, id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let master = mapped.clone().unwrap_or_else(|| id.clone());
+                let (child, owned_child) = if mapped.is_some() {
+                    (Some(id.clone()), false)
+                } else {
+                    let known: Option<(String, Option<String>)> = conn
+                        .query_row(
+                            "SELECT o.asset_record_name,m.master_record_name FROM legacy_master_state_owners o LEFT JOIN asset_master_mappings m ON m.library=o.library AND m.asset_record_name=o.asset_record_name WHERE o.library=?1 AND o.master_record_name=?2",
+                            params![library, master],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?;
+                    match known {
+                        Some((child, Some(mapped_master))) if mapped_master == master => {
+                            (Some(child), true)
+                        }
+                        _ => (None, false),
+                    }
+                };
+                output.push(SourceCandidate {
+                    snapshot: snapshot(conn, &origin.nonce, &id, &master)?,
+                    round: origin.nonce.clone(),
+                    library: library.clone(),
+                    id,
+                    master,
+                    child,
+                    owned_child,
+                });
+            }
+            Ok(output)
+        })
+        .await
+    }
+
     pub(crate) async fn due_source_revalidation(
         &self,
         owner: account::AccountOwner,
@@ -743,6 +875,162 @@ impl SqliteStateDb {
             }
             tx.commit()?;Ok(true)
         }).await
+    }
+
+    #[allow(dead_code)] // L1 catalog drain integration is pending; focused owner tests exercise this.
+    pub(crate) async fn settle_catalog_candidate(
+        &self,
+        owner: account::AccountOwner,
+        library: String,
+        origin: CatalogOrigin,
+        enum_hash: String,
+        candidate: SourceCandidate,
+        authority: CatalogSettlementAuthority,
+    ) -> Result<bool, StateError> {
+        self.with_conn_mut("settling catalog candidate", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            account::validate_authenticated(&tx, &owner)?;
+            if candidate.library != library {
+                return Err(StateError::Invariant {
+                    operation: "settle_catalog_candidate",
+                    detail: "catalog candidate source changed".into(),
+                });
+            }
+            if !super::provider_generations::observation::catalog_origin_current(
+                &tx,
+                &library,
+                &origin,
+                &enum_hash,
+            )? {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let round_matches: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND scope=?3 AND phase='active' AND mode=?4)",
+                params![origin.nonce, library, origin.scope(), CATALOG_MODE],
+                |row| row.get(0),
+            )?;
+            if !round_matches
+                || snapshot(&tx, &candidate.round, &candidate.id, &candidate.master)?
+                    != candidate.snapshot
+            {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let evidence = match &authority {
+                CatalogSettlementAuthority::Deleted { evidence, .. }
+                | CatalogSettlementAuthority::Live { evidence } => evidence.clone(),
+                CatalogSettlementAuthority::Refused => {
+                    tx.execute(
+                        "UPDATE source_revalidation_debt SET next_retry_at=?3 WHERE round=?1 AND id=?2",
+                        params![
+                            candidate.round,
+                            candidate.id,
+                            chrono::Utc::now().timestamp() + 3600
+                        ],
+                    )?;
+                    tx.commit()?;
+                    return Ok(false);
+                }
+            };
+            if evidence.master != candidate.master
+                || evidence.zone.get("zoneName").and_then(serde_json::Value::as_str)
+                    != Some(library.as_str())
+                || !matches!(evidence.database.as_str(), "private" | "shared")
+                || evidence.master_type != "CPLMaster"
+                || evidence.child_type != "CPLAsset"
+                || !evidence.reference_exact
+            {
+                tx.execute(
+                    "UPDATE source_revalidation_debt SET next_retry_at=?3 WHERE round=?1 AND id=?2",
+                    params![
+                        candidate.round,
+                        candidate.id,
+                        chrono::Utc::now().timestamp() + 3600
+                    ],
+                )?;
+                tx.commit()?;
+                return Ok(false);
+            }
+            let expected_child = candidate
+                .child
+                .clone()
+                .unwrap_or_else(|| candidate.id.clone());
+            if evidence.child != expected_child {
+                tx.execute(
+                    "UPDATE source_revalidation_debt SET next_retry_at=?3 WHERE round=?1 AND id=?2",
+                    params![
+                        candidate.round,
+                        candidate.id,
+                        chrono::Utc::now().timestamp() + 3600
+                    ],
+                )?;
+                tx.commit()?;
+                return Ok(false);
+            }
+            match authority {
+                CatalogSettlementAuthority::Deleted { deleted_at, .. }
+                    if evidence.explicit_deleted =>
+                {
+                    let mut ids = std::collections::BTreeSet::new();
+                    ids.insert(candidate.master.clone());
+                    ids.insert(candidate.id.clone());
+                    ids.insert(evidence.child.clone());
+                    let mapped: Vec<String> = tx
+                        .prepare(
+                            "SELECT asset_record_name FROM asset_master_mappings WHERE library=?1 AND master_record_name=?2",
+                        )?
+                        .query_map(params![library, candidate.master], |row| row.get(0))?
+                        .collect::<Result<_, _>>()?;
+                    ids.extend(mapped);
+                    let ids_json = serde_json::to_string(&ids)
+                        .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+                    if catalog_owner_protected(&tx, &library, &ids_json)? {
+                        tx.execute(
+                            "UPDATE source_revalidation_debt SET next_retry_at=?3 WHERE round=?1 AND id=?2",
+                            params![
+                                candidate.round,
+                                candidate.id,
+                                chrono::Utc::now().timestamp() + 3600
+                            ],
+                        )?;
+                        tx.commit()?;
+                        return Ok(false);
+                    }
+                    tx.execute(
+                        "UPDATE assets SET is_deleted=1,deleted_at=COALESCE(?3,deleted_at) WHERE library=?1 AND id IN (SELECT value FROM json_each(?2))",
+                        params![library, ids_json, deleted_at.map(|value| value.timestamp())],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM source_revalidation_debt WHERE round=?1 AND id=?2",
+                        params![candidate.round, candidate.id],
+                    )?;
+                    tx.commit()?;
+                    Ok(true)
+                }
+                CatalogSettlementAuthority::Live { .. } if !evidence.explicit_deleted => {
+                    tx.execute(
+                        "DELETE FROM source_revalidation_debt WHERE round=?1 AND id=?2",
+                        params![candidate.round, candidate.id],
+                    )?;
+                    tx.commit()?;
+                    Ok(true)
+                }
+                _ => {
+                    tx.execute(
+                        "UPDATE source_revalidation_debt SET next_retry_at=?3 WHERE round=?1 AND id=?2",
+                        params![
+                            candidate.round,
+                            candidate.id,
+                            chrono::Utc::now().timestamp() + 3600
+                        ],
+                    )?;
+                    tx.commit()?;
+                    Ok(false)
+                }
+            }
+        })
+        .await
     }
 }
 

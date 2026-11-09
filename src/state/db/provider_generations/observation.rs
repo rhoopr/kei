@@ -7,7 +7,7 @@ use crate::state::db::sync_epoch;
 use crate::state::error::StateError;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 const ACTIVE: &str = "observed_selection:v27:";
 const STAGED: &str = "observed_selection_staged:v27:";
@@ -441,6 +441,84 @@ fn valid(conn: &Connection, key: &str, token: &str) -> Result<Option<Descriptor>
     value.proof_hash = saved;
     Ok(Some(value))
 }
+pub(crate) fn catalog_plan_digest_from_observation(raw: &str, library: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(raw).ok()?;
+    let account = value.get("account")?.as_str()?;
+    let provider = value.get("provider")?.as_str()?;
+    let version = value.get("version")?.as_u64()?;
+    let plans = value.get("plans")?.as_array()?;
+    let mut relevant: Vec<Value> = plans
+        .iter()
+        .filter(|plan| {
+            plan.get("scope")
+                .and_then(Value::as_str)
+                .and_then(|scope| serde_json::from_str::<Value>(scope).ok())
+                .and_then(|scope| {
+                    scope
+                        .pointer("/zone/zoneName")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .is_some_and(|zone| zone == library)
+                || plan
+                    .pointer("/profile/passes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|passes| {
+                        passes.iter().any(|pass| {
+                            pass.pointer("/scope/zone/zoneName").and_then(Value::as_str)
+                                == Some(library)
+                        })
+                    })
+        })
+        .cloned()
+        .collect();
+    if relevant.is_empty() {
+        return None;
+    }
+    relevant.sort_by_key(|plan| serde_json::to_string(plan).unwrap_or_default());
+    let canonical = json!({
+        "version": version,
+        "account": account,
+        "provider": provider,
+        "library": library,
+        "plans": relevant,
+    });
+    Some(digest(canonical.to_string().as_bytes()))
+}
+
+pub(in crate::state::db) fn catalog_origin_current(
+    conn: &Connection,
+    library: &str,
+    origin: &crate::state::db::source_revalidation::CatalogOrigin,
+    enum_hash: &str,
+) -> Result<bool, StateError> {
+    let Some(token) = metadata(conn, &format!("sync_token:v27:{library}"))? else {
+        return Ok(false);
+    };
+    let active_key = format!("{ACTIVE}{library}");
+    let Some(saved) = valid(conn, &active_key, &token)? else {
+        return Ok(false);
+    };
+    if saved.policy[0].as_deref() != Some(enum_hash) {
+        return Ok(false);
+    }
+    let Some(raw) = metadata(conn, &active_key)? else {
+        return Ok(false);
+    };
+    let Some(digest) = catalog_plan_digest_from_observation(&raw, library) else {
+        return Ok(false);
+    };
+    if digest != origin.plan_digest {
+        return Ok(false);
+    }
+    let Some(record) = sync_epoch::read_library(conn, library)? else {
+        return Ok(false);
+    };
+    Ok(record.state == "complete"
+        && record.epoch == origin.epoch
+        && record.attempt == origin.attempt)
+}
+
 pub(in crate::state::db) fn revalidation_scope_current(
     conn: &Connection,
     library: &str,
@@ -469,6 +547,20 @@ pub(crate) fn attach_revalidation_round_for_test(
     value.revalidation_round = Some(round.to_owned());
     store(conn, key, value)?;
     Ok(true)
+}
+
+fn catalog_round_known(conn: &Connection, round: &str, library: &str) -> Result<bool, StateError> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT mode,scope FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND phase!='abandoned'",
+            params![round, library],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.is_some_and(|(mode, scope)| {
+        mode == super::super::source_revalidation::CATALOG_MODE
+            && super::super::source_revalidation::CatalogOrigin::parse(&scope).is_ok()
+    }))
 }
 
 fn store(conn: &Connection, key: &str, mut value: Descriptor) -> Result<(), StateError> {
@@ -519,8 +611,21 @@ impl Prepared {
                     continue;
                 };
                 let hash = digest(boundary.as_bytes());
-                let candidates: Vec<String> = conn.prepare("SELECT r.id FROM source_revalidation_rounds r WHERE r.library=?1 AND r.boundary=?2 AND r.enum_hash=COALESCE((SELECT value FROM metadata WHERE key='pending_enum_config_hash'),(SELECT value FROM metadata WHERE key='enum_config_hash')) AND r.scope NOT LIKE 'catalog:v2:%' AND (r.phase='marking' OR (r.phase='observing' AND EXISTS(SELECT 1 FROM source_revalidation_debt d WHERE d.round=r.id)))")?
-                    .query_map(params![zone,hash], |r| r.get(0))?.collect::<Result<_,_>>()?;
+                let rows: Vec<(String,String,String)> = conn.prepare("SELECT r.id,r.mode,r.scope FROM source_revalidation_rounds r WHERE r.library=?1 AND r.boundary=?2 AND r.enum_hash=COALESCE((SELECT value FROM metadata WHERE key='pending_enum_config_hash'),(SELECT value FROM metadata WHERE key='enum_config_hash')) AND (r.phase='marking' OR (r.phase='observing' AND EXISTS(SELECT 1 FROM source_revalidation_debt d WHERE d.round=r.id)))")?
+                    .query_map(params![zone,hash], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
+                let mut candidates = Vec::new();
+                for (id, mode, scope) in rows {
+                    // Only explicit catalog_v2 with a strictly parseable
+                    // six-component origin may use the optional-link no-veto
+                    // path. Legacy, unknown, or malformed catalog-tagged rows
+                    // keep the conservative baseline guard.
+                    if mode == super::super::source_revalidation::CATALOG_MODE
+                        && super::super::source_revalidation::CatalogOrigin::parse(&scope).is_ok()
+                    {
+                        continue;
+                    }
+                    candidates.push(id);
+                }
                 if !candidates.is_empty()
                     && !self.0.iter().any(|(_, d)| {
                         d.revalidation_round
@@ -636,11 +741,7 @@ pub(in crate::state::db) fn prepare(
                         && target.starts_with(STAGED)
                         && let Some(saved_round) = saved_round.clone()
                     {
-                        let catalog: bool = conn.query_row(
-                            "SELECT EXISTS(SELECT 1 FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND scope LIKE 'catalog:v2:%')",
-                            params![saved_round, zone],
-                            |r| r.get(0),
-                        )?;
+                        let catalog = catalog_round_known(conn, &saved_round, zone)?;
                         if catalog {
                             if round.is_none() {
                                 round = Some(saved_round);
@@ -660,11 +761,7 @@ pub(in crate::state::db) fn prepare(
                     if round.is_none()
                         && let Some(saved_round) = saved_round
                     {
-                        let current: bool = conn.query_row(
-                            "SELECT EXISTS(SELECT 1 FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND phase!='abandoned' AND scope LIKE 'catalog:v2:%')",
-                            params![saved_round, zone],
-                            |r| r.get(0),
-                        )?;
+                        let current = catalog_round_known(conn, &saved_round, zone)?;
                         if current {
                             round = Some(saved_round);
                         }
@@ -706,29 +803,45 @@ pub(in crate::state::db) fn apply(conn: &Connection, prepared: Prepared) -> Resu
             if key.starts_with(ACTIVE)
                 && let Some(round) = &value.revalidation_round
             {
-                let catalog: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND scope LIKE 'catalog:v2:%')",
-                    params![round, value.library],
-                    |row| row.get(0),
-                )?;
-                if catalog {
-                    let phase: Option<String> = conn
-                        .query_row(
-                            "SELECT phase FROM source_revalidation_rounds WHERE id=?1 AND library=?2",
-                            params![round, value.library],
-                            |row| row.get(0),
-                        )
-                        .optional()?;
-                    match phase.as_deref() {
-                        Some("observing") => {
-                            conn.execute("UPDATE source_revalidation_rounds SET phase='active' WHERE id=?1 AND library=?2 AND phase='observing'", params![round, value.library])?;
+                let catalog_round: Option<(String, String, String)> = conn
+                    .query_row(
+                        "SELECT mode,scope,phase FROM source_revalidation_rounds WHERE id=?1 AND library=?2",
+                        params![round, value.library],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                if let Some((mode, scope, phase)) = catalog_round
+                    && mode == super::super::source_revalidation::CATALOG_MODE
+                {
+                    let origin = super::super::source_revalidation::CatalogOrigin::parse(&scope)?;
+                    let raw = serde_json::to_string(&value)
+                        .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+                    let plan_matches = catalog_plan_digest_from_observation(&raw, &value.library)
+                        .is_some_and(|digest| digest == origin.plan_digest);
+                    let epoch_matches = sync_epoch::read_library(conn, &value.library)?
+                        .is_some_and(|record| {
+                            matches!(record.state.as_str(), "pending" | "complete")
+                                && record.epoch == origin.epoch
+                                && record.attempt == origin.attempt
+                        });
+                    let owner_matches =
+                        owner_keys(conn)? == (value.account.clone(), value.provider.clone());
+                    let valid = plan_matches && epoch_matches && owner_matches;
+                    if phase == "observing" {
+                        if !valid {
+                            return Err(StateError::Invariant {
+                                operation: "commit_checkpoint_transition",
+                                detail: "catalog origin activation binding changed".into(),
+                            });
                         }
-                        Some("active") => {}
-                        Some(_) | None => {
-                            // A known stale or missing catalog link is an
-                            // optional consumer only. Do not veto the checkpoint.
+                        conn.execute("UPDATE source_revalidation_rounds SET phase='active' WHERE id=?1 AND library=?2 AND phase='observing'", params![round, value.library])?;
+                    } else if phase == "active" {
+                        if !valid {
+                            // Optional stale active link: omit, do not veto.
                             value.revalidation_round = None;
                         }
+                    } else {
+                        value.revalidation_round = None;
                     }
                 } else {
                     let activated = conn.execute("UPDATE source_revalidation_rounds SET phase='active' WHERE id=?1 AND library=?2 AND phase='observing'", params![round, value.library])?;
