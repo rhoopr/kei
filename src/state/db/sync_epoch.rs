@@ -406,7 +406,10 @@ fn validate_library_record(record: &SyncEpochLibrary, library: &str) -> Result<(
     {
         return Err(StateError::SyncEpochMismatch);
     }
-    parse_qualification_outcome(record.last_outcome.as_deref())?;
+    let qualification = parse_qualification_outcome(record.last_outcome.as_deref())?;
+    if qualification.is_some() && record.state != "pending" {
+        return Err(StateError::SyncEpochMismatch);
+    }
     Ok(())
 }
 
@@ -1043,6 +1046,9 @@ pub(crate) fn record_ready(
     {
         return Err(StateError::SyncEpochMismatch);
     }
+    if parse_qualification_outcome(record.last_outcome.as_deref())?.is_some() {
+        return Err(StateError::SyncEpochMismatch);
+    }
     if record.state == "ready" {
         return if record.binding.as_ref() == Some(&binding) {
             Ok(())
@@ -1187,6 +1193,9 @@ pub(crate) fn reset_libraries_for_token_reset(
 pub(crate) fn complete(conn: &Connection, library: &str, attempt: &str) -> Result<(), StateError> {
     let mut record = read_library(conn, library)?.ok_or(StateError::SyncEpochMismatch)?;
     if record.attempt != attempt {
+        return Err(StateError::SyncEpochMismatch);
+    }
+    if parse_qualification_outcome(record.last_outcome.as_deref())?.is_some() {
         return Err(StateError::SyncEpochMismatch);
     }
     let now = chrono::Utc::now().timestamp();
@@ -2624,6 +2633,36 @@ mod tests {
         assert_eq!(
             reserve_qualification(&conn, &fence, 9_999_999),
             QualificationReserve::StaleFence
+        );
+    }
+
+    #[test]
+    fn qualification_in_progress_blocks_token_stage_complete_and_recovery() {
+        let conn = qualification_db();
+        let fence = qualification_fence(&conn);
+        let reservation = reserved_or_panic(reserve_qualification(&conn, &fence, 10_000));
+        let epoch = validate(&conn).unwrap();
+        let binding = BaselineBinding {
+            token_key: "pending_sync_token:v27:enum:PrimarySync".to_owned(),
+            token_sha256: "token-sha".to_owned(),
+            descriptor_key: "observed_selection_staged:v27:enum:PrimarySync".to_owned(),
+            descriptor_proof_hash: "descriptor-sha".to_owned(),
+            baseline_key: format!("baseline_cursor:v27:{}:scope:enum:", epoch.epoch),
+            baseline_sha256: "baseline-sha".to_owned(),
+        };
+        assert!(record_ready(&conn, &epoch, TEST_LIBRARY, &reservation.attempt, binding).is_err());
+        assert!(complete(&conn, TEST_LIBRARY, &reservation.attempt).is_err());
+        assert_eq!(
+            stored_record(&conn),
+            Some(reservation.reserved_record.clone())
+        );
+
+        recover_attempt(&conn, TEST_LIBRARY, true, None).unwrap();
+        defer_without_attempt(&conn, TEST_LIBRARY, 9_999_999, None, "deferred").unwrap();
+        assert_eq!(
+            stored_record(&conn),
+            Some(reservation.reserved_record),
+            "ordinary recovery must not overwrite the qualification guard"
         );
     }
 
