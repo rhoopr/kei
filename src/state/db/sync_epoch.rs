@@ -1369,7 +1369,15 @@ impl SqliteStateDb {
                 chrono::Utc::now().timestamp(),
                 watch_interval,
             )?;
+            #[cfg(all(test, target_os = "linux"))]
+            let committed_reservation = matches!(&outcome, QualificationReserve::Reserved(_));
             tx.commit()?;
+            #[cfg(all(test, target_os = "linux"))]
+            if committed_reservation {
+                crate::test_helpers::process_death_point(
+                    "indexing-qualification-after-reserve-commit",
+                );
+            }
             Ok(outcome)
         })
         .await

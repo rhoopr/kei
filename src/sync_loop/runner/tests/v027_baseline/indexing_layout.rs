@@ -412,6 +412,224 @@ fn assert_released_catalog_preserved(
 /// indexing hold, the reopened second wake observes FINISHED. Current
 /// production defers before a full inventory and leaves the hold in place, so
 /// the library can never reach its ordinary epoch baseline.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires L1 D cycle seam integration"]
+async fn pending_upgrade_qualification_process_death_worker() {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("KEI_TEST_PROCESS_DEATH_ROOT").expect("process death root"),
+    );
+    let db_path = seed_process_death_fixture(&root);
+    let photos = root.join("child/photos");
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/current"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .mount(&server)
+        .await;
+    let inventory = Arc::new(pair(
+        "current",
+        "current.JPG",
+        &format!("{}/current", server.uri()),
+        22,
+    ));
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let session = pending_upgrade_session(0, Arc::clone(&inventory));
+    let _ = run_pending_upgrade_indexing_cycle(db, session, true, &photos, &shared).await;
+
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let session = pending_upgrade_session(1, Arc::clone(&inventory));
+    let _ = run_pending_upgrade_indexing_cycle(db, session, false, &photos, &shared).await;
+}
+
+fn seed_process_death_fixture(root: &std::path::Path) -> std::path::PathBuf {
+    let dir = root.join("child");
+    std::fs::create_dir_all(dir.join("photos")).unwrap();
+    let db_path = dir.join("state.db");
+    seed_existing_upgrade_db(&db_path);
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,last_seen_at) \
+         VALUES(?1,'historical-asset','original','historical-checksum','historical.JPG',0,0,'photo',0)",
+        [ZONE],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata(key,value) VALUES(?1,?2)",
+        rusqlite::params![format!("sync_token:{ZONE}"), OLD_TOKEN],
+    )
+    .unwrap();
+    db_path
+}
+
+/// One real interrupted process between reservation commit and full provider
+/// work. The child runs the normal RUNNING then FINISHED cycle and parks at the
+/// owner death point after the reservation transaction commits. The parent
+/// kills it, reopens the same owned DB, and proves early wake performs zero full
+/// inventory and does not extend the persisted floor.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires L1 D cycle seam integration"]
+async fn pending_upgrade_qualification_process_death_persists_guard_and_early_wake_defers() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("fixture-owner"),
+        b"kei-synthetic-process-death",
+    )
+    .unwrap();
+    let log = std::fs::File::create(root.path().join("worker.log")).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "sync_loop::runner::tests::v027_baseline::indexing_layout::pending_upgrade_qualification_process_death_worker",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("KEI_TEST_PROCESS_DEATH_ROOT", root.path())
+        .env(
+            "KEI_TEST_PROCESS_DEATH_POINT",
+            "indexing-qualification-after-reserve-commit",
+        )
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !root.path().join("ready").exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "worker exited before reservation: {}",
+            std::fs::read_to_string(root.path().join("worker.log")).unwrap()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "worker did not reach reservation"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("ready")).unwrap(),
+        "indexing-qualification-after-reserve-commit"
+    );
+    child.kill().unwrap();
+    assert_eq!(child.wait().unwrap().signal(), Some(9));
+    drop(child);
+
+    let db_path = root.path().join("child/state.db");
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let (record, hold, replay, token) = {
+        let conn = db.acquire_lock("inspect interrupted reservation").unwrap();
+        let record = crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap();
+        let value = |key: &str| -> Option<String> {
+            conn.query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .ok()
+        };
+        (
+            record,
+            value(&indexing_reconciliation_key(ZONE)),
+            value(&indexing_replay_key(ZONE)),
+            value(&sync_token_key(ZONE)),
+        )
+    };
+    assert_eq!(record.state, "pending");
+    assert!(record.binding.is_none());
+    assert_eq!(record.attempts, 0);
+    assert!(
+        record
+            .last_outcome
+            .as_deref()
+            .is_some_and(|outcome| outcome.starts_with("qualification_in_progress:v1:")),
+        "reservation must be durably committed: {record:?}"
+    );
+    let floor = record.next_attempt_at;
+    assert!(
+        floor > chrono::Utc::now().timestamp(),
+        "reservation must leave a future bounded floor: {record:?}"
+    );
+    assert_eq!(hold.as_deref(), Some("1"));
+    assert_eq!(replay, None);
+    assert_eq!(token, None);
+    let stored_before = {
+        let conn = db.acquire_lock("inspect interrupted record bytes").unwrap();
+        conn.query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [crate::state::db::sync_epoch::library_key(ZONE)],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/current"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let inventory = Arc::new(pair(
+        "current",
+        "current.JPG",
+        &format!("{}/current", server.uri()),
+        23,
+    ));
+    let session = pending_upgrade_session(1, Arc::clone(&inventory));
+    let counters = session.clone();
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let early = run_pending_upgrade_indexing_cycle(
+        Arc::clone(&db),
+        session,
+        false,
+        &root.path().join("child/photos"),
+        &shared,
+    )
+    .await;
+    assert_eq!(early.stats.downloaded, 0, "{early:?}");
+    assert_eq!(counters.inventory_queries.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.boundaries.load(Ordering::SeqCst), 0);
+    let stored_after = {
+        let conn = db.acquire_lock("inspect reopened reservation").unwrap();
+        conn.query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [crate::state::db::sync_epoch::library_key(ZONE)],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        stored_after, stored_before,
+        "early wake must not rewrite or extend the reservation"
+    );
+    let after = {
+        let conn = db.acquire_lock("inspect reopened record").unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(after.next_attempt_at, floor);
+}
+
 #[tokio::test]
 async fn v027_pending_existing_upgrade_running_then_finished_qualifies_then_baselines() {
     let server = crate::start_wiremock_or_skip!();
@@ -658,6 +876,145 @@ async fn v027_pending_existing_upgrade_running_then_finished_qualifies_then_base
     assert_eq!(quiet_counters.boundaries.load(Ordering::SeqCst), 0);
     assert_released_catalog_preserved(&db, &old_path, &provider_checksum, old_bytes.len() as i64);
     assert_eq!(std::fs::read(&old).unwrap(), old_bytes);
+    drop(db);
+
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let session_quiet_again = pending_upgrade_session(2, Arc::clone(&inventory));
+    let quiet_again_counters = session_quiet_again.clone();
+    let quiet_again = run_pending_upgrade_indexing_cycle(
+        Arc::clone(&db),
+        session_quiet_again,
+        false,
+        &root,
+        &shared,
+    )
+    .await;
+    assert_eq!(quiet_again.stats.downloaded, 0, "{quiet_again:?}");
+    assert_eq!(
+        quiet_again_counters
+            .inventory_queries
+            .load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(quiet_again_counters.boundaries.load(Ordering::SeqCst), 0);
+    assert_released_catalog_preserved(&db, &old_path, &provider_checksum, old_bytes.len() as i64);
+    assert_eq!(std::fs::read(&old).unwrap(), old_bytes);
+}
+
+#[tokio::test]
+#[ignore = "requires L1 D cycle seam integration"]
+async fn pending_upgrade_qualification_transition_write_fault_retains_guard() {
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/current"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir(&root).unwrap();
+    let db_path = dir.path().join("state.db");
+    seed_existing_upgrade_db(&db_path);
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,last_seen_at) \
+             VALUES(?1,'historical-asset','original','historical-checksum','historical.JPG',0,0,'photo',0)",
+            [ZONE],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata(key,value) VALUES(?1,?2)",
+            rusqlite::params![format!("sync_token:{ZONE}"), OLD_TOKEN],
+        )
+        .unwrap();
+    }
+    let inventory = Arc::new(pair(
+        "current",
+        "current.JPG",
+        &format!("{}/current", server.uri()),
+        24,
+    ));
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let running_session = pending_upgrade_session(0, Arc::clone(&inventory));
+    let _ =
+        run_pending_upgrade_indexing_cycle(Arc::clone(&db), running_session, true, &root, &shared)
+            .await;
+    drop(db);
+
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    {
+        let conn = db
+            .acquire_lock("install qualification write fault")
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_qualification_commit BEFORE INSERT ON metadata \
+             WHEN NEW.key LIKE 'indexing_replay_required:v27:%' \
+             BEGIN SELECT RAISE(ABORT,'injected qualification write fault'); END;",
+        )
+        .unwrap();
+    }
+    let finished_session = pending_upgrade_session(1, Arc::clone(&inventory));
+    let finished = run_pending_upgrade_indexing_cycle(
+        Arc::clone(&db),
+        finished_session,
+        false,
+        &root,
+        &shared,
+    )
+    .await;
+    let (record, hold, replay, token) = {
+        let conn = db.acquire_lock("inspect write-fault reservation").unwrap();
+        let record = crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap();
+        let value = |key: &str| -> Option<String> {
+            conn.query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .ok()
+        };
+        (
+            record,
+            value(&indexing_reconciliation_key(ZONE)),
+            value(&indexing_replay_key(ZONE)),
+            value(&sync_token_key(ZONE)),
+        )
+    };
+    assert!(
+        finished.stats.state_write_failures > 0,
+        "write fault must be surfaced: {finished:?}"
+    );
+    assert!(
+        finished.failed_count > 0,
+        "write fault must not be reported as a successful cycle: {finished:?}"
+    );
+    assert_eq!(hold.as_deref(), Some("1"));
+    assert_eq!(replay, None);
+    assert_eq!(token, None);
+    assert!(
+        record
+            .last_outcome
+            .as_deref()
+            .is_some_and(|outcome| outcome.starts_with("qualification_in_progress:v1:")),
+        "failed transition must retain the committed reservation: {record:?}"
+    );
+    assert!(record.next_attempt_at > chrono::Utc::now().timestamp());
 }
 
 /// Current strict reader/gate control for the exact proposed qualification
