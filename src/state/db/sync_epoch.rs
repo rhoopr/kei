@@ -35,6 +35,19 @@ const QUALIFICATION_OUTCOME_VERSION: u8 = 1;
 const QUALIFICATION_QUALIFIED_OUTCOME: &str = "indexing_inventory_qualified";
 const QUALIFICATION_INCOMPLETE_PREFIX: &str = "qualification_incomplete:v1:";
 
+// These names mirror the existing state keys owned by the cycle/download
+// layers. Keep them in one finite owner list so the reservation cannot clear a
+// caller-invented key under the library guard.
+const QUALIFICATION_ENUM_HASH_KEY: &str = "enum_config_hash";
+const QUALIFICATION_PENDING_ENUM_HASH_KEY: &str = "pending_enum_config_hash";
+const QUALIFICATION_CONFIG_HASH_KEY: &str = "config_hash";
+const QUALIFICATION_PENDING_CONFIG_HASH_KEY: &str = "pending_download_config_hash";
+const QUALIFICATION_INDEXING_PREFIX: &str = "indexing_reconciliation_required:";
+const QUALIFICATION_REPLAY_PREFIX: &str = "indexing_replay_required:v27:";
+const QUALIFICATION_MATERIALIZATION_PREFIX: &str = "indexing_materialization_required:";
+const QUALIFICATION_SYNC_TOKEN_PREFIX: &str = "sync_token:v27:";
+const QUALIFICATION_RETAINED_HOLD_PREFIX: &str = "retained_checkpoint_hold:v27:";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EpochOrigin {
     FreshInstall,
@@ -800,6 +813,20 @@ pub(crate) fn defer_without_attempt(
     dead_code,
     reason = "consumed by the L1 shared-seam qualification integration"
 )]
+fn qualification_required_keys(library: &str) -> [String; 9] {
+    [
+        QUALIFICATION_ENUM_HASH_KEY.to_owned(),
+        QUALIFICATION_PENDING_ENUM_HASH_KEY.to_owned(),
+        QUALIFICATION_CONFIG_HASH_KEY.to_owned(),
+        QUALIFICATION_PENDING_CONFIG_HASH_KEY.to_owned(),
+        format!("{QUALIFICATION_MATERIALIZATION_PREFIX}{library}"),
+        format!("{QUALIFICATION_INDEXING_PREFIX}{library}"),
+        format!("{QUALIFICATION_REPLAY_PREFIX}{library}"),
+        format!("{QUALIFICATION_SYNC_TOKEN_PREFIX}{library}"),
+        format!("{QUALIFICATION_RETAINED_HOLD_PREFIX}{library}"),
+    ]
+}
+
 fn fence_matches(
     conn: &Connection,
     expected: &[(String, Option<String>)],
@@ -842,15 +869,29 @@ pub(crate) fn reserve_indexing_qualification(
     if expected_epoch.as_deref() != Some(raw_epoch.as_str()) {
         return Ok(QualificationReserve::StaleFence);
     }
+    let expected_indexing = format!("{QUALIFICATION_INDEXING_PREFIX}{library}");
+    let expected_replay = format!("{QUALIFICATION_REPLAY_PREFIX}{library}");
+    if indexing_key != expected_indexing.as_str() || replay_key != expected_replay.as_str() {
+        return Ok(QualificationReserve::StaleFence);
+    }
+    for required in qualification_required_keys(library) {
+        if !expected_metadata.iter().any(|(key, _)| key == &required) {
+            return Ok(QualificationReserve::StaleFence);
+        }
+    }
+    for (index, (key, value)) in expected_metadata.iter().enumerate() {
+        if expected_metadata
+            .iter()
+            .skip(index + 1)
+            .any(|(other_key, other_value)| other_key == key && other_value != value)
+        {
+            return Ok(QualificationReserve::StaleFence);
+        }
+    }
     if !fence_matches(conn, expected_metadata)? {
         return Ok(QualificationReserve::StaleFence);
     }
     let record_key = library_key(library);
-    for required in [indexing_key, replay_key] {
-        if !expected_metadata.iter().any(|(key, _)| key == required) {
-            return Ok(QualificationReserve::StaleFence);
-        }
-    }
     if expected_metadata.iter().any(|(key, _)| key == &record_key) {
         // The owner adds the exact reserved record itself.
         return Ok(QualificationReserve::StaleFence);
@@ -2549,18 +2590,53 @@ mod tests {
     fn qualification_stale_fence_refuses_finish_and_reentry() {
         let conn = qualification_db();
         let fence = qualification_fence(&conn);
+        let stored = stored_record(&conn);
         let mut missing_epoch = fence.clone();
         missing_epoch.retain(|(key, _)| key != SYNC_EPOCH_KEY);
         assert_eq!(
             reserve_qualification(&conn, &missing_epoch, 10_000),
             QualificationReserve::StaleFence
         );
-        let mut missing_hold = fence.clone();
-        missing_hold.retain(|(key, _)| key != TEST_INDEXING_KEY);
+        for required in qualification_required_keys(TEST_LIBRARY) {
+            let mut missing = fence.clone();
+            missing.retain(|(key, _)| key != &required);
+            assert_eq!(
+                reserve_qualification(&conn, &missing, 10_000),
+                QualificationReserve::StaleFence,
+                "missing required fence key {required}"
+            );
+            assert_eq!(stored_record(&conn), stored);
+        }
+        for (indexing_key, replay_key) in [
+            ("indexing_reconciliation_required:Other", TEST_REPLAY_KEY),
+            (TEST_INDEXING_KEY, "indexing_replay_required:v27:Other"),
+        ] {
+            assert_eq!(
+                reserve_indexing_qualification(
+                    &conn,
+                    TEST_LIBRARY,
+                    indexing_key,
+                    replay_key,
+                    &fence,
+                    10_000,
+                    None,
+                )
+                .unwrap(),
+                QualificationReserve::StaleFence,
+                "wrong own-library key names must refuse"
+            );
+            assert_eq!(stored_record(&conn), stored);
+        }
+        let mut conflicting = fence.clone();
+        conflicting.push((
+            crate::download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+            Some("conflicting".to_owned()),
+        ));
         assert_eq!(
-            reserve_qualification(&conn, &missing_hold, 10_000),
+            reserve_qualification(&conn, &conflicting, 10_000),
             QualificationReserve::StaleFence
         );
+        assert_eq!(stored_record(&conn), stored);
         let reservation = reserved_or_panic(reserve_qualification(&conn, &fence, 10_000));
         let reserved = stored_record(&conn);
         conn.execute(
@@ -2584,6 +2660,18 @@ mod tests {
             QualificationReserve::StaleFence
         );
         assert_eq!(stored_record(&conn), reserved);
+    }
+
+    #[test]
+    fn qualification_duplicate_same_value_fence_is_accepted() {
+        let conn = qualification_db();
+        let mut fence = qualification_fence(&conn);
+        fence.push(fence[0].clone());
+        let reservation = reserved_or_panic(reserve_qualification(&conn, &fence, 10_000));
+        assert_eq!(
+            current_record(&conn).last_outcome.as_deref(),
+            Some(reservation.reserved_outcome.as_str())
+        );
     }
 
     #[test]
