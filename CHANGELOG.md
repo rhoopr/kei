@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- SQLite schema 44 adds source-revalidation mode metadata. Stop every writer and keep a matched cold backup of configuration, state, SQLite companions and media before upgrading. A schema 43 binary cannot open schema 44. Existing rounds, debt, epoch state and checkpoints are preserved. Mixed-version operation and downgrade are not supported.
 - Removed `kei install` and `kei uninstall` together with service and host-service installer qualification. `kei service run`, `kei service status`, runtime configuration, notifications, watchdog, PID, metrics and platform service adapters remain.
 - Removed the dedicated missing-reference inventory diagnostic surface. Ordinary `kei doctor --json` and `--live` remain, and normal sync identity recovery is unchanged.
 - `support-export` now writes a one-shot current-state snapshot of build, configuration, immutable state, health and filesystem evidence. Support history is reported unavailable even when older support-history files exist; those files are never read, merged, renamed, deleted or recreated.

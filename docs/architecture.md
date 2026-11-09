@@ -1961,6 +1961,8 @@ The schema 43 migration creates one durable database sync epoch
 historical source-revalidation round as `abandoned` and retains all debt rows.
 It does not remove per-library checkpoints or any user state.
 
+Schema 44 adds `source_revalidation_rounds.mode` with default `legacy_unfiled_v1`. It leaves existing round phases, debt deadlines, epoch state and checkpoints unchanged. It does not repeat the schema 43 epoch creation or quarantine.
+
 Fresh-install detection uses the file-creation origin and the schema version
 captured before migration. A file created by this open with version 0 is fresh.
 Any pre-existing file, including an owned schema 0 file, is existing. An
@@ -1971,9 +1973,9 @@ after the epoch but before the first sync still enrolls a fresh install clean.
 Every owned open at schema 43 or 44 validates the epoch before WAL setup,
 migration or any substantive write. A schema 43 database without a valid epoch
 fails closed before the 43->44 migration, and a same-number schema 44 database
-without a valid epoch fails closed. Schema 45 and newer are refused. Older
-binaries refuse schema 43, and stopping every writer before the upgrade remains
-an operator prerequisite for already-running processes.
+without a valid epoch fails closed. Schema 45 and newer are refused.
+
+Binaries that support only schema 43 can read schema 43 but refuse a schema 44 database when they open it. Binaries older than schema 43 also refuse schema 43. Stop every writer before upgrading. Version refusal protects a new open, not an already-open connection. Mixed-version operation and downgrade are not supported.
 
 Schema 42 is a no-op. New work never creates the retired metadata-activity
 prerequisite tables and does not import their rows. A populated
