@@ -320,10 +320,28 @@ const EXIT_AUTH: u8 = 3;
 /// Exit code for terminal Apple authentication states that need operator action.
 const EXIT_TERMINAL_AUTH: u8 = 4;
 
-/// Returned when some (but not all) sync failures occurred during a cycle.
+/// Returned when some (but not all) sync failures or selected library holds
+/// occurred during a one-shot cycle. Holds are reported separately so the exit
+/// remains truthful without fabricating failed assets or counts.
 #[derive(Debug, thiserror::Error)]
-#[error("{0} sync failures")]
-struct PartialSyncError(usize);
+#[error("{}", partial_sync_message(*failures, *holds))]
+struct PartialSyncError {
+    failures: usize,
+    holds: usize,
+}
+
+fn partial_sync_message(failures: usize, holds: usize) -> String {
+    match (failures, holds) {
+        (0, 0) => "sync incomplete".to_string(),
+        (0, 1) => "1 library held incomplete".to_string(),
+        (0, holds) => format!("{holds} libraries held incomplete"),
+        (failures, 0) => format!("{failures} sync failures"),
+        (failures, 1) => format!("{failures} sync failures; 1 library held incomplete"),
+        (failures, holds) => {
+            format!("{failures} sync failures; {holds} libraries held incomplete")
+        }
+    }
+}
 
 /// Maps a fatal `Err` from `run` to an exit code and decides whether to log it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1846,7 +1864,11 @@ mod tests {
 
     #[test]
     fn classify_exit_error_partial_sync_uses_exit_partial() {
-        let e: anyhow::Error = PartialSyncError(7).into();
+        let e: anyhow::Error = PartialSyncError {
+            failures: 7,
+            holds: 0,
+        }
+        .into();
         let c = classify_exit_error(&e);
         assert_eq!(c, ExitClassification::Partial);
         assert_eq!(c.exit_code(), EXIT_PARTIAL);
@@ -1898,8 +1920,11 @@ mod tests {
             "context-wrapped 2FA-required must keep the documented auth exit code"
         );
 
-        let e: anyhow::Error =
-            anyhow::Error::from(PartialSyncError(3)).context("after final retry pass");
+        let e: anyhow::Error = anyhow::Error::from(PartialSyncError {
+            failures: 3,
+            holds: 0,
+        })
+        .context("after final retry pass");
         assert_eq!(classify_exit_error(&e), ExitClassification::Partial);
 
         let e: anyhow::Error = anyhow::Error::from(auth::error::AuthError::terminal_apple_auth(

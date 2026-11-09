@@ -18,8 +18,9 @@ use crate::sync_loop::reporting::maybe_write_offline_fake_sync_report;
 use crate::sync_loop::reporting::merge_refresh_tail_outcome;
 use crate::sync_loop::session::reacquire_session;
 use crate::sync_loop::watch::{
-    metadata_capture_watch_interval, refresh_metadata_forces_one_shot,
-    repair_truncated_forces_one_shot, validate_capture_timestamp_repair,
+    metadata_capture_watch_interval, metadata_capture_watch_interval_for_cycle,
+    refresh_metadata_forces_one_shot, repair_truncated_forces_one_shot,
+    validate_capture_timestamp_repair,
 };
 use crate::sync_loop::{SyncArgs, service_mode_default_interval, should_reconcile_this_cycle};
 use crate::systemd::SystemdNotifier;
@@ -33,6 +34,25 @@ use crate::{
 #[must_use]
 fn refresh_tail_allows_source_revalidation(tail: &download::RefreshTailOutcome) -> bool {
     tail.new_failures == 0 && tail.witnessed_blocked == 0
+}
+
+/// One-shot partial exit for real failures and selected library holds. The
+/// hold count is carried separately so exit code 2 never requires a fabricated
+/// failed-asset count.
+fn one_shot_partial_error(
+    cycle_result: &crate::sync_cycle::CycleResult,
+) -> Option<PartialSyncError> {
+    // Session expiry and interruption keep their existing priority. A hold is
+    // only an exit reason for an otherwise completed ordinary cycle.
+    let holds = if cycle_result.session_expired || cycle_result.stats.interrupted {
+        0
+    } else {
+        cycle_result.holds.len()
+    };
+    (cycle_result.failed_count > 0 || holds > 0).then_some(PartialSyncError {
+        failures: cycle_result.failed_count,
+        holds,
+    })
 }
 
 /// Revalidate one bounded page after all cycle producers and the metadata tail have joined.
@@ -900,11 +920,20 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 )
                 .await;
 
-            next_watch_interval = metadata_capture_watch_interval(
-                config.watch.interval,
-                &cycle_result.stats,
-                cycle_result.failed_count,
-            );
+            next_watch_interval = if cycle_result.has_selected_holds() {
+                metadata_capture_watch_interval_for_cycle(
+                    config.watch.interval,
+                    &cycle_result.stats,
+                    cycle_result.failed_count,
+                    true,
+                )
+            } else {
+                metadata_capture_watch_interval(
+                    config.watch.interval,
+                    &cycle_result.stats,
+                    cycle_result.failed_count,
+                )
+            };
             if let (Some(configured_interval), Some(follow_up_interval)) =
                 (config.watch.interval, next_watch_interval)
                 && follow_up_interval < configured_interval
@@ -929,17 +958,20 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 )
                 .await?;
                 continue;
-            } else if cycle_result.failed_count > 0 {
-                cumulative_failed_count =
-                    cumulative_failed_count.saturating_add(cycle_result.failed_count);
+            } else if let Some(partial) = one_shot_partial_error(&cycle_result) {
+                if cycle_result.failed_count > 0 {
+                    cumulative_failed_count =
+                        cumulative_failed_count.saturating_add(cycle_result.failed_count);
+                }
                 if is_watch_mode {
                     tracing::warn!(
                         failed_count = cycle_result.failed_count,
+                        held_libraries = cycle_result.holds.len(),
                         cumulative = cumulative_failed_count,
-                        "Some sync failures occurred this cycle, will retry next cycle"
+                        "Some sync work remains incomplete this cycle; held or failed work will retry at the configured cadence"
                     );
                 } else {
-                    return Err(PartialSyncError(cycle_result.failed_count).into());
+                    return Err(partial.into());
                 }
             } else {
                 reauth_attempts = 0;
@@ -1020,7 +1052,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // just the last one. A single successful final cycle must not mask a
     // multi-cycle failure backlog in Docker / systemd exit-code signalling.
     if cumulative_failed_count > 0 {
-        Err(PartialSyncError(cumulative_failed_count).into())
+        Err(PartialSyncError {
+            failures: cumulative_failed_count,
+            holds: 0,
+        }
+        .into())
     } else {
         Ok(())
     }

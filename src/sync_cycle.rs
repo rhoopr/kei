@@ -332,6 +332,72 @@ fn classify_inventory_drop(previous_total: u64, current_total: u64) -> Option<In
     })
 }
 
+/// Bounded reason class for a selected library that did not finish its own
+/// current source work this cycle. These labels are safe for human, health and
+/// notification output: they never contain provider record identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LibraryHoldKind {
+    BaselinePending,
+    IndexingReconciliation,
+    IdentityUnresolved,
+    RetainedCheckpoint,
+    PreservationPending,
+}
+
+impl LibraryHoldKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::BaselinePending => "baseline_pending",
+            Self::IndexingReconciliation => "indexing_reconciliation",
+            Self::IdentityUnresolved => "identity_unresolved",
+            Self::RetainedCheckpoint => "retained_checkpoint",
+            Self::PreservationPending => "preservation_pending",
+        }
+    }
+}
+
+/// One selected library's real hold this cycle. This is a private reporting
+/// fact, not a new report/JSON/metric contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LibraryHoldFact {
+    pub(crate) label: String,
+    pub(crate) kind: LibraryHoldKind,
+    pub(crate) reason: &'static str,
+}
+
+/// Record a hold for one selected library and retain the existing singular
+/// cycle-level machine block fields only as a compatibility projection. The
+/// per-library facts keep every affected label visible without inventing
+/// failed assets or counts.
+fn record_selected_hold(
+    holds: &mut Vec<LibraryHoldFact>,
+    stats: &mut download::SyncStats,
+    zone_name: &str,
+    kind: LibraryHoldKind,
+    reason: &'static str,
+    explanation: &'static str,
+) {
+    let label = download::paths::truncate_library_zone(zone_name).to_owned();
+    if holds
+        .iter()
+        .any(|hold| hold.label == label && hold.kind == kind && hold.reason == reason)
+    {
+        return;
+    }
+    holds.push(LibraryHoldFact {
+        label,
+        kind,
+        reason,
+    });
+    if stats.sync_token_blocked_zone.is_none() {
+        stats.sync_token_blocked = true;
+        stats.sync_token_blocked_reason = Some(reason);
+        stats.sync_token_blocked_source = Some("kei");
+        stats.sync_token_blocked_explanation = Some(explanation);
+        stats.sync_token_blocked_zone = Some(zone_name.to_owned());
+    }
+}
+
 /// Outcome of a single sync cycle across all libraries.
 #[derive(Debug)]
 pub(crate) struct CycleResult {
@@ -339,6 +405,8 @@ pub(crate) struct CycleResult {
     pub(crate) session_expired: bool,
     pub(crate) stats: download::SyncStats,
     pub(crate) db_sync_token_advance_safe: bool,
+    /// Selected libraries that retained real incomplete work this cycle.
+    pub(crate) holds: Vec<LibraryHoldFact>,
 }
 
 impl CycleResult {
@@ -351,6 +419,13 @@ impl CycleResult {
             && self.failed_count == 0
             && !self.stats.interrupted
             && self.db_sync_token_advance_safe
+    }
+
+    /// True when at least one selected library kept real incomplete work.
+    /// Holds are not failed assets and must not be converted into counts.
+    #[must_use]
+    pub(crate) fn has_selected_holds(&self) -> bool {
+        !self.holds.is_empty()
     }
 }
 
@@ -1081,6 +1156,7 @@ pub(crate) async fn run_cycle_with_witness(
     let mut cycle_failed_count = 0usize;
     let mut cycle_session_expired = false;
     let mut cycle_stats = download::SyncStats::default();
+    let mut library_holds: Vec<LibraryHoldFact> = Vec::new();
     let mut sparse_identity_proofs = Vec::new();
 
     let cycle_has_stale_plan = library_states.iter().any(|s| s.plan_is_stale);
@@ -1335,6 +1411,24 @@ pub(crate) async fn run_cycle_with_witness(
                 }
                 state::SyncEpochGate::Defer { reason }
                 | state::SyncEpochGate::Blocked { reason } => {
+                    if !config.runtime.only_print_filenames && !is_retry_failed {
+                        let explanation = if reason == "epoch_blocked" {
+                            "a selected library's baseline is blocked; local work is retained"
+                        } else {
+                            "a selected library is waiting for its scheduled baseline attempt; local work is retained"
+                        };
+                        record_selected_hold(
+                            &mut library_holds,
+                            &mut cycle_stats,
+                            &lib_state.zone_name,
+                            LibraryHoldKind::BaselinePending,
+                            reason,
+                            explanation,
+                        );
+                        // A pending selected baseline is an aggregate database
+                        // checkpoint hold even when a healthy peer progressed.
+                        db_sync_token_advance_safe = false;
+                    }
                     if config.runtime.only_print_filenames || is_retry_failed {
                         // Ineligible runs must not drain queued metadata or run
                         // historical path reconciliation. Retry-only still
@@ -2399,6 +2493,17 @@ pub(crate) async fn run_cycle_with_witness(
             db_sync_token_advance_safe = false;
             path_reconciliation_complete = false;
         }
+        if indexing_hold_required && !indexing_reconciliation {
+            record_selected_hold(
+                &mut library_holds,
+                &mut cycle_stats,
+                &lib_state.zone_name,
+                LibraryHoldKind::IndexingReconciliation,
+                "indexing_reconciliation_required",
+                "a selected library's indexing readiness regressed during enumeration; deletions and checkpoint promotion are disabled",
+            );
+            db_sync_token_advance_safe = false;
+        }
         // Retry-only work cannot discharge either phase: new assets may be
         // skipped before they acquire durable retry rows. Keep their cursor.
         let recovery_retry_only = (indexing_reconciliation
@@ -2536,6 +2641,22 @@ pub(crate) async fn run_cycle_with_witness(
             db_sync_token_advance_safe = false;
             path_reconciliation_complete = false;
             path_reconciliation_cycle_safe = false;
+            let reason = sync_result
+                .stats
+                .sync_token_blocked_reason
+                .unwrap_or("indexing_reconciliation_required");
+            let explanation = sync_result
+                .stats
+                .sync_token_blocked_explanation
+                .unwrap_or("a selected library is waiting for complete indexing and a valid baseline; deletions and checkpoint promotion are disabled");
+            record_selected_hold(
+                &mut library_holds,
+                &mut cycle_stats,
+                &lib_state.zone_name,
+                LibraryHoldKind::IndexingReconciliation,
+                reason,
+                explanation,
+            );
         }
 
         let legacy_proofs = Vec::new();
@@ -2833,6 +2954,17 @@ pub(crate) async fn run_cycle_with_witness(
             sync_result.stats.unattributed_legacy_pending = capture.unattributed_legacy_pending;
         }
 
+        if sync_result.stats.unattributed_legacy_pending > 0 {
+            record_selected_hold(
+                &mut library_holds,
+                &mut cycle_stats,
+                &lib_state.zone_name,
+                LibraryHoldKind::PreservationPending,
+                "legacy_preservation_pending",
+                "legacy current-work certification remains incomplete",
+            );
+        }
+
         // Accumulate stats across libraries.
         cycle_stats.accumulate(&sync_result.stats);
 
@@ -3011,12 +3143,23 @@ pub(crate) async fn run_cycle_with_witness(
             .copied()
             .filter(|library| has_active_passes(library))
         {
-            current_identity_hold |= sparse_identity_holds_current(
+            let held = sparse_identity_holds_current(
                 db,
                 &library.zone_name,
                 is_current_zone_checkpoint(&library.sync_token_key),
             )
             .await?;
+            if held {
+                record_selected_hold(
+                    &mut library_holds,
+                    &mut cycle_stats,
+                    &library.zone_name,
+                    LibraryHoldKind::IdentityUnresolved,
+                    "asset_delta_hydration_incomplete",
+                    download::sync_token_blocked_explanation("asset_delta_hydration_incomplete"),
+                );
+            }
+            current_identity_hold |= held;
         }
         if current_identity_hold {
             download::block_sync_token_for_unresolved_identity(&mut cycle_stats);
@@ -3052,6 +3195,23 @@ pub(crate) async fn run_cycle_with_witness(
                     download::sync_token_blocked_explanation("retained_checkpoint_hold_invalid"),
                 );
             }
+            let reason = match summary.last_recovery_action.as_deref() {
+                Some("retained_checkpoint_retry_exhausted") => {
+                    "retained_checkpoint_retry_exhausted"
+                }
+                Some("repair_retained_checkpoint_evidence") => "retained_checkpoint_hold_invalid",
+                _ => "retained_checkpoint_expired",
+            };
+            if let Some(zone_name) = cycle_stats.sync_token_blocked_zone.clone() {
+                record_selected_hold(
+                    &mut library_holds,
+                    &mut cycle_stats,
+                    &zone_name,
+                    LibraryHoldKind::RetainedCheckpoint,
+                    reason,
+                    download::sync_token_blocked_explanation(reason),
+                );
+            }
             cycle_failed_count = cycle_failed_count.max(1);
             db_sync_token_advance_safe = false;
         }
@@ -3065,6 +3225,7 @@ pub(crate) async fn run_cycle_with_witness(
         session_expired: cycle_session_expired,
         stats: cycle_stats,
         db_sync_token_advance_safe,
+        holds: library_holds,
     })
 }
 

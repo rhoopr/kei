@@ -83,6 +83,9 @@ pub(crate) struct CycleFacts<'a> {
     pub(crate) failed_count: usize,
     pub(crate) elapsed: Duration,
     pub(crate) status: CycleStatus,
+    /// Selected libraries retaining real incomplete work this cycle. These are
+    /// labels/reasons only, never fabricated failed assets or counts.
+    pub(crate) holds: &'a [crate::sync_cycle::LibraryHoldFact],
     accounted_transfer_failures: bool,
 }
 
@@ -98,10 +101,18 @@ impl<'a> CycleFacts<'a> {
             result.session_expired,
             elapsed,
         );
+        facts.holds = &result.holds;
+        facts.status = classify_cycle_with_holds(
+            &result.stats,
+            result.failed_count,
+            result.session_expired,
+            !result.holds.is_empty(),
+        );
         let stats = &result.stats;
         facts.accounted_transfer_failures = result.db_sync_token_advance_safe
             && result.failed_count > 0
             && result.failed_count == stats.failed
+            && result.holds.is_empty()
             && !result.session_expired
             && !stats.interrupted
             && stats.state_write_failures == 0
@@ -125,6 +136,7 @@ impl<'a> CycleFacts<'a> {
             failed_count,
             elapsed,
             status: classify_cycle(stats, failed_count, session_expired),
+            holds: &[],
             accounted_transfer_failures: false,
         }
     }
@@ -163,15 +175,61 @@ pub(crate) fn classify_cycle(
     failed_count: usize,
     session_expired: bool,
 ) -> CycleStatus {
+    classify_cycle_with_holds(stats, failed_count, session_expired, false)
+}
+
+fn classify_cycle_with_holds(
+    stats: &SyncStats,
+    failed_count: usize,
+    session_expired: bool,
+    has_selected_holds: bool,
+) -> CycleStatus {
     if session_expired {
         CycleStatus::SessionExpired
     } else if stats.interrupted {
         CycleStatus::Interrupted
-    } else if failed_count > 0 || stats.identity_incomplete || stats.unattributed_legacy_pending > 0
+    } else if failed_count > 0
+        || stats.identity_incomplete
+        || stats.unattributed_legacy_pending > 0
+        || has_selected_holds
     {
         CycleStatus::Failed
     } else {
         CycleStatus::Success
+    }
+}
+
+fn selected_hold_message(holds: &[crate::sync_cycle::LibraryHoldFact]) -> Option<String> {
+    if holds.is_empty() {
+        return None;
+    }
+    Some(
+        holds
+            .iter()
+            .map(|hold| format!("{}: {} ({})", hold.label, hold.kind.as_str(), hold.reason))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+fn cycle_failure_message(input: &CycleFacts<'_>) -> String {
+    let mut parts = Vec::new();
+    if input.stats.identity_incomplete {
+        parts.push("unresolved asset identity; provider checkpoint replay required".to_string());
+    }
+    if input.stats.unattributed_legacy_pending > 0 {
+        parts.push("legacy current-work certification remains incomplete".to_string());
+    }
+    if let Some(holds) = selected_hold_message(input.holds) {
+        parts.push(format!("held incomplete: {holds}"));
+    }
+    if input.failed_count > 0 {
+        parts.push(format!("{} sync failures", input.failed_count));
+    }
+    if parts.is_empty() {
+        "sync failed".to_string()
+    } else {
+        parts.join("; ")
     }
 }
 
@@ -234,6 +292,14 @@ where
         health: &mut HealthStatus,
         input: CycleFacts<'_>,
     ) {
+        for hold in input.holds {
+            tracing::warn!(
+                library = %hold.label,
+                kind = hold.kind.as_str(),
+                reason = hold.reason,
+                "Selected library held incomplete; real work is retained without fabricating failures"
+            );
+        }
         let friendly_summary = self.friendly_summary().await;
         self.report_friendly_output(&input, friendly_summary.as_ref());
         self.update_health(health, &input);
@@ -292,17 +358,7 @@ where
         match input.status {
             CycleStatus::Success => health.record_success(),
             CycleStatus::Failed if input.accounted_transfer_failures => health.record_success(),
-            CycleStatus::Failed if input.stats.identity_incomplete => {
-                health.record_failure(
-                    "unresolved asset identity; provider checkpoint replay required",
-                );
-            }
-            CycleStatus::Failed if input.stats.unattributed_legacy_pending > 0 => {
-                health.record_failure("legacy current-work certification remains incomplete");
-            }
-            CycleStatus::Failed => {
-                health.record_failure(&format!("{} sync failures", input.failed_count));
-            }
+            CycleStatus::Failed => health.record_failure(&cycle_failure_message(input)),
             CycleStatus::SessionExpired => health.record_failure("session expired"),
             CycleStatus::Interrupted => health.record_failure("sync interrupted"),
         }
@@ -417,13 +473,27 @@ where
                 Some(&notification_data),
                 self.report_path,
             ),
-            CycleStatus::Failed => self.notifier.notify(
-                notifications::Event::SyncFailed,
-                &format!("{} sync failures", input.failed_count),
-                &self.run_options.username,
-                Some(&notification_data),
-                self.report_path,
-            ),
+            CycleStatus::Failed => {
+                let message = match selected_hold_message(input.holds) {
+                    Some(holds) if input.failed_count == 0 => {
+                        format!("Sync incomplete: {holds}")
+                    }
+                    Some(holds) => {
+                        format!(
+                            "{} sync failures; held incomplete: {holds}",
+                            input.failed_count
+                        )
+                    }
+                    None => format!("{} sync failures", input.failed_count),
+                };
+                self.notifier.notify(
+                    notifications::Event::SyncFailed,
+                    &message,
+                    &self.run_options.username,
+                    Some(&notification_data),
+                    self.report_path,
+                );
+            }
             CycleStatus::Interrupted => self.notifier.notify(
                 notifications::Event::SyncFailed,
                 "Sync interrupted",
@@ -1507,6 +1577,7 @@ mod tests {
                     failed: 1,
                     ..SyncStats::default()
                 },
+                holds: Vec::new(),
             };
             match kind {
                 "state_write" => result.stats.state_write_failures = 1,

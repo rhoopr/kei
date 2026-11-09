@@ -1638,6 +1638,116 @@ async fn healthy_second_library_downloads_new_media_during_epoch_hold() {
     assert_eq!(zone_after.decision, zone_before.decision);
 }
 
+/// A real deferred epoch is a selected library hold: the completed cycle must
+/// report partial_failure and be eligible for the one-shot partial exit without
+/// inventing failed assets or counts.
+#[tokio::test]
+async fn epoch_hold_reports_partial_failure_without_fabricated_counts() {
+    let fixture = Fixture::new(false).await;
+    fixture.install_completion_abort().await;
+    let baseline = fixture.run(false, false).await;
+    assert_eq!(baseline.stats.downloaded, 1, "{baseline:?}");
+    fixture.drop_trigger("fail_epoch_complete").await;
+    assert_eq!(fixture.snapshot().await.state, "pending");
+
+    let held = fixture.run(false, false).await;
+    assert_eq!(held.failed_count, 0, "{held:?}");
+    assert_eq!(held.stats.failed, 0, "{held:?}");
+    assert_eq!(held.stats.downloaded, 0, "{held:?}");
+
+    let facts = crate::cycle_reporter::CycleFacts::from_cycle_result(
+        &held,
+        std::time::Duration::from_secs(1),
+    );
+    assert_eq!(
+        facts.status,
+        crate::cycle_reporter::CycleStatus::Failed,
+        "an actual epoch hold must not classify as success: {held:?}"
+    );
+    assert_eq!(
+        held.holds.len(),
+        1,
+        "one held library must have exactly one real hold fact: {held:?}"
+    );
+    let hold = &held.holds[0];
+    assert_eq!(hold.label, "SharedSync-v027-syn");
+    assert_eq!(
+        hold.kind,
+        crate::sync_cycle::LibraryHoldKind::BaselinePending
+    );
+    assert_eq!(hold.reason, "epoch_backoff");
+    assert!(
+        !held.db_sync_token_advance_safe,
+        "a pending selected baseline holds the aggregate database checkpoint"
+    );
+    assert_eq!(
+        held.stats.sync_token_blocked_zone.as_deref(),
+        Some(ZONE),
+        "the existing singular machine block field keeps the full zone"
+    );
+
+    let partial = crate::sync_loop::runner::one_shot_partial_error(&held)
+        .expect("a one-shot epoch hold must exit partial");
+    assert_eq!(partial.to_string(), "1 library held incomplete");
+    assert!(
+        !partial.to_string().contains("0 sync failures"),
+        "a hold must never fabricate a zero failure count"
+    );
+    let exit_error: anyhow::Error = partial.into();
+    assert_eq!(crate::classify_exit_error(&exit_error).exit_code(), 2);
+
+    let db = fixture.open().await;
+    let report_path = fixture.dir().join("sync_report.json");
+    let notifier = crate::notifications::Notifier::new(None);
+    let run_config = make_run_cycle_config();
+    let reporter =
+        crate::cycle_reporter::CycleReporter::new(crate::cycle_reporter::CycleReporterConfig {
+            watch_mode: false,
+            report_path: Some(&report_path),
+            run_options: crate::report::RunOptions::from_config(&run_config),
+            health_dir: fixture.dir(),
+            personality_mode: crate::personality::Mode::Off,
+            state_db: Some(db.as_ref()),
+            metrics_handle: None,
+            notifier: &notifier,
+        });
+    let mut health = crate::health::HealthStatus::new();
+    reporter.report_completed_cycle(&mut health, facts).await;
+
+    let report: Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).expect("epoch hold report"))
+            .expect("epoch hold report json");
+    assert_eq!(report["stats"]["failed"], 0, "{report}");
+    assert_eq!(report["stats"]["downloaded"], 0, "{report}");
+    assert_eq!(report["status"], "partial_failure");
+    assert_eq!(
+        report["stats"]["sync_token_blocked_zone"], ZONE,
+        "the existing singular machine block field is retained: {report}"
+    );
+    let health_error = health.last_error.as_deref().expect("hold health error");
+    assert!(
+        health_error.contains("SharedSync-v027-syn")
+            && health_error.contains("baseline_pending")
+            && health_error.contains("epoch_backoff"),
+        "health must name the safe label, kind and reason: {health_error}"
+    );
+
+    let configured_interval = 3_600;
+    let mut metadata_followup = held.stats.clone();
+    metadata_followup.metadata_capture_remaining = 1;
+    metadata_followup.metadata_capture_progressed = true;
+    assert_eq!(
+        crate::sync_loop::watch::metadata_capture_watch_interval_for_cycle(
+            Some(configured_interval),
+            &metadata_followup,
+            held.failed_count,
+            true,
+        ),
+        Some(configured_interval),
+        "a selected hold keeps the configured cadence even when a real metadata follow-up exists"
+    );
+}
+
 #[tokio::test]
 async fn reset_sync_token_failure_rolls_back_every_component() {
     use crate::config::GlobalArgs;

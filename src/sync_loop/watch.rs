@@ -15,8 +15,22 @@ pub(super) fn metadata_capture_watch_interval(
     stats: &download::SyncStats,
     cycle_failed_count: usize,
 ) -> Option<u64> {
+    metadata_capture_watch_interval_for_cycle(configured_interval, stats, cycle_failed_count, false)
+}
+
+/// A selected library hold keeps the configured cadence even when a real
+/// metadata-capture follow-up exists. Holds are durable obligations, not clean
+/// metadata progress, so expediting the next cycle would not discharge them.
+#[must_use]
+pub(super) fn metadata_capture_watch_interval_for_cycle(
+    configured_interval: Option<u64>,
+    stats: &download::SyncStats,
+    cycle_failed_count: usize,
+    has_selected_holds: bool,
+) -> Option<u64> {
     configured_interval.map(|interval| {
-        if cycle_failed_count == 0
+        if !has_selected_holds
+            && cycle_failed_count == 0
             && stats.metadata_capture_remaining > 0
             && stats.metadata_capture_progressed
             && !stats.has_rate_limit_pressure()
