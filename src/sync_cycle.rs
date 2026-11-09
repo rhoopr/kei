@@ -1171,6 +1171,62 @@ async fn run_epoch_pending_retry(
     .map(Some)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "narrow held-cycle retry adapter mirrors the existing cycle mutation facts"
+)]
+async fn retry_due_admitted_while_held(
+    download_client: &reqwest::Client,
+    lib_state: &LibraryState,
+    retry_config: Arc<download::DownloadConfig>,
+    download_controls: download::DownloadControls,
+    shutdown_token: &CancellationToken,
+    cycle_stats: &mut download::SyncStats,
+    cycle_failed_count: &mut usize,
+    cycle_session_expired: &mut bool,
+    db_sync_token_advance_safe: &mut bool,
+    context: &'static str,
+) -> bool {
+    match Box::pin(download::replay_due_admitted_selection(
+        download_client,
+        &lib_state.plan.passes,
+        retry_config,
+        download_controls,
+        shutdown_token.clone(),
+    ))
+    .await
+    {
+        Ok(Some(retried)) => {
+            cycle_stats.accumulate(&retried.stats);
+            match retried.outcome {
+                download::DownloadOutcome::Success => {}
+                download::DownloadOutcome::SessionExpired { .. } => {
+                    *cycle_session_expired = true;
+                    *db_sync_token_advance_safe = false;
+                }
+                download::DownloadOutcome::PartialFailure { failed_count } => {
+                    *cycle_failed_count = cycle_failed_count.saturating_add(failed_count);
+                }
+            }
+            if retried.stats.state_write_failures > 0 || retried.stats.interrupted {
+                *db_sync_token_advance_safe = false;
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            *cycle_failed_count = cycle_failed_count.saturating_add(1);
+            *db_sync_token_advance_safe = false;
+            tracing::warn!(
+                error = %error,
+                context,
+                "Due admitted selection retry failed while the epoch was held"
+            );
+            return false;
+        }
+    }
+    true
+}
+
 async fn run_epoch_local_recovery(
     download_client: &reqwest::Client,
     db: &dyn download::DownloadStore,
@@ -1628,6 +1684,33 @@ pub(crate) async fn run_cycle_with_witness(
                         true,
                     );
                     db_sync_token_advance_safe = false;
+                    if !is_retry_failed
+                        && !config.runtime.only_print_filenames
+                        && download_controls.run_mode.downloads_files()
+                        && !shutdown_token.is_cancelled()
+                    {
+                        let download_client = shared_session.read().await.download_client().clone();
+                        let retry_config = build_download_config(
+                            download::SyncMode::Full,
+                            Arc::new(rustc_hash::FxHashSet::default()),
+                            Arc::new(download::AssetGroupings::default()),
+                            Arc::from(lib_state.zone_name.as_str()),
+                        );
+                        let retry_config = Arc::new(retry_config.check_ownership().await?);
+                        let _ = retry_due_admitted_while_held(
+                            &download_client,
+                            lib_state,
+                            retry_config,
+                            download_controls,
+                            shutdown_token,
+                            &mut cycle_stats,
+                            &mut cycle_failed_count,
+                            &mut cycle_session_expired,
+                            &mut db_sync_token_advance_safe,
+                            "indexing qualification",
+                        )
+                        .await;
+                    }
                     continue;
                 }
                 state::QualificationReserve::NotPending => {
@@ -1683,6 +1766,10 @@ pub(crate) async fn run_cycle_with_witness(
                 )
                 .await?
             };
+            let retry_during_hold = matches!(
+                &epoch_gate,
+                state::SyncEpochGate::Defer { .. } | state::SyncEpochGate::Blocked { .. }
+            );
             match epoch_gate {
                 state::SyncEpochGate::Open => {}
                 state::SyncEpochGate::Baseline { attempt } => {
@@ -1781,7 +1868,7 @@ pub(crate) async fn run_cycle_with_witness(
                     // Indexing already ran. Keep local path, layout and metadata
                     // recovery moving even while the provider baseline waits.
                     let download_client = shared_session.read().await.download_client().clone();
-                    let local = run_epoch_local_recovery(
+                    let local = Box::pin(run_epoch_local_recovery(
                         &download_client,
                         db,
                         lib_state,
@@ -1792,7 +1879,7 @@ pub(crate) async fn run_cycle_with_witness(
                             && !indexing_reconciliation
                             && pending_download_config_hash.is_some()
                             && download_controls.run_mode.downloads_files(),
-                    )
+                    ))
                     .await?;
                     cycle_failed_count = cycle_failed_count.saturating_add(local.failures);
                     if let Some(stats) = local.reconciliation_stats {
@@ -1802,6 +1889,26 @@ pub(crate) async fn run_cycle_with_witness(
                     path_reconciliation_cycle_safe &= local.path_safe;
                     if local.failures > 0 {
                         db_sync_token_advance_safe = false;
+                    }
+                    if retry_during_hold
+                        && !is_retry_failed
+                        && !config.runtime.only_print_filenames
+                        && download_controls.run_mode.downloads_files()
+                        && !shutdown_token.is_cancelled()
+                    {
+                        let _ = retry_due_admitted_while_held(
+                            &download_client,
+                            lib_state,
+                            Arc::clone(&local.config),
+                            download_controls,
+                            shutdown_token,
+                            &mut cycle_stats,
+                            &mut cycle_failed_count,
+                            &mut cycle_session_expired,
+                            &mut db_sync_token_advance_safe,
+                            "deferred epoch",
+                        )
+                        .await;
                     }
                     db.set_metadata(LAST_RECOVERY_ACTION_KEY, "source_epoch_deferred")
                         .await?;
@@ -1927,7 +2034,7 @@ pub(crate) async fn run_cycle_with_witness(
                 continue;
             };
             let download_client = shared_session.read().await.download_client().clone();
-            let local = run_epoch_local_recovery(
+            let local = Box::pin(run_epoch_local_recovery(
                 &download_client,
                 db,
                 lib_state,
@@ -1938,7 +2045,7 @@ pub(crate) async fn run_cycle_with_witness(
                     && !indexing_reconciliation
                     && pending_download_config_hash.is_some()
                     && download_controls.run_mode.downloads_files(),
-            )
+            ))
             .await?;
             cycle_failed_count = cycle_failed_count.saturating_add(local.failures);
             if let Some(stats) = local.reconciliation_stats {
@@ -1949,7 +2056,28 @@ pub(crate) async fn run_cycle_with_witness(
             if local.failures > 0 {
                 db_sync_token_advance_safe = false;
             }
-            if local.failures == 0
+            let mut replay_ok = true;
+            if !is_retry_failed
+                && !config.runtime.only_print_filenames
+                && download_controls.run_mode.downloads_files()
+                && !shutdown_token.is_cancelled()
+            {
+                replay_ok = retry_due_admitted_while_held(
+                    &download_client,
+                    lib_state,
+                    Arc::clone(&local.config),
+                    download_controls,
+                    shutdown_token,
+                    &mut cycle_stats,
+                    &mut cycle_failed_count,
+                    &mut cycle_session_expired,
+                    &mut db_sync_token_advance_safe,
+                    "epoch promotion",
+                )
+                .await;
+            }
+            if replay_ok
+                && local.failures == 0
                 && !cycle_session_expired
                 && !shutdown_token.is_cancelled()
                 && download_controls.run_mode.downloads_files()
@@ -3276,18 +3404,6 @@ pub(crate) async fn run_cycle_with_witness(
             || sync_result.checkpoint.retained_token_rejected
             || blocked_non_sparse
             || checkpoint_persistence == "failed";
-        let sparse = match (&expected_epoch, &expected_attempt) {
-            (Some(epoch), Some(attempt)) => {
-                let mut witness = sync_result.checkpoint.sparse_current.clone();
-                witness.bind_epoch(epoch, attempt);
-                witness.bind_baseline_scope(&lib_state.library.baseline_scope());
-                Some(SparseHeldWitness {
-                    witness,
-                    completed_delta_replay: sync_result.checkpoint.completed_delta_replay,
-                })
-            }
-            _ => None,
-        };
         if let Some(source) = sources
             .iter_mut()
             .find(|source| source.zone_name == lib_state.zone_name)
@@ -3296,7 +3412,18 @@ pub(crate) async fn run_cycle_with_witness(
             source.ordinary_committed = checkpoint_persistence == "stored";
             source.genuine_error =
                 genuine_error || source.baseline_scope != lib_state.library.baseline_scope();
-            source.sparse = sparse;
+            source.sparse = match (&expected_epoch, &expected_attempt) {
+                (Some(epoch), Some(attempt)) => {
+                    let mut witness = sync_result.checkpoint.sparse_current.clone();
+                    witness.bind_epoch(epoch, attempt);
+                    witness.bind_baseline_scope(&lib_state.library.baseline_scope());
+                    Some(SparseHeldWitness {
+                        witness,
+                        completed_delta_replay: sync_result.checkpoint.completed_delta_replay,
+                    })
+                }
+                _ => None,
+            };
         }
         if let Some(fields) = checkpoint_evidence.as_object_mut() {
             fields.insert(

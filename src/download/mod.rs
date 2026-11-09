@@ -38,7 +38,7 @@ pub(crate) use orchestration::context::{ClaimedLegacyMasterStates, DownloadConte
 use orchestration::context::{RecordedLocalFile, preload_download_context};
 pub use orchestration::dispatch::download_photos_with_sync;
 pub(crate) use orchestration::generation::{
-    has_current_observation, has_due as has_due_selection_work,
+    has_current_observation, has_due as has_due_selection_work, replay_due_admitted_selection,
 };
 pub(crate) use orchestration::maintenance::{
     RefreshTailOutcome, drain_pending_metadata_rewrites, drain_pending_metadata_rewrites_witnessed,
