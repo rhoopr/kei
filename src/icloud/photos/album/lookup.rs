@@ -184,6 +184,67 @@ impl RecordLookupRequest {
     }
 }
 
+/// Private strict catalog-pair outcome. This is deliberately separate from
+/// `RecordResolution`: it never grants deletion authority from a master-only
+/// lookup, a not-found response, a tombstone without a typed pair, or the
+/// ordinary family boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StrictCatalogRefusal {
+    UnavailableAuthority,
+    Authentication,
+    RateLimited,
+    Request,
+    Malformed,
+    NotFound,
+    ProviderError,
+    Omitted,
+    Duplicate,
+    Sibling,
+    WrongType,
+    WrongZone,
+    ReferenceMismatch,
+    InconsistentDeletion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StrictCatalogPairEvidence {
+    pub(crate) database: Arc<str>,
+    pub(crate) zone: Value,
+    pub(crate) master_record_name: ProviderRecordId,
+    pub(crate) child_record_name: ProviderRecordId,
+    pub(crate) master_type: Arc<str>,
+    pub(crate) child_type: Arc<str>,
+    pub(crate) reference_exact: bool,
+    pub(crate) explicit_deleted: bool,
+}
+
+#[allow(dead_code)] // strict pair integration is gated; focused lookup tests read all variants.
+#[derive(Debug)]
+pub(crate) enum StrictCatalogPairResult {
+    Deleted {
+        deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+        evidence: StrictCatalogPairEvidence,
+    },
+    Live {
+        #[allow(dead_code)]
+        // catalog drain integration is gated; live result is for owned-child debt only.
+        asset: PhotoAsset,
+        evidence: StrictCatalogPairEvidence,
+    },
+    Refused {
+        reason: StrictCatalogRefusal,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct StrictCatalogPairOutcome {
+    #[allow(dead_code)] // catalog drain integration is gated; tests read the result.
+    pub(crate) result: StrictCatalogPairResult,
+    #[allow(dead_code)]
+    // catalog drain integration is gated; retained for bounded retry accounting.
+    pub(crate) rate_limit_observations: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ProviderLookupError {
     #[error("provider authentication failed with HTTP {status}: {message}")]
@@ -454,7 +515,302 @@ fn merge_record_resolution(existing: &mut RecordResolution, incoming: RecordReso
     }
 }
 
+#[allow(dead_code)] // strict pair integration is gated; focused lookup tests exercise it.
+#[derive(Clone)]
+struct StrictCatalogAuthority {
+    database: Arc<str>,
+    zone: Value,
+}
+
+#[allow(dead_code)] // strict pair integration is gated; focused lookup tests exercise it.
+fn strict_zone_matches(actual: &Value, expected: &Value) -> bool {
+    let Some(actual) = actual.as_object() else {
+        return false;
+    };
+    let Some(expected) = expected.as_object() else {
+        return false;
+    };
+    actual.get("zoneName") == expected.get("zoneName")
+        && actual.get("ownerRecordName") == expected.get("ownerRecordName")
+        && actual
+            .get("zoneName")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.trim().is_empty())
+        && actual
+            .get("ownerRecordName")
+            .and_then(Value::as_str)
+            .is_some_and(|owner| !owner.trim().is_empty())
+}
+
+#[allow(dead_code)] // strict pair integration is gated; focused lookup tests exercise it.
+fn strict_authority(album: &PhotoAlbum) -> Option<StrictCatalogAuthority> {
+    let (capture, scope, zone) = album.download_scope().ok().flatten()?;
+    let (account, provider) = capture.owner.authenticated_keys().ok()?;
+    if account.trim().is_empty() || provider.trim().is_empty() {
+        return None;
+    }
+    let scope: Value = serde_json::from_str(&scope).ok()?;
+    let database = scope.get("database").and_then(Value::as_str)?;
+    if !matches!(database, "private" | "shared")
+        || scope.get("zone") != Some(&zone)
+        || !strict_zone_matches(&zone, album.zone_id.as_ref())
+    {
+        return None;
+    }
+    Some(StrictCatalogAuthority {
+        database: Arc::from(database),
+        zone,
+    })
+}
+
+#[allow(dead_code)] // strict pair integration is gated; focused lookup tests exercise it.
+fn strict_explicit_deletion(record: &Value, expected_type: &str) -> Result<bool, ()> {
+    if record.get("recordType").and_then(Value::as_str) != Some(expected_type)
+        || record
+            .get("serverErrorCode")
+            .is_some_and(|code| !code.is_null())
+    {
+        return Err(());
+    }
+    if let Some(deleted) = record.get("deleted") {
+        return match deleted.as_bool() {
+            Some(true) => Ok(true),
+            Some(false) => Ok(false),
+            None => Err(()),
+        };
+    }
+    returned_deletion(Some(record), expected_type)
+}
+
+#[allow(dead_code)] // strict pair integration is gated; focused lookup tests exercise it.
+fn strict_deleted_at(master: &Value, child: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    master
+        .pointer("/fields/deletedDate/value")
+        .and_then(Value::as_i64)
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .or_else(|| {
+            master
+                .pointer("/fields/dateExpunged/value")
+                .and_then(Value::as_f64)
+                .and_then(crate::icloud::photos::asset::f64_to_millis_datetime)
+        })
+        .or_else(|| {
+            child
+                .pointer("/fields/dateExpunged/value")
+                .and_then(Value::as_f64)
+                .and_then(crate::icloud::photos::asset::f64_to_millis_datetime)
+        })
+}
+
 impl PhotoAlbum {
+    /// Resolve one exact master+child pair for catalog deletion custody.
+    /// Authority comes from the authenticated album source, not from a caller
+    /// string. Any error, omission, duplicate, sibling, wrong scope, wrong
+    /// type, wrong reference, or contradictory deletion state is a refusal.
+    /// Ordinary `resolve_records` is unchanged.
+    #[allow(dead_code)] // strict pair integration is gated; focused lookup tests exercise it.
+    pub(crate) async fn lookup_catalog_pair_strict(
+        &self,
+        master_record_name: &ProviderRecordId,
+        child_record_name: &ProviderRecordId,
+    ) -> StrictCatalogPairOutcome {
+        let refused = |reason| StrictCatalogPairOutcome {
+            result: StrictCatalogPairResult::Refused { reason },
+            rate_limit_observations: 0,
+        };
+        let Some(authority) = strict_authority(self) else {
+            return refused(StrictCatalogRefusal::UnavailableAuthority);
+        };
+        let url = format!(
+            "{}/records/lookup?{}",
+            self.service_endpoint,
+            encode_params(&self.params)
+        );
+        let body = json!({
+            "records": [
+                {"recordName": master_record_name.as_str()},
+                {"recordName": child_record_name.as_str()},
+            ],
+            "zoneID": authority.zone,
+            "desiredKeys": &*IDENTITY_LOOKUP_KEYS_VALUES,
+        });
+        let retried = session::retry_post_allowing_record_errors(
+            self.session.as_ref(),
+            &url,
+            &body.to_string(),
+            &[("Content-type", "text/plain")],
+            &self.retry_config,
+        )
+        .await;
+        let rate_limit_observations = retried.rate_limit_observations;
+        let with_rate = |result| StrictCatalogPairOutcome {
+            result,
+            rate_limit_observations,
+        };
+        let response = match retried.response {
+            Ok(response) => response,
+            Err(error) => {
+                return with_rate(StrictCatalogPairResult::Refused {
+                    reason: match classify_provider_lookup_error(&error) {
+                        ProviderLookupError::Authentication { .. } => {
+                            StrictCatalogRefusal::Authentication
+                        }
+                        ProviderLookupError::RateLimited { .. } => {
+                            StrictCatalogRefusal::RateLimited
+                        }
+                        ProviderLookupError::Request(_) => StrictCatalogRefusal::Request,
+                        ProviderLookupError::Malformed(_) => StrictCatalogRefusal::Malformed,
+                    },
+                });
+            }
+        };
+        let Some(records) = response.get("records").and_then(Value::as_array) else {
+            return with_rate(StrictCatalogPairResult::Refused {
+                reason: StrictCatalogRefusal::Malformed,
+            });
+        };
+        let mut by_name: FxHashMap<&str, &Value> = FxHashMap::default();
+        for record in records {
+            let Some(name) = record.get("recordName").and_then(Value::as_str) else {
+                return with_rate(StrictCatalogPairResult::Refused {
+                    reason: StrictCatalogRefusal::Malformed,
+                });
+            };
+            if name != master_record_name.as_str() && name != child_record_name.as_str() {
+                return with_rate(StrictCatalogPairResult::Refused {
+                    reason: StrictCatalogRefusal::Sibling,
+                });
+            }
+            if by_name.insert(name, record).is_some() {
+                return with_rate(StrictCatalogPairResult::Refused {
+                    reason: StrictCatalogRefusal::Duplicate,
+                });
+            }
+        }
+        let Some(master) = by_name.get(master_record_name.as_str()).copied() else {
+            return with_rate(StrictCatalogPairResult::Refused {
+                reason: StrictCatalogRefusal::Omitted,
+            });
+        };
+        let Some(child) = by_name.get(child_record_name.as_str()).copied() else {
+            return with_rate(StrictCatalogPairResult::Refused {
+                reason: StrictCatalogRefusal::Omitted,
+            });
+        };
+        for record in [master, child] {
+            if let Some(code) = record.get("serverErrorCode").filter(|code| !code.is_null()) {
+                let reason = match code.as_str() {
+                    Some("UNKNOWN_ITEM" | "NOT_FOUND") => StrictCatalogRefusal::NotFound,
+                    _ => StrictCatalogRefusal::ProviderError,
+                };
+                return with_rate(StrictCatalogPairResult::Refused { reason });
+            }
+        }
+        if master.get("recordType").and_then(Value::as_str) != Some("CPLMaster")
+            || child.get("recordType").and_then(Value::as_str) != Some("CPLAsset")
+        {
+            return with_rate(StrictCatalogPairResult::Refused {
+                reason: StrictCatalogRefusal::WrongType,
+            });
+        }
+        for record in [master, child] {
+            let Some(zone) = record.get("zoneID") else {
+                return with_rate(StrictCatalogPairResult::Refused {
+                    reason: StrictCatalogRefusal::WrongZone,
+                });
+            };
+            if !strict_zone_matches(zone, &authority.zone) {
+                return with_rate(StrictCatalogPairResult::Refused {
+                    reason: StrictCatalogRefusal::WrongZone,
+                });
+            }
+        }
+        let Some(reference) = child.pointer("/fields/masterRef/value") else {
+            return with_rate(StrictCatalogPairResult::Refused {
+                reason: StrictCatalogRefusal::ReferenceMismatch,
+            });
+        };
+        if reference.get("recordName").and_then(Value::as_str) != Some(master_record_name.as_str())
+        {
+            return with_rate(StrictCatalogPairResult::Refused {
+                reason: StrictCatalogRefusal::ReferenceMismatch,
+            });
+        }
+        let Some(reference_zone) = reference.get("zoneID") else {
+            return with_rate(StrictCatalogPairResult::Refused {
+                reason: StrictCatalogRefusal::WrongZone,
+            });
+        };
+        if !strict_zone_matches(reference_zone, &authority.zone) {
+            return with_rate(StrictCatalogPairResult::Refused {
+                reason: StrictCatalogRefusal::WrongZone,
+            });
+        }
+        let master_deleted = match strict_explicit_deletion(master, "CPLMaster") {
+            Ok(value) => value,
+            Err(()) => {
+                return with_rate(StrictCatalogPairResult::Refused {
+                    reason: StrictCatalogRefusal::Malformed,
+                });
+            }
+        };
+        let child_deleted = match strict_explicit_deletion(child, "CPLAsset") {
+            Ok(value) => value,
+            Err(()) => {
+                return with_rate(StrictCatalogPairResult::Refused {
+                    reason: StrictCatalogRefusal::Malformed,
+                });
+            }
+        };
+        let evidence = StrictCatalogPairEvidence {
+            database: Arc::clone(&authority.database),
+            zone: authority.zone,
+            master_record_name: master_record_name.clone(),
+            child_record_name: child_record_name.clone(),
+            master_type: Arc::from("CPLMaster"),
+            child_type: Arc::from("CPLAsset"),
+            reference_exact: true,
+            explicit_deleted: master_deleted && child_deleted,
+        };
+        match (master_deleted, child_deleted) {
+            (true, true) => with_rate(StrictCatalogPairResult::Deleted {
+                deleted_at: strict_deleted_at(master, child),
+                evidence,
+            }),
+            (false, false) => {
+                let master = match serde_json::from_value::<cloudkit::Record>(master.clone()) {
+                    Ok(record) => record,
+                    Err(_) => {
+                        return with_rate(StrictCatalogPairResult::Refused {
+                            reason: StrictCatalogRefusal::Malformed,
+                        });
+                    }
+                };
+                let child = match serde_json::from_value::<cloudkit::Record>(child.clone()) {
+                    Ok(record) => record,
+                    Err(_) => {
+                        return with_rate(StrictCatalogPairResult::Refused {
+                            reason: StrictCatalogRefusal::Malformed,
+                        });
+                    }
+                };
+                match PhotoAsset::try_from_records(
+                    master,
+                    &child,
+                    RequiredAssetFields::Downloadable,
+                ) {
+                    Ok(asset) => with_rate(StrictCatalogPairResult::Live { asset, evidence }),
+                    Err(_) => with_rate(StrictCatalogPairResult::Refused {
+                        reason: StrictCatalogRefusal::Malformed,
+                    }),
+                }
+            }
+            _ => with_rate(StrictCatalogPairResult::Refused {
+                reason: StrictCatalogRefusal::InconsistentDeletion,
+            }),
+        }
+    }
+
     /// Resolve durable pending identities without scanning the surrounding
     /// album or library. Missing response members are inconclusive; only an
     /// explicit CloudKit not-found result or tombstone is deletion evidence.

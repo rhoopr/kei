@@ -1022,3 +1022,122 @@ async fn catalog_tag_scope_survives_baseline_unfiled_reader_paths() {
         .unwrap();
     assert_eq!(debt, 1);
 }
+
+/// Baseline-key ABA on the actual old writer primitives.
+///
+/// `sync_cycle.rs:1859-1861` writes the baseline key; `sync_cycle.rs:2139`
+/// deletes it before a rejected-boundary retry; the next attempt writes the
+/// same key and cursor again. The old writer knows nothing about catalog
+/// rounds, so an observing catalog origin with the same library/boundary
+/// survives untouched. This test executes that exact durable write/delete/
+/// rewrite sequence with the actual state-owner methods and shows the new
+/// reader cannot distinguish same-origin resume from the recreated key.
+#[tokio::test]
+async fn old_writer_baseline_key_aba_leaves_observing_catalog_origin_indistinguishable() {
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
+    let cursor = "same-provider-boundary";
+    let boundary = format!("{:x}", Sha256::digest(cursor.as_bytes()));
+    let baseline_key = "baseline_cursor:v27:synthetic:policy:";
+    let epoch = "11111111-1111-1111-1111-111111111111";
+    let attempt = "22222222-2222-2222-2222-222222222222";
+    let nonce = "33333333-3333-3333-3333-333333333333";
+    let scope = format!("catalog:v2:{}:{epoch}:{attempt}:{nonce}", "a".repeat(64));
+    let epoch_key = crate::state::db::sync_epoch::library_key("PrimarySync");
+    let descriptor_key = "observed_selection:v27:PrimarySync";
+    db.set_metadata(&epoch_key, "epoch-snapshot").await.unwrap();
+    db.set_metadata(descriptor_key, "descriptor-snapshot")
+        .await
+        .unwrap();
+    {
+        let conn = db.acquire_lock("seed surviving catalog origin").unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_rounds VALUES(?1,'PrimarySync',?2,'policy',?3,'','','observing')",
+            rusqlite::params![nonce, scope, boundary],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id) VALUES(?1,'asset')",
+            [nonce],
+        )
+        .unwrap();
+    }
+    let durable = |db: &SqliteStateDb| {
+        let conn = db.acquire_lock("snapshot ABA state").unwrap();
+        let key: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [baseline_key],
+                |row| row.get(0),
+            )
+            .ok();
+        let epoch: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [&epoch_key],
+                |row| row.get(0),
+            )
+            .ok();
+        let descriptor: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [descriptor_key],
+                |row| row.get(0),
+            )
+            .ok();
+        let (phase, debt): (String, i64) = conn
+            .query_row(
+                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id=?1),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1)",
+                [nonce],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        (key, phase, debt, epoch, descriptor)
+    };
+
+    // Old writer first attempt: write the key.
+    db.set_metadata(baseline_key, cursor).await.unwrap();
+    let before = durable(db.as_ref());
+    assert_eq!(before.0.as_deref(), Some(cursor));
+    // Old writer rejected-boundary path deletes the key.
+    assert_eq!(db.delete_metadata_by_prefix(baseline_key).await.unwrap(), 1);
+    assert_eq!(durable(db.as_ref()).0, None);
+    // Next old writer baseline recreates the exact same key and cursor.
+    db.set_metadata(baseline_key, cursor).await.unwrap();
+    drop(db);
+
+    let reopened = SqliteStateDb::open_owned(&path, &owner()).await.unwrap();
+    let after = durable(&reopened);
+    assert_eq!(after.0.as_deref(), Some(cursor));
+    assert_eq!(after.1, "observing");
+    assert_eq!(after.2, 1);
+    assert_eq!(after.3, before.3);
+    assert_eq!(after.4, before.4);
+    // The proposed same-origin predicate sees the recreated key plus exactly
+    // one compatible live origin with no marker showing which write owns it.
+    let compatible = {
+        let conn = reopened
+            .acquire_lock("check same-origin predicate")
+            .unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM source_revalidation_rounds r
+             WHERE r.library='PrimarySync' AND r.boundary=?1
+               AND r.phase='observing' AND r.scope LIKE 'catalog:v2:%'
+               AND EXISTS(SELECT 1 FROM source_revalidation_debt d WHERE d.round=r.id)",
+            [boundary],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    eprintln!(
+        "B-ABA key_present={} round_phase={} debt={} compatible_live_origins={compatible}",
+        after.0.is_some(),
+        after.1,
+        after.2
+    );
+    assert_eq!(compatible, 1);
+}

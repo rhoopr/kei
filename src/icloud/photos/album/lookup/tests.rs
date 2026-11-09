@@ -14,8 +14,15 @@ use std::sync::Mutex;
 
 use super::{
     ProviderLookupError, ProviderRecordId, RecordLookupRequest, RecordResolution,
+    StrictCatalogPairEvidence, StrictCatalogPairResult, StrictCatalogRefusal,
     asset_identity_diagnostic, classify_provider_lookup_error, lookup_record_status,
 };
+use crate::icloud::photos::PhotoAlbum;
+use crate::icloud::photos::album::PhotoAlbumConfig;
+use crate::icloud::photos::inbox::ShadowCapture;
+use crate::state::SqliteStateDb;
+use crate::state::db::account::AccountOwner;
+use std::collections::HashMap;
 
 fn lookup_request(state_id: &str, master: &str, asset: &str) -> RecordLookupRequest {
     RecordLookupRequest::paired(
@@ -1454,4 +1461,248 @@ async fn issue956_single_target_statuses_do_not_invent_the_other_record() {
             && event.field("master_status") == Some("omitted")
             && event.field("child_status") == Some("not_requested"))
     );
+}
+
+fn strict_zone() -> Value {
+    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})
+}
+
+fn strict_album(session: Box<dyn PhotosSession>, zone: Value, database: &str) -> PhotoAlbum {
+    let mut album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(HashMap::new()),
+            service_endpoint: Arc::from(format!(
+                "https://synthetic.example/database/1/photos/production/{database}"
+            )),
+            name: Arc::from("StrictCatalog"),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(zone.clone()),
+            retry_config: RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        session,
+    );
+    let owner = AccountOwner::authenticated(
+        "strict@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"strict-catalog"}})).unwrap(),
+    )
+    .unwrap();
+    album.set_shadow_capture(
+        ShadowCapture::new(
+            Arc::new(SqliteStateDb::open_in_memory().unwrap()),
+            owner,
+            "com",
+        ),
+        Arc::from(database),
+    );
+    album
+}
+
+fn strict_deleted_master(name: &str) -> Value {
+    let mut record = test_master_record(name);
+    record["zoneID"] = strict_zone();
+    record["fields"]["isDeleted"] = json!({"value":1,"type":"INT64"});
+    record["fields"]["isExpunged"] = json!({"value":1,"type":"INT64"});
+    record["fields"]["dateExpunged"] = json!({"value":1792541032000_i64,"type":"TIMESTAMP"});
+    record
+}
+
+fn strict_deleted_child(child: &str, master: &str) -> Value {
+    let mut record = test_asset_record_for(child, master);
+    record["zoneID"] = strict_zone();
+    record["fields"]["masterRef"]["value"]["zoneID"] = strict_zone();
+    record["fields"]["isDeleted"] = json!({"value":1,"type":"INT64"});
+    record["fields"]["isExpunged"] = json!({"value":1,"type":"INT64"});
+    record["fields"]["dateExpunged"] = json!({"value":1792541032000_i64,"type":"TIMESTAMP"});
+    record
+}
+
+fn strict_live_master(name: &str) -> Value {
+    let mut record = test_master_record(name);
+    record["zoneID"] = strict_zone();
+    record
+}
+
+fn strict_live_child(child: &str, master: &str) -> Value {
+    let mut record = test_asset_record_for(child, master);
+    record["zoneID"] = strict_zone();
+    record["fields"]["masterRef"]["value"]["zoneID"] = strict_zone();
+    record
+}
+
+async fn strict_result(records: Vec<Value>) -> StrictCatalogPairResult {
+    let album = strict_album(
+        Box::new(MockPhotosSession::new().ok(json!({"records":records}))),
+        strict_zone(),
+        "private",
+    );
+    album
+        .lookup_catalog_pair_strict(
+            &ProviderRecordId::new("master"),
+            &ProviderRecordId::new("asset-master"),
+        )
+        .await
+        .result
+}
+
+#[tokio::test]
+async fn strict_catalog_pair_requires_typed_explicit_deleted_pair_and_leaves_ordinary_lookup_unchanged()
+ {
+    let master = strict_deleted_master("master");
+    let child = strict_deleted_child("asset-master", "master");
+    let response = json!({"records":[master.clone(), child.clone()]});
+    let album = strict_album(
+        Box::new(MockPhotosSession::new().ok(response.clone()).ok(response)),
+        strict_zone(),
+        "private",
+    );
+    let outcome = album
+        .lookup_catalog_pair_strict(
+            &ProviderRecordId::new("master"),
+            &ProviderRecordId::new("asset-master"),
+        )
+        .await;
+    let StrictCatalogPairResult::Deleted {
+        deleted_at,
+        evidence,
+    } = outcome.result
+    else {
+        panic!("typed explicit deleted pair must be accepted");
+    };
+    assert!(deleted_at.is_some());
+    assert!(evidence.explicit_deleted);
+    assert!(evidence.reference_exact);
+    assert_eq!(evidence.database.as_ref(), "private");
+    assert_eq!(evidence.master_record_name.as_str(), "master");
+    assert_eq!(evidence.child_record_name.as_str(), "asset-master");
+
+    // The ordinary resolution path is intentionally unchanged and still uses
+    // the family boolean, which the strict caller must not rely on.
+    let ordinary = album
+        .resolve_records(&[lookup_request("master", "master", "asset-master")])
+        .await;
+    assert!(matches!(
+        ordinary.results.as_slice(),
+        [(
+            _,
+            RecordResolution::Deleted {
+                master_family: true,
+                ..
+            }
+        )]
+    ));
+}
+
+#[tokio::test]
+async fn strict_catalog_pair_accepts_exact_live_pair_only() {
+    let master = strict_live_master("master");
+    let child = strict_live_child("asset-master", "master");
+    let result = strict_result(vec![master, child]).await;
+    assert!(matches!(
+        result,
+        StrictCatalogPairResult::Live {
+            evidence: StrictCatalogPairEvidence {
+                explicit_deleted: false,
+                reference_exact: true,
+                ..
+            },
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn strict_catalog_pair_refuses_errors_omissions_duplicates_siblings_scope_and_ref_ambiguity()
+{
+    let cases: Vec<(Vec<Value>, StrictCatalogRefusal)> = vec![
+        (
+            vec![
+                json!({"recordName":"master","serverErrorCode":"NOT_FOUND"}),
+                strict_deleted_child("asset-master", "master"),
+            ],
+            StrictCatalogRefusal::NotFound,
+        ),
+        (
+            vec![strict_deleted_master("master")],
+            StrictCatalogRefusal::Omitted,
+        ),
+        (
+            vec![
+                strict_deleted_master("master"),
+                strict_deleted_master("master"),
+                strict_deleted_child("asset-master", "master"),
+            ],
+            StrictCatalogRefusal::Duplicate,
+        ),
+        (
+            vec![
+                strict_deleted_master("master"),
+                strict_deleted_child("asset-other", "master"),
+            ],
+            StrictCatalogRefusal::Sibling,
+        ),
+        (
+            vec![strict_deleted_master("master"), {
+                let mut child = strict_deleted_child("asset-master", "master");
+                child["zoneID"] = json!({"zoneName":"PrimarySync","ownerRecordName":"other-owner"});
+                child
+            }],
+            StrictCatalogRefusal::WrongZone,
+        ),
+        (
+            vec![strict_deleted_master("master"), {
+                let mut child = strict_deleted_child("asset-master", "master");
+                child["fields"]["masterRef"]["value"]["recordName"] = json!("different-master");
+                child
+            }],
+            StrictCatalogRefusal::ReferenceMismatch,
+        ),
+        (
+            vec![
+                strict_deleted_master("master"),
+                strict_live_child("asset-master", "master"),
+            ],
+            StrictCatalogRefusal::InconsistentDeletion,
+        ),
+        (
+            vec![strict_deleted_master("master"), {
+                let mut child = strict_deleted_child("asset-master", "master");
+                child["fields"]["isDeleted"] = json!({"value":"yes","type":"STRING"});
+                child
+            }],
+            StrictCatalogRefusal::Malformed,
+        ),
+    ];
+    for (records, expected) in cases {
+        let result = strict_result(records.clone()).await;
+        assert!(
+            matches!(result, StrictCatalogPairResult::Refused { reason } if reason == expected),
+            "expected {expected:?}, records={records:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn strict_catalog_pair_refuses_missing_authenticated_authority() {
+    let album = make_album_with_session(
+        100,
+        Box::new(MockPhotosSession::new().ok(json!({"records":[]}))),
+    );
+    let outcome = album
+        .lookup_catalog_pair_strict(
+            &ProviderRecordId::new("master"),
+            &ProviderRecordId::new("asset-master"),
+        )
+        .await;
+    assert!(matches!(
+        outcome.result,
+        StrictCatalogPairResult::Refused {
+            reason: StrictCatalogRefusal::UnavailableAuthority
+        }
+    ));
 }
