@@ -1244,7 +1244,9 @@ struct MotionRefreshSession {
     inner: BaselineSession,
     stale_motion_url: String,
     fresh_motion_url: String,
-    lookups: Arc<Mutex<Vec<serde_json::Value>>>,
+    cycle: usize,
+    lookups: Arc<Mutex<Vec<(usize, serde_json::Value)>>>,
+    stale_lookups: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -1257,7 +1259,10 @@ impl crate::icloud::photos::PhotosSession for MotionRefreshSession {
     ) -> anyhow::Result<serde_json::Value> {
         if url.contains("/records/lookup?") {
             let request: serde_json::Value = serde_json::from_str(&body)?;
-            self.lookups.lock().unwrap().push(request.clone());
+            self.lookups
+                .lock()
+                .unwrap()
+                .push((self.cycle, request.clone()));
             let requested = request["records"].as_array().cloned().unwrap_or_default();
             let mut records = Vec::new();
             for record in self
@@ -1277,7 +1282,16 @@ impl crate::icloud::photos::PhotosSession for MotionRefreshSession {
                 if let Some(companion) = record["fields"].get_mut("resOriginalVidComplRes")
                     && companion["value"]["downloadURL"] == json!(self.stale_motion_url)
                 {
-                    companion["value"]["downloadURL"] = json!(self.fresh_motion_url);
+                    // The first exact revalidation must use the recorded stale
+                    // URL so the cycle proves the 410 -> fresh cleanup path.
+                    // Later lookups return the current URL.
+                    let first_lookup = self
+                        .stale_lookups
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        == 0;
+                    if !first_lookup {
+                        companion["value"]["downloadURL"] = json!(self.fresh_motion_url);
+                    }
                 }
                 records.push(record);
             }
@@ -1291,11 +1305,40 @@ impl crate::icloud::photos::PhotosSession for MotionRefreshSession {
     }
 }
 
+/// Real application config for an unfiled-only sync: albums none, unfiled
+/// true, every other option at its normal default.
+fn make_populated_app_config() -> crate::config::Config {
+    let data_dir = tempfile::tempdir().unwrap();
+    let globals = crate::config::GlobalArgs {
+        username: Some("baseline@example.invalid".to_string()),
+        domain: None,
+        data_dir: Some(data_dir.path().to_string_lossy().into_owned()),
+    };
+    let mut sync = crate::cli::SyncArgs::default();
+    sync.config_overrides.albums = vec!["none".to_string()];
+    sync.config_overrides.unfiled = Some(true);
+    crate::config::Config::build(&globals, &crate::cli::PasswordArgs::default(), sync, None)
+        .unwrap()
+}
+
 pub(in crate::sync_loop::runner::tests) async fn exercise_released_populated(
     case: ReleasedPopulatedCase,
 ) {
     let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
     let motion_refresh = matches!(case, ReleasedPopulatedCase::MotionRefresh36);
+    // The unchanged-master variant keeps the released master record name and
+    // the saved exclusive owner/mapping consistent, so pending revalidation
+    // asks for a record the provider actually serves.
+    let current_child = if motion_refresh {
+        "asset-old-master"
+    } else {
+        "asset-current-master"
+    };
+    let current_master = if motion_refresh {
+        "old-master"
+    } else {
+        "current-master"
+    };
     let provider_still = MEDIA.to_vec();
     let checksum = signature(&provider_still);
     let dir = tempfile::tempdir().unwrap();
@@ -1367,8 +1410,8 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_populated(
             );
         }
         conn.execute_batch(&format!(
-            "INSERT INTO legacy_master_state_owners VALUES ('{ZONE}','old-master','asset-current-master',1700000000);
-             INSERT INTO asset_master_mappings VALUES ('{ZONE}','asset-current-master','current-master',1700000000);
+            "INSERT INTO legacy_master_state_owners VALUES ('{ZONE}','old-master','{current_child}',1700000000);
+             INSERT INTO asset_master_mappings VALUES ('{ZONE}','{current_child}','{current_master}',1700000000);
              INSERT INTO asset_metadata_capture_revisions VALUES ('{ZONE}','old-master',1,1700000000);"
         ))
         .unwrap();
@@ -1413,7 +1456,7 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_populated(
         assert_eq!(version, i64::from(crate::state::schema::SCHEMA_VERSION));
     }
     assert!(
-        receipt_rows(&db_path, "asset-current-master").is_empty(),
+        receipt_rows(&db_path, current_child).is_empty(),
         "current selected child starts without a current receipt"
     );
     assert!(
@@ -1430,7 +1473,7 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_populated(
         rows(
             &db_path,
             &format!(
-                "SELECT * FROM assets WHERE library='{ZONE}' AND id='old-master' AND version_size='original'"
+                "SELECT filename,status,local_path,local_checksum,checksum,size_bytes FROM assets WHERE library='{ZONE}' AND id='old-master' AND version_size='original'"
             ),
         )
         .into_iter()
@@ -1495,7 +1538,7 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_populated(
     }
 
     let mut existing = pair(
-        "current-master",
+        current_master,
         "shared-only.JPG",
         &format!("{}/existing", server.uri()),
         1,
@@ -1512,36 +1555,44 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_populated(
         "fileChecksum":signature(MOTION)}});
     existing[0]["fields"]["resOriginalVidComplFileType"] =
         json!({"value":"com.apple.quicktime-movie"});
+    let mut new_item = pair("new-master", "new.JPG", &format!("{}/new", server.uri()), 2);
+    new_item[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    new_item[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
     let mut inventory = existing;
-    inventory.extend(pair(
-        "new-master",
-        "new.JPG",
-        &format!("{}/new", server.uri()),
-        2,
-    ));
+    inventory.extend(new_item);
     // A genuinely new item arrives on the concurrent bridge rather than the
     // first inventory page, so the baseline proves current progress as well as
     // byte-level reuse. The ordinary baseline provider's count side-channel
     // expects two initial assets and one concurrent addition.
-    let concurrent = pair(
+    let mut concurrent = pair(
         "during-master",
         "during.JPG",
         &format!("{}/during", server.uri()),
         3,
     );
+    concurrent[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    concurrent[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
 
     let token_key = sync_token_key(ZONE);
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
-    let pass_scope = json!({"zone":zone(),"name":"",
-        "list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
-        "obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted",
-        "query_filter":null,"container_id":null,"cross_zone_sources":[]});
+    let app_config = make_populated_app_config();
     let lookups = Arc::new(Mutex::new(Vec::new()));
+    let stale_lookups = Arc::new(AtomicUsize::new(0));
+    let new_name = if motion_refresh {
+        "new.JPG"
+    } else {
+        "new_YXNzZXQ.JPG"
+    };
+    let during_name = if motion_refresh {
+        "during.JPG"
+    } else {
+        "during_YXNzZXQ.JPG"
+    };
     let expected_tree = BTreeMap::from([
         ("shared-only.JPG".to_owned(), provider_still.clone()),
         ("shared-only.MOV".to_owned(), MOTION.to_vec()),
-        ("new_YXNzZXQ.JPG".to_owned(), MEDIA.to_vec()),
-        ("during_YXNzZXQ.JPG".to_owned(), MEDIA.to_vec()),
+        (new_name.to_owned(), MEDIA.to_vec()),
+        (during_name.to_owned(), MEDIA.to_vec()),
     ]);
     let mut durable_snapshot = None;
 
@@ -1571,7 +1622,9 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_populated(
                     inner: inner.clone(),
                     stale_motion_url: format!("{}/motion-stale", server.uri()),
                     fresh_motion_url: format!("{}/motion-fresh", server.uri()),
+                    cycle,
                     lookups: Arc::clone(&lookups),
+                    stale_lookups: Arc::clone(&stale_lookups),
                 })
             } else {
                 Box::new(inner.clone())
@@ -1587,19 +1640,50 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_populated(
             baseline_owner(),
             "com",
         ));
-        let passes = vec![AlbumPass {
-            kind: PassKind::Unfiled,
-            album: library.all(),
-            exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
-        }];
-        assert_eq!(passes[0].album.selection_scope(), pass_scope);
-        let mut selected = make_run_cycle_library_state_with_passes(ZONE, &token_key, passes);
+        // Resolve the real application selection (current SyncArgs defaults:
+        // albums none, unfiled true) through the production planner. This is
+        // not a manual AlbumPass override.
+        let selection = &app_config.filters.selection;
+        let selected_zones = crate::commands::zone_name_set(std::slice::from_ref(&library));
+        let collection_zones = selected_zones.clone();
+        let resolved_scope = crate::commands::pass_scope_for_zone(
+            selection,
+            ZONE,
+            &selected_zones,
+            &collection_zones,
+        );
+        assert!(resolved_scope.include_unfiled);
+        assert!(!resolved_scope.include_albums);
+        assert!(!resolved_scope.include_smart_folders);
+        let collection_context =
+            crate::commands::build_collection_context(selection, std::slice::from_ref(&library))
+                .await
+                .unwrap();
+        let plan = crate::commands::resolve_passes_for_scope(
+            &library,
+            selection,
+            resolved_scope,
+            &collection_context,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.passes.len(), 1, "unfiled-only selection");
+        assert_eq!(plan.passes[0].kind, PassKind::Unfiled);
+        let mut selected = make_run_cycle_library_state_with_passes(ZONE, &token_key, plan.passes);
+        assert_eq!(selected.pass_scope, resolved_scope);
         selected.library = library;
         let base = make_run_cycle_download_config_builder(&root, db.clone());
         let builder = |mode, exclude, groups, zone| {
             let mut config = (*base(mode, exclude, groups, zone)).clone();
             config.folder_structure = "none".into();
-            config.file_match_policy = crate::types::FileMatchPolicy::NameId7;
+            config.file_match_policy = if motion_refresh {
+                // The reported motion case keeps the original companion stem,
+                // which is the default name-size-dedup policy.
+                crate::types::FileMatchPolicy::NameSizeDedupWithSuffix
+            } else {
+                crate::types::FileMatchPolicy::NameId7
+            };
             Arc::new(config)
         };
         let result = run_cycle(
@@ -1685,23 +1769,24 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_populated(
             "cycle {cycle}: exact historical identity mutated"
         );
 
+        let completed_owner = if motion_refresh {
+            "old-master"
+        } else {
+            current_child
+        };
         let completed = db.get_downloaded_page(0, 100).await.unwrap();
         for (id, version, path) in [
-            ("asset-current-master", "original", still_path.as_path()),
-            (
-                "asset-current-master",
-                "live_original",
-                motion_path.as_path(),
-            ),
+            (completed_owner, "original", still_path.as_path()),
+            (completed_owner, "live_original", motion_path.as_path()),
             (
                 "asset-new-master",
                 "original",
-                root.join("new_YXNzZXQ.JPG").as_path(),
+                root.join(new_name).as_path(),
             ),
             (
                 "asset-during-master",
                 "original",
-                root.join("during_YXNzZXQ.JPG").as_path(),
+                root.join(during_name).as_path(),
             ),
         ] {
             let row = completed
@@ -1718,7 +1803,7 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_populated(
                 "cycle {cycle}: {id}/{version} must keep the original destination"
             );
         }
-        let receipts = receipt_rows(&db_path, "asset-current-master");
+        let receipts = receipt_rows(&db_path, current_child);
         assert_eq!(
             receipts.len(),
             2,
@@ -1785,12 +1870,36 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_populated(
 
     if motion_refresh {
         let lookups = lookups.lock().unwrap();
-        assert_eq!(lookups.len(), 1, "one bounded exact cleanup lookup");
-        let body = lookups[0].to_string();
-        assert!(body.contains("asset-current"), "exact child lookup: {body}");
+        let allowed = [
+            "asset-old-master",
+            "old-master",
+            "asset-new-master",
+            "new-master",
+            "asset-during-master",
+            "during-master",
+        ];
+        let mut per_cycle = [0usize; 3];
+        for (cycle, body) in lookups.iter() {
+            per_cycle[*cycle] += 1;
+            for record in body["records"].as_array().into_iter().flatten() {
+                let name = record["recordName"].as_str().unwrap();
+                assert!(
+                    allowed.contains(&name),
+                    "lookup crossed the fixture identity set: {name}"
+                );
+            }
+        }
         assert!(
-            body.contains("current-master"),
-            "exact master lookup: {body}"
+            lookups
+                .iter()
+                .any(|(cycle, body)| *cycle == 0 && body.to_string().contains("old-master")),
+            "the expired-companion cycle must revalidate the exact released identity"
+        );
+        assert_eq!(per_cycle[1], 0, "first reopen must be quiet");
+        assert_eq!(per_cycle[2], 0, "second reopen must be quiet");
+        assert!(
+            (1..=14).contains(&per_cycle[0]),
+            "bounded first-cycle revalidation probes: {per_cycle:?}"
         );
     }
     let requests = server.received_requests().await.unwrap();

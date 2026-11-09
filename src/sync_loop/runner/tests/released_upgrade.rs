@@ -273,12 +273,6 @@ async fn released_populated_same_identity_reuse_28() {
 /// adoption and cycle own enrollment, local reuse, expired-URL refresh and
 /// publish at the original companion stem.
 ///
-/// Held for the next expansion: the synthetic provider must answer the
-/// released `old-master` revalidation lookup with the exact current record
-/// before the expired-companion positive is faithful. The first run is
-/// preserved in `l4-populated-motion36-run1.log`; it is not claimed as a
-/// product defect.
-#[ignore = "fixture authority: old failed companion revalidation lookup mapping not yet represented"]
 #[tokio::test]
 async fn released_populated_expired_companion_refresh_36() {
     super::v027_baseline::PRESERVE_SHARED_CLAIMS
