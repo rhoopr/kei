@@ -1230,6 +1230,8 @@ pub(in crate::sync_loop::runner::tests) enum ReleasedPopulatedCase {
     /// Schema 28 Shared history whose exact child owns the separated still and
     /// motion. Both verify from local bytes with no provider GET.
     SameIdentityReuse28,
+    /// The same positive on the genuine schema-36 shape.
+    SameIdentityReuse36,
     /// Schema 36 Shared history with a recorded failed live companion. The
     /// still verifies locally, the companion expires once during the ordinary
     /// cycle and must settle from the exact fresh URL at the original stem.
@@ -1368,7 +1370,7 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_populated(
                     28
                 );
             }
-            ReleasedPopulatedCase::MotionRefresh36 => {
+            ReleasedPopulatedCase::SameIdentityReuse36 | ReleasedPopulatedCase::MotionRefresh36 => {
                 crate::state::schema::migrate_genuine_v36(&conn).unwrap();
                 assert_eq!(
                     conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
@@ -2080,14 +2082,6 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_controls(
         .collect::<Vec<_>>()
     };
     let old_before = old_snapshot();
-    let failed_before = changed_master.then(|| {
-        rows(
-            &db_path,
-            &format!(
-                "SELECT status,local_path,last_error FROM assets WHERE library='{ZONE}' AND id='old-master' AND version_size='live_original'"
-            ),
-        )
-    });
     let old_still_mtime = changed_master.then(|| {
         std::fs::metadata(&current_still)
             .unwrap()
@@ -2368,7 +2362,27 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_controls(
                 ),
                 "old debt stays failed or retryable, never completed: {retained:?}"
             );
-            let _ = failed_before;
+            // The owner's durable reason is the pending released obligation
+            // itself: provider identity retained, no destination, not completed.
+            let retained_identity = rows(
+                &db_path,
+                &format!(
+                    "SELECT checksum,size_bytes,filename FROM assets WHERE library='{ZONE}' AND id='old-master' AND version_size='live_original'"
+                ),
+            );
+            assert_eq!(retained_identity.len(), 1);
+            assert_eq!(
+                retained_identity[0][0],
+                rusqlite::types::Value::Text(signature(MOTION))
+            );
+            assert_eq!(
+                retained_identity[0][1],
+                rusqlite::types::Value::Integer(MOTION.len() as i64)
+            );
+            assert_eq!(
+                retained_identity[0][2],
+                rusqlite::types::Value::Text("shared-only.MOV".into())
+            );
             assert_eq!(old_snapshot(), old_before);
             let receipts = rows(
                 &db_path,
@@ -2863,5 +2877,325 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_protected_his
 async fn released_protected_history_survives_fault_and_quiet_reopens_28() {
     super::PRESERVE_SHARED_CLAIMS
         .scope(true, exercise_released_protected_history())
+        .await;
+}
+
+/// C07/C15 category pair. Attribution-only ambiguity is not a preservation
+/// row; a real unfinished preservation record keeps opaque evidence and paths
+/// while same-library current media and the v27 token progress.
+pub(in crate::sync_loop::runner::tests) async fn exercise_released_preservation_category(
+    unfinished_preservation: bool,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = dir.path().join("released.db");
+    let db_path = dir.path().join("state.db");
+
+    let guarded = root.join("guarded.JPG");
+    let guarded_sidecar = root.join("guarded.JPG.xmp");
+    let preserved = root.join("preserved.JPG");
+    let preserved_sidecar = root.join("preserved.JPG.xmp");
+    let custom = root.join("custom-notes.xmp");
+    std::fs::write(&guarded, b"guarded ambiguity bytes").unwrap();
+    std::fs::write(&guarded_sidecar, b"guarded sidecar bytes").unwrap();
+    std::fs::write(&preserved, b"opaque preserved media bytes").unwrap();
+    std::fs::write(&preserved_sidecar, b"opaque preserved sidecar bytes").unwrap();
+    std::fs::write(&custom, b"opaque custom xmp-named bytes").unwrap();
+    let file_mtimes = [
+        guarded.as_path(),
+        guarded_sidecar.as_path(),
+        preserved.as_path(),
+        preserved_sidecar.as_path(),
+        custom.as_path(),
+    ]
+    .map(|path| std::fs::metadata(path).unwrap().modified().unwrap());
+
+    {
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        if unfinished_preservation {
+            crate::state::schema::migrate_genuine_v36(&conn).unwrap();
+            let files = json!([
+                {"root": root, "path": preserved, "sha256": null, "size": null},
+                {"root": root, "path": preserved_sidecar, "sha256": null, "size": null},
+                {"root": root, "path": custom, "sha256": null, "size": null},
+            ]);
+            conn.execute(
+                "INSERT INTO unattributed_legacy(library,asset_id,evidence_version,original_evidence,files,prepared_at) \
+                 VALUES(?1,'legacy-preserved',1,'opaque released preservation evidence',?2,1700000000)",
+                rusqlite::params![ZONE, files.to_string()],
+            )
+            .unwrap();
+            for path in [&preserved, &preserved_sidecar, &custom] {
+                conn.execute(
+                    "INSERT INTO unattributed_legacy_paths VALUES(?1,'legacy-preserved',?2,?3)",
+                    rusqlite::params![
+                        ZONE,
+                        crate::fs_util::confined_path_key(path).unwrap(),
+                        path.to_str().unwrap()
+                    ],
+                )
+                .unwrap();
+            }
+        } else {
+            crate::state::schema::migrate_genuine_v28(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at,last_outcome) \
+                 VALUES(?1,'ambiguous-source','[1,\"ambiguous-child\",\"SharedSync-absent\",\"historical-owner\"]','[1,\"ambiguous-child\",\"SharedSync-absent\",\"historical-owner\"]',7,1000,'[ambiguous]')",
+                rusqlite::params![ZONE],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO metadata VALUES (?1,?2)",
+            rusqlite::params![format!("sync_token:{ZONE}"), OLD_TOKEN],
+        )
+        .unwrap();
+    }
+    let columns = released_columns(&source);
+    let legacy_rows = released_rows(&source, &columns);
+    crate::state::db::account::adopt_legacy(
+        &source,
+        &db_path,
+        &baseline_owner(),
+        "baseline@example.invalid",
+        "com",
+    )
+    .await
+    .unwrap();
+    assert_eq!(released_rows(&db_path, &columns), legacy_rows);
+
+    let history_snapshot = || {
+        rows(
+            &db_path,
+            "SELECT library,source_record_name,original_evidence,observed_evidence,last_outcome FROM unresolved_sparse_identities ORDER BY library,source_record_name",
+        )
+        .into_iter()
+        .chain(rows(
+            &db_path,
+            "SELECT library,asset_id,evidence_version,original_evidence,files,prepared_at,active_generation FROM unattributed_legacy ORDER BY library,asset_id",
+        ))
+        .chain(rows(
+            &db_path,
+            "SELECT library,asset_id,path_key,local_path FROM unattributed_legacy_paths ORDER BY library,asset_id,path_key",
+        ))
+        .collect::<Vec<_>>()
+    };
+    let history_before = history_snapshot();
+    let files_before = [
+        &guarded,
+        &guarded_sidecar,
+        &preserved,
+        &preserved_sidecar,
+        &custom,
+    ]
+    .map(|path| std::fs::read(path).unwrap());
+
+    let server = crate::test_helpers::start_wiremock_or_skip("released preservation category")
+        .await
+        .expect("acceptance server must bind");
+    for endpoint in ["/current", "/new"] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(MEDIA)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let checksum = signature(MEDIA);
+    let mut current = pair(
+        "current-master",
+        "current.JPG",
+        &format!("{}/current", server.uri()),
+        1,
+    );
+    current[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    current[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+    let mut new_item = pair("new-master", "new.JPG", &format!("{}/new", server.uri()), 2);
+    new_item[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    new_item[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+    let mut inventory = current;
+    inventory.extend(new_item);
+
+    let token_key = sync_token_key(ZONE);
+    let app_config = make_populated_app_config();
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let inventories = Arc::new(AtomicUsize::new(0));
+    for cycle in 0..3 {
+        let inner = Arc::new(
+            SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        let session = ProtectedSession {
+            records: Arc::new(inventory.clone()),
+            incremental: Arc::new(Vec::new()),
+            cycle,
+            inventories: Arc::clone(&inventories),
+        };
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/shared".to_string(),
+            Arc::new(std::collections::HashMap::new()),
+            Box::new(session.clone()),
+            Arc::new(zone()),
+            "shared".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+            inner.clone(),
+            baseline_owner(),
+            "com",
+        ));
+        let selection = &app_config.filters.selection;
+        let selected_zones = crate::commands::zone_name_set(std::slice::from_ref(&library));
+        let collection_zones = selected_zones.clone();
+        let resolved_scope = crate::commands::pass_scope_for_zone(
+            selection,
+            ZONE,
+            &selected_zones,
+            &collection_zones,
+        );
+        let collection_context =
+            crate::commands::build_collection_context(selection, std::slice::from_ref(&library))
+                .await
+                .unwrap();
+        let plan = crate::commands::resolve_passes_for_scope(
+            &library,
+            selection,
+            resolved_scope,
+            &collection_context,
+            &[],
+        )
+        .await
+        .unwrap();
+        let mut selected = make_run_cycle_library_state_with_passes(ZONE, &token_key, plan.passes);
+        selected.library = library;
+        let base = make_run_cycle_download_config_builder(&root, inner.clone());
+        let builder = |mode, exclude, groups, zone| {
+            let mut config = (*base(mode, exclude, groups, zone)).clone();
+            config.folder_structure = "none".into();
+            config.file_match_policy = crate::types::FileMatchPolicy::NameId7;
+            Arc::new(config)
+        };
+        let result = run_cycle(
+            &[&selected],
+            &app_config,
+            Some(inner.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
+        assert!(result.db_sync_token_advance_safe, "cycle {cycle}");
+        assert_eq!(
+            inner.get_metadata(&token_key).await.unwrap().as_deref(),
+            Some(format!("protected-after-{cycle}").as_str()),
+            "cycle {cycle}: current v27 checkpoint"
+        );
+        assert_eq!(
+            history_snapshot(),
+            history_before,
+            "cycle {cycle}: history rows"
+        );
+        let files_after = [
+            &guarded,
+            &guarded_sidecar,
+            &preserved,
+            &preserved_sidecar,
+            &custom,
+        ]
+        .map(|path| std::fs::read(path).unwrap());
+        assert_eq!(files_after, files_before, "cycle {cycle}: protected bytes");
+        assert_eq!(
+            [
+                &guarded,
+                &guarded_sidecar,
+                &preserved,
+                &preserved_sidecar,
+                &custom
+            ]
+            .map(|path| std::fs::metadata(path).unwrap().modified().unwrap()),
+            file_mtimes,
+            "cycle {cycle}: protected mtimes"
+        );
+
+        let status = crate::cycle_reporter::classify_cycle(
+            &result.stats,
+            result.failed_count,
+            result.session_expired,
+        );
+        if unfinished_preservation {
+            assert!(
+                result.stats.unattributed_legacy_assets >= 1,
+                "cycle {cycle}: preservation asset count"
+            );
+            assert!(
+                result.stats.unattributed_legacy_pending >= 1,
+                "cycle {cycle}: unfinished preservation remains pending"
+            );
+            assert_eq!(
+                status,
+                crate::cycle_reporter::CycleStatus::Failed,
+                "cycle {cycle}: report stays partial with failed_assets 0"
+            );
+        } else {
+            assert_eq!(
+                result.stats.unattributed_legacy_assets, 0,
+                "cycle {cycle}: attribution-only is not a preservation row"
+            );
+            assert_eq!(
+                result.stats.unattributed_legacy_pending, 0,
+                "cycle {cycle}: attribution-only is not current preservation debt"
+            );
+            assert_eq!(
+                status,
+                crate::cycle_reporter::CycleStatus::Success,
+                "cycle {cycle}: ordinary current progress"
+            );
+        }
+        assert_eq!(
+            result.stats.downloaded,
+            if cycle == 0 { 2 } else { 0 },
+            "cycle {cycle}: current media then quiet reopen"
+        );
+    }
+    let requests = server.received_requests().await.unwrap();
+    let count = |path: &str| {
+        requests
+            .iter()
+            .filter(|request| request.method.as_str() == "GET" && request.url.path() == path)
+            .count()
+    };
+    assert_eq!(count("/current"), 1);
+    assert_eq!(count("/new"), 1);
+    server.verify().await;
+    eprintln!(
+        "RELEASED_CATEGORY_REACHED preservation={unfinished_preservation} history_rows={}",
+        history_snapshot().len()
+    );
+}
+
+#[tokio::test]
+async fn released_attribution_only_ambiguity_keeps_current_progress_28() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(true, exercise_released_preservation_category(false))
+        .await;
+}
+
+#[tokio::test]
+async fn released_unfinished_preservation_reports_partial_while_progressing_36() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(true, exercise_released_preservation_category(true))
         .await;
 }

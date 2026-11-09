@@ -268,6 +268,20 @@ async fn released_populated_same_identity_reuse_28() {
         .await;
 }
 
+/// Populated released state from the genuine schema-36 constructor with the
+/// same-identity still and motion both reused locally.
+#[tokio::test]
+async fn released_populated_same_identity_reuse_36() {
+    super::v027_baseline::PRESERVE_SHARED_CLAIMS
+        .scope(
+            true,
+            super::v027_baseline::released_schema::exercise_released_populated(
+                super::v027_baseline::released_schema::ReleasedPopulatedCase::SameIdentityReuse36,
+            ),
+        )
+        .await;
+}
+
 /// Populated released state from the genuine schema-36 constructor with a
 /// recorded failed live companion. Every row is synthetic; the production
 /// adoption and cycle own enrollment, local reuse, expired-URL refresh and
