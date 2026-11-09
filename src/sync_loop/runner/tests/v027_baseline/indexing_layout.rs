@@ -16,6 +16,7 @@ use crate::sync_loop::test_support::{
     make_run_cycle_config, make_run_cycle_download_config_builder,
     make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle,
 };
+use base64::Engine as _;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -353,6 +354,48 @@ async fn run_pending_upgrade_indexing_cycle(
     .unwrap()
 }
 
+fn assert_released_catalog_preserved(
+    db: &SqliteStateDb,
+    path: &str,
+    provider_checksum: &str,
+    size: i64,
+) {
+    let conn = db
+        .acquire_lock("inspect preserved released catalog row")
+        .unwrap();
+    let (status, local_path, checksum, stored_size, metadata_paths): (
+        String,
+        Option<String>,
+        String,
+        i64,
+        i64,
+    ) = conn
+        .query_row(
+            "SELECT a.status,a.local_path,a.checksum,a.size_bytes, \
+             (SELECT count(*) FROM asset_metadata_paths p \
+              WHERE p.library=a.library AND p.id=a.id AND p.version_size=a.version_size \
+              AND p.local_path=a.local_path) \
+             FROM assets a WHERE a.library=?1 AND a.id='historical-asset' \
+             AND a.version_size='original'",
+            [ZONE],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(status, "downloaded");
+    assert_eq!(local_path.as_deref(), Some(path));
+    assert_eq!(checksum, provider_checksum);
+    assert_eq!(stored_size, size);
+    assert_eq!(metadata_paths, 1);
+}
+
 /// Faithful stock schema-36 upgrade: the owned open migrates as
 /// `existing_upgrade`, the first wake observes RUNNING and persists the
 /// indexing hold, the reopened second wake observes FINISHED. Current
@@ -374,24 +417,40 @@ async fn v027_pending_existing_upgrade_running_then_finished_qualifies_then_base
     std::fs::write(&old, b"preserved pending-upgrade historical bytes").unwrap();
     let old_bytes = std::fs::read(&old).unwrap();
     let old_mtime = std::fs::metadata(&old).unwrap().modified().unwrap();
+    let old_path = old.to_str().unwrap().to_owned();
+    let provider_checksum =
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&old_bytes));
+    let local_checksum = format!("{:x}", Sha256::digest(&old_bytes));
     let db_path = dir.path().join("state.db");
     seed_existing_upgrade_db(&db_path);
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
+        // Released schema 26/36 stores the active cursor under the legacy
+        // `sync_token:<zone>` key. It is the cursor the upgrade must clear and
+        // must never send as a post-upgrade provider token.
         conn.execute(
             "INSERT OR REPLACE INTO metadata(key,value) VALUES(?1,?2)",
-            rusqlite::params![format!("sync_token:v27:{ZONE}"), OLD_TOKEN],
+            rusqlite::params![format!("sync_token:{ZONE}"), OLD_TOKEN],
+        )
+        .unwrap();
+        // A populated released catalog row binds the preserved bytes by its
+        // actual path, downloaded status, provider checksum and size.
+        conn.execute(
+            "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,local_path,last_seen_at,local_checksum,download_checksum) \
+             VALUES(?1,'historical-asset','original',?2,'historical-edited.JPG',1700000000,?3,'photo','downloaded',?4,1700000000,?5,?5)",
+            rusqlite::params![
+                ZONE,
+                &provider_checksum,
+                old_bytes.len() as i64,
+                &old_path,
+                &local_checksum
+            ],
         )
         .unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO metadata(key,value) VALUES('baseline_cursor:v27:old-scope:old-enum:','old-boundary')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,last_seen_at) \
-             VALUES(?1,'historical-asset','original','historical-checksum','historical.JPG',0,0,'photo',0)",
-            [ZONE],
+            "INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum,download_checksum) \
+             VALUES(?1,'historical-asset','original',?2,?3,?4,?4)",
+            rusqlite::params![ZONE, &old_path, &provider_checksum, &local_checksum],
         )
         .unwrap();
     }
@@ -441,6 +500,14 @@ async fn v027_pending_existing_upgrade_running_then_finished_qualifies_then_base
         "RUNNING must persist the indexing hold"
     );
     assert_eq!(db.get_metadata(&key).await.unwrap(), None);
+    assert_eq!(
+        db.get_metadata(&format!("sync_token:{ZONE}"))
+            .await
+            .unwrap(),
+        None,
+        "the released legacy cursor key must be cleared by enrollment"
+    );
+    assert_released_catalog_preserved(&db, &old_path, &provider_checksum, old_bytes.len() as i64);
     assert_eq!(std::fs::read(&old).unwrap(), old_bytes);
     drop(db);
 
@@ -502,6 +569,7 @@ async fn v027_pending_existing_upgrade_running_then_finished_qualifies_then_base
         record_finished.next_attempt_at <= now,
         "successful qualification must restore the previous already-due deadline: {record_finished:?}"
     );
+    assert_released_catalog_preserved(&db, &old_path, &provider_checksum, old_bytes.len() as i64);
     assert_eq!(std::fs::read(&old).unwrap(), old_bytes);
     assert_eq!(
         std::fs::metadata(&old).unwrap().modified().unwrap(),
@@ -510,8 +578,8 @@ async fn v027_pending_existing_upgrade_running_then_finished_qualifies_then_base
     drop(db);
 
     // Third wake: ordinary epoch baseline from a fresh boundary, then a quiet
-    // incremental wake. The old released token is never requested, the old
-    // pre-epoch boundary survives, and the media GET happens exactly once.
+    // incremental wake. The released legacy cursor is never requested and the
+    // preserved catalog row survives, while the media GET happens exactly once.
     let db = Arc::new(
         SqliteStateDb::open_owned(&db_path, &baseline_owner())
             .await
@@ -527,7 +595,7 @@ async fn v027_pending_existing_upgrade_running_then_finished_qualifies_then_base
         &shared,
     )
     .await;
-    let (record_baseline, active_token, old_boundary) = {
+    let (record_baseline, active_token) = {
         let conn = db.acquire_lock("inspect completed epoch").unwrap();
         let record = crate::state::db::sync_epoch::read_library(&conn, ZONE)
             .unwrap()
@@ -537,14 +605,7 @@ async fn v027_pending_existing_upgrade_running_then_finished_qualifies_then_base
                 row.get(0)
             })
             .ok();
-        let old_boundary: Option<String> = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key='baseline_cursor:v27:old-scope:old-enum:'",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
-        (record, token, old_boundary)
+        (record, token)
     };
     eprintln!(
         "ORDINARY baseline after qualification: inventory_queries={} boundaries={} result={baseline:?} record={record_baseline:?}",
@@ -557,11 +618,7 @@ async fn v027_pending_existing_upgrade_running_then_finished_qualifies_then_base
     assert!(record_baseline.binding.is_none());
     assert!(active_token.is_some());
     assert_ne!(active_token.as_deref(), Some(OLD_TOKEN));
-    assert_eq!(
-        old_boundary.as_deref(),
-        Some("old-boundary"),
-        "the pre-epoch boundary must survive"
-    );
+    assert_released_catalog_preserved(&db, &old_path, &provider_checksum, old_bytes.len() as i64);
     assert_eq!(
         db.get_metadata(&indexing_reconciliation_key(ZONE))
             .await
@@ -588,6 +645,7 @@ async fn v027_pending_existing_upgrade_running_then_finished_qualifies_then_base
     assert_eq!(quiet.stats.downloaded, 0, "{quiet:?}");
     assert_eq!(quiet_counters.inventory_queries.load(Ordering::SeqCst), 0);
     assert_eq!(quiet_counters.boundaries.load(Ordering::SeqCst), 0);
+    assert_released_catalog_preserved(&db, &old_path, &provider_checksum, old_bytes.len() as i64);
     assert_eq!(std::fs::read(&old).unwrap(), old_bytes);
 }
 
@@ -611,19 +669,13 @@ fn pending_upgrade_tagged_outcome_roundtrips_through_compiled_baseline_reader_an
         version: u8,
         nonce: &'a str,
         prior_next_attempt_at: i64,
-        prior_last_outcome: Option<&'a str>,
     }
 
-    fn qualification_outcome(
-        nonce: &str,
-        prior_next_attempt_at: i64,
-        prior_last_outcome: Option<&str>,
-    ) -> String {
+    fn qualification_outcome(nonce: &str, prior_next_attempt_at: i64) -> String {
         let payload = QualificationOutcome {
             version: 1,
             nonce,
             prior_next_attempt_at,
-            prior_last_outcome,
         };
         format!(
             "qualification_in_progress:v1:{}",
@@ -655,7 +707,7 @@ fn pending_upgrade_tagged_outcome_roundtrips_through_compiled_baseline_reader_an
     let nonce = "5154f8f1-7e3b-4c5a-9f2d-6a1b0c9d8e7f";
     let prior_deadline = 1_700_000_000;
     let reserved_deadline = 1_800_000_000;
-    let outcome = qualification_outcome(nonce, prior_deadline, None);
+    let outcome = qualification_outcome(nonce, prior_deadline);
     let mut reserved = before.clone();
     reserved.next_attempt_at = reserved_deadline;
     reserved.last_outcome = Some(outcome.clone());
