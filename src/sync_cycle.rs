@@ -358,7 +358,7 @@ impl LibraryHoldKind {
 
 /// One selected library's real hold this cycle. This is a private reporting
 /// fact, not a new report/JSON/metric contract.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct LibraryHoldFact {
     /// Safe display label derived from the configured `{library}` token.
     pub(crate) label: String,
@@ -369,6 +369,18 @@ pub(crate) struct LibraryHoldFact {
     pub(crate) ordinal: usize,
     pub(crate) kind: LibraryHoldKind,
     pub(crate) reason: &'static str,
+}
+
+impl std::fmt::Debug for LibraryHoldFact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LibraryHoldFact")
+            .field("label", &self.label)
+            .field("source", &"<redacted>")
+            .field("ordinal", &self.ordinal)
+            .field("kind", &self.kind)
+            .field("reason", &self.reason)
+            .finish()
+    }
 }
 
 /// Human-safe joined hold summary. It exposes only the safe label, bounded kind
@@ -4235,5 +4247,26 @@ mod tests {
             "preservation alone must not project a token block"
         );
         assert!(preservation_stats.sync_token_blocked_zone.is_none());
+    }
+
+    #[test]
+    fn library_hold_debug_redacts_full_source() {
+        let raw_source = "SharedSync-A1B2C3D4-E5F6-7890-secret-provider-zone";
+        let hold = LibraryHoldFact {
+            label: "SharedSync-A1B2C3D4".to_owned(),
+            source: raw_source.to_owned(),
+            ordinal: 3,
+            kind: LibraryHoldKind::BaselinePending,
+            reason: "epoch_backoff",
+        };
+        let rendered = format!("{hold:?}");
+        assert!(!rendered.contains(raw_source), "{rendered}");
+        assert!(!rendered.contains("secret-provider-zone"), "{rendered}");
+        assert!(rendered.contains("source: \"<redacted>\""), "{rendered}");
+        assert!(rendered.contains("SharedSync-A1B2C3D4"), "{rendered}");
+        assert!(rendered.contains("ordinal: 3"), "{rendered}");
+        assert!(rendered.contains("BaselinePending"), "{rendered}");
+        assert!(rendered.contains("epoch_backoff"), "{rendered}");
+        assert_eq!(hold.clone(), hold);
     }
 }
