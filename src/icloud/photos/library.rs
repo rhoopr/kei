@@ -178,10 +178,44 @@ impl PhotoLibrary {
     }
 
     pub(crate) fn baseline_scope(&self) -> String {
+        Self::baseline_scope_hash(self.library_type.as_ref(), self.zone_id.as_ref())
+    }
+
+    /// Canonical full-zone identity. The entire zone JSON is hashed, not the
+    /// reduced capture projection.
+    pub(crate) fn baseline_scope_hash(database: &str, zone: &Value) -> String {
         use sha2::{Digest, Sha256};
-        let encoded =
-            json!({"database": self.library_type.as_ref(), "zone": self.zone_id.as_ref()});
+        let encoded = json!({"database": database, "zone": zone});
         format!("{:x}", Sha256::digest(encoded.to_string().as_bytes()))
+    }
+
+    /// Validate the full captured provider scope and return its
+    /// zoneName/ownerRecordName/database projection. This is the only provider
+    /// scope projection the preservation owner may compare; it never pretends
+    /// the reduced capture scope is the full zone hash.
+    pub(crate) fn provider_scope_projection(scope: &str) -> Option<(String, String, String)> {
+        let value: Value = serde_json::from_str(scope).ok()?;
+        if value.get("format").and_then(Value::as_u64) != Some(1)
+            || value
+                .get("realm")
+                .and_then(Value::as_str)
+                .is_none_or(|realm| realm.trim().is_empty())
+            || value.get("container").and_then(Value::as_str) != Some("com.apple.photos.cloud")
+            || value.get("environment").and_then(Value::as_str) != Some("production")
+        {
+            return None;
+        }
+        let database = value.get("database")?.as_str()?;
+        if !matches!(database, "private" | "shared") {
+            return None;
+        }
+        let zone = value.get("zone")?;
+        let zone_name = zone.get("zoneName")?.as_str()?.trim();
+        let owner = zone.get("ownerRecordName")?.as_str()?.trim();
+        if zone_name.is_empty() || owner.is_empty() {
+            return None;
+        }
+        Some((zone_name.to_owned(), owner.to_owned(), database.to_owned()))
     }
 
     /// Create a library with explicit FINISHED or provisional RUNNING readiness.

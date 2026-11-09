@@ -3,8 +3,10 @@
 
 use std::path::PathBuf;
 
+use super::account::AccountOwner;
+use crate::icloud::photos::PhotoLibrary;
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -721,6 +723,410 @@ pub(super) fn counts(conn: &Connection, library: &str) -> Result<(u64, u64), Sta
         }
     }
     Ok((total, pending))
+}
+
+/// One preservation ownership request bound to the same pre-dispatch identity
+/// as the current sparse H witness. The request is Clone, not Copy, and never
+/// implements Debug because it carries owner/scope values.
+#[allow(dead_code, reason = "consumed by the L1 preservation hold seam")]
+#[derive(Clone)]
+pub(crate) struct PreservationHoldRequest {
+    pub(crate) library: String,
+    pub(crate) expected_owner: AccountOwner,
+    pub(crate) expected_epoch: String,
+    pub(crate) expected_attempt: String,
+    pub(crate) scope: String,
+    pub(crate) expected_zone_name: String,
+    pub(crate) expected_owner_record_name: String,
+    pub(crate) expected_database: String,
+    pub(crate) baseline_scope: String,
+}
+
+#[allow(dead_code, reason = "consumed by the L1 preservation hold seam")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreservationHoldRefusal {
+    OwnerMissing,
+    OwnerMismatch,
+    EpochUnavailable,
+    EpochChanged,
+    EpochNotComplete,
+    AttemptChanged,
+    ScopeMissing,
+    ScopeUnauthenticated,
+    ScopeProjectionMismatch,
+    ScopeHashMissing,
+    UnsupportedEvidenceVersion,
+    EmptyFiles,
+    MalformedFiles,
+    InvalidRoot,
+    PathEscape,
+    DuplicatePath,
+    PathSetMismatch,
+    MissingPreparedPath,
+    PathNotProtected,
+    ProofJournalMissing,
+    ProofJournalUnsupported,
+    Unsupported,
+}
+
+#[allow(dead_code, reason = "consumed by the L1 preservation hold seam")]
+impl PreservationHoldRefusal {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnerMissing => "owner_missing",
+            Self::OwnerMismatch => "owner_mismatch",
+            Self::EpochUnavailable => "epoch_unavailable",
+            Self::EpochChanged => "epoch_changed",
+            Self::EpochNotComplete => "epoch_not_complete",
+            Self::AttemptChanged => "attempt_changed",
+            Self::ScopeMissing => "scope_missing",
+            Self::ScopeUnauthenticated => "scope_unauthenticated",
+            Self::ScopeProjectionMismatch => "scope_projection_mismatch",
+            Self::ScopeHashMissing => "scope_hash_missing",
+            Self::UnsupportedEvidenceVersion => "unsupported_evidence_version",
+            Self::EmptyFiles => "empty_files",
+            Self::MalformedFiles => "malformed_files",
+            Self::InvalidRoot => "invalid_root",
+            Self::PathEscape => "path_escape",
+            Self::DuplicatePath => "duplicate_path",
+            Self::PathSetMismatch => "path_set_mismatch",
+            Self::MissingPreparedPath => "missing_prepared_path",
+            Self::PathNotProtected => "path_not_protected",
+            Self::ProofJournalMissing => "proof_journal_missing",
+            Self::ProofJournalUnsupported => "proof_journal_unsupported",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[allow(dead_code, reason = "consumed by the L1 preservation hold seam")]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PreservationHoldProof {
+    library: String,
+    rows: u64,
+    paths: u64,
+}
+
+impl std::fmt::Debug for PreservationHoldProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreservationHoldProof")
+            .field("rows", &self.rows)
+            .field("paths", &self.paths)
+            .finish_non_exhaustive()
+    }
+}
+
+#[allow(dead_code, reason = "consumed by the L1 preservation hold seam")]
+pub(crate) enum PreservationHoldOutcome {
+    Accounted(PreservationHoldProof),
+    Refused(PreservationHoldRefusal),
+}
+
+/// One real deferred read transaction over the exact immutable preservation
+/// rows and their full recorded path claims. SQL/cache/read failures propagate
+/// as StateError; identity, scope and row-shape mismatches are typed refusals.
+#[cfg(test)]
+pub(crate) static PRESERVATION_INTERLEAVE: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+
+#[allow(dead_code, reason = "consumed by the L1 preservation hold seam")]
+pub(crate) fn preservation_hold_snapshot(
+    conn: &Connection,
+    request: &PreservationHoldRequest,
+) -> Result<PreservationHoldOutcome, StateError> {
+    if request.library.is_empty() {
+        return Ok(PreservationHoldOutcome::Refused(
+            PreservationHoldRefusal::ScopeMissing,
+        ));
+    }
+    if super::account::validate_authenticated(conn, &request.expected_owner).is_err() {
+        return Ok(PreservationHoldOutcome::Refused(
+            PreservationHoldRefusal::OwnerMismatch,
+        ));
+    }
+    let epoch = match super::sync_epoch::validate_if_present(conn) {
+        Ok(Some(epoch)) => epoch,
+        Ok(None) | Err(_) => {
+            return Ok(PreservationHoldOutcome::Refused(
+                PreservationHoldRefusal::EpochUnavailable,
+            ));
+        }
+    };
+    if epoch.epoch != request.expected_epoch {
+        return Ok(PreservationHoldOutcome::Refused(
+            PreservationHoldRefusal::EpochChanged,
+        ));
+    }
+    let record = match super::sync_epoch::read_library(conn, &request.library) {
+        Ok(Some(record)) => record,
+        Ok(None) | Err(_) => {
+            return Ok(PreservationHoldOutcome::Refused(
+                PreservationHoldRefusal::EpochUnavailable,
+            ));
+        }
+    };
+    if record.epoch != request.expected_epoch {
+        return Ok(PreservationHoldOutcome::Refused(
+            PreservationHoldRefusal::EpochChanged,
+        ));
+    }
+    if record.state != "complete" {
+        return Ok(PreservationHoldOutcome::Refused(
+            PreservationHoldRefusal::EpochNotComplete,
+        ));
+    }
+    if record.attempt != request.expected_attempt {
+        return Ok(PreservationHoldOutcome::Refused(
+            PreservationHoldRefusal::AttemptChanged,
+        ));
+    }
+    if request.baseline_scope.trim().is_empty() {
+        return Ok(PreservationHoldOutcome::Refused(
+            PreservationHoldRefusal::ScopeHashMissing,
+        ));
+    }
+    let Some((scope_zone, scope_owner, scope_database)) =
+        PhotoLibrary::provider_scope_projection(&request.scope)
+    else {
+        return Ok(PreservationHoldOutcome::Refused(
+            PreservationHoldRefusal::ScopeUnauthenticated,
+        ));
+    };
+    if scope_zone != request.library
+        || scope_zone != request.expected_zone_name
+        || scope_owner != request.expected_owner_record_name
+        || scope_database != request.expected_database
+    {
+        return Ok(PreservationHoldOutcome::Refused(
+            PreservationHoldRefusal::ScopeProjectionMismatch,
+        ));
+    }
+    if super::provider_generations::guard_library_scope(conn, &request.scope, &request.library)
+        .is_err()
+    {
+        return Ok(PreservationHoldOutcome::Refused(
+            PreservationHoldRefusal::ScopeUnauthenticated,
+        ));
+    }
+    #[cfg(test)]
+    if let Some(hook) = PRESERVATION_INTERLEAVE
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take())
+    {
+        hook();
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT asset_id, evidence_version, files, active_generation \
+         FROM unattributed_legacy WHERE library=?1 ORDER BY asset_id",
+    )?;
+    let mut rows = stmt.query([request.library.as_str()])?;
+    let mut total_rows = 0u64;
+    let mut total_paths = 0u64;
+    while let Some(row) = rows.next()? {
+        total_rows = total_rows.saturating_add(1);
+        let asset_id: String = row.get(0)?;
+        let evidence_version: i64 = row.get(1)?;
+        let files: String = row.get(2)?;
+        let active_generation: Option<i64> = row.get(3)?;
+        if evidence_version != EVIDENCE_VERSION {
+            return Ok(PreservationHoldOutcome::Refused(
+                PreservationHoldRefusal::UnsupportedEvidenceVersion,
+            ));
+        }
+        let files: Vec<LegacyFileEvidence> = match serde_json::from_str(&files) {
+            Ok(files) => files,
+            Err(_error) => {
+                return Ok(PreservationHoldOutcome::Refused(
+                    PreservationHoldRefusal::MalformedFiles,
+                ));
+            }
+        };
+        if files.is_empty() {
+            return Ok(PreservationHoldOutcome::Refused(
+                PreservationHoldRefusal::EmptyFiles,
+            ));
+        }
+        let mut file_keys = std::collections::HashSet::new();
+        for file in &files {
+            if !file.root.is_absolute() || !file.path.is_absolute() {
+                return Ok(PreservationHoldOutcome::Refused(
+                    PreservationHoldRefusal::InvalidRoot,
+                ));
+            }
+            if !file.path.starts_with(&file.root) {
+                return Ok(PreservationHoldOutcome::Refused(
+                    PreservationHoldRefusal::PathEscape,
+                ));
+            }
+            if crate::fs_util::confined_path_key(&file.root).is_err()
+                || crate::fs_util::confined_path_key(&file.path).is_err()
+            {
+                return Ok(PreservationHoldOutcome::Refused(
+                    PreservationHoldRefusal::PathEscape,
+                ));
+            }
+            if file.sha256.is_some() != file.size.is_some() {
+                return Ok(PreservationHoldOutcome::Refused(
+                    PreservationHoldRefusal::MalformedFiles,
+                ));
+            }
+            if let Some(hash) = file.sha256.as_deref()
+                && (hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            {
+                return Ok(PreservationHoldOutcome::Refused(
+                    PreservationHoldRefusal::MalformedFiles,
+                ));
+            }
+            let Some(path_text) = file.path.to_str() else {
+                return Ok(PreservationHoldOutcome::Refused(
+                    PreservationHoldRefusal::PathEscape,
+                ));
+            };
+            let Ok(key) = crate::fs_util::confined_path_key(&file.path) else {
+                return Ok(PreservationHoldOutcome::Refused(
+                    PreservationHoldRefusal::PathEscape,
+                ));
+            };
+            if !file_keys.insert((key, path_text.to_owned())) {
+                return Ok(PreservationHoldOutcome::Refused(
+                    PreservationHoldRefusal::DuplicatePath,
+                ));
+            }
+        }
+        let mut claim_stmt = conn.prepare(
+            "SELECT path_key, local_path FROM unattributed_legacy_paths \
+             WHERE library=?1 AND asset_id=?2 ORDER BY path_key",
+        )?;
+        let claims: Vec<(String, String)> = claim_stmt
+            .query_map(
+                params![request.library.as_str(), asset_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+            .collect::<Result<_, _>>()?;
+        if claims.len() != files.len() {
+            return Ok(PreservationHoldOutcome::Refused(
+                PreservationHoldRefusal::PathSetMismatch,
+            ));
+        }
+        for (path_key, local_path) in &claims {
+            let matched = files.iter().any(|file| {
+                file.path.to_str() == Some(local_path.as_str())
+                    && crate::fs_util::confined_path_key(&file.path)
+                        .is_ok_and(|key| &key == path_key)
+            });
+            if !matched {
+                return Ok(PreservationHoldOutcome::Refused(
+                    PreservationHoldRefusal::PathSetMismatch,
+                ));
+            }
+        }
+        let protected = path_cache::protected_paths(conn)?;
+        let protected_keys: std::collections::HashSet<String> = protected
+            .into_iter()
+            .map(|path| crate::fs_util::confined_path_key(&path).map_err(|_error| invalid()))
+            .collect::<Result<_, _>>()?;
+        for file in &files {
+            let key = crate::fs_util::confined_path_key(&file.path).map_err(|_error| invalid())?;
+            if !protected_keys.contains(&key) {
+                return Ok(PreservationHoldOutcome::Refused(
+                    PreservationHoldRefusal::PathNotProtected,
+                ));
+            }
+            total_paths = total_paths.saturating_add(1);
+        }
+        if let Some(generation) = active_generation {
+            let version: Option<i64> = conn
+                .query_row(
+                    "SELECT evidence_version FROM unattributed_legacy_proofs \
+                     WHERE library=?1 AND asset_id=?2 AND generation=?3",
+                    params![request.library.as_str(), asset_id.as_str(), generation],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match version {
+                None => {
+                    return Ok(PreservationHoldOutcome::Refused(
+                        PreservationHoldRefusal::ProofJournalMissing,
+                    ));
+                }
+                Some(EVIDENCE_VERSION) => {}
+                Some(_) => {
+                    return Ok(PreservationHoldOutcome::Refused(
+                        PreservationHoldRefusal::ProofJournalUnsupported,
+                    ));
+                }
+            }
+        }
+    }
+    if total_rows == 0 {
+        return Ok(PreservationHoldOutcome::Refused(
+            PreservationHoldRefusal::MissingPreparedPath,
+        ));
+    }
+    Ok(PreservationHoldOutcome::Accounted(PreservationHoldProof {
+        library: request.library.clone(),
+        rows: total_rows,
+        paths: total_paths,
+    }))
+}
+
+#[allow(dead_code, reason = "consumed by the L1 preservation hold seam")]
+impl SqliteStateDb {
+    pub(crate) async fn preservation_hold(
+        &self,
+        request: PreservationHoldRequest,
+    ) -> Result<PreservationHoldOutcome, StateError> {
+        let request = request.clone();
+        self.with_conn_mut("preservation_hold", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            preservation_hold_snapshot(&tx, &request)
+        })
+        .await
+    }
+}
+
+#[cfg(test)]
+impl SqliteStateDb {
+    pub(crate) fn set_preservation_interleave(hook: Box<dyn FnOnce() + Send>) {
+        if let Ok(mut pending) = PRESERVATION_INTERLEAVE.lock() {
+            *pending = Some(hook);
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test helper mirrors the private owner request fields"
+    )]
+    pub(crate) async fn preservation_hold_test(
+        &self,
+        library: &str,
+        expected_owner: AccountOwner,
+        expected_epoch: &str,
+        expected_attempt: &str,
+        scope: &str,
+        expected_zone_name: &str,
+        expected_owner_record_name: &str,
+        expected_database: &str,
+        baseline_scope: &str,
+    ) -> Result<Result<(u64, u64), &'static str>, StateError> {
+        let request = PreservationHoldRequest {
+            library: library.to_owned(),
+            expected_owner,
+            expected_epoch: expected_epoch.to_owned(),
+            expected_attempt: expected_attempt.to_owned(),
+            scope: scope.to_owned(),
+            expected_zone_name: expected_zone_name.to_owned(),
+            expected_owner_record_name: expected_owner_record_name.to_owned(),
+            expected_database: expected_database.to_owned(),
+            baseline_scope: baseline_scope.to_owned(),
+        };
+        Ok(match self.preservation_hold(request).await? {
+            PreservationHoldOutcome::Accounted(proof) => Ok((proof.rows, proof.paths)),
+            PreservationHoldOutcome::Refused(refusal) => Err(refusal.as_str()),
+        })
+    }
 }
 
 #[cfg(test)]
