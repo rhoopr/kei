@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Independent byte/path/database/checkpoint oracles through the normal cycle.
 use crate::commands::{AlbumPass, PassKind};
 use crate::icloud::photos::PhotosSession;

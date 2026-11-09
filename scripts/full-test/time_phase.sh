@@ -119,23 +119,9 @@ if [[ $is_live -eq 1 ]]; then
         fi
     fi
     if [[ -n "$skip_status" ]]; then
-        skip_json=$(
-            python3 - "$phase" "$skip_status" "$skip_reason" <<'PY'
-import json, sys
-phase, status, reason = sys.argv[1:4]
-print(json.dumps({
-    "phase": phase,
-    "wall_s": 0.0,
-    "exit": 0,
-    "status": status,
-    "reason": reason,
-}))
-PY
-        )
-        (
-            flock 9
-            echo "$skip_json" >>"$current"
-        ) 9>"$lockfile"
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        # A failed JSON writer or locked append must not report a successful skip.
+        bash -e "$script_dir/record_skip.sh" "$phase" "$skip_status" "$skip_reason" || exit $?
         printf '[%s] %s skipped (%s)\n' "$skip_status" "$phase" "$skip_reason" >&2
         exit 0
     fi

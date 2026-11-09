@@ -439,15 +439,17 @@ release TARGET="":
             ;;
     esac
     cargo build --locked --release --target "$target"
+    target_dir=$(scripts/full-test/cargo_target_dir.sh)
+    repo_root="$PWD"
     mkdir -p dist
     case "$target" in
         *-windows-*)
             archive="dist/kei-$target.zip"
-            (cd "target/$target/release" && zip "../../../$archive" kei.exe)
+            (cd "$target_dir/$target/release" && zip "$repo_root/$archive" kei.exe)
             ;;
         *)
             archive="dist/kei-$target.tar.gz"
-            tar -C "target/$target/release" -czf "$archive" kei
+            tar -C "$target_dir/$target/release" -czf "$archive" kei
             ;;
     esac
     checksum_file="dist/SHA256SUMS.txt"

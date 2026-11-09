@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Format 2 owns selected tasks without admitting historical rank/catalog proof.
 use super::{CURRENT, Fixture, owner, records};
 use crate::download::planner::{TaskPlanner, pending_record_for_task};

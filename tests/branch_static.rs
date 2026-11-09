@@ -448,6 +448,121 @@ fn full_test_release_artifacts_follow_cargo_target_dir() {
             "{consumer} must resolve release artifacts through cargo_target_dir.sh"
         );
     }
+
+    let temp = tempfile::tempdir().unwrap();
+    let output = Command::new("python3").args(["-c", r#"
+import hashlib, os, pathlib, shutil, subprocess, sys, tarfile, zipfile
+source, temp = map(pathlib.Path, sys.argv[1:])
+root = temp / 'release repo'
+bin_dir = root / 'bin'
+bin_dir.mkdir(parents=True)
+for name in ['justfile', 'scripts/full-test/cargo_target_dir.sh']:
+    dest = root / name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source / name, dest)
+(root / 'Cargo.toml').write_text('version = "0.0.0"\n')
+(root / 'CHANGELOG.md').write_text('## [0.0.0]\nfixture\n')
+(bin_dir / 'cargo').write_text('''#!/usr/bin/env bash
+set -euo pipefail
+[[ "$*" == "build --locked --release --target $5" ]]
+dir="$(scripts/full-test/cargo_target_dir.sh)/$5/release"
+mkdir -p "$dir"
+printf 'requested artifact' > "$dir/kei"
+printf 'requested artifact' > "$dir/kei.exe"
+''')
+# Controlled ZIP dispatch writes a real archive; no platform compiler is run.
+(bin_dir / 'zip').write_text('''#!/usr/bin/env python3
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], 'w') as archive:
+    archive.write(sys.argv[2], sys.argv[2])
+''')
+for tool in bin_dir.iterdir():
+    tool.chmod(0o755)
+for override in [None, 'custom target/deep', str(temp / 'absolute target/deeper/cache')]:
+    for target in ['x86_64-unknown-linux-gnu', 'x86_64-pc-windows-msvc']:
+        stale = root / 'target' / target / 'release'
+        stale.mkdir(parents=True, exist_ok=True)
+        for name in ['kei', 'kei.exe']:
+            (stale / name).write_text('stale artifact')
+        env = dict(os.environ, PATH=str(bin_dir) + ':' + os.environ['PATH'])
+        env.pop('CARGO_TARGET_DIR', None)
+        if override is not None:
+            env['CARGO_TARGET_DIR'] = override
+        subprocess.run(['just', '--justfile', str(root / 'justfile'), 'release', target], cwd=temp, env=env, check=True)
+        windows = 'windows' in target
+        name = 'kei-' + target + ('.zip' if windows else '.tar.gz')
+        path = root / 'dist' / name
+        with (zipfile.ZipFile(path) if windows else tarfile.open(path)) as archive:
+            member = 'kei.exe' if windows else 'kei'
+            payload = archive.read(member) if windows else archive.extractfile(member).read()
+        assert payload == b'requested artifact'
+        rows = (root / 'dist/SHA256SUMS.txt').read_text().splitlines()
+        assert [row for row in rows if row.split()[1] == name] == [hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + name]
+"#]).arg(repo_path("")).arg(temp.path()).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_test_live_auto_skip_dispatch_preserves_records_and_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    for script in ["time_phase.sh", "record_skip.sh"] {
+        write_executable(
+            &temp.path().join(script),
+            &repo_file(&format!("scripts/full-test/{script}")),
+        );
+    }
+    let output = Command::new("python3").args(["-c", r#"
+import json, os, pathlib, subprocess, sys
+root = pathlib.Path(sys.argv[1])
+def run(name, live, skip, rate, rc=0, broken=False):
+    runs = root / name
+    runs.mkdir()
+    if skip:
+        (runs / '.live-skipped').write_text('first reason\nsecond reason\n')
+    if rate:
+        (runs / '.rate-limited').write_text('rate reason')
+    if broken:
+        (runs / '.current.jsonl').mkdir()
+    sentinel = runs / 'child-ran'
+    env = dict(os.environ, KEI_FULL_TEST_RUNS_DIR=str(runs), KEI_FULLTEST_LOG_DIR=str(runs))
+    argv = [str(root / 'time_phase.sh')] + (['--live'] if live else [])
+    result = subprocess.run(argv + [name, '--', 'bash', '-c', 'touch "$1"; exit "$2"', 'synthetic-child', str(sentinel), str(rc)], cwd='/', env=env)
+    skipped = live and (skip or rate)
+    assert sentinel.exists() == (not skipped)
+    if broken:
+        assert result.returncode != 0
+        return
+    assert result.returncode == (0 if skipped else rc)
+    rows = (runs / '.current.jsonl').read_text().splitlines()
+    assert len(rows) == 1
+    row = json.loads(rows[0])
+    if skipped:
+        assert row == dict(phase=name, wall_s=0.0, exit=0, status='skipped' if skip else 'rate_limited', reason='first reason;second reason' if skip else 'rate reason')
+    else:
+        assert row['phase'] == name and row['exit'] == rc
+        assert row['status'] == ('pass' if rc == 0 else 'fail') and row['wall_s'] >= 0
+run('skipped', True, True, False, 9)
+run('rate', True, False, True, 9)
+run('priority', True, True, True, 9)
+run('offline', False, True, True)
+run('healthy', True, False, False)
+run('failed', True, False, False, 7)
+run('writer-failed', True, True, False, broken=True)
+for args in [['invalid', 'pass', 'reason'], ['missing', 'skipped']]:
+    runs = root / args[0]
+    result = subprocess.run([str(root / 'record_skip.sh')] + args, env=dict(os.environ, KEI_FULL_TEST_RUNS_DIR=str(runs)))
+    assert result.returncode == 64 and not (runs / '.current.jsonl').exists()
+"#]).arg(temp.path()).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(target_os = "linux")]
