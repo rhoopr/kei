@@ -928,3 +928,97 @@ async fn source_revalidation_interrupted_marking_cannot_advance_without_baseline
     }
     assert!(db.get_metadata(TOKEN).await.unwrap().is_none());
 }
+
+/// Baseline-reader evidence for the proposed catalog scope codec.
+///
+/// The pre-change producer and drain paths pass the ordinary selected plan
+/// scope (`root.spec.scope` / the Unfiled download scope). A catalog round
+/// tagged with its own versioned scope can therefore never be retired by an
+/// ordinary confirmation or drained by the old Unfiled path, even when the
+/// asset ID matches. This is conservative retention, not deletion authority.
+/// The test uses the baseline methods themselves rather than assuming the
+/// property from the tag spelling.
+#[tokio::test]
+async fn catalog_tag_scope_survives_baseline_unfiled_reader_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    let catalog = "catalog:v1:0123456789abcdef";
+    {
+        let conn = db.acquire_lock("seed catalog-tag reader evidence").unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_rounds VALUES('catalog-round','PrimarySync',?1,'policy','boundary','','','observing')",
+            [catalog],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id) VALUES('catalog-round','asset')",
+            [],
+        )
+        .unwrap();
+    }
+    // The ordinary producer confirmation passes the current selected-plan
+    // scope, not the catalog tag.
+    db.source_revalidation_seen(
+        owner(),
+        "PrimarySync".into(),
+        "ordinary-selected-scope".into(),
+        "asset".into(),
+    )
+    .await
+    .unwrap();
+    {
+        let conn = db
+            .acquire_lock("catalog debt survives ordinary confirm")
+            .unwrap();
+        let debt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_revalidation_debt WHERE round='catalog-round'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            debt, 1,
+            "ordinary selected-plan confirmation cannot retire catalog-tag debt"
+        );
+    }
+    // The baseline Unfiled drain is scoped to the ordinary plan scope too.
+    assert!(
+        db.due_source_revalidation(
+            owner(),
+            "PrimarySync".into(),
+            "ordinary-selected-scope".into()
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "baseline Unfiled drain cannot take catalog-tag work"
+    );
+    // The catalog debt also remains after a second ordinary selected-plan
+    // confirmation. Product isolation must additionally reject the tag itself
+    // in `source_revalidation_seen`; this baseline evidence already shows the
+    // ordinary producer cannot reach it.
+    db.source_revalidation_seen(
+        owner(),
+        "PrimarySync".into(),
+        "ordinary-selected-scope".into(),
+        "asset".into(),
+    )
+    .await
+    .unwrap();
+    let conn = db
+        .acquire_lock("catalog debt remains after repeat confirm")
+        .unwrap();
+    let debt: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM source_revalidation_debt WHERE round='catalog-round'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(debt, 1);
+}

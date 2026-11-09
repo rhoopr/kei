@@ -867,3 +867,543 @@ async fn initial_album_confirmation_retry(legacy: bool) {
         }
     }
 }
+
+/// Reporter C16 prerequisite, unchanged production baseline.
+///
+/// The actual resolver for M1 (`libraries = shared`, no albums, `unfiled =
+/// true`, `--smart-folder Hidden`) widens collection enumeration to every
+/// visible library while Unfiled stays selected-zone scoped. That produces
+/// `PrimarySync` Hidden plus `SharedSync` Hidden+Unfiled. A still+motion pair
+/// downloaded before this ExistingUpgrade baseline boundary is omitted from
+/// the fresh inventory and from the empty delta bridge, yet an exact strict
+/// paired lookup proves both family records deleted. The mixed plan must still
+/// census per authenticated source instead of requiring exactly one
+/// unrestricted Unfiled pass. Local bytes, paths, and mtimes stay untouched.
+#[tokio::test]
+async fn v027_mixed_shared_hidden_baseline_censuses_preboundary_deleted_live_pair() {
+    use crate::commands::{
+        build_collection_context, collection_libraries, pass_scope_for_zone,
+        resolve_passes_for_scope, zone_name_set,
+    };
+    use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
+    const PRIMARY: &str = "PrimarySync";
+    const DELETED_MASTER: &str = "shared-live-master";
+    const DELETED_CHILD: &str = "asset-shared-live-master";
+
+    fn mixed_pair(
+        zone_id: &Value,
+        record_name: &str,
+        filename: &str,
+        url: &str,
+        tag: u8,
+        hidden: bool,
+    ) -> Vec<Value> {
+        let zone = zone_id["zoneName"].as_str().unwrap();
+        let mut records = crate::sync_loop::test_support::full_album_page_with_download(
+            zone,
+            record_name,
+            "inventory-last-page",
+            url,
+            MEDIA.len() as u64,
+            &super::generation(tag),
+        )["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+        records[0]["zoneID"] = zone_id.clone();
+        records[0]["fields"]["filenameEnc"] = json!({"value":filename,"type":"STRING"});
+        records[1]["zoneID"] = zone_id.clone();
+        records[1]["fields"]["masterRef"]["value"]["zoneID"] = zone_id.clone();
+        if hidden {
+            records[1]["fields"]["isHidden"] = json!({"value":1,"type":"INT64"});
+        }
+        records
+    }
+
+    fn deleted_lookup_records(zone_id: &Value) -> Vec<Value> {
+        vec![
+            json!({
+                "recordName":DELETED_MASTER,"recordType":"CPLMaster","zoneID":zone_id,
+                "fields":{
+                    "isDeleted":{"value":1,"type":"INT64"},
+                    "isExpunged":{"value":1,"type":"INT64"},
+                    "dateExpunged":{"value":1792541032000_i64,"type":"TIMESTAMP"}
+                }
+            }),
+            json!({
+                "recordName":DELETED_CHILD,"recordType":"CPLAsset","zoneID":zone_id,
+                "fields":{
+                    "masterRef":{"value":{"recordName":DELETED_MASTER,"zoneID":zone_id},"type":"REFERENCE"},
+                    "isDeleted":{"value":1,"type":"INT64"},
+                    "isExpunged":{"value":1,"type":"INT64"},
+                    "dateExpunged":{"value":1792541032000_i64,"type":"TIMESTAMP"}
+                }
+            }),
+        ]
+    }
+
+    #[derive(Clone)]
+    struct MixedSession {
+        zone_id: Value,
+        zone: String,
+        boundary: String,
+        current: Arc<Vec<Value>>,
+        current_on_hidden: bool,
+        deleted: Arc<Vec<Value>>,
+        lookups: Arc<AtomicUsize>,
+        requested: Arc<Mutex<Vec<Vec<String>>>>,
+        changes: Arc<AtomicUsize>,
+    }
+    impl MixedSession {
+        fn current_pass(&self, request: &Value) -> bool {
+            let record_type = request
+                .pointer("/query/recordType")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if record_type.contains("WithoutHiddenOrDeleted") {
+                !self.current_on_hidden
+            } else if record_type.contains("Hidden") {
+                self.current_on_hidden
+            } else {
+                false
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for MixedSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            let request: Value = serde_json::from_str(&body)?;
+            if url.contains("/zones/list") {
+                return Ok(
+                    json!({"zones":[{"zoneID":self.zone_id,"syncToken":self.boundary,"deleted":false}]}),
+                );
+            }
+            if request.pointer("/query/recordType").and_then(Value::as_str)
+                == Some("CheckIndexingState")
+            {
+                return Ok(
+                    json!({"records":[{"recordName":"index","recordType":"CheckIndexingState","fields":{"state":{"value":"FINISHED"}}}]}),
+                );
+            }
+            if url.contains("/internal/records/query/batch") {
+                let batch: Vec<Value> = request["batch"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|query| {
+                        let record_type = query
+                            .pointer("/query/recordType")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let count = if record_type.contains("WithoutHiddenOrDeleted") {
+                            u64::from(!self.current_on_hidden)
+                        } else if record_type.contains("Hidden") {
+                            u64::from(self.current_on_hidden)
+                        } else {
+                            0
+                        };
+                        json!({"records":[{"fields":{"itemCount":{"value":count}}}]})
+                    })
+                    .collect();
+                return Ok(json!({"batch":batch}));
+            }
+            if url.contains("/records/query?") {
+                let record_type = request
+                    .pointer("/query/recordType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                // Album folder enumeration for the PrimarySync library.
+                if record_type == "CPLAlbumByPositionLive" {
+                    return Ok(json!({"records":[]}));
+                }
+                let records = if self.current_pass(&request) {
+                    self.current.as_ref().clone()
+                } else {
+                    Vec::new()
+                };
+                return Ok(json!({"records":records,"syncToken":"inventory-last-page"}));
+            }
+            if url.contains("/changes/zone?") {
+                let bridge = self.changes.fetch_add(1, Ordering::SeqCst);
+                let expected = if bridge == 0 {
+                    self.boundary.clone()
+                } else {
+                    format!("after-{}-{bridge}", self.zone)
+                };
+                assert_eq!(
+                    request["zones"][0]["syncToken"], expected,
+                    "baseline bridge must use its saved {} boundary",
+                    self.zone
+                );
+                return Ok(json!({"zones":[{"zoneID":self.zone_id,
+                    "records":[],
+                    "syncToken":format!("after-{}-{}",self.zone,bridge+1),
+                    "moreComing":false}]}));
+            }
+            if url.contains("/records/lookup?") {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                let requested: Vec<String> = request["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|query| query["recordName"].as_str().map(str::to_owned))
+                    .collect();
+                self.requested.lock().unwrap().push(requested.clone());
+                let records: Vec<Value> = self
+                    .deleted
+                    .iter()
+                    .filter(|record| {
+                        requested
+                            .iter()
+                            .any(|name| record["recordName"].as_str() == Some(name))
+                    })
+                    .cloned()
+                    .collect();
+                return Ok(json!({"records":records}));
+            }
+            anyhow::bail!("unexpected mixed-source endpoint {url}")
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    let server = crate::start_wiremock_or_skip!();
+    for id in ["shared-current", "primary-current"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("media");
+    std::fs::create_dir(&root).unwrap();
+    let db_path = dir.path().join("state.db");
+    super::seed_existing_upgrade_db(&db_path);
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+
+    let deleted_paths = [root.join("live.jpg"), root.join("live.mov")];
+    let deleted_bytes = [
+        b"synthetic still".as_slice(),
+        b"synthetic motion".as_slice(),
+    ];
+    for ((version, name), (path, bytes)) in [
+        (crate::state::VersionSizeKey::Original, "live.jpg"),
+        (crate::state::VersionSizeKey::LiveOriginal, "live.mov"),
+    ]
+    .into_iter()
+    .zip(deleted_paths.iter().zip(deleted_bytes))
+    {
+        std::fs::write(path, bytes).unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new(DELETED_MASTER)
+            .library(ZONE)
+            .version_size(version)
+            .added_at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap())
+            .filename(name)
+            .checksum(&super::generation(90))
+            .size(MEDIA.len() as u64)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            ZONE,
+            DELETED_MASTER,
+            version.as_str(),
+            path,
+            "synthetic-local",
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    db.upsert_asset_master_mapping(ZONE, DELETED_CHILD, DELETED_MASTER)
+        .await
+        .unwrap();
+    assert!(
+        db.claim_legacy_master_state_owner(ZONE, DELETED_MASTER, DELETED_CHILD)
+            .await
+            .unwrap()
+    );
+    let deleted_snapshots = deleted_paths.map(|path| {
+        (
+            path.clone(),
+            std::fs::read(&path).unwrap(),
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+        )
+    });
+
+    let shared_zone_id = json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"});
+    let primary_zone_id = json!({"zoneName":PRIMARY,"ownerRecordName":"_defaultOwner"});
+    let shared_current = mixed_pair(
+        &shared_zone_id,
+        "shared-current",
+        "shared-current.JPG",
+        &format!("{}/shared-current", server.uri()),
+        91,
+        false,
+    );
+    let primary_current = mixed_pair(
+        &primary_zone_id,
+        "primary-current",
+        "primary-current.JPG",
+        &format!("{}/primary-current", server.uri()),
+        92,
+        true,
+    );
+    let mut shared_lookup_records = deleted_lookup_records(&shared_zone_id);
+    shared_lookup_records.extend(shared_current.iter().cloned());
+    let shared_deleted = Arc::new(shared_lookup_records);
+    let primary_deleted = Arc::new(primary_current.clone());
+    let shared_lookups = Arc::new(AtomicUsize::new(0));
+    let primary_lookups = Arc::new(AtomicUsize::new(0));
+    let shared_requests = Arc::new(Mutex::new(Vec::new()));
+    let primary_requests = Arc::new(Mutex::new(Vec::new()));
+
+    let shared_session = MixedSession {
+        zone_id: shared_zone_id.clone(),
+        zone: ZONE.into(),
+        boundary: format!("before-{ZONE}"),
+        current: Arc::new(shared_current),
+        current_on_hidden: false,
+        deleted: Arc::clone(&shared_deleted),
+        lookups: Arc::clone(&shared_lookups),
+        requested: Arc::clone(&shared_requests),
+        changes: Arc::new(AtomicUsize::new(0)),
+    };
+    let primary_session = MixedSession {
+        zone_id: primary_zone_id.clone(),
+        zone: PRIMARY.into(),
+        boundary: format!("before-{PRIMARY}"),
+        current: Arc::new(primary_current),
+        current_on_hidden: true,
+        deleted: Arc::clone(&primary_deleted),
+        lookups: Arc::clone(&primary_lookups),
+        requested: Arc::clone(&primary_requests),
+        changes: Arc::new(AtomicUsize::new(0)),
+    };
+
+    let mut shared_library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/private".into(),
+        Arc::default(),
+        Box::new(shared_session),
+        Arc::new(shared_zone_id),
+        "shared".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    let mut primary_library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/private".into(),
+        Arc::default(),
+        Box::new(primary_session),
+        Arc::new(primary_zone_id),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    let capture =
+        || crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), baseline_owner(), "com");
+    shared_library.shadow_capture = Some(capture());
+    primary_library.shadow_capture = Some(capture());
+
+    let selection = Selection {
+        albums: AlbumSelector::None,
+        albums_explicit: false,
+        smart_folders: SmartFolderSelector::Named {
+            included: BTreeSet::from(["Hidden".to_string()]),
+            excluded: BTreeSet::new(),
+        },
+        smart_folders_explicit: true,
+        libraries: LibrarySelector {
+            primary: false,
+            shared_all: true,
+            named: BTreeSet::new(),
+            excluded: BTreeSet::new(),
+        },
+        unfiled: true,
+    };
+    let selected_libraries = vec![shared_library.clone()];
+    let all_libraries = vec![primary_library.clone(), shared_library.clone()];
+    let collection = collection_libraries(&selection, &selected_libraries, &all_libraries);
+    let collection_context = build_collection_context(&selection, collection)
+        .await
+        .unwrap();
+    let selected_zones = zone_name_set(&selected_libraries);
+    let collection_zones = zone_name_set(collection);
+    let shared_scope = pass_scope_for_zone(&selection, ZONE, &selected_zones, &collection_zones);
+    let primary_scope =
+        pass_scope_for_zone(&selection, PRIMARY, &selected_zones, &collection_zones);
+    let shared_plan = resolve_passes_for_scope(
+        &shared_library,
+        &selection,
+        shared_scope,
+        &collection_context,
+        &[],
+    )
+    .await
+    .unwrap();
+    let primary_plan = resolve_passes_for_scope(
+        &primary_library,
+        &selection,
+        primary_scope,
+        &collection_context,
+        &[],
+    )
+    .await
+    .unwrap();
+    let kinds = |plan: &crate::commands::AlbumPlan| {
+        plan.passes.iter().map(|pass| pass.kind).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        kinds(&shared_plan),
+        vec![PassKind::SmartFolder, PassKind::Unfiled],
+        "M1 shared source must resolve Hidden+Unfiled from the actual resolver"
+    );
+    assert_eq!(
+        kinds(&primary_plan),
+        vec![PassKind::SmartFolder],
+        "M1 primary source must resolve Hidden only from the actual resolver"
+    );
+
+    let mut shared_state =
+        make_run_cycle_library_state_with_passes(ZONE, &sync_token_key(ZONE), shared_plan.passes);
+    shared_state.library = shared_library;
+    let mut primary_state = make_run_cycle_library_state_with_passes(
+        PRIMARY,
+        &sync_token_key(PRIMARY),
+        primary_plan.passes,
+    );
+    primary_state.library = primary_library;
+
+    let builder = make_run_cycle_download_config_builder(&root, db.clone());
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let result = run_cycle(
+        &[&shared_state, &primary_state],
+        &make_run_cycle_config(),
+        Some(db.as_ref()),
+        false,
+        &builder,
+        download::DownloadControls::download_hidden(),
+        &shared,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    {
+        let conn = db.acquire_lock("inspect mixed-source baseline").unwrap();
+        let epoch: String = conn
+            .query_row(
+                "SELECT json_extract(value,'$.reason') FROM metadata WHERE key=?1",
+                [crate::state::db::sync_epoch::library_key(ZONE)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let token: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [sync_token_key(ZONE)],
+                |row| row.get(0),
+            )
+            .ok();
+        let rounds: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_revalidation_rounds WHERE library=?1",
+                [ZONE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let debt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE r.library=?1",
+                [ZONE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        eprintln!(
+            "B-PREREQ epoch={epoch} rounds={rounds} debt={debt} lookups={} token_present={} downloaded={} failed={}",
+            shared_lookups.load(Ordering::SeqCst),
+            token.is_some(),
+            result.stats.downloaded,
+            result.failed_count
+        );
+        assert_eq!(epoch, "existing_upgrade");
+        assert!(
+            token.is_some(),
+            "the mixed baseline must complete its ordinary checkpoint: {result:?}"
+        );
+        assert_eq!(
+            debt, 1,
+            "mixed-source Shared+Hidden baseline must record one strict source census obligation for the downloaded still+motion family"
+        );
+    }
+
+    crate::sync_loop::runner::drain_source_revalidation(
+        &[&shared_state, &primary_state],
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    {
+        let conn = db
+            .acquire_lock("verify mixed-source deletion census")
+            .unwrap();
+        let rows: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT version_size,is_deleted FROM assets WHERE library=?1 AND id=?2 ORDER BY version_size",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![ZONE, DELETED_MASTER], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let shared_requests = shared_requests.lock().unwrap();
+        assert!(
+            shared_requests.iter().any(|names| {
+                names.iter().any(|name| name == DELETED_MASTER)
+                    && names.iter().any(|name| name == DELETED_CHILD)
+            }),
+            "the exact authenticated shared source must be asked for the omitted family, requested={shared_requests:?}"
+        );
+        assert_eq!(
+            rows,
+            vec![
+                ("live_original".to_string(), 1),
+                ("original".to_string(), 1)
+            ],
+            "a strict deleted CPLMaster+CPLAsset pair must mark both downloaded renditions without touching local media"
+        );
+    }
+
+    for (path, bytes, mtime) in &deleted_snapshots {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        assert_eq!(&std::fs::metadata(path).unwrap().modified().unwrap(), mtime);
+    }
+    assert_eq!(
+        std::fs::read(root.join("shared-current.JPG")).unwrap(),
+        MEDIA
+    );
+    assert_eq!(
+        std::fs::read(root.join("primary-current.JPG")).unwrap(),
+        MEDIA
+    );
+    server.verify().await;
+}
