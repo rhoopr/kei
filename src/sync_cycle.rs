@@ -2767,17 +2767,17 @@ pub(crate) async fn run_cycle_with_witness(
                 };
                 let finish = if auth_or_cancel {
                     db.finish_indexing_qualification_auth_or_cancel(
-                        reservation.clone(),
+                        reservation,
                         config.watch.interval,
                     )
                     .await
                     .map(|_| ())
                 } else if let Some(reason) = qualification_reason {
-                    db.finish_indexing_qualification_nonqualified(reservation.clone(), reason)
+                    db.finish_indexing_qualification_nonqualified(reservation, reason)
                         .await
                         .map(|_| ())
                 } else {
-                    match db.commit_indexing_qualification(reservation.clone()).await {
+                    match db.commit_indexing_qualification(reservation).await {
                         Ok(()) => {
                             qualified = true;
                             Ok(())
