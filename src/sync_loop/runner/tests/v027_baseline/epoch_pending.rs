@@ -1190,11 +1190,25 @@ async fn capture_repair_applies_during_pending_epoch_and_leaves_epoch_pending() 
         after_probe.datetime_original, before_probe.datetime_original,
         "the explicit repair must replace the embedded capture timestamp"
     );
+    #[cfg(feature = "xmp")]
     assert_eq!(
         after_probe.datetime_original.as_deref(),
         Some("2023-11-14T14:13:20-08:00"),
         "the explicit repair must write the capture-local timestamp with its matching offset: {after_probe:?}"
     );
+    #[cfg(not(feature = "xmp"))]
+    {
+        assert_eq!(
+            after_probe.datetime_original.as_deref(),
+            Some("2023:11:14 14:13:20"),
+            "the explicit repair must write the capture-local EXIF timestamp: {after_probe:?}"
+        );
+        assert_eq!(
+            after_probe.offset_time_original.as_deref(),
+            Some("-08:00"),
+            "the explicit repair must write the matching EXIF offset: {after_probe:?}"
+        );
+    }
 
     // A compact receipt for this exact completed asset/path/rendition/provider
     // resource is the only local-byte proof an explicit capture repair may
