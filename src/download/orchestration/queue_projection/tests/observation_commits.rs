@@ -1642,6 +1642,56 @@ async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
             .await
             .unwrap()
     );
+    for (id, revision) in [
+        ("missing-capture", None),
+        ("stale-capture", Some(0_i64)),
+        ("retry-capture", Some(1_i64)),
+    ] {
+        let path = dir.path().join(format!("{id}.jpg"));
+        std::fs::write(&path, b"catalog control").unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new(id)
+            .library("PrimarySync")
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded("PrimarySync", id, "original", &path, "synthetic", None)
+            .await
+            .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", &format!("child-{id}"), id)
+            .await
+            .unwrap();
+        assert!(
+            db.claim_legacy_master_state_owner("PrimarySync", id, &format!("child-{id}"))
+                .await
+                .unwrap()
+        );
+        {
+            let conn = db.acquire_lock("seed capture revision control").unwrap();
+            match revision {
+                None => {
+                    conn.execute(
+                        "DELETE FROM asset_metadata_capture_revisions WHERE library='PrimarySync' AND asset_id=?1",
+                        [id],
+                    )
+                    .unwrap();
+                }
+                Some(revision) => {
+                    conn.execute(
+                        "INSERT INTO asset_metadata_capture_revisions(library,asset_id,revision,updated_at) VALUES('PrimarySync',?1,?2,1) ON CONFLICT(library,asset_id) DO UPDATE SET revision=excluded.revision,updated_at=excluded.updated_at",
+                        rusqlite::params![id, revision],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
+    {
+        let conn = db.acquire_lock("seed retry capture control").unwrap();
+        conn.execute(
+            "INSERT INTO metadata_capture_retries(library,asset_id,target_revision,evidence,generation,attempts,last_attempt_at,next_retry_at) VALUES('PrimarySync','retry-capture',1,'[]',1,1,1,2)",
+            [],
+        )
+        .unwrap();
+    }
     let boundary = format!("{:x}", Sha256::digest(b"catalog-boundary"));
     {
         let conn = db.acquire_lock("seed active catalog settlement").unwrap();
@@ -1655,6 +1705,13 @@ async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
             [&nonce],
         )
         .unwrap();
+        for id in ["missing-capture", "stale-capture", "retry-capture"] {
+            conn.execute(
+                "INSERT INTO source_revalidation_debt(round,id) VALUES(?1,?2)",
+                rusqlite::params![nonce, id],
+            )
+            .unwrap();
+        }
     }
     let evidence = |deleted: bool| CatalogPairEvidence {
         database: "shared".into(),
@@ -1675,30 +1732,76 @@ async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
         )
         .await
         .unwrap();
-    assert_eq!(due.len(), 1);
+    assert_eq!(due.len(), 4);
+    let master_due = due
+        .iter()
+        .find(|candidate| candidate.id == "master")
+        .cloned()
+        .unwrap();
     eprintln!(
         "B-CATALOG-DUE candidate round={} id={} master={} child={:?} owned={}",
-        due[0].round, due[0].id, due[0].master, due[0].child, due[0].owned_child
+        master_due.round,
+        master_due.id,
+        master_due.master,
+        master_due.child,
+        master_due.owned_child
     );
-    eprintln!("B-CATALOG-SETTLE-CALL deleted");
-    eprintln!("B-CATALOG-SETTLE-CALL live");
-    assert!(
-        db.settle_catalog_candidate(
+    let deleted_result = db
+        .settle_catalog_candidate(
             owner(),
             "PrimarySync".into(),
             origin.clone(),
             "policy".into(),
-            due[0].clone(),
+            master_due.clone(),
             CatalogSettlementAuthority::Deleted {
                 deleted_at: None,
                 evidence: evidence(true),
             },
         )
         .await
-        .unwrap()
-    );
+        .unwrap();
+    eprintln!("B-CATALOG-SETTLE-RESULT deleted={deleted_result}");
+    assert!(deleted_result);
+    for control in ["missing-capture", "stale-capture", "retry-capture"] {
+        let candidate = due
+            .iter()
+            .find(|candidate| candidate.id == control)
+            .cloned()
+            .unwrap();
+        let held = !db
+            .settle_catalog_candidate(
+                owner(),
+                "PrimarySync".into(),
+                origin.clone(),
+                "policy".into(),
+                candidate,
+                CatalogSettlementAuthority::Deleted {
+                    deleted_at: None,
+                    evidence: CatalogPairEvidence {
+                        master: control.into(),
+                        child: format!("child-{control}"),
+                        ..evidence(true)
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert!(held, "{control} must remain held");
+        let conn = db.acquire_lock("verify capture control held").unwrap();
+        let (deleted, debt): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id=?1),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?2 AND id=?1)",
+                rusqlite::params![control, nonce],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((deleted, debt), (0, 1), "{control}");
+    }
     {
-        let conn = db.acquire_lock("verify strict deleted settlement").unwrap();
+        let conn = db
+            .acquire_lock("verify completed capture settlement")
+            .unwrap();
         let (deleted, debt): (i64, i64) = conn
             .query_row(
                 "SELECT (SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id='master'),
@@ -1713,47 +1816,6 @@ async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO source_revalidation_debt(round,id) VALUES(?1,'master')",
-            [&nonce],
-        )
-        .unwrap();
-    }
-    let due = db
-        .due_catalog_candidates(
-            owner(),
-            "PrimarySync".into(),
-            origin.clone(),
-            "policy".into(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(due.len(), 1);
-    assert!(
-        db.settle_catalog_candidate(
-            owner(),
-            "PrimarySync".into(),
-            origin.clone(),
-            "policy".into(),
-            due[0].clone(),
-            CatalogSettlementAuthority::Live {
-                evidence: evidence(false),
-            },
-        )
-        .await
-        .unwrap()
-    );
-    {
-        let conn = db.acquire_lock("verify strict live settlement").unwrap();
-        let (deleted, debt): (i64, i64) = conn
-            .query_row(
-                "SELECT (SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id='master'),
-                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1 AND id='master')",
-                [&nonce],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!((deleted, debt), (0, 0));
         conn.execute(
             "INSERT INTO source_revalidation_debt(round,id) VALUES(?1,'master')",
             [&nonce],
@@ -1774,31 +1836,140 @@ async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
         )
         .await
         .unwrap();
-    assert_eq!(due.len(), 1);
-    eprintln!("B-CATALOG-SETTLE-CALL protected");
-    assert!(
-        !db.settle_catalog_candidate(
+    let master_due = due
+        .iter()
+        .find(|candidate| candidate.id == "master")
+        .cloned()
+        .unwrap();
+    let live_result = db
+        .settle_catalog_candidate(
             owner(),
             "PrimarySync".into(),
-            origin,
+            origin.clone(),
             "policy".into(),
-            due[0].clone(),
+            master_due,
+            CatalogSettlementAuthority::Live {
+                evidence: evidence(false),
+            },
+        )
+        .await
+        .unwrap();
+    eprintln!("B-CATALOG-SETTLE-RESULT live={live_result}");
+    assert!(live_result);
+    {
+        let conn = db.acquire_lock("verify strict live retirement").unwrap();
+        let (deleted, debt, verification): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id='master'),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1 AND id='master'),
+                        (SELECT COUNT(*) FROM asset_verifications WHERE library='PrimarySync' AND id='master')",
+                [&nonce],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((deleted, debt, verification), (0, 0, 1));
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id) VALUES(?1,'master')",
+            [&nonce],
+        )
+        .unwrap();
+    }
+    let due = db
+        .due_catalog_candidates(
+            owner(),
+            "PrimarySync".into(),
+            origin.clone(),
+            "policy".into(),
+        )
+        .await
+        .unwrap();
+    let master_due = due
+        .iter()
+        .find(|candidate| candidate.id == "master")
+        .cloned()
+        .unwrap();
+    let protected = db
+        .settle_catalog_candidate(
+            owner(),
+            "PrimarySync".into(),
+            origin.clone(),
+            "policy".into(),
+            master_due,
             CatalogSettlementAuthority::Deleted {
                 deleted_at: None,
                 evidence: evidence(true),
             },
         )
         .await
-        .unwrap()
-    );
-    let conn = db.acquire_lock("verify protected catalog set").unwrap();
-    let (deleted, debt): (i64, i64) = conn
-        .query_row(
-            "SELECT (SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id='master'),
-                    (SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1 AND id='master')",
-            [&nonce],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+        .unwrap();
+    assert!(!protected);
+    {
+        let conn = db.acquire_lock("verify protected catalog set").unwrap();
+        let (deleted, debt): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id='master'),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1 AND id='master')",
+                [&nonce],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((deleted, debt), (0, 1));
+        conn.execute(
+            "DELETE FROM asset_verifications WHERE library='PrimarySync' AND id='master'",
+            [],
         )
         .unwrap();
-    assert_eq!((deleted, debt), (0, 1));
+        conn.execute(
+            "UPDATE source_revalidation_debt SET next_retry_at=0 WHERE round=?1 AND id='master'",
+            [&nonce],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_catalog_deletion BEFORE UPDATE ON assets              WHEN NEW.is_deleted=1 BEGIN SELECT RAISE(ABORT,'synthetic catalog deletion'); END;",
+        )
+        .unwrap();
+    }
+    let due = db
+        .due_catalog_candidates(owner(), "PrimarySync".into(), origin, "policy".into())
+        .await
+        .unwrap();
+    let master_due = due
+        .iter()
+        .find(|candidate| candidate.id == "master")
+        .cloned()
+        .unwrap();
+    let rollback = db
+        .settle_catalog_candidate(
+            owner(),
+            "PrimarySync".into(),
+            CatalogOrigin::new(
+                digest,
+                record.epoch.clone(),
+                record.attempt.clone(),
+                nonce.clone(),
+            )
+            .unwrap(),
+            "policy".into(),
+            master_due,
+            CatalogSettlementAuthority::Deleted {
+                deleted_at: None,
+                evidence: evidence(true),
+            },
+        )
+        .await;
+    assert!(rollback.is_err());
+    {
+        let conn = db.acquire_lock("verify catalog deletion rollback").unwrap();
+        let (deleted, debt): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id='master'),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1 AND id='master')",
+                [&nonce],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((deleted, debt), (0, 1));
+        conn.execute_batch("DROP TRIGGER fail_catalog_deletion;")
+            .unwrap();
+    }
 }

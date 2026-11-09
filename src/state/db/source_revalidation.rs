@@ -276,7 +276,6 @@ fn catalog_owner_protected(
         "SELECT EXISTS(SELECT 1 FROM unattributed_legacy WHERE library=?1 AND asset_id IN (SELECT value FROM json_each(?2)))",
         "SELECT EXISTS(SELECT 1 FROM asset_verifications WHERE library=?1 AND id IN (SELECT value FROM json_each(?2)))",
         "SELECT EXISTS(SELECT 1 FROM metadata_capture_retries WHERE library=?1 AND asset_id IN (SELECT value FROM json_each(?2)))",
-        "SELECT EXISTS(SELECT 1 FROM asset_metadata_capture_revisions WHERE library=?1 AND asset_id IN (SELECT value FROM json_each(?2)))",
         "SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE library=?1 AND (asset_id IN (SELECT value FROM json_each(?2)) OR master IN (SELECT value FROM json_each(?2))) AND ((admitted=1 AND (verified_media=0 OR verified_metadata=0)) OR prepared_hash IS NOT NULL OR prepared_checksum IS NOT NULL OR prepared_size IS NOT NULL))",
         "SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE child IN (SELECT value FROM json_each(?2)) AND (outcome='deferred' OR admission='deferred'))",
         "SELECT EXISTS(SELECT 1 FROM provider_work_obligations WHERE library=?1 AND asset_id IN (SELECT value FROM json_each(?2)))",
@@ -291,7 +290,21 @@ fn catalog_owner_protected(
             return Ok(true);
         }
     }
-    Ok(false)
+    let unfinished_capture: bool = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM assets a
+           LEFT JOIN asset_metadata_capture_revisions r
+             ON r.library=a.library AND r.asset_id=a.id
+           WHERE a.library=?1 AND a.id IN (SELECT value FROM json_each(?2))
+             AND a.status='downloaded' AND a.is_deleted=0
+             AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p
+                            WHERE p.library=a.library AND p.asset_id=a.id)
+             AND (r.revision IS NULL OR r.revision < ?3)
+         )",
+        params![library, ids_json, crate::state::METADATA_CAPTURE_REVISION],
+        |row| row.get(0),
+    )?;
+    Ok(unfinished_capture)
 }
 
 fn catalog_signals(
