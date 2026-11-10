@@ -2709,28 +2709,23 @@ pub(crate) async fn replay_due_admitted_selection(
         return Ok(None);
     };
     let owner = context.capture.owner.clone();
-    let mut roots = Vec::new();
-    if let Some(root) = context.current().await? {
-        roots.push(root);
-    }
-    let current_id = roots
-        .first()
-        .map(|root| root.id.clone())
-        .unwrap_or_default();
-    roots.extend(
-        context
-            .capture
-            .db
-            .retained_selection_roots(
-                owner.clone(),
-                context.scope.clone(),
-                context.config_hash.clone(),
-                current_id,
-                (context.format == 2).then(|| context.profile.clone()),
-                7,
-            )
-            .await?,
-    );
+    // Retain the current owner's full seal and dependency validation even when
+    // the fair root window selects a historical source first.
+    let _ = context.current().await?;
+    // Current and historical roots share one durable rotation. Prioritizing the
+    // current root on every wake can starve peers when its refusals remain due.
+    let roots = context
+        .capture
+        .db
+        .retained_selection_roots(
+            owner.clone(),
+            context.scope.clone(),
+            context.config_hash.clone(),
+            String::new(),
+            (context.format == 2).then(|| context.profile.clone()),
+            8,
+        )
+        .await?;
 
     let mut combined = SyncStats::default();
     let mut attempted = false;

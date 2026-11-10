@@ -1885,3 +1885,625 @@ async fn retry_function_preserves_auth_and_cancellation_without_ack_or_backoff()
         "cancellation must not ack or back off"
     );
 }
+
+#[derive(Clone)]
+struct CountingRetrySession {
+    inner: super::ResetCycleSession,
+    lookups: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for CountingRetrySession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        if url.contains("/records/lookup?") {
+            let request: serde_json::Value = serde_json::from_str(&body)?;
+            if let Some([record]) = request["records"].as_array().map(Vec::as_slice)
+                && let Some(name) = record["recordName"].as_str()
+            {
+                self.lookups.lock().unwrap().push(name.to_owned());
+            }
+        }
+        crate::icloud::photos::PhotosSession::post(&self.inner, url, body, headers).await
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+async fn admit_due_media(
+    db: &SqliteStateDb,
+    generation: &str,
+    pass_key: &str,
+    zone: &str,
+    pair: &[serde_json::Value],
+    path: &std::path::Path,
+    attempts: u32,
+) -> String {
+    use super::baseline_owner;
+    use crate::state::VersionSizeKey;
+    use crate::state::db::provider_generations::{ActiveDecision, MAX_GENERATION_BYTES};
+    use crate::state::db::provider_selection::{
+        SelectionDecision, SelectionDestination, SelectionOutcome, SelectionPath,
+    };
+
+    let master_json = pair[0].clone();
+    let asset_json = pair[1].clone();
+    let child = asset_json["recordName"].as_str().unwrap().to_owned();
+    let master = master_json["recordName"].as_str().unwrap().to_owned();
+    let body = serde_json::to_vec(&json!({"records": [asset_json, master_json]})).unwrap();
+    let photo = crate::icloud::photos::current_asset(
+        &body,
+        &child,
+        &master,
+        &json!({"zoneName": zone, "ownerRecordName": "_defaultOwner"}),
+    )
+    .unwrap();
+    let version = photo
+        .versions()
+        .iter()
+        .find(|(size, _)| VersionSizeKey::from(*size) == VersionSizeKey::Original)
+        .map(|(_, facts)| facts)
+        .unwrap();
+    let metadata = photo.metadata_arc(VersionSizeKey::Original);
+    let metadata_hash = metadata.metadata_hash.clone().unwrap();
+    let destination = SelectionDestination {
+        version_size: VersionSizeKey::Original.as_str().to_owned(),
+        path: SelectionPath::from_path(path),
+        checksum: version.checksum.to_string(),
+        size: version.size,
+        metadata_hash: metadata_hash.clone(),
+    };
+    let manifest = ActiveDecision {
+        state_id: child.clone(),
+        sources: vec![],
+        decision: SelectionDecision {
+            pass_key: pass_key.to_owned(),
+            child: child.clone(),
+            master: Some(master),
+            confirmation: Some(body),
+            outcome: SelectionOutcome::Selected,
+            reason: String::new(),
+            destinations: vec![destination],
+        },
+    };
+    let record = crate::test_helpers::TestAssetRecord::new(&child)
+        .library(zone)
+        .version_size(VersionSizeKey::Original)
+        .filename(path.file_name().unwrap().to_str().unwrap())
+        .checksum(&version.checksum)
+        .size(version.size)
+        .created_at(photo.created())
+        .added_at(photo.added_date())
+        .metadata((*metadata).clone())
+        .build();
+    db.project_selection_decision_with_proof(
+        baseline_owner(),
+        generation.to_owned(),
+        manifest,
+        vec![record],
+        None,
+        MAX_GENERATION_BYTES,
+    )
+    .await
+    .unwrap();
+    for _ in 0..attempts {
+        let identity = db
+            .selection_retry_identity(
+                baseline_owner(),
+                generation.to_owned(),
+                pass_key.to_owned(),
+                child.clone(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let captured = captured_from_identity(&identity);
+        assert!(
+            db.defer_selection_media_failure(baseline_owner(), captured)
+                .await
+                .unwrap()
+        );
+    }
+    child
+}
+
+#[tokio::test]
+async fn actual_retry_function_bounds_source_and_rotates_three_roots() {
+    use std::sync::Arc;
+
+    use super::{
+        MEDIA, ZONE, baseline_owner, make_run_cycle_config, make_run_cycle_download_config_builder,
+        make_shared_session_for_run_cycle, seed_existing_upgrade_db,
+    };
+    use crate::download;
+    use crate::state::SqliteStateDb;
+    use tokio_util::sync::CancellationToken;
+
+    const EXTRA: usize = 64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let db_path = dir.path().join("state.db");
+    seed_existing_upgrade_db(&db_path);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let allow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/fail"))
+        .respond_with(GatedBytes {
+            calls: Arc::clone(&calls),
+            allow: Arc::clone(&allow),
+            bytes: Arc::new(MEDIA.to_vec()),
+        })
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path_regex(r"^/extra-\d+$"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .mount(&server)
+        .await;
+    let fail_pair = media_pair(ZONE, "fail", "fail.JPG", &format!("{}/fail", server.uri()));
+    let full_queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let first_library = stock36_library_state(
+        db.clone(),
+        ZONE,
+        fail_pair.clone(),
+        Arc::clone(&full_queries),
+        Arc::clone(&changes),
+    )
+    .await;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let mut config = make_run_cycle_config();
+    config.retry.max_retries = 0;
+    run_stock36_cycle(&db, &[&first_library], &root, &shared, &config)
+        .await
+        .expect("first baseline must create the current root");
+
+    let (current_generation, pass_key): (String, String) = {
+        let conn = db.acquire_lock("read current root").unwrap();
+        conn.query_row(
+            "SELECT generation,pass_key FROM provider_active_decisions WHERE child='asset-fail'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    };
+    let spec: crate::state::db::provider_generations::GenerationSpec = {
+        let conn = db.acquire_lock("read current spec").unwrap();
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT specification FROM provider_active_generations WHERE id=?1",
+                [&current_generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    async fn begin_fairness_root(
+        db: &SqliteStateDb,
+        spec: crate::state::db::provider_generations::GenerationSpec,
+    ) -> crate::state::db::provider_generations::ActiveGeneration {
+        db.begin_selection_generation(
+            baseline_owner(),
+            spec,
+            crate::state::db::provider_generations::MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap()
+    }
+
+    let future_root = begin_fairness_root(&db, spec.clone()).await;
+    let future_pair = media_pair(
+        ZONE,
+        "future",
+        "future.JPG",
+        &format!("{}/future", server.uri()),
+    );
+    admit_due_media(
+        &db,
+        &future_root.id,
+        &pass_key,
+        ZONE,
+        &future_pair,
+        &root.join("future.JPG"),
+        1,
+    )
+    .await;
+
+    // A real excluded decision makes the oldest scheduled source non-media.
+    let excluded = media_pair(
+        ZONE,
+        "excluded",
+        "excluded.JPG",
+        "https://invalid.example/excluded",
+    );
+    let excluded_body = serde_json::to_vec(&json!({"records": excluded})).unwrap();
+    db.project_selection_decision_with_proof(
+        baseline_owner(),
+        future_root.id.clone(),
+        crate::state::db::provider_generations::ActiveDecision {
+            state_id: "asset-excluded".into(),
+            sources: vec![],
+            decision: crate::state::db::provider_selection::SelectionDecision {
+                pass_key: pass_key.clone(),
+                child: "asset-excluded".into(),
+                master: Some("excluded".into()),
+                confirmation: Some(excluded_body),
+                outcome: crate::state::db::provider_selection::SelectionOutcome::Excluded,
+                reason: "filtered".into(),
+                destinations: vec![],
+            },
+        },
+        vec![],
+        None,
+        crate::state::db::provider_generations::MAX_GENERATION_BYTES,
+    )
+    .await
+    .unwrap();
+
+    let refused_root = begin_fairness_root(&db, spec.clone()).await;
+    let wrong_correct = media_pair(
+        ZONE,
+        "wrong",
+        "wrong.JPG",
+        &format!("{}/wrong", server.uri()),
+    );
+    admit_due_media(
+        &db,
+        &refused_root.id,
+        &pass_key,
+        ZONE,
+        &wrong_correct,
+        &root.join("wrong.JPG"),
+        0,
+    )
+    .await;
+
+    let good_pair = media_pair(ZONE, "good", "good.JPG", &format!("{}/good", server.uri()));
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/good"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .mount(&server)
+        .await;
+    admit_due_media(
+        &db,
+        &refused_root.id,
+        &pass_key,
+        ZONE,
+        &good_pair,
+        &root.join("good.JPG"),
+        0,
+    )
+    .await;
+
+    // Generation ordering uses millisecond timestamps. Separate the current
+    // root from its historical peers and verify the production owner lookup.
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let peer_root = begin_fairness_root(&db, spec.clone()).await;
+    assert_eq!(
+        db.current_download_generation(
+            baseline_owner(),
+            spec.scope.clone(),
+            spec.config_hash.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .id,
+        peer_root.id,
+        "the 64-refusal root must be the actual current owner"
+    );
+    let mut extra_pairs = Vec::new();
+    for index in 0..EXTRA {
+        let id = format!("extra-{index:02}");
+        let pair = media_pair(
+            ZONE,
+            &id,
+            "fail.JPG",
+            &format!("{}/extra-{index:02}", server.uri()),
+        );
+        admit_due_media(
+            &db,
+            &peer_root.id,
+            &pass_key,
+            ZONE,
+            &pair,
+            &root.join(format!("extra-{index:02}.JPG")),
+            0,
+        )
+        .await;
+        extra_pairs.push(pair);
+    }
+    for id in [&future_root.id, &current_generation, &refused_root.id] {
+        db.rotate_retained_selection_root(baseline_owner(), id.clone())
+            .await
+            .unwrap();
+    }
+    let mut inventory = fail_pair.clone();
+    for pair in &extra_pairs {
+        // Current confirmation cannot prove a pair when the master is absent.
+        // The originally admitted confirmation remains intact and still due.
+        inventory.push(pair[1].clone());
+    }
+    // The current provider view for the wrong-proof child differs from its
+    // admitted resource, so the retry owner refuses it without a GET.
+    let mut wrong_current = wrong_correct.clone();
+    wrong_current[1]["fields"]["masterRef"]["value"]["recordName"] = serde_json::json!("wrong");
+    wrong_current[1]["fields"]["assetDate"]["value"] = serde_json::json!(1_600_000_000_000_i64);
+    inventory.extend(wrong_current);
+    inventory.extend(future_pair);
+    inventory.extend(good_pair);
+    let mut restored_inventory: Vec<_> = inventory
+        .iter()
+        .filter(|record| {
+            !record["recordName"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("asset-extra-"))
+        })
+        .cloned()
+        .collect();
+    for pair in &extra_pairs {
+        restored_inventory.extend(pair.clone());
+    }
+    let generations_before = generation_count(&db);
+    let epoch_before = epoch_state(&db, ZONE);
+    let token_before = token(&db, ZONE);
+    let future_before = decision_state(&db, "asset-future");
+    let wrong_before = decision_state(&db, "asset-wrong");
+    assert!(future_before.2 > chrono::Utc::now().timestamp());
+    let lookups = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let session = CountingRetrySession {
+        inner: super::ResetCycleSession {
+            zone: ZONE,
+            inventory: Arc::new(inventory),
+            full_queries: Arc::clone(&full_queries),
+            changes: Arc::clone(&changes),
+            fail_full: false,
+            auth_expired: false,
+            boundary: "inventory-last-page",
+        },
+        lookups: Arc::clone(&lookups),
+    };
+    let mut library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/private".into(),
+        Arc::new(std::collections::HashMap::new()),
+        Box::new(session),
+        Arc::new(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db.clone(),
+        baseline_owner(),
+        "com",
+    ));
+    let passes = [crate::commands::AlbumPass {
+        kind: crate::commands::PassKind::Unfiled,
+        album: library.all(),
+        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+    }];
+    let passes = passes.as_slice();
+    let base = make_run_cycle_download_config_builder(&root, db.clone());
+    let owner_config = Arc::new(
+        (*base(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from(ZONE),
+        ))
+        .clone(),
+    );
+    let controls = download::DownloadControls::download_hidden();
+    let client = reqwest::Client::new();
+    allow.store(true, std::sync::atomic::Ordering::SeqCst);
+    let baseline_gets = calls.load(std::sync::atomic::Ordering::SeqCst);
+
+    let first = crate::download::replay_due_admitted_selection(
+        &client,
+        passes,
+        owner_config.clone(),
+        controls,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("fairness wake must complete");
+    let first_lookups = lookups.lock().unwrap().clone();
+    assert_eq!(first_lookups.len(), EXTRA);
+    assert_eq!(
+        first_lookups
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        EXTRA
+    );
+    let requests_after_first = server.received_requests().await.unwrap();
+    assert!(
+        first.is_none(),
+        "refused current decisions must not download"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        baseline_gets
+    );
+    let current_cursor: (String, String) = {
+        let conn = db.acquire_lock("read refused current cursor").unwrap();
+        let cursor: String = conn
+            .query_row(
+                "SELECT replay_after FROM provider_active_generations WHERE id=?1",
+                [&peer_root.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&cursor).unwrap()
+    };
+    assert_eq!(
+        current_cursor,
+        (pass_key.clone(), "asset-extra-63".to_owned())
+    );
+    let historical = crate::download::replay_due_admitted_selection(
+        &client,
+        passes,
+        owner_config.clone(),
+        controls,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("second fairness wake must complete");
+    let second_lookups = lookups.lock().unwrap().clone();
+    let second_lookups = &second_lookups[first_lookups.len()..];
+    assert_eq!(second_lookups.len(), 64);
+    assert_eq!(
+        second_lookups
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        64
+    );
+    assert!(second_lookups.iter().any(|name| name == "asset-good"));
+    assert!(second_lookups.iter().any(|name| name == "asset-wrong"));
+    assert!(!second_lookups.iter().any(|name| name == "asset-future"));
+    assert!(
+        historical.is_some(),
+        "still-due current refusals must not starve historical work"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        baseline_gets
+    );
+    assert!(historical.unwrap().stats.downloaded > 0);
+    let requests_after_second = server.received_requests().await.unwrap();
+    assert_eq!(requests_after_first.len(), baseline_gets);
+    assert_eq!(
+        requests_after_second
+            .iter()
+            .filter(|r| r.url.path() == "/good")
+            .count(),
+        1
+    );
+    assert_eq!(requests_after_second.len(), baseline_gets + 1);
+    assert!(root.join("good.JPG").exists());
+    let current_cursor: (String, String) = {
+        let conn = db.acquire_lock("read bounded second cursor").unwrap();
+        let cursor: String = conn
+            .query_row(
+                "SELECT replay_after FROM provider_active_generations WHERE id=?1",
+                [&peer_root.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&cursor).unwrap()
+    };
+    assert_eq!(
+        current_cursor,
+        (pass_key.clone(), "asset-extra-61".to_owned())
+    );
+    let before_quiet = requests_after_second.len();
+    for _ in 0..2 {
+        let quiet = crate::download::replay_due_admitted_selection(
+            &client,
+            passes,
+            owner_config.clone(),
+            controls,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("quiet wake must complete");
+        assert!(quiet.is_none());
+    }
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        before_quiet,
+        "settled source must stay quiet without GETs"
+    );
+    let restored = stock36_library_state(
+        db.clone(),
+        ZONE,
+        restored_inventory,
+        Arc::clone(&full_queries),
+        Arc::clone(&changes),
+    )
+    .await;
+    for _ in 0..4 {
+        crate::download::replay_due_admitted_selection(
+            &client,
+            restored.plan.passes.as_slice(),
+            owner_config.clone(),
+            controls,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("restored current source must retry");
+        let requests = server.received_requests().await.unwrap();
+        if requests
+            .iter()
+            .filter(|r| r.url.path().starts_with("/extra-"))
+            .count()
+            == EXTRA
+        {
+            break;
+        }
+    }
+    let requests = server.received_requests().await.unwrap();
+    for index in 0..EXTRA {
+        let path = format!("/extra-{index:02}");
+        assert_eq!(
+            requests.iter().filter(|r| r.url.path() == path).count(),
+            1,
+            "each current peer gets exactly one GET"
+        );
+        assert!(root.join(format!("extra-{index:02}.JPG")).exists());
+    }
+    let settled_gets = requests.len();
+    for _ in 0..2 {
+        assert!(
+            crate::download::replay_due_admitted_selection(
+                &client,
+                restored.plan.passes.as_slice(),
+                owner_config.clone(),
+                controls,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("settled wake must complete")
+            .is_none()
+        );
+    }
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        settled_gets
+    );
+    assert_eq!(
+        generation_count(&db),
+        generations_before,
+        "retry must not readmit roots"
+    );
+    assert_eq!(epoch_state(&db, ZONE), epoch_before);
+    assert_eq!(token(&db, ZONE), token_before);
+    assert_eq!(decision_state(&db, "asset-future"), future_before);
+    assert_eq!(decision_state(&db, "asset-wrong"), wrong_before);
+    assert_eq!(
+        requests.iter().filter(|r| r.url.path() == "/good").count(),
+        1
+    );
+    eprintln!(
+        "RETRY_FAIRNESS first_examined=64 second_examined=64 first_ack=extra-63 second_ack=extra-61 historical_gets=1 current_gets=64 future_gets=0 wrong_gets=0 quiet_wakes=2"
+    );
+    assert!(!root.join("wrong.JPG").exists());
+    assert!(!root.join("future.JPG").exists());
+    assert_eq!(full_queries.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

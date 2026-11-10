@@ -1711,6 +1711,21 @@ pub(crate) struct RootAdmissionReuse {
     pub(crate) validate_file: Box<dyn Fn() -> Result<(), StateError> + Send>,
 }
 
+// Millisecond ties must not let a repeatedly refused root win the same
+// source-order tiebreaker on every wake.
+fn next_retry_rotation(conn: &Connection, generation: &str) -> Result<i64, StateError> {
+    let latest: i64 = conn.query_row(
+        "SELECT coalesce(max(last_replayed_at), 0) FROM provider_active_generations WHERE scope=(SELECT scope FROM provider_active_generations WHERE id=?1)",
+        [generation],
+        |row| row.get(0),
+    )?;
+    Ok(Utc::now().timestamp_millis().max(
+        latest
+            .checked_add(1)
+            .ok_or(StateError::ProviderSelectionInvalid)?,
+    ))
+}
+
 impl SqliteStateDb {
     pub(crate) async fn selection_attempt_due(
         &self,
@@ -1834,9 +1849,10 @@ impl SqliteStateDb {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             account::validate_authenticated(&tx, &owner)?;
             load_generation(&tx, &generation)?;
+            let rotated_at = next_retry_rotation(&tx, &generation)?;
             tx.execute(
                 "UPDATE provider_active_generations SET last_replayed_at=?2 WHERE id=?1",
-                params![generation, Utc::now().timestamp_millis()],
+                params![generation, rotated_at],
             )?;
             tx.commit()?;
             Ok(())
@@ -2167,14 +2183,15 @@ impl SqliteStateDb {
             }
             let cursor = serde_json::to_string(&last_examined)
                 .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+            let rotated_at = next_retry_rotation(&tx, &generation)?;
             let changed = match expected_cursor {
                 Some(expected) => tx.execute(
                     "UPDATE provider_active_generations SET replay_after=?2,last_replayed_at=?3 WHERE id=?1 AND replay_after=?4",
-                    params![generation, cursor, Utc::now().timestamp_millis(), expected],
+                    params![generation, cursor, rotated_at, expected],
                 )?,
                 None => tx.execute(
                     "UPDATE provider_active_generations SET replay_after=?2,last_replayed_at=?3 WHERE id=?1 AND replay_after IS NULL",
-                    params![generation, cursor, Utc::now().timestamp_millis()],
+                    params![generation, cursor, rotated_at],
                 )?,
             };
             tx.commit()?;
