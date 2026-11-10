@@ -507,6 +507,117 @@ impl std::fmt::Debug for SelectionRun {
     }
 }
 
+#[allow(dead_code, reason = "consumed by L3 catalog claim fixtures")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogPlanPass {
+    pub(crate) key: String,
+    pub(crate) kind: String,
+    pub(crate) scope: Value,
+    pub(crate) excludes: Vec<String>,
+}
+
+/// Authoritative read-only source-plan context for a catalog claim. It is built
+/// from the same resolved plans that construct the observation Descriptor.
+#[allow(dead_code, reason = "consumed by L3 catalog claim fixtures")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogPlanContext {
+    pub(crate) account: String,
+    pub(crate) provider: String,
+    pub(crate) database: String,
+    pub(crate) zone: Value,
+    pub(crate) scope: String,
+    pub(crate) config_hash: String,
+    pub(crate) metadata_enabled: bool,
+    pub(crate) metadata_flags: u8,
+    pub(crate) passes: Vec<CatalogPlanPass>,
+    pub(crate) profile: Value,
+}
+
+impl SelectionContext {
+    /// Read-only projection of the exact source plan used for observation.
+    pub(super) fn catalog_plan_context(
+        &self,
+        config: &DownloadConfig,
+    ) -> Option<CatalogPlanContext> {
+        let (account, provider) = self.capture.owner.authenticated_keys().ok()?;
+        let spec = self.spec(config, String::new());
+        let scope_value: Value = serde_json::from_str(&spec.scope).ok()?;
+        let database = scope_value.get("database")?.as_str()?.to_owned();
+        let passes = spec
+            .profile
+            .get("passes")?
+            .as_array()?
+            .iter()
+            .map(|pass| {
+                Some(CatalogPlanPass {
+                    key: pass.get("key")?.as_str()?.to_owned(),
+                    kind: pass.get("kind")?.as_str()?.to_owned(),
+                    scope: pass.get("scope")?.clone(),
+                    excludes: pass
+                        .get("excludes")?
+                        .as_array()?
+                        .iter()
+                        .map(|value| value.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(CatalogPlanContext {
+            account: account.to_owned(),
+            provider: provider.to_owned(),
+            database,
+            zone: spec.zone.clone(),
+            scope: spec.scope.clone(),
+            config_hash: spec.config_hash.clone(),
+            metadata_enabled: spec.metadata_enabled,
+            metadata_flags: spec.metadata_flags,
+            passes,
+            profile: spec.profile,
+        })
+    }
+}
+
+/// Build the same canonical plan digest used by the state observation reader.
+#[allow(dead_code, reason = "consumed by L3 catalog claim fixtures")]
+pub(crate) fn catalog_plan_digest_from_source_context(context: &CatalogPlanContext) -> String {
+    let zone_name = context
+        .zone
+        .get("zoneName")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let plan = json!({
+        "scope": context.scope,
+        "config": context.config_hash,
+        "profile": context.profile,
+        "metadata": context.metadata_enabled,
+        "flags": context.metadata_flags,
+    });
+    let canonical = json!({
+        "version": 1,
+        "account": context.account,
+        "provider": context.provider,
+        "library": zone_name,
+        "plans": [plan],
+    });
+    let mut hash = Sha256::new();
+    hash.update(canonical.to_string().as_bytes());
+    format!("{:x}", hash.finalize())
+}
+
+/// Resolve exactly one authenticated source context without admitting work.
+#[allow(dead_code, reason = "consumed by L3 catalog claim fixtures")]
+pub(crate) async fn catalog_plan_context_for_source(
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+    source: Option<&str>,
+) -> Result<Option<CatalogPlanContext>> {
+    let Some(context) = context_for_source(passes, config, controls, 2, source).await? else {
+        return Ok(None);
+    };
+    Ok(context.catalog_plan_context(config))
+}
+
 impl SelectionContext {
     #[cfg(test)]
     pub(super) async fn start_for_test(
@@ -3073,6 +3184,155 @@ fn metadata_writer_limits() -> (usize, usize) {
 #[test]
 fn metadata_writer_default_limits_reserve_250_within_500() {
     assert_eq!(metadata_writer_limits(), (250, 500));
+}
+
+#[cfg(test)]
+#[test]
+fn catalog_plan_context_digest_matches_state_observation_digest() {
+    let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+    let scope = serde_json::to_string(&json!({
+        "format":1,"realm":"com","container":"com.apple.photos.cloud",
+        "environment":"production","database":"private","zone":zone,
+    }))
+    .unwrap();
+    let pass_scope = json!({"database":"private","zone":zone,"kind":"unfiled"});
+    let profile = json!({"format":2,"coverage":"selected_downloads","passes":[
+        {"key":"pass","kind":"Unfiled","scope":pass_scope,"excludes":["one","two"]}
+    ]});
+    let context = CatalogPlanContext {
+        account: "account".into(),
+        provider: "provider".into(),
+        database: "private".into(),
+        zone: zone.clone(),
+        scope: scope.clone(),
+        config_hash: "a".repeat(64),
+        metadata_enabled: false,
+        metadata_flags: 0,
+        passes: vec![CatalogPlanPass {
+            key: "pass".into(),
+            kind: "Unfiled".into(),
+            scope: pass_scope.clone(),
+            excludes: vec!["one".into(), "two".into()],
+        }],
+        profile: profile.clone(),
+    };
+    let raw = json!({
+        "version": 1,
+        "account": "account",
+        "provider": "provider",
+        "plans": [{
+            "scope": scope,
+            "config": "a".repeat(64),
+            "profile": profile,
+            "metadata": false,
+            "flags": 0,
+        }],
+    })
+    .to_string();
+    let expected =
+        crate::state::db::provider_generations::observation::catalog_plan_digest_from_observation(
+            &raw,
+            "PrimarySync",
+        )
+        .unwrap();
+    assert_eq!(catalog_plan_digest_from_source_context(&context), expected);
+
+    let mut different = context.clone();
+    different.passes[0].excludes = vec!["one".into(), "three".into()];
+    different.profile["passes"][0]["excludes"] = json!(["one", "three"]);
+    assert_ne!(
+        catalog_plan_digest_from_source_context(&different),
+        expected
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn catalog_plan_context_digest_distinguishes_source_and_plan_variants() {
+    let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+    let make_scope = |database: &str| {
+        serde_json::to_string(&json!({
+            "format":1,"realm":"com","container":"com.apple.photos.cloud",
+            "environment":"production","database":database,"zone":zone,
+        }))
+        .unwrap()
+    };
+    let pass_scope = json!({"database":"private","zone":zone,"kind":"unfiled"});
+    let mut base = CatalogPlanContext {
+        account: "account".into(),
+        provider: "provider".into(),
+        database: "private".into(),
+        zone: zone.clone(),
+        scope: make_scope("private"),
+        config_hash: "a".repeat(64),
+        metadata_enabled: false,
+        metadata_flags: 0,
+        passes: vec![CatalogPlanPass {
+            key: "pass".into(),
+            kind: "Unfiled".into(),
+            scope: pass_scope.clone(),
+            excludes: vec!["one".into()],
+        }],
+        profile: json!({"format":2,"coverage":"selected_downloads","passes":[
+            {"key":"pass","kind":"Unfiled","scope":pass_scope,"excludes":["one"]}
+        ]}),
+    };
+    let raw_from = |context: &CatalogPlanContext| {
+        json!({
+            "version": 1,
+            "account": context.account,
+            "provider": context.provider,
+            "plans": [{
+                "scope": context.scope,
+                "config": context.config_hash,
+                "profile": context.profile,
+                "metadata": context.metadata_enabled,
+                "flags": context.metadata_flags,
+            }],
+        })
+        .to_string()
+    };
+    let assert_matches = |context: &CatalogPlanContext| {
+        let expected = crate::state::db::provider_generations::observation::catalog_plan_digest_from_observation(
+            &raw_from(context), "PrimarySync",
+        )
+        .unwrap();
+        assert_eq!(catalog_plan_digest_from_source_context(context), expected);
+    };
+    let base_digest = catalog_plan_digest_from_source_context(&base);
+    assert_matches(&base);
+
+    let mut shared = base.clone();
+    shared.database = "shared".into();
+    shared.scope = make_scope("shared");
+    shared.profile["passes"][0]["scope"]["database"] = json!("shared");
+    shared.passes[0].scope["database"] = json!("shared");
+    assert_matches(&shared);
+    assert_ne!(
+        catalog_plan_digest_from_source_context(&shared),
+        base_digest
+    );
+
+    let mut different_excludes = base.clone();
+    different_excludes.passes[0].excludes = vec!["one".into(), "two".into()];
+    different_excludes.profile["passes"][0]["excludes"] = json!(["one", "two"]);
+    assert_matches(&different_excludes);
+    assert_ne!(
+        catalog_plan_digest_from_source_context(&different_excludes),
+        base_digest
+    );
+
+    let mut different_metadata = base.clone();
+    different_metadata.metadata_enabled = true;
+    different_metadata.metadata_flags = 3;
+    assert_matches(&different_metadata);
+    assert_ne!(
+        catalog_plan_digest_from_source_context(&different_metadata),
+        base_digest
+    );
+
+    base.account = "other-account".into();
+    assert_matches(&base);
 }
 
 /// Keep the existing 500-row writer budget while rotating past retained failed

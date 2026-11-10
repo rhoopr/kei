@@ -42,6 +42,14 @@ pub use orchestration::dispatch::download_photos_with_sync;
     reason = "L1 shared held-epoch seam calls this exact private re-export"
 )]
 pub(crate) use orchestration::generation::replay_due_admitted_selection;
+#[allow(
+    unused_imports,
+    reason = "consumed by L3 catalog claim fixtures at the next owner boundary"
+)]
+pub(crate) use orchestration::generation::{
+    CatalogPlanContext, CatalogPlanPass, catalog_plan_context_for_source,
+    catalog_plan_digest_from_source_context,
+};
 pub(crate) use orchestration::generation::{
     has_current_observation, has_due as has_due_selection_work,
 };
