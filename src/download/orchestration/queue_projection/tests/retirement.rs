@@ -1,4 +1,6 @@
 //! Completion ownership survives body compaction and predecessor retirement.
+mod media_failure_successor;
+
 use super::{CURRENT, Fixture, controls, destination_pass, destination_pass_with, owner, records};
 use crate::download::DownloadTask;
 use crate::download::orchestration::models::DownloadStore;

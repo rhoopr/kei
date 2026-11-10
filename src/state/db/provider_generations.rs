@@ -129,6 +129,32 @@ pub(crate) struct CapturedSelectionRetry {
     pub(crate) destination: SelectionDestination,
 }
 
+/// Actual committed decision state for one exact captured destination.
+/// The pipeline, not the state owner, supplies any transient failure cause.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the later mixed-failure pipeline seam"
+    )
+)]
+#[must_use]
+#[derive(Clone, Debug)]
+pub(crate) struct DeferredMediaSuccessor {
+    pub(crate) captured: CapturedSelectionRetry,
+    pub(crate) admission: String,
+    pub(crate) reason: String,
+    pub(crate) attempts: i64,
+    pub(crate) next_retry_at: i64,
+    pub(crate) committed_admission_hash: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MediaFailureValidation {
+    Legacy,
+    ExactGroup,
+}
+
 fn invalid<T>() -> Result<T, StateError> {
     Err(StateError::ProviderSelectionInvalid)
 }
@@ -1336,13 +1362,27 @@ fn defer_attempt_with_reason(
     child: &str,
     admitted_reason: &str,
 ) -> Result<(), StateError> {
+    defer_attempt_with_reason_inner(conn, root, key, child, admitted_reason)?;
+    Ok(())
+}
+
+fn defer_attempt_with_reason_inner(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    key: &str,
+    child: &str,
+    admitted_reason: &str,
+) -> Result<(usize, u32, i64), StateError> {
     let (admission,attempts):(String,u32)=conn.query_row("SELECT admission,attempts FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,key,child],|r|Ok((r.get(0)?,r.get(1)?)))?;
     if admission == "excluded" {
         return invalid();
     }
     let delay = (3600_i64 * (1_i64 << attempts.min(5))).min(86400);
-    conn.execute("UPDATE provider_active_decisions SET attempts=?4,next_retry_at=?5,reason=CASE WHEN admission='admitted' THEN ?6 ELSE reason END WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,key,child,attempts.saturating_add(1).min(32),Utc::now().timestamp()+delay,admitted_reason])?;
-    refresh_admission_hash(conn, root, key, child)
+    let next_attempts = attempts.saturating_add(1).min(32);
+    let next_retry_at = Utc::now().timestamp() + delay;
+    let changed = conn.execute("UPDATE provider_active_decisions SET attempts=?4,next_retry_at=?5,reason=CASE WHEN admission='admitted' THEN ?6 ELSE reason END WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,key,child,next_attempts,next_retry_at,admitted_reason])?;
+    refresh_admission_hash(conn, root, key, child)?;
+    Ok((changed, next_attempts, next_retry_at))
 }
 
 fn refresh_admission_hash(
@@ -1354,6 +1394,180 @@ fn refresh_admission_hash(
     let hash = admission_hash(conn, root, key, child)?;
     conn.execute("UPDATE provider_active_decisions SET admission_hash=?4 WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,key,child,hash])?;
     Ok(())
+}
+
+/// Called only inside the caller's IMMEDIATE transaction. `None` performs no
+/// backoff write; a post-write validation error must roll that transaction back.
+fn defer_media_failure_tx(
+    conn: &Connection,
+    owner: &account::AccountOwner,
+    captures: &[CapturedSelectionRetry],
+    validation: MediaFailureValidation,
+) -> Result<Option<Vec<DeferredMediaSuccessor>>, StateError> {
+    account::validate_authenticated(conn, owner)?;
+    let Some(first) = captures.first() else {
+        return Ok(None);
+    };
+    let mut destinations = HashSet::new();
+    for captured in captures {
+        if captured.generation != first.generation
+            || captured.specification_hash != first.specification_hash
+            || captured.pass_key != first.pass_key
+            || captured.child != first.child
+            || captured.state_id != first.state_id
+            || captured.manifest_hash != first.manifest_hash
+            || captured.admission_hash != first.admission_hash
+            || !destinations.insert((
+                captured.destination.version_size.clone(),
+                captured.destination.path.to_path(),
+            ))
+        {
+            return Ok(None);
+        }
+    }
+    let root = load_generation(conn, &first.generation)?;
+    let stored_specification: String = conn.query_row(
+        "SELECT specification_hash FROM provider_active_generations WHERE id=?1",
+        [&first.generation],
+        |row| row.get(0),
+    )?;
+    if stored_specification != first.specification_hash {
+        return Ok(None);
+    }
+    // Prepared/frozen and mismatched rows must refuse before decoding a
+    // potentially incomplete prepared state as a valid successor.
+    if validation == MediaFailureValidation::ExactGroup {
+        let library = root
+            .spec
+            .zone
+            .get("zoneName")
+            .and_then(Value::as_str)
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        guard_library_scope(conn, &root.spec.scope, library)?;
+        for captured in captures {
+            if !exact_unfinished_media_destination(conn, &root, captured)? {
+                return Ok(None);
+            }
+        }
+    }
+    let manifest = load_decision(conn, &root, &first.pass_key, &first.child)?;
+    if manifest.state_id != first.state_id {
+        return Ok(None);
+    }
+    let (manifest_hash, admission, stored_hash, compacted): (String, String, Option<String>, bool) =
+        conn.query_row(
+            "SELECT manifest_hash,admission,admission_hash,compacted_hash IS NOT NULL FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+            params![first.generation, first.pass_key, first.child],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    if manifest_hash != first.manifest_hash
+        || admission != "admitted"
+        || stored_hash.as_deref() != Some(first.admission_hash.as_str())
+        || compacted
+    {
+        return Ok(None);
+    }
+    for captured in captures {
+        let Some(destination) = manifest.decision.destinations.iter().find(|destination| {
+            destination.version_size == captured.destination.version_size
+                && destination.path == captured.destination.path
+                && destination.checksum == captured.destination.checksum
+                && destination.size == captured.destination.size
+                && (validation == MediaFailureValidation::Legacy
+                    || *destination == &captured.destination)
+        }) else {
+            return Ok(None);
+        };
+        let valid: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=0 AND prepared_hash IS NULL AND frozen_metadata IS NULL)",
+            params![first.generation, first.pass_key, first.child, destination.version_size, destination.path.key()?],
+            |row| row.get(0),
+        )?;
+        if !valid {
+            return Ok(None);
+        }
+    }
+    let (changed, expected_attempts, expected_deadline) = defer_attempt_with_reason_inner(
+        conn,
+        &root,
+        &first.pass_key,
+        &first.child,
+        "download_failed",
+    )?;
+    if validation == MediaFailureValidation::Legacy {
+        return Ok(Some(Vec::new()));
+    }
+    if changed != 1 {
+        return invalid();
+    }
+    account::validate_authenticated(conn, owner)?;
+    let post_root = load_generation(conn, &first.generation)?;
+    let library = post_root
+        .spec
+        .zone
+        .get("zoneName")
+        .and_then(Value::as_str)
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    guard_library_scope(conn, &post_root.spec.scope, library)?;
+    let post_specification: String = conn.query_row(
+        "SELECT specification_hash FROM provider_active_generations WHERE id=?1",
+        [&first.generation],
+        |row| row.get(0),
+    )?;
+    let post_manifest = load_decision(conn, &post_root, &first.pass_key, &first.child)?;
+    let (post_manifest_hash, admission, reason, attempts, next_retry_at, hash, compacted):
+        (String, String, String, i64, i64, Option<String>, bool) = conn.query_row(
+        "SELECT manifest_hash,admission,reason,attempts,next_retry_at,admission_hash,compacted_hash IS NOT NULL FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+        params![first.generation, first.pass_key, first.child],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+    )?;
+    let Some(hash) = hash else { return invalid() };
+    if post_root.spec != root.spec
+        || post_root.sealed != root.sealed
+        || post_root.checkpoint_ready != root.checkpoint_ready
+        || post_root.checkpoint_veto != root.checkpoint_veto
+        || post_specification != first.specification_hash
+        || post_manifest != manifest
+        || post_manifest_hash != first.manifest_hash
+        || admission != "admitted"
+        || reason != "download_failed"
+        || attempts != i64::from(expected_attempts)
+        || next_retry_at != expected_deadline
+        || compacted
+        || hash != admission_hash(conn, &post_root, &first.pass_key, &first.child)?
+    {
+        return invalid();
+    }
+    let mut successors = Vec::with_capacity(captures.len());
+    for captured in captures {
+        if !exact_unfinished_media_destination(conn, &post_root, captured)? {
+            return invalid();
+        }
+        successors.push(DeferredMediaSuccessor {
+            captured: captured.clone(),
+            admission: admission.clone(),
+            reason: reason.clone(),
+            attempts,
+            next_retry_at,
+            committed_admission_hash: hash.clone(),
+        });
+    }
+    Ok(Some(successors))
+}
+
+fn exact_unfinished_media_destination(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    captured: &CapturedSelectionRetry,
+) -> Result<bool, StateError> {
+    let destination = &captured.destination;
+    let size =
+        i64::try_from(destination.size).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND library=?4 AND asset_id=?5 AND version_size=?6 AND path=?7 AND compat_path=?8 AND checksum=?9 AND size_bytes=?10 AND metadata_hash=?11 AND admitted=1 AND verified_media=0 AND prepared_checksum IS NULL AND prepared_size IS NULL AND prepared_hash IS NULL AND frozen_metadata IS NULL AND frozen_metadata_hash IS NULL)",
+        params![captured.generation, captured.pass_key, captured.child, root.spec.zone.get("zoneName").and_then(Value::as_str), captured.state_id, destination.version_size, destination.path.key()?, destination.path.to_path().to_string_lossy(), destination.checksum, size, destination.metadata_hash],
+        |row| row.get(0),
+    )?)
 }
 
 fn validate_decision_rows(
@@ -2209,64 +2423,39 @@ impl SqliteStateDb {
     ) -> Result<bool, StateError> {
         self.with_conn_mut("recording admitted media failure", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            account::validate_authenticated(&tx, &owner)?;
-            let root = load_generation(&tx, &captured.generation)?;
-            let stored_specification: String = tx.query_row(
-                "SELECT specification_hash FROM provider_active_generations WHERE id=?1",
-                [&captured.generation],
-                |row| row.get(0),
-            )?;
-            if stored_specification != captured.specification_hash {
-                tx.commit()?;
-                return Ok(false);
-            }
-            let manifest = load_decision(&tx, &root, &captured.pass_key, &captured.child)?;
-            if manifest.state_id != captured.state_id {
-                tx.commit()?;
-                return Ok(false);
-            }
-            let (manifest_hash, admission, admission_hash, compacted): (String, String, Option<String>, bool) =
-                tx.query_row(
-                    "SELECT manifest_hash,admission,admission_hash,compacted_hash IS NOT NULL FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
-                    params![captured.generation, captured.pass_key, captured.child],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )?;
-            if manifest_hash != captured.manifest_hash
-                || admission != "admitted"
-                || admission_hash.as_deref() != Some(captured.admission_hash.as_str())
-                || compacted
-            {
-                tx.commit()?;
-                return Ok(false);
-            }
-            let Some(destination) = manifest.decision.destinations.iter().find(|destination| {
-                destination.version_size == captured.destination.version_size
-                    && destination.path == captured.destination.path
-                    && destination.checksum == captured.destination.checksum
-                    && destination.size == captured.destination.size
-            }) else {
-                tx.commit()?;
-                return Ok(false);
-            };
-            let path = destination.path.key()?;
-            let valid: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=0 AND prepared_hash IS NULL AND frozen_metadata IS NULL)",
-                params![captured.generation, captured.pass_key, captured.child, destination.version_size, path],
-                |row| row.get(0),
-            )?;
-            if !valid {
-                tx.commit()?;
-                return Ok(false);
-            }
-            defer_attempt_with_reason(
+            let recorded = defer_media_failure_tx(
                 &tx,
-                &root,
-                &captured.pass_key,
-                &captured.child,
-                "download_failed",
-            )?;
+                &owner,
+                std::slice::from_ref(&captured),
+                MediaFailureValidation::Legacy,
+            )?
+            .is_some();
             tx.commit()?;
-            Ok(true)
+            Ok(recorded)
+        })
+        .await
+    }
+
+    /// Atomically back off one exact decision and return one committed
+    /// successor for each supplied destination. Refusal yields no receipts.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the later mixed-failure pipeline seam"
+        )
+    )]
+    pub(crate) async fn defer_media_failure_successors(
+        &self,
+        owner: account::AccountOwner,
+        captures: Vec<CapturedSelectionRetry>,
+    ) -> Result<Option<Vec<DeferredMediaSuccessor>>, StateError> {
+        self.with_conn_mut("recording grouped admitted media failures", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let successors =
+                defer_media_failure_tx(&tx, &owner, &captures, MediaFailureValidation::ExactGroup)?;
+            tx.commit()?;
+            Ok(successors)
         })
         .await
     }
