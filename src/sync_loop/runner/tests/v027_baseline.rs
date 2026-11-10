@@ -1767,6 +1767,8 @@ mod raw_replay;
 
 mod indexing_layout;
 
+mod source_originals;
+
 mod configuration_safety;
 
 mod current_sparse_coverage;
