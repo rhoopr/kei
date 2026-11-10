@@ -49,6 +49,46 @@ pub(crate) struct SourcePrework {
     protected_retries: Vec<ProtectedRetry>,
 }
 
+#[cfg(test)]
+impl SourcePrework {
+    /// Inspect the actual captured request without granting health authority.
+    pub(crate) fn census_evidence_for_test(
+        &self,
+        conn: &Connection,
+    ) -> Result<(bool, bool, bool, bool), StateError> {
+        let request = &self.request;
+        let Some((library, _, database)) =
+            crate::icloud::photos::PhotoLibrary::provider_scope_projection(
+                &request.specification.scope,
+            )
+        else {
+            return Ok((false, false, false, false));
+        };
+        let source = super::observation::catalog_source_matches(
+            conn,
+            &library,
+            &database,
+            &request.specification.zone,
+        )?;
+        let plan = if let Some(plan) = &request.catalog_plan {
+            super::observation::catalog_active_plan_matches(
+                conn,
+                &library,
+                plan,
+                &request.enum_policy,
+            )?
+        } else {
+            false
+        };
+        Ok((
+            source_valid(conn, request)?,
+            source,
+            plan,
+            census_accounted(conn, request, &library)?,
+        ))
+    }
+}
+
 /// Paths returned here name only validated unfinished selection destinations.
 /// They do not prove filesystem journal absence or provider completion.
 pub(crate) struct SourceAccounting {

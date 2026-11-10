@@ -3396,6 +3396,8 @@ pub(crate) async fn run_cycle_with_witness(
                         .db
                         .install_fresh_catalog_origin(capture.owner.clone(), request)
                         .await?;
+                    #[cfg(test)]
+                    tracing::debug!(nonce = %origin.nonce, "test fresh catalog transaction returned");
                     prepared_baseline_fence = Some(Some(boundary.clone()));
                     capture
                         .db

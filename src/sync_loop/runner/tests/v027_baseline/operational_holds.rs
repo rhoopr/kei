@@ -4,8 +4,8 @@
 //! intended H1 behavior and intentionally fails on the pre-H A base.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -37,6 +37,9 @@ struct Session {
     baseline: Arc<Vec<Value>>,
     progress: Arc<Vec<Value>>,
     hold_child: Arc<Value>,
+    hold_pair: Arc<Vec<Value>>,
+    followup_child: Arc<Value>,
+    recovery_events: Arc<Mutex<Vec<String>>>,
     zone_name: String,
     empty: bool,
     cycle: usize,
@@ -57,8 +60,11 @@ impl PhotosSession for Session {
     ) -> anyhow::Result<Value> {
         let request: Value = serde_json::from_str(&body)?;
         if url.contains("/zones/list") {
+            if self.cycle == 5 {
+                self.recovery_events.lock().unwrap().push("boundary".into());
+            }
             return Ok(json!({"zones":[{"zoneID":zone_for(&self.zone_name),
-                "syncToken":if self.cycle == 3 { "pair-fresh-one" } else { "op-hold-boundary" },"deleted":false}]}));
+                "syncToken":match self.cycle { 3 => "pair-fresh-one", 5 => "pair-fresh-two", _ => "op-hold-boundary" },"deleted":false}]}));
         }
         if request["query"]["recordType"] == "CheckIndexingState" {
             return Ok(json!({"records":[{"recordName":"index",
@@ -66,7 +72,13 @@ impl PhotosSession for Session {
                 "fields":{"state":{"value":"FINISHED"}}}]}));
         }
         if url.contains("/internal/records/query/batch") {
-            return Ok(album_count_response(if self.empty { 0 } else { 2 }));
+            return Ok(album_count_response(if self.empty {
+                0
+            } else if self.cycle == 5 {
+                4
+            } else {
+                2
+            }));
         }
         if url.contains("/records/query?") {
             self.inventory_queries.fetch_add(1, Ordering::SeqCst);
@@ -85,19 +97,43 @@ impl PhotosSession for Session {
                 .and_then(|f| f["fieldValue"]["value"].as_u64())
                 .unwrap_or(0);
             let records = if offset == 0 {
-                self.baseline.as_ref().clone()
+                let mut records = self.baseline.as_ref().clone();
+                if self.cycle == 5 {
+                    self.recovery_events
+                        .lock()
+                        .unwrap()
+                        .push("inventory".into());
+                    records.extend(self.progress.iter().cloned());
+                    records.extend(self.hold_pair.iter().cloned());
+                }
+                records
             } else {
                 Vec::new()
             };
             return Ok(json!({"records":records,"syncToken":"op-query-not-checkpoint"}));
         }
         if url.contains("/records/lookup?") {
+            if self.cycle == 5 {
+                assert_eq!(request["zoneID"], zone_for(&self.zone_name));
+            }
             let requested = request["records"].as_array().unwrap();
             let mut records = Vec::new();
             for request in requested {
                 let name = request["recordName"].as_str().unwrap_or_default();
+                if self.cycle == 5 {
+                    self.recovery_events
+                        .lock()
+                        .unwrap()
+                        .push(format!("lookup:{name}"));
+                    records.extend(
+                        self.hold_pair
+                            .iter()
+                            .filter(|record| record["recordName"].as_str() == Some(name))
+                            .cloned(),
+                    );
+                }
                 if name == "op-hold-child" {
-                    // Asset-only child with no masterRef and no provider answer.
+                    // Only the recovery phase supplied this previously missing master.
                     continue;
                 }
                 records.extend(
@@ -107,6 +143,11 @@ impl PhotosSession for Session {
                         .filter(|candidate| candidate["recordName"].as_str() == Some(name))
                         .cloned(),
                 );
+            }
+            if self.cycle == 5 {
+                for record in &mut records {
+                    record["zoneID"] = zone_for(&self.zone_name);
+                }
             }
             return Ok(json!({"records":records}));
         }
@@ -122,7 +163,9 @@ impl PhotosSession for Session {
             let token = request["zones"][0]["syncToken"]
                 .as_str()
                 .unwrap_or_default();
-            if self.cycle == 3 && token == "op-hold-after-baseline" {
+            if (self.cycle == 3 && token == "op-hold-after-baseline")
+                || (self.cycle == 5 && token == "pair-after-one")
+            {
                 return Ok(json!({"zones":[{"zoneID":zone_for(&self.zone_name),
                     "serverErrorCode":"BAD_REQUEST"}]}));
             }
@@ -136,6 +179,15 @@ impl PhotosSession for Session {
                 (Vec::new(), "op-hold-after-baseline".to_string())
             } else if self.cycle == 3 && token == "pair-fresh-one" {
                 (Vec::new(), "pair-after-one".to_owned())
+            } else if self.cycle == 5 && token == "pair-fresh-two" {
+                self.recovery_events.lock().unwrap().push("bridge".into());
+                (Vec::new(), "pair-after-two".to_owned())
+            } else if self.cycle == 6 {
+                assert_eq!(token, "pair-after-two");
+                (
+                    vec![self.followup_child.as_ref().clone()],
+                    "pair-after-three".to_owned(),
+                )
             } else if self.cycle == 1 || self.cycle == 4 {
                 assert_eq!(
                     token,
@@ -171,6 +223,9 @@ pub(super) struct Fixture {
     baseline: Arc<Vec<Value>>,
     progress: Arc<Vec<Value>>,
     hold_child: Arc<Value>,
+    hold_pair: Arc<Vec<Value>>,
+    followup_child: Arc<Value>,
+    pub(super) recovery_events: Arc<Mutex<Vec<String>>>,
     pub(super) key: String,
     peer_errors: Arc<AtomicUsize>,
     pub(super) _server: wiremock::MockServer,
@@ -238,18 +293,35 @@ impl Fixture {
             ));
         }
         let progress = Arc::new(progress);
-        let mut hold_child = pair(
+        Mock::given(method("GET"))
+            .and(path("/hold"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .mount(&server)
+            .await;
+        let hold_pair = Arc::new(pair(
             "op-hold-child",
             "hold.JPG",
             &format!("{}/hold", server.uri()),
             43,
-        )[1]
-        .clone();
+        ));
+        let mut hold_child = hold_pair[1].clone();
         hold_child["fields"]
             .as_object_mut()
             .unwrap()
             .remove("masterRef");
         let hold_child = Arc::new(hold_child);
+        let mut followup_child = pair(
+            "op-followup-hold",
+            "followup.JPG",
+            &format!("{}/followup", server.uri()),
+            45,
+        )[1]
+        .clone();
+        followup_child["fields"]
+            .as_object_mut()
+            .unwrap()
+            .remove("masterRef");
+        let followup_child = Arc::new(followup_child);
         let db = Arc::new(
             SqliteStateDb::open_owned(&database, &baseline_owner())
                 .await
@@ -284,6 +356,9 @@ impl Fixture {
             baseline,
             progress,
             hold_child,
+            hold_pair,
+            followup_child,
+            recovery_events: Arc::new(Mutex::new(Vec::new())),
             key,
             peer_errors: Arc::new(AtomicUsize::new(0)),
             _server: server,
@@ -301,6 +376,9 @@ impl Fixture {
             baseline,
             progress,
             hold_child,
+            hold_pair,
+            followup_child,
+            recovery_events,
             key,
             peer_errors,
             _server,
@@ -326,6 +404,9 @@ impl Fixture {
             baseline,
             progress,
             hold_child,
+            hold_pair,
+            followup_child,
+            recovery_events,
             key,
             peer_errors,
             _server,
@@ -354,6 +435,9 @@ impl Fixture {
             baseline: Arc::clone(&self.baseline),
             progress: Arc::clone(&self.progress),
             hold_child: Arc::clone(&self.hold_child),
+            hold_pair: Arc::clone(&self.hold_pair),
+            followup_child: Arc::clone(&self.followup_child),
+            recovery_events: Arc::clone(&self.recovery_events),
             zone_name: ZONE.to_owned(),
             empty: false,
             cycle,
@@ -472,6 +556,9 @@ impl Fixture {
                     baseline: Arc::clone(&self.baseline),
                     progress: Arc::clone(&self.progress),
                     hold_child: Arc::clone(&self.hold_child),
+                    hold_pair: Arc::clone(&self.hold_pair),
+                    followup_child: Arc::clone(&self.followup_child),
+                    recovery_events: Arc::clone(&self.recovery_events),
                     zone_name: ZONE.to_owned(),
                     empty: false,
                     cycle: 1,
@@ -495,6 +582,79 @@ impl Fixture {
             .unwrap()
     }
 
+    pub(super) async fn drain_recovery_catalog(&self, result: &mut CycleResult) -> usize {
+        let selected = self
+            .library_state(
+                Session {
+                    baseline: Arc::clone(&self.baseline),
+                    progress: Arc::clone(&self.progress),
+                    hold_child: Arc::clone(&self.hold_child),
+                    hold_pair: Arc::clone(&self.hold_pair),
+                    followup_child: Arc::clone(&self.followup_child),
+                    recovery_events: Arc::clone(&self.recovery_events),
+                    zone_name: ZONE.to_owned(),
+                    empty: false,
+                    cycle: 5,
+                    fail_inventory: false,
+                    provider_error: false,
+                    provider_errors: Arc::new(AtomicUsize::new(0)),
+                    changes: Arc::new(AtomicUsize::new(0)),
+                    inventory_queries: Arc::clone(&self.inventory_queries),
+                },
+                ZONE,
+                &self.key,
+            )
+            .await;
+        let db: Arc<dyn download::DownloadStore> = self.db.clone();
+        let base = make_run_cycle_download_config_builder(&self.root, db);
+        let builder = |mode, exclude, groups, zone| {
+            let mut config = (*base(mode, exclude, groups, zone)).clone();
+            config.folder_structure = "none".into();
+            config.retry.max_retries = 0;
+            Arc::new(config)
+        };
+        let policy = self
+            .db
+            .get_metadata("enum_config_hash")
+            .await
+            .unwrap()
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        crate::sync_loop::runner::drain_source_revalidation(&[&selected], &shutdown)
+            .await
+            .unwrap();
+        let drained = crate::sync_loop::runner::drain_catalog_source_revalidation(
+            &[&selected],
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &policy,
+            &shutdown,
+        )
+        .await
+        .unwrap();
+        let retained = drained.retained;
+        assert!(!drained.session_expired);
+        crate::sync_loop::runner::apply_catalog_drain_outcome(result, &[&selected], drained, false);
+        retained
+    }
+
+    pub(super) async fn finish_pair_tail(
+        &self,
+        result: &mut CycleResult,
+    ) -> Option<download::OperationalJournalGuards> {
+        let shutdown = CancellationToken::new();
+        result
+            .prepare_operational_tail(&self.shared, &shutdown)
+            .await
+            .unwrap();
+        assert_eq!(self.drain_recovery_catalog(result).await, 0);
+        result.revalidate_sparse_holds(Some(self.db.as_ref())).await;
+        result
+            .finish_operational_tail(&self.shared, &shutdown)
+            .await
+            .unwrap()
+    }
+
     pub(super) async fn release_account_lock(&self) {
         self.shared.read().await.release_lock().unwrap();
     }
@@ -507,6 +667,9 @@ impl Fixture {
                     baseline: Arc::clone(&self.baseline),
                     progress: Arc::clone(&self.progress),
                     hold_child: Arc::clone(&self.hold_child),
+                    hold_pair: Arc::clone(&self.hold_pair),
+                    followup_child: Arc::clone(&self.followup_child),
+                    recovery_events: Arc::clone(&self.recovery_events),
                     zone_name: ZONE.to_owned(),
                     empty: false,
                     cycle,
@@ -527,6 +690,9 @@ impl Fixture {
                     baseline: Arc::clone(&self.baseline),
                     progress: Arc::clone(&self.progress),
                     hold_child: Arc::clone(&self.hold_child),
+                    hold_pair: Arc::clone(&self.hold_pair),
+                    followup_child: Arc::clone(&self.followup_child),
+                    recovery_events: Arc::clone(&self.recovery_events),
                     zone_name: PEER_ZONE.to_owned(),
                     empty: true,
                     cycle,

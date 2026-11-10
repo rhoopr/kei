@@ -95,6 +95,17 @@ fn peer_provenance(db: &crate::state::SqliteStateDb) -> Vec<PeerProvenance> {
     rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
 }
 
+fn preserved_pair_metadata(db: &crate::state::SqliteStateDb) -> Vec<String> {
+    let conn = db
+        .acquire_lock("snapshot existing source metadata")
+        .unwrap();
+    [
+        "SELECT json_group_array(json_array(id,version_size,filename,created_at,added_at,metadata_hash,metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size,is_deleted)) FROM (SELECT * FROM assets WHERE library=?1 AND id IN ('asset-op-baseline','asset-op-healthy-peer') ORDER BY id,version_size)",
+        "SELECT json_group_array(json_array(id,version_size,local_path,provider_checksum,local_checksum,download_checksum,metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size)) FROM (SELECT * FROM asset_metadata_paths WHERE library=?1 AND id IN ('asset-op-baseline','asset-op-healthy-peer') ORDER BY id,version_size,local_path)",
+        "SELECT json_group_array(json_array(asset_record_name,master_record_name)) FROM (SELECT * FROM asset_master_mappings WHERE library=?1 AND asset_record_name IN ('asset-op-baseline','asset-op-healthy-peer') ORDER BY asset_record_name)",
+    ].iter().map(|sql| conn.query_row(sql, [ZONE], |row| row.get(0)).unwrap()).collect()
+}
+
 async fn mixed_case() -> Option<(crate::health::HealthStatus, serde_json::Value)> {
     let observations = Arc::new(Mutex::new(Vec::new()));
     let callback_observations = Arc::clone(&observations);
@@ -822,6 +833,422 @@ async fn catalog_health_pair_normal_expiry_creates_active_debt_that_vetoes_mixed
             .unwrap(),
         baseline_mtime
     );
+}
+
+#[tokio::test]
+async fn catalog_health_positive_recovers_real_sparse_identity() {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let requests = attempts.clone();
+    let recovered_transfer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let response_ready = recovered_transfer.clone();
+    let fixture = Fixture::with_progress(move |_| {
+        move |_: &Request| {
+            requests.fetch_add(1, Ordering::SeqCst);
+            if response_ready.load(Ordering::SeqCst) {
+                ResponseTemplate::new(200).set_body_bytes(MEDIA)
+            } else {
+                ResponseTemplate::new(500)
+            }
+        }
+    })
+    .await
+    .expect("synthetic provider must execute");
+    let baseline = Box::pin(fixture.run(0, false, false)).await;
+    assert!(baseline.can_advance_database_checkpoint(), "{baseline:?}");
+    let expiry = Box::pin(fixture.run(3, false, false)).await;
+    assert!(expiry.can_advance_database_checkpoint(), "{expiry:?}");
+    let old: (String, String, i64, String, String) = {
+        let conn = fixture
+            .db
+            .acquire_lock("read active catalog obligation")
+            .unwrap();
+        conn.query_row("SELECT r.id,d.id,d.next_retry_at,r.scope,json_array(r.library,r.scope,r.enum_hash,r.boundary,r.high_id,r.after_id,r.mode) FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.library=?1 AND r.phase='active' AND r.mode='catalog_v2'", [ZONE], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap()
+    };
+    assert_eq!(old.1, "asset-op-baseline");
+    let old_origin = crate::state::db::source_revalidation::CatalogOrigin::parse(&old.3).unwrap();
+    let old_policy = fixture
+        .db
+        .get_metadata("enum_config_hash")
+        .await
+        .unwrap()
+        .unwrap();
+    let initial_due = fixture
+        .db
+        .due_catalog_candidates(
+            baseline_owner(),
+            ZONE.to_owned(),
+            old_origin.clone(),
+            old_policy,
+        )
+        .await
+        .unwrap();
+    assert!(
+        initial_due
+            .iter()
+            .any(|candidate| candidate.round == old.0 && candidate.id == old.1)
+    );
+    let held = Box::pin(fixture.run(4, true, false)).await;
+    assert_eq!(
+        held.stats.failed, 1,
+        "the first real transfer fails: {held:?}"
+    );
+    assert!(
+        held.holds
+            .iter()
+            .any(|hold| hold.source == ZONE && hold.kind == LibraryHoldKind::IdentityUnresolved)
+    );
+    let held_sparse = fixture.db.sparse_identities(ZONE).await.unwrap();
+    assert_eq!(held_sparse.len(), 1);
+    assert_eq!(held_sparse[0].source.as_str(), "asset-op-hold-child");
+    let held_source = held
+        .sources
+        .iter()
+        .find(|source| source.zone_name == ZONE)
+        .unwrap();
+    assert_eq!(held_source.media_failures.len(), 1);
+    let held_witness = held_source.sparse.as_ref().unwrap();
+    assert!(held_witness.completed_delta_replay);
+    fixture
+        .db
+        .attest_current_sparse(&held_witness.witness)
+        .await
+        .unwrap();
+    let captured = expiry
+        .sources
+        .iter()
+        .find(|source| source.zone_name == ZONE)
+        .unwrap()
+        .operational_prework
+        .as_ref()
+        .expect("pre-expiry source owner was captured");
+    let census = {
+        let conn = fixture
+            .db
+            .acquire_lock("inspect captured source census")
+            .unwrap();
+        captured.prework.census_evidence_for_test(&conn).unwrap()
+    };
+    assert_eq!(
+        census,
+        (true, true, true, false),
+        "the actual source and plan are current but the census refuses"
+    );
+    assert!(
+        captured
+            .db
+            .operational_accounting(
+                captured.prework.clone(),
+                vec![held_source.media_failures[0].successor.clone()],
+                Some(held_witness.witness.clone()),
+                false
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let baseline_path = fixture.root.join("baseline.JPG");
+    let peer_path = fixture.root.join("healthy-peer.JPG");
+    let baseline_mtime = std::fs::metadata(&baseline_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    let peer_mtime = std::fs::metadata(&peer_path).unwrap().modified().unwrap();
+    let peer_before = peer_provenance(&fixture.db);
+    let metadata_before = preserved_pair_metadata(&fixture.db);
+    // Observe the transaction before census marking can add this same item.
+    // The TEMP table records facts and is not consulted by any owner.
+    {
+        let conn = fixture.db.acquire_lock("observe catalog transfer").unwrap();
+        conn.execute_batch("CREATE TEMP TABLE pair_transfer_observation(old_round TEXT,new_round TEXT,item TEXT,old_deadline INTEGER,new_deadline INTEGER);
+            CREATE TEMP TRIGGER pair_transfer_observer AFTER UPDATE OF phase ON main.source_revalidation_rounds
+            WHEN OLD.phase='active' AND NEW.phase='abandoned'
+            BEGIN INSERT INTO pair_transfer_observation
+            SELECT OLD.id,r.id,d.id,d.next_retry_at,n.next_retry_at
+            FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.library=OLD.library AND r.id<>OLD.id AND r.phase='marking'
+            JOIN source_revalidation_debt n ON n.round=r.id AND n.id=d.id WHERE d.round=OLD.id; END;").unwrap();
+        conn.execute_batch("CREATE TEMP TABLE peer_completion_observation(scope TEXT,library TEXT,child TEXT,master TEXT,state_id TEXT,path TEXT,verified INTEGER,receipt_id TEXT);
+            CREATE TEMP TRIGGER peer_completion_observer AFTER DELETE ON main.provider_active_destinations
+            WHEN OLD.child='asset-op-healthy-peer'
+            BEGIN INSERT INTO peer_completion_observation
+            SELECT g.scope,OLD.library,OLD.child,OLD.master,OLD.asset_id,OLD.path,OLD.verified_media,r.id
+            FROM provider_active_generations g JOIN download_receipts r ON r.scope=g.scope AND r.library=OLD.library
+            AND r.child=OLD.child AND r.master=OLD.master AND r.state_id=OLD.asset_id AND r.version_size=OLD.version_size
+            AND r.provider_checksum=OLD.checksum AND r.provider_size=OLD.size_bytes AND r.native_path=OLD.path
+            AND r.source_checksum=OLD.source_checksum AND r.local_checksum=OLD.local_checksum
+            AND r.account_key=g.account_key AND r.provider_key=g.provider_key
+            WHERE g.id=OLD.generation AND OLD.admitted=1 AND OLD.verified_media=1; END;").unwrap();
+    }
+    let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
+    let failed_attempts = attempts.load(Ordering::SeqCst);
+    assert!(failed_attempts > 0);
+    recovered_transfer.store(true, Ordering::SeqCst);
+    let mut recovered = Box::pin(fixture.run(5, false, false)).await;
+    let events = fixture.recovery_events.lock().unwrap().clone();
+    assert!(
+        recovered.can_advance_database_checkpoint(),
+        "{recovered:?}; provider events: {events:?}"
+    );
+    assert_eq!(
+        recovered.stats.failed, 0,
+        "the separately observed retry returned 200"
+    );
+    assert!(
+        fixture.db.sparse_identities(ZONE).await.unwrap().is_empty(),
+        "source owner must retire the original sparse identity"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event == "lookup:asset-op-hold-child" || event == "lookup:op-hold-child"),
+        "actual recovery lookup: {events:?}"
+    );
+    assert!(events.iter().any(|event| event == "inventory"));
+    assert!(events.iter().any(|event| event == "bridge"));
+    assert!(
+        attempts.load(Ordering::SeqCst) > failed_attempts,
+        "the failed transfer was actually retried successfully"
+    );
+    assert_eq!(std::fs::read(fixture.root.join("hold.JPG")).unwrap(), MEDIA);
+    assert_eq!(
+        std::fs::read(fixture.root.join("progress.JPG")).unwrap(),
+        MEDIA
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("healthy-peer.JPG")).unwrap(),
+        MEDIA
+    );
+    let trace_events = trace.events();
+    let new_id = trace_events
+        .iter()
+        .find(|event| event.message() == Some("test fresh catalog transaction returned"))
+        .and_then(|event| event.field("nonce"))
+        .expect("the owner transaction must return its origin");
+    let (old_phase, copied_phase, copy): (String, String, (String, String, String, i64, i64)) = {
+        let conn = fixture
+            .db
+            .acquire_lock("verify transferred catalog debt")
+            .unwrap();
+        let phases = conn.query_row("SELECT (SELECT phase FROM source_revalidation_rounds WHERE id=?1), (SELECT phase FROM source_revalidation_rounds WHERE id=?2)", rusqlite::params![old.0,new_id], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        let copy = conn.query_row("SELECT old_round,new_round,item,old_deadline,new_deadline FROM pair_transfer_observation", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pair_transfer_observation",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        (phases.0, phases.1, copy)
+    };
+    assert_eq!(
+        (old_phase.as_str(), copied_phase.as_str()),
+        ("abandoned", "active")
+    );
+    assert_eq!(
+        (&copy.0, copy.1.as_str(), &copy.2, copy.3, copy.4),
+        (&old.0, new_id, &old.1, old.2, old.2)
+    );
+    let policy = fixture
+        .db
+        .get_metadata("enum_config_hash")
+        .await
+        .unwrap()
+        .unwrap();
+    let origin = {
+        let conn = fixture
+            .db
+            .acquire_lock("read current catalog origin")
+            .unwrap();
+        let scope: String = conn
+            .query_row(
+                "SELECT scope FROM source_revalidation_rounds WHERE id=?1",
+                [new_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        crate::state::db::source_revalidation::CatalogOrigin::parse(&scope).unwrap()
+    };
+    assert_eq!(
+        (&origin.plan_digest, &origin.epoch, &origin.attempt),
+        (
+            &old_origin.plan_digest,
+            &old_origin.epoch,
+            &old_origin.attempt
+        )
+    );
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("verify current source epoch and observation")
+            .unwrap();
+        let epoch = crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (&*epoch.state, &epoch.epoch, &epoch.attempt),
+            ("complete", &origin.epoch, &origin.attempt)
+        );
+        let (token, round, boundary): (String,String,String) = conn.query_row(
+            "SELECT (SELECT value FROM metadata WHERE key=?1), (SELECT json_extract(value,'$.revalidation_round') FROM metadata WHERE key=?2), (SELECT boundary FROM source_revalidation_rounds WHERE id=?3)",
+            rusqlite::params![fixture.key,format!("observed_selection:v27:{ZONE}"),new_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!((token.as_str(), round.as_str()), ("pair-after-two", new_id));
+        assert_eq!(
+            boundary,
+            crate::state::db::source_revalidation::CatalogOrigin::boundary("pair-fresh-two")
+        );
+    }
+    let due = fixture
+        .db
+        .due_catalog_candidates(baseline_owner(), ZONE.to_owned(), origin, policy)
+        .await
+        .unwrap();
+    assert!(
+        due.iter().any(|candidate| candidate.round == new_id
+            && candidate.id == old.1
+            && candidate.master == "op-baseline"
+            && candidate.child.as_deref() == Some("asset-op-baseline")),
+        "actual ACTIVE source must authorize the copied child: {due:?}"
+    );
+    let events_before_drain = fixture.recovery_events.lock().unwrap().len();
+    assert_eq!(
+        fixture.drain_recovery_catalog(&mut recovered).await,
+        0,
+        "strict source drain must settle current debt"
+    );
+    let drain_events = fixture.recovery_events.lock().unwrap()[events_before_drain..].to_vec();
+    assert!(
+        drain_events
+            .iter()
+            .any(|event| event == "lookup:op-baseline")
+            && drain_events
+                .iter()
+                .any(|event| event == "lookup:asset-op-baseline"),
+        "strict lookup must request the exact pair: {drain_events:?}"
+    );
+    let (old_debt, new_debt): (i64, i64) = {
+        let conn = fixture.db.acquire_lock("verify strict settlement").unwrap();
+        conn.query_row("SELECT (SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id=?2), (SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?3)", rusqlite::params![old.0,old.1,new_id], |row| Ok((row.get(0)?,row.get(1)?))).unwrap()
+    };
+    assert_eq!((old_debt, new_debt), (old.2, 0));
+    let old_history: String = fixture.db.acquire_lock("verify abandoned history").unwrap().query_row(
+        "SELECT json_array(library,scope,enum_hash,boundary,high_id,after_id,mode) FROM source_revalidation_rounds WHERE id=?1 AND phase='abandoned'", [&old.0], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(old_history, old.4);
+    assert_eq!(preserved_pair_metadata(&fixture.db), metadata_before);
+    assert_eq!(std::fs::read(&baseline_path).unwrap(), MEDIA);
+    assert_eq!(
+        std::fs::metadata(&baseline_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        baseline_mtime
+    );
+    assert_eq!(std::fs::read(&peer_path).unwrap(), MEDIA);
+    assert_eq!(
+        std::fs::metadata(&peer_path).unwrap().modified().unwrap(),
+        peer_mtime
+    );
+    // Completed generations may retire only after their exact source-bound
+    // receipt is saved. Observe that handoff instead of requiring a transient
+    // active-generation row to remain forever.
+    assert!(peer_provenance(&fixture.db).is_empty());
+    let (peer_handoff, receipt_id): (PeerProvenance, String) = {
+        let conn = fixture
+            .db
+            .acquire_lock("verify peer completion handoff")
+            .unwrap();
+        conn.query_row("SELECT scope,library,child,master,state_id,path,verified,receipt_id FROM peer_completion_observation", [], |row| Ok(((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?),row.get(7)?))).unwrap()
+    };
+    assert_eq!(peer_before, vec![peer_handoff]);
+    let receipt_retained: bool = fixture
+        .db
+        .acquire_lock("verify retained peer receipt")
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM download_receipts WHERE id=?1 AND length(proof_hash)=64)",
+            [&receipt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(receipt_retained);
+    // A new, independently observed sparse child supplies the partial hold for
+    // the health check. The original child above must remain resolved.
+    let mut followup = Box::pin(fixture.run(6, true, false)).await;
+    assert_eq!(
+        followup.stats.failed, 0,
+        "the follow-up has no new failed transfer: {followup:?}"
+    );
+    assert!(
+        followup
+            .holds
+            .iter()
+            .any(|hold| hold.source == ZONE && hold.kind == LibraryHoldKind::IdentityUnresolved)
+    );
+    let sparse = fixture.db.sparse_identities(ZONE).await.unwrap();
+    assert_eq!(sparse.len(), 1);
+    assert_eq!(sparse[0].source.as_str(), "asset-op-followup-hold");
+    let source = followup
+        .sources
+        .iter()
+        .find(|source| source.zone_name == ZONE)
+        .unwrap();
+    assert!(source.reached && source.operational_prework.is_some());
+    let witness = source.sparse.as_ref().unwrap();
+    assert!(witness.completed_delta_replay);
+    fixture
+        .db
+        .attest_current_sparse(&witness.witness)
+        .await
+        .unwrap();
+    let guards = fixture.finish_pair_tail(&mut followup).await;
+    assert!(
+        guards.is_some(),
+        "all current source and journal owners must permit the follow-up hold"
+    );
+    let (health, report) =
+        reported_health(&fixture, &followup, "catalog-positive-health.json").await;
+    assert!(health.last_success_at.is_some());
+    assert_eq!(report["status"], "partial_failure");
+    assert_eq!(report["stats"]["failed"], 0);
+    assert!(!followup.can_advance_database_checkpoint());
+    let old_deadline: i64 = fixture
+        .db
+        .acquire_lock("recheck historical catalog obligation")
+        .unwrap()
+        .query_row(
+            "SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id=?2",
+            rusqlite::params![old.0, old.1],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_deadline, old.2);
+    let receipt_still_retained: bool = fixture
+        .db
+        .acquire_lock("recheck peer completion receipt")
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM download_receipts WHERE id=?1 AND length(proof_hash)=64)",
+            [&receipt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(receipt_still_retained);
+    assert_eq!(preserved_pair_metadata(&fixture.db), metadata_before);
+    assert_eq!(std::fs::read(&baseline_path).unwrap(), MEDIA);
+    assert_eq!(
+        std::fs::metadata(&baseline_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        baseline_mtime
+    );
+    assert_eq!(std::fs::read(&peer_path).unwrap(), MEDIA);
+    assert_eq!(
+        std::fs::metadata(&peer_path).unwrap().modified().unwrap(),
+        peer_mtime
+    );
+    drop(guards);
 }
 
 #[tokio::test]
