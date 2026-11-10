@@ -660,7 +660,7 @@ impl SqliteStateDb {
                     .collect::<Result<_, _>>()?;
                 for (id, scope, enum_hash, boundary, high_id, after_id, phase) in rows {
                     let Ok(origin) = CatalogOrigin::parse(&scope) else { continue };
-                    if library_before.state != "pending"
+                    if !matches!(library_before.state.as_str(), "pending" | "ready")
                         || library_before.epoch != epoch.epoch
                         || origin.epoch != epoch.epoch
                         || origin.attempt != library_before.attempt
@@ -673,7 +673,7 @@ impl SqliteStateDb {
                     matching.push(ExistingCatalogRound { id, scope, origin, enum_hash, boundary, high_id, after_id, phase });
                 }
             }
-            if matching.len() > 1 {
+            if library_before.state != "ready" && matching.len() > 1 {
                 return Err(StateError::Invariant {
                     operation: "claim_catalog_baseline",
                     detail: "multiple catalog origins share the baseline".into(),
@@ -689,10 +689,37 @@ impl SqliteStateDb {
             )?;
             let outcome = match gate {
                 super::sync_epoch::SyncEpochGate::Baseline { attempt } => {
+                    if library_before.state == "ready"
+                        && library_before.binding.as_ref().is_none_or(|binding| {
+                            binding.baseline_key != claim.baseline_key
+                                || claim.expected_baseline.as_deref().is_none_or(|cursor| {
+                                    CatalogOrigin::boundary(cursor) != binding.baseline_sha256
+                                })
+                        })
+                    {
+                        return Err(StateError::Invariant {
+                            operation: "claim_catalog_baseline",
+                            detail: "stale ready baseline binding changed".into(),
+                        });
+                    }
+                    if matching.len() > 1 {
+                        return Err(StateError::Invariant {
+                            operation: "claim_catalog_baseline",
+                            detail: "multiple catalog origins share the baseline".into(),
+                        });
+                    }
+                    if library_before.state == "ready"
+                        && old.as_ref().is_some_and(|round| !matches!(round.phase.as_str(), "marking" | "observing"))
+                    {
+                        return Err(StateError::Invariant {
+                            operation: "claim_catalog_baseline",
+                            detail: "stale ready catalog origin is not resumable".into(),
+                        });
+                    }
                     let pending_due = library_before.state == "pending"
                         && claim.now >= library_before.next_attempt_at;
                     if let Some(old) = &old
-                        && pending_due
+                        && (pending_due || library_before.state == "ready")
                         && old.origin.attempt == library_before.attempt
                         && matches!(old.phase.as_str(), "marking" | "observing")
                     {
@@ -1244,7 +1271,7 @@ impl SqliteStateDb {
         self.with_conn_mut("settling confirmed source revalidation", move |conn| {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             account::validate_authenticated(&tx,&owner)?;
-            let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE d.round=?1 AND d.id=?2 AND r.phase='active')",params![candidate.round,candidate.id],|r|r.get(0))?;
+            let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE d.round=?1 AND d.id=?2 AND r.library=?3 AND r.mode=?4 AND r.phase='active')",params![candidate.round,candidate.id,candidate.library,LEGACY_MODE],|r|r.get(0))?;
             if !exists { tx.commit()?; return Ok(false); }
             if snapshot(&tx,&candidate.round,&candidate.id,&candidate.master)? != candidate.snapshot {
                 tx.execute("UPDATE source_revalidation_debt SET next_retry_at=?3 WHERE round=?1 AND id=?2",params![candidate.round,candidate.id,chrono::Utc::now().timestamp()+3600])?;
@@ -1381,6 +1408,25 @@ impl SqliteStateDb {
                 tx.commit()?;
                 return Ok(false);
             }
+            // The strict provider pair authenticates one child. The mutable
+            // state identity must be that child, or an explicitly owned legacy
+            // master-state row bound to it. Other historical mappings protect
+            // the family but do not expand the deletion target.
+            let identity_matches: bool = if candidate.id == candidate.master {
+                candidate.owned_child && candidate.child.is_some() && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM legacy_master_state_owners o JOIN asset_master_mappings m ON m.library=o.library AND m.asset_record_name=o.asset_record_name AND m.master_record_name=o.master_record_name WHERE o.library=?1 AND o.master_record_name=?2 AND o.asset_record_name=?3)",
+                    params![library,candidate.master,expected_child], |row| row.get(0),
+                )?
+            } else {
+                !candidate.owned_child && candidate.child.as_deref() == Some(candidate.id.as_str()) && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM asset_master_mappings WHERE library=?1 AND asset_record_name=?2 AND master_record_name=?3)",
+                    params![library,candidate.id,candidate.master], |row| row.get(0),
+                )?
+            };
+            if !identity_matches {
+                tx.commit()?;
+                return Ok(false);
+            }
             match authority {
                 CatalogSettlementAuthority::Deleted { deleted_at, .. }
                     if evidence.explicit_deleted =>
@@ -1411,8 +1457,8 @@ impl SqliteStateDb {
                         return Ok(false);
                     }
                     tx.execute(
-                        "UPDATE assets SET is_deleted=1,deleted_at=COALESCE(?3,deleted_at) WHERE library=?1 AND id IN (SELECT value FROM json_each(?2))",
-                        params![library, ids_json, deleted_at.map(|value| value.timestamp())],
+                        "UPDATE assets SET is_deleted=1,deleted_at=COALESCE(?3,deleted_at) WHERE library=?1 AND id=?2",
+                        params![library, candidate.id, deleted_at.map(|value| value.timestamp())],
                     )?;
                     tx.execute(
                         "DELETE FROM source_revalidation_debt WHERE round=?1 AND id=?2",
@@ -1510,6 +1556,20 @@ mod tests {
                 snapshot,
             }
         };
+        let mut wrong_library = candidate.clone();
+        wrong_library.library = "OtherLibrary".into();
+        assert!(
+            !db.settle_source_revalidation(owner(), wrong_library, Some((true, None)), false)
+                .await
+                .unwrap()
+        );
+        {
+            let conn = db
+                .acquire_lock("verify legacy wrong-library refusal")
+                .unwrap();
+            let deadline: i64 = conn.query_row("SELECT next_retry_at FROM source_revalidation_debt WHERE round='round' AND id='item'", [], |row| row.get(0)).unwrap();
+            assert_eq!(deadline, 0);
+        }
         assert!(
             !db.settle_source_revalidation(owner(), candidate.clone(), Some((true, None)), false)
                 .await

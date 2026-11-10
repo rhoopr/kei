@@ -315,6 +315,435 @@ impl CatalogOwnerFixture {
     }
 }
 
+async fn strict_deleted_pair(db: Arc<SqliteStateDb>) -> CatalogSettlementAuthority {
+    use crate::icloud::photos::{
+        PhotoAlbum, PhotoAlbumConfig, ProviderRecordId, StrictCatalogPairResult,
+    };
+    let zone = serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+    let mut records = super::records("master", super::CURRENT, "strict pair");
+    for record in &mut records {
+        record["zoneID"] = zone.clone();
+        record["fields"]["isDeleted"] = serde_json::json!({"value":1,"type":"INT64"});
+        record["fields"]["isExpunged"] = serde_json::json!({"value":1,"type":"INT64"});
+        record["fields"]["dateExpunged"] =
+            serde_json::json!({"value":1792541032000_i64,"type":"TIMESTAMP"});
+    }
+    records[1]["fields"]["masterRef"]["value"]["zoneID"] = zone.clone();
+    let mut album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(HashMap::new()),
+            service_endpoint: Arc::from(
+                "https://synthetic.example/database/1/photos/production/private",
+            ),
+            name: Arc::from("strict"),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(zone),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(MockPhotosSession::new().ok(serde_json::json!({"records":records}))),
+    );
+    album.set_shadow_capture(ShadowCapture::new(db, owner(), "com"), Arc::from("private"));
+    let StrictCatalogPairResult::Deleted {
+        deleted_at,
+        evidence,
+    } = album
+        .lookup_catalog_pair_strict(
+            &ProviderRecordId::new("master"),
+            &ProviderRecordId::new("asset-master"),
+        )
+        .await
+        .result
+    else {
+        panic!("strict deleted pair must qualify")
+    };
+    CatalogSettlementAuthority::Deleted {
+        deleted_at,
+        evidence: CatalogPairEvidence {
+            database: evidence.database.to_string(),
+            zone: evidence.zone,
+            master: evidence.master_record_name.as_str().to_owned(),
+            child: evidence.child_record_name.as_str().to_owned(),
+            master_type: evidence.master_type.to_string(),
+            child_type: evidence.child_type.to_string(),
+            reference_exact: evidence.reference_exact,
+            explicit_deleted: evidence.explicit_deleted,
+        },
+    }
+}
+
+#[tokio::test]
+async fn catalog_strict_deleted_pair_does_not_delete_historical_sibling() {
+    use crate::state::VersionSizeKey;
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+    let origin = fixture.install().await;
+    fixture.stage(&origin).await;
+    fixture.promote("staged").await;
+    for (id, version) in [
+        ("asset-master", VersionSizeKey::Original),
+        ("asset-master", VersionSizeKey::Medium),
+        ("sibling", VersionSizeKey::Original),
+    ] {
+        let path = dir.path().join(format!("{id}-{}.jpg", version.as_str()));
+        std::fs::write(&path, b"media preserved").unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new(id)
+            .library("PrimarySync")
+            .version_size(version)
+            .build();
+        fixture.db.upsert_seen(&record).await.unwrap();
+        fixture
+            .db
+            .mark_downloaded(
+                "PrimarySync",
+                id,
+                version.as_str(),
+                &path,
+                "synthetic",
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    for id in ["asset-master", "sibling"] {
+        fixture
+            .db
+            .upsert_asset_master_mapping("PrimarySync", id, "master")
+            .await
+            .unwrap();
+    }
+    let sibling_path = dir.path().join("sibling-original.jpg");
+    let sibling_mtime = std::fs::metadata(&sibling_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    let before_mtime = std::fs::metadata(dir.path().join("asset-master-medium.jpg"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    {
+        let conn = fixture.db.acquire_lock("prepare sibling census").unwrap();
+        conn.execute("INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES(?1,'asset-master',0),(?1,'sibling',0)", [&origin.nonce]).unwrap();
+        conn.execute("INSERT INTO asset_verifications VALUES('PrimarySync','asset-master','medium','unknown','protected rendition',1)", []).unwrap();
+    }
+    let authority = strict_deleted_pair(fixture.db.clone()).await;
+    let due = fixture
+        .db
+        .due_catalog_candidates(
+            owner(),
+            "PrimarySync".into(),
+            origin.clone(),
+            "policy".into(),
+        )
+        .await
+        .unwrap();
+    let candidate = due
+        .iter()
+        .find(|candidate| candidate.id == "asset-master")
+        .unwrap()
+        .clone();
+    assert!(
+        !fixture
+            .db
+            .settle_catalog_candidate(
+                owner(),
+                "PrimarySync".into(),
+                origin.clone(),
+                "policy".into(),
+                candidate,
+                authority.clone()
+            )
+            .await
+            .unwrap()
+    );
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("verify protected rendition retained")
+            .unwrap();
+        let (deleted,debt):(i64,i64) = conn.query_row("SELECT (SELECT SUM(is_deleted) FROM assets WHERE library='PrimarySync' AND id='asset-master'),(SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1 AND id='asset-master')", [&origin.nonce], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!((deleted, debt), (0, 1));
+        conn.execute("DELETE FROM asset_verifications WHERE library='PrimarySync' AND id='asset-master' AND version_size='medium'", []).unwrap();
+        conn.execute("UPDATE source_revalidation_debt SET next_retry_at=0 WHERE round=?1 AND id='asset-master'", [&origin.nonce]).unwrap();
+    }
+    let due = fixture
+        .db
+        .due_catalog_candidates(
+            owner(),
+            "PrimarySync".into(),
+            origin.clone(),
+            "policy".into(),
+        )
+        .await
+        .unwrap();
+    let candidate = due
+        .iter()
+        .find(|candidate| candidate.id == "asset-master")
+        .unwrap()
+        .clone();
+    assert!(
+        fixture
+            .db
+            .settle_catalog_candidate(
+                owner(),
+                "PrimarySync".into(),
+                origin.clone(),
+                "policy".into(),
+                candidate,
+                authority
+            )
+            .await
+            .unwrap()
+    );
+    let conn = fixture
+        .db
+        .acquire_lock("verify exact pair deletion")
+        .unwrap();
+    let (a_deleted,b_deleted,b_debt):(i64,i64,i64) = conn.query_row("SELECT (SELECT SUM(is_deleted) FROM assets WHERE library='PrimarySync' AND id='asset-master'),(SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id='sibling'),(SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1 AND id='sibling')", [&origin.nonce], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    assert_eq!((a_deleted, b_deleted, b_debt), (2, 0, 1));
+    assert_eq!(
+        std::fs::metadata(&sibling_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        sibling_mtime
+    );
+    assert_eq!(
+        std::fs::metadata(dir.path().join("asset-master-medium.jpg"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        before_mtime
+    );
+    assert_eq!(std::fs::read(sibling_path).unwrap(), b"media preserved");
+}
+
+#[tokio::test]
+async fn catalog_and_unknown_candidates_cannot_use_legacy_settler() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+    let origin = fixture.install().await;
+    fixture.stage(&origin).await;
+    fixture.promote("staged").await;
+    let path = dir.path().join("asset.jpg");
+    std::fs::write(&path, b"media retained").unwrap();
+    let record = crate::test_helpers::TestAssetRecord::new("asset-master")
+        .library("PrimarySync")
+        .build();
+    fixture.db.upsert_seen(&record).await.unwrap();
+    fixture
+        .db
+        .mark_downloaded(
+            "PrimarySync",
+            "asset-master",
+            "original",
+            &path,
+            "synthetic",
+            None,
+        )
+        .await
+        .unwrap();
+    fixture
+        .db
+        .upsert_asset_master_mapping("PrimarySync", "asset-master", "master")
+        .await
+        .unwrap();
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("prepare legacy boundary control")
+            .unwrap();
+        conn.execute("INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES(?1,'asset-master',7)", [&origin.nonce]).unwrap();
+    }
+    let candidate = fixture
+        .db
+        .due_catalog_candidates(
+            owner(),
+            "PrimarySync".into(),
+            origin.clone(),
+            "policy".into(),
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        !fixture
+            .db
+            .settle_source_revalidation(owner(), candidate.clone(), Some((true, None)), false)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !fixture
+            .db
+            .settle_source_revalidation(owner(), candidate.clone(), None, true)
+            .await
+            .unwrap()
+    );
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("make unknown mode control")
+            .unwrap();
+        conn.execute(
+            "UPDATE source_revalidation_rounds SET mode='future_mode' WHERE id=?1",
+            [&origin.nonce],
+        )
+        .unwrap();
+    }
+    assert!(
+        !fixture
+            .db
+            .settle_source_revalidation(owner(), candidate.clone(), Some((true, None)), false)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !fixture
+            .db
+            .settle_source_revalidation(owner(), candidate, None, true)
+            .await
+            .unwrap()
+    );
+    let conn = fixture
+        .db
+        .acquire_lock("verify legacy boundary preserves debt")
+        .unwrap();
+    let (deleted,deadline):(i64,i64) = conn.query_row("SELECT (SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id='asset-master'),(SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id='asset-master')", [&origin.nonce], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!((deleted, deadline), (0, 7));
+    assert_eq!(std::fs::read(path).unwrap(), b"media retained");
+}
+
+#[tokio::test]
+async fn catalog_legacy_master_requires_exclusive_child_owner_for_deletion() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+    let origin = fixture.install().await;
+    fixture.stage(&origin).await;
+    fixture.promote("staged").await;
+    let path = dir.path().join("legacy-master.jpg");
+    std::fs::write(&path, b"legacy retained").unwrap();
+    let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let record = crate::test_helpers::TestAssetRecord::new("master")
+        .library("PrimarySync")
+        .build();
+    fixture.db.upsert_seen(&record).await.unwrap();
+    fixture
+        .db
+        .mark_downloaded(
+            "PrimarySync",
+            "master",
+            "original",
+            &path,
+            "synthetic",
+            None,
+        )
+        .await
+        .unwrap();
+    fixture
+        .db
+        .upsert_asset_master_mapping("PrimarySync", "asset-master", "master")
+        .await
+        .unwrap();
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("prepare unowned legacy debt")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES(?1,'master',0)",
+            [&origin.nonce],
+        )
+        .unwrap();
+    }
+    let authority = strict_deleted_pair(fixture.db.clone()).await;
+    let due = fixture
+        .db
+        .due_catalog_candidates(
+            owner(),
+            "PrimarySync".into(),
+            origin.clone(),
+            "policy".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    assert!(!due[0].owned_child);
+    assert!(
+        !fixture
+            .db
+            .settle_catalog_candidate(
+                owner(),
+                "PrimarySync".into(),
+                origin.clone(),
+                "policy".into(),
+                due[0].clone(),
+                authority.clone()
+            )
+            .await
+            .unwrap()
+    );
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("verify unowned legacy retained")
+            .unwrap();
+        let (deleted,debt):(i64,i64) = conn.query_row("SELECT (SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id='master'),(SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1 AND id='master')", [&origin.nonce], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!((deleted, debt), (0, 1));
+        conn.execute(
+            "UPDATE source_revalidation_debt SET next_retry_at=0 WHERE round=?1 AND id='master'",
+            [&origin.nonce],
+        )
+        .unwrap();
+    }
+    assert!(
+        fixture
+            .db
+            .claim_legacy_master_state_owner("PrimarySync", "master", "asset-master")
+            .await
+            .unwrap()
+    );
+    let due = fixture
+        .db
+        .due_catalog_candidates(
+            owner(),
+            "PrimarySync".into(),
+            origin.clone(),
+            "policy".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    assert!(due[0].owned_child);
+    assert!(
+        fixture
+            .db
+            .settle_catalog_candidate(
+                owner(),
+                "PrimarySync".into(),
+                origin.clone(),
+                "policy".into(),
+                due[0].clone(),
+                authority
+            )
+            .await
+            .unwrap()
+    );
+    let conn = fixture
+        .db
+        .acquire_lock("verify exclusive legacy owner settlement")
+        .unwrap();
+    let (deleted,debt):(i64,i64) = conn.query_row("SELECT (SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id='master'),(SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1 AND id='master')", [&origin.nonce], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!((deleted, debt), (1, 0));
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    assert_eq!(std::fs::read(path).unwrap(), b"legacy retained");
+}
+
 #[tokio::test]
 async fn catalog_observing_seed_reopens_idempotently_and_bridges_to_drain() {
     use sha2::{Digest, Sha256};
@@ -590,7 +1019,12 @@ async fn catalog_observing_seed_reopens_idempotently_and_bridges_to_drain() {
 
 async fn pending_claim_fixture(
     dir: &std::path::Path,
-) -> (Arc<SqliteStateDb>, CatalogBaselineClaim, CatalogOrigin) {
+) -> (
+    Arc<SqliteStateDb>,
+    CatalogBaselineClaim,
+    CatalogOrigin,
+    GenerationSpec,
+) {
     let path = dir.join("pending.db");
     prepare_existing_owned_database_for_test(&path, &owner()).unwrap();
     let db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
@@ -629,6 +1063,16 @@ async fn pending_claim_fixture(
     .unwrap()
     .unwrap();
     let digest = crate::download::catalog_plan_digest_from_source_context(&context);
+    let selected = GenerationSpec {
+        format: 2,
+        scope: context.scope.clone(),
+        zone: context.zone.clone(),
+        config_hash: context.config_hash.clone(),
+        basis: context.config_hash.clone(),
+        profile: context.profile.clone(),
+        metadata_enabled: context.metadata_enabled,
+        metadata_flags: context.metadata_flags,
+    };
     let scope = library.baseline_scope();
     db.enroll_sync_epoch(vec![("PrimarySync".into(), scope.clone())])
         .await
@@ -680,13 +1124,13 @@ async fn pending_claim_fixture(
         now: record.next_attempt_at,
         watch_interval: Some(3600),
     };
-    (db, claim, origin)
+    (db, claim, origin, selected)
 }
 
 #[tokio::test]
 async fn catalog_claim_transfers_only_qualified_owner_and_retains_foreign_rows() {
     let dir = tempfile::tempdir().unwrap();
-    let (db, claim, origin) = pending_claim_fixture(dir.path()).await;
+    let (db, claim, origin, _) = pending_claim_fixture(dir.path()).await;
     let foreign_epoch = CatalogOrigin::new(
         origin.plan_digest.clone(),
         uuid::Uuid::new_v4().to_string(),
@@ -788,7 +1232,7 @@ async fn catalog_claim_transfers_only_qualified_owner_and_retains_foreign_rows()
 #[tokio::test]
 async fn catalog_claim_refuses_multiple_qualified_owners_without_rotating_attempt() {
     let dir = tempfile::tempdir().unwrap();
-    let (db, claim, origin) = pending_claim_fixture(dir.path()).await;
+    let (db, claim, origin, _) = pending_claim_fixture(dir.path()).await;
     let second = CatalogOrigin::new(
         origin.plan_digest.clone(),
         origin.epoch.clone(),
@@ -820,7 +1264,7 @@ async fn catalog_claim_refuses_multiple_qualified_owners_without_rotating_attemp
 #[tokio::test]
 async fn catalog_claim_without_qualified_owner_keeps_foreign_debt() {
     let dir = tempfile::tempdir().unwrap();
-    let (db, claim, origin) = pending_claim_fixture(dir.path()).await;
+    let (db, claim, origin, _) = pending_claim_fixture(dir.path()).await;
     let foreign = CatalogOrigin::new(
         origin.plan_digest.clone(),
         uuid::Uuid::new_v4().to_string(),
@@ -847,6 +1291,213 @@ async fn catalog_claim_without_qualified_owner_keeps_foreign_debt() {
         .unwrap();
     let after: String = conn.query_row("SELECT json_array(r.scope,r.boundary,r.high_id,r.after_id,r.phase,(SELECT json_group_array(json_array(id,next_retry_at)) FROM (SELECT id,next_retry_at FROM source_revalidation_debt WHERE round=r.id ORDER BY id))) FROM source_revalidation_rounds r WHERE r.id=?1", [&origin.nonce], |row| row.get(0)).unwrap();
     assert_eq!(before, after);
+}
+
+#[tokio::test]
+async fn catalog_claim_stale_ready_transfers_owned_census_and_valid_ready_promotes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, mut claim, origin, selected) = pending_claim_fixture(dir.path()).await;
+    let boundary = claim.expected_baseline.clone().unwrap();
+    db.seed_source_revalidation(
+        owner(),
+        "PrimarySync".into(),
+        origin.scope(),
+        "policy".into(),
+        CatalogOrigin::boundary(&boundary),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let root = db
+        .begin_selection_generation(owner(), selected, BUDGET)
+        .await
+        .unwrap();
+    let receipt = db
+        .seal_observed_selection(owner(), root.id, true, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let proof = ObservationProof::inventory(vec![receipt.clone()])
+        .unwrap()
+        .bridge(
+            ObservationProof::delivery(receipt)
+                .delta(&boundary, "ready-token")
+                .unwrap(),
+            &boundary,
+        )
+        .unwrap()
+        .with_epoch_attempt(Some(origin.attempt.clone()))
+        .with_catalog_origin(origin.clone());
+    let staged = "pending_sync_token:v27:policy:PrimarySync";
+    let staged_descriptor = "observed_selection_staged:v27:policy:PrimarySync";
+    let mut save = transition(&db, "ready-token").await;
+    save.metadata_updates[0].0 = staged.into();
+    save.expected_metadata.push((staged.into(), None));
+    save.expected_metadata
+        .push((claim.baseline_key.clone(), Some(boundary.clone())));
+    db.commit_observation_transition(save, Some(proof), false)
+        .await
+        .unwrap();
+    let read_record = || {
+        let conn = db.acquire_lock("read ready catalog attempt").unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, "PrimarySync")
+            .unwrap()
+            .unwrap()
+    };
+    let ready = read_record();
+    assert_eq!(ready.state, "ready");
+    assert_eq!(ready.attempt, origin.attempt);
+    assert!(ready.binding.is_some());
+    let descriptor: Value =
+        serde_json::from_str(&db.get_metadata(staged_descriptor).await.unwrap().unwrap()).unwrap();
+    assert_eq!(descriptor["revalidation_round"], origin.nonce);
+    let competing = CatalogOrigin::new(
+        origin.plan_digest.clone(),
+        origin.epoch.clone(),
+        origin.attempt.clone(),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .unwrap();
+    {
+        let conn = db
+            .acquire_lock("prepare competing ready catalog control")
+            .unwrap();
+        conn.execute("INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES(?1,'PrimarySync',?2,'policy',?3,'high','after','observing','catalog_v2')", rusqlite::params![competing.nonce,competing.scope(),CatalogOrigin::boundary(&boundary)]).unwrap();
+    }
+    claim.expected_library_json = serde_json::to_string(&ready).unwrap();
+    assert_eq!(
+        db.claim_catalog_baseline(owner(), claim.clone())
+            .await
+            .unwrap(),
+        CatalogClaimOutcome::Promote {
+            attempt: origin.attempt.clone()
+        }
+    );
+    assert_eq!(read_record().attempt, origin.attempt);
+    {
+        let conn = db
+            .acquire_lock("retire competing ready test control")
+            .unwrap();
+        conn.execute(
+            "UPDATE source_revalidation_rounds SET phase='abandoned' WHERE id=?1",
+            [&competing.nonce],
+        )
+        .unwrap();
+    }
+    db.set_metadata(staged, "ready-token").await.unwrap();
+    assert!(db.get_metadata(staged_descriptor).await.unwrap().is_none());
+    let stale = read_record();
+    assert_eq!(stale.state, "ready");
+    claim.expected_library_json = serde_json::to_string(&stale).unwrap();
+    {
+        let conn = db
+            .acquire_lock("prepare nonresumable ready control")
+            .unwrap();
+        conn.execute(
+            "UPDATE source_revalidation_rounds SET phase='active' WHERE id=?1",
+            [&origin.nonce],
+        )
+        .unwrap();
+    }
+    assert!(
+        db.claim_catalog_baseline(owner(), claim.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(read_record().attempt, origin.attempt);
+    {
+        let conn = db.acquire_lock("restore resumable ready control").unwrap();
+        conn.execute(
+            "UPDATE source_revalidation_rounds SET phase='observing' WHERE id=?1",
+            [&origin.nonce],
+        )
+        .unwrap();
+    }
+    let alias = format!("{}different-path", claim.baseline_key);
+    db.set_metadata(&alias, &boundary).await.unwrap();
+    let mut wrong_binding = claim.clone();
+    wrong_binding.baseline_key = alias;
+    assert!(
+        db.claim_catalog_baseline(owner(), wrong_binding)
+            .await
+            .is_err()
+    );
+    let preserved = read_record();
+    assert_eq!(
+        (preserved.state.as_str(), preserved.attempt.as_str()),
+        ("ready", origin.attempt.as_str())
+    );
+    {
+        let conn = db.acquire_lock("inject ready transfer copy fault").unwrap();
+        conn.execute_batch(&format!("CREATE TRIGGER fail_ready_copy BEFORE INSERT ON source_revalidation_debt WHEN NEW.round<>'{}' BEGIN SELECT RAISE(ABORT,'synthetic ready copy'); END;", origin.nonce)).unwrap();
+    }
+    let error = db
+        .claim_catalog_baseline(owner(), claim.clone())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("synthetic ready copy"));
+    assert_eq!(
+        (read_record().state.as_str(), read_record().attempt.as_str()),
+        ("ready", origin.attempt.as_str())
+    );
+    {
+        let conn = db.acquire_lock("remove ready transfer copy fault").unwrap();
+        let (phase,debt):(String,i64) = conn.query_row("SELECT r.phase,COUNT(d.id) FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1 GROUP BY r.id", [&origin.nonce], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!((phase.as_str(), debt), ("observing", 2));
+        conn.execute_batch("DROP TRIGGER fail_ready_copy;").unwrap();
+    }
+    let outcome = db.claim_catalog_baseline(owner(), claim).await.unwrap();
+    let CatalogClaimOutcome::Transferred {
+        old_round,
+        new_round,
+        attempt,
+        copied_debt,
+    } = outcome
+    else {
+        panic!("stale READY must transfer the existing census")
+    };
+    assert_eq!(old_round, origin.nonce);
+    assert_ne!(attempt, origin.attempt);
+    assert_eq!(copied_debt, 2);
+    let conn = db.acquire_lock("verify stale READY transfer").unwrap();
+    let (phase, high, after, boundary_hash): (String, String, String, String) = conn
+        .query_row(
+            "SELECT phase,high_id,after_id,boundary FROM source_revalidation_rounds WHERE id=?1",
+            [&new_round],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            phase.as_str(),
+            high.as_str(),
+            after.as_str(),
+            boundary_hash.as_str()
+        ),
+        (
+            "observing",
+            "high",
+            "after",
+            CatalogOrigin::boundary(&boundary).as_str()
+        )
+    );
+    let debts: Vec<(String, i64)> = conn
+        .prepare("SELECT id,next_retry_at FROM source_revalidation_debt WHERE round=?1 ORDER BY id")
+        .unwrap()
+        .query_map([&new_round], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(debts, vec![("asset1".into(), 10), ("asset2".into(), 20)]);
+    let (old_phase,old_debts):(String,i64) = conn.query_row("SELECT r.phase,COUNT(d.id) FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1 GROUP BY r.id", [&origin.nonce], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!((old_phase.as_str(), old_debts), ("abandoned", 2));
+    let record = crate::state::db::sync_epoch::read_library(&conn, "PrimarySync")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (record.state.as_str(), record.attempt.as_str()),
+        ("pending", attempt.as_str())
+    );
 }
 
 #[tokio::test]
