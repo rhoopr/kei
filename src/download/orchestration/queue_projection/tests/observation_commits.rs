@@ -498,6 +498,105 @@ async fn catalog_optional_stale_carried_link_does_not_block_delta() {
 }
 
 #[tokio::test]
+async fn catalog_stale_abandoned_link_allows_observed_delta_bootstrap() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+    let old = fixture.install().await;
+    fixture.stage(&old).await;
+    fixture.promote("staged").await;
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("retain stale catalog debt")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES(?1,'retained',31)",
+            [&old.nonce],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE source_revalidation_rounds SET phase='abandoned' WHERE id=?1",
+            [&old.nonce],
+        )
+        .unwrap();
+    }
+    let mut fences = Vec::new();
+    for key in [
+        crate::state::db::sync_epoch::SYNC_EPOCH_KEY.to_owned(),
+        crate::state::db::sync_epoch::library_key("PrimarySync"),
+        "enum_config_hash".into(),
+        "pending_enum_config_hash".into(),
+        "config_hash".into(),
+        "pending_download_config_hash".into(),
+        TOKEN.into(),
+        PROOF.into(),
+        "download_ledger_scope:PrimarySync".into(),
+    ] {
+        fences.push((key.clone(), fixture.db.get_metadata(&key).await.unwrap()));
+    }
+    let request = FreshCatalogOriginRequest {
+        library: "PrimarySync".into(),
+        plan: fixture.plan.clone(),
+        baseline_key: fixture.baseline_key.clone(),
+        preservation_config_hash: String::new(),
+        expected_baseline: fixture
+            .db
+            .get_metadata(&fixture.baseline_key)
+            .await
+            .unwrap(),
+        fresh_cursor: "later".into(),
+        enum_hash: fixture.policy.clone(),
+        expected_epoch: fixture.epoch.clone(),
+        expected_attempt: fixture.attempt.clone(),
+        expected_metadata: fences,
+        expected_catalog_snapshot: fixture
+            .db
+            .fresh_catalog_snapshot(owner(), "PrimarySync".into())
+            .await
+            .unwrap(),
+    };
+    let proof = ObservationProof::delivery(fixture.receipt.clone())
+        .delta("staged", "later")
+        .unwrap()
+        .with_epoch_attempt(Some(fixture.attempt.clone()));
+    let checkpoint = transition(&fixture.db, "later").await;
+    let origin = fixture
+        .db
+        .install_catalog_origin_after_delta(owner(), request, checkpoint, proof)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.db.get_metadata(TOKEN).await.unwrap().as_deref(),
+        Some("later")
+    );
+    assert_eq!(
+        fixture
+            .db
+            .get_metadata(&fixture.baseline_key)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("later")
+    );
+    let descriptor: Value =
+        serde_json::from_str(&fixture.db.get_metadata(PROOF).await.unwrap().unwrap()).unwrap();
+    assert!(
+        descriptor
+            .get("revalidation_round")
+            .is_none_or(Value::is_null)
+    );
+    let conn = fixture
+        .db
+        .acquire_lock("verify stale history retained")
+        .unwrap();
+    let (old_phase, old_deadline, new_phase):(String,i64,String) = conn.query_row("SELECT r.phase,d.next_retry_at,(SELECT phase FROM source_revalidation_rounds WHERE id=?2) FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1 AND d.id='retained'", rusqlite::params![old.nonce,origin.nonce], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(
+        (old_phase.as_str(), old_deadline, new_phase.as_str()),
+        ("abandoned", 31, "marking")
+    );
+}
+
+#[tokio::test]
 async fn catalog_observed_delta_installs_origin_atomically_including_quiet_eof() {
     for next in ["after", "delta-eof"] {
         let dir = tempfile::tempdir().unwrap();

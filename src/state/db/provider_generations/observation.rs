@@ -740,8 +740,29 @@ pub(in crate::state::db) fn require_catalog_delta(
         return Err(required_catalog_error());
     }
     let previous = valid(conn, &key, &old)?.ok_or_else(required_catalog_error)?;
-    if previous.revalidation_round.is_some() {
-        return Err(required_catalog_error());
+    if let Some(round) = &previous.revalidation_round {
+        let saved: Option<(String, String)> = conn
+            .query_row(
+                "SELECT mode,scope FROM source_revalidation_rounds WHERE id=?1 AND library=?2",
+                params![round, library],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((mode, scope)) = saved else {
+            return Err(required_catalog_error());
+        };
+        let Ok(origin) = crate::state::db::source_revalidation::CatalogOrigin::parse(&scope) else {
+            return Err(required_catalog_error());
+        };
+        let enum_hash = previous.policy[0]
+            .as_deref()
+            .ok_or_else(required_catalog_error)?;
+        if mode != super::super::source_revalidation::CATALOG_MODE
+            || origin.nonce != *round
+            || catalog_origin_current(conn, library, &origin, enum_hash)?
+        {
+            return Err(required_catalog_error());
+        }
     }
     let prepared = prepare(
         conn,

@@ -2104,7 +2104,7 @@ baseline key and new catalog origin. It copies matching old debt with its
 earliest deadlines, marks those old rounds abandoned, and retains their rows and
 debt. A write failure rolls back the transaction.
 
-For a complete epoch with a valid ACTIVE cursor and no catalog link, a completed
+For a complete epoch with a valid ACTIVE cursor and no current catalog origin, a completed
 delta observation can install its actual EOF cursor as the baseline in the same
 transaction that commits its checkpoint and ACTIVE descriptor. The operation
 checks the predecessor, successor, plan, owner, attempt and state fences, and
