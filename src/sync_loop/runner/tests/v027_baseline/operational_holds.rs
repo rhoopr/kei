@@ -58,7 +58,7 @@ impl PhotosSession for Session {
         let request: Value = serde_json::from_str(&body)?;
         if url.contains("/zones/list") {
             return Ok(json!({"zones":[{"zoneID":zone_for(&self.zone_name),
-                "syncToken":"op-hold-boundary","deleted":false}]}));
+                "syncToken":if self.cycle == 3 { "pair-fresh-one" } else { "op-hold-boundary" },"deleted":false}]}));
         }
         if request["query"]["recordType"] == "CheckIndexingState" {
             return Ok(json!({"records":[{"recordName":"index",
@@ -122,6 +122,10 @@ impl PhotosSession for Session {
             let token = request["zones"][0]["syncToken"]
                 .as_str()
                 .unwrap_or_default();
+            if self.cycle == 3 && token == "op-hold-after-baseline" {
+                return Ok(json!({"zones":[{"zoneID":zone_for(&self.zone_name),
+                    "serverErrorCode":"BAD_REQUEST"}]}));
+            }
             let (records, successor) = if self.cycle == 0 && token == "op-hold-boundary" {
                 (Vec::new(), "op-hold-after-baseline".to_string())
             } else if self.cycle == 0 {
@@ -130,9 +134,15 @@ impl PhotosSession for Session {
                     "baseline replay must use the saved boundary"
                 );
                 (Vec::new(), "op-hold-after-baseline".to_string())
-            } else if self.cycle == 1 {
+            } else if self.cycle == 3 && token == "pair-fresh-one" {
+                (Vec::new(), "pair-after-one".to_owned())
+            } else if self.cycle == 1 || self.cycle == 4 {
                 assert_eq!(
-                    token, "op-hold-after-baseline",
+                    token,
+                    match self.cycle {
+                        4 => "pair-after-one",
+                        _ => "op-hold-after-baseline",
+                    },
                     "a held cycle must retain the baseline cursor"
                 );
                 let mut records = self.progress.as_ref().clone();

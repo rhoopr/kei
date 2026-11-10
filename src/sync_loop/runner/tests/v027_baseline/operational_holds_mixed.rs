@@ -711,6 +711,120 @@ async fn mixed_health_refuses_owner_created_source_revalidation_debt() {
 }
 
 #[tokio::test]
+async fn catalog_health_pair_normal_expiry_creates_active_debt_that_vetoes_mixed_health() {
+    let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
+        .await
+        .expect("mixed operational fixture must execute");
+    let baseline = Box::pin(fixture.run(0, false, false)).await;
+    assert!(baseline.can_advance_database_checkpoint(), "{baseline:?}");
+    let baseline_path = fixture.root.join("baseline.JPG");
+    let baseline_mtime = std::fs::metadata(&baseline_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    // The ordinary rejected-cursor path installs and activates a real census.
+    // The runner's separate catalog drain has not yet run.
+    let expiry = Box::pin(fixture.run(3, false, false)).await;
+    assert!(expiry.can_advance_database_checkpoint(), "{expiry:?}");
+    let read_catalog = || {
+        let conn = fixture.db.acquire_lock("read real catalog debt").unwrap();
+        let mut query = conn
+            .prepare(
+                "SELECT r.id,r.scope,r.boundary,r.phase,r.mode,d.id,d.next_retry_at \
+             FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id \
+             WHERE r.library=?1 ORDER BY r.id,d.id",
+            )
+            .unwrap();
+        query
+            .query_map([ZONE], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let active = read_catalog();
+    assert_eq!(active.len(), 1, "{active:?}");
+    assert_eq!(
+        (&*active[0].3, &*active[0].4, &*active[0].5),
+        ("active", "catalog_v2", "asset-op-baseline")
+    );
+    let origin = crate::state::db::source_revalidation::CatalogOrigin::parse(&active[0].1).unwrap();
+    let policy = fixture
+        .db
+        .get_metadata("enum_config_hash")
+        .await
+        .unwrap()
+        .unwrap();
+    let candidates = fixture
+        .db
+        .due_catalog_candidates(
+            baseline_owner(),
+            ZONE.to_owned(),
+            origin.clone(),
+            policy.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "current origin must authorize the actual due candidate"
+    );
+    let mut held = Box::pin(fixture.run(4, true, false)).await;
+    assert_eq!(
+        held.stats.failed, 1,
+        "one actual transfer failure: {held:?}"
+    );
+    assert!(
+        held.holds
+            .iter()
+            .any(|hold| hold.source == ZONE && hold.kind == LibraryHoldKind::IdentityUnresolved)
+    );
+    let source = held
+        .sources
+        .iter()
+        .find(|source| source.zone_name == ZONE)
+        .unwrap();
+    assert!(source.sparse.as_ref().unwrap().completed_delta_replay);
+    assert_eq!(source.media_failures.len(), 1);
+    fixture
+        .db
+        .attest_current_sparse(&source.sparse.as_ref().unwrap().witness)
+        .await
+        .unwrap();
+    // This component slice does not run the catalog drain. In the full runner,
+    // pre-tail accounting happens before that drain and must already refuse.
+    let guards = fixture.finish_mixed_tail(&mut held).await;
+    assert!(
+        guards.is_none(),
+        "active census debt must veto known sparse/media accounting"
+    );
+    let (health, report) = reported_health(&fixture, &held, "catalog-active-veto.json").await;
+    assert!(health.last_success_at.is_none());
+    assert_eq!(report["status"], "partial_failure");
+    assert_eq!(report["stats"]["failed"], 1);
+    assert_eq!(read_catalog(), active);
+    assert_eq!(std::fs::read(&baseline_path).unwrap(), MEDIA);
+    assert_eq!(
+        std::fs::metadata(&baseline_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        baseline_mtime
+    );
+}
+
+#[tokio::test]
 async fn mixed_health_refuses_actual_prepared_publication() {
     use crate::state::VersionSizeKey;
     use crate::state::db::provider_selection::SelectionPath;
