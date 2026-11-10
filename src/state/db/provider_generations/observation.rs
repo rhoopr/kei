@@ -734,6 +734,25 @@ fn descriptor_own_source(descriptor: &Descriptor) -> Result<bool, StateError> {
         }))
 }
 
+pub(in crate::state::db) fn catalog_resume_predecessor_matches(
+    conn: &Connection,
+    library: &str,
+    token: &str,
+    plan: &str,
+    enum_hash: &str,
+) -> Result<bool, StateError> {
+    if token.trim().is_empty()
+        || metadata(conn, &format!("sync_token:v27:{library}"))?.as_deref() != Some(token)
+        || !catalog_active_plan_matches(conn, library, plan, enum_hash)?
+    {
+        return Ok(false);
+    }
+    let Some(saved) = valid(conn, &format!("{ACTIVE}{library}"), token)? else {
+        return Ok(false);
+    };
+    descriptor_own_source(&saved)
+}
+
 pub(in crate::state::db) fn catalog_bootstrap_eligibility(
     conn: &Connection,
     library: &str,
@@ -767,6 +786,16 @@ pub(in crate::state::db) fn catalog_bootstrap_eligibility(
         params![round, library], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
     ).optional()?;
     let (mode, scope, phase, round_enum) = row.ok_or_else(required_catalog_error)?;
+    if mode == super::super::source_revalidation::LEGACY_MODE {
+        if phase != "active"
+            || round_enum != enum_hash
+            || !saved.plans.iter().any(|plan| plan.scope == scope)
+            || !revalidation_scope_current(conn, library, &scope, enum_hash)?
+        {
+            return Err(required_catalog_error());
+        }
+        return Ok(CatalogBootstrapEligibility::CurrentLegacyLink);
+    }
     let origin = CatalogOrigin::parse(&scope).map_err(|_invalid| required_catalog_error())?;
     let current = sync_epoch::read_library(conn, library)?.ok_or_else(required_catalog_error)?;
     if mode != CATALOG_MODE

@@ -11,8 +11,9 @@ use crate::state::db::provider_generations::observation::{
 };
 use crate::state::db::source_revalidation::{
     CatalogBaselineClaim, CatalogBootstrapEligibility, CatalogClaimOutcome, CatalogOrigin,
-    CatalogPairEvidence, CatalogSettlementAuthority, FreshCatalogOriginRequest, FreshCatalogPass,
-    FreshCatalogPlan, prepare_existing_owned_database_for_test, quarantine_all_rounds,
+    CatalogPairEvidence, CatalogResumeRelation, CatalogSettlementAuthority,
+    FreshCatalogOriginRequest, FreshCatalogPass, FreshCatalogPlan,
+    prepare_existing_owned_database_for_test, quarantine_all_rounds,
 };
 use crate::state::{CheckpointTransition, SqliteStateDb};
 use crate::test_helpers::MockPhotosSession;
@@ -930,6 +931,14 @@ async fn catalog_observed_delta_installs_origin_atomically_including_quiet_eof()
                 .get("revalidation_round")
                 .is_none_or(Value::is_null)
         );
+        let resume = db
+            .catalog_resume(owner(), fixture.hint_request(next).await)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resume.origin, origin);
+        assert_eq!(resume.boundary, next);
+        assert_eq!(resume.relation, CatalogResumeRelation::CurrentToken);
         {
             let conn = db.acquire_lock("verify delta bootstrap origin").unwrap();
             let copied:i64 = conn.query_row("SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id='retained-asset'", [&origin.nonce], |r| r.get(0)).unwrap();
@@ -1193,6 +1202,21 @@ async fn catalog_pending_shared_full_zone_install_and_required_checkpoint() {
         .install_fresh_catalog_origin(owner(), request.clone())
         .await
         .unwrap();
+    let mut pending_resume = request.clone();
+    pending_resume.fresh_cursor.clear();
+    pending_resume.expected_baseline = Some(cursor.clone());
+    pending_resume.expected_catalog_snapshot = db
+        .fresh_catalog_snapshot(owner(), name.into())
+        .await
+        .unwrap();
+    let resumed = db
+        .catalog_resume(owner(), pending_resume)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed.origin, origin);
+    assert_eq!(resumed.boundary, cursor);
+    assert_eq!(resumed.relation, CatalogResumeRelation::PendingAttempt);
     assert_eq!(db.get_metadata(&token_key).await.unwrap(), None);
     assert_eq!(db.get_metadata(&proof_key).await.unwrap(), None);
     {
@@ -1657,6 +1681,135 @@ async fn catalog_pending_shared_full_zone_install_and_required_checkpoint() {
         std::fs::metadata(&medium).unwrap().modified().unwrap(),
         medium_mtime
     );
+}
+
+#[tokio::test]
+async fn catalog_hint_current_legacy_link_preserves_ordinary_delta_and_debt() {
+    for with_debt in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+        let db = &fixture.db;
+        let media = dir.path().join("legacy.jpg");
+        if with_debt {
+            std::fs::write(&media, b"legacy media").unwrap();
+            let asset = crate::test_helpers::TestAssetRecord::new("legacy-child")
+                .library("PrimarySync")
+                .build();
+            db.upsert_seen(&asset).await.unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                "legacy-child",
+                "original",
+                &media,
+                "synthetic",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let boundary = fixture.library.fresh_baseline_cursor().await.unwrap();
+        db.set_metadata(&fixture.baseline_key, &boundary)
+            .await
+            .unwrap();
+        db.seed_source_revalidation(
+            owner(),
+            "PrimarySync".into(),
+            fixture.plan.scope.clone(),
+            "policy".into(),
+            CatalogOrigin::boundary(&boundary),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let proof = ObservationProof::inventory(vec![fixture.receipt.clone()])
+            .unwrap()
+            .bridge(
+                ObservationProof::delivery(fixture.receipt.clone())
+                    .delta(&boundary, "legacy-active")
+                    .unwrap(),
+                &boundary,
+            )
+            .unwrap();
+        let mut save = transition(db, "legacy-active").await;
+        save.expected_metadata
+            .push((fixture.baseline_key.clone(), Some(boundary)));
+        db.commit_observation_transition(save, Some(proof), false)
+            .await
+            .unwrap();
+        let descriptor: Value =
+            serde_json::from_str(&db.get_metadata(PROOF).await.unwrap().unwrap()).unwrap();
+        let round = descriptor["revalidation_round"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            db.catalog_bootstrap_eligibility(owner(), fixture.hint_request("legacy-active").await)
+                .await
+                .unwrap(),
+            CatalogBootstrapEligibility::CurrentLegacyLink
+        );
+        let delta = ObservationProof::delivery(fixture.receipt.clone())
+            .delta("legacy-active", "legacy-next")
+            .unwrap();
+        db.commit_observation_transition(transition(db, "legacy-next").await, Some(delta), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_metadata(TOKEN).await.unwrap().as_deref(),
+            Some("legacy-next")
+        );
+        let conn = db
+            .acquire_lock("verify legacy round after ordinary delta")
+            .unwrap();
+        let (mode,phase,debt):(String,String,i64) = conn.query_row("SELECT r.mode,r.phase,COUNT(d.id) FROM source_revalidation_rounds r LEFT JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1 GROUP BY r.id", [&round], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(
+            (mode.as_str(), phase.as_str(), debt),
+            ("legacy_unfiled_v1", "active", i64::from(with_debt))
+        );
+        drop(conn);
+        if with_debt {
+            assert_eq!(std::fs::read(&media).unwrap(), b"legacy media");
+        }
+    }
+}
+
+#[tokio::test]
+async fn catalog_resume_returns_actual_saved_expiry_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+    let origin = fixture.install().await;
+    let resume = fixture
+        .db
+        .catalog_resume(owner(), fixture.hint_request("after").await)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resume.origin, origin);
+    assert_eq!(resume.boundary, "before");
+    assert_eq!(resume.relation, CatalogResumeRelation::SavedBoundary);
+    fixture
+        .db
+        .seed_source_revalidation(
+            owner(),
+            "PrimarySync".into(),
+            origin.scope(),
+            "policy".into(),
+            CatalogOrigin::boundary(&resume.boundary),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let reopened = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+        .await
+        .unwrap();
+    let resume = reopened
+        .catalog_resume(owner(), fixture.hint_request("after").await)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resume.origin, origin);
+    assert_eq!(resume.boundary, "before");
+    assert_eq!(resume.relation, CatalogResumeRelation::SavedBoundary);
 }
 
 #[tokio::test]

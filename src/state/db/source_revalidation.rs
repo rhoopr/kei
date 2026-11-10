@@ -137,7 +137,33 @@ pub(crate) struct FreshCatalogOriginRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CatalogBootstrapEligibility {
     CurrentLink,
+    CurrentLegacyLink,
     AttemptBootstrap,
+}
+
+#[must_use]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CatalogResumeRelation {
+    /// Text equality only; this is not proof that a provider stream reached EOF.
+    CurrentToken,
+    SavedBoundary,
+    PendingAttempt,
+}
+
+#[must_use]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CatalogResume {
+    pub(crate) origin: CatalogOrigin,
+    pub(crate) boundary: String,
+    pub(crate) relation: CatalogResumeRelation,
+}
+
+impl std::fmt::Debug for CatalogResume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatalogResume")
+            .field("relation", &self.relation)
+            .finish_non_exhaustive()
+    }
 }
 
 enum CatalogOriginOperation {
@@ -149,11 +175,13 @@ enum CatalogOriginOperation {
         )>,
     ),
     Eligibility,
+    Resume,
 }
 
 enum CatalogOriginOperationResult {
     Installed(CatalogOrigin),
     Eligibility(CatalogBootstrapEligibility),
+    Resume(Option<CatalogResume>),
 }
 
 fn catalog_snapshot(conn: &Connection, library: &str) -> Result<String, StateError> {
@@ -826,7 +854,7 @@ impl SqliteStateDb {
             .await?
         {
             CatalogOriginOperationResult::Installed(origin) => Ok(origin),
-            CatalogOriginOperationResult::Eligibility(_) => Err(StateError::SyncEpochMismatch),
+            _ => Err(StateError::SyncEpochMismatch),
         }
     }
 
@@ -850,7 +878,7 @@ impl SqliteStateDb {
             .await?
         {
             CatalogOriginOperationResult::Installed(origin) => Ok(origin),
-            CatalogOriginOperationResult::Eligibility(_) => Err(StateError::SyncEpochMismatch),
+            _ => Err(StateError::SyncEpochMismatch),
         }
     }
 
@@ -868,7 +896,25 @@ impl SqliteStateDb {
             .await?
         {
             CatalogOriginOperationResult::Eligibility(hint) => Ok(hint),
-            CatalogOriginOperationResult::Installed(_) => Err(StateError::SyncEpochMismatch),
+            _ => Err(StateError::SyncEpochMismatch),
+        }
+    }
+
+    /// Read an exact saved census boundary and typed origin. This grants no
+    /// checkpoint or provider-completeness authority. For a complete epoch,
+    /// `fresh_cursor` is the current token; for pending it is unused.
+    #[allow(dead_code)] // L1 cycle integration is pending.
+    pub(crate) async fn catalog_resume(
+        &self,
+        owner: account::AccountOwner,
+        request: FreshCatalogOriginRequest,
+    ) -> Result<Option<CatalogResume>, StateError> {
+        match self
+            .catalog_origin_operation(owner, request, CatalogOriginOperation::Resume)
+            .await?
+        {
+            CatalogOriginOperationResult::Resume(resume) => Ok(resume),
+            _ => Err(StateError::SyncEpochMismatch),
         }
     }
 
@@ -880,7 +926,7 @@ impl SqliteStateDb {
     ) -> Result<CatalogOriginOperationResult, StateError> {
         self.with_conn_mut("installing fresh catalog origin", move |conn| {
             let behavior = match operation {
-                CatalogOriginOperation::Eligibility => TransactionBehavior::Deferred,
+                CatalogOriginOperation::Eligibility | CatalogOriginOperation::Resume => TransactionBehavior::Deferred,
                 _ => TransactionBehavior::Immediate,
             };
             let tx = conn.transaction_with_behavior(behavior)?;
@@ -1036,7 +1082,7 @@ impl SqliteStateDb {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if actual_baseline != request.expected_baseline || request.fresh_cursor.trim().is_empty()
+            if actual_baseline != request.expected_baseline || (!matches!(operation, CatalogOriginOperation::Resume) && request.fresh_cursor.trim().is_empty())
             {
                 return Err(StateError::Invariant {
                     operation: "install_fresh_catalog_origin",
@@ -1054,6 +1100,47 @@ impl SqliteStateDb {
                     operation: "install_fresh_catalog_origin",
                     detail: "current ACTIVE source plan changed".into(),
                 });
+            }
+            if matches!(operation, CatalogOriginOperation::Resume) {
+                if library_record.state == "complete"
+                    && !super::provider_generations::observation::catalog_resume_predecessor_matches(
+                        &tx, &request.library, &request.fresh_cursor, &digest, &request.enum_hash,
+                    )?
+                {
+                    return Err(StateError::SyncEpochMismatch);
+                }
+                let Some(boundary) = actual_baseline.filter(|value| !value.trim().is_empty()) else {
+                    tx.commit()?;
+                    return Ok(CatalogOriginOperationResult::Resume(None));
+                };
+                let hash = CatalogOrigin::boundary(&boundary);
+                let rows: Vec<(String,String,String,String)> = tx.prepare(
+                    "SELECT id,scope,enum_hash,mode FROM source_revalidation_rounds WHERE library=?1 AND boundary=?2 AND phase IN ('marking','observing') ORDER BY id"
+                )?.query_map(params![request.library,hash], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?.collect::<Result<_,_>>()?;
+                let [(id, scope, enum_hash, mode)] = rows.as_slice() else {
+                    if rows.is_empty() {
+                        tx.commit()?;
+                        return Ok(CatalogOriginOperationResult::Resume(None));
+                    }
+                    return Err(StateError::SyncEpochMismatch);
+                };
+                let origin = CatalogOrigin::parse(scope)?;
+                if mode != CATALOG_MODE || enum_hash != &request.enum_hash || origin.nonce != *id
+                    || origin.plan_digest != digest || origin.epoch != epoch.epoch
+                    || origin.attempt != library_record.attempt
+                {
+                    return Err(StateError::SyncEpochMismatch);
+                }
+                catalog_seed_phase(&tx, &request.library, scope, &request.enum_hash, &hash)?;
+                let relation = if library_record.state == "pending" {
+                    CatalogResumeRelation::PendingAttempt
+                } else if request.fresh_cursor == boundary {
+                    CatalogResumeRelation::CurrentToken
+                } else {
+                    CatalogResumeRelation::SavedBoundary
+                };
+                tx.commit()?;
+                return Ok(CatalogOriginOperationResult::Resume(Some(CatalogResume { origin, boundary, relation })));
             }
             if matches!(operation, CatalogOriginOperation::Eligibility) {
                 if library_record.state != "complete" {
