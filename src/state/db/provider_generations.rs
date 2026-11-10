@@ -21,6 +21,7 @@ use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
 
 mod adjusted_redirect;
+pub(crate) mod operational_hold;
 pub(crate) use adjusted_redirect::AdjustedRedirect;
 pub(crate) mod coverage;
 pub(crate) mod observation;
@@ -131,13 +132,6 @@ pub(crate) struct CapturedSelectionRetry {
 
 /// Actual committed decision state for one exact captured destination.
 /// The pipeline, not the state owner, supplies any transient failure cause.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later mixed-failure pipeline seam"
-    )
-)]
 #[must_use]
 #[derive(Clone, Debug)]
 pub(crate) struct DeferredMediaSuccessor {
@@ -2471,13 +2465,6 @@ impl SqliteStateDb {
 
     /// Atomically back off one exact decision and return one committed
     /// successor for each supplied destination. Refusal yields no receipts.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by the later mixed-failure pipeline seam"
-        )
-    )]
     pub(crate) async fn defer_media_failure_successors(
         &self,
         owner: account::AccountOwner,

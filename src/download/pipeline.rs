@@ -26,9 +26,39 @@ pub(in crate::download) use task::{DownloadSingleContext, download_single_task};
 mod test_support;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::download) enum MediaFailureCause {
+pub(crate) enum MediaFailureCause {
     Transfer,
     ExpiredUrl,
+}
+
+/// A typed failure observed in this execution and its committed state successor.
+#[derive(Clone)]
+pub(crate) struct AccountedMediaFailure {
+    pub(crate) cause: MediaFailureCause,
+    pub(crate) successor: crate::state::db::provider_generations::DeferredMediaSuccessor,
+    pub(in crate::download) task_key: crate::download::orchestration::url_refresh::RetryTaskKey,
+}
+
+impl AccountedMediaFailure {
+    pub(crate) fn task_identity(&self) -> &(impl Eq + std::hash::Hash) {
+        &self.task_key
+    }
+
+    pub(crate) fn matches_source(&self, source: &str) -> bool {
+        let captured = &self.successor.captured;
+        self.task_key.library.as_ref() == source
+            && self.task_key.asset_id.as_ref() == captured.state_id
+            && self.task_key.version_size.as_str() == captured.destination.version_size
+            && self.task_key.download_path == captured.destination.path.to_path()
+    }
+}
+
+impl std::fmt::Debug for AccountedMediaFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountedMediaFailure")
+            .field("cause", &self.cause)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]

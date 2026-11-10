@@ -131,6 +131,31 @@ pub(crate) struct FreshCatalogOriginRequest {
     pub(crate) expected_catalog_snapshot: String,
 }
 
+/// A pre-stream decision only. The checkpoint and catalog owner revalidate all
+/// evidence after the provider stream has actually reached EOF.
+#[must_use]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CatalogBootstrapEligibility {
+    CurrentLink,
+    AttemptBootstrap,
+}
+
+enum CatalogOriginOperation {
+    Fresh,
+    ObservedDelta(
+        Box<(
+            super::CheckpointTransition,
+            super::provider_generations::observation::ObservationProof,
+        )>,
+    ),
+    Eligibility,
+}
+
+enum CatalogOriginOperationResult {
+    Installed(CatalogOrigin),
+    Eligibility(CatalogBootstrapEligibility),
+}
+
 fn catalog_snapshot(conn: &Connection, library: &str) -> Result<String, StateError> {
     let mut hash = Sha256::new();
     let mut statement = conn.prepare(
@@ -796,7 +821,13 @@ impl SqliteStateDb {
         owner: account::AccountOwner,
         request: FreshCatalogOriginRequest,
     ) -> Result<CatalogOrigin, StateError> {
-        self.install_catalog_origin(owner, request, None).await
+        match self
+            .catalog_origin_operation(owner, request, CatalogOriginOperation::Fresh)
+            .await?
+        {
+            CatalogOriginOperationResult::Installed(origin) => Ok(origin),
+            CatalogOriginOperationResult::Eligibility(_) => Err(StateError::SyncEpochMismatch),
+        }
     }
 
     /// Commit a completed observed delta and install its successor as a new
@@ -810,21 +841,49 @@ impl SqliteStateDb {
         transition: super::CheckpointTransition,
         proof: super::provider_generations::observation::ObservationProof,
     ) -> Result<CatalogOrigin, StateError> {
-        self.install_catalog_origin(owner, request, Some((transition, proof)))
-            .await
+        match self
+            .catalog_origin_operation(
+                owner,
+                request,
+                CatalogOriginOperation::ObservedDelta(Box::new((transition, proof))),
+            )
+            .await?
+        {
+            CatalogOriginOperationResult::Installed(origin) => Ok(origin),
+            CatalogOriginOperationResult::Eligibility(_) => Err(StateError::SyncEpochMismatch),
+        }
     }
 
-    async fn install_catalog_origin(
+    /// Read a pre-stream hint. `request.fresh_cursor` is the current token T,
+    /// not an EOF boundary. A later bootstrap must replace it with actual D.
+    /// An error means the caller must retain the checkpoint and work.
+    #[allow(dead_code)] // L1 cycle integration is pending.
+    pub(crate) async fn catalog_bootstrap_eligibility(
         &self,
         owner: account::AccountOwner,
         request: FreshCatalogOriginRequest,
-        observed_delta: Option<(
-            super::CheckpointTransition,
-            super::provider_generations::observation::ObservationProof,
-        )>,
-    ) -> Result<CatalogOrigin, StateError> {
+    ) -> Result<CatalogBootstrapEligibility, StateError> {
+        match self
+            .catalog_origin_operation(owner, request, CatalogOriginOperation::Eligibility)
+            .await?
+        {
+            CatalogOriginOperationResult::Eligibility(hint) => Ok(hint),
+            CatalogOriginOperationResult::Installed(_) => Err(StateError::SyncEpochMismatch),
+        }
+    }
+
+    async fn catalog_origin_operation(
+        &self,
+        owner: account::AccountOwner,
+        request: FreshCatalogOriginRequest,
+        operation: CatalogOriginOperation,
+    ) -> Result<CatalogOriginOperationResult, StateError> {
         self.with_conn_mut("installing fresh catalog origin", move |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let behavior = match operation {
+                CatalogOriginOperation::Eligibility => TransactionBehavior::Deferred,
+                _ => TransactionBehavior::Immediate,
+            };
+            let tx = conn.transaction_with_behavior(behavior)?;
             account::validate_authenticated(&tx, &owner)?;
             if catalog_snapshot(&tx, &request.library)? != request.expected_catalog_snapshot {
                 return Err(StateError::Invariant { operation: "install_fresh_catalog_origin", detail: "catalog round fence changed".into() });
@@ -996,7 +1055,18 @@ impl SqliteStateDb {
                     detail: "current ACTIVE source plan changed".into(),
                 });
             }
-            let required_delta = if let Some((transition, proof)) = observed_delta {
+            if matches!(operation, CatalogOriginOperation::Eligibility) {
+                if library_record.state != "complete" {
+                    return Err(StateError::SyncEpochMismatch);
+                }
+                let hint = super::provider_generations::observation::catalog_bootstrap_eligibility(
+                    &tx, &request.library, &request.fresh_cursor, &digest, &request.enum_hash,
+                )?;
+                tx.commit()?;
+                return Ok(CatalogOriginOperationResult::Eligibility(hint));
+            }
+            let required_delta = if let CatalogOriginOperation::ObservedDelta(delta) = operation {
+                let (transition, proof) = *delta;
                 if library_record.state != "complete" {
                     return Err(StateError::SyncEpochMismatch);
                 }
@@ -1108,7 +1178,7 @@ impl SqliteStateDb {
                 }
             }
             tx.commit()?;
-            Ok(origin)
+            Ok(CatalogOriginOperationResult::Installed(origin))
         })
         .await
     }

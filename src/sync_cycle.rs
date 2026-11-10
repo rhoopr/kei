@@ -504,6 +504,13 @@ pub(crate) struct SourceOutcome {
     /// Actual outcome/checkpoint/provider failure, never a positive count.
     pub(crate) genuine_error: bool,
     pub(crate) sparse: Option<SparseHeldWitness>,
+    pub(crate) operational_prework: Option<download::OperationalPrework>,
+    pub(crate) media_failures: Vec<download::pipeline::AccountedMediaFailure>,
+    pub(crate) media_failure_unaccounted: bool,
+    operational_active: bool,
+    operational_eligible: bool,
+    operational_other_error: bool,
+    operational_pre_tail_paths: Option<Vec<(std::path::PathBuf, std::path::PathBuf)>>,
 }
 
 impl std::fmt::Debug for SourceOutcome {
@@ -537,6 +544,205 @@ pub(crate) struct CycleResult {
 }
 
 impl CycleResult {
+    #[cfg(test)]
+    pub(crate) fn operational_tail_prepared(&self) -> bool {
+        !self.sources.is_empty()
+            && self
+                .sources
+                .iter()
+                .all(|source| source.operational_pre_tail_paths.is_some())
+    }
+
+    async fn operational_paths(
+        &self,
+        session: &auth::SharedSession,
+    ) -> anyhow::Result<Option<Vec<Vec<(std::path::PathBuf, std::path::PathBuf)>>>> {
+        if self.holds.is_empty()
+            || self.session_expired
+            || self.stats.interrupted
+            || self.stats.skipped.retry_exhausted > 0
+            || self.holds.iter().any(|hold| {
+                self.sources
+                    .iter()
+                    .filter(|source| source.operational_active && source.zone_name == hold.source)
+                    .count()
+                    != 1
+            })
+        {
+            return Ok(None);
+        }
+        let receipts = self
+            .sources
+            .iter()
+            .map(|source| source.media_failures.len())
+            .sum::<usize>();
+        // Counts are only negative checks. Positive authority comes from the
+        // typed, per-task successors matched to the complete owner snapshot.
+        if self.stats.failed != receipts || self.failed_count != receipts {
+            return Ok(None);
+        }
+        let mut task_keys = std::collections::HashSet::new();
+        if self
+            .sources
+            .iter()
+            .flat_map(|source| &source.media_failures)
+            .any(|failure| !task_keys.insert(failure.task_identity()))
+        {
+            return Ok(None);
+        }
+        let session = session.read().await;
+        let mut all_paths = Vec::with_capacity(self.sources.len());
+        for source in &self.sources {
+            if !source.operational_active {
+                // No independent owner census was captured for this source.
+                return Ok(None);
+            }
+            if !source.operational_eligible
+                || !source.reached
+                || source.operational_other_error
+                || source.media_failure_unaccounted
+            {
+                return Ok(None);
+            }
+            let Some(prework) = &source.operational_prework else {
+                return Ok(None);
+            };
+            if !session.operational_owner_matches(&prework.owner).await {
+                return Ok(None);
+            }
+            if source
+                .media_failures
+                .iter()
+                .any(|failure| !failure.matches_source(&source.zone_name))
+            {
+                return Ok(None);
+            }
+            let mut sparse = false;
+            let mut preservation = false;
+            for hold in self
+                .holds
+                .iter()
+                .filter(|hold| hold.source == source.zone_name)
+            {
+                match hold.kind {
+                    LibraryHoldKind::IdentityUnresolved => sparse = true,
+                    LibraryHoldKind::PreservationPending => preservation = true,
+                    _ => return Ok(None),
+                }
+            }
+            // Preservation alone is not proof that the source made ordinary
+            // progress. Sparse holds instead require a completed delta below.
+            if !sparse && !source.ordinary_committed {
+                return Ok(None);
+            }
+            let witness = if sparse {
+                let Some(held) = &source.sparse else {
+                    return Ok(None);
+                };
+                if !held.completed_delta_replay
+                    || held.witness.baseline_scope() != Some(source.baseline_scope.as_str())
+                {
+                    return Ok(None);
+                }
+                Some(held.witness.clone())
+            } else {
+                None
+            };
+            let successors = source
+                .media_failures
+                .iter()
+                .map(|failure| match failure.cause {
+                    download::pipeline::MediaFailureCause::Transfer
+                    | download::pipeline::MediaFailureCause::ExpiredUrl => {
+                        failure.successor.clone()
+                    }
+                })
+                .collect();
+            let Some(accounting) = prework
+                .db
+                .operational_accounting(prework.prework.clone(), successors, witness, preservation)
+                .await?
+            else {
+                return Ok(None);
+            };
+            all_paths.push(accounting.paths);
+        }
+        Ok(Some(all_paths))
+    }
+
+    /// Record the exact journals before the runner schedules its joined tails.
+    pub(crate) async fn prepare_operational_tail(
+        &mut self,
+        session: &auth::SharedSession,
+        shutdown: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        // A pre-tail sparse attestation cannot survive newly discovered work
+        // or a failed journal check without the post-tail observation.
+        if !self.holds.is_empty() {
+            self.operational_safe_holds = false;
+        }
+        let Some(paths) = self.operational_paths(session).await? else {
+            return Ok(());
+        };
+        let flat: Vec<_> = paths.iter().flatten().cloned().collect();
+        let _guards = match download::guard_operational_journals(&flat, shutdown).await {
+            Ok(Some(guards)) => guards,
+            Ok(None) => return Ok(()),
+            Err(_) => {
+                tracing::warn!("Could not inspect operational journals; retaining partial health");
+                return Ok(());
+            }
+        };
+        for (source, paths) in self.sources.iter_mut().zip(paths) {
+            source.operational_pre_tail_paths = Some(paths);
+        }
+        Ok(())
+    }
+
+    /// Revalidate after joined tails and retain destination guards through the
+    /// caller's health observation. This grants no checkpoint authority.
+    pub(crate) async fn finish_operational_tail(
+        &mut self,
+        session: &auth::SharedSession,
+        shutdown: &CancellationToken,
+    ) -> anyhow::Result<Option<download::OperationalJournalGuards>> {
+        let Some(paths) = self.operational_paths(session).await? else {
+            return Ok(None);
+        };
+        if self
+            .sources
+            .iter()
+            .zip(&paths)
+            .any(|(source, paths)| source.operational_pre_tail_paths.as_ref() != Some(paths))
+        {
+            return Ok(None);
+        }
+        let flat: Vec<_> = paths.iter().flatten().cloned().collect();
+        let guards = match download::guard_operational_journals(&flat, shutdown).await {
+            Ok(Some(guards)) => guards,
+            Ok(None) => return Ok(None),
+            Err(_) => {
+                tracing::warn!("Could not inspect operational journals; retaining partial health");
+                return Ok(None);
+            }
+        };
+        if self.operational_paths(session).await?.as_ref() != Some(&paths)
+            || shutdown.is_cancelled()
+        {
+            return Ok(None);
+        }
+        match download::operational_media_journals_clear(&flat).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
+            Err(_) => {
+                tracing::warn!("Could not recheck operational journals; retaining partial health");
+                return Ok(None);
+            }
+        }
+        self.operational_safe_holds = true;
+        Ok(Some(guards))
+    }
+
     /// The database pre-check needs a clean aggregate cycle as well as safe
     /// selected-zone checkpoints. A durable transfer failure can satisfy the
     /// zone gate without satisfying this broader gate.
@@ -1518,6 +1724,13 @@ pub(crate) async fn run_cycle_with_witness(
             ordinary_committed: false,
             genuine_error: false,
             sparse: None,
+            operational_prework: None,
+            media_failures: Vec::new(),
+            media_failure_unaccounted: false,
+            operational_active: expected.active_passes,
+            operational_eligible: false,
+            operational_other_error: false,
+            operational_pre_tail_paths: None,
         })
         .collect();
     let mut sparse_identity_proofs = Vec::new();
@@ -2813,6 +3026,33 @@ pub(crate) async fn run_cycle_with_witness(
                     .ok()
                     .map(|record| record.attempt);
         }
+        if pending_download_config_hash.is_none()
+            && let (Some(epoch), Some(attempt)) = (&expected_epoch, &expected_attempt)
+            && let Some(source) = sources
+                .iter_mut()
+                .find(|source| source.zone_name == lib_state.zone_name)
+        {
+            source.operational_prework = download::operational_prework(
+                &lib_state.plan.passes,
+                &download_config,
+                download_controls,
+                &source.baseline_scope,
+                epoch,
+                attempt,
+            )
+            .await?;
+            if let Some(prework) = &source.operational_prework {
+                let same_store = state_db.is_some_and(|db| {
+                    std::ptr::eq(
+                        std::ptr::from_ref(db).cast::<()>(),
+                        Arc::as_ptr(&prework.db).cast::<()>(),
+                    )
+                });
+                if !same_store {
+                    source.operational_prework = None;
+                }
+            }
+        }
         if let Some(source) = sources
             .iter_mut()
             .find(|source| source.zone_name == lib_state.zone_name)
@@ -4006,6 +4246,16 @@ pub(crate) async fn run_cycle_with_witness(
             source.ordinary_committed = checkpoint_persistence == "stored";
             source.genuine_error =
                 genuine_error || source.baseline_scope != lib_state.library.baseline_scope();
+            source.media_failures = sync_result.checkpoint.media_failures.clone();
+            source.media_failure_unaccounted = sync_result.checkpoint.media_failure_unaccounted;
+            source.operational_other_error = matches!(
+                sync_result.outcome,
+                download::DownloadOutcome::SessionExpired { .. }
+            ) || sync_result.checkpoint.enumeration_errors > 0
+                || sync_result.checkpoint.state_write_failures > 0
+                || sync_result.checkpoint.retained_token_rejected
+                || blocked_non_sparse
+                || checkpoint_persistence == "failed";
             source.sparse = match (&expected_epoch, &expected_attempt) {
                 (Some(epoch), Some(attempt)) => {
                     let mut witness = sync_result.checkpoint.sparse_current.clone();
@@ -4370,6 +4620,23 @@ pub(crate) async fn run_cycle_with_witness(
             }
             db_sync_token_advance_safe = false;
         }
+    }
+
+    let operational_candidate_eligible = !config.runtime.dry_run
+        && !config.runtime.only_print_filenames
+        && !is_retry_failed
+        && state_db.is_some()
+        && !cycle_session_expired
+        && !cycle_stats.interrupted
+        && !cycle_has_stale_plan
+        && !operational_state_fault
+        && cycle_stats.exif_failures == 0
+        && cycle_stats.state_write_failures == 0
+        && cycle_stats.enumeration_errors == 0
+        && !cycle_stats.enumeration_incomplete
+        && cycle_stats.count_probe_failures == 0;
+    for source in &mut sources {
+        source.operational_eligible = operational_candidate_eligible;
     }
 
     let operational_safe_holds = {

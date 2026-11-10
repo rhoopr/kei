@@ -682,6 +682,7 @@ pub(in crate::download) async fn build_download_result(
         ));
     }
 
+    checkpoint.media_failure_unaccounted = !remaining_failed.is_empty();
     if auth_errors == 0
         && phase2_auth_errors == 0
         && retry_plan.provider_auth_errors == 0
@@ -692,14 +693,18 @@ pub(in crate::download) async fn build_download_result(
     {
         let phase2_media_failures = pass_result.media_failures;
         let phase2_failed_failure_writes = pass_result.failed_failure_writes;
-        let mut final_media: FxHashMap<_, _> = phase1_media_failures
-            .into_iter()
-            .map(|failure| (crate::download::RetryTaskKey::from(&failure.task), failure))
-            .collect();
+        let mut final_media = FxHashMap::default();
+        let mut duplicate_media = false;
+        for failure in phase1_media_failures {
+            duplicate_media |= final_media
+                .insert(crate::download::RetryTaskKey::from(&failure.task), failure)
+                .is_some();
+        }
         let phase2_media_keys: FxHashSet<_> = phase2_media_failures
             .iter()
             .map(|failure| crate::download::RetryTaskKey::from(&failure.task))
             .collect();
+        duplicate_media |= phase2_media_keys.len() != phase2_media_failures.len();
         for key in &downloaded_keys {
             final_media.remove(key);
         }
@@ -718,8 +723,22 @@ pub(in crate::download) async fn build_download_result(
             final_media.remove(&failure.task_key);
         }
         if !final_media.is_empty() {
-            run.record_media_failure_backoff(&final_media.into_values().collect::<Vec<_>>())
-                .await?;
+            let remaining_keys: FxHashSet<_> = remaining_failed
+                .iter()
+                .map(crate::download::RetryTaskKey::from)
+                .collect();
+            let exact = !duplicate_media
+                && remaining_keys.len() == remaining_failed.len()
+                && final_media.len() == remaining_keys.len()
+                && final_media.keys().all(|key| remaining_keys.contains(key));
+            if let Some(receipts) = run
+                .record_media_failure_successors(&final_media.into_values().collect::<Vec<_>>())
+                .await?
+                && exact
+            {
+                checkpoint.media_failures = receipts;
+                checkpoint.media_failure_unaccounted = false;
+            }
         }
     }
 

@@ -10,9 +10,9 @@ use crate::state::db::provider_generations::observation::{
     AdmissionReceipt, ObservationProof, catalog_plan_digest_from_observation,
 };
 use crate::state::db::source_revalidation::{
-    CatalogBaselineClaim, CatalogClaimOutcome, CatalogOrigin, CatalogPairEvidence,
-    CatalogSettlementAuthority, FreshCatalogOriginRequest, FreshCatalogPass, FreshCatalogPlan,
-    prepare_existing_owned_database_for_test, quarantine_all_rounds,
+    CatalogBaselineClaim, CatalogBootstrapEligibility, CatalogClaimOutcome, CatalogOrigin,
+    CatalogPairEvidence, CatalogSettlementAuthority, FreshCatalogOriginRequest, FreshCatalogPass,
+    FreshCatalogPlan, prepare_existing_owned_database_for_test, quarantine_all_rounds,
 };
 use crate::state::{CheckpointTransition, SqliteStateDb};
 use crate::test_helpers::MockPhotosSession;
@@ -262,6 +262,40 @@ impl CatalogOwnerFixture {
             )
             .await
             .unwrap()
+    }
+
+    async fn hint_request(&self, token: &str) -> FreshCatalogOriginRequest {
+        let mut expected_metadata = Vec::new();
+        for key in [
+            crate::state::db::sync_epoch::SYNC_EPOCH_KEY.to_owned(),
+            crate::state::db::sync_epoch::library_key("PrimarySync"),
+            "enum_config_hash".into(),
+            "pending_enum_config_hash".into(),
+            "config_hash".into(),
+            "pending_download_config_hash".into(),
+            TOKEN.into(),
+            PROOF.into(),
+            "download_ledger_scope:PrimarySync".into(),
+        ] {
+            expected_metadata.push((key.clone(), self.db.get_metadata(&key).await.unwrap()));
+        }
+        FreshCatalogOriginRequest {
+            library: "PrimarySync".into(),
+            plan: self.plan.clone(),
+            baseline_key: self.baseline_key.clone(),
+            preservation_config_hash: String::new(),
+            expected_baseline: self.db.get_metadata(&self.baseline_key).await.unwrap(),
+            fresh_cursor: token.into(),
+            enum_hash: self.policy.clone(),
+            expected_epoch: self.epoch.clone(),
+            expected_attempt: self.attempt.clone(),
+            expected_metadata,
+            expected_catalog_snapshot: self
+                .db
+                .fresh_catalog_snapshot(owner(), "PrimarySync".into())
+                .await
+                .unwrap(),
+        }
     }
 
     async fn stage(&self, origin: &CatalogOrigin) {
@@ -672,6 +706,14 @@ async fn catalog_observed_delta_installs_origin_atomically_including_quiet_eof()
                 .await
                 .unwrap(),
         };
+        let mut pre_stream = request.clone();
+        pre_stream.fresh_cursor = "after".into();
+        assert_eq!(
+            db.catalog_bootstrap_eligibility(owner(), pre_stream)
+                .await
+                .unwrap(),
+            CatalogBootstrapEligibility::AttemptBootstrap
+        );
         let checkpoint = transition(db, next).await;
         let source = &fixture.plan.passes[0].scope;
         let page = serde_json::json!({"zones":[{"zoneID":fixture.plan.zone,"records":[],"syncToken":next,"moreComing":false}]});
@@ -1345,7 +1387,7 @@ async fn catalog_pending_shared_full_zone_install_and_required_checkpoint() {
         *value = db.get_metadata(key).await.unwrap();
     }
     assert!(
-        db.install_fresh_catalog_origin(owner(), ready_request)
+        db.install_fresh_catalog_origin(owner(), ready_request.clone())
             .await
             .is_err()
     );
@@ -1386,6 +1428,340 @@ async fn catalog_pending_shared_full_zone_install_and_required_checkpoint() {
         db.get_metadata(&token_key).await.unwrap().as_deref(),
         Some("shared-eof")
     );
+    ready_request.fresh_cursor = "shared-eof".into();
+    ready_request.expected_baseline = db.get_metadata(&baseline_key).await.unwrap();
+    ready_request.expected_catalog_snapshot = db
+        .fresh_catalog_snapshot(owner(), name.into())
+        .await
+        .unwrap();
+    for (key, value) in &mut ready_request.expected_metadata {
+        *value = db.get_metadata(key).await.unwrap();
+    }
+    assert_eq!(
+        db.catalog_bootstrap_eligibility(owner(), ready_request.clone())
+            .await
+            .unwrap(),
+        CatalogBootstrapEligibility::CurrentLink
+    );
+    ready_request.plan.zone["ownerRecordName"] = serde_json::json!("other-owner");
+    assert!(
+        db.catalog_bootstrap_eligibility(owner(), ready_request)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn catalog_bootstrap_hint_preserves_linked_progress_and_rejects_bad_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+    let db = &fixture.db;
+    let request = fixture.hint_request("after").await;
+    assert_eq!(
+        db.catalog_bootstrap_eligibility(owner(), request.clone())
+            .await
+            .unwrap(),
+        CatalogBootstrapEligibility::AttemptBootstrap
+    );
+    let before = db.get_metadata(PROOF).await.unwrap();
+    assert_eq!(
+        db.get_metadata(TOKEN).await.unwrap().as_deref(),
+        Some("after")
+    );
+    assert_eq!(db.get_metadata(&fixture.baseline_key).await.unwrap(), None);
+    for bad in [
+        {
+            let mut r = request.clone();
+            r.fresh_cursor = "wrong-token".into();
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.plan.database = "shared".into();
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.plan.zone["ownerRecordName"] = serde_json::json!("wrong-owner");
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.plan.provider = "wrong-pin".into();
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.plan.config_hash = "a".repeat(64);
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.expected_epoch = uuid::Uuid::new_v4().to_string();
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.expected_attempt = uuid::Uuid::new_v4().to_string();
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.expected_catalog_snapshot = "stale".into();
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.baseline_key.push_str("alias");
+            r
+        },
+    ] {
+        assert!(
+            db.catalog_bootstrap_eligibility(owner(), bad)
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(db.get_metadata(PROOF).await.unwrap(), before);
+    {
+        let conn = db.acquire_lock("inject catalog read failure").unwrap();
+        conn.execute_batch("ALTER TABLE source_revalidation_rounds RENAME TO catalog_rounds_temporarily_unavailable").unwrap();
+    }
+    assert!(
+        db.catalog_bootstrap_eligibility(owner(), request)
+            .await
+            .is_err()
+    );
+    {
+        let conn = db.acquire_lock("restore catalog read").unwrap();
+        conn.execute_batch("ALTER TABLE catalog_rounds_temporarily_unavailable RENAME TO source_revalidation_rounds").unwrap();
+    }
+    assert_eq!(
+        db.catalog_bootstrap_eligibility(owner(), fixture.hint_request("after").await)
+            .await
+            .unwrap(),
+        CatalogBootstrapEligibility::AttemptBootstrap
+    );
+    let origin = fixture.install().await;
+    fixture.stage(&origin).await;
+    fixture.promote("staged").await;
+    assert!(
+        db.catalog_pending_signals(owner(), "PrimarySync".into())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.catalog_bootstrap_eligibility(owner(), fixture.hint_request("staged").await)
+            .await
+            .unwrap(),
+        CatalogBootstrapEligibility::CurrentLink
+    );
+    let delta = ObservationProof::delivery(fixture.receipt.clone())
+        .delta("staged", "next")
+        .unwrap();
+    db.commit_observation_transition(transition(db, "next").await, Some(delta), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.catalog_bootstrap_eligibility(owner(), fixture.hint_request("next").await)
+            .await
+            .unwrap(),
+        CatalogBootstrapEligibility::CurrentLink
+    );
+    let descriptor: Value =
+        serde_json::from_str(&db.get_metadata(PROOF).await.unwrap().unwrap()).unwrap();
+    assert_eq!(descriptor["revalidation_round"], origin.nonce);
+    let wrong_owner = crate::state::db::account::AccountOwner::authenticated(
+        "other@example.invalid",
+        "com",
+        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"other-provider"}})).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        db.catalog_bootstrap_eligibility(wrong_owner, fixture.hint_request("next").await)
+            .await
+            .is_err()
+    );
+    for (column, changed, original) in [
+        ("mode", "future_mode".to_owned(), "catalog_v2".to_owned()),
+        ("scope", "catalog:v2:malformed".to_owned(), origin.scope()),
+        (
+            "scope",
+            CatalogOrigin::new(
+                origin.plan_digest.clone(),
+                uuid::Uuid::new_v4().to_string(),
+                origin.attempt.clone(),
+                origin.nonce.clone(),
+            )
+            .unwrap()
+            .scope(),
+            origin.scope(),
+        ),
+        (
+            "scope",
+            CatalogOrigin::new(
+                origin.plan_digest.clone(),
+                origin.epoch.clone(),
+                uuid::Uuid::new_v4().to_string(),
+                origin.nonce.clone(),
+            )
+            .unwrap()
+            .scope(),
+            origin.scope(),
+        ),
+        ("phase", "observing".to_owned(), "active".to_owned()),
+        ("enum_hash", "other-policy".to_owned(), "policy".to_owned()),
+    ] {
+        {
+            let conn = db.acquire_lock("change catalog hint evidence").unwrap();
+            conn.execute(
+                &format!("UPDATE source_revalidation_rounds SET {column}=?2 WHERE id=?1"),
+                rusqlite::params![origin.nonce, changed],
+            )
+            .unwrap();
+        }
+        assert!(
+            db.catalog_bootstrap_eligibility(owner(), fixture.hint_request("next").await)
+                .await
+                .is_err()
+        );
+        let conn = db.acquire_lock("restore catalog hint evidence").unwrap();
+        conn.execute(
+            &format!("UPDATE source_revalidation_rounds SET {column}=?2 WHERE id=?1"),
+            rusqlite::params![origin.nonce, original],
+        )
+        .unwrap();
+    }
+    let moved_nonce = uuid::Uuid::new_v4().to_string();
+    {
+        let conn = db.acquire_lock("remove linked round identity").unwrap();
+        conn.execute(
+            "UPDATE source_revalidation_rounds SET id=?2 WHERE id=?1",
+            rusqlite::params![origin.nonce, moved_nonce],
+        )
+        .unwrap();
+    }
+    assert!(
+        db.catalog_bootstrap_eligibility(owner(), fixture.hint_request("next").await)
+            .await
+            .is_err()
+    );
+    {
+        let conn = db.acquire_lock("restore linked round identity").unwrap();
+        conn.execute(
+            "UPDATE source_revalidation_rounds SET id=?1 WHERE id=?2",
+            rusqlite::params![origin.nonce, moved_nonce],
+        )
+        .unwrap();
+    }
+    let raw = db.get_metadata(PROOF).await.unwrap().unwrap();
+    {
+        let conn = db
+            .acquire_lock("remove descriptor for hint control")
+            .unwrap();
+        conn.execute("DELETE FROM metadata WHERE key=?1", [PROOF])
+            .unwrap();
+    }
+    assert!(
+        db.catalog_bootstrap_eligibility(owner(), fixture.hint_request("next").await)
+            .await
+            .is_err()
+    );
+    db.set_metadata(PROOF, "malformed descriptor")
+        .await
+        .unwrap();
+    assert!(
+        db.catalog_bootstrap_eligibility(owner(), fixture.hint_request("next").await)
+            .await
+            .is_err()
+    );
+    db.set_metadata(PROOF, &raw).await.unwrap();
+    assert_eq!(
+        db.catalog_bootstrap_eligibility(owner(), fixture.hint_request("next").await)
+            .await
+            .unwrap(),
+        CatalogBootstrapEligibility::CurrentLink
+    );
+}
+
+#[tokio::test]
+async fn catalog_bootstrap_hint_abandoned_link_and_stale_hint_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+    let db = &fixture.db;
+    let origin = fixture.install().await;
+    fixture.stage(&origin).await;
+    fixture.promote("staged").await;
+    {
+        let conn = db.acquire_lock("prepare abandoned hint").unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES(?1,'retained',31)",
+            [&origin.nonce],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE source_revalidation_rounds SET phase='abandoned' WHERE id=?1",
+            [&origin.nonce],
+        )
+        .unwrap();
+    }
+    let hint = fixture.hint_request("staged").await;
+    assert_eq!(
+        db.catalog_bootstrap_eligibility(owner(), hint.clone())
+            .await
+            .unwrap(),
+        CatalogBootstrapEligibility::AttemptBootstrap
+    );
+    let proof = ObservationProof::delivery(fixture.receipt.clone())
+        .delta("staged", "staged")
+        .unwrap()
+        .with_epoch_attempt(Some(fixture.attempt.clone()));
+    let checkpoint = transition(db, "staged").await;
+    let mut stale = hint.clone();
+    stale.fresh_cursor = "staged".into();
+    {
+        let conn = db
+            .acquire_lock("invalidate pre-stream catalog hint")
+            .unwrap();
+        conn.execute(
+            "UPDATE source_revalidation_rounds SET high_id='changed' WHERE id=?1",
+            [&origin.nonce],
+        )
+        .unwrap();
+    }
+    assert!(
+        db.install_catalog_origin_after_delta(owner(), stale, checkpoint.clone(), proof.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        db.get_metadata(TOKEN).await.unwrap().as_deref(),
+        Some("staged")
+    );
+    let request = fixture.hint_request("staged").await;
+    assert_eq!(
+        db.catalog_bootstrap_eligibility(owner(), request.clone())
+            .await
+            .unwrap(),
+        CatalogBootstrapEligibility::AttemptBootstrap
+    );
+    let new_origin = db
+        .install_catalog_origin_after_delta(owner(), request, checkpoint, proof)
+        .await
+        .unwrap();
+    assert_ne!(new_origin.nonce, origin.nonce);
+    let conn = db
+        .acquire_lock("verify abandoned hint debt retained")
+        .unwrap();
+    let debt: i64 = conn
+        .query_row(
+            "SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id='retained'",
+            [&origin.nonce],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(debt, 31);
 }
 
 async fn strict_deleted_pair(db: Arc<SqliteStateDb>) -> CatalogSettlementAuthority {

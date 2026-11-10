@@ -21,7 +21,7 @@ use crate::sync_cycle::{
 };
 use crate::sync_loop::test_support::{
     album_count_response, make_run_cycle_config, make_run_cycle_download_config_builder,
-    make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle,
+    make_run_cycle_library_state_with_passes,
 };
 
 use super::{MEDIA, ZONE, baseline_owner, pair, zone};
@@ -207,12 +207,27 @@ impl Fixture {
             &format!("{}/baseline", server.uri()),
             41,
         ));
-        let progress = Arc::new(pair(
+        let mut progress = pair(
             "op-progress",
             "progress.JPG",
             &format!("{}/progress", server.uri()),
             42,
-        ));
+        );
+        if !exact_one {
+            Mock::given(method("GET"))
+                .and(path("/healthy-peer"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+                .expect(1)
+                .mount(&server)
+                .await;
+            progress.extend(pair(
+                "op-healthy-peer",
+                "healthy-peer.JPG",
+                &format!("{}/healthy-peer", server.uri()),
+                44,
+            ));
+        }
+        let progress = Arc::new(progress);
         let mut hold_child = pair(
             "op-hold-child",
             "hold.JPG",
@@ -230,8 +245,25 @@ impl Fixture {
                 .await
                 .unwrap(),
         );
-        let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
-        let config = make_run_cycle_config();
+        // Keep the actual authenticated account lock for the life of the
+        // fixture, including the reopened cycle and final health observation.
+        let mut session = crate::auth::session::Session::new(
+            dir.path(),
+            "baseline@example.invalid",
+            "https://www.icloud.com",
+            None,
+        )
+        .await
+        .unwrap();
+        session
+            .bind_principal(
+                &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-baseline"}})).unwrap(),
+                None,
+            )
+            .unwrap();
+        let shared = Arc::new(tokio::sync::RwLock::new(session));
+        let mut config = make_run_cycle_config();
+        config.auth.username = "baseline@example.invalid".to_owned();
         let key = sync_token_key(ZONE);
         Some(Self {
             _dir: dir,
@@ -404,6 +436,57 @@ impl Fixture {
         let mut selected = make_run_cycle_library_state_with_passes(zone_name, key, vec![pass]);
         selected.library = library;
         selected
+    }
+
+    pub(super) async fn finish_mixed_tail(
+        &self,
+        result: &mut CycleResult,
+    ) -> Option<download::OperationalJournalGuards> {
+        self.finish_mixed_tail_with(result, |_| {}).await
+    }
+
+    pub(super) async fn finish_mixed_tail_with(
+        &self,
+        result: &mut CycleResult,
+        after_prepare: impl FnOnce(bool),
+    ) -> Option<download::OperationalJournalGuards> {
+        let shutdown = CancellationToken::new();
+        result
+            .prepare_operational_tail(&self.shared, &shutdown)
+            .await
+            .unwrap();
+        after_prepare(result.operational_tail_prepared());
+        let selected = self
+            .library_state(
+                Session {
+                    baseline: Arc::clone(&self.baseline),
+                    progress: Arc::clone(&self.progress),
+                    hold_child: Arc::clone(&self.hold_child),
+                    zone_name: ZONE.to_owned(),
+                    empty: false,
+                    cycle: 1,
+                    fail_inventory: false,
+                    provider_error: false,
+                    provider_errors: Arc::new(AtomicUsize::new(0)),
+                    changes: Arc::new(AtomicUsize::new(0)),
+                    inventory_queries: Arc::new(AtomicUsize::new(0)),
+                },
+                ZONE,
+                &self.key,
+            )
+            .await;
+        crate::sync_loop::runner::drain_source_revalidation(&[&selected], &shutdown)
+            .await
+            .unwrap();
+        result.revalidate_sparse_holds(Some(self.db.as_ref())).await;
+        result
+            .finish_operational_tail(&self.shared, &shutdown)
+            .await
+            .unwrap()
+    }
+
+    pub(super) async fn release_account_lock(&self) {
+        self.shared.read().await.release_lock().unwrap();
     }
 
     async fn run_two(&self, cycle: usize, provider_error: bool, peer_first: bool) -> CycleResult {

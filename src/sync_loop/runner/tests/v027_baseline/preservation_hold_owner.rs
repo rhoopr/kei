@@ -658,3 +658,30 @@ async fn preservation_owner_propagates_a_read_error() {
         .await;
     assert!(result.is_err(), "SQL/read errors must propagate StateError");
 }
+
+#[tokio::test]
+async fn preservation_owner_propagates_owner_epoch_and_scope_read_errors() {
+    for table in ["account_owner", "metadata", "download_receipts"] {
+        let fixture = fixture().await;
+        let (_, db, baseline_scope) = run_cycle_at(&fixture, 0, false).await;
+        let (epoch, attempt, scope, zone_name, owner, database) = identity(&db).await;
+        let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
+        conn.execute_batch(&format!("ALTER TABLE {table} RENAME TO hidden_{table}"))
+            .unwrap();
+        drop(conn);
+        let result = db
+            .preservation_hold_test(
+                ZONE,
+                baseline_owner(),
+                &epoch,
+                &attempt,
+                &scope,
+                &zone_name,
+                &owner,
+                &database,
+                &baseline_scope,
+            )
+            .await;
+        assert!(result.is_err(), "{table} read failure must propagate");
+    }
+}

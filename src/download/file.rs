@@ -156,6 +156,73 @@ pub(super) async fn has_replacement_journal(
     tokio::task::spawn_blocking(move || has_replacement_journal_blocking(&root, &target)).await?
 }
 
+/// Process-local guards retained until an operational observation is consumed.
+pub(crate) struct OperationalJournalGuards {
+    _guards: Vec<staging::StagingGuard>,
+}
+
+pub(crate) async fn guard_operational_journals(
+    paths: &[(std::path::PathBuf, std::path::PathBuf)],
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<Option<OperationalJournalGuards>> {
+    let mut lock_paths = std::collections::BTreeMap::new();
+    let mut journals = Vec::new();
+    for (root, path) in paths {
+        crate::fs_util::reserved_path_under_root(root, path)?;
+        let Some(name) = path.file_name() else {
+            return Ok(None);
+        };
+        let mut sidecar_name = name.to_os_string();
+        sidecar_name.push(".xmp");
+        let sidecar = path.with_file_name(sidecar_name);
+        for target in [path.clone(), sidecar] {
+            let key = staging::destination_key(&target)?;
+            lock_paths.entry(key).or_insert_with(|| target.clone());
+            journals.push((root.clone(), target));
+        }
+    }
+    let mut lock_paths: Vec<_> = lock_paths.into_values().collect();
+    // Match the layout owner's native-path acquisition order.
+    lock_paths.sort();
+    let mut guards = Vec::with_capacity(lock_paths.len());
+    for path in lock_paths {
+        guards.push(lock_download_destination(&path, shutdown).await?);
+    }
+    if !operational_journals_clear(&journals).await? {
+        return Ok(None);
+    }
+    Ok(Some(OperationalJournalGuards { _guards: guards }))
+}
+
+pub(crate) async fn operational_journals_clear(
+    journals: &[(std::path::PathBuf, std::path::PathBuf)],
+) -> anyhow::Result<bool> {
+    for (root, path) in journals {
+        if has_replacement_journal(root, path).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(crate) async fn operational_media_journals_clear(
+    paths: &[(std::path::PathBuf, std::path::PathBuf)],
+) -> anyhow::Result<bool> {
+    for (root, path) in paths {
+        let Some(name) = path.file_name() else {
+            return Ok(false);
+        };
+        let mut sidecar_name = name.to_os_string();
+        sidecar_name.push(".xmp");
+        for target in [path.clone(), path.with_file_name(sidecar_name)] {
+            if has_replacement_journal(root, &target).await? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// Same confined read for commit callbacks already running on a blocking worker.
 pub(super) fn has_replacement_journal_blocking(
     root: &std::path::Path,

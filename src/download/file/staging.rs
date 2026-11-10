@@ -52,6 +52,11 @@ pub(super) fn staging_path(path: &Path, checksum: &[u8], suffix: &str) -> anyhow
 }
 
 type DestinationKey = [u8; 32];
+
+pub(super) fn destination_key(path: &Path) -> anyhow::Result<DestinationKey> {
+    Ok(destination_digest(path)?.finalize().into())
+}
+
 type DestinationMutex = tokio::sync::Mutex<()>;
 type Registry = Mutex<HashMap<DestinationKey, Weak<DestinationMutex>>>;
 static DESTINATIONS: OnceLock<Registry> = OnceLock::new();
@@ -123,10 +128,7 @@ pub(in crate::download) async fn lock_download_destination(
     destination: &Path,
     shutdown: &CancellationToken,
 ) -> Result<StagingGuard, DownloadError> {
-    let key = destination_digest(destination)
-        .map_err(DownloadError::Other)?
-        .finalize()
-        .into();
+    let key = destination_key(destination).map_err(DownloadError::Other)?;
     // Create the pruning guard before constructing the waiting future. The
     // future drops its Arc before this guard cleans up on cancellation/abort.
     let mut guard = StagingGuard { key, guard: None };

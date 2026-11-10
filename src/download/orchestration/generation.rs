@@ -250,6 +250,48 @@ pub(crate) async fn context(
     Ok(Some(context))
 }
 
+/// Capture the exact source owner before dispatch without admitting work.
+pub(crate) async fn operational_prework(
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+    baseline_scope: &str,
+    epoch: &str,
+    attempt: &str,
+) -> Result<Option<OperationalPrework>> {
+    let Some(context) = context(passes, config, controls).await? else {
+        return Ok(None);
+    };
+    // Cross-source selectors require an independent prework and final census
+    // for each selected source. Do not treat a partial context as authority.
+    if !context.source_contexts.is_empty() {
+        return Ok(None);
+    }
+    let request = crate::state::db::provider_generations::operational_hold::SourceRequest {
+        owner: context.capture.owner.clone(),
+        specification: context.spec(config, context.config_hash.clone()),
+        baseline_scope: baseline_scope.to_owned(),
+        epoch: epoch.to_owned(),
+        attempt: attempt.to_owned(),
+        directory: config.directory.to_path_buf(),
+    };
+    let Some(prework) = context.capture.db.operational_prework(request).await? else {
+        return Ok(None);
+    };
+    Ok(Some(OperationalPrework {
+        db: Arc::clone(&context.capture.db),
+        owner: context.capture.owner.clone(),
+        prework,
+    }))
+}
+
+#[derive(Clone)]
+pub(crate) struct OperationalPrework {
+    pub(crate) db: Arc<crate::state::SqliteStateDb>,
+    pub(crate) owner: crate::state::db::account::AccountOwner,
+    pub(crate) prework: crate::state::db::provider_generations::operational_hold::SourcePrework,
+}
+
 /// Compare the exact current selector/source plans with an existing checkpoint.
 /// Constructing contexts here neither admits work nor grants coverage.
 pub(crate) async fn has_current_observation(
@@ -1413,6 +1455,99 @@ impl SelectionRun {
             }
         }
         Ok(())
+    }
+
+    /// Pair only actual typed failures with successors from the grouped owner.
+    /// If exact grouping refuses, retain the ordinary C backoff behavior without
+    /// crediting that group as health evidence.
+    pub(in crate::download) async fn record_media_failure_successors(
+        &self,
+        failures: &[crate::download::pipeline::MediaFailureTask],
+    ) -> Result<Option<Vec<crate::download::pipeline::AccountedMediaFailure>>> {
+        let mut keys = std::collections::HashSet::new();
+        if failures.iter().any(|failure| {
+            failure.captured.as_ref().is_none_or(|captured| {
+                !captured_failure_matches_task(captured, &failure.task)
+                    || !keys.insert(captured.task_key.clone())
+            })
+        }) {
+            self.record_media_failure_backoff(failures).await?;
+            return Ok(None);
+        }
+        let mut groups = std::collections::BTreeMap::new();
+        for failure in failures {
+            let Some(captured) = failure.captured.as_ref() else {
+                return Ok(None);
+            };
+            groups
+                .entry((
+                    captured.generation.clone(),
+                    captured.pass_key.clone(),
+                    captured.child.clone(),
+                ))
+                .or_insert_with(Vec::new)
+                .push(failure);
+        }
+        let mut complete = true;
+        let mut receipts = Vec::with_capacity(failures.len());
+        for group in groups.into_values() {
+            let captures: Vec<_> = group
+                .iter()
+                .filter_map(|failure| failure.captured.as_ref())
+                .map(
+                    |captured| crate::state::db::provider_generations::CapturedSelectionRetry {
+                        generation: captured.generation.clone(),
+                        specification_hash: captured.specification_hash.clone(),
+                        pass_key: captured.pass_key.clone(),
+                        child: captured.child.clone(),
+                        state_id: captured.state_id.clone(),
+                        manifest_hash: captured.manifest_hash.clone(),
+                        admission_hash: captured.admission_hash.clone(),
+                        destination: captured.destination.clone(),
+                    },
+                )
+                .collect();
+            let successors = self
+                .capture
+                .db
+                .defer_media_failure_successors(self.capture.owner.clone(), captures)
+                .await?;
+            let Some(successors) = successors else {
+                let fallback: Vec<_> = group.iter().map(|failure| (*failure).clone()).collect();
+                self.record_media_failure_backoff(&fallback).await?;
+                complete = false;
+                continue;
+            };
+            if successors.len() != group.len() {
+                complete = false;
+                continue;
+            }
+            for (failure, successor) in group.iter().zip(successors) {
+                let Some(captured) = failure.captured.as_ref() else {
+                    complete = false;
+                    continue;
+                };
+                let pre = &successor.captured;
+                if pre.generation != captured.generation
+                    || pre.specification_hash != captured.specification_hash
+                    || pre.pass_key != captured.pass_key
+                    || pre.child != captured.child
+                    || pre.state_id != captured.state_id
+                    || pre.manifest_hash != captured.manifest_hash
+                    || pre.admission_hash != captured.admission_hash
+                    || pre.destination != captured.destination
+                {
+                    complete = false;
+                    continue;
+                }
+                receipts.push(crate::download::pipeline::AccountedMediaFailure {
+                    cause: failure.cause,
+                    successor,
+                    task_key: captured.task_key.clone(),
+                });
+            }
+        }
+        Ok(complete.then_some(receipts))
     }
 
     /// Capture only failed tasks' original selected provenance. This transient

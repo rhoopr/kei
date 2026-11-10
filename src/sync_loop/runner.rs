@@ -1060,6 +1060,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 Some(&all_library_states),
             ))
             .await?;
+            cycle_result
+                .prepare_operational_tail(&shared_session, &shutdown_token)
+                .await?;
             // Drain tagged rewrites now so the one-shot --refresh-metadata repair finishes in this run.
             let refresh_tail = if config.runtime.refresh_metadata {
                 if let Some(db) = state_db.as_deref() {
@@ -1132,6 +1135,16 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             cycle_result
                 .revalidate_sparse_holds(state_db.as_deref())
                 .await;
+            let _operational_journal_guards = if refresh_tail.new_failures == 0
+                && refresh_tail.witnessed_blocked == 0
+                && !shutdown_token.is_cancelled()
+            {
+                cycle_result
+                    .finish_operational_tail(&shared_session, &shutdown_token)
+                    .await?
+            } else {
+                None
+            };
             super::reporting::record_cycle_run(
                 state_db.as_deref(),
                 &cycle_result,
@@ -1165,6 +1178,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     ),
                 )
                 .await;
+            drop(_operational_journal_guards);
 
             next_watch_interval = if cycle_result.has_selected_holds() {
                 metadata_capture_watch_interval_for_cycle(

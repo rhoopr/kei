@@ -213,6 +213,11 @@ pub(crate) struct InventoryMeasurement {
 #[derive(Debug, Default)]
 #[must_use]
 pub(crate) struct CheckpointEvidence {
+    /// Exact transient transfer causes paired with their committed successors.
+    /// This is not provider-checkpoint authority.
+    pub(crate) media_failures: Vec<crate::download::pipeline::AccountedMediaFailure>,
+    /// A failed task did not receive an exact positive successor in this result.
+    pub(crate) media_failure_unaccounted: bool,
     /// Scan-issued proof; generic statistics/retry composition never promotes it.
     pub(crate) observation:
         Option<crate::state::db::provider_generations::observation::ObservationProof>,
@@ -251,6 +256,7 @@ impl CheckpointEvidence {
     /// from its report. Full enumeration supplies pipeline evidence directly.
     fn from_execution_stats(stats: &SyncStats) -> Self {
         Self {
+            media_failure_unaccounted: stats.failed > 0,
             state_write_failures: stats.state_write_failures,
             enumeration_errors: stats.enumeration_errors,
             enumeration_incomplete: stats.enumeration_incomplete,
@@ -262,6 +268,9 @@ impl CheckpointEvidence {
     }
 
     fn accumulate(&mut self, other: &Self) {
+        self.media_failures
+            .extend(other.media_failures.iter().cloned());
+        self.media_failure_unaccounted |= other.media_failure_unaccounted;
         // Additional work may veto the original query proof, but cannot create it.
         self.bounded_path_selection_complete &= !other.sync_token_blocked
             && !other.enumeration_incomplete

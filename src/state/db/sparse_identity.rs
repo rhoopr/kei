@@ -693,7 +693,7 @@ fn baseline_scope_hash(scope: &str) -> Option<String> {
     dead_code,
     reason = "owner read is consumed by the L1 cycle health seam patch"
 )]
-fn attest_current_sparse(
+pub(super) fn attest_current_sparse(
     conn: &Connection,
     witness: &SparseCurrentWitness,
 ) -> Result<(), SparseAttestationRefusal> {

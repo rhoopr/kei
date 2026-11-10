@@ -29,6 +29,9 @@ pub(crate) use filter::{AssetGroupings, determine_media_type};
 
 mod orchestration;
 
+pub(crate) use file::{
+    OperationalJournalGuards, guard_operational_journals, operational_media_journals_clear,
+};
 pub(crate) use orchestration::config::{
     DOWNLOAD_CONFIG_HASH_KEY, DownloadConfig, InventoryScope, compute_config_hash,
     compute_config_hash_for_unfiled, hash_download_config, hash_legacy_download_config,
@@ -52,7 +55,8 @@ pub(crate) use orchestration::generation::{
     catalog_plan_digest_from_source_context,
 };
 pub(crate) use orchestration::generation::{
-    has_current_observation, has_due as has_due_selection_work,
+    OperationalPrework, has_current_observation, has_due as has_due_selection_work,
+    operational_prework,
 };
 pub(crate) use orchestration::maintenance::{
     RefreshTailOutcome, drain_pending_metadata_rewrites, drain_pending_metadata_rewrites_witnessed,

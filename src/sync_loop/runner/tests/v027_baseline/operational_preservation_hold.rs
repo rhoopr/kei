@@ -19,7 +19,7 @@ use crate::state::db::LegacyFileEvidence;
 use crate::sync_cycle::{CycleResult, LibraryHoldKind, run_cycle, sync_token_key};
 use crate::sync_loop::test_support::{
     album_count_response, make_run_cycle_config, make_run_cycle_download_config_builder,
-    make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle,
+    make_run_cycle_library_state_with_passes,
 };
 
 const OLD: &str = "old-preservation-master";
@@ -103,7 +103,13 @@ async fn cycle(
     shared: &crate::auth::session::SharedSession,
     baseline: &Arc<Vec<Value>>,
     number: usize,
-) -> (CycleResult, String, String, Vec<String>) {
+) -> (
+    CycleResult,
+    String,
+    String,
+    Vec<String>,
+    Option<download::OperationalJournalGuards>,
+) {
     let changes = Arc::new(Mutex::new(Vec::new()));
     let mut library = PhotoLibrary::new(
         "https://synthetic.example/database/1/photos/production/private".into(),
@@ -143,9 +149,11 @@ async fn cycle(
         }
         Arc::new(config)
     };
-    let result = run_cycle(
+    let mut config = make_run_cycle_config();
+    config.auth.username = "baseline@example.invalid".to_owned();
+    let mut result = run_cycle(
         &[&state],
-        &make_run_cycle_config(),
+        &config,
         Some(db.as_ref()),
         false,
         &builder,
@@ -155,8 +163,21 @@ async fn cycle(
     )
     .await
     .unwrap();
+    let shutdown = CancellationToken::new();
+    result
+        .prepare_operational_tail(shared, &shutdown)
+        .await
+        .unwrap();
+    crate::sync_loop::runner::drain_source_revalidation(&[&state], &shutdown)
+        .await
+        .unwrap();
+    result.revalidate_sparse_holds(Some(db.as_ref())).await;
+    let guards = result
+        .finish_operational_tail(shared, &shutdown)
+        .await
+        .unwrap();
     let cursors = changes.lock().unwrap().clone();
-    (result, scope, baseline_scope, cursors)
+    (result, scope, baseline_scope, cursors, guards)
 }
 
 fn retained_snapshot(db: &SqliteStateDb) -> Vec<(&'static str, Vec<Vec<rusqlite::types::Value>>)> {
@@ -186,6 +207,7 @@ fn retained_snapshot(db: &SqliteStateDb) -> Vec<(&'static str, Vec<Vec<rusqlite:
 async fn retain_legacy(
     db: &SqliteStateDb,
     root: &Path,
+    blocked_metadata: bool,
 ) -> Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> {
     let media = root.join("protected-old.JPG");
     let sidecar = root.join("protected-old.JPG.xmp");
@@ -241,6 +263,11 @@ async fn retain_legacy(
             .await
             .unwrap()
     );
+    if blocked_metadata {
+        db.record_metadata_write_failure(ZONE, OLD, "original")
+            .await
+            .unwrap();
+    }
     let snapshot = db
         .legacy_preparation_snapshots(ZONE, 64)
         .await
@@ -297,7 +324,7 @@ async fn owner_read(
     clippy::print_stdout,
     reason = "bounded synthetic reachability facts are test evidence"
 )]
-async fn scenario() -> Option<(crate::health::HealthStatus, Value)> {
+async fn scenario(blocked_metadata: bool) -> Option<(crate::health::HealthStatus, Value)> {
     let server =
         crate::test_helpers::start_wiremock_or_skip("operational_preservation_hold").await?;
     Mock::given(method("GET"))
@@ -327,8 +354,23 @@ async fn scenario() -> Option<(crate::health::HealthStatus, Value)> {
         &format!("{}/current", server.uri()),
         41,
     ));
-    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
-    let (initial, scope, baseline_scope, cursors) = cycle(&db, &root, &shared, &baseline, 0).await;
+    let mut session = crate::auth::session::Session::new(
+        dir.path(),
+        "baseline@example.invalid",
+        "https://www.icloud.com",
+        None,
+    )
+    .await
+    .unwrap();
+    session
+        .bind_principal(
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-baseline"}})).unwrap(),
+            None,
+        )
+        .unwrap();
+    let shared = Arc::new(tokio::sync::RwLock::new(session));
+    let (initial, scope, baseline_scope, cursors, initial_guards) =
+        cycle(&db, &root, &shared, &baseline, 0).await;
     assert_eq!(initial.stats.downloaded, 1, "{initial:?}");
     assert_eq!(initial.failed_count, 0);
     assert!(initial.can_advance_database_checkpoint());
@@ -348,11 +390,18 @@ async fn scenario() -> Option<(crate::health::HealthStatus, Value)> {
             .as_deref(),
         Some(scope.as_str())
     );
-    let files = retain_legacy(&db, &root).await;
+    let files = retain_legacy(&db, &root, blocked_metadata).await;
     let retained = retained_snapshot(&db);
     assert_eq!(retained[0].1.len(), 1);
     assert_eq!(retained[1].1.len(), 2);
     assert!(retained[2].1.is_empty());
+    assert!(
+        retained
+            .iter()
+            .find(|(name, _)| *name == "retries")
+            .is_some_and(|(_, rows)| !rows.is_empty()),
+        "preserved legacy retry evidence must remain present"
+    );
     {
         let conn = db
             .acquire_lock("no fabricated current legacy proof")
@@ -362,7 +411,7 @@ async fn scenario() -> Option<(crate::health::HealthStatus, Value)> {
     }
     owner_read(&db, &scope, &baseline_scope, &epoch, &before_epoch.attempt).await;
 
-    let (held, actual_scope, actual_baseline, cursors) =
+    let (held, actual_scope, actual_baseline, cursors, held_guards) =
         cycle(&db, &root, &shared, &baseline, 1).await;
     assert_eq!(actual_scope, scope);
     assert_eq!(actual_baseline, baseline_scope);
@@ -381,6 +430,11 @@ async fn scenario() -> Option<(crate::health::HealthStatus, Value)> {
         held.sources[0].reached && !held.sources[0].genuine_error,
         "{:?}",
         held.sources[0]
+    );
+    assert_eq!(
+        held.sources[0].operational_prework.is_some(),
+        !blocked_metadata,
+        "prework must distinguish retained preservation evidence from pending metadata failure"
     );
     assert_eq!(held.sources[0].baseline_scope, baseline_scope);
     assert!(
@@ -438,13 +492,17 @@ async fn scenario() -> Option<(crate::health::HealthStatus, Value)> {
         held.operational_safe_holds
     );
     drop(reporter);
+    drop(held_guards);
+    drop(initial_guards);
+    drop(held);
+    drop(initial);
     drop(db);
     let reopened = Arc::new(
         SqliteStateDb::open_owned(&database, &baseline_owner())
             .await
             .unwrap(),
     );
-    let (quiet, quiet_scope, quiet_baseline, cursors) =
+    let (quiet, quiet_scope, quiet_baseline, cursors, _quiet_guards) =
         cycle(&reopened, &root, &shared, &baseline, 2).await;
     assert_eq!(cursors, ["preservation-after-1"]);
     assert_eq!(quiet.stats.downloaded, 0, "{quiet:?}");
@@ -498,18 +556,26 @@ async fn scenario() -> Option<(crate::health::HealthStatus, Value)> {
 
 #[tokio::test]
 async fn normal_cycle_reports_preservation_hold_and_owner_accounts_after_reopen() {
-    let _ = Box::pin(scenario()).await;
+    let _ = Box::pin(scenario(false)).await;
 }
 
 #[tokio::test]
-#[ignore = "preservation hold operational health composition is not implemented"]
 async fn accounted_preservation_hold_should_advance_operational_health() {
-    let Some((health, report)) = Box::pin(scenario()).await else {
-        return;
-    };
+    let (health, report) = Box::pin(scenario(false))
+        .await
+        .expect("preservation operational fixture must execute");
     assert_eq!(report["status"], "partial_failure");
     assert!(
         health.last_success_at.is_some(),
         "desired preservation health requires a future owner composition"
     );
+}
+
+#[tokio::test]
+async fn protected_pending_metadata_refuses_operational_health() {
+    let (health, report) = Box::pin(scenario(true))
+        .await
+        .expect("protected metadata fixture must execute");
+    assert_eq!(report["status"], "partial_failure");
+    assert!(health.last_success_at.is_none());
 }

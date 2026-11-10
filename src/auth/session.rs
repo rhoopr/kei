@@ -762,6 +762,48 @@ impl Session {
         self.principal.as_deref()
     }
 
+    /// Confirm that this live session still holds the authenticated owner's
+    /// existing account lock. The cycle must join its work and must not release
+    /// or reschedule that session before consuming the observation.
+    pub(crate) async fn operational_owner_matches(
+        &self,
+        owner: &crate::state::db::account::AccountOwner,
+    ) -> bool {
+        let Ok((key, provider)) = owner.authenticated_keys() else {
+            return false;
+        };
+        if !self.state_guard.locked.load(Ordering::Acquire)
+            || self.sanitized_username != key
+            || self.principal.as_deref() != Some(provider)
+        {
+            return false;
+        }
+        let Ok(file) = self.state_guard.lock_file.try_clone() else {
+            return false;
+        };
+        let path = self
+            .cookie_dir
+            .join(format!("{}.lock", self.sanitized_username));
+        let same_lock = tokio::task::spawn_blocking(move || {
+            let (Ok(held), Ok(named)) = (file.metadata(), std::fs::metadata(path)) else {
+                return false;
+            };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                held.dev() == named.dev() && held.ino() == named.ino()
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (held, named);
+                false
+            }
+        })
+        .await
+        .unwrap_or(false);
+        same_lock && self.state_guard.locked.load(Ordering::Acquire)
+    }
+
     pub(crate) fn cookiejar_path(&self) -> PathBuf {
         self.cookie_dir.join(&self.sanitized_username)
     }

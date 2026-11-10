@@ -691,6 +691,75 @@ fn required_catalog_error() -> StateError {
     }
 }
 
+fn descriptor_own_source(descriptor: &Descriptor) -> Result<bool, StateError> {
+    let selector = descriptor
+        .plans
+        .first()
+        .and_then(Plan::selector)
+        .ok_or_else(required_catalog_error)?;
+    let selector = serde_json::to_string(&selector).map_err(|_invalid| required_catalog_error())?;
+    let projection = crate::icloud::photos::PhotoLibrary::provider_scope_projection(&selector)
+        .ok_or_else(required_catalog_error)?;
+    Ok(projection.0 == descriptor.library
+        && descriptor.plans.iter().all(|plan| {
+            crate::icloud::photos::PhotoLibrary::provider_scope_projection(&plan.scope).as_ref()
+                == Some(&projection)
+        }))
+}
+
+pub(in crate::state::db) fn catalog_bootstrap_eligibility(
+    conn: &Connection,
+    library: &str,
+    token: &str,
+    expected_plan: &str,
+    enum_hash: &str,
+) -> Result<super::super::source_revalidation::CatalogBootstrapEligibility, StateError> {
+    use super::super::source_revalidation::{
+        CATALOG_MODE, CatalogBootstrapEligibility, CatalogOrigin,
+    };
+    if token.trim().is_empty()
+        || metadata(conn, &format!("sync_token:v27:{library}"))?.as_deref() != Some(token)
+    {
+        return Err(required_catalog_error());
+    }
+    let saved =
+        valid(conn, &format!("{ACTIVE}{library}"), token)?.ok_or_else(required_catalog_error)?;
+    let raw = serde_json::to_string(&saved).map_err(|_invalid| required_catalog_error())?;
+    if saved.library != library
+        || saved.policy[0].as_deref() != Some(enum_hash)
+        || catalog_plan_digest_from_observation(&raw, library).as_deref() != Some(expected_plan)
+        || !descriptor_own_source(&saved)?
+    {
+        return Err(required_catalog_error());
+    }
+    let Some(round) = &saved.revalidation_round else {
+        return Ok(CatalogBootstrapEligibility::AttemptBootstrap);
+    };
+    let row: Option<(String, String, String, String)> = conn.query_row(
+        "SELECT mode,scope,phase,enum_hash FROM source_revalidation_rounds WHERE id=?1 AND library=?2",
+        params![round, library], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    ).optional()?;
+    let (mode, scope, phase, round_enum) = row.ok_or_else(required_catalog_error)?;
+    let origin = CatalogOrigin::parse(&scope).map_err(|_invalid| required_catalog_error())?;
+    let current = sync_epoch::read_library(conn, library)?.ok_or_else(required_catalog_error)?;
+    if mode != CATALOG_MODE
+        || origin.nonce != *round
+        || origin.plan_digest != expected_plan
+        || round_enum != enum_hash
+        || origin.epoch != current.epoch
+        || origin.attempt != current.attempt
+    {
+        return Err(required_catalog_error());
+    }
+    if catalog_origin_current(conn, library, &origin, enum_hash)? {
+        return Ok(CatalogBootstrapEligibility::CurrentLink);
+    }
+    if phase == "abandoned" {
+        return Ok(CatalogBootstrapEligibility::AttemptBootstrap);
+    }
+    Err(required_catalog_error())
+}
+
 /// The expected descriptor is kept in memory so an empty preparation or an
 /// equal-token write cannot masquerade as an observed delta.
 pub(in crate::state::db) struct RequiredCatalogDelta {
@@ -783,20 +852,7 @@ pub(in crate::state::db) fn require_catalog_delta(
     {
         return Err(required_catalog_error());
     }
-    let selector = descriptor
-        .plans
-        .first()
-        .and_then(Plan::selector)
-        .ok_or_else(required_catalog_error)?;
-    let selector = serde_json::to_string(&selector).map_err(|_invalid| required_catalog_error())?;
-    let projection = crate::icloud::photos::PhotoLibrary::provider_scope_projection(&selector)
-        .ok_or_else(required_catalog_error)?;
-    if projection.0 != library
-        || descriptor.plans.iter().any(|plan| {
-            crate::icloud::photos::PhotoLibrary::provider_scope_projection(&plan.scope).as_ref()
-                != Some(&projection)
-        })
-    {
+    if !descriptor_own_source(descriptor)? {
         return Err(required_catalog_error());
     }
     Ok(RequiredCatalogDelta {
@@ -838,22 +894,7 @@ fn validate_required_catalog_row(
     let epoch = sync_epoch::validate(conn)?;
     let record =
         sync_epoch::read_library(conn, &descriptor.library)?.ok_or_else(required_catalog_error)?;
-    let selector = descriptor
-        .plans
-        .first()
-        .and_then(Plan::selector)
-        .ok_or_else(required_catalog_error)?;
-    let selector_scope =
-        serde_json::to_string(&selector).map_err(|_invalid| required_catalog_error())?;
-    let selector_projection =
-        crate::icloud::photos::PhotoLibrary::provider_scope_projection(&selector_scope)
-            .ok_or_else(required_catalog_error)?;
-    if selector_projection.0 != descriptor.library
-        || descriptor.plans.iter().any(|plan| {
-            crate::icloud::photos::PhotoLibrary::provider_scope_projection(&plan.scope).as_ref()
-                != Some(&selector_projection)
-        })
-    {
+    if !descriptor_own_source(descriptor)? {
         return Err(required_catalog_error());
     }
     if epoch.epoch != origin.epoch

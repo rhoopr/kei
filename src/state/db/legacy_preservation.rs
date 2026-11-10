@@ -805,6 +805,7 @@ pub(crate) struct PreservationHoldProof {
     library: String,
     rows: u64,
     paths: u64,
+    pub(crate) protected_paths: Vec<(PathBuf, PathBuf)>,
 }
 
 impl std::fmt::Debug for PreservationHoldProof {
@@ -839,14 +840,18 @@ pub(crate) fn preservation_hold_snapshot(
             PreservationHoldRefusal::ScopeMissing,
         ));
     }
-    if super::account::validate_authenticated(conn, &request.expected_owner).is_err() {
-        return Ok(PreservationHoldOutcome::Refused(
-            PreservationHoldRefusal::OwnerMismatch,
-        ));
+    match super::account::validate_authenticated(conn, &request.expected_owner) {
+        Ok(()) => {}
+        Err(StateError::AccountOwnerMismatch | StateError::AccountIdentityUnavailable) => {
+            return Ok(PreservationHoldOutcome::Refused(
+                PreservationHoldRefusal::OwnerMismatch,
+            ));
+        }
+        Err(error) => return Err(error),
     }
-    let epoch = match super::sync_epoch::validate_if_present(conn) {
-        Ok(Some(epoch)) => epoch,
-        Ok(None) | Err(_) => {
+    let epoch = match super::sync_epoch::validate_if_present(conn)? {
+        Some(epoch) => epoch,
+        None => {
             return Ok(PreservationHoldOutcome::Refused(
                 PreservationHoldRefusal::EpochUnavailable,
             ));
@@ -857,9 +862,9 @@ pub(crate) fn preservation_hold_snapshot(
             PreservationHoldRefusal::EpochChanged,
         ));
     }
-    let record = match super::sync_epoch::read_library(conn, &request.library) {
-        Ok(Some(record)) => record,
-        Ok(None) | Err(_) => {
+    let record = match super::sync_epoch::read_library(conn, &request.library)? {
+        Some(record) => record,
+        None => {
             return Ok(PreservationHoldOutcome::Refused(
                 PreservationHoldRefusal::EpochUnavailable,
             ));
@@ -901,12 +906,14 @@ pub(crate) fn preservation_hold_snapshot(
             PreservationHoldRefusal::ScopeProjectionMismatch,
         ));
     }
-    if super::provider_generations::guard_library_scope(conn, &request.scope, &request.library)
-        .is_err()
-    {
-        return Ok(PreservationHoldOutcome::Refused(
-            PreservationHoldRefusal::ScopeUnauthenticated,
-        ));
+    match super::provider_generations::guard_library_scope(conn, &request.scope, &request.library) {
+        Ok(()) => {}
+        Err(StateError::ProviderWorkConflict) => {
+            return Ok(PreservationHoldOutcome::Refused(
+                PreservationHoldRefusal::ScopeUnauthenticated,
+            ));
+        }
+        Err(error) => return Err(error),
     }
     #[cfg(test)]
     if let Some(hook) = PRESERVATION_INTERLEAVE
@@ -924,6 +931,7 @@ pub(crate) fn preservation_hold_snapshot(
     let mut rows = stmt.query([request.library.as_str()])?;
     let mut total_rows = 0u64;
     let mut total_paths = 0u64;
+    let mut protected_paths = Vec::new();
     while let Some(row) = rows.next()? {
         total_rows = total_rows.saturating_add(1);
         let asset_id: String = row.get(0)?;
@@ -1035,6 +1043,7 @@ pub(crate) fn preservation_hold_snapshot(
                 ));
             }
             total_paths = total_paths.saturating_add(1);
+            protected_paths.push((file.root.clone(), file.path.clone()));
         }
         if let Some(generation) = active_generation {
             let version: Option<i64> = conn
@@ -1069,6 +1078,7 @@ pub(crate) fn preservation_hold_snapshot(
         library: request.library.clone(),
         rows: total_rows,
         paths: total_paths,
+        protected_paths,
     }))
 }
 

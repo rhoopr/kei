@@ -161,6 +161,7 @@ match their headings, so searching a label finds the section.
 | Durable layout journals | `src/state/db/primary_layout.rs` | Stores preservation-backed layout bindings, operations, members, path claims, and immutable historical receipts. |
 | Prior publication recovery | `src/state/db/pending_publication.rs` | Recovers a rendition's unchanged prior current publication and retains conditional recovery evidence. |
 | Legacy preservation evidence | `src/state/db/legacy_preservation.rs` | Stores immutable legacy evidence and generation-fenced current-coverage receipts. It never assigns identity, writes files, or infers provider completion. |
+| Held-work health evidence | `src/state/db/provider_generations/operational_hold.rs`, `src/sync_cycle.rs`, `src/sync_loop/runner.rs` | Accounts for eligible source holds and rechecks their owners and journals before reporting health. It does not authorize checkpoints. |
 | State reports | `src/state/db/reports.rs` | Reads status, verification and manifest data, and records sync-run history. |
 | Import-existing | `src/commands/import.rs` | Matches existing files to expected iCloud paths and adopts verified files into state. |
 | Service integration | `src/service/` | Owns status, service execution, and the Windows SCM runtime adapter. Host supervisors own registration. |
@@ -991,6 +992,8 @@ sync_loop::run_sync
   -> sync_cycle source checkpoint decision
   -> cycle reporting and watch control
 ```
+
+For eligible mixed transfer failures or preservation holds, the pipeline pairs each actual final transfer failure with its exact committed successor; a retained future owner must have been captured before dispatch. The state owner rechecks source, epoch, destination, sparse, preservation and pending-work evidence in a deferred snapshot. After the cycle and its tails join, the runner rechecks recorded media and sidecar journals under process-local destination guards before reporting health. The account session lock remains held. These checks do not make SQLite and the filesystem atomic or create a root lease. Partial reports and one-shot exit status remain unchanged.
 
 Photo readiness is explicit provider evidence. `PhotoLibrary` accepts `FINISHED`
 or `RUNNING`; missing and unknown states fail closed. Sync checks readiness before
@@ -2112,6 +2115,11 @@ requires the new descriptor to be stored. An empty delta may return the same
 cursor. The new origin starts in marking; a later full inventory and bridge
 must prove it before activation. A cross-zone resource selection does not authorize attaching
 that resource's origin to the selecting owner's checkpoint.
+
+Before the stream, an authenticated state read can distinguish a current
+catalog link from a missing or known abandoned link. It checks the current
+source, plan, token, epoch and fences. This is a hint only: the checkpoint
+transaction rechecks the completed stream and current state.
 
 When the epoch gate claims a due pending attempt or a stale READY attempt, a
 qualified marking or observing catalog round can transfer its boundary, census
