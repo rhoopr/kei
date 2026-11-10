@@ -447,6 +447,56 @@ async fn catalog_required_origin_rolls_back_checkpoint_on_mismatch_and_sql_fault
     );
 }
 
+#[tokio::test]
+async fn catalog_optional_stale_carried_link_does_not_block_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+    let origin = fixture.install().await;
+    fixture.stage(&origin).await;
+    fixture.promote("staged").await;
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("stale carried catalog link")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES(?1,'retained',42)",
+            [&origin.nonce],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE source_revalidation_rounds SET phase='abandoned' WHERE id=?1",
+            [&origin.nonce],
+        )
+        .unwrap();
+    }
+    let delta = ObservationProof::delivery(fixture.receipt.clone())
+        .delta("staged", "later")
+        .unwrap();
+    fixture
+        .db
+        .commit_observation_transition(transition(&fixture.db, "later").await, Some(delta), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.db.get_metadata(TOKEN).await.unwrap().as_deref(),
+        Some("later")
+    );
+    let descriptor: Value =
+        serde_json::from_str(&fixture.db.get_metadata(PROOF).await.unwrap().unwrap()).unwrap();
+    assert!(
+        descriptor
+            .get("revalidation_round")
+            .is_none_or(Value::is_null)
+    );
+    let conn = fixture
+        .db
+        .acquire_lock("verify stale carried debt")
+        .unwrap();
+    let row: (String, i64) = conn.query_row("SELECT r.phase,d.next_retry_at FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1 AND d.id='retained'", [&origin.nonce], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(row, ("abandoned".into(), 42));
+}
+
 async fn strict_deleted_pair(db: Arc<SqliteStateDb>) -> CatalogSettlementAuthority {
     use crate::icloud::photos::{
         PhotoAlbum, PhotoAlbumConfig, ProviderRecordId, StrictCatalogPairResult,
