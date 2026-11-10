@@ -2484,6 +2484,7 @@ async fn run_full_enumeration_metadata_cycle(
                 skip_authority: crate::sync_cycle::SkipAuthority::Reached,
             })
             .collect::<Vec<_>>(),
+        None,
     ))
     .await
     .expect("run cycle");
@@ -2732,6 +2733,7 @@ async fn runner_outer_witness_keeps_source_revalidation_closed_for_blocked_debt(
             active_passes: !lib_state.plan.passes.is_empty(),
             skip_authority: crate::sync_cycle::SkipAuthority::Reached,
         }],
+        None,
     )
     .await
     .expect("run witnessed cycle");
@@ -6305,6 +6307,7 @@ async fn run_full_enumeration_metadata_cycle_authenticated(
             active_passes: !lib_state.plan.passes.is_empty(),
             skip_authority: crate::sync_cycle::SkipAuthority::Reached,
         }],
+        None,
     ))
     .await
     .expect("authenticated witnessed run cycle");

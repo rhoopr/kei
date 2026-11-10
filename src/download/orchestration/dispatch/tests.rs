@@ -22,7 +22,10 @@ use super::super::test_support::{
     incremental_test_config, mock_album, seed_complete_album_snapshot, test_config,
     unused_unfiled_changes_pass,
 };
-use super::{IncrementalErrorClass, classify_incremental_error, download_photos_with_sync};
+use super::{
+    FreshBaselineRequired, IncrementalErrorClass, classify_incremental_error,
+    download_photos_with_sync,
+};
 
 fn reqwest_status_error(status: u16) -> anyhow::Error {
     let response = http::Response::builder()
@@ -744,6 +747,129 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
             assert!(result.stats.sync_token_blocked);
             assert_eq!(result.sync_token, None);
             assert_eq!(query_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn deferred_fallback_returns_typed_handoff_before_replacement_query() {
+    #[derive(Clone)]
+    struct RejectedSession {
+        code: &'static str,
+        changes: Arc<AtomicUsize>,
+        queries: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for RejectedSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/changes/zone?") {
+                self.changes.fetch_add(1, Ordering::SeqCst);
+                return Ok(json!({"zones": [{
+                    "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                    "serverErrorCode": self.code
+                }]}));
+            }
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"records": [], "syncToken": "query-token"}))
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    for (code, expected) in [
+        ("BAD_REQUEST", FreshBaselineRequired::RejectedToken),
+        ("UNEXPECTED", FreshBaselineRequired::StaticFallback),
+    ] {
+        for selected in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let changes = Arc::new(AtomicUsize::new(0));
+            let queries = Arc::new(AtomicUsize::new(0));
+            let session = RejectedSession {
+                code,
+                changes: Arc::clone(&changes),
+                queries: Arc::clone(&queries),
+            };
+            let mut config = incremental_test_config(&directory);
+            let album = if selected {
+                let owner = crate::state::db::account::AccountOwner::authenticated(
+                    "dispatch@example.invalid",
+                    "com",
+                    &serde_json::from_value(json!({"dsInfo":{"dsid":"dispatch-provider"}}))
+                        .unwrap(),
+                )
+                .unwrap();
+                let db = Arc::new(
+                    SqliteStateDb::open_owned(&directory.path().join("state.db"), &owner)
+                        .await
+                        .unwrap(),
+                );
+                let mut album = crate::icloud::photos::PhotoAlbum::new(
+                    crate::icloud::photos::PhotoAlbumConfig {
+                        params: Arc::default(),
+                        service_endpoint: Arc::from("https://example.invalid"),
+                        name: Arc::from(""),
+                        list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                        obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                        query_filter: None,
+                        page_size: 100,
+                        zone_id: Arc::new(
+                            json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                        ),
+                        retry_config: crate::retry::RetryConfig::default(),
+                        container_id: None,
+                        cross_zone_sources: Vec::new(),
+                    },
+                    Box::new(session),
+                );
+                album.set_shadow_capture(
+                    crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner, "com"),
+                    Arc::from("private"),
+                );
+                config.state_db = Some(db);
+                album
+            } else {
+                changes_album("", session)
+            };
+            let passes = vec![AlbumPass {
+                kind: PassKind::Unfiled,
+                album,
+                exclude_ids: Arc::new(FxHashSet::default()),
+            }];
+            assert_eq!(
+                super::super::generation::context(
+                    &passes,
+                    &config,
+                    DownloadControls::download_hidden()
+                )
+                .await
+                .unwrap()
+                .is_some(),
+                selected,
+                "exercise both selected and legacy dispatch"
+            );
+            let mut controls = DownloadControls::download_hidden();
+            controls.defer_fallback_to_cycle = true;
+            let error = download_photos_with_sync(
+                &Client::new(),
+                &passes,
+                Arc::new(config),
+                controls,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("rejected delta must hand off before replacement inventory");
+            assert_eq!(
+                error.downcast_ref::<FreshBaselineRequired>(),
+                Some(&expected)
+            );
+            assert_eq!(changes.load(Ordering::SeqCst), 1);
+            assert_eq!(queries.load(Ordering::SeqCst), 0);
         }
     }
 }

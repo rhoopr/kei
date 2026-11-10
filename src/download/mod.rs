@@ -36,6 +36,7 @@ pub(crate) use orchestration::config::{
 };
 pub(crate) use orchestration::context::{ClaimedLegacyMasterStates, DownloadContext};
 use orchestration::context::{RecordedLocalFile, preload_download_context};
+pub(crate) use orchestration::dispatch::FreshBaselineRequired;
 pub use orchestration::dispatch::download_photos_with_sync;
 #[allow(
     unused_imports,

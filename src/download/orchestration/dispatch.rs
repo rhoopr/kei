@@ -37,6 +37,23 @@ enum IncrementalErrorClass {
     CaptureRefused,
 }
 
+/// The cycle must establish a fresh source boundary before replacement inventory.
+/// This contains no provider error text or cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum FreshBaselineRequired {
+    #[error("rejected incremental token requires a fresh baseline")]
+    RejectedToken,
+    #[error("incremental fallback requires a fresh baseline")]
+    StaticFallback,
+}
+
+fn fresh_baseline_required(class: IncrementalErrorClass) -> FreshBaselineRequired {
+    match class {
+        IncrementalErrorClass::TokenFallback => FreshBaselineRequired::RejectedToken,
+        _ => FreshBaselineRequired::StaticFallback,
+    }
+}
+
 /// Classify incremental-enumeration failures before deciding whether to fall
 /// back to a full records/query pass.
 ///
@@ -513,6 +530,9 @@ async fn download_photos_with_sync_inner(
                 Err(error) => match classify_selection_incremental_error(&error) {
                     class @ (IncrementalErrorClass::TokenFallback
                     | IncrementalErrorClass::StaticFallback) => {
+                        if controls.defer_fallback_to_cycle {
+                            return Err(fresh_baseline_required(class).into());
+                        }
                         Box::pin(super::generation::inventory(
                             download_client,
                             passes,
@@ -615,6 +635,9 @@ async fn download_photos_with_sync_inner(
                         Err(e) => match classify_incremental_error(&e) {
                             class @ (IncrementalErrorClass::TokenFallback
                             | IncrementalErrorClass::StaticFallback) => {
+                                if controls.defer_fallback_to_cycle {
+                                    return Err(fresh_baseline_required(class).into());
+                                }
                                 let reason = FullEnumerationReason::OtherStaticReason;
                                 tracing::warn!(
                                     error = %e,

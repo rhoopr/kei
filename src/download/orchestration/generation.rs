@@ -2512,6 +2512,7 @@ enum DueMediaRefusal {
     InvalidConfirmation,
     ProviderFactsChanged,
     NotCurrentlySelected,
+    SelectionProofUnavailable,
     MissingSelectorWitness,
     InvalidRendition,
     MissingRendition,
@@ -2527,6 +2528,7 @@ impl DueMediaRefusal {
             Self::InvalidConfirmation => "invalid_confirmation",
             Self::ProviderFactsChanged => "provider_facts_changed",
             Self::NotCurrentlySelected => "not_currently_selected",
+            Self::SelectionProofUnavailable => "selection_proof_unavailable",
             Self::MissingSelectorWitness => "missing_selector_witness",
             Self::InvalidRendition => "invalid_rendition",
             Self::MissingRendition => "missing_rendition",
@@ -2568,6 +2570,53 @@ fn log_due_media_refusal(generation: &str, refusal: DueMediaRefusal) {
     );
 }
 
+async fn current_legacy_retry_hashes(
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+    current: &SelectionContext,
+) -> Result<Vec<String>> {
+    let Some(legacy) = context_for_format(passes, config, controls, 1).await? else {
+        return Ok(Vec::new());
+    };
+    if legacy.scope != current.scope || legacy.zone != current.zone {
+        return Ok(Vec::new());
+    }
+    let candidates: Vec<Option<&str>> = if config.enum_config_hash.is_none() {
+        vec![None]
+    } else {
+        config
+            .legacy_enum_hashes
+            .as_ref()
+            .map_or_else(Vec::new, |hashes| {
+                hashes.iter().map(|hash| Some(hash.as_ref())).collect()
+            })
+    };
+    let anchored_root = SelectionPath::from_path(&std::path::absolute(&config.directory)?);
+    let mut result = Vec::new();
+    for enum_hash in candidates {
+        let mut policy = selection_policy(
+            config,
+            &legacy.scope,
+            &legacy.zone,
+            None,
+            hash_download_config(config),
+            enum_hash,
+            &anchored_root,
+        );
+        policy
+            .as_object_mut()
+            .context("Invalid legacy selection policy")?
+            .insert("profile".into(), legacy.profile.clone());
+        result.push(digest(&serde_json::to_vec(&policy)?));
+    }
+    Ok(result)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "retry revalidation needs the exact task, pass, source and cancellation proofs"
+)]
 async fn due_media_task(
     identity: &crate::state::db::provider_generations::SelectionRetryIdentity,
     destination: &SelectionDestination,
@@ -2576,10 +2625,24 @@ async fn due_media_task(
     config: &DownloadConfig,
     zone_name: &str,
     zone: &Value,
+    context: &SelectionContext,
+    unfiled_without_album_dependency: bool,
     cancel: &CancellationToken,
 ) -> Result<filter::DownloadTask, DueMediaFailure> {
     if cancel.is_cancelled() {
         return Err(DueMediaFailure::Interrupted);
+    }
+    let cross_source = album.zone_name() != zone_name;
+    if config.recent.is_some()
+        || match pass.kind {
+            PassKind::Unfiled => !unfiled_without_album_dependency || cross_source,
+            PassKind::Album => !cross_source || context.profile.get("selector_binding").is_none(),
+            PassKind::SmartFolder => true,
+        }
+    {
+        return Err(DueMediaFailure::Refusal(
+            DueMediaRefusal::SelectionProofUnavailable,
+        ));
     }
     let body = identity
         .confirmation
@@ -2605,17 +2668,26 @@ async fn due_media_task(
             DueMediaRefusal::ProviderFactsChanged,
         ));
     }
-    let pass_config = config.with_pass(pass);
-    if filter::is_asset_filtered(&current.asset, &pass_config).is_some() {
+    if !crate::icloud::photos::current_retry_visible(&current.body, &identity.child, master, zone)
+        .map_err(|_error| DueMediaFailure::Refusal(DueMediaRefusal::SelectionProofUnavailable))?
+    {
         return Err(DueMediaFailure::Refusal(
             DueMediaRefusal::NotCurrentlySelected,
         ));
     }
+    let pass_config = config.with_pass(pass);
     if config
-        .selection_context
-        .as_ref()
-        .is_some_and(|context| context.profile.get("selector_binding").is_some())
+        .exclude_asset_ids
+        .contains(current.asset.asset_record_name())
+        || config.exclude_asset_ids.contains(current.asset.id())
+        || filter::is_asset_filtered_quiet(&current.asset, &pass_config).is_some()
+        || filter::fallback_filename_excluded(&current.asset, &pass_config)
     {
+        return Err(DueMediaFailure::Refusal(
+            DueMediaRefusal::NotCurrentlySelected,
+        ));
+    }
+    if pass.kind == PassKind::Album {
         let witness = stored
             .selector_membership()
             .cloned()
@@ -2674,6 +2746,8 @@ async fn due_media_task(
 pub(crate) async fn replay_due_admitted_selection(
     client: &Client,
     passes: &[AlbumPass],
+    resolved_selection: Option<&crate::selection::Selection>,
+    all_resolved_plans: Option<&[&[AlbumPass]]>,
     config: Arc<DownloadConfig>,
     controls: DownloadControls,
     cancel: CancellationToken,
@@ -2681,35 +2755,104 @@ pub(crate) async fn replay_due_admitted_selection(
     if !controls.run_mode.downloads_files() || cancel.is_cancelled() {
         return Ok(None);
     }
+    // The caller supplies the top-level selection only for a current local
+    // plan, and the full plan set only when every relevant plan is current.
+    // Absent proof cannot authorize the work that depends on it.
+    let Some(selection) = resolved_selection else {
+        return Ok(None);
+    };
+    let no_excluded_album = match &selection.albums {
+        crate::selection::AlbumSelector::None => true,
+        crate::selection::AlbumSelector::All { excluded }
+        | crate::selection::AlbumSelector::Named { excluded, .. } => excluded.is_empty(),
+    };
+    // An individual library plan cannot prove that an album selected in a
+    // different library has no members in this source. Only an explicit
+    // album-free selector or the complete current plan set supplies that fact.
+    let no_selected_albums = matches!(selection.albums, crate::selection::AlbumSelector::None)
+        || all_resolved_plans.is_some_and(|plans| {
+            plans.iter().any(|plan| std::ptr::eq(*plan, passes))
+                && plans
+                    .iter()
+                    .all(|plan| !plan.iter().any(|pass| pass.kind == PassKind::Album))
+        });
+    let unfiled_without_album_dependency = selection.unfiled
+        && no_excluded_album
+        && no_selected_albums
+        && !passes.iter().any(|pass| pass.kind == PassKind::Album)
+        && passes
+            .iter()
+            .filter(|pass| pass.kind == PassKind::Unfiled)
+            .count()
+            == 1;
     let Some(context) = context(passes, &config, controls).await? else {
         return Ok(None);
     };
     let owner = context.capture.owner.clone();
-    // Retain the current owner's full seal and dependency validation even when
-    // the fair root window selects a historical source first.
-    let _ = context.current().await?;
-    // Current and historical roots share one durable rotation. Prioritizing the
-    // current root on every wake can starve peers when its refusals remain due.
+    let legacy_hashes = current_legacy_retry_hashes(passes, &config, controls, &context).await?;
+    let sources: Vec<_> = std::iter::once(&context)
+        .chain(context.source_contexts.iter())
+        .collect();
+    let mut root_sources = Vec::with_capacity(sources.len());
+    for (index, source) in sources.iter().enumerate() {
+        anyhow::ensure!(
+            source.capture.owner == owner && Arc::ptr_eq(&source.capture.db, &context.capture.db),
+            "Selected retry source owner mismatch"
+        );
+        // Keep full current-owner validation even if the bounded rotation
+        // selects a historical or cross-source root first.
+        let _ = source.current().await?;
+        root_sources.push(crate::state::db::provider_generations::RetryRootSource {
+            scope: source.scope.clone(),
+            config_hash: source.config_hash.clone(),
+            excluded: String::new(),
+            profile: (source.format == 2).then(|| source.profile.clone()),
+            legacy_hashes: if index == 0 {
+                legacy_hashes.clone()
+            } else {
+                Vec::new()
+            },
+        });
+    }
+    // All selected sources and formats share this single durable root window.
     let roots = context
         .capture
         .db
-        .retained_selection_roots(
-            owner.clone(),
-            context.scope.clone(),
-            context.config_hash.clone(),
-            String::new(),
-            (context.format == 2).then(|| context.profile.clone()),
-            8,
-        )
+        .retained_selection_roots(owner.clone(), root_sources, 8)
         .await?;
+    let rotation_floor = roots
+        .iter()
+        .map(|(_, _, last)| *last)
+        .max()
+        .unwrap_or_default()
+        .checked_add(1)
+        .context("Retry root rotation exhausted")?;
 
     let mut combined = SyncStats::default();
     let mut attempted = false;
     let mut failed_count = 0usize;
     let mut remaining_decisions = MAX_REPLAY_DECISIONS;
-    for root in roots {
+    for (source_index, root, _) in roots {
+        let source = sources
+            .get(source_index)
+            .context("Missing selected retry source")?;
         if remaining_decisions == 0 {
             break;
+        }
+        if root.spec.format == 1
+            && (!legacy_hashes.contains(&root.spec.config_hash)
+                || legacy_recorded_passes(&root, source, passes, &config)?.is_none())
+        {
+            context
+                .capture
+                .db
+                .rotate_retained_selection_root_at_least(
+                    owner.clone(),
+                    root.id.clone(),
+                    rotation_floor,
+                )
+                .await?;
+            continue;
         }
         let window = context
             .capture
@@ -2725,7 +2868,11 @@ pub(crate) async fn replay_due_admitted_selection(
             context
                 .capture
                 .db
-                .rotate_retained_selection_root(owner.clone(), root.id.clone())
+                .rotate_retained_selection_root_at_least(
+                    owner.clone(),
+                    root.id.clone(),
+                    rotation_floor,
+                )
                 .await?;
             continue;
         }
@@ -2738,7 +2885,7 @@ pub(crate) async fn replay_due_admitted_selection(
             .and_then(Value::as_str)
             .context("Missing admitted media zone")?
             .to_owned();
-        let run = context.replay_run(root.clone(), passes, false, true);
+        let run = source.replay_run(root.clone(), passes, false, true);
         let mut last_ackable = None;
         for identity in window.identities {
             if cancel.is_cancelled() {
@@ -2753,11 +2900,18 @@ pub(crate) async fn replay_due_admitted_selection(
                 .iter()
                 .find(|pass| pass_key(pass) == identity.pass_key)
             else {
+                last_ackable = Some((identity.pass_key.clone(), identity.child.clone()));
+                log_due_media_refusal(&root.id, DueMediaRefusal::SelectionProofUnavailable);
                 continue;
             };
             let Some(album) = run.albums.get(&identity.pass_key) else {
+                last_ackable = Some((identity.pass_key.clone(), identity.child.clone()));
+                log_due_media_refusal(&root.id, DueMediaRefusal::SelectionProofUnavailable);
                 continue;
             };
+            let unfiled_eligible = unfiled_without_album_dependency
+                && pass.kind == PassKind::Unfiled
+                && album.catalog_work_scope()?.is_some();
             let mut tasks = Vec::new();
             let mut refused = false;
             for destination in &identity.destinations {
@@ -2769,6 +2923,8 @@ pub(crate) async fn replay_due_admitted_selection(
                     &config,
                     &zone_name,
                     &root.spec.zone,
+                    source,
+                    unfiled_eligible,
                     &cancel,
                 )
                 .await
@@ -2887,6 +3043,7 @@ pub(crate) async fn replay_due_admitted_selection(
                     root.id.clone(),
                     window.cursor,
                     last_ackable,
+                    rotation_floor,
                 )
                 .await?;
             if !acknowledged {
@@ -4170,6 +4327,36 @@ pub(super) async fn after_delta(
         .selection_context
         .as_ref()
         .context("Missing selection context")?;
+    if controls.defer_changed_fresh_bridge_inventory && delta.inventory_rank_changed {
+        // Do not acknowledge this delta or enumerate again. The original
+        // boundary remains available to replay all changes on the next wake.
+        let mut stats = SyncStats {
+            state_write_failures: delta.state_transition_failures,
+            identity_incomplete: delta.identity_incomplete,
+            interrupted: cancel.is_cancelled(),
+            ..SyncStats::default()
+        };
+        if let Some(reason) = delta.token_unsafe_reason {
+            block_sync_token_for_incremental_delta(&mut stats, reason);
+        }
+        let mut result = SyncResult::from_incremental_execution(
+            if delta.state_transition_failures > 0 {
+                DownloadOutcome::PartialFailure {
+                    failed_count: delta.state_transition_failures,
+                }
+            } else {
+                DownloadOutcome::Success
+            },
+            None,
+            stats,
+            delta.sparse_identity_proofs,
+            delta.sparse_current,
+            delta.sync_token.is_some(),
+            true,
+        );
+        result.block_incremental_token("baseline_changed_during_inventory");
+        return Ok(result);
+    }
     if delta.missing_successor && context.format != 2 {
         // Legacy selection cannot deliver a partial source replay safely.
         return Err(crate::icloud::photos::error::MissingChangesSuccessor.into());

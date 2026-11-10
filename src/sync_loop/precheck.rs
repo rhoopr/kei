@@ -163,6 +163,47 @@ pub(super) async fn include_pending_local_work(
     }
 }
 
+/// Installed catalog work must wake its owning source when its saved deadline
+/// is due. This is only scheduling; the state owner revalidates authority.
+pub(super) async fn has_due_catalog(
+    library: &LibraryState,
+    config: &download::DownloadConfig,
+    controls: download::DownloadControls,
+) -> anyhow::Result<bool> {
+    let Some(db) = &config.state_db else {
+        return Ok(false);
+    };
+    if db.sync_epoch_backoff(library.zone_name.clone()).await? {
+        return Ok(false);
+    }
+    let Some(plan) =
+        download::catalog_plan_context_for_source(&library.plan.passes, config, controls, None)
+            .await?
+    else {
+        return Ok(false);
+    };
+    let digest = download::catalog_plan_digest_from_source_context(&plan);
+    for pass in &library.plan.passes {
+        if let Some((capture, scope, zone)) = pass.album.download_scope()?
+            && scope == plan.scope
+            && zone == plan.zone
+        {
+            let signals = capture
+                .db
+                .catalog_pending_signals(capture.owner, library.zone_name.clone())
+                .await?;
+            return Ok(signals.into_iter().any(|signal| {
+                signal.due_at <= chrono::Utc::now().timestamp()
+                    && state::db::source_revalidation::CatalogOrigin::parse(&signal.scope)
+                        .is_ok_and(|origin| {
+                            origin.nonce == signal.round && origin.plan_digest == digest
+                        })
+            }));
+        }
+    }
+    Ok(false)
+}
+
 /// Retained current-config work is scheduled locally even when the provider is
 /// quiet. Unsupported selection remains with its existing owner.
 pub(super) async fn include_pending_provider_work(
@@ -197,7 +238,8 @@ pub(super) async fn include_pending_provider_work(
                     download::has_due_selection_work(&library.plan.passes, &config, controls)
                         .await?
                         .unwrap_or(false);
-                Ok::<_, anyhow::Error>(retained || selected)
+                let catalog = has_due_catalog(library, &config, controls).await?;
+                Ok::<_, anyhow::Error>(retained || selected || catalog)
             }
             .await
         }

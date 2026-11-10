@@ -402,7 +402,7 @@ pub(crate) fn selected_hold_summary(holds: &[LibraryHoldFact]) -> Option<String>
 /// cycle-level machine block fields only as a compatibility projection. The
 /// per-library facts keep every affected label visible without inventing
 /// failed assets or counts.
-fn record_selected_hold(
+pub(crate) fn record_selected_hold(
     holds: &mut Vec<LibraryHoldFact>,
     stats: &mut download::SyncStats,
     source: &str,
@@ -449,6 +449,49 @@ pub(crate) struct ExpectedSource {
     pub(crate) baseline_scope: String,
     pub(crate) active_passes: bool,
     pub(crate) skip_authority: SkipAuthority,
+}
+
+/// A filtered watch cycle cannot certify the complete selection plan universe.
+fn current_retry_plan_universe<'a>(
+    all: &'a [&'a LibraryState],
+    reached: &[&LibraryState],
+    expected: &[ExpectedSource],
+) -> Option<Vec<&'a [crate::commands::AlbumPass]>> {
+    if all.is_empty()
+        || all.len() != expected.len()
+        || all
+            .iter()
+            .any(|state| state.plan_is_stale || state.plan_needs_refresh)
+        || reached
+            .iter()
+            .any(|state| !all.iter().any(|full| std::ptr::eq(*full, *state)))
+        || all.iter().any(|state| {
+            expected
+                .iter()
+                .filter(|source| source.zone_name == state.zone_name)
+                .count()
+                != 1
+        })
+        || expected.iter().any(|source| {
+            let mut matches = all
+                .iter()
+                .filter(|state| state.zone_name == source.zone_name);
+            match (matches.next(), matches.next()) {
+                (Some(state), None) => {
+                    state.library.baseline_scope() != source.baseline_scope
+                        || has_active_passes(state) != source.active_passes
+                }
+                _ => true,
+            }
+        })
+    {
+        return None;
+    }
+    Some(
+        all.iter()
+            .map(|state| state.plan.passes.as_slice())
+            .collect(),
+    )
 }
 
 #[derive(Clone)]
@@ -1178,6 +1221,8 @@ async fn run_epoch_pending_retry(
 async fn retry_due_admitted_while_held(
     download_client: &reqwest::Client,
     lib_state: &LibraryState,
+    selection: &crate::selection::Selection,
+    all_plans: Option<&[&[crate::commands::AlbumPass]]>,
     retry_config: Arc<download::DownloadConfig>,
     download_controls: download::DownloadControls,
     shutdown_token: &CancellationToken,
@@ -1190,6 +1235,8 @@ async fn retry_due_admitted_while_held(
     match Box::pin(download::replay_due_admitted_selection(
         download_client,
         &lib_state.plan.passes,
+        (!lib_state.plan_is_stale && !lib_state.plan_needs_refresh).then_some(selection),
+        all_plans,
         retry_config,
         download_controls,
         shutdown_token.clone(),
@@ -1314,7 +1361,7 @@ pub(crate) async fn run_cycle(
         })
         .collect();
     let metadata_witness = Arc::new(download::MetadataWriterWitness::default());
-    run_cycle_with_witness(
+    Box::pin(run_cycle_with_witness(
         library_states,
         config,
         state_db,
@@ -1325,7 +1372,8 @@ pub(crate) async fn run_cycle(
         shutdown_token,
         metadata_witness,
         &expected_sources,
-    )
+        None,
+    ))
     .await
 }
 
@@ -1344,7 +1392,10 @@ pub(crate) async fn run_cycle_with_witness(
     shutdown_token: &CancellationToken,
     metadata_witness: Arc<download::MetadataWriterWitness>,
     expected_sources: &[ExpectedSource],
+    all_library_states: Option<&[&LibraryState]>,
 ) -> anyhow::Result<CycleResult> {
+    let all_retry_plans = all_library_states
+        .and_then(|all| current_retry_plan_universe(all, library_states, expected_sources));
     let sync_epoch = match state_db {
         Some(db) => db.sync_epoch_id().await?,
         None => None,
@@ -1700,6 +1751,8 @@ pub(crate) async fn run_cycle_with_witness(
                         let _ = retry_due_admitted_while_held(
                             &download_client,
                             lib_state,
+                            &config.filters.selection,
+                            all_retry_plans.as_deref(),
                             retry_config,
                             download_controls,
                             shutdown_token,
@@ -1899,6 +1952,8 @@ pub(crate) async fn run_cycle_with_witness(
                         let _ = retry_due_admitted_while_held(
                             &download_client,
                             lib_state,
+                            &config.filters.selection,
+                            all_retry_plans.as_deref(),
                             Arc::clone(&local.config),
                             download_controls,
                             shutdown_token,
@@ -2065,6 +2120,8 @@ pub(crate) async fn run_cycle_with_witness(
                 replay_ok = retry_due_admitted_while_held(
                     &download_client,
                     lib_state,
+                    &config.filters.selection,
+                    all_retry_plans.as_deref(),
                     Arc::clone(&local.config),
                     download_controls,
                     shutdown_token,
@@ -2328,7 +2385,7 @@ pub(crate) async fn run_cycle_with_witness(
                 preservation_config_hash.as_deref().unwrap_or(""),
             ),
         };
-        let baseline_cursor_at_start = if retained_cursor_at_start.is_none()
+        let mut baseline_cursor_at_start = if retained_cursor_at_start.is_none()
             && matches!(download_config.sync_mode, download::SyncMode::Full)
             && download_controls.run_mode.downloads_files()
             && !download_config.retry_only
@@ -2510,14 +2567,250 @@ pub(crate) async fn run_cycle_with_witness(
         {
             source.reached = true;
         }
-        let mut sync_result = Box::pin(download::download_photos_with_sync(
+        // Only a current, authenticated local source can hand a rejected
+        // incremental token back for an atomic fresh-origin installation.
+        let fresh_catalog = if expected_epoch.is_some()
+            && expected_attempt.is_some()
+            && !lib_state.plan_is_stale
+            && indexing_finished
+            && !indexing_reconciliation
+            && checkpoint_transition_state_safe
+            && !download_config.retry_only
+            && !config.runtime.dry_run
+            && download_controls.run_mode.downloads_files()
+            && matches!(
+                &download_config.sync_mode,
+                download::SyncMode::Incremental { zone_sync_token }
+                    if Some(zone_sync_token) == retained_cursor_at_start.as_ref()
+            )
+            && download::has_current_observation(
+                &lib_state.plan.passes,
+                &download_config,
+                download_controls,
+                &lib_state.sync_token_key,
+            )
+            .await?
+        {
+            let plan = download::catalog_plan_context_for_source(
+                &lib_state.plan.passes,
+                &download_config,
+                download_controls,
+                None,
+            )
+            .await?;
+            let mut capture = None;
+            if let Some(plan) = plan {
+                for pass in &lib_state.plan.passes {
+                    if let Some((source, scope, zone)) = pass.album.download_scope()?
+                        && scope == plan.scope
+                        && zone == plan.zone
+                    {
+                        capture = Some((plan, source));
+                        break;
+                    }
+                }
+            }
+            capture
+        } else {
+            None
+        };
+        let mut dispatch_controls = download_controls;
+        dispatch_controls.defer_fallback_to_cycle = fresh_catalog.is_some();
+        let initial_result = Box::pin(download::download_photos_with_sync(
             &download_client,
             &lib_state.plan.passes,
             Arc::clone(&download_config),
-            download_controls,
+            dispatch_controls,
             shutdown_token.clone(),
         ))
-        .await?;
+        .await;
+        let mut fresh_origin = None;
+        let mut sync_result = match initial_result {
+            Ok(result) => result,
+            Err(error)
+                if error
+                    .downcast_ref::<download::FreshBaselineRequired>()
+                    .is_some() =>
+            {
+                let Some((plan, capture)) = fresh_catalog else {
+                    return Err(error);
+                };
+                if matches!(
+                    error.downcast_ref::<download::FreshBaselineRequired>(),
+                    Some(download::FreshBaselineRequired::StaticFallback)
+                ) {
+                    record_selected_hold(
+                        &mut library_holds,
+                        &mut cycle_stats,
+                        &lib_state.zone_name,
+                        library_ordinal,
+                        LibraryHoldKind::RetainedCheckpoint,
+                        "incremental_fallback_unproven",
+                        "the retained provider interval could not be accounted; its checkpoint and local work are retained",
+                        true,
+                    );
+                    db_sync_token_advance_safe = false;
+                    path_reconciliation_complete = false;
+                    path_reconciliation_cycle_safe = false;
+                    continue;
+                }
+                let prepared: anyhow::Result<_> = Box::pin(async {
+                    let db = state_db
+                        .ok_or_else(|| anyhow::anyhow!("Fresh catalog requires durable state"))?;
+                    anyhow::ensure!(
+                        std::ptr::addr_eq(db, capture.db.as_ref() as &dyn download::DownloadStore),
+                        "Fresh catalog database context mismatch"
+                    );
+                    let mut expected_metadata = zone_metadata_fence.clone();
+                    expected_metadata.extend(path_metadata_at_start.iter().cloned());
+                    for key in [
+                        state::SYNC_EPOCH_KEY.to_owned(),
+                        state::db::sync_epoch::library_key(&lib_state.zone_name),
+                        ENUM_CONFIG_HASH_KEY.to_owned(),
+                        PENDING_ENUM_CONFIG_HASH_KEY.to_owned(),
+                        download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+                        PENDING_DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+                        lib_state.sync_token_key.clone(),
+                        format!("observed_selection:v27:{}", lib_state.zone_name),
+                        format!("download_ledger_scope:{}", lib_state.zone_name),
+                    ] {
+                        if !expected_metadata.iter().any(|(saved, _)| saved == &key) {
+                            let value = db.get_metadata(&key).await?;
+                            expected_metadata.push((key, value));
+                        }
+                    }
+                    let expected_baseline = db.get_metadata(&baseline_key).await?;
+                    let snapshot = capture
+                        .db
+                        .fresh_catalog_snapshot(capture.owner.clone(), lib_state.zone_name.clone())
+                        .await?;
+                    let boundary = lib_state.library.fresh_baseline_cursor().await?;
+                    let request = state::db::source_revalidation::FreshCatalogOriginRequest {
+                        library: lib_state.zone_name.clone(),
+                        plan: state::db::source_revalidation::FreshCatalogPlan {
+                            account: plan.account,
+                            provider: plan.provider,
+                            database: plan.database,
+                            zone: plan.zone,
+                            scope: plan.scope,
+                            config_hash: plan.config_hash,
+                            metadata_enabled: plan.metadata_enabled,
+                            metadata_flags: plan.metadata_flags,
+                            passes: plan
+                                .passes
+                                .into_iter()
+                                .map(|pass| state::db::source_revalidation::FreshCatalogPass {
+                                    key: pass.key,
+                                    kind: pass.kind,
+                                    scope: pass.scope,
+                                    excludes: pass.excludes,
+                                })
+                                .collect(),
+                            profile: plan.profile,
+                        },
+                        baseline_key: baseline_key.clone(),
+                        preservation_config_hash: preservation_config_hash
+                            .clone()
+                            .unwrap_or_default(),
+                        expected_baseline,
+                        fresh_cursor: boundary.clone(),
+                        enum_hash: enum_config_hash.clone(),
+                        expected_epoch: expected_epoch
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("Fresh catalog requires an epoch"))?,
+                        expected_attempt: expected_attempt
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("Fresh catalog requires an attempt"))?,
+                        expected_metadata,
+                        expected_catalog_snapshot: snapshot,
+                    };
+                    let origin = capture
+                        .db
+                        .install_fresh_catalog_origin(capture.owner.clone(), request)
+                        .await?;
+                    capture
+                        .db
+                        .seed_source_revalidation(
+                            capture.owner.clone(),
+                            lib_state.zone_name.clone(),
+                            origin.scope(),
+                            enum_config_hash.clone(),
+                            state::db::source_revalidation::CatalogOrigin::boundary(&boundary),
+                            shutdown_token.clone(),
+                        )
+                        .await?;
+                    anyhow::ensure!(
+                        !shutdown_token.is_cancelled(),
+                        "Fresh catalog census interrupted"
+                    );
+                    let signals = capture
+                        .db
+                        .catalog_pending_signals(capture.owner, lib_state.zone_name.clone())
+                        .await?;
+                    anyhow::ensure!(
+                        signals.iter().any(|signal| signal.round == origin.nonce
+                            && signal.scope == origin.scope()
+                            && signal.phase == "observing"),
+                        "Fresh catalog census is not complete"
+                    );
+                    Ok((boundary, origin))
+                })
+                .await;
+                let (boundary, origin) = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        db_sync_token_advance_safe = false;
+                        path_reconciliation_complete = false;
+                        path_reconciliation_cycle_safe = false;
+                        if shutdown_token.is_cancelled() {
+                            cycle_stats.interrupted = true;
+                            break;
+                        }
+                        if crate::icloud::photos::session::is_session_error(&error) {
+                            cycle_session_expired = true;
+                            break;
+                        }
+                        if matches!(
+                            error.downcast_ref::<state::error::StateError>(),
+                            Some(
+                                state::error::StateError::Query { .. }
+                                    | state::error::StateError::Migration(_)
+                                    | state::error::StateError::LockPoisoned(_)
+                                    | state::error::StateError::Spawn(_)
+                            )
+                        ) {
+                            cycle_stats.state_write_failures =
+                                cycle_stats.state_write_failures.saturating_add(1);
+                            operational_state_fault = true;
+                        }
+                        record_selected_hold(
+                            &mut library_holds,
+                            &mut cycle_stats,
+                            &lib_state.zone_name,
+                            library_ordinal,
+                            LibraryHoldKind::RetainedCheckpoint,
+                            "fresh_catalog_unavailable",
+                            "a fresh qualified source boundary could not be installed; the checkpoint and local work are retained",
+                            true,
+                        );
+                        continue;
+                    }
+                };
+                zone_metadata_fence.push((baseline_key.clone(), Some(boundary.clone())));
+                baseline_cursor_at_start = Some(boundary);
+                fresh_origin = Some(origin);
+                Arc::make_mut(&mut download_config).sync_mode = download::SyncMode::Full;
+                Box::pin(download::download_photos_with_sync(
+                    &download_client,
+                    &lib_state.plan.passes,
+                    Arc::clone(&download_config),
+                    download_controls,
+                    shutdown_token.clone(),
+                ))
+                .await?
+            }
+            Err(error) => return Err(error),
+        };
 
         // Capture only the initial complete selected scope, before a bridge
         // adds repeated count observations to the public activity statistics.
@@ -2614,14 +2907,36 @@ pub(crate) async fn run_cycle_with_witness(
                             sync_result.checkpoint.observation.clone().map(Box::new);
                         Arc::make_mut(&mut bridge_config).prior_sparse_bridge_proofs =
                             Arc::from(sync_result.checkpoint.sparse_identity_proofs.clone());
+                        let mut bridge_controls = if fresh_origin.is_some() {
+                            dispatch_controls
+                        } else {
+                            download_controls
+                        };
+                        bridge_controls.defer_changed_fresh_bridge_inventory =
+                            fresh_origin.is_some();
                         let bridge_result = Box::pin(download::download_photos_with_sync(
                             &download_client,
                             &lib_state.plan.passes,
                             bridge_config,
-                            download_controls,
+                            bridge_controls,
                             shutdown_token.clone(),
                         ))
-                        .await?;
+                        .await;
+                        let bridge_result = match bridge_result {
+                            Ok(result) => result,
+                            Err(error)
+                                if error
+                                    .downcast_ref::<download::FreshBaselineRequired>()
+                                    .is_some() =>
+                            {
+                                sync_result.sync_token = None;
+                                sync_result.checkpoint.sync_token_blocked = true;
+                                sync_result.checkpoint.project(&mut sync_result.stats);
+                                block_for_retained_checkpoint(&mut sync_result.stats);
+                                break;
+                            }
+                            Err(error) => return Err(error),
+                        };
                         observe_sync_component(
                             "delta_bridge",
                             &bridge_result,
@@ -2636,6 +2951,21 @@ pub(crate) async fn run_cycle_with_witness(
                         sync_result.outcome =
                             merge_download_outcomes(&sync_result.outcome, &bridge_result.outcome);
                         sync_result.accumulate(&bridge_result);
+                        if fresh_origin.is_some() && bridge_result.checkpoint.inventory_rank_changed
+                        {
+                            // A catalog origin is bound to the original boundary.
+                            // Do not rewrite that boundary independently of its owner.
+                            sync_result.sync_token = None;
+                            sync_result.checkpoint.sync_token_blocked = true;
+                            sync_result.checkpoint.project(&mut sync_result.stats);
+                            sync_result.stats.sync_token_blocked_reason =
+                                Some("baseline_changed_during_inventory");
+                            sync_result.stats.sync_token_blocked_source = Some("icloud");
+                            sync_result.stats.sync_token_blocked_explanation = Some(
+                                "provider changes shifted the inventory; the original boundary and completed work are retained",
+                            );
+                            break;
+                        }
                         if baseline_cursor_at_start.is_some()
                             && bridge_result.checkpoint.retained_token_rejected
                             && let Some(db) = state_db
@@ -2736,7 +3066,7 @@ pub(crate) async fn run_cycle_with_witness(
                             }
                             block_for_retained_checkpoint(&mut sync_result.stats);
                         }
-                        if !bridge_result.full_enumeration_ran
+                        if (fresh_origin.is_none() && !bridge_result.full_enumeration_ran)
                             || bridge_result.checkpoint.completed_delta_replay
                         {
                             if let SourceCheckpointDecision::Advance { token, .. } = bridge_decision
@@ -2748,9 +3078,22 @@ pub(crate) async fn run_cycle_with_witness(
                                     .zip(bridge_result.checkpoint.observation.clone())
                                     .and_then(|(inventory, delta)| {
                                         inventory.bridge(delta, &prior_token)
+                                    })
+                                    .map(|proof| match &fresh_origin {
+                                        Some(origin) => proof.with_catalog_origin(origin.clone()),
+                                        None => proof,
                                     });
-                                sync_result.sync_token = Some(token);
-                                checkpoint_basis = CheckpointBasis::InventoryWithDeltaBridge;
+                                if fresh_origin.is_some()
+                                    && sync_result.checkpoint.observation.is_none()
+                                {
+                                    sync_result.sync_token = None;
+                                    sync_result.checkpoint.sync_token_blocked = true;
+                                    sync_result.checkpoint.project(&mut sync_result.stats);
+                                    block_for_retained_checkpoint(&mut sync_result.stats);
+                                } else {
+                                    sync_result.sync_token = Some(token);
+                                    checkpoint_basis = CheckpointBasis::InventoryWithDeltaBridge;
+                                }
                             } else {
                                 sync_result.sync_token = None;
                                 sync_result.checkpoint.sync_token_blocked = true;
@@ -4137,6 +4480,53 @@ mod tests {
             plan_is_stale: false,
             plan_needs_refresh: false,
         }
+    }
+
+    #[test]
+    fn retry_plan_universe_requires_complete_current_sources_and_exact_local_plan() {
+        let primary = make_library_state(true);
+        let mut peer = make_library_state(true);
+        peer.zone_name = "SharedSync-peer".into();
+        peer.library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+            Box::new(crate::test_helpers::MockPhotosSession::new()),
+            "SharedSync-peer",
+        );
+        peer.plan.passes[0].kind = PassKind::Album;
+        let expected = |states: &[&LibraryState]| -> Vec<ExpectedSource> {
+            states
+                .iter()
+                .map(|state| ExpectedSource {
+                    zone_name: state.zone_name.clone(),
+                    baseline_scope: state.library.baseline_scope(),
+                    active_passes: has_active_passes(state),
+                    skip_authority: SkipAuthority::NoChanges,
+                })
+                .collect()
+        };
+        let sources = expected(&[&primary, &peer]);
+        let all = [&primary, &peer];
+        let reached = [&primary];
+        let plans = current_retry_plan_universe(&all, &reached, &sources).unwrap();
+        assert_eq!(
+            plans.len(),
+            2,
+            "watch-omitted peer must remain in the universe"
+        );
+        assert!(std::ptr::eq(plans[0], primary.plan.passes.as_slice()));
+        assert_eq!(plans[1][0].kind, PassKind::Album);
+        assert!(current_retry_plan_universe(&reached, &reached, &sources).is_none());
+        assert!(
+            current_retry_plan_universe(&all, &[&make_library_state(true)], &sources).is_none()
+        );
+        assert!(
+            current_retry_plan_universe(&all, &reached, &[sources[0].clone(), sources[0].clone()])
+                .is_none()
+        );
+        peer.plan_needs_refresh = true;
+        assert!(current_retry_plan_universe(&[&primary, &peer], &reached, &sources).is_none());
+        peer.plan_needs_refresh = false;
+        peer.plan_is_stale = true;
+        assert!(current_retry_plan_universe(&[&primary, &peer], &reached, &sources).is_none());
     }
 
     #[test]

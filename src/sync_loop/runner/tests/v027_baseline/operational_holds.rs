@@ -369,6 +369,7 @@ impl Fixture {
             &CancellationToken::new(),
             Arc::new(download::MetadataWriterWitness::default()),
             &expected_sources,
+            None,
         )
         .await
         .unwrap()

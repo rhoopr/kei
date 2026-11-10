@@ -151,6 +151,10 @@ impl DownloadReporting {
 pub(crate) struct DownloadControls {
     pub(crate) run_mode: DownloadRunMode,
     pub(crate) reporting: DownloadReporting,
+    /// Return an incremental fallback to the cycle before replacement inventory.
+    pub(crate) defer_fallback_to_cycle: bool,
+    /// Retain a changed fresh-boundary bridge rather than starting another inventory.
+    pub(crate) defer_changed_fresh_bridge_inventory: bool,
 }
 
 impl DownloadControls {
@@ -158,6 +162,8 @@ impl DownloadControls {
         Self {
             run_mode,
             reporting,
+            defer_fallback_to_cycle: false,
+            defer_changed_fresh_bridge_inventory: false,
         }
     }
 

@@ -547,6 +547,7 @@ async fn stock36_held_identity_baseline_replays_due_admitted_media_without_inven
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
     let mut config = make_run_cycle_config();
     config.retry.max_retries = 0;
+    config.filters.selection = resolved_unfiled_only();
 
     let first = run_stock36_cycle(&db, &[&support, &peer], &root, &shared, &config)
         .await

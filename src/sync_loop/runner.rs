@@ -135,6 +135,214 @@ async fn drain_source_revalidation(
     Ok(())
 }
 
+/// Drain at most one qualified catalog page per selected source after all
+/// producers and metadata writers have joined. This never grants a checkpoint.
+#[derive(Default)]
+struct CatalogDrainOutcome {
+    session_expired: bool,
+    rate_limited: usize,
+    retained: usize,
+    retained_sources: Vec<String>,
+}
+
+async fn drain_catalog_source_revalidation(
+    libraries: &[&LibraryState],
+    build_download_config: &crate::sync_cycle::BuildDownloadConfigFn<'_>,
+    controls: download::DownloadControls,
+    enum_hash: &str,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<CatalogDrainOutcome> {
+    use crate::icloud::photos::{ProviderRecordId, StrictCatalogPairResult, StrictCatalogRefusal};
+    use crate::state::db::source_revalidation::{
+        CatalogOrigin, CatalogPairEvidence, CatalogSettlementAuthority,
+    };
+
+    let mut outcome = CatalogDrainOutcome::default();
+    for library in libraries {
+        if shutdown.is_cancelled() {
+            break;
+        }
+        if library.plan_is_stale {
+            continue;
+        }
+        let retained_before = outcome.retained;
+        let config = build_download_config(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from(library.zone_name.as_str()),
+        );
+        let Some(plan) = download::catalog_plan_context_for_source(
+            &library.plan.passes,
+            &config,
+            controls,
+            None,
+        )
+        .await?
+        else {
+            continue;
+        };
+        let mut source = None;
+        for pass in &library.plan.passes {
+            if let Some((capture, scope, zone)) = pass.album.download_scope()?
+                && scope == plan.scope
+                && zone == plan.zone
+            {
+                source = Some((pass, capture));
+                break;
+            }
+        }
+        let Some((pass, capture)) = source else {
+            continue;
+        };
+        let digest = download::catalog_plan_digest_from_source_context(&plan);
+        let signals = capture
+            .db
+            .catalog_pending_signals(capture.owner.clone(), library.zone_name.clone())
+            .await?;
+        for signal in signals {
+            if signal.phase != "active" || signal.due_at > chrono::Utc::now().timestamp() {
+                continue;
+            }
+            let Ok(origin) = CatalogOrigin::parse(&signal.scope) else {
+                continue;
+            };
+            if origin.nonce != signal.round || origin.plan_digest != digest {
+                continue;
+            }
+            let candidates = capture
+                .db
+                .due_catalog_candidates(
+                    capture.owner.clone(),
+                    library.zone_name.clone(),
+                    origin.clone(),
+                    enum_hash.to_owned(),
+                )
+                .await?;
+            for candidate in candidates {
+                if shutdown.is_cancelled() {
+                    return Ok(outcome);
+                }
+                let authority = if let Some(child) = &candidate.child {
+                    let result = pass
+                        .album
+                        .lookup_catalog_pair_strict(
+                            &ProviderRecordId::new(candidate.master.clone()),
+                            &ProviderRecordId::new(child.clone()),
+                        )
+                        .await;
+                    outcome.rate_limited = outcome
+                        .rate_limited
+                        .saturating_add(result.rate_limit_observations);
+                    if shutdown.is_cancelled() {
+                        return Ok(outcome);
+                    }
+                    let evidence = |value: crate::icloud::photos::StrictCatalogPairEvidence| {
+                        CatalogPairEvidence {
+                            database: value.database.to_string(),
+                            zone: value.zone,
+                            master: value.master_record_name.as_str().to_owned(),
+                            child: value.child_record_name.as_str().to_owned(),
+                            master_type: value.master_type.to_string(),
+                            child_type: value.child_type.to_string(),
+                            reference_exact: value.reference_exact,
+                            explicit_deleted: value.explicit_deleted,
+                        }
+                    };
+                    match result.result {
+                        StrictCatalogPairResult::Deleted {
+                            deleted_at,
+                            evidence: value,
+                        } => CatalogSettlementAuthority::Deleted {
+                            deleted_at,
+                            evidence: evidence(value),
+                        },
+                        StrictCatalogPairResult::Live {
+                            evidence: value, ..
+                        } => CatalogSettlementAuthority::Live {
+                            evidence: evidence(value),
+                        },
+                        StrictCatalogPairResult::Refused {
+                            reason: StrictCatalogRefusal::Authentication,
+                        } => {
+                            outcome.session_expired = true;
+                            return Ok(outcome);
+                        }
+                        StrictCatalogPairResult::Refused { .. } => {
+                            CatalogSettlementAuthority::Refused
+                        }
+                    }
+                } else {
+                    CatalogSettlementAuthority::Refused
+                };
+                let settled = capture
+                    .db
+                    .settle_catalog_candidate(
+                        capture.owner.clone(),
+                        library.zone_name.clone(),
+                        origin.clone(),
+                        enum_hash.to_owned(),
+                        candidate,
+                        authority,
+                    )
+                    .await?;
+                if !settled {
+                    outcome.retained = outcome.retained.saturating_add(1);
+                }
+            }
+        }
+        if outcome.retained > retained_before {
+            outcome.retained_sources.push(library.zone_name.clone());
+        }
+    }
+    if outcome.retained > 0 {
+        tracing::warn!(
+            count = outcome.retained,
+            "Source revalidation retained unconfirmed work for retry"
+        );
+    }
+    Ok(outcome)
+}
+
+fn apply_catalog_drain_outcome(
+    cycle: &mut crate::sync_cycle::CycleResult,
+    libraries: &[&LibraryState],
+    outcome: CatalogDrainOutcome,
+    interrupted: bool,
+) {
+    cycle.stats.rate_limited = cycle
+        .stats
+        .rate_limited
+        .saturating_add(outcome.rate_limited);
+    for source in &outcome.retained_sources {
+        if let Some(ordinal) = libraries
+            .iter()
+            .position(|library| &library.zone_name == source)
+        {
+            crate::sync_cycle::record_selected_hold(
+                &mut cycle.holds,
+                &mut cycle.stats,
+                source,
+                ordinal,
+                crate::sync_cycle::LibraryHoldKind::BaselinePending,
+                "catalog_revalidation_pending",
+                "source revalidation retained unconfirmed work for retry",
+                false,
+            );
+        }
+    }
+    if !outcome.retained_sources.is_empty() || outcome.session_expired {
+        cycle.db_sync_token_advance_safe = false;
+        cycle.operational_safe_holds = false;
+    }
+    cycle.session_expired |= outcome.session_expired;
+    if interrupted {
+        cycle.stats.interrupted = true;
+        cycle.db_sync_token_advance_safe = false;
+        cycle.operational_safe_holds = false;
+    }
+}
+
 /// Run the sync command: authenticate, enumerate photos, download, and
 /// optionally loop in watch mode.
 pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> anyhow::Result<()> {
@@ -808,8 +1016,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &mut consecutive_album_refresh_failures,
             )
             .await;
-            let cycle_library_states: Vec<&LibraryState> = library_states
+            let all_library_states: Vec<&LibraryState> = library_states.iter().collect();
+            let cycle_library_states: Vec<&LibraryState> = all_library_states
                 .iter()
+                .copied()
                 .filter(|s| watch_precheck.should_sync_zone(&s.zone_name))
                 .collect();
             debug_assert!(!cycle_library_states.is_empty());
@@ -847,6 +1057,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &shutdown_token,
                 Arc::clone(&metadata_witness),
                 &expected_sources,
+                Some(&all_library_states),
             ))
             .await?;
             // Drain tagged rewrites now so the one-shot --refresh-metadata repair finishes in this run.
@@ -897,6 +1108,20 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 && refresh_tail_allows_source_revalidation(&refresh_tail)
             {
                 drain_source_revalidation(&cycle_library_states, &shutdown_token).await?;
+                let catalog = drain_catalog_source_revalidation(
+                    &cycle_library_states,
+                    &build_download_config,
+                    download_controls,
+                    &enum_config_hash,
+                    &shutdown_token,
+                )
+                .await?;
+                apply_catalog_drain_outcome(
+                    &mut cycle_result,
+                    &cycle_library_states,
+                    catalog,
+                    shutdown_token.is_cancelled(),
+                );
             }
             if refresh_tail.new_failures > 0
                 || refresh_tail.witnessed_blocked > 0

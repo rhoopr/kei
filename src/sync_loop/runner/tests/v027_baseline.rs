@@ -1769,6 +1769,8 @@ mod indexing_layout;
 
 mod source_originals;
 
+mod ordinary_expiry;
+
 mod configuration_safety;
 
 mod current_sparse_coverage;

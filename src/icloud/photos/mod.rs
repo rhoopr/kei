@@ -25,9 +25,10 @@ pub use album::PhotoAlbum;
 pub use album::PhotoAlbumConfig;
 pub(crate) use album::ProviderLookupError;
 pub(crate) use album::catalog_observed_page;
-pub(crate) use album::work::{current_asset, same_selected_facts};
+pub(crate) use album::work::{current_asset, current_retry_visible, same_selected_facts};
 pub(crate) use album::{
     ProviderRecordId, RecordLookupRequest, RecordResolution, RecordResolutionBatch,
+    StrictCatalogPairEvidence, StrictCatalogPairResult, StrictCatalogRefusal,
 };
 pub use asset::{PhotoAsset, VersionsMap};
 pub use library::PhotoLibrary;

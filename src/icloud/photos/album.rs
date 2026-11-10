@@ -38,7 +38,8 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) use lookup::{
     ProviderLookupError, ProviderRecordId, RecordLookupRequest, RecordResolution,
-    RecordResolutionBatch,
+    RecordResolutionBatch, StrictCatalogPairEvidence, StrictCatalogPairResult,
+    StrictCatalogRefusal,
 };
 #[cfg(test)]
 pub(crate) use test_support::StubSession;
