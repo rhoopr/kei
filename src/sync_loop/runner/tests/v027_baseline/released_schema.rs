@@ -5376,6 +5376,7 @@ async fn exercise_stock28_old_debt(
     capture_rows: usize,
     catalog: Stock28Catalog,
 ) {
+    let fixture_start = std::time::Instant::now();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("photos");
     let protected = root.join("protected");
@@ -5541,6 +5542,13 @@ async fn exercise_stock28_old_debt(
         }
     }
     let legacy_rows = released_rows(&source, &columns);
+    eprintln!(
+        "C04_PHASE setup elapsed_ms={} old_catalog={old_assets} sparse={sparse_rows} protected_capture_retries={capture_rows} old_media_sha256={} sparse_payload_sha256={}",
+        fixture_start.elapsed().as_millis(),
+        old_bytes_sha,
+        sha256_hex(b"[malformed legacy evidence]")
+    );
+    let adoption_start = std::time::Instant::now();
     crate::state::db::account::adopt_legacy(
         &source,
         &db_path,
@@ -5550,6 +5558,10 @@ async fn exercise_stock28_old_debt(
     )
     .await
     .unwrap();
+    eprintln!(
+        "C04_PHASE owned_adoption elapsed_ms={}",
+        adoption_start.elapsed().as_millis()
+    );
     assert_eq!(released_rows(&db_path, &columns), legacy_rows);
 
     let old_snapshot = || {
@@ -5685,6 +5697,7 @@ async fn exercise_stock28_old_debt(
             config.retry.max_retries = 0;
             Arc::new(config)
         };
+        let cycle_start = std::time::Instant::now();
         let result = run_cycle(
             &[&selected],
             &app_config,
@@ -5697,6 +5710,10 @@ async fn exercise_stock28_old_debt(
         )
         .await
         .unwrap();
+        eprintln!(
+            "C04_PHASE run_cycle cycle={cycle} elapsed_ms={}",
+            cycle_start.elapsed().as_millis()
+        );
 
         if catalog == Stock28Catalog::InconclusivePendingDownloads {
             assert_eq!(cycle, 0);
@@ -5774,7 +5791,14 @@ async fn exercise_stock28_old_debt(
                 *modified
             );
         }
-        let completed = db.get_downloaded_page(0, 100).await.unwrap();
+        // Released downloaded rows precede the two newly published rows by
+        // rowid. Keep the proof bounded when the catalogue is large.
+        let offset = if catalog == Stock28Catalog::DownloadedCaptureHistory {
+            u64::try_from(old_assets).unwrap()
+        } else {
+            0
+        };
+        let completed = db.get_downloaded_page(offset, 100).await.unwrap();
         if catalog == Stock28Catalog::InconclusivePendingDownloads {
             let current = completed
                 .iter()
@@ -5820,6 +5844,10 @@ async fn exercise_stock28_old_debt(
         }
     }
     server.verify().await;
+    eprintln!(
+        "C04_PHASE fixture_total elapsed_ms={}",
+        fixture_start.elapsed().as_millis()
+    );
 }
 
 #[tokio::test]
@@ -5847,6 +5875,23 @@ async fn released_stock28_inconclusive_pending_downloads_remain_partial() {
                 4,
                 8,
                 Stock28Catalog::InconclusivePendingDownloads,
+            )),
+        )
+        .await;
+}
+
+/// Synthetic stock-28 scale probe; not reporter data or a backlog-repair test.
+#[tokio::test]
+#[ignore = "representative optimized cost probe; run explicitly and measure externally"]
+async fn released_stock28_representative_first_adoption_cost() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(
+            true,
+            Box::pin(exercise_stock28_old_debt(
+                61_098,
+                481,
+                2,
+                Stock28Catalog::DownloadedCaptureHistory,
             )),
         )
         .await;
