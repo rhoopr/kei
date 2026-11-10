@@ -53,6 +53,9 @@ struct RetainedSession {
     inventories: Arc<AtomicUsize>,
     retained: Arc<AtomicUsize>,
     injected: Arc<AtomicBool>,
+    priming: bool,
+    reject_historical: bool,
+    historical_rejected: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -60,6 +63,16 @@ impl PhotosSession for RetainedSession {
     async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
         self.requests.fetch_add(1, Ordering::SeqCst);
         let request: Value = serde_json::from_str(&body)?;
+        if url.ends_with("/zones/list") {
+            return Ok(
+                json!({"zones":[{"zoneID":{"zoneName":ZONE,"ownerRecordName":"_defaultOwner"},"syncToken":"fresh-source-anchor","deleted":false}]}),
+            );
+        }
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(
+                json!({"records":[{"recordName":"index-state","recordType":"CheckIndexingState","fields":{"state":{"value":"FINISHED"}}}]}),
+            );
+        }
         if url.contains("/internal/records/query/batch?") {
             return Ok(album_count_response((self.records.len() / 2) as u64));
         }
@@ -122,6 +135,12 @@ impl PhotosSession for RetainedSession {
             "unexpected retained fixture request"
         );
         let token = request["zones"][0]["syncToken"].as_str();
+        if self.reject_historical && token == Some("fresh-source-anchor") {
+            self.historical_rejected.fetch_add(1, Ordering::SeqCst);
+            return Ok(
+                json!({"zones": [{"zoneID":{"zoneName":ZONE,"ownerRecordName":"_defaultOwner"},"serverErrorCode":"BAD_REQUEST","syncToken":"","moreComing":false}]}),
+            );
+        }
         if token == Some(PRIOR) {
             self.retained.fetch_add(1, Ordering::SeqCst);
             if self.reject_prior {
@@ -140,7 +159,7 @@ impl PhotosSession for RetainedSession {
         };
         Ok(json!({"zones": [{
             "zoneID": {"zoneName": ZONE, "ownerRecordName": "_defaultOwner"},
-            "syncToken": if token.is_none() {"fresh-source-anchor"} else {"validated-old-replay"},
+            "syncToken": if token.is_none() {"fresh-source-anchor"} else if self.priming {PRIOR} else {"validated-old-replay"},
             "moreComing": false, "records": records
         }]}))
     }
@@ -205,6 +224,13 @@ impl Fixture {
     async fn new_with_owner(
         trigger: Trigger,
         owner: Option<&state::db::account::AccountOwner>,
+    ) -> Self {
+        Self::new_with_owner_and_priming(trigger, owner, false).await
+    }
+    async fn new_with_owner_and_priming(
+        trigger: Trigger,
+        owner: Option<&state::db::account::AccountOwner>,
+        priming: bool,
     ) -> Self {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
@@ -376,9 +402,11 @@ impl Fixture {
             } else {
                 download::compute_config_hash(&make_run_cycle_config())
             };
-            db.set_metadata(ENUM_CONFIG_HASH_KEY, &hash).await.unwrap();
-            db.set_metadata(CURSOR_KEY, PRIOR).await.unwrap();
-            if trigger == Trigger::Sparse {
+            if !priming {
+                db.set_metadata(ENUM_CONFIG_HASH_KEY, &hash).await.unwrap();
+                db.set_metadata(CURSOR_KEY, PRIOR).await.unwrap();
+            }
+            if trigger == Trigger::Sparse && !priming {
                 seed_sparse(&db, "private-source").await;
                 let evidence = state::SparseEvidence::new(
                     r#"[1,"prior-deleted-child","SharedSync-absent","private-owner"]"#.to_owned(),
@@ -513,8 +541,849 @@ impl Fixture {
             inventories: Arc::new(AtomicUsize::new(0)),
             retained: Arc::new(AtomicUsize::new(0)),
             injected: Arc::new(AtomicBool::new(false)),
+            priming: false,
+            reject_historical: false,
+            historical_rejected: Arc::new(AtomicUsize::new(0)),
         }
     }
+}
+
+// Each invocation drops its account-owned database, library, passes and builder
+// before returning. The next cycle opens SQLite without a surviving fixture handle.
+fn owned_sparse_config() -> crate::config::Config {
+    let mut config = make_run_cycle_config();
+    // The fixture resolves exactly one unfiled pass and no named albums.
+    config.filters.selection.albums = crate::selection::AlbumSelector::None;
+    config
+}
+
+async fn owned_sparse_cycle(
+    fixture: &Fixture,
+    owner: &state::db::account::AccountOwner,
+    shared: &crate::auth::SharedSession,
+    provider: RetainedSession,
+) -> crate::sync_cycle::CycleResult {
+    owned_sparse_cycle_with_media(
+        fixture,
+        owner,
+        shared,
+        provider,
+        media_without_photo_downloads(),
+    )
+    .await
+}
+
+async fn owned_sparse_cycle_with_media(
+    fixture: &Fixture,
+    owner: &state::db::account::AccountOwner,
+    shared: &crate::auth::SharedSession,
+    mut provider: RetainedSession,
+    media: crate::config::MediaSelection,
+) -> crate::sync_cycle::CycleResult {
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned(&fixture.database, owner)
+            .await
+            .unwrap(),
+    );
+    let mut source = crate::icloud::photos::PhotoLibrary::new(
+        "https://example.com/database/1/photos/production/private".into(),
+        Arc::new(std::collections::HashMap::new()),
+        Box::new(provider.clone()),
+        Arc::new(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    source.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db.clone(),
+        owner.clone(),
+        "com",
+    ));
+    let mut library = make_run_cycle_library_state_with_album(ZONE, CURSOR_KEY, source.all());
+    library.library = source;
+    let base = make_run_cycle_download_config_builder_with_options(
+        &fixture.media,
+        db.clone(),
+        RunCycleDownloadConfigOptions {
+            media,
+            ..Default::default()
+        },
+    );
+    let builder = |mode, exclude, groups, library| {
+        let mut config = (*base(mode, exclude, groups, library)).clone();
+        config.retry.max_retries = 0;
+        Arc::new(config)
+    };
+    let cancel = std::mem::take(&mut provider.cancel);
+    let mut result = run_cycle(
+        &[&library],
+        &owned_sparse_config(),
+        Some(db.as_ref()),
+        false,
+        &builder,
+        download::DownloadControls::download_hidden(),
+        shared,
+        &cancel,
+    )
+    .await
+    .unwrap();
+    // CycleResult retains pre-tail operational readers for the real runner.
+    // This fixture has inspected the cycle result and does not run that tail.
+    for source in &mut result.sources {
+        source.operational_prework = None;
+    }
+    drop(base);
+    drop(library);
+    assert!(
+        Arc::try_unwrap(db).is_ok(),
+        "all cycle-owned database handles must close before reopen"
+    );
+    result
+}
+
+async fn primed_sparse_fixture(
+    owner: &state::db::account::AccountOwner,
+    shared: &crate::auth::SharedSession,
+    deletion_checkpoint: &str,
+) -> Fixture {
+    primed_sparse_fixture_with_media(
+        owner,
+        shared,
+        deletion_checkpoint,
+        media_without_photo_downloads(),
+    )
+    .await
+}
+
+async fn primed_sparse_fixture_with_media(
+    owner: &state::db::account::AccountOwner,
+    shared: &crate::auth::SharedSession,
+    deletion_checkpoint: &str,
+    media: crate::config::MediaSelection,
+) -> Fixture {
+    let mut fixture = Fixture::new_with_owner_and_priming(Trigger::Sparse, Some(owner), true).await;
+    let mut provider = fixture.session(false, Fault::None, CancellationToken::new());
+    provider.priming = true;
+    let primed = owned_sparse_cycle_with_media(&fixture, owner, shared, provider, media).await;
+    assert!(
+        primed.db_sync_token_advance_safe,
+        "starting baseline must complete: {primed:?}"
+    );
+    seed_original_sparse_history(&mut fixture, owner, deletion_checkpoint).await;
+    fixture
+}
+
+async fn seed_original_sparse_history(
+    fixture: &mut Fixture,
+    owner: &state::db::account::AccountOwner,
+    deletion_checkpoint: &str,
+) {
+    {
+        let db = state::SqliteStateDb::open_owned(&fixture.database, owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_metadata(CURSOR_KEY).await.unwrap().as_deref(),
+            Some(PRIOR)
+        );
+        seed_sparse(&db, "private-source").await;
+        let evidence = state::SparseEvidence::new(
+            r#"[1,"prior-deleted-child","SharedSync-absent","private-owner"]"#.to_owned(),
+        );
+        let row = db
+            .observe_sparse_identity(
+                ZONE,
+                &state::SparseSourceId::new("prior-deleted-source"),
+                &evidence,
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        db.record_sparse_attempt(
+            &row,
+            state::SparseAttemptOutcome::SourceDeleted(
+                state::SparseDeletionCheckpoint::new(deletion_checkpoint).unwrap(),
+            ),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        // This is the original retained-recovery fixture's synthetic history,
+        // not a new source receipt or an authenticated deletion observation.
+        db.acquire_lock("defer saved deletion uncertainty").unwrap().execute(
+            "UPDATE unresolved_sparse_identities SET next_retry_at=?1 WHERE library='PrimarySync' AND source_record_name='prior-deleted-source'", [chrono::Utc::now().timestamp()+3600]
+        ).unwrap();
+    }
+    fixture.original_sparse = rows(
+        &fixture.database,
+        "SELECT * FROM unresolved_sparse_identities ORDER BY library,source_record_name",
+    );
+    fixture.assert_preserved();
+}
+
+#[tokio::test]
+async fn retained_main_rejection_with_sparse_debt_is_bounded_across_closed_reopens() {
+    use sha2::{Digest, Sha256};
+    let owner = run_cycle_account_owner();
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let fixture = primed_sparse_fixture(&owner, &shared, PRIOR).await;
+    let mut saved_hold = None;
+    let mut saved_rounds = None;
+    let mut saved_catalog_debt = None;
+    let active_metadata = rows(
+        &fixture.database,
+        "SELECT key,value FROM metadata WHERE key IN ('sync_token:v27:PrimarySync','observed_selection:v27:PrimarySync','enum_config_hash','config_hash') ORDER BY key",
+    );
+    for cycle in 0..3 {
+        let provider = fixture.session(true, Fault::None, CancellationToken::new());
+        let result = owned_sparse_cycle(&fixture, &owner, &shared, provider.clone()).await;
+        assert!(
+            !result.db_sync_token_advance_safe,
+            "cycle {cycle}: {result:?}"
+        );
+        let db = state::SqliteStateDb::open_owned(&fixture.database, &owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_metadata(CURSOR_KEY).await.unwrap().as_deref(),
+            Some(PRIOR)
+        );
+        let raw = db
+            .get_metadata(HOLD_KEY)
+            .await
+            .unwrap()
+            .expect("typed main rejection must retain a bounded hold");
+        let hold: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            hold["prior_cursor_sha256"],
+            data_encoding::HEXLOWER.encode(&Sha256::digest(PRIOR))
+        );
+        assert_eq!(
+            hold["enum_config_hash"],
+            download::compute_config_hash(&owned_sparse_config())
+        );
+        assert_eq!(hold["attempt_count"], 1);
+        assert!(hold["next_attempt_at"].as_i64().unwrap() > chrono::Utc::now().timestamp());
+        if let Some(previous) = &saved_hold {
+            assert_eq!(&raw, previous, "not-due cycles cannot change the hold");
+            assert_eq!(provider.retained.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.queries.load(Ordering::SeqCst), 0);
+        } else {
+            assert!(
+                provider.retained.load(Ordering::SeqCst) > 0,
+                "main rejection must be reached"
+            );
+            assert!(
+                provider.queries.load(Ordering::SeqCst) > 0,
+                "fresh replacement inventory must run"
+            );
+            saved_hold = Some(raw);
+        }
+        drop(db);
+        assert_eq!(
+            rows(
+                &fixture.database,
+                "SELECT key,value FROM metadata WHERE key IN ('sync_token:v27:PrimarySync','observed_selection:v27:PrimarySync','enum_config_hash','config_hash') ORDER BY key"
+            ),
+            active_metadata
+        );
+        let rounds = rows(
+            &fixture.database,
+            "SELECT id,mode,phase,boundary FROM source_revalidation_rounds ORDER BY id",
+        );
+        let debt = rows(
+            &fixture.database,
+            "SELECT round,id,next_retry_at FROM source_revalidation_debt ORDER BY round,id",
+        );
+        if let Some(expected) = &saved_rounds {
+            assert_eq!(
+                &rounds, expected,
+                "not-due cycles cannot replace or activate the fresh origin"
+            );
+            assert_eq!(
+                Some(&debt),
+                saved_catalog_debt.as_ref(),
+                "not-due cycles cannot clear catalog debt"
+            );
+        } else {
+            assert!(
+                rounds.iter().any(|row| row.get(1)
+                    == Some(&rusqlite::types::Value::Text("catalog_v2".into()))
+                    && row.get(2) == Some(&rusqlite::types::Value::Text("observing".into()))),
+                "replacement origin must remain observing"
+            );
+            saved_rounds = Some(rounds);
+            saved_catalog_debt = Some(debt);
+        }
+        assert_eq!(
+            rows(
+                &fixture.database,
+                "SELECT * FROM unresolved_sparse_identities ORDER BY library,source_record_name"
+            ),
+            fixture.original_sparse
+        );
+        fixture.assert_preserved();
+    }
+    for attempt in 2..=3 {
+        {
+            let db = state::SqliteStateDb::open_owned(&fixture.database, &owner)
+                .await
+                .unwrap();
+            let mut hold: Value =
+                serde_json::from_str(&db.get_metadata(HOLD_KEY).await.unwrap().unwrap()).unwrap();
+            assert_eq!(hold["attempt_count"], attempt - 1);
+            // Exercise the existing hold's due boundary without waiting an hour.
+            hold["next_attempt_at"] = json!(0);
+            db.set_metadata(HOLD_KEY, &hold.to_string()).await.unwrap();
+        }
+        let provider = fixture.session(true, Fault::None, CancellationToken::new());
+        let result = owned_sparse_cycle(&fixture, &owner, &shared, provider.clone()).await;
+        assert!(
+            !result.db_sync_token_advance_safe,
+            "due attempt {attempt}: {result:?}"
+        );
+        assert!(
+            provider.queries.load(Ordering::SeqCst) > 0,
+            "due attempt must resume fresh inventory"
+        );
+        let db = state::SqliteStateDb::open_owned(&fixture.database, &owner)
+            .await
+            .unwrap();
+        let raw = db.get_metadata(HOLD_KEY).await.unwrap().unwrap();
+        let hold: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(hold["attempt_count"], attempt);
+        assert_eq!(
+            hold["prior_cursor_sha256"],
+            data_encoding::HEXLOWER.encode(&Sha256::digest(PRIOR))
+        );
+        assert!(hold["next_attempt_at"].as_i64().unwrap() > chrono::Utc::now().timestamp());
+        assert_eq!(
+            db.get_metadata(CURSOR_KEY).await.unwrap().as_deref(),
+            Some(PRIOR)
+        );
+        drop(db);
+        assert_eq!(
+            rows(
+                &fixture.database,
+                "SELECT key,value FROM metadata WHERE key IN ('sync_token:v27:PrimarySync','observed_selection:v27:PrimarySync','enum_config_hash','config_hash') ORDER BY key"
+            ),
+            active_metadata
+        );
+        assert_eq!(
+            rows(
+                &fixture.database,
+                "SELECT * FROM unresolved_sparse_identities ORDER BY library,source_record_name"
+            ),
+            fixture.original_sparse
+        );
+        fixture.assert_preserved();
+    }
+    let exhausted = {
+        let db = state::SqliteStateDb::open_owned(&fixture.database, &owner)
+            .await
+            .unwrap();
+        let mut hold: Value =
+            serde_json::from_str(&db.get_metadata(HOLD_KEY).await.unwrap().unwrap()).unwrap();
+        hold["next_attempt_at"] = json!(0);
+        let raw = hold.to_string();
+        db.set_metadata(HOLD_KEY, &raw).await.unwrap();
+        raw
+    };
+    let provider = fixture.session(true, Fault::None, CancellationToken::new());
+    let result = owned_sparse_cycle(&fixture, &owner, &shared, provider.clone()).await;
+    assert!(!result.db_sync_token_advance_safe);
+    assert_eq!(provider.retained.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.queries.load(Ordering::SeqCst), 0);
+    let db = state::SqliteStateDb::open_owned(&fixture.database, &owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_metadata(HOLD_KEY).await.unwrap().as_deref(),
+        Some(exhausted.as_str())
+    );
+    assert_eq!(
+        db.get_metadata(CURSOR_KEY).await.unwrap().as_deref(),
+        Some(PRIOR)
+    );
+    drop(db);
+    assert_eq!(
+        rows(
+            &fixture.database,
+            "SELECT * FROM unresolved_sparse_identities ORDER BY library,source_record_name"
+        ),
+        fixture.original_sparse
+    );
+    fixture.assert_preserved();
+}
+
+#[tokio::test]
+async fn retained_main_hold_write_failure_is_visible_without_checkpoint_promotion() {
+    let owner = run_cycle_account_owner();
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let fixture = primed_sparse_fixture(&owner, &shared, PRIOR).await;
+    {
+        let db = state::SqliteStateDb::open_owned(&fixture.database, &owner)
+            .await
+            .unwrap();
+        db.acquire_lock("inject hold write failure").unwrap().execute_batch(
+            "CREATE TRIGGER retained_hold_fault BEFORE INSERT ON metadata WHEN NEW.key='retained_checkpoint_hold:v27:PrimarySync' BEGIN SELECT RAISE(ABORT,'injected hold write failure'); END;"
+        ).unwrap();
+    }
+    let provider = fixture.session(true, Fault::None, CancellationToken::new());
+    let result = owned_sparse_cycle(&fixture, &owner, &shared, provider.clone()).await;
+    assert!(provider.retained.load(Ordering::SeqCst) > 0);
+    assert!(!result.db_sync_token_advance_safe);
+    assert!(
+        result.stats.state_write_failures > 0,
+        "failed hold write must be visible: {result:?}"
+    );
+    let db = state::SqliteStateDb::open_owned(&fixture.database, &owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_metadata(CURSOR_KEY).await.unwrap().as_deref(),
+        Some(PRIOR)
+    );
+    assert!(db.get_metadata(HOLD_KEY).await.unwrap().is_none());
+    drop(db);
+    assert_eq!(
+        rows(
+            &fixture.database,
+            "SELECT * FROM unresolved_sparse_identities ORDER BY library,source_record_name"
+        ),
+        fixture.original_sparse
+    );
+    fixture.assert_preserved();
+}
+
+#[tokio::test]
+async fn retained_historical_sparse_rejection_alone_does_not_create_main_hold() {
+    let owner = run_cycle_account_owner();
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let fixture = primed_sparse_fixture(&owner, &shared, "fresh-source-anchor").await;
+    let mut provider = fixture.session(false, Fault::None, CancellationToken::new());
+    provider.reject_historical = true;
+    let result = owned_sparse_cycle(&fixture, &owner, &shared, provider.clone()).await;
+    assert!(
+        provider.retained.load(Ordering::SeqCst) > 0,
+        "valid main token must be requested"
+    );
+    assert!(
+        provider.historical_rejected.load(Ordering::SeqCst) > 0,
+        "different historical deletion token must be rejected"
+    );
+    assert!(
+        !result.db_sync_token_advance_safe,
+        "unresolved identity remains held: {result:?}"
+    );
+    let db = state::SqliteStateDb::open_owned(&fixture.database, &owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_metadata(CURSOR_KEY).await.unwrap().as_deref(),
+        Some(PRIOR)
+    );
+    assert!(
+        db.get_metadata(HOLD_KEY).await.unwrap().is_none(),
+        "historical rejection is not a main rejection"
+    );
+    drop(db);
+    assert_eq!(
+        rows(
+            &fixture.database,
+            "SELECT * FROM unresolved_sparse_identities ORDER BY library,source_record_name"
+        ),
+        fixture.original_sparse
+    );
+    fixture.assert_preserved();
+}
+
+#[derive(Clone)]
+struct HeldRetryBytes {
+    allow: Arc<AtomicBool>,
+    calls: Arc<AtomicUsize>,
+    bytes: Arc<Vec<u8>>,
+}
+
+impl wiremock::Respond for HeldRetryBytes {
+    fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.allow.load(Ordering::SeqCst) {
+            wiremock::ResponseTemplate::new(200).set_body_bytes(self.bytes.as_slice())
+        } else {
+            wiremock::ResponseTemplate::new(404)
+        }
+    }
+}
+
+#[tokio::test]
+async fn retained_main_hold_allows_due_admitted_media_retry_without_source_replay() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+
+    let owner = run_cycle_account_owner();
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let media = crate::config::MediaSelection::all();
+    let fixture = primed_sparse_fixture_with_media(&owner, &shared, PRIOR, media).await;
+    let allow = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/retry.jpg"))
+        .respond_with(HeldRetryBytes {
+            allow: allow.clone(),
+            calls: calls.clone(),
+            bytes: Arc::new(fixture.bytes.clone()),
+        })
+        .mount(&server)
+        .await;
+    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&fixture.bytes));
+    let page = full_album_page_with_download(
+        ZONE,
+        "retry-new",
+        "unused-rank",
+        &format!("{}/retry.jpg", server.uri()),
+        fixture.bytes.len() as u64,
+        &checksum,
+    );
+    let records = Arc::new(page["records"].as_array().unwrap().clone());
+    let mut provider = fixture.session(true, Fault::None, CancellationToken::new());
+    provider.records = records.clone();
+    let first =
+        owned_sparse_cycle_with_media(&fixture, &owner, &shared, provider.clone(), media).await;
+    assert!(
+        provider.retained.load(Ordering::SeqCst) > 0,
+        "the main rejection must be reached"
+    );
+    assert!(
+        !first.db_sync_token_advance_safe,
+        "the sparse identity remains held: {first:?}"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) > 0,
+        "the admitted media must actually fail first"
+    );
+    let initial_calls = calls.load(Ordering::SeqCst);
+    let hold = {
+        let db = state::SqliteStateDb::open_owned(&fixture.database, &owner)
+            .await
+            .unwrap();
+        {
+            let conn = db.acquire_lock("inspect admitted failed media").unwrap();
+            let (admitted, verified): (i64, i64) = conn.query_row(
+                "SELECT admitted,verified_media FROM provider_active_destinations WHERE child='asset-retry-new'", [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!((admitted, verified), (1, 0));
+        }
+        let hold = db
+            .get_metadata(HOLD_KEY)
+            .await
+            .unwrap()
+            .expect("rejected main cursor must be held");
+        assert_eq!(
+            db.get_metadata(CURSOR_KEY).await.unwrap().as_deref(),
+            Some(PRIOR)
+        );
+        db.make_selection_retry_due(owner.clone(), "asset-retry-new".to_owned())
+            .await
+            .unwrap();
+        hold
+    };
+    allow.store(true, Ordering::SeqCst);
+    let mut provider = fixture.session(true, Fault::None, CancellationToken::new());
+    provider.records = records;
+    let retried =
+        owned_sparse_cycle_with_media(&fixture, &owner, &shared, provider.clone(), media).await;
+    assert!(
+        !retried.db_sync_token_advance_safe,
+        "media retry cannot promote the source checkpoint"
+    );
+    assert_eq!(
+        provider.queries.load(Ordering::SeqCst),
+        0,
+        "backoff must not repeat inventory"
+    );
+    assert_eq!(
+        provider.retained.load(Ordering::SeqCst),
+        0,
+        "backoff must not replay the rejected source"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) > initial_calls,
+        "the due admitted media must retry: {retried:?}"
+    );
+    let db = state::SqliteStateDb::open_owned(&fixture.database, &owner)
+        .await
+        .unwrap();
+    {
+        let conn = db.acquire_lock("inspect verified retry").unwrap();
+        let (admitted, verified): (i64, i64) = conn.query_row(
+            "SELECT admitted,verified_media FROM provider_active_destinations WHERE child='asset-retry-new'", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!((admitted, verified), (1, 1));
+        let local: String = conn.query_row("SELECT local_path FROM assets WHERE library=?1 AND id='asset-retry-new' AND version_size='original'", [ZONE], |row| row.get(0)).unwrap();
+        assert_eq!(std::fs::read(local).unwrap(), fixture.bytes);
+    }
+    assert_eq!(
+        db.get_metadata(CURSOR_KEY).await.unwrap().as_deref(),
+        Some(PRIOR)
+    );
+    assert_eq!(
+        db.get_metadata(HOLD_KEY).await.unwrap().as_deref(),
+        Some(hold.as_str())
+    );
+    drop(db);
+    assert_eq!(
+        rows(
+            &fixture.database,
+            "SELECT * FROM unresolved_sparse_identities ORDER BY library,source_record_name"
+        ),
+        fixture.original_sparse
+    );
+    fixture.assert_preserved();
+}
+
+const HELD_PEER: &str = "SharedSync-retained-peer";
+
+#[derive(Clone)]
+struct HeldPeerSession {
+    step: usize,
+    changes: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for HeldPeerSession {
+    async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
+        let request: Value = serde_json::from_str(&body)?;
+        let zone = json!({"zoneName":HELD_PEER,"ownerRecordName":"synthetic-peer-owner"});
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(
+                json!({"records":[{"recordName":"index-state","recordType":"CheckIndexingState","fields":{"state":{"value":"FINISHED"}}}]}),
+            );
+        }
+        if url.ends_with("/zones/list") {
+            return Ok(
+                json!({"zones":[{"zoneID":zone,"syncToken":"peer-baseline","deleted":false}]}),
+            );
+        }
+        if url.contains("/internal/records/query/batch?") {
+            return Ok(album_count_response(0));
+        }
+        if url.contains("/records/query?") {
+            return Ok(json!({"records":[],"syncToken":"peer-rank"}));
+        }
+        if url.contains("/changes/zone?") {
+            self.changes.fetch_add(1, Ordering::SeqCst);
+            return Ok(
+                json!({"zones":[{"zoneID":zone,"records":[],"syncToken":format!("peer-after-{}", self.step),"moreComing":false}]}),
+            );
+        }
+        anyhow::bail!("unexpected synthetic peer endpoint")
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+async fn owned_held_pair_cycle(
+    fixture: &Fixture,
+    owner: &state::db::account::AccountOwner,
+    shared: &crate::auth::SharedSession,
+    mut provider: RetainedSession,
+    peer: HeldPeerSession,
+) -> crate::sync_cycle::CycleResult {
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned(&fixture.database, owner)
+            .await
+            .unwrap(),
+    );
+    let mut primary = crate::icloud::photos::PhotoLibrary::new(
+        "https://example.com/database/1/photos/production/private".into(),
+        Arc::new(std::collections::HashMap::new()),
+        Box::new(provider.clone()),
+        Arc::new(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    primary.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db.clone(),
+        owner.clone(),
+        "com",
+    ));
+    let mut other = crate::icloud::photos::PhotoLibrary::new(
+        "https://example.com/database/1/photos/production/shared".into(),
+        Arc::new(std::collections::HashMap::new()),
+        Box::new(peer),
+        Arc::new(json!({"zoneName":HELD_PEER,"ownerRecordName":"synthetic-peer-owner"})),
+        "shared".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    other.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db.clone(),
+        owner.clone(),
+        "com",
+    ));
+    let mut first = make_run_cycle_library_state_with_album(ZONE, CURSOR_KEY, primary.all());
+    first.library = primary;
+    let mut second = make_run_cycle_library_state_with_album(
+        HELD_PEER,
+        &format!("sync_token:v27:{HELD_PEER}"),
+        other.all(),
+    );
+    second.library = other;
+    let base = make_run_cycle_download_config_builder_with_options(
+        &fixture.media,
+        db.clone(),
+        RunCycleDownloadConfigOptions {
+            media: media_without_photo_downloads(),
+            ..Default::default()
+        },
+    );
+    let builder = |mode, exclude, groups, library| {
+        let mut config = (*base(mode, exclude, groups, library)).clone();
+        config.retry.max_retries = 0;
+        Arc::new(config)
+    };
+    let cancel = std::mem::take(&mut provider.cancel);
+    let mut result = run_cycle(
+        &[&first, &second],
+        &owned_sparse_config(),
+        Some(db.as_ref()),
+        false,
+        &builder,
+        download::DownloadControls::download_hidden(),
+        shared,
+        &cancel,
+    )
+    .await
+    .unwrap();
+    for source in &mut result.sources {
+        source.operational_prework = None;
+    }
+    drop(base);
+    drop(first);
+    drop(second);
+    assert!(
+        Arc::try_unwrap(db).is_ok(),
+        "all pair-cycle database handles must close"
+    );
+    result
+}
+
+#[tokio::test]
+async fn retained_main_backoff_does_not_block_healthy_peer_progress() {
+    let owner = run_cycle_account_owner();
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let mut fixture =
+        Fixture::new_with_owner_and_priming(Trigger::Sparse, Some(&owner), true).await;
+    let mut primary = fixture.session(false, Fault::None, CancellationToken::new());
+    primary.priming = true;
+    let primed = owned_held_pair_cycle(
+        &fixture,
+        &owner,
+        &shared,
+        primary,
+        HeldPeerSession {
+            step: 0,
+            changes: Arc::new(AtomicUsize::new(0)),
+        },
+    )
+    .await;
+    assert!(
+        primed.db_sync_token_advance_safe,
+        "both production baselines must complete: {primed:?}"
+    );
+    seed_original_sparse_history(&mut fixture, &owner, PRIOR).await;
+    let primary = fixture.session(true, Fault::None, CancellationToken::new());
+    let peer_changes = Arc::new(AtomicUsize::new(0));
+    let held = owned_held_pair_cycle(
+        &fixture,
+        &owner,
+        &shared,
+        primary.clone(),
+        HeldPeerSession {
+            step: 1,
+            changes: peer_changes.clone(),
+        },
+    )
+    .await;
+    assert!(!held.db_sync_token_advance_safe);
+    assert!(primary.retained.load(Ordering::SeqCst) > 0);
+    assert!(
+        peer_changes.load(Ordering::SeqCst) > 0,
+        "healthy peer must run while the source becomes held"
+    );
+    let first_hold = {
+        let db = state::SqliteStateDb::open_owned(&fixture.database, &owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_metadata(&format!("sync_token:v27:{HELD_PEER}"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("peer-after-1")
+        );
+        db.get_metadata(HOLD_KEY)
+            .await
+            .unwrap()
+            .expect("primary hold")
+    };
+    let primary = fixture.session(true, Fault::None, CancellationToken::new());
+    let peer_changes = Arc::new(AtomicUsize::new(0));
+    let deferred = owned_held_pair_cycle(
+        &fixture,
+        &owner,
+        &shared,
+        primary.clone(),
+        HeldPeerSession {
+            step: 2,
+            changes: peer_changes.clone(),
+        },
+    )
+    .await;
+    assert!(!deferred.db_sync_token_advance_safe);
+    assert_eq!(primary.retained.load(Ordering::SeqCst), 0);
+    assert_eq!(primary.queries.load(Ordering::SeqCst), 0);
+    assert!(
+        peer_changes.load(Ordering::SeqCst) > 0,
+        "healthy peer must continue during backoff"
+    );
+    let db = state::SqliteStateDb::open_owned(&fixture.database, &owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_metadata(CURSOR_KEY).await.unwrap().as_deref(),
+        Some(PRIOR)
+    );
+    assert_eq!(
+        db.get_metadata(HOLD_KEY).await.unwrap().as_deref(),
+        Some(first_hold.as_str())
+    );
+    assert_eq!(
+        db.get_metadata(&format!("sync_token:v27:{HELD_PEER}"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("peer-after-2")
+    );
+    drop(db);
+    assert_eq!(
+        rows(
+            &fixture.database,
+            "SELECT * FROM unresolved_sparse_identities ORDER BY library,source_record_name"
+        ),
+        fixture.original_sparse
+    );
+    fixture.assert_preserved();
 }
 
 #[tokio::test]
@@ -595,11 +1464,9 @@ async fn retained_checkpoint_expiry_holds_all_trigger_classes_and_quiet_reopen()
                 db.get_metadata(ENUM_CONFIG_HASH_KEY).await.unwrap(),
                 old_hash
             );
-            let raw = db
-                .get_metadata(HOLD_KEY)
-                .await
-                .unwrap()
-                .expect("expired retained replay must create a durable hold");
+            let raw = db.get_metadata(HOLD_KEY).await.unwrap().unwrap_or_else(|| {
+                panic!("expired retained replay must create a durable hold: {trigger:?} cycle {cycle}: {result:?}")
+            });
             let hold: Value = serde_json::from_str(&raw).unwrap();
             assert_eq!(hold["version"], 1);
             assert_eq!(

@@ -66,8 +66,19 @@ impl PhotosSession for SourceSession {
             if self.primary && self.phase > 0 {
                 self.events.lock().unwrap().push("fresh-boundary");
             }
+            let fresh = if self.phase > 1
+                && matches!(
+                    self.fault,
+                    OriginFault::RepeatBridge
+                        | OriginFault::RankChange
+                        | OriginFault::CheckpointGuard
+                ) {
+                "later-primary-boundary"
+            } else {
+                "fresh-primary"
+            };
             return Ok(
-                json!({"zones":[{"zoneID":source,"syncToken":if self.phase > 0 && self.primary {"fresh-primary".to_owned()} else {format!("{name}-boundary")},"deleted":false}]}),
+                json!({"zones":[{"zoneID":source,"syncToken":if self.phase > 0 && self.primary {fresh.to_owned()} else {format!("{name}-boundary")},"deleted":false}]}),
             );
         }
         if url.contains("/internal/records/query/batch") {
@@ -363,6 +374,23 @@ async fn exercise_expiry(fault: OriginFault) {
                 .await
                 .unwrap(),
         );
+        if phase == 2 && interrupted {
+            // The real first attempt created the bounded hold. Move only its
+            // deadline to the due boundary, without changing its source,
+            // policy binding or attempt count, so the existing recovery and
+            // two quiet reopen oracles exercise the permitted next attempt.
+            let key = format!(
+                "{}{}",
+                crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX,
+                PRIMARY
+            );
+            let mut hold: Value =
+                serde_json::from_str(&db.get_metadata(&key).await.unwrap().unwrap()).unwrap();
+            assert_eq!(hold["attempt_count"], 1);
+            assert!(hold["next_attempt_at"].as_i64().unwrap() > chrono::Utc::now().timestamp());
+            hold["next_attempt_at"] = json!(0);
+            db.set_metadata(&key, &hold.to_string()).await.unwrap();
+        }
         if fault == OriginFault::Write && phase == 1 {
             db.acquire_lock("inject catalog origin write failure").unwrap().execute_batch(
                 "CREATE TRIGGER fail_fresh_catalog_origin BEFORE INSERT ON source_revalidation_rounds WHEN NEW.mode='catalog_v2' BEGIN SELECT RAISE(ABORT,'synthetic catalog write fault'); END;"
@@ -518,6 +546,19 @@ async fn exercise_expiry(fault: OriginFault) {
             return;
         }
         let mut result = result.unwrap();
+        if fault == OriginFault::None {
+            assert!(
+                db.get_metadata(&format!(
+                    "{}{}",
+                    crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX,
+                    PRIMARY
+                ))
+                .await
+                .unwrap()
+                .is_none(),
+                "a completed fresh bridge must not create a retained checkpoint hold"
+            );
+        }
         if confirmed_deletion && phase == 0 {
             let failures = download::drain_pending_metadata_rewrites(
                 db.as_ref(),
@@ -573,6 +614,17 @@ async fn exercise_expiry(fault: OriginFault) {
         }
         if interrupted && phase == 1 {
             assert!(!result.can_advance_database_checkpoint(), "{result:?}");
+            assert!(
+                db.get_metadata(&format!(
+                    "{}{}",
+                    crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX,
+                    PRIMARY
+                ))
+                .await
+                .unwrap()
+                .is_some(),
+                "an incomplete typed main rejection must retain its bounded hold"
+            );
             if matches!(fault, OriginFault::Write | OriginFault::CheckpointGuard) {
                 assert!(result.stats.state_write_failures > 0, "{result:?}");
             }
@@ -988,14 +1040,16 @@ async fn exercise_expiry(fault: OriginFault) {
                         .iter()
                         .filter(|event| **event == "rejected")
                         .count(),
-                    2
+                    if fault == OriginFault::Write { 2 } else { 1 },
+                    "an installed origin must not replay the rejected retained cursor"
                 );
                 assert_eq!(
                     recorded
                         .iter()
                         .filter(|event| **event == "fresh-boundary")
                         .count(),
-                    2
+                    if fault == OriginFault::Write { 2 } else { 1 },
+                    "an installed origin must use its saved boundary, not request a later one"
                 );
             }
             assert!(
@@ -1056,4 +1110,268 @@ async fn exercise_expiry(fault: OriginFault) {
     }
     assert_eq!(published.len(), 4);
     server.verify().await;
+}
+
+const EOF_ZONE: &str = "PrimarySync-eof-bootstrap";
+
+#[derive(Clone)]
+struct EofBootstrapSession {
+    db: Arc<SqliteStateDb>,
+    events: Arc<Mutex<Vec<&'static str>>>,
+    zone: Value,
+    successor: &'static str,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for EofBootstrapSession {
+    async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
+        let request: Value = serde_json::from_str(&body)?;
+        let zone = self.zone.clone();
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(
+                json!({"records":[{"recordName":"index","fields":{"state":{"value":"FINISHED"}}}]}),
+            );
+        }
+        if url.contains("/zones/list") {
+            self.events.lock().unwrap().push("zones-list");
+            return Ok(
+                json!({"zones":[{"zoneID":zone,"syncToken":"initial-boundary","deleted":false}]}),
+            );
+        }
+        if url.contains("/internal/records/query/batch") {
+            let batch: Vec<_> = request["batch"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|_| json!({"records":[{"fields":{"itemCount":{"value":0}}}]}))
+                .collect();
+            return Ok(json!({"batch":batch}));
+        }
+        if url.contains("/records/query?") {
+            if request["query"]["recordType"] == "CPLAlbumByPositionLive" {
+                return Ok(json!({"records":[]}));
+            }
+            let mut events = self.events.lock().unwrap();
+            if events.contains(&"delta-eof") {
+                let conn = self.db.acquire_lock("check EOF census before inventory")?;
+                let observing: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM source_revalidation_rounds WHERE library=?1 AND mode='catalog_v2' AND phase='observing'",
+                    [self.zone["zoneName"].as_str().unwrap()], |row| row.get(0),
+                )?;
+                assert_eq!(observing, 1, "EOF origin must be seeded before inventory");
+                events.push("bootstrap-inventory");
+            } else {
+                events.push("initial-inventory");
+            }
+            return Ok(json!({"records":[],"syncToken":"inventory-page"}));
+        }
+        if url.contains("/changes/zone?") {
+            let token = request["zones"][0]["syncToken"].as_str().unwrap();
+            let mut events = self.events.lock().unwrap();
+            let next = if token == "initial-boundary" {
+                "prior-T"
+            } else if events.contains(&"bootstrap-inventory") && token == self.successor {
+                events.push("bootstrap-bridge");
+                "bridged-final"
+            } else if token == "prior-T" {
+                events.push("delta-eof");
+                self.successor
+            } else if token == "bridged-final" {
+                events.push("quiet-delta");
+                "bridged-final"
+            } else {
+                anyhow::bail!("unexpected synthetic EOF cursor")
+            };
+            return Ok(
+                json!({"zones":[{"zoneID":zone,"records":[],"syncToken":next,"moreComing":false}]}),
+            );
+        }
+        anyhow::bail!("unexpected synthetic EOF endpoint")
+    }
+
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn valid_token_bootstraps_from_actual_eof_and_reopens_quietly() {
+    for (zone_name, database_kind, zone, successor) in [
+        (
+            EOF_ZONE,
+            "private",
+            json!({"zoneName":EOF_ZONE,"ownerRecordName":"_defaultOwner"}),
+            "after-D",
+        ),
+        (
+            EOF_ZONE,
+            "private",
+            json!({"zoneName":EOF_ZONE,"ownerRecordName":"_defaultOwner"}),
+            "prior-T",
+        ),
+        (
+            "SharedSync-eof-bootstrap",
+            "shared",
+            json!({"zoneName":"SharedSync-eof-bootstrap","ownerRecordName":"shared-owner","zoneType":"synthetic-shared-zone"}),
+            "after-D",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let database = dir.path().join("state.db");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+        let mut initial_descriptor = None;
+        for phase in 0..4 {
+            let db = Arc::new(
+                SqliteStateDb::open_owned(&database, &baseline_owner())
+                    .await
+                    .unwrap(),
+            );
+            let mut library = PhotoLibrary::new(
+                format!("https://synthetic.example/database/1/photos/production/{database_kind}"),
+                Arc::default(),
+                Box::new(EofBootstrapSession {
+                    db: db.clone(),
+                    events: events.clone(),
+                    zone: zone.clone(),
+                    successor,
+                }),
+                Arc::new(zone.clone()),
+                database_kind.into(),
+                crate::retry::RetryConfig::default(),
+            )
+            .await
+            .unwrap();
+            library.shadow_capture = Some(ShadowCapture::new(db.clone(), baseline_owner(), "com"));
+            if phase == 0 {
+                db.enroll_sync_epoch(vec![(zone_name.into(), library.baseline_scope())])
+                    .await
+                    .unwrap();
+            }
+            let hidden = library.albums().await.unwrap().remove("Hidden").unwrap();
+            let pass = crate::commands::AlbumPass {
+                kind: PassKind::SmartFolder,
+                album: hidden,
+                exclude_ids: Arc::default(),
+            };
+            let mut state = make_run_cycle_library_state_with_passes(
+                zone_name,
+                &sync_token_key(zone_name),
+                vec![pass],
+            );
+            state.library = library;
+            let builder = make_run_cycle_download_config_builder(&root, db.clone());
+            let result = run_cycle(
+                &[&state],
+                &make_run_cycle_config(),
+                Some(db.as_ref()),
+                false,
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &session,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                !result.session_expired && !result.stats.interrupted,
+                "{result:?}"
+            );
+            if phase == 0 {
+                let raw = db
+                    .get_metadata(&format!("observed_selection:v27:{zone_name}"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let descriptor: Value = serde_json::from_str(&raw).unwrap();
+                assert!(
+                    descriptor.get("revalidation_round").is_none(),
+                    "the initial real baseline must have no catalog link: {:?}",
+                    descriptor.get("revalidation_round")
+                );
+                initial_descriptor = Some(raw);
+                assert_eq!(
+                    db.get_metadata(&sync_token_key(zone_name))
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("prior-T")
+                );
+            }
+            if phase == 1 {
+                let observed = db
+                    .get_metadata(&format!("observed_selection:v27:{zone_name}"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(
+                    Some(&observed),
+                    initial_descriptor.as_ref(),
+                    "the completed delta must persist a new observation even when T equals D"
+                );
+                assert_eq!(
+                    db.get_metadata(&sync_token_key(zone_name))
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some(successor),
+                    "the current checkpoint must be the actual completed EOF"
+                );
+                let conn = db.acquire_lock("verify observed EOF origin").unwrap();
+                let marking: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM source_revalidation_rounds r JOIN metadata m ON m.key LIKE 'baseline_cursor:v27:%' AND m.value=?2 WHERE r.library=?1 AND r.mode='catalog_v2' AND r.phase='marking' AND r.boundary=?3",
+                    rusqlite::params![zone_name, successor, crate::state::db::source_revalidation::CatalogOrigin::boundary(successor)], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(
+                    marking, 1,
+                    "the actual EOF and marking origin must be durable together"
+                );
+            }
+            if phase == 3 {
+                let active: i64 = {
+                    let conn = db.acquire_lock("verify EOF origin after reopen").unwrap();
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM source_revalidation_rounds r JOIN metadata m ON m.key=?2 AND json_extract(m.value,'$.revalidation_round')=r.id WHERE r.library=?1 AND r.mode='catalog_v2' AND r.phase='active'",
+                        rusqlite::params![zone_name, format!("observed_selection:v27:{zone_name}")], |row| row.get(0),
+                    ).unwrap()
+                };
+                assert_eq!(
+                    active, 1,
+                    "actual EOF must lead to a current active catalog origin"
+                );
+                assert_eq!(
+                    db.get_metadata(&sync_token_key(zone_name))
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("bridged-final")
+                );
+            }
+        }
+        let events = events.lock().unwrap();
+        let eof = events
+            .iter()
+            .position(|event| *event == "delta-eof")
+            .unwrap();
+        let inventory = events
+            .iter()
+            .position(|event| *event == "bootstrap-inventory")
+            .unwrap();
+        let bridge = events
+            .iter()
+            .position(|event| *event == "bootstrap-bridge")
+            .unwrap();
+        assert!(eof < inventory && inventory < bridge);
+        assert!(events.contains(&"quiet-delta"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == "zones-list")
+                .count(),
+            1,
+            "EOF bootstrap must not request a replacement boundary"
+        );
+    }
 }

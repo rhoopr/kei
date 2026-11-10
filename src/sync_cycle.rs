@@ -2391,6 +2391,39 @@ pub(crate) async fn run_cycle_with_witness(
                         retry_exhausted = exhausted,
                         "Retained checkpoint evidence is unavailable; preserving history and deferring recovery"
                     );
+                    if deferred
+                        && !is_retry_failed
+                        && !config.runtime.only_print_filenames
+                        && download_controls.run_mode.downloads_files()
+                        && !shutdown_token.is_cancelled()
+                    {
+                        let download_client = shared_session.read().await.download_client().clone();
+                        let retry_config = build_download_config(
+                            download::SyncMode::Full,
+                            Arc::new(rustc_hash::FxHashSet::default()),
+                            Arc::new(download::AssetGroupings::default()),
+                            Arc::from(lib_state.zone_name.as_str()),
+                        );
+                        let retry_config = Arc::new(retry_config.check_ownership().await?);
+                        let _ = retry_due_admitted_while_held(
+                            &download_client,
+                            lib_state,
+                            &config.filters.selection,
+                            all_retry_plans.as_deref(),
+                            retry_config,
+                            download_controls,
+                            shutdown_token,
+                            &mut cycle_stats,
+                            &mut cycle_failed_count,
+                            &mut cycle_session_expired,
+                            &mut db_sync_token_advance_safe,
+                            "retained checkpoint",
+                        )
+                        .await;
+                        if cycle_session_expired || shutdown_token.is_cancelled() {
+                            break;
+                        }
+                    }
                     continue;
                 }
             }
@@ -2556,7 +2589,8 @@ pub(crate) async fn run_cycle_with_witness(
                 &lib_state.sync_token_key,
             )
             .await?;
-        let sync_mode_decision = if indexing_reconciliation || indexing_materialization_pending {
+        let mut sync_mode_decision = if indexing_reconciliation || indexing_materialization_pending
+        {
             SyncModeDecision {
                 mode: download::SyncMode::Full,
                 full_enumeration_reason: Some(download::FullEnumerationReason::OtherStaticReason),
@@ -2733,33 +2767,17 @@ pub(crate) async fn run_cycle_with_witness(
                 else {
                     return Ok(None);
                 };
-                let digest =
-                    state::db::source_revalidation::fresh_catalog_plan_digest(&request.plan);
-                let signals = capture
+                let resume = capture
                     .db
-                    .catalog_pending_signals(capture.owner.clone(), lib_state.zone_name.clone())
+                    .catalog_resume(capture.owner.clone(), request.clone())
                     .await?;
-                let mut matching = signals.iter().filter_map(|signal| {
-                    let origin =
-                        state::db::source_revalidation::CatalogOrigin::parse(&signal.scope).ok()?;
-                    (matches!(signal.phase.as_str(), "marking" | "observing")
-                        && signal.round == origin.nonce
-                        && origin.plan_digest == digest
-                        && origin.epoch == epoch
-                        && origin.attempt == attempt)
-                        .then_some(origin)
-                });
-                let existing = matching.next();
-                anyhow::ensure!(
-                    matching.next().is_none(),
-                    "Ambiguous pending catalog origins"
-                );
-                let (boundary, origin) = if let Some(origin) = existing {
-                    let boundary = request
-                        .expected_baseline
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!("Pending catalog boundary is missing"))?;
-                    (boundary, origin)
+                let (boundary, origin) = if let Some(resume) = resume {
+                    anyhow::ensure!(
+                        resume.relation
+                            == state::db::source_revalidation::CatalogResumeRelation::PendingAttempt,
+                        "Catalog resume is not a pending attempt"
+                    );
+                    (resume.boundary, resume.origin)
                 } else {
                     let boundary = lib_state.library.fresh_baseline_cursor().await?;
                     request.fresh_cursor = boundary.clone();
@@ -2783,16 +2801,6 @@ pub(crate) async fn run_cycle_with_witness(
                 anyhow::ensure!(
                     !shutdown_token.is_cancelled(),
                     "Pending catalog census interrupted"
-                );
-                let signals = capture
-                    .db
-                    .catalog_pending_signals(capture.owner, lib_state.zone_name.clone())
-                    .await?;
-                anyhow::ensure!(
-                    signals.iter().any(|signal| signal.round == origin.nonce
-                        && signal.scope == origin.scope()
-                        && signal.phase == "observing"),
-                    "Pending catalog census is not complete"
                 );
                 Ok(Some((boundary, origin)))
             })
@@ -3104,8 +3112,167 @@ pub(crate) async fn run_cycle_with_witness(
         } else {
             None
         };
+        enum CatalogPrestream {
+            Current,
+            Bootstrap(
+                Box<(
+                    crate::icloud::photos::inbox::ShadowCapture,
+                    state::db::source_revalidation::FreshCatalogOriginRequest,
+                )>,
+            ),
+            Resume {
+                origin: state::db::source_revalidation::CatalogOrigin,
+                boundary: String,
+            },
+        }
+        let mut bootstrap_candidate = None;
+        if matches!(
+            &download_config.sync_mode,
+            download::SyncMode::Incremental { zone_sync_token }
+                if Some(zone_sync_token) == retained_cursor_at_start.as_ref()
+        ) && !force_full_for_config_hash
+            && pending_download_config_hash.is_none()
+            && !lib_state.plan_is_stale
+            && indexing_finished
+            && !indexing_reconciliation
+            && checkpoint_transition_state_safe
+            && !download_config.retry_only
+            && !config.runtime.dry_run
+            && download_controls.run_mode.downloads_files()
+            && let (Some(db), Some(epoch), Some(attempt), Some(token)) = (
+                state_db,
+                expected_epoch.as_deref(),
+                expected_attempt.as_deref(),
+                retained_cursor_at_start.as_deref(),
+            )
+        {
+            let prepared: anyhow::Result<_> = Box::pin(async {
+                anyhow::ensure!(
+                    !lib_state.plan_needs_refresh,
+                    "Current catalog source plan needs refresh"
+                );
+                let (capture, mut request) = capture_catalog_request(
+                    lib_state,
+                    &download_config,
+                    download_controls,
+                    db,
+                    epoch,
+                    attempt,
+                    &baseline_key,
+                    &enum_config_hash,
+                    preservation_config_hash.as_deref(),
+                    &zone_metadata_fence,
+                    &path_metadata_at_start,
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Current catalog source is unavailable"))?;
+                request.fresh_cursor = token.to_owned();
+                let resume = capture
+                    .db
+                    .catalog_resume(capture.owner.clone(), request.clone())
+                    .await?;
+                if let Some(resume) = resume {
+                    anyhow::ensure!(
+                        resume.relation
+                            != state::db::source_revalidation::CatalogResumeRelation::PendingAttempt,
+                        "Current catalog resume unexpectedly belongs to a pending attempt"
+                    );
+                    // Equal token text is not EOF proof. Both relations still
+                    // require a full inventory and a bridge from this boundary.
+                    let origin = resume.origin;
+                    let boundary = resume.boundary;
+                    capture
+                        .db
+                        .seed_source_revalidation(
+                            capture.owner.clone(),
+                            lib_state.zone_name.clone(),
+                            origin.scope(),
+                            enum_config_hash.clone(),
+                            state::db::source_revalidation::CatalogOrigin::boundary(&boundary),
+                            shutdown_token.clone(),
+                        )
+                        .await?;
+                    anyhow::ensure!(!shutdown_token.is_cancelled(), "Catalog census interrupted");
+                    return Ok(CatalogPrestream::Resume { origin, boundary });
+                }
+                match capture
+                    .db
+                    .catalog_bootstrap_eligibility(capture.owner.clone(), request.clone())
+                    .await?
+                {
+                    state::db::source_revalidation::CatalogBootstrapEligibility::CurrentLink
+                    | state::db::source_revalidation::CatalogBootstrapEligibility::CurrentLegacyLink => {
+                        Ok(CatalogPrestream::Current)
+                    }
+                    state::db::source_revalidation::CatalogBootstrapEligibility::AttemptBootstrap => {
+                        Ok(CatalogPrestream::Bootstrap(Box::new((capture, request))))
+                    }
+                }
+            })
+            .await;
+            match prepared {
+                Ok(CatalogPrestream::Current) => {}
+                Ok(CatalogPrestream::Bootstrap(candidate)) => {
+                    bootstrap_candidate = Some(candidate);
+                }
+                Ok(CatalogPrestream::Resume { origin, boundary }) => {
+                    zone_metadata_fence.push((baseline_key.clone(), Some(boundary.clone())));
+                    baseline_cursor_at_start = Some(boundary);
+                    fresh_origin = Some(origin);
+                    Arc::make_mut(&mut download_config).sync_mode = download::SyncMode::Full;
+                    let reason = download::FullEnumerationReason::OtherStaticReason;
+                    sync_mode_decision.full_enumeration_reason = Some(reason);
+                    if let Err(error) = db
+                        .set_metadata(LAST_FULL_ENUMERATION_REASON_KEY, reason.as_str())
+                        .await
+                    {
+                        tracing::debug!(error = %error, "Failed to persist full-enumeration reason");
+                    }
+                    tracing::info!(
+                        zone = %lib_state.zone_name,
+                        full_enumeration_reason = reason.as_str(),
+                        "Resuming the catalog inventory from its observed boundary"
+                    );
+                }
+                Err(error) => {
+                    db_sync_token_advance_safe = false;
+                    path_reconciliation_complete = false;
+                    path_reconciliation_cycle_safe = false;
+                    if shutdown_token.is_cancelled() {
+                        cycle_stats.interrupted = true;
+                        break;
+                    }
+                    if matches!(
+                        error.downcast_ref::<state::error::StateError>(),
+                        Some(
+                            state::error::StateError::Query { .. }
+                                | state::error::StateError::Migration(_)
+                                | state::error::StateError::LockPoisoned(_)
+                                | state::error::StateError::Spawn(_)
+                        )
+                    ) {
+                        cycle_stats.state_write_failures =
+                            cycle_stats.state_write_failures.saturating_add(1);
+                        operational_state_fault = true;
+                    }
+                    record_selected_hold(
+                        &mut library_holds,
+                        &mut cycle_stats,
+                        &lib_state.zone_name,
+                        library_ordinal,
+                        LibraryHoldKind::BaselinePending,
+                        "catalog_bootstrap_unavailable",
+                        "the source checkpoint and local work are retained until catalog evidence is current",
+                        true,
+                    );
+                    continue;
+                }
+            }
+        }
         let mut dispatch_controls = download_controls;
-        dispatch_controls.defer_fallback_to_cycle = fresh_catalog.is_some();
+        dispatch_controls.defer_fallback_to_cycle =
+            fresh_catalog.is_some() || fresh_origin.is_some();
+        let mut retained_main_rejected = false;
         let initial_result = Box::pin(download::download_photos_with_sync(
             &download_client,
             &lib_state.plan.passes,
@@ -3121,6 +3288,9 @@ pub(crate) async fn run_cycle_with_witness(
                     .downcast_ref::<download::FreshBaselineRequired>()
                     .is_some() =>
             {
+                // The rejected interval is owned by the fresh-boundary path,
+                // not by the pre-stream hint for a completed delta.
+                bootstrap_candidate = None;
                 let Some((plan, capture)) = fresh_catalog else {
                     return Err(error);
                 };
@@ -3143,6 +3313,8 @@ pub(crate) async fn run_cycle_with_witness(
                     path_reconciliation_cycle_safe = false;
                     continue;
                 }
+                retained_main_rejected = true;
+                let mut prepared_baseline_fence = None;
                 let prepared: anyhow::Result<_> = Box::pin(async {
                     let db = state_db
                         .ok_or_else(|| anyhow::anyhow!("Fresh catalog requires durable state"))?;
@@ -3169,6 +3341,7 @@ pub(crate) async fn run_cycle_with_witness(
                         }
                     }
                     let expected_baseline = db.get_metadata(&baseline_key).await?;
+                    prepared_baseline_fence = Some(expected_baseline.clone());
                     let snapshot = capture
                         .db
                         .fresh_catalog_snapshot(capture.owner.clone(), lib_state.zone_name.clone())
@@ -3217,6 +3390,7 @@ pub(crate) async fn run_cycle_with_witness(
                         .db
                         .install_fresh_catalog_origin(capture.owner.clone(), request)
                         .await?;
+                    prepared_baseline_fence = Some(Some(boundary.clone()));
                     capture
                         .db
                         .seed_source_revalidation(
@@ -3231,16 +3405,6 @@ pub(crate) async fn run_cycle_with_witness(
                     anyhow::ensure!(
                         !shutdown_token.is_cancelled(),
                         "Fresh catalog census interrupted"
-                    );
-                    let signals = capture
-                        .db
-                        .catalog_pending_signals(capture.owner, lib_state.zone_name.clone())
-                        .await?;
-                    anyhow::ensure!(
-                        signals.iter().any(|signal| signal.round == origin.nonce
-                            && signal.scope == origin.scope()
-                            && signal.phase == "observing"),
-                        "Fresh catalog census is not complete"
                     );
                     Ok((boundary, origin))
                 })
@@ -3271,6 +3435,37 @@ pub(crate) async fn run_cycle_with_witness(
                             cycle_stats.state_write_failures =
                                 cycle_stats.state_write_failures.saturating_add(1);
                             operational_state_fault = true;
+                        }
+                        if let (Some(db), Some(prior), Some(expected_baseline)) = (
+                            state_db,
+                            retained_cursor_at_start.as_deref(),
+                            prepared_baseline_fence,
+                        ) {
+                            let mut hold = RetainedCheckpointHold::new(
+                                prior,
+                                &enum_config_hash,
+                                preservation_config_hash.as_deref(),
+                            );
+                            hold.attempt_count = retained_checkpoint_attempt;
+                            let expected = zone_metadata_fence
+                                .iter()
+                                .cloned()
+                                .chain(path_metadata_at_start.iter().cloned())
+                                .chain([(baseline_key.clone(), expected_baseline)])
+                                .collect();
+                            if let Err(hold_error) = persist_retained_checkpoint_hold(
+                                db,
+                                hold_key.clone(),
+                                &hold,
+                                expected,
+                            )
+                            .await
+                            {
+                                tracing::warn!(error = %hold_error, "Failed to retain rejected main checkpoint hold");
+                                cycle_stats.state_write_failures =
+                                    cycle_stats.state_write_failures.saturating_add(1);
+                                operational_state_fault = true;
+                            }
                         }
                         record_selected_hold(
                             &mut library_holds,
@@ -3830,6 +4025,62 @@ pub(crate) async fn run_cycle_with_witness(
                 }
             };
 
+        // Only the typed rejection of this cycle's active main cursor can
+        // establish this hold. A failed historical sparse validation cannot.
+        // The replacement origin is not completion until its own bridge and
+        // checkpoint proof succeed. Bind the hold to the original cursor, not
+        // the fresh boundary used for the replacement inventory.
+        if retained_main_rejected
+            && let SourceCheckpointDecision::Preserve { reason, recovery } =
+                &mut checkpoint_decision
+            && let (Some(db), Some(prior)) = (state_db, retained_cursor_at_start.as_deref())
+        {
+            let mut hold = RetainedCheckpointHold::new(
+                prior,
+                &enum_config_hash,
+                preservation_config_hash.as_deref(),
+            );
+            hold.attempt_count = retained_checkpoint_attempt;
+            let expected = zone_metadata_fence
+                .iter()
+                .cloned()
+                .chain(path_metadata_at_start.iter().cloned())
+                .collect();
+            if let Err(error) =
+                persist_retained_checkpoint_hold(db, hold_key.clone(), &hold, expected).await
+            {
+                tracing::warn!(error = %error, "Failed to retain rejected main checkpoint hold");
+                sync_result.checkpoint.state_write_failures = sync_result
+                    .checkpoint
+                    .state_write_failures
+                    .saturating_add(1);
+                sync_result.stats.state_write_failures =
+                    sync_result.stats.state_write_failures.saturating_add(1);
+                operational_state_fault = true;
+                if !matches!(
+                    reason,
+                    CheckpointHoldReason::SessionExpired | CheckpointHoldReason::Interrupted
+                ) {
+                    *reason = CheckpointHoldReason::StateNotDurable;
+                    *recovery = RecoveryAction::ReplayFromPriorToken;
+                }
+            } else {
+                if *reason == CheckpointHoldReason::TokenProofIncomplete {
+                    *recovery = RecoveryAction::AwaitRetainedCheckpointEvidence;
+                }
+                record_selected_hold(
+                    &mut library_holds,
+                    &mut cycle_stats,
+                    &lib_state.zone_name,
+                    library_ordinal,
+                    LibraryHoldKind::RetainedCheckpoint,
+                    "retained_checkpoint_expired",
+                    download::sync_token_blocked_explanation("retained_checkpoint_expired"),
+                    true,
+                );
+            }
+        }
+
         if sync_result.stats.sync_token_blocked_reason == Some("retained_checkpoint_expired")
             && let SourceCheckpointDecision::Preserve { reason, .. } = checkpoint_decision
         {
@@ -4017,6 +4268,7 @@ pub(crate) async fn run_cycle_with_witness(
 
         let mut checkpoint_evidence = checkpoint_support_fields(&checkpoint_decision);
         let mut checkpoint_persistence = "no_state_db";
+        let mut advance_write_failed = false;
         match checkpoint_decision {
             SourceCheckpointDecision::Advance { token, basis } => {
                 crate::metrics::record_checkpoint_decision("advanced", basis.as_str());
@@ -4067,6 +4319,7 @@ pub(crate) async fn run_cycle_with_witness(
                             )
                             .await
                         {
+                            advance_write_failed = true;
                             checkpoint_hold_action =
                                 Some(RecoveryAction::ReplayFromPriorToken.as_str());
                             db_sync_token_advance_safe = false;
@@ -4081,7 +4334,8 @@ pub(crate) async fn run_cycle_with_witness(
                             checkpoint_persistence = "staged_reconciliation";
                         }
                     } else {
-                        let mut metadata_updates = vec![(lib_state.sync_token_key.clone(), token)];
+                        let mut metadata_updates =
+                            vec![(lib_state.sync_token_key.clone(), token.clone())];
                         if let Some(recovery_action) = checkpoint_hold_action {
                             metadata_updates.push((
                                 LAST_CHECKPOINT_STATUS_KEY.to_owned(),
@@ -4099,36 +4353,63 @@ pub(crate) async fn run_cycle_with_witness(
                             metadata_updates
                                 .push((LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()));
                         }
-                        if let Err(e) = db
-                            .commit_observation_transition(
-                                state::CheckpointTransition {
-                                    expected_metadata: zone_metadata_fence
-                                        .iter()
-                                        .cloned()
-                                        .chain(path_metadata_at_start.iter().cloned())
-                                        .collect(),
-                                    legacy_preservation_proofs: legacy_proofs,
-                                    legacy_config_hash: preservation_config_hash.clone(),
-                                    sparse_identity_proofs: sync_result
-                                        .checkpoint
-                                        .sparse_identity_proofs
-                                        .clone(),
-                                    metadata_updates,
-                                    metadata_deletes: [(!is_current_zone_checkpoint(
-                                        &lib_state.sync_token_key,
-                                    ))
-                                    .then(|| state::unresolved_identity_key(&lib_state.zone_name))]
-                                    .into_iter()
-                                    .flatten()
-                                    .chain(vec![
-                                        baseline_key.clone(),
-                                        retained_checkpoint_hold_key(&lib_state.zone_name),
-                                        indexing_key.clone(),
-                                        replay_key.clone(),
-                                        materialization_key.clone(),
-                                    ])
-                                    .collect(),
-                                },
+                        let bootstrapping = bootstrap_candidate.is_some();
+                        let transition = state::CheckpointTransition {
+                            expected_metadata: zone_metadata_fence
+                                .iter()
+                                .cloned()
+                                .chain(path_metadata_at_start.iter().cloned())
+                                .collect(),
+                            legacy_preservation_proofs: legacy_proofs,
+                            legacy_config_hash: preservation_config_hash.clone(),
+                            sparse_identity_proofs: sync_result
+                                .checkpoint
+                                .sparse_identity_proofs
+                                .clone(),
+                            metadata_updates,
+                            metadata_deletes: [(!is_current_zone_checkpoint(
+                                &lib_state.sync_token_key,
+                            ))
+                            .then(|| state::unresolved_identity_key(&lib_state.zone_name))]
+                            .into_iter()
+                            .flatten()
+                            // The atomic catalog owner replaces this key after
+                            // validating its pre-stream value.
+                            .chain((!bootstrapping).then(|| baseline_key.clone()))
+                            .chain(vec![
+                                retained_checkpoint_hold_key(&lib_state.zone_name),
+                                indexing_key.clone(),
+                                replay_key.clone(),
+                                materialization_key.clone(),
+                            ])
+                            .collect(),
+                        };
+                        let committed = if let Some(candidate) = bootstrap_candidate {
+                            let (capture, mut request) = *candidate;
+                            request.fresh_cursor = token;
+                            match sync_result.checkpoint.observation.clone() {
+                                Some(proof) if sync_result.checkpoint.completed_delta_replay => {
+                                    let proof = proof
+                                        .with_epoch_attempt(Some(request.expected_attempt.clone()));
+                                    capture
+                                        .db
+                                        .install_catalog_origin_after_delta(
+                                            capture.owner,
+                                            request,
+                                            transition,
+                                            proof,
+                                        )
+                                        .await
+                                        .map(|_| ())
+                                }
+                                _ => Err(state::error::StateError::Invariant {
+                                    operation: "catalog_bootstrap",
+                                    detail: "completed delta observation is unavailable".into(),
+                                }),
+                            }
+                        } else {
+                            db.commit_observation_transition(
+                                transition,
                                 sync_result
                                     .checkpoint
                                     .observation
@@ -4137,13 +4418,30 @@ pub(crate) async fn run_cycle_with_witness(
                                 false,
                             )
                             .await
-                        {
+                        };
+                        if let Err(e) = committed {
+                            advance_write_failed = true;
                             checkpoint_hold_action =
                                 Some(RecoveryAction::ReplayFromPriorToken.as_str());
                             db_sync_token_advance_safe = false;
                             path_reconciliation_cycle_safe = false;
                             tracing::warn!(error = %e, "Failed to store provider checkpoint");
                             checkpoint_persistence = "failed";
+                        } else if bootstrapping {
+                            checkpoint_persistence = "catalog_bootstrap_pending";
+                            db_sync_token_advance_safe = false;
+                            path_reconciliation_complete = false;
+                            path_reconciliation_cycle_safe = false;
+                            record_selected_hold(
+                                &mut library_holds,
+                                &mut cycle_stats,
+                                &lib_state.zone_name,
+                                library_ordinal,
+                                LibraryHoldKind::BaselinePending,
+                                "catalog_bootstrap_pending",
+                                "the observed checkpoint is retained while its catalog inventory and bridge complete",
+                                true,
+                            );
                         } else {
                             checkpoint_persistence = "stored";
                             if cycle_has_stale_plan && !lib_state.plan_is_stale {
@@ -4221,6 +4519,32 @@ pub(crate) async fn run_cycle_with_witness(
                     explanation,
                     "Provider checkpoint preserved; recovery will use the narrowest safe action"
                 );
+            }
+        }
+
+        // A rejected main cursor is not repaired when the fresh proof cannot
+        // commit. The failed checkpoint transaction has rolled back, so the
+        // same captured cursor, baseline and policy fences still apply.
+        if retained_main_rejected
+            && advance_write_failed
+            && let (Some(db), Some(prior)) = (state_db, retained_cursor_at_start.as_deref())
+        {
+            let mut hold = RetainedCheckpointHold::new(
+                prior,
+                &enum_config_hash,
+                preservation_config_hash.as_deref(),
+            );
+            hold.attempt_count = retained_checkpoint_attempt;
+            let expected = zone_metadata_fence
+                .iter()
+                .cloned()
+                .chain(path_metadata_at_start.iter().cloned())
+                .collect();
+            if let Err(error) =
+                persist_retained_checkpoint_hold(db, hold_key.clone(), &hold, expected).await
+            {
+                tracing::warn!(error = %error, "Failed to retain rejected main checkpoint hold after checkpoint failure");
+                operational_state_fault = true;
             }
         }
 

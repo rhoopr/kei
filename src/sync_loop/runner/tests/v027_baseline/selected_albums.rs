@@ -881,6 +881,21 @@ async fn initial_album_confirmation_retry(legacy: bool) {
 /// unrestricted Unfiled pass. Local bytes, paths, and mtimes stay untouched.
 #[tokio::test]
 async fn v027_mixed_shared_hidden_baseline_censuses_preboundary_deleted_live_pair() {
+    mixed_shared_hidden_baseline_census(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"}))
+        .await;
+}
+
+#[tokio::test]
+async fn v027_mixed_shared_hidden_baseline_censuses_distinct_full_zone() {
+    mixed_shared_hidden_baseline_census(json!({
+        "zoneName":ZONE,
+        "ownerRecordName":"synthetic-shared-owner",
+        "zoneType":"synthetic-shared-zone"
+    }))
+    .await;
+}
+
+async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
     use crate::commands::{
         build_collection_context, collection_libraries, pass_scope_for_zone,
         resolve_passes_for_scope, zone_name_set,
@@ -1146,7 +1161,6 @@ async fn v027_mixed_shared_hidden_baseline_censuses_preboundary_deleted_live_pai
         )
     });
 
-    let shared_zone_id = json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"});
     let primary_zone_id = json!({"zoneName":PRIMARY,"ownerRecordName":"_defaultOwner"});
     let shared_current = mixed_pair(
         &shared_zone_id,
@@ -1200,7 +1214,7 @@ async fn v027_mixed_shared_hidden_baseline_censuses_preboundary_deleted_live_pai
         "https://synthetic.example/database/1/photos/production/private".into(),
         Arc::default(),
         Box::new(shared_session),
-        Arc::new(shared_zone_id),
+        Arc::new(shared_zone_id.clone()),
         "shared".into(),
         crate::retry::RetryConfig::default(),
     )
@@ -1290,7 +1304,14 @@ async fn v027_mixed_shared_hidden_baseline_censuses_preboundary_deleted_live_pai
     );
     primary_state.library = primary_library;
 
-    let builder = make_run_cycle_download_config_builder(&root, db.clone());
+    let base = make_run_cycle_download_config_builder(&root, db.clone());
+    let builder = |mode, exclude, groups, library| {
+        let mut config = (*base(mode, exclude, groups, library)).clone();
+        config.folder_structure = "none".into();
+        config.folder_structure_albums = Arc::from("none");
+        config.folder_structure_smart_folders = Arc::from("none");
+        Arc::new(config)
+    };
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
     let result = run_cycle(
         &[&shared_state, &primary_state],
@@ -1415,6 +1436,24 @@ async fn v027_mixed_shared_hidden_baseline_censuses_preboundary_deleted_live_pai
             &serde_json::from_str(descriptor.as_ref().unwrap()).unwrap(),
             &shared_state.plan.passes,
         );
+        let captured_zone = &serde_json::from_str::<Value>(&shared_probe.2).unwrap()["zone"];
+        assert_eq!(captured_zone["zoneName"], shared_zone_id["zoneName"]);
+        assert_eq!(
+            captured_zone["ownerRecordName"], shared_zone_id["ownerRecordName"],
+            "the captured source must retain the distinct Shared owner"
+        );
+        let enrolled_scope: String = conn
+            .query_row(
+                "SELECT json_extract(value,'$.baseline_scope') FROM metadata WHERE key=?1",
+                [crate::state::db::sync_epoch::library_key(ZONE)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            enrolled_scope,
+            PhotoLibrary::baseline_scope_hash("shared", &shared_zone_id),
+            "the epoch must pin the entire Shared zone, not just its capture projection"
+        );
         let primary_probe = canonical(
             &serde_json::from_str(primary_descriptor.as_ref().unwrap()).unwrap(),
             &primary_state.plan.passes,
@@ -1427,12 +1466,25 @@ async fn v027_mixed_shared_hidden_baseline_censuses_preboundary_deleted_live_pai
         );
     }
 
-    crate::sync_loop::runner::drain_source_revalidation(
+    let requests_before_drain = shared_requests.lock().unwrap().len();
+    let catalog = crate::sync_loop::runner::drain_catalog_source_revalidation(
         &[&shared_state, &primary_state],
+        &builder,
+        download::DownloadControls::download_hidden(),
+        &download::compute_config_hash(&make_run_cycle_config()),
         &CancellationToken::new(),
     )
     .await
     .unwrap();
+    assert!(!catalog.session_expired);
+    assert!(
+        shared_requests.lock().unwrap()[requests_before_drain..]
+            .iter()
+            .any(|names| names.iter().any(|name| name == DELETED_MASTER)
+                && names.iter().any(|name| name == DELETED_CHILD)),
+        "the typed drain must request the exact source pair"
+    );
+    assert_eq!(catalog.retained, 0);
 
     {
         let conn = db
@@ -1709,15 +1761,23 @@ async fn v027_expired_active_token_fallback_omits_catalog_origin() {
             order[changes].contains(token.as_deref().unwrap()),
             "the next cycle must present the baseline-created token: {order:?}"
         );
+        let replacement_zones = order[changes + 1..]
+            .iter()
+            .position(|entry| entry == "zones/list");
+        let replacement_query = order[changes + 1..]
+            .iter()
+            .position(|entry| entry.starts_with("query:"));
         assert!(
-            order[changes + 1..]
-                .iter()
-                .any(|entry| entry.starts_with("query:")),
-            "the rejected token must fall back to an inventory: {order:?}"
+            replacement_zones.is_some(),
+            "the rejected token must require a fresh cycle-owned boundary: {order:?}"
         );
         assert!(
-            !order[changes..].iter().any(|entry| entry == "zones/list"),
-            "the fallback inventory must not establish a fresh cycle-owned boundary: {order:?}"
+            replacement_query.is_some(),
+            "a qualified fresh boundary must be followed by real inventory: {order:?}"
+        );
+        assert!(
+            replacement_zones.unwrap() < replacement_query.unwrap(),
+            "fresh boundary must precede replacement inventory: {order:?}"
         );
         let conn = db
             .acquire_lock("inspect expired-token catalog omission")
@@ -1744,8 +1804,8 @@ async fn v027_expired_active_token_fallback_omits_catalog_origin() {
         );
         assert_eq!(
             (rounds, debt),
-            (0, 0),
-            "unchanged product omits the mixed-source catalog origin on token expiry"
+            (1, 1),
+            "the fresh cycle-owned boundary must install one qualified catalog origin"
         );
     }
     server.verify().await;
