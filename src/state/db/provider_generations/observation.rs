@@ -601,18 +601,45 @@ pub(in crate::state::db) fn catalog_source_matches(
     database: &str,
     zone: &Value,
 ) -> Result<bool, StateError> {
+    let Some(name) = zone
+        .get("zoneName")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+    let Some(owner) = zone
+        .get("ownerRecordName")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+    if name != library || !matches!(database, "private" | "shared") {
+        return Ok(false);
+    }
+    let epoch = sync_epoch::validate(conn)?;
+    let Some(record) = sync_epoch::read_library(conn, library)? else {
+        return Ok(false);
+    };
+    if record.state != "complete"
+        || record.epoch != epoch.epoch
+        || record.baseline_scope
+            != crate::icloud::photos::PhotoLibrary::baseline_scope_hash(database, zone)
+    {
+        return Ok(false);
+    }
     let Some(token) = metadata(conn, &format!("sync_token:v27:{library}"))? else {
         return Ok(false);
     };
     let Some(saved) = valid(conn, &format!("{ACTIVE}{library}"), &token)? else {
         return Ok(false);
     };
-    Ok(!saved.plans.is_empty()
+    let expected = (library.to_owned(), owner.to_owned(), database.to_owned());
+    Ok(descriptor_own_source(&saved)?
         && saved.plans.iter().all(|plan| {
-            serde_json::from_str::<Value>(&plan.scope).is_ok_and(|scope| {
-                scope.get("database").and_then(Value::as_str) == Some(database)
-                    && scope.get("zone") == Some(zone)
-            })
+            crate::icloud::photos::PhotoLibrary::provider_scope_projection(&plan.scope).as_ref()
+                == Some(&expected)
         }))
 }
 

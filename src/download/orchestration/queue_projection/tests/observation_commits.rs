@@ -1056,7 +1056,18 @@ async fn catalog_pending_shared_full_zone_install_and_required_checkpoint() {
         uuid::Uuid::new_v4().to_string(),
     )
     .unwrap();
-    for id in ["census-a", "census-z"] {
+    for id in [
+        "case-db",
+        "case-owner",
+        "case-empty",
+        "case-zone",
+        "case-extra",
+        "case-missing",
+        "case-stale",
+        "case-token",
+        "census-a",
+        "census-z",
+    ] {
         let asset = crate::test_helpers::TestAssetRecord::new(id)
             .library(name)
             .build();
@@ -1067,6 +1078,16 @@ async fn catalog_pending_shared_full_zone_install_and_required_checkpoint() {
             .await
             .unwrap();
     }
+    let medium = dir.path().join("census-a-medium.jpg");
+    std::fs::write(&medium, b"retained medium").unwrap();
+    let asset = crate::test_helpers::TestAssetRecord::new("census-a")
+        .library(name)
+        .version_size(crate::state::VersionSizeKey::Medium)
+        .build();
+    db.upsert_seen(&asset).await.unwrap();
+    db.mark_downloaded(name, "census-a", "medium", &medium, "synthetic", None)
+        .await
+        .unwrap();
     {
         let conn = db.acquire_lock("seed retained shared debt").unwrap();
         conn.execute("INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES(?1,?2,?3,'policy','old-boundary','high','after','observing','catalog_v2')", rusqlite::params![old.nonce,name,old.scope()]).unwrap();
@@ -1201,7 +1222,7 @@ async fn catalog_pending_shared_full_zone_install_and_required_checkpoint() {
     {
         let conn = db.acquire_lock("verify complete shared census").unwrap();
         let (phase, count, retained): (String, i64, i64) = conn.query_row("SELECT r.phase,(SELECT COUNT(*) FROM source_revalidation_debt WHERE round=r.id),(SELECT next_retry_at FROM source_revalidation_debt WHERE round=r.id AND id='retained') FROM source_revalidation_rounds r WHERE r.id=?1", [&origin.nonce], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
-        assert_eq!((phase.as_str(), count, retained), ("observing", 3, 42));
+        assert_eq!((phase.as_str(), count, retained), ("observing", 11, 42));
     }
     // A resource selected by Primary is not authority to attach the Shared
     // origin to Primary's checkpoint, even when the source is authenticated.
@@ -1317,7 +1338,7 @@ async fn catalog_pending_shared_full_zone_install_and_required_checkpoint() {
     {
         let conn = db.acquire_lock("verify cross-owner refusal").unwrap();
         let (phase, count): (String, i64) = conn.query_row("SELECT r.phase,(SELECT COUNT(*) FROM source_revalidation_debt WHERE round=r.id) FROM source_revalidation_rounds r WHERE r.id=?1", [&origin.nonce], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
-        assert_eq!((phase.as_str(), count), ("observing", 3));
+        assert_eq!((phase.as_str(), count), ("observing", 11));
     }
     let spec = GenerationSpec {
         format: 2,
@@ -1448,6 +1469,193 @@ async fn catalog_pending_shared_full_zone_install_and_required_checkpoint() {
         db.catalog_bootstrap_eligibility(owner(), ready_request)
             .await
             .is_err()
+    );
+    let ids = [
+        "case-db",
+        "case-owner",
+        "case-empty",
+        "case-zone",
+        "case-extra",
+        "case-missing",
+        "case-stale",
+        "case-token",
+        "census-a",
+    ];
+    for id in ids {
+        db.upsert_asset_master_mapping(name, id, &format!("master-{id}"))
+            .await
+            .unwrap();
+    }
+    let media: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            let path = dir.path().join(format!("{id}.jpg"));
+            let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+            (path, mtime)
+        })
+        .collect();
+    let medium_mtime = std::fs::metadata(&medium).unwrap().modified().unwrap();
+    let due = db
+        .due_catalog_candidates(owner(), name.into(), origin.clone(), "policy".into())
+        .await
+        .unwrap();
+    let candidate = |id: &str| {
+        due.iter()
+            .find(|candidate| candidate.id == id)
+            .unwrap()
+            .clone()
+    };
+    let pair = |id: &str| CatalogPairEvidence {
+        database: "shared".into(),
+        zone: zone.clone(),
+        master: format!("master-{id}"),
+        child: id.into(),
+        master_type: "CPLMaster".into(),
+        child_type: "CPLAsset".into(),
+        reference_exact: true,
+        explicit_deleted: true,
+    };
+    for id in [
+        "case-db",
+        "case-owner",
+        "case-empty",
+        "case-zone",
+        "case-extra",
+        "case-missing",
+    ] {
+        let mut evidence = pair(id);
+        match id {
+            "case-db" => evidence.database = "private".into(),
+            "case-owner" => evidence.zone["ownerRecordName"] = serde_json::json!("other-owner"),
+            "case-empty" => evidence.zone["ownerRecordName"] = serde_json::json!(""),
+            "case-zone" => evidence.zone["zoneName"] = serde_json::json!("SharedSync-other"),
+            "case-extra" => evidence.zone["zoneType"] = serde_json::json!("other-extra"),
+            "case-missing" => {
+                evidence.zone.as_object_mut().unwrap().remove("zoneType");
+            }
+            _ => panic!("unexpected source control {id}"),
+        }
+        assert!(
+            !db.settle_catalog_candidate(
+                owner(),
+                name.into(),
+                origin.clone(),
+                "policy".into(),
+                candidate(id),
+                CatalogSettlementAuthority::Deleted {
+                    deleted_at: None,
+                    evidence
+                }
+            )
+            .await
+            .unwrap(),
+            "wrong source evidence must retain {id}"
+        );
+    }
+    let stale = CatalogOrigin::new(
+        origin.plan_digest.clone(),
+        origin.epoch.clone(),
+        uuid::Uuid::new_v4().to_string(),
+        origin.nonce.clone(),
+    )
+    .unwrap();
+    assert!(
+        !db.settle_catalog_candidate(
+            owner(),
+            name.into(),
+            stale,
+            "policy".into(),
+            candidate("case-stale"),
+            CatalogSettlementAuthority::Deleted {
+                deleted_at: None,
+                evidence: pair("case-stale")
+            }
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        db.settle_catalog_candidate(
+            owner(),
+            name.into(),
+            origin.clone(),
+            "policy".into(),
+            candidate("census-a"),
+            CatalogSettlementAuthority::Deleted {
+                deleted_at: None,
+                evidence: pair("census-a")
+            }
+        )
+        .await
+        .unwrap(),
+        "exact shared full-zone evidence must settle the owner-produced candidate"
+    );
+    db.set_metadata(&token_key, "changed-current-token")
+        .await
+        .unwrap();
+    assert!(
+        !db.settle_catalog_candidate(
+            owner(),
+            name.into(),
+            origin.clone(),
+            "policy".into(),
+            candidate("case-token"),
+            CatalogSettlementAuthority::Deleted {
+                deleted_at: None,
+                evidence: pair("case-token")
+            }
+        )
+        .await
+        .unwrap()
+    );
+    {
+        let conn = db
+            .acquire_lock("verify shared settlement source guards")
+            .unwrap();
+        for id in [
+            "case-db",
+            "case-owner",
+            "case-empty",
+            "case-zone",
+            "case-extra",
+            "case-missing",
+            "case-stale",
+            "case-token",
+        ] {
+            let (deleted, debt):(i64,i64) = conn.query_row("SELECT (SELECT is_deleted FROM assets WHERE library=?1 AND id=?2 AND version_size='original'), (SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?3 AND id=?2)", rusqlite::params![name,id,origin.nonce], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!((deleted, debt), (0, 1), "wrong source must retain {id}");
+        }
+        for id in [
+            "case-db",
+            "case-owner",
+            "case-empty",
+            "case-zone",
+            "case-extra",
+            "case-missing",
+        ] {
+            let deadline: i64 = conn
+                .query_row(
+                    "SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id=?2",
+                    rusqlite::params![origin.nonce, id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                deadline > chrono::Utc::now().timestamp(),
+                "source refusal must defer {id}"
+            );
+        }
+        let (versions, deleted, debt):(i64,i64,i64) = conn.query_row("SELECT COUNT(*),SUM(is_deleted),(SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?2 AND id='census-a') FROM assets WHERE library=?1 AND id='census-a'", rusqlite::params![name,origin.nonce], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!((versions, deleted, debt), (2, 2, 0));
+    }
+    for (path, mtime) in media {
+        assert_eq!(std::fs::read(&path).unwrap(), b"retained media");
+        assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), mtime);
+    }
+    assert_eq!(std::fs::read(&medium).unwrap(), b"retained medium");
+    assert_eq!(
+        std::fs::metadata(&medium).unwrap().modified().unwrap(),
+        medium_mtime
     );
 }
 
