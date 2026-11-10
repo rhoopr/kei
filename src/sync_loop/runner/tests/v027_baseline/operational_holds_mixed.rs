@@ -429,9 +429,9 @@ async fn mixed_refusal_fixture() -> (Fixture, crate::sync_cycle::CycleResult) {
     let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
         .await
         .expect("mixed operational fixture must execute");
-    let baseline = fixture.run(0, false, false).await;
+    let baseline = Box::pin(fixture.run(0, false, false)).await;
     assert!(baseline.can_advance_database_checkpoint());
-    let held = fixture.run(1, true, false).await;
+    let held = Box::pin(fixture.run(1, true, false)).await;
     assert!(held.stats.failed > 0);
     assert!(
         held.holds.iter().any(|hold| {

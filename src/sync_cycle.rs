@@ -2300,15 +2300,16 @@ pub(crate) async fn run_cycle_with_witness(
                     == RecoveryAction::RepairRetainedCheckpointEvidence.as_str()
             })
         {
-            cycle_stats.sync_token_blocked = true;
-            cycle_stats.sync_token_blocked_reason = Some("retained_checkpoint_hold_invalid");
-            cycle_stats.sync_token_blocked_source = Some("kei");
-            cycle_stats.sync_token_blocked_explanation = Some(
+            record_selected_hold(
+                &mut library_holds,
+                &mut cycle_stats,
+                &lib_state.zone_name,
+                library_ordinal,
+                LibraryHoldKind::RetainedCheckpoint,
+                "retained_checkpoint_hold_invalid",
                 download::sync_token_blocked_explanation("retained_checkpoint_hold_invalid"),
+                true,
             );
-            cycle_stats
-                .sync_token_blocked_zone
-                .get_or_insert_with(|| lib_state.zone_name.clone());
             cycle_failed_count = cycle_failed_count.saturating_add(1);
             db_sync_token_advance_safe = false;
             checkpoint_hold_action =
@@ -2358,10 +2359,6 @@ pub(crate) async fn run_cycle_with_witness(
                     *expected = Some(serde_json::to_string(&current)?);
                 }
                 if deferred || reservation_failed {
-                    block_for_retained_checkpoint(&mut cycle_stats);
-                    cycle_stats
-                        .sync_token_blocked_zone
-                        .get_or_insert_with(|| lib_state.zone_name.clone());
                     if reservation_failed {
                         cycle_stats.state_write_failures =
                             cycle_stats.state_write_failures.saturating_add(1);
@@ -3039,6 +3036,7 @@ pub(crate) async fn run_cycle_with_witness(
                 &source.baseline_scope,
                 epoch,
                 attempt,
+                &enum_config_hash,
             )
             .await?;
             if let Some(prework) = &source.operational_prework {
@@ -3424,6 +3422,18 @@ pub(crate) async fn run_cycle_with_witness(
                                 sync_result.checkpoint.sync_token_blocked = true;
                                 sync_result.checkpoint.project(&mut sync_result.stats);
                                 block_for_retained_checkpoint(&mut sync_result.stats);
+                                record_selected_hold(
+                                    &mut library_holds,
+                                    &mut cycle_stats,
+                                    &lib_state.zone_name,
+                                    library_ordinal,
+                                    LibraryHoldKind::RetainedCheckpoint,
+                                    "retained_checkpoint_expired",
+                                    download::sync_token_blocked_explanation(
+                                        "retained_checkpoint_expired",
+                                    ),
+                                    true,
+                                );
                                 break;
                             }
                             Err(error) => return Err(error),
@@ -4312,6 +4322,19 @@ pub(crate) async fn run_cycle_with_witness(
             sync_result.stats.sync_token_blocked_zone = Some(lib_state.zone_name.clone());
         }
 
+        if sync_result.stats.sync_token_blocked_reason == Some("retained_checkpoint_expired") {
+            record_selected_hold(
+                &mut library_holds,
+                &mut cycle_stats,
+                &lib_state.zone_name,
+                library_ordinal,
+                LibraryHoldKind::RetainedCheckpoint,
+                "retained_checkpoint_expired",
+                download::sync_token_blocked_explanation("retained_checkpoint_expired"),
+                true,
+            );
+        }
+
         if sync_result.checkpoint.identity_incomplete {
             // The checkpoint owner retains unresolved current identity; report
             // it as a hold label instead of fabricating a failed-asset count.
@@ -4528,6 +4551,7 @@ pub(crate) async fn run_cycle_with_witness(
         tracing::warn!(error = %e, "Failed to promote completed local path reconciliation");
     }
 
+    let mut retained_recovery_summary = false;
     if let Some(db) = state_db {
         let summary = db.get_summary().await?;
         let mut current_identity_hold = false;
@@ -4573,51 +4597,11 @@ pub(crate) async fn run_cycle_with_witness(
                 )
             })
         {
-            block_for_retained_checkpoint(&mut cycle_stats);
-            if summary.last_recovery_action.as_deref()
-                == Some("retained_checkpoint_retry_exhausted")
-            {
-                cycle_stats.sync_token_blocked_reason = Some("retained_checkpoint_retry_exhausted");
-                cycle_stats.sync_token_blocked_explanation = Some(
-                    download::sync_token_blocked_explanation("retained_checkpoint_retry_exhausted"),
-                );
-            }
-            if summary.last_recovery_action.as_deref()
-                == Some("repair_retained_checkpoint_evidence")
-            {
-                cycle_stats.sync_token_blocked_reason = Some("retained_checkpoint_hold_invalid");
-                cycle_stats.sync_token_blocked_explanation = Some(
-                    download::sync_token_blocked_explanation("retained_checkpoint_hold_invalid"),
-                );
-            }
-            let reason = match summary.last_recovery_action.as_deref() {
-                Some("retained_checkpoint_retry_exhausted") => {
-                    "retained_checkpoint_retry_exhausted"
-                }
-                Some("repair_retained_checkpoint_evidence") => "retained_checkpoint_hold_invalid",
-                _ => "retained_checkpoint_expired",
-            };
-            let retained_zone = cycle_stats.sync_token_blocked_zone.clone().or_else(|| {
-                library_states
-                    .first()
-                    .map(|library| library.zone_name.clone())
-            });
-            if let Some(zone_name) = retained_zone {
-                let library_ordinal = library_states
-                    .iter()
-                    .position(|library| library.zone_name == zone_name)
-                    .unwrap_or(0);
-                record_selected_hold(
-                    &mut library_holds,
-                    &mut cycle_stats,
-                    &zone_name,
-                    library_ordinal,
-                    LibraryHoldKind::RetainedCheckpoint,
-                    reason,
-                    download::sync_token_blocked_explanation(reason),
-                    true,
-                );
-            }
+            // This database-wide recovery action has no source identity. It
+            // may hold the aggregate checkpoint, but cannot replace a
+            // source's diagnostic or manufacture a per-library hold.
+            retained_recovery_summary = true;
+            cycle_stats.sync_token_blocked = true;
             db_sync_token_advance_safe = false;
         }
     }
@@ -4630,6 +4614,7 @@ pub(crate) async fn run_cycle_with_witness(
         && !cycle_stats.interrupted
         && !cycle_has_stale_plan
         && !operational_state_fault
+        && !retained_recovery_summary
         && cycle_stats.exif_failures == 0
         && cycle_stats.state_write_failures == 0
         && cycle_stats.enumeration_errors == 0
@@ -4647,7 +4632,8 @@ pub(crate) async fn run_cycle_with_witness(
             && !cycle_session_expired
             && !cycle_stats.interrupted
             && !cycle_has_stale_plan
-            && !operational_state_fault;
+            && !operational_state_fault
+            && !retained_recovery_summary;
         let clean_aggregate = cycle_stats.failed == 0
             && cycle_stats.exif_failures == 0
             && cycle_stats.state_write_failures == 0

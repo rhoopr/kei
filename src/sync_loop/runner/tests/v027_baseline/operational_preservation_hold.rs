@@ -207,7 +207,6 @@ fn retained_snapshot(db: &SqliteStateDb) -> Vec<(&'static str, Vec<Vec<rusqlite:
 async fn retain_legacy(
     db: &SqliteStateDb,
     root: &Path,
-    blocked_metadata: bool,
 ) -> Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> {
     let media = root.join("protected-old.JPG");
     let sidecar = root.join("protected-old.JPG.xmp");
@@ -263,11 +262,6 @@ async fn retain_legacy(
             .await
             .unwrap()
     );
-    if blocked_metadata {
-        db.record_metadata_write_failure(ZONE, OLD, "original")
-            .await
-            .unwrap();
-    }
     let snapshot = db
         .legacy_preparation_snapshots(ZONE, 64)
         .await
@@ -289,6 +283,44 @@ fn assert_files(files: &[(PathBuf, Vec<u8>, std::time::SystemTime)]) {
         assert_eq!(&std::fs::read(path).unwrap(), bytes);
         assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), *mtime);
     }
+}
+
+fn peer_receipts(db: &SqliteStateDb, id: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let conn = db.acquire_lock("current peer receipts").unwrap();
+    let mut statement = conn
+        .prepare("SELECT * FROM download_receipts WHERE library=?1 AND state_id=?2 ORDER BY id")
+        .unwrap();
+    let count = statement.column_count();
+    statement
+        .query_map([ZONE, id], |row| {
+            (0..count).map(|index| row.get(index)).collect()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+fn assert_peer_failure(
+    db: &SqliteStateDb,
+    peer: &Path,
+    id: &str,
+    version: &str,
+    mtime: std::time::SystemTime,
+    receipts: &[Vec<rusqlite::types::Value>],
+) {
+    let pending: bool = db
+        .acquire_lock("current peer metadata failure")
+        .unwrap()
+        .query_row(
+            "SELECT metadata_write_failed_at IS NOT NULL FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
+            rusqlite::params![ZONE, id, version],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(pending, "the metadata owner must retain actual peer work");
+    assert_eq!(std::fs::read(peer).unwrap(), MEDIA);
+    assert_eq!(std::fs::metadata(peer).unwrap().modified().unwrap(), mtime);
+    assert_eq!(peer_receipts(db, id), receipts);
 }
 
 async fn owner_read(
@@ -390,7 +422,7 @@ async fn scenario(blocked_metadata: bool) -> Option<(crate::health::HealthStatus
             .as_deref(),
         Some(scope.as_str())
     );
-    let files = retain_legacy(&db, &root, blocked_metadata).await;
+    let files = retain_legacy(&db, &root).await;
     let retained = retained_snapshot(&db);
     assert_eq!(retained[0].1.len(), 1);
     assert_eq!(retained[1].1.len(), 2);
@@ -402,6 +434,56 @@ async fn scenario(blocked_metadata: bool) -> Option<(crate::health::HealthStatus
             .is_some_and(|(_, rows)| !rows.is_empty()),
         "preserved legacy retry evidence must remain present"
     );
+    let peer_failure = if blocked_metadata {
+        let error = db
+            .record_metadata_write_failure(ZONE, OLD, "original")
+            .await
+            .expect_err("the protected legacy identity must refuse a metadata mutation");
+        assert!(
+            error
+                .to_string()
+                .contains("unattributed legacy identity is protected")
+        );
+        assert_eq!(retained_snapshot(&db), retained);
+        assert_files(&files);
+
+        // The baseline pipeline created this separate selected peer. Record a
+        // real state-owner failure, not a synthetic failure on the protected ID.
+        let peer = root.join("current.JPG");
+        let peer_mtime = std::fs::metadata(&peer).unwrap().modified().unwrap();
+        assert_eq!(std::fs::read(&peer).unwrap(), MEDIA);
+        let (peer_id, version): (String, String) = db
+            .acquire_lock("current peer identity")
+            .unwrap()
+            .query_row(
+                "SELECT id,version_size FROM assets WHERE library=?1 AND local_path=?2 AND status='downloaded'",
+                rusqlite::params![ZONE, peer.to_str().unwrap()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(peer_id, OLD);
+        let selected: bool = db
+            .acquire_lock("current peer selection evidence")
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM download_receipts WHERE library=?1 AND state_id=?2) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND verified_media=1)",
+                rusqlite::params![ZONE, peer_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            selected,
+            "the current peer must have actual selection evidence"
+        );
+        db.record_metadata_write_failure(ZONE, &peer_id, &version)
+            .await
+            .unwrap();
+        let receipts = peer_receipts(&db, &peer_id);
+        assert_peer_failure(&db, &peer, &peer_id, &version, peer_mtime, &receipts);
+        Some((peer, peer_id, version, peer_mtime, receipts))
+    } else {
+        None
+    };
     {
         let conn = db
             .acquire_lock("no fabricated current legacy proof")
@@ -453,6 +535,9 @@ async fn scenario(blocked_metadata: bool) -> Option<(crate::health::HealthStatus
     owner_read(&db, &scope, &baseline_scope, &epoch, &before_epoch.attempt).await;
     assert_eq!(retained_snapshot(&db), retained);
     assert_files(&files);
+    if let Some((peer, id, version, mtime, receipts)) = &peer_failure {
+        assert_peer_failure(&db, peer, id, version, *mtime, receipts);
+    }
 
     let report_path = root.join("preservation-report.json");
     let notifier = crate::notifications::Notifier::new(None);
@@ -542,6 +627,9 @@ async fn scenario(blocked_metadata: bool) -> Option<(crate::health::HealthStatus
     .await;
     assert_eq!(retained_snapshot(&reopened), retained);
     assert_files(&files);
+    if let Some((peer, id, version, mtime, receipts)) = &peer_failure {
+        assert_peer_failure(&reopened, peer, id, version, *mtime, receipts);
+    }
     assert_eq!(
         server.received_requests().await.unwrap().len(),
         1,

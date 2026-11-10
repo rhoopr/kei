@@ -258,6 +258,7 @@ pub(crate) async fn operational_prework(
     baseline_scope: &str,
     epoch: &str,
     attempt: &str,
+    enum_policy: &str,
 ) -> Result<Option<OperationalPrework>> {
     let Some(context) = context(passes, config, controls).await? else {
         return Ok(None);
@@ -274,6 +275,10 @@ pub(crate) async fn operational_prework(
         epoch: epoch.to_owned(),
         attempt: attempt.to_owned(),
         directory: config.directory.to_path_buf(),
+        catalog_plan: context
+            .catalog_plan_context(config)
+            .map(|plan| catalog_plan_digest_from_source_context(&plan)),
+        enum_policy: enum_policy.to_owned(),
     };
     let Some(prework) = context.capture.db.operational_prework(request).await? else {
         return Ok(None);

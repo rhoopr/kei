@@ -19,6 +19,8 @@ pub(crate) struct SourceRequest {
     pub(crate) epoch: String,
     pub(crate) attempt: String,
     pub(crate) directory: PathBuf,
+    pub(crate) catalog_plan: Option<String>,
+    pub(crate) enum_policy: String,
 }
 
 #[derive(Clone)]
@@ -93,6 +95,90 @@ fn same_capture(a: &CapturedSelectionRetry, b: &CapturedSelectionRetry) -> bool 
         && a.destination == b.destination
 }
 
+/// Classify the entire census, not just due debt or owner pending signals.
+fn census_accounted(
+    conn: &Connection,
+    request: &SourceRequest,
+    library: &str,
+) -> Result<bool, StateError> {
+    use super::super::source_revalidation::{CATALOG_MODE, CatalogOrigin, LEGACY_MODE};
+    use super::observation::{
+        catalog_active_plan_matches, catalog_origin_current, catalog_source_matches,
+        revalidation_scope_current,
+    };
+
+    let rows: Vec<(String, String, String, String, String, String, bool)> = conn
+        .prepare(
+            "SELECT r.id,r.scope,r.enum_hash,r.boundary,r.phase,r.mode,\
+             EXISTS(SELECT 1 FROM source_revalidation_debt d WHERE d.round=r.id) \
+             FROM source_revalidation_rounds r WHERE r.library=?1 ORDER BY r.id",
+        )?
+        .query_map([library], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    if rows.is_empty() {
+        return Ok(true);
+    }
+    let Some(plan) = &request.catalog_plan else {
+        return Ok(false);
+    };
+    let policy = &request.enum_policy;
+    let Some((_, _, database)) = crate::icloud::photos::PhotoLibrary::provider_scope_projection(
+        &request.specification.scope,
+    ) else {
+        return Ok(false);
+    };
+    if !catalog_source_matches(conn, library, &database, &request.specification.zone)?
+        || !catalog_active_plan_matches(conn, library, plan, policy)?
+    {
+        return Ok(false);
+    }
+    let mut active_catalog = false;
+    let mut abandoned_catalog = false;
+    for (id, scope, enum_hash, boundary, phase, mode, debt) in rows {
+        if enum_hash != *policy {
+            return Ok(false);
+        }
+        match (phase.as_str(), mode.as_str()) {
+            ("abandoned", CATALOG_MODE) | ("active", CATALOG_MODE) => {
+                let Ok(origin) = CatalogOrigin::parse(&scope) else {
+                    return Ok(false);
+                };
+                if origin.nonce != id
+                    || origin.plan_digest != *plan
+                    || boundary.len() != 64
+                    || !boundary.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Ok(false);
+                }
+                if phase == "abandoned" {
+                    abandoned_catalog = true;
+                } else if debt || !catalog_origin_current(conn, library, &origin, policy)? {
+                    return Ok(false);
+                } else {
+                    active_catalog = true;
+                }
+            }
+            ("active", LEGACY_MODE) if !debt => {
+                if !revalidation_scope_current(conn, library, &scope, policy)? {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(!abandoned_catalog || active_catalog)
+}
+
 /// All inner work uses the one supplied transaction. No bounded retry window is
 /// treated as a census. SQL/owner failures remain errors, not empty results.
 fn inspect(
@@ -113,6 +199,9 @@ fn inspect(
         .get("zoneName")
         .and_then(Value::as_str)
         .ok_or(StateError::ProviderSelectionInvalid)?;
+    if !census_accounted(conn, request, library)? {
+        return Ok(None);
+    }
     if prework.is_some() && sparse.is_none() {
         let unresolved: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM unresolved_sparse_identities WHERE library=?1) OR EXISTS(SELECT 1 FROM metadata WHERE key=?2)",

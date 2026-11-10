@@ -390,7 +390,7 @@ impl Fixture {
             skip_authority: SkipAuthority::Reached,
         }];
         expected_sources.extend_from_slice(extra_sources);
-        run_cycle_with_witness(
+        Box::pin(run_cycle_with_witness(
             &[&selected],
             &self.config,
             Some(self.db.as_ref()),
@@ -402,7 +402,7 @@ impl Fixture {
             Arc::new(download::MetadataWriterWitness::default()),
             &expected_sources,
             None,
-        )
+        ))
         .await
         .unwrap()
     }
@@ -868,6 +868,9 @@ async fn operational_safe_hold_refuses_peer_bad_request_primary_first() {
     };
     let baseline = fixture.run_two(0, false, false).await;
     assert_eq!(baseline.stats.downloaded, 1, "{}", cycle_facts(&baseline));
+    let primary_before = fixture.db.get_metadata(&fixture.key).await.unwrap();
+    let peer_key = sync_token_key(PEER_ZONE);
+    let peer_before = fixture.db.get_metadata(&peer_key).await.unwrap();
     let held = fixture.run_two(1, true, false).await;
     assert_eq!(held.stats.enumeration_errors, 0, "{}", cycle_facts(&held));
     assert!(
@@ -878,6 +881,7 @@ async fn operational_safe_hold_refuses_peer_bad_request_primary_first() {
     assert!(
         held.holds.iter().any(|hold| {
             hold.source == ZONE
+                && hold.ordinal == 0
                 && hold.kind == crate::sync_cycle::LibraryHoldKind::IdentityUnresolved
         }),
         "the Primary safe sparse hold must remain: {}",
@@ -887,6 +891,24 @@ async fn operational_safe_hold_refuses_peer_bad_request_primary_first() {
         fixture.peer_errors.load(Ordering::SeqCst) > 0,
         "the peer real BAD_REQUEST must actually execute: {}",
         cycle_facts(&held)
+    );
+    assert_eq!(fixture.peer_errors.load(Ordering::SeqCst), 2);
+    assert!(held.holds.iter().any(|hold| {
+        hold.source == PEER_ZONE
+            && hold.ordinal == 1
+            && hold.kind == crate::sync_cycle::LibraryHoldKind::RetainedCheckpoint
+            && hold.reason == "retained_checkpoint_expired"
+    }));
+    assert!(!held.holds.iter().any(|hold| {
+        hold.source == ZONE && hold.kind == crate::sync_cycle::LibraryHoldKind::RetainedCheckpoint
+    }));
+    assert_eq!(
+        fixture.db.get_metadata(&fixture.key).await.unwrap(),
+        primary_before
+    );
+    assert_eq!(
+        fixture.db.get_metadata(&peer_key).await.unwrap(),
+        peer_before
     );
     assert_eq!(
         held.stats.sync_token_blocked_zone.as_deref(),
@@ -917,6 +939,9 @@ async fn operational_safe_hold_refuses_peer_bad_request_peer_first() {
     };
     let baseline = fixture.run_two(0, false, true).await;
     assert_eq!(baseline.stats.downloaded, 1, "{}", cycle_facts(&baseline));
+    let primary_before = fixture.db.get_metadata(&fixture.key).await.unwrap();
+    let peer_key = sync_token_key(PEER_ZONE);
+    let peer_before = fixture.db.get_metadata(&peer_key).await.unwrap();
     let held = fixture.run_two(1, true, true).await;
     assert_eq!(held.stats.enumeration_errors, 0, "{}", cycle_facts(&held));
     assert!(
@@ -927,6 +952,7 @@ async fn operational_safe_hold_refuses_peer_bad_request_peer_first() {
     assert!(
         held.holds.iter().any(|hold| {
             hold.source == ZONE
+                && hold.ordinal == 1
                 && hold.kind == crate::sync_cycle::LibraryHoldKind::IdentityUnresolved
         }),
         "the Primary safe sparse hold must remain: {}",
@@ -936,6 +962,32 @@ async fn operational_safe_hold_refuses_peer_bad_request_peer_first() {
         fixture.peer_errors.load(Ordering::SeqCst) > 0,
         "the peer real BAD_REQUEST must actually execute: {}",
         cycle_facts(&held)
+    );
+    assert_eq!(fixture.peer_errors.load(Ordering::SeqCst), 2);
+    assert!(held.holds.iter().any(|hold| {
+        hold.source == PEER_ZONE
+            && hold.ordinal == 0
+            && hold.kind == crate::sync_cycle::LibraryHoldKind::RetainedCheckpoint
+            && hold.reason == "retained_checkpoint_expired"
+    }));
+    assert!(!held.holds.iter().any(|hold| {
+        hold.source == ZONE && hold.kind == crate::sync_cycle::LibraryHoldKind::RetainedCheckpoint
+    }));
+    assert_eq!(
+        held.stats.sync_token_blocked_zone.as_deref(),
+        Some(PEER_ZONE)
+    );
+    assert_eq!(
+        held.stats.sync_token_blocked_reason,
+        Some("retained_checkpoint_expired")
+    );
+    assert_eq!(
+        fixture.db.get_metadata(&fixture.key).await.unwrap(),
+        primary_before
+    );
+    assert_eq!(
+        fixture.db.get_metadata(&peer_key).await.unwrap(),
+        peer_before
     );
     let (health, report) = reported_health(&fixture, &held, "peer-second-report.json").await;
     assert_eq!(report["status"], "partial_failure", "{report}");
