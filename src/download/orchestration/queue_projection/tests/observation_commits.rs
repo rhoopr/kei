@@ -1960,6 +1960,68 @@ async fn catalog_resume_returns_actual_saved_expiry_boundary() {
     ] {
         assert!(fixture.db.catalog_resume(owner(), invalid).await.is_err());
     }
+    let wrong_owner = crate::state::db::account::AccountOwner::authenticated(
+        "other@example.invalid",
+        "com",
+        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"other-provider"}})).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        fixture
+            .db
+            .catalog_resume(wrong_owner, fixture.hint_request("after").await)
+            .await
+            .is_err()
+    );
+    for invalid_scope in [
+        "catalog:v2:malformed".to_owned(),
+        CatalogOrigin::new(
+            origin.plan_digest.clone(),
+            uuid::Uuid::new_v4().to_string(),
+            origin.attempt.clone(),
+            origin.nonce.clone(),
+        )
+        .unwrap()
+        .scope(),
+        CatalogOrigin::new(
+            origin.plan_digest.clone(),
+            origin.epoch.clone(),
+            origin.attempt.clone(),
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap()
+        .scope(),
+    ] {
+        {
+            let conn = fixture
+                .db
+                .acquire_lock("invalidate catalog resume identity")
+                .unwrap();
+            conn.execute(
+                "UPDATE source_revalidation_rounds SET scope=?2 WHERE id=?1",
+                rusqlite::params![origin.nonce, invalid_scope],
+            )
+            .unwrap();
+        }
+        assert!(
+            fixture
+                .db
+                .catalog_resume(owner(), fixture.hint_request("after").await)
+                .await
+                .is_err()
+        );
+        {
+            let conn = fixture
+                .db
+                .acquire_lock("restore catalog resume identity")
+                .unwrap();
+            conn.execute(
+                "UPDATE source_revalidation_rounds SET scope=?2 WHERE id=?1",
+                rusqlite::params![origin.nonce, origin.scope()],
+            )
+            .unwrap();
+        }
+    }
     let duplicate = CatalogOrigin::new(
         origin.plan_digest.clone(),
         origin.epoch.clone(),
