@@ -44,6 +44,7 @@ struct Session {
     provider_error: bool,
     provider_errors: Arc<AtomicUsize>,
     changes: Arc<AtomicUsize>,
+    inventory_queries: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -68,6 +69,7 @@ impl PhotosSession for Session {
             return Ok(album_count_response(if self.empty { 0 } else { 2 }));
         }
         if url.contains("/records/query?") {
+            self.inventory_queries.fetch_add(1, Ordering::SeqCst);
             if self.fail_inventory && self.cycle > 0 {
                 return Ok(json!({"records":"malformed inventory page"}));
             }
@@ -128,7 +130,7 @@ impl PhotosSession for Session {
                     "baseline replay must use the saved boundary"
                 );
                 (Vec::new(), "op-hold-after-baseline".to_string())
-            } else {
+            } else if self.cycle == 1 {
                 assert_eq!(
                     token, "op-hold-after-baseline",
                     "a held cycle must retain the baseline cursor"
@@ -136,6 +138,9 @@ impl PhotosSession for Session {
                 let mut records = self.progress.as_ref().clone();
                 records.push(self.hold_child.as_ref().clone());
                 (records, "op-hold-after-hold".to_string())
+            } else {
+                assert_eq!(token, "op-hold-after-baseline");
+                (Vec::new(), "op-hold-after-quiet".to_string())
             };
             return Ok(json!({"zones":[{"zoneID":zone_for(&self.zone_name),
                 "records":records,"syncToken":successor,"moreComing":false}]}));
@@ -147,35 +152,55 @@ impl PhotosSession for Session {
     }
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     _dir: tempfile::TempDir,
-    root: PathBuf,
-    db: Arc<SqliteStateDb>,
+    pub(super) root: PathBuf,
+    pub(super) db: Arc<SqliteStateDb>,
     shared: crate::auth::session::SharedSession,
     config: crate::config::Config,
     baseline: Arc<Vec<Value>>,
     progress: Arc<Vec<Value>>,
     hold_child: Arc<Value>,
-    key: String,
+    pub(super) key: String,
     peer_errors: Arc<AtomicUsize>,
-    _server: wiremock::MockServer,
+    pub(super) _server: wiremock::MockServer,
+    pub(super) inventory_queries: Arc<AtomicUsize>,
 }
 
 impl Fixture {
     async fn new() -> Option<Self> {
+        Self::with_progress_inner(|_| ResponseTemplate::new(200).set_body_bytes(MEDIA), true).await
+    }
+
+    pub(super) async fn with_progress<R: wiremock::Respond + Send + Sync + 'static>(
+        response: impl FnOnce(PathBuf) -> R,
+    ) -> Option<Self> {
+        Self::with_progress_inner(response, false).await
+    }
+
+    async fn with_progress_inner<R: wiremock::Respond + Send + Sync + 'static>(
+        response: impl FnOnce(PathBuf) -> R,
+        exact_one: bool,
+    ) -> Option<Self> {
         let server = crate::test_helpers::start_wiremock_or_skip("operational_holds").await?;
-        for name in ["baseline", "progress"] {
-            Mock::given(method("GET"))
-                .and(path(format!("/{name}")))
-                .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
-                .expect(1)
-                .mount(&server)
-                .await;
-        }
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("media");
         std::fs::create_dir(&root).unwrap();
         let database = dir.path().join("state.db");
+        Mock::given(method("GET"))
+            .and(path("/baseline"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let progress = Mock::given(method("GET"))
+            .and(path("/progress"))
+            .respond_with(response(database.clone()));
+        if exact_one {
+            progress.expect(1).mount(&server).await;
+        } else {
+            progress.expect(1..).mount(&server).await;
+        }
         let baseline = Arc::new(pair(
             "op-baseline",
             "baseline.JPG",
@@ -220,10 +245,58 @@ impl Fixture {
             key,
             peer_errors: Arc::new(AtomicUsize::new(0)),
             _server: server,
+            inventory_queries: Arc::new(AtomicUsize::new(0)),
         })
     }
 
-    async fn run(&self, cycle: usize, fail_inventory: bool, provider_error: bool) -> CycleResult {
+    pub(super) async fn reopen(self) -> Self {
+        let Self {
+            _dir,
+            root,
+            db,
+            shared,
+            config,
+            baseline,
+            progress,
+            hold_child,
+            key,
+            peer_errors,
+            _server,
+            inventory_queries,
+        } = self;
+        assert_eq!(
+            Arc::strong_count(&db),
+            1,
+            "all cycle database handles must close"
+        );
+        drop(db);
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&_dir.path().join("state.db"), &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        Self {
+            _dir,
+            root,
+            db,
+            shared,
+            config,
+            baseline,
+            progress,
+            hold_child,
+            key,
+            peer_errors,
+            _server,
+            inventory_queries,
+        }
+    }
+
+    pub(super) async fn run(
+        &self,
+        cycle: usize,
+        fail_inventory: bool,
+        provider_error: bool,
+    ) -> CycleResult {
         self.run_with_expected_sources(cycle, fail_inventory, provider_error, &[])
             .await
     }
@@ -246,6 +319,7 @@ impl Fixture {
             provider_error,
             provider_errors: Arc::new(AtomicUsize::new(0)),
             changes: Arc::new(AtomicUsize::new(0)),
+            inventory_queries: Arc::clone(&self.inventory_queries),
         };
         let mut library = PhotoLibrary::new(
             "https://synthetic.example/database/1/photos/production/private".into(),
@@ -346,6 +420,7 @@ impl Fixture {
                     provider_error: false,
                     provider_errors: Arc::new(AtomicUsize::new(0)),
                     changes: Arc::new(AtomicUsize::new(0)),
+                    inventory_queries: Arc::new(AtomicUsize::new(0)),
                 },
                 ZONE,
                 &self.key,
@@ -365,6 +440,7 @@ impl Fixture {
                     provider_error,
                     provider_errors: Arc::clone(&self.peer_errors),
                     changes: Arc::new(AtomicUsize::new(0)),
+                    inventory_queries: Arc::new(AtomicUsize::new(0)),
                 },
                 PEER_ZONE,
                 &peer_key,
@@ -408,7 +484,7 @@ fn cycle_facts(result: &CycleResult) -> String {
     )
 }
 
-async fn reported_health(
+pub(super) async fn reported_health(
     fixture: &Fixture,
     result: &CycleResult,
     name: &str,

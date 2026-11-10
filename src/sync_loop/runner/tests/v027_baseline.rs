@@ -5422,6 +5422,8 @@ mod epoch_pending;
 mod legacy_scale;
 #[path = "v027_baseline/operational_holds.rs"]
 mod operational_holds;
+#[path = "v027_baseline/operational_holds_mixed.rs"]
+mod operational_holds_mixed;
 #[path = "v027_baseline/preservation_hold_owner.rs"]
 mod preservation_hold_owner;
 pub(super) mod released_schema;
