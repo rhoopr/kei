@@ -1274,6 +1274,111 @@ async fn retry_due_admitted_while_held(
     true
 }
 
+/// Capture the actual source plan and durable fences before a provider boundary
+/// or delta stream. The returned request carries no cursor authority yet.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the catalog owner requires the actual plan, epoch and checkpoint fences"
+)]
+async fn capture_catalog_request(
+    library: &LibraryState,
+    config: &download::DownloadConfig,
+    controls: download::DownloadControls,
+    db: &dyn download::DownloadStore,
+    epoch: &str,
+    attempt: &str,
+    baseline_key: &str,
+    enum_hash: &str,
+    preservation_hash: Option<&str>,
+    zone_fence: &[(String, Option<String>)],
+    path_fence: &[(String, Option<String>)],
+) -> anyhow::Result<
+    Option<(
+        crate::icloud::photos::inbox::ShadowCapture,
+        state::db::source_revalidation::FreshCatalogOriginRequest,
+    )>,
+> {
+    let Some(plan) =
+        download::catalog_plan_context_for_source(&library.plan.passes, config, controls, None)
+            .await?
+    else {
+        return Ok(None);
+    };
+    let mut capture = None;
+    for pass in &library.plan.passes {
+        if let Some((source, scope, zone)) = pass.album.download_scope()?
+            && scope == plan.scope
+            && zone == plan.zone
+        {
+            capture = Some(source);
+            break;
+        }
+    }
+    let Some(capture) = capture else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        std::ptr::addr_eq(db, capture.db.as_ref() as &dyn download::DownloadStore),
+        "Fresh catalog database context mismatch"
+    );
+    let mut expected_metadata = zone_fence.to_vec();
+    expected_metadata.extend(path_fence.iter().cloned());
+    for key in [
+        state::SYNC_EPOCH_KEY.to_owned(),
+        state::db::sync_epoch::library_key(&library.zone_name),
+        ENUM_CONFIG_HASH_KEY.to_owned(),
+        PENDING_ENUM_CONFIG_HASH_KEY.to_owned(),
+        download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+        PENDING_DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+        library.sync_token_key.clone(),
+        format!("observed_selection:v27:{}", library.zone_name),
+        format!("download_ledger_scope:{}", library.zone_name),
+    ] {
+        if !expected_metadata.iter().any(|(saved, _)| saved == &key) {
+            expected_metadata.push((key.clone(), db.get_metadata(&key).await?));
+        }
+    }
+    let expected_baseline = db.get_metadata(baseline_key).await?;
+    let expected_catalog_snapshot = capture
+        .db
+        .fresh_catalog_snapshot(capture.owner.clone(), library.zone_name.clone())
+        .await?;
+    let request = state::db::source_revalidation::FreshCatalogOriginRequest {
+        library: library.zone_name.clone(),
+        plan: state::db::source_revalidation::FreshCatalogPlan {
+            account: plan.account,
+            provider: plan.provider,
+            database: plan.database,
+            zone: plan.zone,
+            scope: plan.scope,
+            config_hash: plan.config_hash,
+            metadata_enabled: plan.metadata_enabled,
+            metadata_flags: plan.metadata_flags,
+            passes: plan
+                .passes
+                .into_iter()
+                .map(|pass| state::db::source_revalidation::FreshCatalogPass {
+                    key: pass.key,
+                    kind: pass.kind,
+                    scope: pass.scope,
+                    excludes: pass.excludes,
+                })
+                .collect(),
+            profile: plan.profile,
+        },
+        baseline_key: baseline_key.to_owned(),
+        preservation_config_hash: preservation_hash.unwrap_or_default().to_owned(),
+        expected_baseline,
+        fresh_cursor: String::new(),
+        enum_hash: enum_hash.to_owned(),
+        expected_epoch: epoch.to_owned(),
+        expected_attempt: attempt.to_owned(),
+        expected_metadata,
+        expected_catalog_snapshot,
+    };
+    Ok(Some((capture, request)))
+}
+
 async fn run_epoch_local_recovery(
     download_client: &reqwest::Client,
     db: &dyn download::DownloadStore,
@@ -2385,6 +2490,146 @@ pub(crate) async fn run_cycle_with_witness(
                 preservation_config_hash.as_deref().unwrap_or(""),
             ),
         };
+        let mut fresh_origin = None;
+        let pending_catalog = if force_epoch_baseline
+            && retained_cursor_at_start.is_none()
+            && matches!(download_config.sync_mode, download::SyncMode::Full)
+            && !lib_state.plan_is_stale
+            && !lib_state.plan_needs_refresh
+            && indexing_finished
+            && !indexing_reconciliation
+            && checkpoint_transition_state_safe
+            && !download_config.retry_only
+            && !config.runtime.dry_run
+            && download_controls.run_mode.downloads_files()
+            && let (Some(db), Some(epoch), Some(attempt)) =
+                (state_db, sync_epoch.as_deref(), epoch_attempt.as_deref())
+        {
+            let result: anyhow::Result<_> = Box::pin(async {
+                let Some((capture, mut request)) = capture_catalog_request(
+                    lib_state,
+                    &download_config,
+                    download_controls,
+                    db,
+                    epoch,
+                    attempt,
+                    &baseline_key,
+                    &enum_config_hash,
+                    preservation_config_hash.as_deref(),
+                    &zone_metadata_fence,
+                    &path_metadata_at_start,
+                )
+                .await?
+                else {
+                    return Ok(None);
+                };
+                let digest =
+                    state::db::source_revalidation::fresh_catalog_plan_digest(&request.plan);
+                let signals = capture
+                    .db
+                    .catalog_pending_signals(capture.owner.clone(), lib_state.zone_name.clone())
+                    .await?;
+                let mut matching = signals.iter().filter_map(|signal| {
+                    let origin =
+                        state::db::source_revalidation::CatalogOrigin::parse(&signal.scope).ok()?;
+                    (matches!(signal.phase.as_str(), "marking" | "observing")
+                        && signal.round == origin.nonce
+                        && origin.plan_digest == digest
+                        && origin.epoch == epoch
+                        && origin.attempt == attempt)
+                        .then_some(origin)
+                });
+                let existing = matching.next();
+                anyhow::ensure!(
+                    matching.next().is_none(),
+                    "Ambiguous pending catalog origins"
+                );
+                let (boundary, origin) = if let Some(origin) = existing {
+                    let boundary = request
+                        .expected_baseline
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Pending catalog boundary is missing"))?;
+                    (boundary, origin)
+                } else {
+                    let boundary = lib_state.library.fresh_baseline_cursor().await?;
+                    request.fresh_cursor = boundary.clone();
+                    let origin = capture
+                        .db
+                        .install_fresh_catalog_origin(capture.owner.clone(), request)
+                        .await?;
+                    (boundary, origin)
+                };
+                capture
+                    .db
+                    .seed_source_revalidation(
+                        capture.owner.clone(),
+                        lib_state.zone_name.clone(),
+                        origin.scope(),
+                        enum_config_hash.clone(),
+                        state::db::source_revalidation::CatalogOrigin::boundary(&boundary),
+                        shutdown_token.clone(),
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    !shutdown_token.is_cancelled(),
+                    "Pending catalog census interrupted"
+                );
+                let signals = capture
+                    .db
+                    .catalog_pending_signals(capture.owner, lib_state.zone_name.clone())
+                    .await?;
+                anyhow::ensure!(
+                    signals.iter().any(|signal| signal.round == origin.nonce
+                        && signal.scope == origin.scope()
+                        && signal.phase == "observing"),
+                    "Pending catalog census is not complete"
+                );
+                Ok(Some((boundary, origin)))
+            })
+            .await;
+            match result {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    db_sync_token_advance_safe = false;
+                    path_reconciliation_complete = false;
+                    path_reconciliation_cycle_safe = false;
+                    if shutdown_token.is_cancelled() {
+                        cycle_stats.interrupted = true;
+                        break;
+                    }
+                    if crate::icloud::photos::session::is_session_error(&error) {
+                        cycle_session_expired = true;
+                        break;
+                    }
+                    if matches!(
+                        error.downcast_ref::<state::error::StateError>(),
+                        Some(
+                            state::error::StateError::Query { .. }
+                                | state::error::StateError::Migration(_)
+                                | state::error::StateError::LockPoisoned(_)
+                                | state::error::StateError::Spawn(_)
+                        )
+                    ) {
+                        cycle_stats.state_write_failures =
+                            cycle_stats.state_write_failures.saturating_add(1);
+                        operational_state_fault = true;
+                    }
+                    record_selected_hold(
+                        &mut library_holds,
+                        &mut cycle_stats,
+                        &lib_state.zone_name,
+                        library_ordinal,
+                        LibraryHoldKind::BaselinePending,
+                        "pending_catalog_unavailable",
+                        "the source baseline and its local work are retained for retry",
+                        true,
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         let mut baseline_cursor_at_start = if retained_cursor_at_start.is_none()
             && matches!(download_config.sync_mode, download::SyncMode::Full)
             && download_controls.run_mode.downloads_files()
@@ -2394,21 +2639,28 @@ pub(crate) async fn run_cycle_with_witness(
         {
             let db = state_db
                 .ok_or_else(|| anyhow::anyhow!("Baseline comparison requires durable state"))?;
-            let cursor = match db.get_metadata(&baseline_key).await? {
-                Some(cursor) if !cursor.trim().is_empty() => cursor,
-                Some(_) => anyhow::bail!("Saved baseline cursor is invalid"),
-                None => {
-                    let cursor = lib_state.library.fresh_baseline_cursor().await?;
-                    db.set_metadata(&baseline_key, &cursor).await?;
-                    cursor
+            let cursor = match pending_catalog {
+                Some((boundary, origin)) => {
+                    fresh_origin = Some(origin);
+                    boundary
                 }
+                None => match db.get_metadata(&baseline_key).await? {
+                    Some(cursor) if !cursor.trim().is_empty() => cursor,
+                    Some(_) => anyhow::bail!("Saved baseline cursor is invalid"),
+                    None => {
+                        let cursor = lib_state.library.fresh_baseline_cursor().await?;
+                        db.set_metadata(&baseline_key, &cursor).await?;
+                        cursor
+                    }
+                },
             };
             zone_metadata_fence.push((baseline_key.clone(), Some(cursor.clone())));
             Some(cursor)
         } else {
             None
         };
-        if let Some(boundary) = &baseline_cursor_at_start
+        if fresh_origin.is_none()
+            && let Some(boundary) = &baseline_cursor_at_start
             && !lib_state.plan_is_stale
             && let [pass] = lib_state.plan.passes.as_slice()
             && pass.kind == crate::commands::PassKind::Unfiled
@@ -2624,7 +2876,6 @@ pub(crate) async fn run_cycle_with_witness(
             shutdown_token.clone(),
         ))
         .await;
-        let mut fresh_origin = None;
         let mut sync_result = match initial_result {
             Ok(result) => result,
             Err(error)

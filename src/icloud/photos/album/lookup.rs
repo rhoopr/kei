@@ -552,7 +552,9 @@ fn strict_authority(album: &PhotoAlbum) -> Option<StrictCatalogAuthority> {
     let scope: Value = serde_json::from_str(&scope).ok()?;
     let database = scope.get("database").and_then(Value::as_str)?;
     if !matches!(database, "private" | "shared")
-        || scope.get("zone") != Some(&zone)
+        || !scope
+            .get("zone")
+            .is_some_and(|projection| strict_zone_matches(projection, &zone))
         || !strict_zone_matches(&zone, album.zone_id.as_ref())
     {
         return None;

@@ -337,6 +337,7 @@ async fn exercise_expiry(fault: OriginFault) {
     let mut attempt = None;
     let mut published = Vec::new();
     let mut original_active = None;
+    let mut initial_origin = None;
     let mut retained_debt = None;
     let mut sidecar_snapshot = None;
     let mut baseline_marker = None;
@@ -753,6 +754,16 @@ async fn exercise_expiry(fault: OriginFault) {
                 )
                 .unwrap();
             original_active = Some((token, descriptor));
+            let origin: (String, String, String, String) = conn.query_row(
+                "SELECT r.id,r.scope,r.boundary,r.phase FROM source_revalidation_rounds r JOIN metadata m ON m.key=?2 AND json_extract(m.value,'$.revalidation_round')=r.id WHERE r.library=?1 AND r.mode='catalog_v2'",
+                rusqlite::params![PRIMARY, format!("observed_selection:v27:{PRIMARY}")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap();
+            assert_eq!(
+                origin.3, "active",
+                "initial pending baseline must activate its origin"
+            );
+            initial_origin = Some(origin);
         }
         if interrupted && phase == 1 {
             let token: String = conn
@@ -771,7 +782,28 @@ async fn exercise_expiry(fault: OriginFault) {
                 .unwrap();
             assert_eq!(Some((token, descriptor)), original_active);
             let origins: i64 = conn.query_row("SELECT COUNT(*) FROM source_revalidation_rounds WHERE library=?1 AND mode='catalog_v2'", [PRIMARY], |row| row.get(0)).unwrap();
-            assert_eq!(origins, i64::from(fault != OriginFault::Write));
+            assert_eq!(origins, 1 + i64::from(fault != OriginFault::Write));
+            let (id, scope, boundary, _) = initial_origin.as_ref().unwrap();
+            let saved: (String, String, String) = conn
+                .query_row(
+                    "SELECT scope,boundary,phase FROM source_revalidation_rounds WHERE id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (&saved.0, &saved.1),
+                (scope, boundary),
+                "the original catalog origin must remain intact"
+            );
+            assert_eq!(
+                saved.2,
+                if fault == OriginFault::Write {
+                    "active"
+                } else {
+                    "abandoned"
+                }
+            );
             let shared_token: String = conn
                 .query_row(
                     "SELECT value FROM metadata WHERE key=?1",

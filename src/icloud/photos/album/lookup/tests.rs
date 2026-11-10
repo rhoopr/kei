@@ -1617,6 +1617,57 @@ async fn strict_catalog_pair_accepts_exact_live_pair_only() {
 }
 
 #[tokio::test]
+async fn strict_catalog_pair_uses_full_shared_zone_with_projected_capture_scope() {
+    let zone = json!({
+        "zoneName":"SharedSync",
+        "ownerRecordName":"shared-owner",
+        "zoneType":"synthetic-shared-zone"
+    });
+    let mut master = strict_deleted_master("master");
+    master["zoneID"] = zone.clone();
+    let mut child = strict_deleted_child("asset-master", "master");
+    child["zoneID"] = zone.clone();
+    child["fields"]["masterRef"]["value"]["zoneID"] = zone.clone();
+    let album = strict_album(
+        Box::new(MockPhotosSession::new().ok(json!({"records":[master.clone(), child.clone()]}))),
+        zone.clone(),
+        "shared",
+    );
+    let result = album
+        .lookup_catalog_pair_strict(
+            &ProviderRecordId::new("master"),
+            &ProviderRecordId::new("asset-master"),
+        )
+        .await
+        .result;
+    let StrictCatalogPairResult::Deleted { evidence, .. } = result else {
+        panic!("the exact Shared pair should be accepted");
+    };
+    assert_eq!(evidence.database.as_ref(), "shared");
+    assert_eq!(evidence.zone, zone);
+
+    child["zoneID"]["ownerRecordName"] = json!("different-owner");
+    let album = strict_album(
+        Box::new(MockPhotosSession::new().ok(json!({"records":[master, child]}))),
+        zone,
+        "shared",
+    );
+    let result = album
+        .lookup_catalog_pair_strict(
+            &ProviderRecordId::new("master"),
+            &ProviderRecordId::new("asset-master"),
+        )
+        .await
+        .result;
+    assert!(matches!(
+        result,
+        StrictCatalogPairResult::Refused {
+            reason: StrictCatalogRefusal::WrongZone
+        }
+    ));
+}
+
+#[tokio::test]
 async fn strict_catalog_pair_refuses_errors_omissions_duplicates_siblings_scope_and_ref_ambiguity()
 {
     let cases: Vec<(Vec<Value>, StrictCatalogRefusal)> = vec![
