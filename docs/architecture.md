@@ -2079,6 +2079,63 @@ metadata rewrite drain while the epoch waits; retry-failed may replay durable
 pending transfers without enumeration. Creating Hidden rounds remains a separate,
 disabled lifecycle.
 
+### Source revalidation
+
+Schema 44 distinguishes legacy Unfiled rounds (`legacy_unfiled_v1`) from
+catalog rounds (`catalog_v2`). Unknown modes and malformed catalog origins
+remain retained evidence, not catalog settlement authority. The legacy boolean
+settler accepts only a legacy round for the candidate's library.
+
+The catalog owner binds an origin to the authenticated owner, full source plan,
+epoch, attempt and round nonce. Catalog due work and settlement require the
+current ACTIVE observation descriptor to name that exact round and match its
+plan and policy. A recognized optional catalog link can be omitted when stale
+without vetoing an independently valid checkpoint; an omitted link cannot
+authorize drain. Legacy, unknown and malformed rows retain their conservative
+checkpoint guards.
+
+The fresh-origin operation accepts a complete epoch with a matching ACTIVE plan
+or the current pending attempt without an ACTIVE descriptor. The caller captures
+the plan and state fences before reading a new boundary from the authenticated
+private or shared source. A saved or rejected cursor is not a fresh provider
+read, even if the provider later returns the same opaque cursor text. One
+IMMEDIATE transaction checks those fences and writes the existing-format
+baseline key and new catalog origin. It copies matching old debt with its
+earliest deadlines, marks those old rounds abandoned, and retains their rows and
+debt. A write failure rolls back the transaction.
+
+For a complete epoch with a valid ACTIVE cursor and no catalog link, a completed
+delta observation can install its actual EOF cursor as the baseline in the same
+transaction that commits its checkpoint and ACTIVE descriptor. The operation
+checks the predecessor, successor, plan, owner, attempt and state fences, and
+requires the new descriptor to be stored. An empty delta may return the same
+cursor. The new origin starts in marking; a later full inventory and bridge
+must prove it before activation. A cross-zone resource selection does not authorize attaching
+that resource's origin to the selecting owner's checkpoint.
+
+When the epoch gate claims a due pending attempt or a stale READY attempt, a
+qualified marking or observing catalog round can transfer its boundary, census
+progress and debt deadlines to the new attempt in the same transaction as the
+gate. The old round and debt remain as history. A valid READY proof keeps
+promotion priority; ambiguous or mismatched ownership does not authorize a
+transfer. Resuming an observing catalog round does not create a legacy round.
+
+The catalog settler requires an exact provider master/child pair and matching
+source evidence. It updates deletion flags only for the confirmed candidate's
+state ID across its renditions. A legacy master-keyed candidate also needs its
+existing exclusive child-owner binding. Historical mappings may widen the
+protection checks but do not authorize deletion of an unconfirmed sibling.
+Recorded pending or failed work, capture retries, prepared destinations,
+verification evidence, metadata obligations and layout bindings or operations
+checked by the owner hold deletion for the candidate. Unknown identity retains
+debt. These checks do not certify that every filesystem journal is absent.
+Catalog settlement does not remove or repair local media or change media file
+mtimes.
+
+These are state and provider owner capabilities. They do not route the current
+token-expiry fallback, prove inventory completeness, or advance a checkpoint on
+their own; the sync cycle retains those decisions.
+
 ### Metadata
 
 Provider metadata may be captured in SQLite without changing local media.

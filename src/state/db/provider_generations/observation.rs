@@ -691,6 +691,115 @@ fn required_catalog_error() -> StateError {
     }
 }
 
+/// The expected descriptor is kept in memory so an empty preparation or an
+/// equal-token write cannot masquerade as an observed delta.
+pub(in crate::state::db) struct RequiredCatalogDelta {
+    key: String,
+    token_key: String,
+    next: String,
+    descriptor_hash: String,
+}
+
+pub(in crate::state::db) fn require_catalog_delta(
+    conn: &Connection,
+    transition: &crate::state::db::CheckpointTransition,
+    proof: &ObservationProof,
+    library: &str,
+    expected_plan: &str,
+    expected_attempt: &str,
+    next: &str,
+) -> Result<RequiredCatalogDelta, StateError> {
+    let Kind::Delta {
+        prior,
+        next: proof_next,
+    } = &proof.kind
+    else {
+        return Err(required_catalog_error());
+    };
+    let token_key = format!("sync_token:v27:{library}");
+    let key = format!("{ACTIVE}{library}");
+    let old = metadata(conn, &token_key)?.ok_or_else(required_catalog_error)?;
+    if old.trim().is_empty()
+        || next.trim().is_empty()
+        || proof.epoch_attempt.as_deref() != Some(expected_attempt)
+        || digest(old.as_bytes()) != *prior
+        || digest(next.as_bytes()) != *proof_next
+        || transition
+            .metadata_updates
+            .iter()
+            .filter(|(k, v)| k == &token_key && v == next)
+            .count()
+            != 1
+        || transition
+            .expected_metadata
+            .iter()
+            .filter(|(k, v)| k == &token_key && v.as_deref() == Some(old.as_str()))
+            .count()
+            != 1
+    {
+        return Err(required_catalog_error());
+    }
+    let previous = valid(conn, &key, &old)?.ok_or_else(required_catalog_error)?;
+    if previous.revalidation_round.is_some() {
+        return Err(required_catalog_error());
+    }
+    let prepared = prepare(
+        conn,
+        &transition.metadata_updates,
+        &transition.expected_metadata,
+        Some(proof),
+        false,
+    )?;
+    let [(prepared_key, descriptor)] = prepared.0.as_slice() else {
+        return Err(required_catalog_error());
+    };
+    let raw = serde_json::to_string(descriptor).map_err(|_invalid| required_catalog_error())?;
+    if prepared_key != &key
+        || descriptor.library != library
+        || descriptor.revalidation_round.is_some()
+        || catalog_plan_digest_from_observation(&raw, library).as_deref() != Some(expected_plan)
+        || descriptor.plans != previous.plans
+    {
+        return Err(required_catalog_error());
+    }
+    let selector = descriptor
+        .plans
+        .first()
+        .and_then(Plan::selector)
+        .ok_or_else(required_catalog_error)?;
+    let selector = serde_json::to_string(&selector).map_err(|_invalid| required_catalog_error())?;
+    let projection = crate::icloud::photos::PhotoLibrary::provider_scope_projection(&selector)
+        .ok_or_else(required_catalog_error)?;
+    if projection.0 != library
+        || descriptor.plans.iter().any(|plan| {
+            crate::icloud::photos::PhotoLibrary::provider_scope_projection(&plan.scope).as_ref()
+                != Some(&projection)
+        })
+    {
+        return Err(required_catalog_error());
+    }
+    Ok(RequiredCatalogDelta {
+        key,
+        token_key,
+        next: next.to_owned(),
+        descriptor_hash: digest(&encode(descriptor)?),
+    })
+}
+
+pub(in crate::state::db) fn verify_catalog_delta(
+    conn: &Connection,
+    required: &RequiredCatalogDelta,
+) -> Result<(), StateError> {
+    if metadata(conn, &required.token_key)?.as_deref() != Some(required.next.as_str()) {
+        return Err(required_catalog_error());
+    }
+    let saved = valid(conn, &required.key, &required.next)?.ok_or_else(required_catalog_error)?;
+    if saved.proof_hash != required.descriptor_hash {
+        return Err(required_catalog_error());
+    }
+    Ok(())
+}
+
 fn validate_required_catalog_row(
     conn: &Connection,
     required: &RequiredCatalog,

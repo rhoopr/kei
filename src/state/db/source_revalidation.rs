@@ -796,6 +796,33 @@ impl SqliteStateDb {
         owner: account::AccountOwner,
         request: FreshCatalogOriginRequest,
     ) -> Result<CatalogOrigin, StateError> {
+        self.install_catalog_origin(owner, request, None).await
+    }
+
+    /// Commit a completed observed delta and install its successor as a new
+    /// baseline in the same transaction. The proof is made by the existing
+    /// completed-stream producer; a bare cursor cannot call this operation.
+    #[allow(dead_code)] // L1 cycle integration is pending.
+    pub(crate) async fn install_catalog_origin_after_delta(
+        &self,
+        owner: account::AccountOwner,
+        request: FreshCatalogOriginRequest,
+        transition: super::CheckpointTransition,
+        proof: super::provider_generations::observation::ObservationProof,
+    ) -> Result<CatalogOrigin, StateError> {
+        self.install_catalog_origin(owner, request, Some((transition, proof)))
+            .await
+    }
+
+    async fn install_catalog_origin(
+        &self,
+        owner: account::AccountOwner,
+        request: FreshCatalogOriginRequest,
+        observed_delta: Option<(
+            super::CheckpointTransition,
+            super::provider_generations::observation::ObservationProof,
+        )>,
+    ) -> Result<CatalogOrigin, StateError> {
         self.with_conn_mut("installing fresh catalog origin", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             account::validate_authenticated(&tx, &owner)?;
@@ -969,17 +996,50 @@ impl SqliteStateDb {
                     detail: "current ACTIVE source plan changed".into(),
                 });
             }
+            let required_delta = if let Some((transition, proof)) = observed_delta {
+                if library_record.state != "complete" {
+                    return Err(StateError::SyncEpochMismatch);
+                }
+                let required = super::provider_generations::observation::require_catalog_delta(
+                    &tx, &transition, &proof, &request.library, &digest, &request.expected_attempt, &request.fresh_cursor,
+                )?;
+                super::checkpoints::commit_observation_transition_in_tx(&tx, transition, Some(proof), false)?;
+                super::provider_generations::observation::verify_catalog_delta(&tx, &required)?;
+                account::validate_authenticated(&tx, &owner)?;
+                let token_key = format!("sync_token:v27:{}", request.library);
+                let descriptor_key = format!("observed_selection:v27:{}", request.library);
+                for (key, expected) in &request.expected_metadata {
+                    if key == &token_key || key == &descriptor_key {
+                        continue;
+                    }
+                    let actual: Option<String> = tx.query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| row.get(0)).optional()?;
+                    if actual != *expected {
+                        return Err(StateError::SyncEpochMismatch);
+                    }
+                }
+                let baseline: Option<String> = tx.query_row("SELECT value FROM metadata WHERE key=?1", [&request.baseline_key], |row| row.get(0)).optional()?;
+                if baseline != request.expected_baseline
+                    || catalog_snapshot(&tx, &request.library)? != request.expected_catalog_snapshot
+                    || super::provider_generations::observation::has_valid_staged_for_library(&tx, &request.library)?
+                {
+                    return Err(StateError::SyncEpochMismatch);
+                }
+                Some(required)
+            } else {
+                None
+            };
             let boundary = CatalogOrigin::boundary(&request.fresh_cursor);
             let high_id: Option<String> = tx.query_row(
                 "SELECT MAX(id) FROM assets WHERE library=?1 AND (status='downloaded' OR downloaded_at IS NOT NULL) AND is_deleted=0",
                 [&request.library],
                 |row| row.get(0),
             )?;
+            let high_id = high_id.unwrap_or_default();
             let nonce = uuid::Uuid::new_v4().to_string();
             let origin = CatalogOrigin::new(
                 digest,
-                request.expected_epoch,
-                request.expected_attempt,
+                request.expected_epoch.clone(),
+                request.expected_attempt.clone(),
                 nonce.clone(),
             )?;
             tx.execute(
@@ -991,7 +1051,7 @@ impl SqliteStateDb {
                     origin.scope(),
                     request.enum_hash,
                     boundary,
-                    high_id.unwrap_or_default(),
+                    high_id,
                     CATALOG_MODE
                 ],
             )?;
@@ -1022,6 +1082,31 @@ impl SqliteStateDb {
                 "INSERT INTO metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![request.baseline_key, request.fresh_cursor],
             )?;
+            if let Some(required) = &required_delta {
+                super::provider_generations::observation::verify_catalog_delta(&tx, required)?;
+                account::validate_authenticated(&tx, &owner)?;
+                let token_key = format!("sync_token:v27:{}", request.library);
+                let descriptor_key = format!("observed_selection:v27:{}", request.library);
+                for (key, expected) in &request.expected_metadata {
+                    if key == &token_key || key == &descriptor_key || key == &request.baseline_key {
+                        continue;
+                    }
+                    let actual: Option<String> = tx.query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| row.get(0)).optional()?;
+                    if actual != *expected {
+                        return Err(StateError::SyncEpochMismatch);
+                    }
+                }
+                let baseline: Option<String> = tx.query_row("SELECT value FROM metadata WHERE key=?1", [&request.baseline_key], |row| row.get(0)).optional()?;
+                let exact: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND scope=?3 AND enum_hash=?4 AND boundary=?5 AND high_id=?6 AND after_id='' AND phase='marking' AND mode=?7)",
+                    params![origin.nonce, request.library, origin.scope(), request.enum_hash, boundary, high_id, CATALOG_MODE], |row| row.get(0),
+                )?;
+                if baseline.as_deref() != Some(request.fresh_cursor.as_str()) || !exact
+                    || super::provider_generations::observation::has_valid_staged_for_library(&tx, &request.library)?
+                {
+                    return Err(StateError::SyncEpochMismatch);
+                }
+            }
             tx.commit()?;
             Ok(origin)
         })

@@ -498,6 +498,329 @@ async fn catalog_optional_stale_carried_link_does_not_block_delta() {
 }
 
 #[tokio::test]
+async fn catalog_observed_delta_installs_origin_atomically_including_quiet_eof() {
+    for next in ["after", "delta-eof"] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+        let db = &fixture.db;
+        let media = dir.path().join("retained.jpg");
+        std::fs::write(&media, b"retained media").unwrap();
+        let mtime = std::fs::metadata(&media).unwrap().modified().unwrap();
+        let asset = crate::test_helpers::TestAssetRecord::new("retained-asset")
+            .library("PrimarySync")
+            .build();
+        db.upsert_seen(&asset).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "retained-asset",
+            "original",
+            &media,
+            "synthetic",
+            None,
+        )
+        .await
+        .unwrap();
+        let old_origins: Vec<_> = (0..2)
+            .map(|_| {
+                CatalogOrigin::new(
+                    crate::state::db::source_revalidation::fresh_catalog_plan_digest(&fixture.plan),
+                    fixture.epoch.clone(),
+                    fixture.attempt.clone(),
+                    uuid::Uuid::new_v4().to_string(),
+                )
+                .unwrap()
+            })
+            .collect();
+        {
+            let conn = db
+                .acquire_lock("seed unrelated retained source debt")
+                .unwrap();
+            conn.execute("INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES('unknown-round','PrimarySync','unknown','policy','old','','','observing','future_mode')", []).unwrap();
+            conn.execute("INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES('unknown-round','retained',37)", []).unwrap();
+            for (old, deadline) in old_origins.iter().zip([19, 7]) {
+                conn.execute("INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES(?1,'PrimarySync',?2,'policy','old','retained-asset','','observing','catalog_v2')", rusqlite::params![old.nonce,old.scope()]).unwrap();
+                conn.execute("INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES(?1,'retained-asset',?2)", rusqlite::params![old.nonce,deadline]).unwrap();
+            }
+        }
+        let old_descriptor = db.get_metadata(PROOF).await.unwrap();
+        let mut fences = Vec::new();
+        for key in [
+            crate::state::db::sync_epoch::SYNC_EPOCH_KEY.to_owned(),
+            crate::state::db::sync_epoch::library_key("PrimarySync"),
+            "enum_config_hash".into(),
+            "pending_enum_config_hash".into(),
+            "config_hash".into(),
+            "pending_download_config_hash".into(),
+            TOKEN.into(),
+            PROOF.into(),
+            "download_ledger_scope:PrimarySync".into(),
+        ] {
+            fences.push((key.clone(), db.get_metadata(&key).await.unwrap()));
+        }
+        let request = FreshCatalogOriginRequest {
+            library: "PrimarySync".into(),
+            plan: fixture.plan.clone(),
+            baseline_key: fixture.baseline_key.clone(),
+            preservation_config_hash: String::new(),
+            expected_baseline: None,
+            fresh_cursor: next.into(),
+            enum_hash: fixture.policy.clone(),
+            expected_epoch: fixture.epoch.clone(),
+            expected_attempt: fixture.attempt.clone(),
+            expected_metadata: fences,
+            expected_catalog_snapshot: db
+                .fresh_catalog_snapshot(owner(), "PrimarySync".into())
+                .await
+                .unwrap(),
+        };
+        let checkpoint = transition(db, next).await;
+        let source = &fixture.plan.passes[0].scope;
+        let page = serde_json::json!({"zones":[{"zoneID":fixture.plan.zone,"records":[],"syncToken":next,"moreComing":false}]});
+        let mut album = crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::new(HashMap::new()),
+                service_endpoint: Arc::from(
+                    "https://synthetic.example/database/1/photos/production/private",
+                ),
+                name: Arc::from(source["name"].as_str().unwrap()),
+                list_type: Arc::from(source["list_type"].as_str().unwrap()),
+                obj_type: Arc::from(source["obj_type"].as_str().unwrap()),
+                query_filter: None,
+                page_size: 200,
+                zone_id: Arc::new(fixture.plan.zone.clone()),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: vec![],
+            },
+            Box::new(MockPhotosSession::new().ok(page)),
+        );
+        album.set_shadow_capture(
+            ShadowCapture::new(db.clone(), owner(), "com"),
+            Arc::from("private"),
+        );
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album,
+            exclude_ids: Arc::default(),
+        }];
+        let controls = DownloadControls::download_hidden();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.library = Arc::from("PrimarySync");
+        config.sync_mode = crate::download::SyncMode::Incremental {
+            zone_sync_token: "after".into(),
+        };
+        let context =
+            crate::download::orchestration::generation::context(&passes, &config, controls)
+                .await
+                .unwrap()
+                .unwrap();
+        config.selection_context = Some(Arc::new(context));
+        let mut result = crate::download::orchestration::incremental::download_photos_incremental(
+            &reqwest::Client::new(),
+            &passes,
+            &Arc::new(config),
+            "after",
+            controls,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.sync_token.as_deref(), Some(next));
+        let proof = result
+            .checkpoint
+            .observation
+            .take()
+            .expect("completed empty delta must produce an observation")
+            .with_epoch_attempt(Some(fixture.attempt.clone()));
+        let wrong = ObservationProof::delivery(fixture.receipt.clone())
+            .delta("wrong-prior", next)
+            .unwrap()
+            .with_epoch_attempt(Some(fixture.attempt.clone()));
+        assert!(
+            db.install_catalog_origin_after_delta(
+                owner(),
+                request.clone(),
+                checkpoint.clone(),
+                wrong
+            )
+            .await
+            .is_err()
+        );
+        for proof_attempt in [None, Some(uuid::Uuid::new_v4().to_string())] {
+            assert!(
+                db.install_catalog_origin_after_delta(
+                    owner(),
+                    request.clone(),
+                    checkpoint.clone(),
+                    proof.clone().with_epoch_attempt(proof_attempt)
+                )
+                .await
+                .is_err()
+            );
+        }
+        for bad_request in [
+            {
+                let mut r = request.clone();
+                r.plan.database = "shared".into();
+                r
+            },
+            {
+                let mut r = request.clone();
+                r.plan.zone["ownerRecordName"] = serde_json::json!("other-owner");
+                r
+            },
+            {
+                let mut r = request.clone();
+                r.plan.provider = "wrong-pin".into();
+                r
+            },
+            {
+                let mut r = request.clone();
+                r.plan.config_hash = "a".repeat(64);
+                r
+            },
+            {
+                let mut r = request.clone();
+                r.expected_attempt = uuid::Uuid::new_v4().to_string();
+                r
+            },
+            {
+                let mut r = request.clone();
+                r.expected_epoch = uuid::Uuid::new_v4().to_string();
+                r
+            },
+            {
+                let mut r = request.clone();
+                r.expected_catalog_snapshot = "stale".into();
+                r
+            },
+        ] {
+            assert!(
+                db.install_catalog_origin_after_delta(
+                    owner(),
+                    bad_request,
+                    checkpoint.clone(),
+                    proof.clone()
+                )
+                .await
+                .is_err()
+            );
+        }
+        let mut missing_policy_fence = checkpoint.clone();
+        missing_policy_fence
+            .expected_metadata
+            .retain(|(key, _)| key != "config_hash");
+        assert!(
+            db.install_catalog_origin_after_delta(
+                owner(),
+                request.clone(),
+                missing_policy_fence,
+                proof.clone()
+            )
+            .await
+            .is_err()
+        );
+        for trigger in [
+            "CREATE TRIGGER delta_bootstrap_fault BEFORE INSERT ON metadata WHEN NEW.key='observed_selection:v27:PrimarySync' BEGIN SELECT RAISE(IGNORE); END",
+            "CREATE TRIGGER delta_bootstrap_fault BEFORE INSERT ON source_revalidation_rounds WHEN NEW.mode='catalog_v2' BEGIN SELECT RAISE(ABORT,'origin fault'); END",
+            "CREATE TRIGGER delta_bootstrap_fault AFTER INSERT ON metadata WHEN NEW.key LIKE 'baseline_cursor:v27:%' BEGIN UPDATE metadata SET value='tampered' WHERE key='sync_token:v27:PrimarySync'; END",
+        ] {
+            {
+                let conn = db.acquire_lock("inject delta bootstrap fault").unwrap();
+                conn.execute_batch(trigger).unwrap();
+            }
+            assert!(
+                db.install_catalog_origin_after_delta(
+                    owner(),
+                    request.clone(),
+                    checkpoint.clone(),
+                    proof.clone()
+                )
+                .await
+                .is_err()
+            );
+            {
+                let conn = db.acquire_lock("clear delta bootstrap fault").unwrap();
+                conn.execute_batch("DROP TRIGGER delta_bootstrap_fault")
+                    .unwrap();
+            }
+            let reopened = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened.get_metadata(TOKEN).await.unwrap().as_deref(),
+                Some("after")
+            );
+            assert_eq!(reopened.get_metadata(PROOF).await.unwrap(), old_descriptor);
+            assert_eq!(
+                reopened.get_metadata(&fixture.baseline_key).await.unwrap(),
+                None
+            );
+            let conn = reopened.acquire_lock("check delta rollback debt").unwrap();
+            let debt:i64 = conn.query_row("SELECT next_retry_at FROM source_revalidation_debt WHERE round='unknown-round' AND id='retained'", [], |r| r.get(0)).unwrap();
+            assert_eq!(debt, 37);
+            let unchanged:i64 = conn.query_row("SELECT COUNT(*) FROM source_revalidation_rounds WHERE id IN (?1,?2) AND phase='observing'", rusqlite::params![old_origins[0].nonce,old_origins[1].nonce], |r| r.get(0)).unwrap();
+            assert_eq!(unchanged, 2);
+            assert_eq!(std::fs::read(&media).unwrap(), b"retained media");
+            assert_eq!(
+                std::fs::metadata(&media).unwrap().modified().unwrap(),
+                mtime
+            );
+        }
+        let origin = db
+            .install_catalog_origin_after_delta(owner(), request, checkpoint, proof)
+            .await
+            .unwrap();
+        assert_eq!(db.get_metadata(TOKEN).await.unwrap().as_deref(), Some(next));
+        assert_eq!(
+            db.get_metadata(&fixture.baseline_key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(next)
+        );
+        let descriptor: Value =
+            serde_json::from_str(&db.get_metadata(PROOF).await.unwrap().unwrap()).unwrap();
+        assert_ne!(db.get_metadata(PROOF).await.unwrap(), old_descriptor);
+        assert!(
+            descriptor
+                .get("revalidation_round")
+                .is_none_or(Value::is_null)
+        );
+        {
+            let conn = db.acquire_lock("verify delta bootstrap origin").unwrap();
+            let copied:i64 = conn.query_row("SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id='retained-asset'", [&origin.nonce], |r| r.get(0)).unwrap();
+            assert_eq!(copied, 7);
+            let previous:i64 = conn.query_row("SELECT COUNT(*) FROM source_revalidation_rounds WHERE id IN (?1,?2) AND phase='abandoned'", rusqlite::params![old_origins[0].nonce,old_origins[1].nonce], |r| r.get(0)).unwrap();
+            assert_eq!(previous, 2);
+            let (phase,boundary,debt,high):(String,String,i64,String) = conn.query_row("SELECT phase,boundary,(SELECT next_retry_at FROM source_revalidation_debt WHERE round='unknown-round' AND id='retained'),high_id FROM source_revalidation_rounds WHERE id=?1", [&origin.nonce], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            assert_eq!(
+                (phase.as_str(), boundary, debt, high.as_str()),
+                (
+                    "marking",
+                    CatalogOrigin::boundary(next),
+                    37,
+                    "retained-asset"
+                )
+            );
+        }
+        assert!(
+            db.due_catalog_candidates(owner(), "PrimarySync".into(), origin, "policy".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(&media).unwrap(), b"retained media");
+        assert_eq!(
+            std::fs::metadata(&media).unwrap().modified().unwrap(),
+            mtime
+        );
+    }
+}
+
+#[tokio::test]
 async fn catalog_pending_shared_full_zone_install_and_required_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
