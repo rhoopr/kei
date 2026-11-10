@@ -145,12 +145,37 @@ struct CatalogDrainOutcome {
     retained_sources: Vec<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CatalogVisit {
+    DrainDue,
+    Inspect,
+}
+
 async fn drain_catalog_source_revalidation(
     libraries: &[&LibraryState],
     build_download_config: &crate::sync_cycle::BuildDownloadConfigFn<'_>,
     controls: download::DownloadControls,
     enum_hash: &str,
     shutdown: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<CatalogDrainOutcome> {
+    catalog_source_revalidation(
+        libraries,
+        build_download_config,
+        controls,
+        enum_hash,
+        shutdown,
+        CatalogVisit::DrainDue,
+    )
+    .await
+}
+
+async fn catalog_source_revalidation(
+    libraries: &[&LibraryState],
+    build_download_config: &crate::sync_cycle::BuildDownloadConfigFn<'_>,
+    controls: download::DownloadControls,
+    enum_hash: &str,
+    shutdown: &tokio_util::sync::CancellationToken,
+    visit: CatalogVisit,
 ) -> anyhow::Result<CatalogDrainOutcome> {
     use crate::icloud::photos::{ProviderRecordId, StrictCatalogPairResult, StrictCatalogRefusal};
     use crate::state::db::source_revalidation::{
@@ -162,16 +187,28 @@ async fn drain_catalog_source_revalidation(
         if shutdown.is_cancelled() {
             break;
         }
-        if library.plan_is_stale {
-            continue;
-        }
-        let retained_before = outcome.retained;
         let config = build_download_config(
             download::SyncMode::Full,
             Arc::new(rustc_hash::FxHashSet::default()),
             Arc::new(download::AssetGroupings::default()),
             Arc::from(library.zone_name.as_str()),
         );
+        if config.state_db.is_none()
+            || !controls.run_mode.downloads_files()
+            || config.retry_only
+            || matches!(
+                config.capture_timestamp_repair,
+                download::CaptureTimestampRepair::ReplaceWithCaptureLocal
+            )
+            || library.plan.passes.is_empty()
+        {
+            continue;
+        }
+        anyhow::ensure!(
+            !library.plan_is_stale && !library.plan_needs_refresh,
+            "Selected catalog plan is not current"
+        );
+        let retained_before = outcome.retained;
         let Some(plan) = download::catalog_plan_context_for_source(
             &library.plan.passes,
             &config,
@@ -180,7 +217,7 @@ async fn drain_catalog_source_revalidation(
         )
         .await?
         else {
-            continue;
+            anyhow::bail!("Selected catalog plan authority is unavailable");
         };
         let mut source = None;
         for pass in &library.plan.passes {
@@ -193,7 +230,7 @@ async fn drain_catalog_source_revalidation(
             }
         }
         let Some((pass, capture)) = source else {
-            continue;
+            anyhow::bail!("Selected catalog source authority is unavailable");
         };
         let digest = download::catalog_plan_digest_from_source_context(&plan);
         let signals = capture
@@ -201,7 +238,10 @@ async fn drain_catalog_source_revalidation(
             .catalog_pending_signals(capture.owner.clone(), library.zone_name.clone())
             .await?;
         for signal in signals {
-            if signal.phase != "active" || signal.due_at > chrono::Utc::now().timestamp() {
+            if visit == CatalogVisit::Inspect
+                || signal.phase != "active"
+                || signal.due_at > chrono::Utc::now().timestamp()
+            {
                 continue;
             }
             let Ok(origin) = CatalogOrigin::parse(&signal.scope) else {
@@ -286,10 +326,24 @@ async fn drain_catalog_source_revalidation(
                         authority,
                     )
                     .await?;
-                if !settled {
-                    outcome.retained = outcome.retained.saturating_add(1);
-                }
+                let _ = settled;
             }
+        }
+        let remaining = capture
+            .db
+            .selected_catalog_outcome(
+                capture.owner.clone(),
+                library.zone_name.clone(),
+                digest,
+                enum_hash.to_owned(),
+            )
+            .await?;
+        if remaining.pending {
+            outcome.retained = outcome.retained.saturating_add(
+                usize::try_from(remaining.retained)
+                    .unwrap_or(usize::MAX)
+                    .max(1),
+            );
         }
         if outcome.retained > retained_before {
             outcome.retained_sources.push(library.zone_name.clone());
@@ -341,6 +395,38 @@ fn apply_catalog_drain_outcome(
         cycle.db_sync_token_advance_safe = false;
         cycle.operational_safe_holds = false;
     }
+}
+
+async fn quiet_catalog_cycle(
+    libraries: &[&LibraryState],
+    build_download_config: &crate::sync_cycle::BuildDownloadConfigFn<'_>,
+    controls: download::DownloadControls,
+    enum_hash: &str,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<Option<Box<crate::sync_cycle::CycleResult>>> {
+    let outcome = catalog_source_revalidation(
+        libraries,
+        build_download_config,
+        controls,
+        enum_hash,
+        shutdown,
+        CatalogVisit::Inspect,
+    )
+    .await?;
+    if outcome.retained_sources.is_empty() {
+        return Ok(None);
+    }
+    let mut cycle = crate::sync_cycle::CycleResult {
+        failed_count: 0,
+        session_expired: false,
+        stats: download::SyncStats::default(),
+        db_sync_token_advance_safe: false,
+        holds: Vec::new(),
+        sources: Vec::new(),
+        operational_safe_holds: false,
+    };
+    apply_catalog_drain_outcome(&mut cycle, libraries, outcome, shutdown.is_cancelled());
+    Ok(Some(Box::new(cycle)))
 }
 
 /// Run the sync command: authenticate, enumerate photos, download, and
@@ -1006,7 +1092,35 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         }
 
         if matches!(watch_precheck, WatchPrecheck::SkipAll) {
-            cycle_reporter.report_skipped_watch_cycle(&mut health).await;
+            let all_states: Vec<&LibraryState> = library_states.iter().collect();
+            let quiet = if state_db.is_some()
+                && !config.runtime.dry_run
+                && !config.runtime.only_print_filenames
+            {
+                quiet_catalog_cycle(
+                    &all_states,
+                    &build_download_config,
+                    download_controls,
+                    &enum_config_hash,
+                    &shutdown_token,
+                )
+                .await?
+            } else {
+                None
+            };
+            if let Some(quiet) = quiet {
+                cycle_reporter
+                    .report_completed_cycle(
+                        &mut health,
+                        crate::cycle_reporter::CycleFacts::from_cycle_result(
+                            &quiet,
+                            std::time::Duration::ZERO,
+                        ),
+                    )
+                    .await;
+            } else {
+                cycle_reporter.report_skipped_watch_cycle(&mut health).await;
+            }
         } else {
             refresh_needed_library_plans(
                 &mut library_states,
@@ -1112,7 +1226,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             {
                 drain_source_revalidation(&cycle_library_states, &shutdown_token).await?;
                 let catalog = drain_catalog_source_revalidation(
-                    &cycle_library_states,
+                    &all_library_states,
                     &build_download_config,
                     download_controls,
                     &enum_config_hash,
@@ -1121,7 +1235,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 .await?;
                 apply_catalog_drain_outcome(
                     &mut cycle_result,
-                    &cycle_library_states,
+                    &all_library_states,
                     catalog,
                     shutdown_token.is_cancelled(),
                 );

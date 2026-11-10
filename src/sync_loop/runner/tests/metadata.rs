@@ -2717,7 +2717,7 @@ async fn runner_outer_witness_keeps_source_revalidation_closed_for_blocked_debt(
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
     let witness = Arc::new(download::MetadataWriterWitness::default());
 
-    let result = run_cycle_with_witness(
+    let result = Box::pin(run_cycle_with_witness(
         &[&lib_state],
         &config,
         Some(db.as_ref()),
@@ -2734,7 +2734,7 @@ async fn runner_outer_witness_keeps_source_revalidation_closed_for_blocked_debt(
             skip_authority: crate::sync_cycle::SkipAuthority::Reached,
         }],
         None,
-    )
+    ))
     .await
     .expect("run witnessed cycle");
     let tail = download::drain_pending_metadata_rewrites_witnessed(

@@ -1772,6 +1772,182 @@ impl crate::icloud::photos::PhotosSession for AuthLookupSession {
 }
 
 #[tokio::test]
+async fn held_cycle_surfaces_admitted_retry_auth_without_ack_or_fake_failure() {
+    use super::{
+        ZONE, baseline_owner, make_run_cycle_config, make_run_cycle_library_state_with_passes,
+        make_shared_session_for_run_cycle, seed_existing_upgrade_db, sync_token_key,
+    };
+    use crate::commands::{AlbumPass, PassKind};
+    use crate::icloud::photos::PhotoLibrary;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir(&root).unwrap();
+    let db_path = dir.path().join("state.db");
+    seed_existing_upgrade_db(&db_path);
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/fail"))
+        .respond_with(wiremock::ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let mut inventory = media_pair(ZONE, "fail", "fail.JPG", &format!("{}/fail", server.uri()));
+    inventory.push(missing_master_asset(
+        ZONE,
+        "orphan",
+        "currently-absent-master",
+    ));
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let full_queries = Arc::new(AtomicUsize::new(0));
+    let changes = Arc::new(AtomicUsize::new(0));
+    let selected =
+        stock36_library_state(db.clone(), ZONE, inventory, full_queries.clone(), changes).await;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let mut config = make_run_cycle_config();
+    config.retry.max_retries = 0;
+    config.filters.selection = resolved_unfiled_only();
+    let first = run_stock36_cycle(&db, &[&selected], &root, &shared, &config)
+        .await
+        .unwrap();
+    assert_eq!(
+        epoch_state(&db, ZONE),
+        "pending",
+        "real sparse identity must hold the baseline: {first:?}"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path() == "/fail"),
+        "the first source transfer must be attempted: {first:?}"
+    );
+    assert!(epoch_next_attempt(&db, ZONE) > chrono::Utc::now().timestamp());
+    let snapshot = |db: &SqliteStateDb| -> (String, String, i64, i64, Option<String>) {
+        let conn = db.acquire_lock("snapshot held auth owner").unwrap();
+        let decision: (String, String, i64, i64) = conn.query_row(
+            "SELECT reason,admission_hash,attempts,next_retry_at FROM provider_active_decisions WHERE child='asset-fail'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).unwrap();
+        let cursor = conn.query_row("SELECT replay_after FROM provider_active_generations WHERE id=(SELECT generation FROM provider_active_decisions WHERE child='asset-fail')", [], |row| row.get(0)).unwrap();
+        (decision.0, decision.1, decision.2, decision.3, cursor)
+    };
+    let before = snapshot(&db);
+    assert!(
+        before.3 <= chrono::Utc::now().timestamp(),
+        "the actual admitted owner must already be due: {before:?}"
+    );
+    let calls_before = full_queries.load(Ordering::SeqCst);
+    drop(selected);
+    drop(first);
+    assert_eq!(
+        Arc::strong_count(&db),
+        1,
+        "held cycle owners must close before retry"
+    );
+    drop(db);
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        snapshot(&db),
+        before,
+        "the actual admitted decision survives reopen"
+    );
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let mut library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/private".into(),
+        Arc::new(std::collections::HashMap::new()),
+        Box::new(AuthLookupSession {
+            zone: ZONE,
+            lookups: lookups.clone(),
+        }),
+        Arc::new(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db.clone(),
+        baseline_owner(),
+        "com",
+    ));
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: library.all(),
+        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+    };
+    let mut selected =
+        make_run_cycle_library_state_with_passes(ZONE, &sync_token_key(ZONE), vec![pass]);
+    selected.library = library;
+    let retried = run_stock36_cycle(&db, &[&selected], &root, &shared, &config)
+        .await
+        .unwrap();
+    assert_eq!(
+        lookups.load(Ordering::SeqCst),
+        1,
+        "the held retry must reach actual confirmation"
+    );
+    assert_eq!(
+        full_queries.load(Ordering::SeqCst),
+        calls_before,
+        "no replacement inventory"
+    );
+    assert_eq!(
+        snapshot(&db),
+        before,
+        "session failure must not ack or back off admitted work"
+    );
+    assert_eq!(epoch_state(&db, ZONE), "pending");
+    assert!(token(&db, ZONE).is_none());
+    assert!(
+        retried.session_expired,
+        "held retry must preserve typed authentication: {retried:?}"
+    );
+    assert_eq!(
+        retried.failed_count, 0,
+        "confirmation auth is not a media failure"
+    );
+    let facts =
+        crate::cycle_reporter::CycleFacts::from_cycle_result(&retried, std::time::Duration::ZERO);
+    assert_eq!(
+        facts.status,
+        crate::cycle_reporter::CycleStatus::SessionExpired
+    );
+    assert!(crate::sync_loop::runner::one_shot_partial_error(&retried).is_none());
+    let notifier = crate::notifications::Notifier::new(None);
+    let report_path = dir.path().join("held-auth.json");
+    let reporter =
+        crate::cycle_reporter::CycleReporter::new(crate::cycle_reporter::CycleReporterConfig {
+            watch_mode: true,
+            report_path: Some(&report_path),
+            run_options: crate::report::RunOptions::from_config(&config),
+            health_dir: dir.path(),
+            personality_mode: crate::personality::Mode::Off,
+            state_db: Some(db.as_ref()),
+            metrics_handle: None,
+            notifier: &notifier,
+        });
+    let mut health = crate::health::HealthStatus::new();
+    reporter.report_completed_cycle(&mut health, facts).await;
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+    assert_eq!(report["status"], "session_expired");
+    assert_eq!(report["stats"]["failed"], 0);
+    assert_eq!(health.last_error.as_deref(), Some("session expired"));
+}
+
+#[tokio::test]
 async fn retry_function_preserves_auth_and_cancellation_without_ack_or_backoff() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

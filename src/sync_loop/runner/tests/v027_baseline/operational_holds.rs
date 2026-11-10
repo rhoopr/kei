@@ -188,6 +188,9 @@ impl PhotosSession for Session {
                     vec![self.followup_child.as_ref().clone()],
                     "pair-after-three".to_owned(),
                 )
+            } else if self.cycle == 7 {
+                assert_eq!(token, "op-hold-after-baseline");
+                (self.progress.as_ref().clone(), "op-after-disk".to_owned())
             } else if self.cycle == 1 || self.cycle == 4 {
                 assert_eq!(
                     token,
@@ -234,22 +237,31 @@ pub(super) struct Fixture {
 
 impl Fixture {
     async fn new() -> Option<Self> {
-        Self::with_progress_inner(|_| ResponseTemplate::new(200).set_body_bytes(MEDIA), true).await
+        Self::with_progress_inner(
+            |_| ResponseTemplate::new(200).set_body_bytes(MEDIA),
+            true,
+            None,
+            1,
+        )
+        .await
     }
 
     pub(super) async fn with_progress<R: wiremock::Respond + Send + Sync + 'static>(
         response: impl FnOnce(PathBuf) -> R,
     ) -> Option<Self> {
-        Self::with_progress_inner(response, false).await
+        Self::with_progress_inner(response, false, None, 1).await
     }
 
     async fn with_progress_inner<R: wiremock::Respond + Send + Sync + 'static>(
         response: impl FnOnce(PathBuf) -> R,
         exact_one: bool,
+        media_root: Option<&std::path::Path>,
+        progress_requests: u64,
     ) -> Option<Self> {
         let server = crate::test_helpers::start_wiremock_or_skip("operational_holds").await?;
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("media");
+        let root =
+            media_root.map_or_else(|| dir.path().join("media"), std::path::Path::to_path_buf);
         std::fs::create_dir(&root).unwrap();
         let database = dir.path().join("state.db");
         Mock::given(method("GET"))
@@ -262,7 +274,7 @@ impl Fixture {
             .and(path("/progress"))
             .respond_with(response(database.clone()));
         if exact_one {
-            progress.expect(1).mount(&server).await;
+            progress.expect(progress_requests).mount(&server).await;
         } else {
             progress.expect(1..).mount(&server).await;
         }
@@ -475,6 +487,9 @@ impl Fixture {
             let mut download = (*base(mode, exclude, groups, zone)).clone();
             download.folder_structure = "none".into();
             download.retry.max_retries = 0;
+            if cycle == 7 {
+                download.temp_suffix = Arc::from(".part");
+            }
             Arc::new(download)
         };
         let mut expected_sources = vec![ExpectedSource {
@@ -742,6 +757,140 @@ fn cycle_facts(result: &CycleResult) -> String {
         !result.holds.is_empty(),
         result.stats.sync_token_blocked_reason
     )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn no_hold_actual_disk_failure_is_partial_and_unhealthy() {
+    const NAME: &str = "sync_loop::runner::tests::v027_baseline::operational_holds::no_hold_actual_disk_failure_is_partial_and_unhealthy";
+    if let Some(root) = std::env::var_os("KEI_TEST_LATE_IO_ROOT") {
+        let root = PathBuf::from(root);
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async {
+            let fixture = Fixture::with_progress_inner(
+                |_| ResponseTemplate::new(200).set_body_bytes(MEDIA), true, Some(&root.join("media")), 2,
+            ).await.unwrap();
+            let baseline = fixture.run(0, false, false).await;
+            assert!(baseline.can_advance_database_checkpoint(), "{baseline:?}");
+            let baseline_bytes = std::fs::read(fixture.root.join("baseline.JPG")).unwrap();
+            std::fs::write(root.join("fault-enabled"), b"enable").unwrap();
+            let mut failed = fixture.run(7, false, false).await;
+            let reached = std::fs::read_to_string(root.join("fault-reached")).unwrap();
+            assert!(reached.contains("errno=28") && !reached.contains("progress=0"), "{reached}");
+            assert_eq!(failed.failed_count, 1, "{failed:?}");
+            assert_eq!(failed.stats.failed, 1, "{failed:?}");
+            assert!(failed.holds.is_empty(), "{failed:?}");
+            assert!(failed.db_sync_token_advance_safe, "{failed:?}");
+            assert_eq!(failed.stats.state_write_failures, 0, "{failed:?}");
+            assert!(failed.sources.iter().all(|source| source.media_failures.is_empty()));
+            {
+                let conn = fixture.db.acquire_lock("verify real disk failure").unwrap();
+                let (status, error): (String, String) = conn.query_row(
+                    "SELECT status,last_error FROM assets WHERE library=?1 AND id='asset-op-progress'",
+                    [ZONE], |row| Ok((row.get(0)?,row.get(1)?)),
+                ).unwrap();
+                assert_eq!(status, "failed");
+                assert!(error.contains("space") || error.contains("28"), "{error}");
+            }
+            assert_eq!(std::fs::read(fixture.root.join("baseline.JPG")).unwrap(), baseline_bytes);
+            std::fs::remove_file(root.join("fault-enabled")).unwrap();
+            let shutdown = CancellationToken::new();
+            failed.prepare_operational_tail(&fixture.shared, &shutdown).await.unwrap();
+            let _guards = failed.finish_operational_tail(&fixture.shared, &shutdown).await.unwrap();
+            let (health, report) = reported_health(&fixture, &failed, "disk-report.json").await;
+            assert_eq!(report["status"], "partial_failure");
+            assert_eq!(report["stats"]["failed"], 1);
+            assert!(health.last_success_at.is_none(), "real disk failure must not advance health");
+        });
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let shim = dir.path().join("late-io.so");
+    let output = std::process::Command::new("cc")
+        .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror", "-o"])
+        .arg(&shim)
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/late_io_fixture.c"),
+        )
+        .args(["-ldl", "-pthread"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .env("LD_PRELOAD", shim)
+        .env("KEI_TEST_LATE_IO_ROOT", dir.path())
+        .env("KEI_TEST_LATE_IO_CASE", "write_enospc")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn no_hold_accounted_http_failure_requires_matching_owner_and_journals() {
+    let fixture = Fixture::with_progress_inner(|_| ResponseTemplate::new(500), true, None, 2)
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .run(0, false, false)
+            .await
+            .can_advance_database_checkpoint()
+    );
+    let mut failed = fixture.run(7, false, false).await;
+    assert_eq!(
+        (failed.failed_count, failed.stats.failed),
+        (1, 1),
+        "{failed:?}"
+    );
+    assert!(
+        failed.holds.is_empty() && failed.db_sync_token_advance_safe,
+        "{failed:?}"
+    );
+    assert_eq!(failed.sources[0].media_failures.len(), 1);
+    let shutdown = CancellationToken::new();
+    failed
+        .prepare_operational_tail(&fixture.shared, &shutdown)
+        .await
+        .unwrap();
+    let guards = failed
+        .finish_operational_tail(&fixture.shared, &shutdown)
+        .await
+        .unwrap();
+    assert!(
+        guards.is_some(),
+        "a durably accounted HTTP failure must reach the journal guard"
+    );
+    let (health, report) = reported_health(&fixture, &failed, "http-accounted.json").await;
+    assert_eq!(report["status"], "partial_failure");
+    assert!(health.last_success_at.is_some());
+    drop(guards);
+    failed.sources[0].media_failures[0]
+        .successor
+        .committed_admission_hash
+        .push('0');
+    assert!(
+        failed
+            .finish_operational_tail(&fixture.shared, &shutdown)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (health, report) = reported_health(&fixture, &failed, "http-stale.json").await;
+    assert_eq!(report["status"], "partial_failure");
+    assert!(
+        health.last_success_at.is_none(),
+        "stale accounting cannot retain preliminary health authority"
+    );
 }
 
 pub(super) async fn reported_health(

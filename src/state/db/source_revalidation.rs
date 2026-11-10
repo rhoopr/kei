@@ -1421,6 +1421,63 @@ impl SqliteStateDb {
         .await
     }
 
+    /// Remaining work for the exact currently selected plan, including future
+    /// deadlines and work beyond the bounded due page. This grants no cursor.
+    pub(crate) async fn selected_catalog_outcome(
+        &self,
+        owner: account::AccountOwner,
+        library: String,
+        plan_digest: String,
+        enum_hash: String,
+    ) -> Result<CatalogSourceOutcome, StateError> {
+        self.with_conn("reading selected catalog outcome", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            account::validate_authenticated(&tx, &owner)?;
+            let epoch = super::sync_epoch::read_library(&tx, &library)?;
+            let mut stmt = tx.prepare(
+                "SELECT r.id,r.scope,r.phase,r.enum_hash,r.boundary,COUNT(d.id),MIN(d.next_retry_at)
+                 FROM source_revalidation_rounds r LEFT JOIN source_revalidation_debt d ON d.round=r.id
+                 WHERE r.library=?1 AND r.mode=?2 AND r.phase IN ('marking','observing','active')
+                 GROUP BY r.id,r.scope,r.phase,r.enum_hash,r.boundary ORDER BY r.id",
+            )?;
+            let rows = stmt.query_map(params![library, CATALOG_MODE], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(5)?, row.get::<_, Option<i64>>(6)?))
+            })?;
+            let mut output = CatalogSourceOutcome { pending: false, retained: 0, next_due_at: None };
+            for row in rows {
+                let (round, scope, phase, policy, boundary, count, due) = row?;
+                let origin = CatalogOrigin::parse(&scope)?;
+                if origin.plan_digest != plan_digest {
+                    continue;
+                }
+                let record = epoch.as_ref().ok_or(StateError::ProviderSelectionInvalid)?;
+                if origin.epoch != record.epoch || origin.attempt != record.attempt {
+                    continue;
+                }
+                if origin.nonce != round || policy != enum_hash {
+                    return Err(StateError::ProviderSelectionInvalid);
+                }
+                if phase == "active" {
+                    if !super::provider_generations::observation::catalog_origin_current(&tx, &library, &origin, &enum_hash)? {
+                        return Err(StateError::ProviderSelectionInvalid);
+                    }
+                    if count == 0 { continue; }
+                } else {
+                    catalog_seed_phase(&tx, &library, &scope, &enum_hash, &boundary)?;
+                }
+                output.pending = true;
+                output.retained = output.retained.saturating_add(u64::try_from(count).map_err(|_error| StateError::ProviderSelectionInvalid)?);
+                if let Some(due) = due {
+                    output.next_due_at = Some(output.next_due_at.map_or(due, |prior| prior.min(due)));
+                }
+            }
+            drop(stmt);
+            tx.commit()?;
+            Ok(output)
+        }).await
+    }
+
     #[allow(dead_code)] // L1 catalog drain integration is pending; focused owner tests exercise this.
     pub(crate) async fn due_catalog_candidates(
         &self,

@@ -557,7 +557,16 @@ impl CycleResult {
         &self,
         session: &auth::SharedSession,
     ) -> anyhow::Result<Option<Vec<Vec<(std::path::PathBuf, std::path::PathBuf)>>>> {
-        if self.holds.is_empty()
+        if (self.holds.is_empty()
+            && (self.failed_count == 0
+                || !self.db_sync_token_advance_safe
+                || self.stats.state_write_failures > 0
+                || self.stats.enumeration_errors > 0
+                || self.stats.enumeration_incomplete
+                || self.stats.identity_incomplete
+                || self.stats.sync_token_blocked
+                || self.stats.exif_failures > 0
+                || self.stats.count_probe_failures > 0))
             || self.session_expired
             || self.stats.interrupted
             || self.stats.skipped.retry_exhausted > 0
@@ -678,8 +687,11 @@ impl CycleResult {
     ) -> anyhow::Result<()> {
         // A pre-tail sparse attestation cannot survive newly discovered work
         // or a failed journal check without the post-tail observation.
-        if !self.holds.is_empty() {
+        if !self.holds.is_empty() || self.failed_count > 0 {
             self.operational_safe_holds = false;
+        }
+        for source in &mut self.sources {
+            source.operational_pre_tail_paths = None;
         }
         let Some(paths) = self.operational_paths(session).await? else {
             return Ok(());
@@ -706,6 +718,9 @@ impl CycleResult {
         session: &auth::SharedSession,
         shutdown: &CancellationToken,
     ) -> anyhow::Result<Option<download::OperationalJournalGuards>> {
+        if !self.holds.is_empty() || self.failed_count > 0 {
+            self.operational_safe_holds = false;
+        }
         let Some(paths) = self.operational_paths(session).await? else {
             return Ok(None);
         };
@@ -1467,7 +1482,13 @@ async fn retry_due_admitted_while_held(
         }
         Ok(None) => {}
         Err(error) => {
-            *cycle_failed_count = cycle_failed_count.saturating_add(1);
+            if crate::icloud::photos::session::is_session_error(&error) {
+                *cycle_session_expired = true;
+            } else if shutdown_token.is_cancelled() {
+                cycle_stats.interrupted = true;
+            } else {
+                *cycle_failed_count = cycle_failed_count.saturating_add(1);
+            }
             *db_sync_token_advance_safe = false;
             tracing::warn!(
                 error = %error,
@@ -3492,14 +3513,47 @@ pub(crate) async fn run_cycle_with_witness(
                 baseline_cursor_at_start = Some(boundary);
                 fresh_origin = Some(origin);
                 Arc::make_mut(&mut download_config).sync_mode = download::SyncMode::Full;
-                Box::pin(download::download_photos_with_sync(
+                let replacement = Box::pin(download::download_photos_with_sync(
                     &download_client,
                     &lib_state.plan.passes,
                     Arc::clone(&download_config),
                     download_controls,
                     shutdown_token.clone(),
                 ))
-                .await?
+                .await;
+                match replacement {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if let (Some(db), Some(prior)) =
+                            (state_db, retained_cursor_at_start.as_deref())
+                        {
+                            let mut hold = RetainedCheckpointHold::new(
+                                prior,
+                                &enum_config_hash,
+                                preservation_config_hash.as_deref(),
+                            );
+                            hold.attempt_count = retained_checkpoint_attempt;
+                            let expected = zone_metadata_fence
+                                .iter()
+                                .cloned()
+                                .chain(path_metadata_at_start.iter().cloned())
+                                .collect();
+                            if let Err(hold_error) = persist_retained_checkpoint_hold(
+                                db,
+                                hold_key.clone(),
+                                &hold,
+                                expected,
+                            )
+                            .await
+                            {
+                                return Err(error.context(format!(
+                                    "Failed to retain rejected main checkpoint hold: {hold_error:#}"
+                                )));
+                            }
+                        }
+                        return Err(error);
+                    }
+                }
             }
             Err(error) => return Err(error),
         };

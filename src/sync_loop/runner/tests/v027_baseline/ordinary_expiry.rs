@@ -65,6 +65,18 @@ impl PhotosSession for SourceSession {
         if url.contains("/zones/list") {
             if self.primary && self.phase > 0 {
                 self.events.lock().unwrap().push("fresh-boundary");
+                if matches!(
+                    self.fault,
+                    OriginFault::ReplacementError | OriginFault::ReplacementHoldError
+                ) {
+                    let conn = self
+                        .db
+                        .acquire_lock("inject replacement-only owner failure")?;
+                    conn.execute_batch("CREATE TRIGGER IF NOT EXISTS fail_replacement_generation BEFORE INSERT ON provider_active_generations BEGIN SELECT RAISE(ABORT,'synthetic replacement generation failure'); END;")?;
+                    if self.fault == OriginFault::ReplacementHoldError {
+                        conn.execute_batch("CREATE TRIGGER IF NOT EXISTS fail_replacement_hold BEFORE INSERT ON metadata WHEN NEW.key='retained_checkpoint_hold:v27:PrimarySync-expiry' BEGIN SELECT RAISE(ABORT,'synthetic hold write failure'); END;")?;
+                    }
+                }
             }
             let fresh = if self.phase > 1
                 && matches!(
@@ -82,7 +94,9 @@ impl PhotosSession for SourceSession {
             );
         }
         if url.contains("/internal/records/query/batch") {
-            let count = if self.primary
+            let count = if self.primary && self.fault == OriginFault::ManyDebt {
+                if self.phase == 0 { 65 } else { 66 }
+            } else if self.primary
                 && self.phase > 0
                 && self.fault != OriginFault::PreBoundaryDeleted
             {
@@ -221,8 +235,10 @@ impl PhotosSession for SourceSession {
                 })
                 .cloned()
                 .collect();
-            if self.fault == OriginFault::WrongScope
-                && self.primary
+            if matches!(
+                self.fault,
+                OriginFault::WrongScope | OriginFault::FutureDebt | OriginFault::ManyDebt
+            ) && self.primary
                 && self.events.lock().unwrap().contains(&"fresh-bridge")
             {
                 for record in &mut records {
@@ -282,6 +298,10 @@ enum OriginFault {
     DeletedProtected,
     PreparedPublication,
     WrongScope,
+    FutureDebt,
+    ManyDebt,
+    ReplacementError,
+    ReplacementHoldError,
     AuthLookup,
     CancelLookup,
     RecordAuthMaster,
@@ -318,6 +338,26 @@ async fn m1_rank_change_holds_without_second_inventory_and_recovers_after_reopen
 #[tokio::test]
 async fn m1_strict_wrong_scope_retains_catalog_debt_across_quiet_reopens() {
     exercise_expiry(OriginFault::WrongScope).await;
+}
+
+#[tokio::test]
+async fn m1_future_catalog_debt_remains_visible_after_reopen_without_early_lookup() {
+    exercise_expiry(OriginFault::FutureDebt).await;
+}
+
+#[tokio::test]
+async fn m1_bounded_catalog_page_reports_the_remaining_sixty_fifth_candidate() {
+    exercise_expiry(OriginFault::ManyDebt).await;
+}
+
+#[tokio::test]
+async fn m1_replacement_error_retains_original_cursor_hold() {
+    exercise_expiry(OriginFault::ReplacementError).await;
+}
+
+#[tokio::test]
+async fn m1_replacement_error_reports_hold_write_failure() {
+    exercise_expiry(OriginFault::ReplacementHoldError).await;
 }
 
 #[cfg(feature = "xmp")]
@@ -395,10 +435,21 @@ async fn exercise_expiry(fault: OriginFault) {
         let mock = Mock::given(method("GET"))
             .and(path(format!("/{id}")))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA));
-        if fault == OriginFault::MarkerWriterProbe {
+        if matches!(
+            fault,
+            OriginFault::MarkerWriterProbe
+                | OriginFault::ReplacementError
+                | OriginFault::ReplacementHoldError
+        ) {
             mock.mount(&server).await;
         } else {
-            mock.expect(1).mount(&server).await;
+            mock.expect(if fault == OriginFault::ManyDebt && id == "primary-old" {
+                65
+            } else {
+                1
+            })
+            .mount(&server)
+            .await;
         }
     }
     let dir = tempfile::tempdir().unwrap();
@@ -430,6 +481,8 @@ async fn exercise_expiry(fault: OriginFault) {
     let deferred = matches!(
         fault,
         OriginFault::WrongScope
+            | OriginFault::FutureDebt
+            | OriginFault::ManyDebt
             | OriginFault::DeletedProtected
             | OriginFault::PreparedPublication
             | OriginFault::TopFalseMalformed
@@ -493,6 +546,22 @@ async fn exercise_expiry(fault: OriginFault) {
             let name = if primary { "primary" } else { "shared" };
             let old = format!("{name}-old");
             let new = format!("{name}-new");
+            let mut current = media(
+                &old,
+                &format!("{}/{old}", server.uri()),
+                &source,
+                if primary { 71 } else { 72 },
+            );
+            if primary && fault == OriginFault::ManyDebt {
+                for index in 0..64 {
+                    current.extend(media(
+                        &format!("primary-extra-{index:02}"),
+                        &format!("{}/primary-old", server.uri()),
+                        &source,
+                        index as u8,
+                    ));
+                }
+            }
             SourceSession {
                 primary,
                 phase,
@@ -500,12 +569,7 @@ async fn exercise_expiry(fault: OriginFault) {
                 db: db.clone(),
                 cancel: shutdown.clone(),
                 events: events.clone(),
-                current: Arc::new(media(
-                    &old,
-                    &format!("{}/{old}", server.uri()),
-                    &source,
-                    if primary { 71 } else { 72 },
-                )),
+                current: Arc::new(current),
                 added: Arc::new(media(
                     &new,
                     &format!("{}/{new}", server.uri()),
@@ -626,6 +690,103 @@ async fn exercise_expiry(fault: OriginFault) {
             assert_eq!(peer, format!("{SHARED}-1"));
             return;
         }
+        if phase == 1
+            && matches!(
+                fault,
+                OriginFault::ReplacementError | OriginFault::ReplacementHoldError
+            )
+        {
+            let error = result
+                .expect_err("replacement generation must fail after typed original rejection");
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("synthetic replacement generation failure"),
+                "{text}"
+            );
+            assert!(events.lock().unwrap().contains(&"rejected"));
+            let (key, raw, original) = {
+                let conn = db.acquire_lock("verify replacement error hold").unwrap();
+                let original: String = conn
+                    .query_row(
+                        "SELECT value FROM metadata WHERE key=?1",
+                        [sync_token_key(PRIMARY)],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(original, format!("{PRIMARY}-1"));
+                let origin: (String, i64) = conn.query_row("SELECT phase,(SELECT COUNT(*) FROM source_revalidation_debt d WHERE d.round=r.id) FROM source_revalidation_rounds r WHERE library=?1 AND mode='catalog_v2' AND phase='observing'", [PRIMARY], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+                assert_eq!(origin, ("observing".to_owned(), 1));
+                let key = format!(
+                    "{}{}",
+                    crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX,
+                    PRIMARY
+                );
+                let raw: Option<String> = conn
+                    .query_row("SELECT value FROM metadata WHERE key=?1", [&key], |row| {
+                        row.get(0)
+                    })
+                    .ok();
+                if fault == OriginFault::ReplacementHoldError {
+                    assert!(raw.is_none());
+                    assert!(
+                        text.contains("synthetic hold write failure"),
+                        "hold-write failure must be visible: {text}"
+                    );
+                } else {
+                    let hold: Value = serde_json::from_str(
+                        raw.as_ref()
+                            .expect("the original rejected cursor must retain its fenced hold"),
+                    )
+                    .unwrap();
+                    use sha2::{Digest, Sha256};
+                    assert_eq!(
+                        hold["prior_cursor_sha256"],
+                        data_encoding::HEXLOWER.encode(&Sha256::digest(original.as_bytes()))
+                    );
+                    assert_eq!(hold["attempt_count"], 1);
+                    assert!(
+                        hold["next_attempt_at"].as_i64().unwrap() > chrono::Utc::now().timestamp()
+                    );
+                }
+                for (path, modified) in &published {
+                    assert_eq!(std::fs::read(path).unwrap(), MEDIA);
+                    assert_eq!(
+                        &std::fs::metadata(path).unwrap().modified().unwrap(),
+                        modified
+                    );
+                }
+                (key, raw, original)
+            };
+            drop(states);
+            drop(context);
+            drop(all);
+            drop(selected);
+            drop(base);
+            assert_eq!(
+                Arc::strong_count(&db),
+                1,
+                "all source owners must close before reopen"
+            );
+            drop(db);
+            let reopened = SqliteStateDb::open_owned(&database, &baseline_owner())
+                .await
+                .unwrap();
+            assert_eq!(reopened.get_metadata(&key).await.unwrap(), raw);
+            assert_eq!(
+                reopened
+                    .get_metadata(&sync_token_key(PRIMARY))
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(original.as_str())
+            );
+            let conn = reopened
+                .acquire_lock("verify replacement origin after reopen")
+                .unwrap();
+            let debt: i64 = conn.query_row("SELECT COUNT(*) FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE r.library=?1 AND r.phase='observing'", [PRIMARY], |row| row.get(0)).unwrap();
+            assert_eq!(debt, 1);
+            return;
+        }
         let mut result = result.unwrap();
         if fault == OriginFault::None {
             assert!(
@@ -657,6 +818,7 @@ async fn exercise_expiry(fault: OriginFault) {
             );
         }
         let expected_downloads = match (fault, phase) {
+            (OriginFault::ManyDebt, 0) => 66,
             (_, 0)
             | (
                 OriginFault::None
@@ -670,6 +832,8 @@ async fn exercise_expiry(fault: OriginFault) {
                 | OriginFault::DeletedProtected
                 | OriginFault::PreparedPublication
                 | OriginFault::WrongScope
+                | OriginFault::FutureDebt
+                | OriginFault::ManyDebt
                 | OriginFault::AuthLookup
                 | OriginFault::CancelLookup
                 | OriginFault::RecordAuthMaster
@@ -739,6 +903,172 @@ async fn exercise_expiry(fault: OriginFault) {
             }
         } else {
             assert!(result.can_advance_database_checkpoint(), "{result:?}");
+        }
+        if fault == OriginFault::FutureDebt && phase > recovery_phase {
+            let lookups_before = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| **event == "lookup")
+                .count();
+            states[0].plan_is_stale = true;
+            let no_db = |mode, exclude, groups, library| {
+                let mut config = (*builder(mode, exclude, groups, library)).clone();
+                config.state_db = None;
+                Arc::new(config)
+            };
+            assert!(
+                crate::sync_loop::runner::quiet_catalog_cycle(
+                    &[&states[0]],
+                    &no_db,
+                    download::DownloadControls::download_hidden(),
+                    &download::compute_config_hash(&run_config),
+                    &shutdown,
+                )
+                .await
+                .unwrap()
+                .is_none(),
+                "absent state must keep its previous shortcut"
+            );
+            let preview = download::DownloadControls::new(
+                download::DownloadRunMode::DryRun,
+                download::DownloadReporting::hidden(),
+            );
+            assert!(
+                crate::sync_loop::runner::quiet_catalog_cycle(
+                    &[&states[0]],
+                    &builder,
+                    preview,
+                    &download::compute_config_hash(&run_config),
+                    &shutdown,
+                )
+                .await
+                .unwrap()
+                .is_none(),
+                "preview must not acquire catalog health policy"
+            );
+            let retry_only = |mode, exclude, groups, library| {
+                let mut config = (*builder(mode, exclude, groups, library)).clone();
+                config.retry_only = true;
+                Arc::new(config)
+            };
+            assert!(
+                crate::sync_loop::runner::quiet_catalog_cycle(
+                    &[&states[0]],
+                    &retry_only,
+                    download::DownloadControls::download_hidden(),
+                    &download::compute_config_hash(&run_config),
+                    &shutdown,
+                )
+                .await
+                .unwrap()
+                .is_none(),
+                "manual retry keeps its existing selection policy"
+            );
+            let capture_repair = |mode, exclude, groups, library| {
+                let mut config = (*builder(mode, exclude, groups, library)).clone();
+                config.capture_timestamp_repair =
+                    download::CaptureTimestampRepair::ReplaceWithCaptureLocal;
+                Arc::new(config)
+            };
+            assert!(
+                crate::sync_loop::runner::quiet_catalog_cycle(
+                    &[&states[0]],
+                    &capture_repair,
+                    download::DownloadControls::download_hidden(),
+                    &download::compute_config_hash(&run_config),
+                    &shutdown,
+                )
+                .await
+                .unwrap()
+                .is_none(),
+                "explicit capture repair keeps its existing selection policy"
+            );
+            assert!(
+                crate::sync_loop::runner::quiet_catalog_cycle(
+                    &[&states[0]],
+                    &builder,
+                    download::DownloadControls::download_hidden(),
+                    &download::compute_config_hash(&run_config),
+                    &shutdown,
+                )
+                .await
+                .is_err(),
+                "a stale selected catalog plan cannot certify health"
+            );
+            states[0].plan_is_stale = false;
+            let quiet = crate::sync_loop::runner::quiet_catalog_cycle(
+                &[&states[0], &states[1]],
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &download::compute_config_hash(&run_config),
+                &shutdown,
+            )
+            .await
+            .unwrap()
+            .expect("selected future debt must veto skipped-watch success");
+            assert_eq!(quiet.failed_count, 0);
+            let notifier = crate::notifications::Notifier::new(None);
+            let report_path = dir.path().join("quiet-catalog-report.json");
+            let reporter = crate::cycle_reporter::CycleReporter::new(
+                crate::cycle_reporter::CycleReporterConfig {
+                    watch_mode: true,
+                    report_path: Some(&report_path),
+                    run_options: crate::report::RunOptions::from_config(&run_config),
+                    health_dir: dir.path(),
+                    personality_mode: crate::personality::Mode::Off,
+                    state_db: Some(db.as_ref()),
+                    metrics_handle: None,
+                    notifier: &notifier,
+                },
+            );
+            let mut health = crate::health::HealthStatus::new();
+            reporter
+                .report_completed_cycle(
+                    &mut health,
+                    crate::cycle_reporter::CycleFacts::from_cycle_result(
+                        &quiet,
+                        std::time::Duration::ZERO,
+                    ),
+                )
+                .await;
+            let report: Value =
+                serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+            assert_eq!(report["status"], "partial_failure");
+            assert_eq!(report["stats"]["failed"], 0);
+            assert!(health.last_success_at.is_none());
+            let remaining = crate::sync_loop::runner::drain_catalog_source_revalidation(
+                &[&states[0], &states[1]],
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &download::compute_config_hash(&run_config),
+                &shutdown,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| **event == "lookup")
+                    .count(),
+                lookups_before,
+                "future debt must not trigger an early provider lookup"
+            );
+            assert_eq!(
+                remaining.retained_sources,
+                vec![PRIMARY],
+                "future selected debt remains visible after reopen"
+            );
+            crate::sync_loop::runner::apply_catalog_drain_outcome(
+                &mut result,
+                &[&states[0], &states[1]],
+                remaining,
+                false,
+            );
+            assert_eq!(result.failed_count, 0);
+            assert!(crate::sync_loop::runner::one_shot_partial_error(&result).is_some());
         }
         if phase == recovery_phase {
             let probe = builder(
@@ -848,6 +1178,12 @@ async fn exercise_expiry(fault: OriginFault) {
                     std::fs::metadata(&sidecar).unwrap().modified().unwrap(),
                 ));
             }
+            let lookups_before = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| **event == "lookup")
+                .count();
             let drained = crate::sync_loop::runner::drain_catalog_source_revalidation(
                 &[&states[0], &states[1]],
                 &builder,
@@ -857,6 +1193,38 @@ async fn exercise_expiry(fault: OriginFault) {
             )
             .await
             .unwrap();
+            if fault == OriginFault::ManyDebt {
+                assert_eq!(drained.retained, 65);
+                assert_eq!(drained.retained_sources, vec![PRIMARY]);
+                assert_eq!(
+                    events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|event| **event == "lookup")
+                        .count()
+                        - lookups_before,
+                    64
+                );
+                let conn = db
+                    .acquire_lock("verify 65 actual catalog candidates")
+                    .unwrap();
+                let (debt, due, intact): (i64, i64, i64) = conn.query_row(
+                    "SELECT (SELECT COUNT(*) FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE r.library=?1 AND r.phase='active'), (SELECT COUNT(*) FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE r.library=?1 AND r.phase='active' AND d.next_retry_at<=?2), (SELECT COUNT(*) FROM assets WHERE library=?1 AND status='downloaded' AND is_deleted=0)",
+                    rusqlite::params![PRIMARY, chrono::Utc::now().timestamp()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                ).unwrap();
+                assert_eq!((debt, due, intact), (65, 1, 66));
+                drop(conn);
+                crate::sync_loop::runner::apply_catalog_drain_outcome(
+                    &mut result,
+                    &[&states[0], &states[1]],
+                    drained,
+                    false,
+                );
+                assert_eq!(result.failed_count, 0);
+                assert!(crate::sync_loop::runner::one_shot_partial_error(&result).is_some());
+                return;
+            }
             if fault == OriginFault::PreparedPublication {
                 let conn = db
                     .acquire_lock("verify deletion and publication custody")
@@ -985,6 +1353,28 @@ async fn exercise_expiry(fault: OriginFault) {
                 "initial pending baseline must activate its origin"
             );
             initial_origin = Some(origin);
+            if matches!(
+                fault,
+                OriginFault::ReplacementError | OriginFault::ReplacementHoldError
+            ) {
+                for id in ["primary-old", "shared-old"] {
+                    let native: String = conn
+                        .query_row(
+                            "SELECT native_path FROM download_receipts WHERE child=?1",
+                            [format!("asset-{id}")],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    let path = serde_json::from_str::<
+                        crate::state::db::provider_selection::SelectionPath,
+                    >(&native)
+                    .unwrap()
+                    .to_path();
+                    assert_eq!(std::fs::read(&path).unwrap(), MEDIA);
+                    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                    published.push((path, modified));
+                }
+            }
         }
         if interrupted && phase == 1 {
             let token: String = conn

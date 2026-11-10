@@ -112,7 +112,8 @@ impl<'a> CycleFacts<'a> {
             !result.holds.is_empty(),
         );
         let stats = &result.stats;
-        facts.accounted_transfer_failures = result.db_sync_token_advance_safe
+        facts.accounted_transfer_failures = result.operational_safe_holds
+            && result.db_sync_token_advance_safe
             && result.failed_count > 0
             && result.failed_count == stats.failed
             && result.holds.is_empty()

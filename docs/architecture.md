@@ -993,7 +993,9 @@ sync_loop::run_sync
   -> cycle reporting and watch control
 ```
 
-For eligible mixed transfer failures or preservation holds, the pipeline pairs each actual final transfer failure with its exact committed successor; a retained future owner must have been captured before dispatch. The state owner rechecks source, epoch, destination, sparse, preservation and pending-work evidence in a deferred snapshot. After the cycle and its tails join, the runner rechecks recorded media and sidecar journals under process-local destination guards before reporting health. The account session lock remains held. These checks do not make SQLite and the filesystem atomic or create a root lease. Partial reports and one-shot exit status remain unchanged.
+For eligible transfer failures, with or without holds, and preservation holds, the pipeline pairs each actual final transfer failure with its exact committed successor; a retained future owner must have been captured before dispatch. The state owner rechecks source, epoch, destination, sparse, preservation and pending-work evidence in a deferred snapshot. After the cycle and its tails join, the runner rechecks recorded media and sidecar journals under process-local destination guards before reporting health. The account session lock remains held. These checks do not make SQLite and the filesystem atomic or create a root lease. Partial reports and one-shot exit status remain unchanged.
+
+Selected catalog revalidation debt remains visible after a bounded drain and on quiet watch cycles, including work whose retry deadline is in the future. Inspection does not advance the deadline or authorize a checkpoint.
 
 Photo readiness is explicit provider evidence. `PhotoLibrary` accepts `FINISHED`
 or `RUNNING`; missing and unknown states fail closed. Sync checks readiness before
