@@ -939,6 +939,15 @@ async fn catalog_observed_delta_installs_origin_atomically_including_quiet_eof()
         assert_eq!(resume.origin, origin);
         assert_eq!(resume.boundary, next);
         assert_eq!(resume.relation, CatalogResumeRelation::CurrentToken);
+        let reopened = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        let resumed = reopened
+            .catalog_resume(owner(), fixture.hint_request(next).await)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed, resume);
         {
             let conn = db.acquire_lock("verify delta bootstrap origin").unwrap();
             let copied:i64 = conn.query_row("SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id='retained-asset'", [&origin.nonce], |r| r.get(0)).unwrap();
@@ -1748,9 +1757,93 @@ async fn catalog_hint_current_legacy_link_preserves_ordinary_delta_and_debt() {
                 .unwrap(),
             CatalogBootstrapEligibility::CurrentLegacyLink
         );
+        for (column, changed, original) in [
+            (
+                "mode",
+                "future_mode".to_owned(),
+                "legacy_unfiled_v1".to_owned(),
+            ),
+            (
+                "mode",
+                "catalog_v2".to_owned(),
+                "legacy_unfiled_v1".to_owned(),
+            ),
+            ("phase", "observing".to_owned(), "active".to_owned()),
+            (
+                "scope",
+                "foreign-scope".to_owned(),
+                fixture.plan.scope.clone(),
+            ),
+            ("enum_hash", "wrong-policy".to_owned(), "policy".to_owned()),
+        ] {
+            {
+                let conn = db.acquire_lock("invalidate current legacy link").unwrap();
+                conn.execute(
+                    &format!("UPDATE source_revalidation_rounds SET {column}=?2 WHERE id=?1"),
+                    rusqlite::params![round, changed],
+                )
+                .unwrap();
+            }
+            assert!(
+                db.catalog_bootstrap_eligibility(
+                    owner(),
+                    fixture.hint_request("legacy-active").await
+                )
+                .await
+                .is_err()
+            );
+            {
+                let conn = db.acquire_lock("restore current legacy link").unwrap();
+                conn.execute(
+                    &format!("UPDATE source_revalidation_rounds SET {column}=?2 WHERE id=?1"),
+                    rusqlite::params![round, original],
+                )
+                .unwrap();
+            }
+        }
         let delta = ObservationProof::delivery(fixture.receipt.clone())
             .delta("legacy-active", "legacy-next")
             .unwrap();
+        for trigger in [
+            "CREATE TRIGGER legacy_delta_fault BEFORE INSERT ON metadata WHEN NEW.key='observed_selection:v27:PrimarySync' BEGIN SELECT RAISE(ABORT,'legacy checkpoint fault'); END",
+            "CREATE TRIGGER legacy_delta_fault AFTER UPDATE ON metadata WHEN NEW.key='sync_token:v27:PrimarySync' BEGIN UPDATE source_revalidation_rounds SET phase='abandoned' WHERE mode='legacy_unfiled_v1'; END",
+        ] {
+            {
+                let conn = db.acquire_lock("inject legacy delta failure").unwrap();
+                conn.execute_batch(trigger).unwrap();
+            }
+            assert!(
+                db.commit_observation_transition(
+                    transition(db, "legacy-next").await,
+                    Some(delta.clone()),
+                    false
+                )
+                .await
+                .is_err()
+            );
+            {
+                let conn = db.acquire_lock("clear legacy delta failure").unwrap();
+                conn.execute_batch("DROP TRIGGER legacy_delta_fault")
+                    .unwrap();
+            }
+            let reopened = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened.get_metadata(TOKEN).await.unwrap().as_deref(),
+                Some("legacy-active")
+            );
+            assert_eq!(
+                reopened
+                    .catalog_bootstrap_eligibility(
+                        owner(),
+                        fixture.hint_request("legacy-active").await
+                    )
+                    .await
+                    .unwrap(),
+                CatalogBootstrapEligibility::CurrentLegacyLink
+            );
+        }
         db.commit_observation_transition(transition(db, "legacy-next").await, Some(delta), false)
             .await
             .unwrap();
@@ -1758,15 +1851,37 @@ async fn catalog_hint_current_legacy_link_preserves_ordinary_delta_and_debt() {
             db.get_metadata(TOKEN).await.unwrap().as_deref(),
             Some("legacy-next")
         );
-        let conn = db
-            .acquire_lock("verify legacy round after ordinary delta")
+        {
+            let conn = db
+                .acquire_lock("verify legacy round after ordinary delta")
+                .unwrap();
+            let (mode,phase,debt):(String,String,i64) = conn.query_row("SELECT r.mode,r.phase,COUNT(d.id) FROM source_revalidation_rounds r LEFT JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1 GROUP BY r.id", [&round], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!(
+                (mode.as_str(), phase.as_str(), debt),
+                ("legacy_unfiled_v1", "active", i64::from(with_debt))
+            );
+        }
+        let due = db
+            .due_source_revalidation(owner(), "PrimarySync".into(), fixture.plan.scope.clone())
+            .await
             .unwrap();
-        let (mode,phase,debt):(String,String,i64) = conn.query_row("SELECT r.mode,r.phase,COUNT(d.id) FROM source_revalidation_rounds r LEFT JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1 GROUP BY r.id", [&round], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(due.len(), usize::from(with_debt));
         assert_eq!(
-            (mode.as_str(), phase.as_str(), debt),
-            ("legacy_unfiled_v1", "active", i64::from(with_debt))
+            db.catalog_bootstrap_eligibility(owner(), fixture.hint_request("legacy-next").await)
+                .await
+                .unwrap(),
+            CatalogBootstrapEligibility::CurrentLegacyLink
         );
-        drop(conn);
+        let reopened = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .catalog_bootstrap_eligibility(owner(), fixture.hint_request("legacy-next").await)
+                .await
+                .unwrap(),
+            CatalogBootstrapEligibility::CurrentLegacyLink
+        );
         if with_debt {
             assert_eq!(std::fs::read(&media).unwrap(), b"legacy media");
         }
@@ -1777,6 +1892,14 @@ async fn catalog_hint_current_legacy_link_preserves_ordinary_delta_and_debt() {
 async fn catalog_resume_returns_actual_saved_expiry_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+    assert!(
+        fixture
+            .db
+            .catalog_resume(owner(), fixture.hint_request("after").await)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let origin = fixture.install().await;
     let resume = fixture
         .db
@@ -1787,6 +1910,151 @@ async fn catalog_resume_returns_actual_saved_expiry_boundary() {
     assert_eq!(resume.origin, origin);
     assert_eq!(resume.boundary, "before");
     assert_eq!(resume.relation, CatalogResumeRelation::SavedBoundary);
+    let request = fixture.hint_request("after").await;
+    for invalid in [
+        {
+            let mut r = request.clone();
+            r.fresh_cursor = "wrong-token".into();
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.plan.database = "shared".into();
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.plan.zone["zoneType"] = serde_json::json!("wrong-full-zone");
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.plan.provider = "wrong-pin".into();
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.plan.config_hash = "a".repeat(64);
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.expected_attempt = uuid::Uuid::new_v4().to_string();
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.expected_epoch = uuid::Uuid::new_v4().to_string();
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.expected_catalog_snapshot = "stale".into();
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.baseline_key.push_str("alias");
+            r
+        },
+    ] {
+        assert!(fixture.db.catalog_resume(owner(), invalid).await.is_err());
+    }
+    let duplicate = CatalogOrigin::new(
+        origin.plan_digest.clone(),
+        origin.epoch.clone(),
+        origin.attempt.clone(),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .unwrap();
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("insert competing catalog resume")
+            .unwrap();
+        conn.execute("INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES(?1,'PrimarySync',?2,'policy',?3,'','','marking','catalog_v2')", rusqlite::params![duplicate.nonce,duplicate.scope(),CatalogOrigin::boundary("before")]).unwrap();
+    }
+    assert!(
+        fixture
+            .db
+            .catalog_resume(owner(), fixture.hint_request("after").await)
+            .await
+            .is_err()
+    );
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("make competing catalog round active")
+            .unwrap();
+        conn.execute(
+            "UPDATE source_revalidation_rounds SET phase='active' WHERE id=?1",
+            [&duplicate.nonce],
+        )
+        .unwrap();
+    }
+    assert!(
+        fixture
+            .db
+            .catalog_resume(owner(), fixture.hint_request("after").await)
+            .await
+            .is_err()
+    );
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("retain competing catalog history")
+            .unwrap();
+        conn.execute(
+            "UPDATE source_revalidation_rounds SET phase='abandoned' WHERE id=?1",
+            [&duplicate.nonce],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE source_revalidation_rounds SET mode='future_mode' WHERE id=?1",
+            [&origin.nonce],
+        )
+        .unwrap();
+    }
+    assert!(
+        fixture
+            .db
+            .catalog_resume(owner(), fixture.hint_request("after").await)
+            .await
+            .is_err()
+    );
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("restore catalog mode and inject read fault")
+            .unwrap();
+        conn.execute(
+            "UPDATE source_revalidation_rounds SET mode='catalog_v2' WHERE id=?1",
+            [&origin.nonce],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "ALTER TABLE source_revalidation_rounds RENAME TO unavailable_resume_rounds",
+        )
+        .unwrap();
+    }
+    assert!(
+        fixture
+            .db
+            .catalog_resume(owner(), request.clone())
+            .await
+            .is_err()
+    );
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("restore catalog resume read")
+            .unwrap();
+        conn.execute_batch(
+            "ALTER TABLE unavailable_resume_rounds RENAME TO source_revalidation_rounds",
+        )
+        .unwrap();
+    }
+    let before_seed = fixture.hint_request("after").await;
     fixture
         .db
         .seed_source_revalidation(
@@ -1799,6 +2067,13 @@ async fn catalog_resume_returns_actual_saved_expiry_boundary() {
         )
         .await
         .unwrap();
+    assert!(
+        fixture
+            .db
+            .catalog_resume(owner(), before_seed)
+            .await
+            .is_err()
+    );
     let reopened = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
         .await
         .unwrap();
@@ -1810,6 +2085,53 @@ async fn catalog_resume_returns_actual_saved_expiry_boundary() {
     assert_eq!(resume.origin, origin);
     assert_eq!(resume.boundary, "before");
     assert_eq!(resume.relation, CatalogResumeRelation::SavedBoundary);
+}
+
+#[tokio::test]
+async fn catalog_resume_equal_fresh_boundary_is_not_eof_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+    let zone = fixture.plan.zone.clone();
+    let mock = MockPhotosSession::new()
+        .ok(serde_json::json!({"records":[{"recordName":"index","recordType":"CheckIndexingState","fields":{"state":{"value":"FINISHED"}}}]}))
+        .ok(serde_json::json!({"zones":[{"zoneID":zone,"syncToken":"after"}]}));
+    let mut library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/private".into(),
+        Arc::new(HashMap::new()),
+        Box::new(mock),
+        Arc::new(zone),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    library.shadow_capture = Some(ShadowCapture::new(fixture.db.clone(), owner(), "com"));
+    let mut request = fixture.hint_request("after").await;
+    let actual_fresh_boundary = library.fresh_baseline_cursor().await.unwrap();
+    assert_eq!(actual_fresh_boundary, "after");
+    request.fresh_cursor = actual_fresh_boundary;
+    let origin = fixture
+        .db
+        .install_fresh_catalog_origin(owner(), request)
+        .await
+        .unwrap();
+    let resume = fixture
+        .db
+        .catalog_resume(owner(), fixture.hint_request("after").await)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resume.origin, origin);
+    assert_eq!(resume.boundary, "after");
+    assert_eq!(resume.relation, CatalogResumeRelation::CurrentToken);
+    assert!(
+        fixture
+            .db
+            .due_catalog_candidates(owner(), "PrimarySync".into(), origin, "policy".into())
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]

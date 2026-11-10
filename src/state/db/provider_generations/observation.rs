@@ -672,6 +672,24 @@ fn catalog_round_known(conn: &Connection, round: &str, library: &str) -> Result<
     }))
 }
 
+fn legacy_round_current(
+    conn: &Connection,
+    descriptor: &Descriptor,
+    round: &str,
+) -> Result<bool, StateError> {
+    let row: Option<(String, String)> = conn.query_row(
+        "SELECT scope,enum_hash FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND mode=?3 AND phase='active'",
+        params![round, descriptor.library, super::super::source_revalidation::LEGACY_MODE],
+        |row| Ok((row.get(0)?,row.get(1)?)),
+    ).optional()?;
+    let Some((scope, enum_hash)) = row else {
+        return Ok(false);
+    };
+    Ok(descriptor.policy[0].as_deref() == Some(enum_hash.as_str())
+        && descriptor.plans.iter().any(|plan| plan.scope == scope)
+        && descriptor_own_source(descriptor)?)
+}
+
 fn store(conn: &Connection, key: &str, mut value: Descriptor) -> Result<(), StateError> {
     value.proof_hash.clear();
     value.proof_hash = digest(&encode(&value)?);
@@ -1260,7 +1278,9 @@ pub(in crate::state::db) fn prepare(
                     if round.is_none()
                         && let Some(saved_round) = saved_round
                     {
-                        let current = catalog_round_known(conn, &saved_round, zone)?;
+                        let current = catalog_round_known(conn, &saved_round, zone)?
+                            || (target.starts_with(ACTIVE)
+                                && legacy_round_current(conn, &saved, &saved_round)?);
                         if current {
                             round = Some(saved_round);
                         }
@@ -1294,6 +1314,7 @@ pub(in crate::state::db) fn apply(
     conn: &Connection,
     prepared: Prepared,
     required: Option<&RequiredCatalog>,
+    proof: Option<&ObservationProof>,
 ) -> Result<(), StateError> {
     for (key, mut value) in prepared.0 {
         if value.policy != policy(conn)? && value.revalidation_round.is_some() {
@@ -1358,7 +1379,15 @@ pub(in crate::state::db) fn apply(
                     } else {
                         value.revalidation_round = None;
                     }
-                } else {
+                } else if !(proof.is_some_and(|proof| matches!(proof.kind, Kind::Delta { .. }))
+                    && legacy_round_current(conn, &value, round)?)
+                {
+                    if proof.is_some_and(|proof| matches!(proof.kind, Kind::Delta { .. })) {
+                        return Err(StateError::Invariant {
+                            operation: "commit_checkpoint_transition",
+                            detail: "current legacy source revalidation round changed".into(),
+                        });
+                    }
                     let activated = conn.execute("UPDATE source_revalidation_rounds SET phase='active' WHERE id=?1 AND library=?2 AND phase='observing'", params![round, value.library])?;
                     if activated != 1 {
                         return Err(StateError::Invariant {

@@ -1114,10 +1114,10 @@ impl SqliteStateDb {
                     return Ok(CatalogOriginOperationResult::Resume(None));
                 };
                 let hash = CatalogOrigin::boundary(&boundary);
-                let rows: Vec<(String,String,String,String)> = tx.prepare(
-                    "SELECT id,scope,enum_hash,mode FROM source_revalidation_rounds WHERE library=?1 AND boundary=?2 AND phase IN ('marking','observing') ORDER BY id"
-                )?.query_map(params![request.library,hash], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?.collect::<Result<_,_>>()?;
-                let [(id, scope, enum_hash, mode)] = rows.as_slice() else {
+                let rows: Vec<(String,String,String,String,String)> = tx.prepare(
+                    "SELECT id,scope,enum_hash,mode,phase FROM source_revalidation_rounds WHERE library=?1 AND boundary=?2 AND phase!='abandoned' ORDER BY id"
+                )?.query_map(params![request.library,hash], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?.collect::<Result<_,_>>()?;
+                let [(id, scope, enum_hash, mode, phase)] = rows.as_slice() else {
                     if rows.is_empty() {
                         tx.commit()?;
                         return Ok(CatalogOriginOperationResult::Resume(None));
@@ -1129,6 +1129,13 @@ impl SqliteStateDb {
                     || origin.plan_digest != digest || origin.epoch != epoch.epoch
                     || origin.attempt != library_record.attempt
                 {
+                    return Err(StateError::SyncEpochMismatch);
+                }
+                if phase == "active" {
+                    tx.commit()?;
+                    return Ok(CatalogOriginOperationResult::Resume(None));
+                }
+                if !matches!(phase.as_str(), "marking" | "observing") {
                     return Err(StateError::SyncEpochMismatch);
                 }
                 catalog_seed_phase(&tx, &request.library, scope, &request.enum_hash, &hash)?;

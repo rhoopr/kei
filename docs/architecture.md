@@ -2117,9 +2117,15 @@ must prove it before activation. A cross-zone resource selection does not author
 that resource's origin to the selecting owner's checkpoint.
 
 Before the stream, an authenticated state read can distinguish a current
-catalog link from a missing or known abandoned link. It checks the current
-source, plan, token, epoch and fences. This is a hint only: the checkpoint
-transaction rechecks the completed stream and current state.
+catalog or legacy link from a missing or known abandoned link. It checks the
+current source, plan, token, epoch and fences. This is a hint only: the
+checkpoint transaction rechecks the completed stream and current state.
+
+The state owner can return a typed marking or observing catalog origin with its
+exact saved boundary. It checks the source, attempt, plan and fences and refuses
+ambiguous rounds. The saved boundary may differ from the retained ACTIVE token
+after expiry. A matching token does not by itself prove provider EOF; resuming
+still requires the full inventory and bridge before activation.
 
 When the epoch gate claims a due pending attempt or a stale READY attempt, a
 qualified marking or observing catalog round can transfer its boundary, census

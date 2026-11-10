@@ -436,7 +436,12 @@ pub(crate) fn commit_observation_transition_in_tx(
     if let Some(required) = &required_catalog {
         observation::verify_required_catalog_before_apply(tx, required)?;
     }
-    observation::apply(tx, prepared_observation, required_catalog.as_ref())?;
+    observation::apply(
+        tx,
+        prepared_observation,
+        required_catalog.as_ref(),
+        proof.as_ref(),
+    )?;
     if let Some(required) = &required_catalog {
         observation::verify_required_catalog_after_apply(tx, required)?;
     }
