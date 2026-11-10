@@ -85,6 +85,81 @@ impl CatalogOrigin {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FreshCatalogPass {
+    pub(crate) key: String,
+    pub(crate) kind: String,
+    pub(crate) scope: serde_json::Value,
+    pub(crate) excludes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FreshCatalogPlan {
+    pub(crate) account: String,
+    pub(crate) provider: String,
+    pub(crate) database: String,
+    pub(crate) zone: serde_json::Value,
+    pub(crate) scope: String,
+    pub(crate) config_hash: String,
+    pub(crate) metadata_enabled: bool,
+    pub(crate) metadata_flags: u8,
+    pub(crate) passes: Vec<FreshCatalogPass>,
+    pub(crate) profile: serde_json::Value,
+}
+
+#[derive(Clone)]
+pub(crate) struct FreshCatalogOriginRequest {
+    pub(crate) library: String,
+    pub(crate) plan: FreshCatalogPlan,
+    pub(crate) baseline_key: String,
+    pub(crate) preservation_config_hash: String,
+    pub(crate) expected_baseline: Option<String>,
+    pub(crate) fresh_cursor: String,
+    pub(crate) enum_hash: String,
+    pub(crate) expected_epoch: String,
+    pub(crate) expected_attempt: String,
+    pub(crate) expected_metadata: Vec<(String, Option<String>)>,
+    pub(crate) expected_catalog_snapshot: String,
+}
+
+fn catalog_snapshot(conn: &Connection, library: &str) -> Result<String, StateError> {
+    let mut hash = Sha256::new();
+    let mut statement = conn.prepare(
+        "SELECT json_array(id,scope,enum_hash,boundary,high_id,after_id,phase,mode)
+         FROM source_revalidation_rounds WHERE library=?1 ORDER BY id",
+    )?;
+    let rows = statement.query_map([library], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let row = row?;
+        hash.update((row.len() as u64).to_be_bytes());
+        hash.update(row.as_bytes());
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+pub(crate) fn fresh_catalog_plan_digest(plan: &FreshCatalogPlan) -> String {
+    let zone_name = plan
+        .zone
+        .get("zoneName")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let plan_json = serde_json::json!({
+        "scope": plan.scope,
+        "config": plan.config_hash,
+        "profile": plan.profile,
+        "metadata": plan.metadata_enabled,
+        "flags": plan.metadata_flags,
+    });
+    let canonical = serde_json::json!({
+        "version": 1,
+        "account": plan.account,
+        "provider": plan.provider,
+        "library": zone_name,
+        "plans": [plan_json],
+    });
+    format!("{:x}", Sha256::digest(canonical.to_string().as_bytes()))
+}
+
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // L1 catalog cycle integration is pending; focused owner tests exercise this API.
 pub(crate) struct CatalogBaselineClaim {
@@ -299,14 +374,16 @@ fn catalog_signals(
     conn: &Connection,
     library: &str,
 ) -> Result<Vec<CatalogPendingSignal>, StateError> {
-    let rows: Vec<(String, String, String, String, i64, Option<i64>)> = conn
+    let record = super::sync_epoch::read_library(conn, library)?;
+    type SignalRow = (String, String, String, String, String, i64, Option<i64>);
+    let rows: Vec<SignalRow> = conn
         .prepare(
-            "SELECT r.id,r.library,r.scope,r.phase,COUNT(d.id),MIN(d.next_retry_at)
+            "SELECT r.id,r.library,r.scope,r.phase,r.enum_hash,COUNT(d.id),MIN(d.next_retry_at)
              FROM source_revalidation_rounds r
              LEFT JOIN source_revalidation_debt d ON d.round=r.id
              WHERE r.library=?1 AND r.mode=?2
                AND r.phase IN ('marking','observing','active')
-             GROUP BY r.id,r.library,r.scope,r.phase
+              GROUP BY r.id,r.library,r.scope,r.phase,r.enum_hash
              ORDER BY r.id",
         )?
         .query_map(params![library, CATALOG_MODE], |row| {
@@ -317,11 +394,38 @@ fn catalog_signals(
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
             ))
         })?
         .collect::<Result<_, _>>()?;
     let mut signals = Vec::new();
-    for (round, library, scope, phase, debt, next_retry) in rows {
+    for (round, library, scope, phase, policy, debt, next_retry) in rows {
+        if let Some(record) = &record
+            && record.state == "complete"
+        {
+            let Ok(origin) = CatalogOrigin::parse(&scope) else {
+                continue;
+            };
+            if origin.nonce != round
+                || origin.epoch != record.epoch
+                || origin.attempt != record.attempt
+                || !super::provider_generations::observation::catalog_active_plan_matches(
+                    conn,
+                    &library,
+                    &origin.plan_digest,
+                    &policy,
+                )?
+            {
+                continue;
+            }
+            if phase == "active"
+                && !super::provider_generations::observation::catalog_origin_current(
+                    conn, &library, &origin, &policy,
+                )?
+            {
+                continue;
+            }
+        }
         if phase == "active" && debt == 0 {
             continue;
         }
@@ -387,6 +491,20 @@ pub(crate) fn summary_counts(conn: &rusqlite::Connection) -> Result<(u64, u64), 
 }
 
 impl SqliteStateDb {
+    /// Capture the catalog state before obtaining the provider boundary. This
+    /// also fences equal-cursor replacements against concurrent installations.
+    #[allow(dead_code)] // L1 cycle integration is pending.
+    pub(crate) async fn fresh_catalog_snapshot(
+        &self,
+        owner: account::AccountOwner,
+        library: String,
+    ) -> Result<String, StateError> {
+        self.with_conn("reading fresh catalog fence", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            catalog_snapshot(conn, &library)
+        })
+        .await
+    }
     /// Claim an epoch baseline and, only for a validated pending-due old
     /// catalog origin, transfer census ownership to the new attempt in the same
     /// IMMEDIATE transaction as the unchanged epoch gate.
@@ -590,6 +708,223 @@ impl SqliteStateDb {
         .await
     }
 
+    /// Install a fresh catalog origin and the fresh baseline cursor atomically.
+    /// This grants no checkpoint, deletion, selection or promotion authority.
+    #[allow(dead_code)] // L1 cycle integration is pending; focused owner tests exercise this API.
+    pub(crate) async fn install_fresh_catalog_origin(
+        &self,
+        owner: account::AccountOwner,
+        request: FreshCatalogOriginRequest,
+    ) -> Result<CatalogOrigin, StateError> {
+        self.with_conn_mut("installing fresh catalog origin", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            account::validate_authenticated(&tx, &owner)?;
+            if catalog_snapshot(&tx, &request.library)? != request.expected_catalog_snapshot {
+                return Err(StateError::Invariant { operation: "install_fresh_catalog_origin", detail: "catalog round fence changed".into() });
+            }
+            let (owner_account, owner_provider) = owner.authenticated_keys()?;
+            let (account_key, provider_key): (String, String) = tx.query_row(
+                "SELECT account_key,provider_key FROM account_owner WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if owner_account != account_key
+                || owner_provider != provider_key
+                || request.plan.account != account_key
+                || request.plan.provider != provider_key
+                || request.plan.database != "private"
+                || request.plan.zone.get("zoneName").and_then(serde_json::Value::as_str)
+                    != Some(request.library.as_str())
+                || request.plan.zone.get("ownerRecordName").and_then(serde_json::Value::as_str)
+                    .is_none_or(|owner| owner.trim().is_empty())
+            {
+                return Err(StateError::Invariant {
+                    operation: "install_fresh_catalog_origin",
+                    detail: "authenticated source pin changed".into(),
+                });
+            }
+            let plan_scope: serde_json::Value = serde_json::from_str(&request.plan.scope)
+                .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+            if plan_scope.get("zone") != Some(&request.plan.zone)
+                || plan_scope.get("database").and_then(serde_json::Value::as_str)
+                    != Some(request.plan.database.as_str())
+                || request.plan.profile.get("passes")
+                    != Some(&serde_json::Value::Array(request.plan.passes.iter().map(|pass| {
+                        serde_json::json!({"key": pass.key, "kind": pass.kind, "scope": pass.scope, "excludes": pass.excludes})
+                    }).collect()))
+            {
+                return Err(StateError::Invariant {
+                    operation: "install_fresh_catalog_origin",
+                    detail: "catalog source scope changed".into(),
+                });
+            }
+            let required = [
+                super::sync_epoch::SYNC_EPOCH_KEY.to_owned(),
+                super::sync_epoch::library_key(&request.library),
+                "enum_config_hash".to_owned(),
+                "pending_enum_config_hash".to_owned(),
+                "config_hash".to_owned(),
+                "pending_download_config_hash".to_owned(),
+                format!("sync_token:v27:{}", request.library),
+                format!("observed_selection:v27:{}", request.library),
+                format!("download_ledger_scope:{}", request.library),
+            ];
+            if required.iter().any(|key| request.expected_metadata.iter().filter(|(saved, _)| saved == key).count() != 1) {
+                return Err(StateError::Invariant { operation: "install_fresh_catalog_origin", detail: "missing or duplicate catalog metadata fence".into() });
+            }
+            for (key, expected) in &request.expected_metadata {
+                let actual: Option<String> = tx
+                    .query_row(
+                        "SELECT value FROM metadata WHERE key=?1",
+                        [key],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if actual != *expected {
+                    return Err(StateError::Invariant {
+                        operation: "install_fresh_catalog_origin",
+                        detail: "catalog metadata fence changed".into(),
+                    });
+                }
+            }
+            let epoch = super::sync_epoch::validate(&tx)?;
+            if epoch.epoch != request.expected_epoch {
+                return Err(StateError::Invariant {
+                    operation: "install_fresh_catalog_origin",
+                    detail: "catalog epoch changed".into(),
+                });
+            }
+            let library_record = super::sync_epoch::read_library(&tx, &request.library)?
+                .ok_or(StateError::SyncEpochMismatch)?;
+            if library_record.state != "complete"
+                || library_record.epoch != epoch.epoch
+                || library_record.attempt != request.expected_attempt
+                || library_record.baseline_scope != format!("{:x}", Sha256::digest(serde_json::json!({"database":request.plan.database,"zone":request.plan.zone}).to_string().as_bytes()))
+            {
+                return Err(StateError::Invariant {
+                    operation: "install_fresh_catalog_origin",
+                    detail: "catalog library attempt changed".into(),
+                });
+            }
+            let expected_key = format!("baseline_cursor:v27:{}:{}:{}:{}", epoch.epoch, library_record.baseline_scope, request.enum_hash, request.preservation_config_hash);
+            if request.baseline_key != expected_key
+                || super::provider_generations::observation::has_valid_staged_for_library(&tx, &request.library)?
+            {
+                return Err(StateError::Invariant { operation: "install_fresh_catalog_origin", detail: "catalog baseline key or staged promotion changed".into() });
+            }
+            let epoch_raw = serde_json::to_string(&epoch)
+                .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+            let library_raw = serde_json::to_string(&library_record)
+                .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+            for (key, expected) in [
+                (
+                    super::sync_epoch::SYNC_EPOCH_KEY.to_owned(),
+                    Some(epoch_raw),
+                ),
+                (
+                    super::sync_epoch::library_key(&request.library),
+                    Some(library_raw),
+                ),
+            ] {
+                let actual: Option<String> = tx
+                    .query_row(
+                        "SELECT value FROM metadata WHERE key=?1",
+                        [&key],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if actual != expected {
+                    return Err(StateError::Invariant {
+                        operation: "install_fresh_catalog_origin",
+                        detail: "catalog raw epoch fence changed".into(),
+                    });
+                }
+            }
+            let actual_baseline: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM metadata WHERE key=?1",
+                    [&request.baseline_key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if actual_baseline != request.expected_baseline || request.fresh_cursor.trim().is_empty()
+            {
+                return Err(StateError::Invariant {
+                    operation: "install_fresh_catalog_origin",
+                    detail: "catalog baseline cursor fence changed".into(),
+                });
+            }
+            let digest = fresh_catalog_plan_digest(&request.plan);
+            if !super::provider_generations::observation::catalog_active_plan_matches(
+                &tx,
+                &request.library,
+                &digest,
+                &request.enum_hash,
+            )? {
+                return Err(StateError::Invariant {
+                    operation: "install_fresh_catalog_origin",
+                    detail: "current ACTIVE source plan changed".into(),
+                });
+            }
+            let boundary = CatalogOrigin::boundary(&request.fresh_cursor);
+            let high_id: Option<String> = tx.query_row(
+                "SELECT MAX(id) FROM assets WHERE library=?1 AND (status='downloaded' OR downloaded_at IS NOT NULL) AND is_deleted=0",
+                [&request.library],
+                |row| row.get(0),
+            )?;
+            let nonce = uuid::Uuid::new_v4().to_string();
+            let origin = CatalogOrigin::new(
+                digest,
+                request.expected_epoch,
+                request.expected_attempt,
+                nonce.clone(),
+            )?;
+            tx.execute(
+                "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode)
+                 VALUES(?1,?2,?3,?4,?5,?6,'','marking',?7)",
+                params![
+                    nonce,
+                    request.library,
+                    origin.scope(),
+                    request.enum_hash,
+                    boundary,
+                    high_id.unwrap_or_default(),
+                    CATALOG_MODE
+                ],
+            )?;
+            // A replacement must not strand retry deadlines behind an older
+            // ACTIVE descriptor. Keep the old rounds and debt as history, and
+            // carry matching obligations into the new census without delaying
+            // any earlier retry.
+            let previous: Vec<(String, String)> = tx.prepare(
+                "SELECT id,scope FROM source_revalidation_rounds WHERE library=?1 AND mode=?2 AND enum_hash=?3 AND id<>?4 AND phase!='abandoned'"
+            )?.query_map(params![request.library, CATALOG_MODE, request.enum_hash, nonce], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<_, _>>()?;
+            for (id, scope) in previous {
+                let Ok(old) = CatalogOrigin::parse(&scope) else { continue };
+                if old.nonce != id || old.plan_digest != origin.plan_digest || old.epoch != origin.epoch || old.attempt != origin.attempt {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT INTO source_revalidation_debt(round,id,next_retry_at)
+                     SELECT ?1,id,next_retry_at FROM source_revalidation_debt WHERE round=?2
+                     ON CONFLICT(round,id) DO UPDATE SET next_retry_at=MIN(next_retry_at,excluded.next_retry_at)",
+                    params![nonce, id],
+                )?;
+                tx.execute(
+                    "UPDATE source_revalidation_rounds SET phase='abandoned' WHERE id=?1",
+                    [&id],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![request.baseline_key, request.fresh_cursor],
+            )?;
+            tx.commit()?;
+            Ok(origin)
+        })
+        .await
+    }
+
     /// Finish bounded candidate marking before the corresponding inventory begins.
     pub(crate) async fn seed_source_revalidation(
         &self,
@@ -699,13 +1034,14 @@ impl SqliteStateDb {
         self.with_conn("reading catalog source outcome", move |conn| {
             account::validate_authenticated(conn, &owner)?;
             let signals = catalog_signals(conn, &library)?;
-            let retained = signals
-                .iter()
-                .map(|signal| signal.pending_debt)
-                .sum::<u64>();
+            let retained: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE r.library=?1 AND r.mode=?2 AND r.phase!='abandoned'",
+                params![library, CATALOG_MODE], |row| row.get(0),
+            )?;
+            let retained = u64::try_from(retained).map_err(|_error| StateError::ProviderSelectionInvalid)?;
             let next_due_at = signals.iter().map(|signal| signal.due_at).min();
             Ok(CatalogSourceOutcome {
-                pending: !signals.is_empty(),
+                pending: !signals.is_empty() || retained != 0,
                 retained,
                 next_due_at,
             })
@@ -912,6 +1248,7 @@ impl SqliteStateDb {
                 |row| row.get(0),
             )?;
             if !round_matches
+                || candidate.round != origin.nonce
                 || snapshot(&tx, &candidate.round, &candidate.id, &candidate.master)?
                     != candidate.snapshot
             {
@@ -938,6 +1275,9 @@ impl SqliteStateDb {
                 || evidence.zone.get("zoneName").and_then(serde_json::Value::as_str)
                     != Some(library.as_str())
                 || !matches!(evidence.database.as_str(), "private" | "shared")
+                || !super::provider_generations::observation::catalog_source_matches(
+                    &tx, &library, &evidence.database, &evidence.zone,
+                )?
                 || evidence.master_type != "CPLMaster"
                 || evidence.child_type != "CPLAsset"
                 || !evidence.reference_exact

@@ -1,14 +1,22 @@
 //! Observation certificates share the checkpoint transaction and policy fences.
 use super::owner;
 use super::retirement::{BUDGET, admission, spec};
+use crate::commands::{AlbumPass, PassKind};
+use crate::download::{DownloadConfig, DownloadControls, catalog_plan_context_for_source};
+use crate::icloud::photos::PhotoLibrary;
+use crate::icloud::photos::inbox::ShadowCapture;
+use crate::state::db::provider_generations::GenerationSpec;
 use crate::state::db::provider_generations::observation::{
-    ObservationProof, attach_revalidation_round_for_test, catalog_plan_digest_from_observation,
+    AdmissionReceipt, ObservationProof, catalog_plan_digest_from_observation,
 };
 use crate::state::db::source_revalidation::{
-    CatalogOrigin, CatalogPairEvidence, CatalogSettlementAuthority, quarantine_all_rounds,
+    CatalogOrigin, CatalogPairEvidence, CatalogSettlementAuthority, FreshCatalogOriginRequest,
+    FreshCatalogPass, FreshCatalogPlan, quarantine_all_rounds,
 };
 use crate::state::{CheckpointTransition, SqliteStateDb};
+use crate::test_helpers::MockPhotosSession;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const TOKEN: &str = "sync_token:v27:PrimarySync";
@@ -63,6 +71,247 @@ async fn fixture(dir: &std::path::Path) -> (Arc<SqliteStateDb>, ObservationProof
         )
         .unwrap();
     (db, proof)
+}
+
+// Owner-API mechanism fixture. The provider and media are synthetic; no P0 or
+// full inventory claim is made by these tests.
+struct CatalogOwnerFixture {
+    db: Arc<SqliteStateDb>,
+    library: PhotoLibrary,
+    plan: FreshCatalogPlan,
+    receipt: AdmissionReceipt,
+    baseline_key: String,
+    epoch: String,
+    attempt: String,
+    policy: String,
+}
+
+impl CatalogOwnerFixture {
+    async fn new(dir: &std::path::Path, policy: &str, pending: bool) -> Self {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&dir.join("state.db"), &owner())
+                .await
+                .unwrap(),
+        );
+        db.set_metadata("enum_config_hash", policy).await.unwrap();
+        if pending {
+            db.set_metadata("pending_enum_config_hash", policy)
+                .await
+                .unwrap();
+            db.set_metadata("pending_download_config_hash", "next-path")
+                .await
+                .unwrap();
+        }
+        let zone = serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+        let mut mock = MockPhotosSession::new().ok(serde_json::json!({"records":[{"recordName":"index","recordType":"CheckIndexingState","fields":{"state":{"value":"FINISHED"}}}]}));
+        for _ in 0..8 {
+            mock = mock.ok(serde_json::json!({"zones":[{"zoneID":zone,"syncToken":"before"}]}));
+        }
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/private".into(),
+            Arc::new(HashMap::new()),
+            Box::new(mock),
+            Arc::new(zone),
+            "private".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        library.shadow_capture = Some(ShadowCapture::new(db.clone(), owner(), "com"));
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: library.all(),
+            exclude_ids: Arc::default(),
+        };
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir);
+        config.state_db = Some(db.clone());
+        config.library = Arc::from("PrimarySync");
+        let context = catalog_plan_context_for_source(
+            &[pass],
+            &config,
+            DownloadControls::download_hidden(),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let plan = FreshCatalogPlan {
+            account: context.account.clone(),
+            provider: context.provider.clone(),
+            database: context.database.clone(),
+            zone: context.zone.clone(),
+            scope: context.scope.clone(),
+            config_hash: context.config_hash.clone(),
+            metadata_enabled: context.metadata_enabled,
+            metadata_flags: context.metadata_flags,
+            passes: context
+                .passes
+                .iter()
+                .map(|pass| FreshCatalogPass {
+                    key: pass.key.clone(),
+                    kind: pass.kind.clone(),
+                    scope: pass.scope.clone(),
+                    excludes: pass.excludes.clone(),
+                })
+                .collect(),
+            profile: context.profile.clone(),
+        };
+        let scope = library.baseline_scope();
+        db.enroll_sync_epoch(vec![("PrimarySync".into(), scope.clone())])
+            .await
+            .unwrap();
+        assert_eq!(
+            db.sync_epoch_gate("PrimarySync".into(), scope.clone(), None)
+                .await
+                .unwrap(),
+            crate::state::SyncEpochGate::Open
+        );
+        let selected = GenerationSpec {
+            format: 2,
+            scope: context.scope,
+            zone: context.zone,
+            config_hash: context.config_hash.clone(),
+            basis: context.config_hash,
+            profile: context.profile,
+            metadata_enabled: context.metadata_enabled,
+            metadata_flags: context.metadata_flags,
+        };
+        let root = db
+            .begin_selection_generation(owner(), selected, BUDGET)
+            .await
+            .unwrap();
+        let receipt = db
+            .seal_observed_selection(owner(), root.id, true, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let proof = ObservationProof::inventory(vec![receipt.clone()])
+            .unwrap()
+            .bridge(
+                ObservationProof::delivery(receipt.clone())
+                    .delta("initial", "after")
+                    .unwrap(),
+                "initial",
+            )
+            .unwrap();
+        db.commit_observation_transition(transition(&db, "after").await, Some(proof), false)
+            .await
+            .unwrap();
+        let (epoch, attempt) = {
+            let conn = db.acquire_lock("read owner fixture epoch").unwrap();
+            let epoch = crate::state::db::sync_epoch::validate(&conn).unwrap();
+            let record = crate::state::db::sync_epoch::read_library(&conn, "PrimarySync")
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.state, "complete");
+            (epoch.epoch, record.attempt)
+        };
+        let baseline_key = format!("baseline_cursor:v27:{epoch}:{scope}:{policy}:");
+        Self {
+            db,
+            library,
+            plan,
+            receipt,
+            baseline_key,
+            epoch,
+            attempt,
+            policy: policy.into(),
+        }
+    }
+
+    async fn install(&self) -> CatalogOrigin {
+        let mut expected_metadata = Vec::new();
+        for key in [
+            crate::state::db::sync_epoch::SYNC_EPOCH_KEY.to_owned(),
+            crate::state::db::sync_epoch::library_key("PrimarySync"),
+            "enum_config_hash".into(),
+            "pending_enum_config_hash".into(),
+            "config_hash".into(),
+            "pending_download_config_hash".into(),
+            TOKEN.into(),
+            PROOF.into(),
+            "download_ledger_scope:PrimarySync".into(),
+        ] {
+            expected_metadata.push((key.clone(), self.db.get_metadata(&key).await.unwrap()));
+        }
+        let expected_baseline = self.db.get_metadata(&self.baseline_key).await.unwrap();
+        let expected_catalog_snapshot = self
+            .db
+            .fresh_catalog_snapshot(owner(), "PrimarySync".into())
+            .await
+            .unwrap();
+        let fresh_cursor = self.library.fresh_baseline_cursor().await.unwrap();
+        self.db
+            .install_fresh_catalog_origin(
+                owner(),
+                FreshCatalogOriginRequest {
+                    library: "PrimarySync".into(),
+                    plan: self.plan.clone(),
+                    baseline_key: self.baseline_key.clone(),
+                    preservation_config_hash: String::new(),
+                    expected_baseline,
+                    fresh_cursor,
+                    enum_hash: self.policy.clone(),
+                    expected_epoch: self.epoch.clone(),
+                    expected_attempt: self.attempt.clone(),
+                    expected_metadata,
+                    expected_catalog_snapshot,
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn stage(&self, origin: &CatalogOrigin) {
+        self.db
+            .seed_source_revalidation(
+                owner(),
+                "PrimarySync".into(),
+                origin.scope(),
+                self.policy.clone(),
+                CatalogOrigin::boundary("before"),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let proof = ObservationProof::inventory(vec![self.receipt.clone()])
+            .unwrap()
+            .bridge(
+                ObservationProof::delivery(self.receipt.clone())
+                    .delta("before", "staged")
+                    .unwrap(),
+                "before",
+            )
+            .unwrap()
+            .with_catalog_origin(origin.clone());
+        let staged = format!("pending_sync_token:v27:{}:PrimarySync", self.policy);
+        let mut save = transition(&self.db, "staged").await;
+        save.metadata_updates[0].0 = staged.clone();
+        save.expected_metadata.push((staged, None));
+        save.expected_metadata
+            .push((self.baseline_key.clone(), Some("before".into())));
+        self.db
+            .commit_observation_transition(save, Some(proof), false)
+            .await
+            .unwrap();
+    }
+
+    async fn promote(&self, token: &str) {
+        let staged = format!("pending_sync_token:v27:{}:PrimarySync", self.policy);
+        let mut promote = transition(&self.db, token).await;
+        promote
+            .metadata_updates
+            .push(("enum_config_hash".into(), self.policy.clone()));
+        promote
+            .expected_metadata
+            .push((staged.clone(), Some(token.into())));
+        promote.metadata_deletes.push(staged);
+        self.db
+            .commit_observation_transition(promote, None, true)
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -1150,96 +1399,48 @@ async fn old_writer_baseline_key_aba_leaves_observing_catalog_origin_indistingui
 
 #[tokio::test]
 async fn catalog_v2_linked_staged_promotion_reopen_rollback_and_quarantine() {
-    use sha2::{Digest, Sha256};
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
-    db.set_metadata("pending_enum_config_hash", "next-enum")
-        .await
-        .unwrap();
-    db.set_metadata("pending_download_config_hash", "next-path")
-        .await
-        .unwrap();
-    let mut selected = spec();
-    selected.profile["current_download_metadata"] = serde_json::json!(1);
-    let boundary = format!("{:x}", Sha256::digest(b"before"));
-    let catalog = format!(
-        "catalog:v2:{}:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:33333333-3333-3333-3333-333333333333",
-        "a".repeat(64)
-    );
+    let fixture = CatalogOwnerFixture::new(dir.path(), "next-enum", true).await;
+    let origin = fixture.install().await;
+    fixture.stage(&origin).await;
+    let receipt_for_delta = fixture.receipt.clone();
+    let db = fixture.db.clone();
+    let old_active = db.get_metadata(PROOF).await.unwrap();
     {
         let conn = db
             .acquire_lock("seed linked staged catalog origin")
             .unwrap();
         conn.execute(
-            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES('catalog','PrimarySync',?1,'next-enum',?2,'','','observing','catalog_v2')",
-            rusqlite::params![catalog, boundary],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO source_revalidation_debt(round,id) VALUES('catalog','asset')",
-            [],
+            "INSERT INTO source_revalidation_debt(round,id) VALUES(?1,'asset')",
+            [&origin.nonce],
         )
         .unwrap();
     }
-    let root = db
-        .begin_selection_generation(owner(), selected, BUDGET)
-        .await
-        .unwrap();
-    admission(&db, &root.id, &dir.path().join("media"), 0, false, BUDGET).await;
-    let receipt = db
-        .seal_observed_selection(owner(), root.id, true, None)
-        .await
-        .unwrap()
-        .unwrap();
-    let receipt_for_delta = receipt.clone();
-    let baseline = ObservationProof::inventory(vec![receipt.clone()])
-        .unwrap()
-        .bridge(
-            ObservationProof::delivery(receipt)
-                .delta("before", "after")
-                .unwrap(),
-            "before",
-        )
-        .unwrap();
     let staged = "pending_sync_token:v27:next-enum:PrimarySync";
-    let mut save = transition(&db, "after").await;
-    save.metadata_updates[0].0 = staged.into();
-    save.expected_metadata.push((staged.into(), None));
-    db.commit_observation_transition(save, Some(baseline), false)
-        .await
-        .unwrap();
     let staged_proof = "observed_selection_staged:v27:next-enum:PrimarySync";
-    {
-        let conn = db
-            .acquire_lock("attach catalog link to staged proof")
-            .unwrap();
-        assert!(
-            attach_revalidation_round_for_test(&conn, staged_proof, "after", "catalog").unwrap()
-        );
-    }
+    drop(fixture);
     drop(db);
 
     let db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
     let staged_json: Value =
         serde_json::from_str(&db.get_metadata(staged_proof).await.unwrap().unwrap()).unwrap();
-    assert_eq!(staged_json["revalidation_round"], "catalog");
+    assert_eq!(staged_json["revalidation_round"], origin.nonce);
 
     let delta = ObservationProof::delivery(receipt_for_delta)
-        .delta("after", "quiet")
+        .delta("staged", "quiet")
         .unwrap();
     let mut advance = transition(&db, "quiet").await;
     advance.metadata_updates[0].0 = staged.into();
     advance
         .expected_metadata
-        .push((staged.into(), Some("after".into())));
+        .push((staged.into(), Some("staged".into())));
     db.commit_observation_transition(advance, Some(delta), false)
         .await
         .unwrap();
     let staged_json: Value =
         serde_json::from_str(&db.get_metadata(staged_proof).await.unwrap().unwrap()).unwrap();
-    assert_eq!(staged_json["revalidation_round"], "catalog");
+    assert_eq!(staged_json["revalidation_round"], origin.nonce);
 
     // A SQL error during activation must roll back the whole promotion.
     {
@@ -1275,22 +1476,19 @@ async fn catalog_v2_linked_staged_promotion_reopen_rollback_and_quarantine() {
             .unwrap();
         let (phase, debt): (String, i64) = conn
             .query_row(
-                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id='catalog'),
-                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round='catalog')",
-                [],
+                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id=?1),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1)",
+                [&origin.nonce],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!((phase.as_str(), debt), ("observing", 1));
-        assert!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM metadata WHERE key='observed_selection:v27:PrimarySync'",
-                [],
-                |row| row.get::<_, i64>(0)
-            )
-            .unwrap()
-                == 0
-        );
+        let active: String = conn
+            .query_row("SELECT value FROM metadata WHERE key=?1", [PROOF], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(Some(active), old_active);
         conn.execute_batch("DROP TRIGGER fail_catalog_activation;")
             .unwrap();
     }
@@ -1323,15 +1521,15 @@ async fn catalog_v2_linked_staged_promotion_reopen_rollback_and_quarantine() {
         let conn = db.acquire_lock("verify linked staged promotion").unwrap();
         let (phase, debt): (String, i64) = conn
             .query_row(
-                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id='catalog'),
-                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round='catalog')",
-                [],
+                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id=?1),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1)",
+                [&origin.nonce],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         let active: Value = serde_json::from_str(&active_raw).unwrap();
         assert_eq!((phase.as_str(), debt), ("active", 1));
-        assert_eq!(active["revalidation_round"], "catalog");
+        assert_eq!(active["revalidation_round"], origin.nonce);
         let quarantined = quarantine_all_rounds(&conn).unwrap();
         assert_eq!(quarantined.0, 1);
     }
@@ -1339,9 +1537,9 @@ async fn catalog_v2_linked_staged_promotion_reopen_rollback_and_quarantine() {
         let conn = db.acquire_lock("verify quarantine retained debt").unwrap();
         let (phase, debt): (String, i64) = conn
             .query_row(
-                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id='catalog'),
-                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round='catalog')",
-                [],
+                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id=?1),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1)",
+                [&origin.nonce],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -1351,44 +1549,25 @@ async fn catalog_v2_linked_staged_promotion_reopen_rollback_and_quarantine() {
 
 #[tokio::test]
 async fn catalog_v2_linked_active_delta_keeps_debt_and_ordinary_producer_cannot_retire() {
-    use sha2::{Digest, Sha256};
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let (db, baseline) = fixture(dir.path()).await;
-    let save = transition(&db, "after").await;
-    db.commit_observation_transition(save.clone(), Some(baseline), false)
-        .await
-        .unwrap();
-    let boundary = format!("{:x}", Sha256::digest(b"before"));
-    let catalog = format!(
-        "catalog:v2:{}:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:44444444-4444-4444-4444-444444444444",
-        "b".repeat(64)
-    );
+    let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+    let origin = fixture.install().await;
+    fixture.stage(&origin).await;
+    fixture.promote("staged").await;
+    let receipt = fixture.receipt.clone();
+    let db = fixture.db.clone();
     {
         let conn = db
             .acquire_lock("seed linked active catalog origin")
             .unwrap();
         conn.execute(
-            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES('active-catalog','PrimarySync',?1,'policy',?2,'','','active','catalog_v2')",
-            rusqlite::params![catalog, boundary],
+            "INSERT INTO source_revalidation_debt(round,id) VALUES(?1,'asset')",
+            [&origin.nonce],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO source_revalidation_debt(round,id) VALUES('active-catalog','asset')",
-            [],
-        )
-        .unwrap();
-        assert!(
-            attach_revalidation_round_for_test(
-                &conn,
-                "observed_selection:v27:PrimarySync",
-                "after",
-                "active-catalog"
-            )
-            .unwrap()
-        );
     }
+    drop(fixture);
     drop(db);
     let db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
     let active: Value = serde_json::from_str(
@@ -1398,22 +1577,9 @@ async fn catalog_v2_linked_active_delta_keeps_debt_and_ordinary_producer_cannot_
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(active["revalidation_round"], "active-catalog");
-
-    let mut selected = spec();
-    selected.profile["current_download_metadata"] = serde_json::json!(1);
-    let root = db
-        .begin_selection_generation(owner(), selected, BUDGET)
-        .await
-        .unwrap();
-    admission(&db, &root.id, &dir.path().join("media"), 0, false, BUDGET).await;
-    let receipt = db
-        .seal_observed_selection(owner(), root.id, true, None)
-        .await
-        .unwrap()
-        .unwrap();
+    assert_eq!(active["revalidation_round"], origin.nonce);
     let delta = ObservationProof::delivery(receipt)
-        .delta("after", "quiet")
+        .delta("staged", "quiet")
         .unwrap();
     let advance = transition(&db, "quiet").await;
     db.commit_observation_transition(advance.clone(), Some(delta), false)
@@ -1423,9 +1589,9 @@ async fn catalog_v2_linked_active_delta_keeps_debt_and_ordinary_producer_cannot_
         let conn = db.acquire_lock("verify linked active delta").unwrap();
         let (phase, debt): (String, i64) = conn
             .query_row(
-                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id='active-catalog'),
-                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round='active-catalog')",
-                [],
+                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id=?1),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1)",
+                [&origin.nonce],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -1444,7 +1610,7 @@ async fn catalog_v2_linked_active_delta_keeps_debt_and_ordinary_producer_cannot_
         "B-LINKED-ACTIVE-DELTA link={:?}",
         active.get("revalidation_round")
     );
-    assert_eq!(active["revalidation_round"], "active-catalog");
+    assert_eq!(active["revalidation_round"], origin.nonce);
     db.source_revalidation_seen(
         owner(),
         "PrimarySync".into(),
@@ -1467,8 +1633,8 @@ async fn catalog_v2_linked_active_delta_keeps_debt_and_ordinary_producer_cannot_
         let conn = db.acquire_lock("linked active debt retained").unwrap();
         let debt_after: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM source_revalidation_debt WHERE round='active-catalog'",
-                [],
+                "SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1",
+                [&origin.nonce],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1557,67 +1723,13 @@ async fn catalog_v2_missing_link_does_not_veto_checkpoint_and_preserves_debt() {
 
 #[tokio::test]
 async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
-    use sha2::{Digest, Sha256};
-
     let dir = tempfile::tempdir().unwrap();
-    let db = Arc::new(
-        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
-            .await
-            .unwrap(),
-    );
-    db.set_metadata("enum_config_hash", "policy").await.unwrap();
-    db.enroll_sync_epoch(vec![("PrimarySync".into(), "scope".into())])
-        .await
-        .unwrap();
-    {
-        let conn = db.acquire_lock("mark epoch complete").unwrap();
-        conn.execute(
-            "UPDATE metadata SET value=json_set(value,'$.state','complete','$.completed_at',1) WHERE key=?1",
-            [crate::state::db::sync_epoch::library_key("PrimarySync")],
-        )
-        .unwrap();
-    }
-    let mut selected = spec();
-    selected.profile["current_download_metadata"] = serde_json::json!(1);
-    let root = db
-        .begin_selection_generation(owner(), selected.clone(), BUDGET)
-        .await
-        .unwrap();
-    admission(&db, &root.id, &dir.path().join("media"), 0, false, BUDGET).await;
-    let receipt = db
-        .seal_observed_selection(owner(), root.id, true, None)
-        .await
-        .unwrap()
-        .unwrap();
-    let proof = ObservationProof::inventory(vec![receipt.clone()])
-        .unwrap()
-        .bridge(
-            ObservationProof::delivery(receipt)
-                .delta("before", "after")
-                .unwrap(),
-            "before",
-        )
-        .unwrap();
-    let save = transition(&db, "after").await;
-    db.commit_observation_transition(save, Some(proof), false)
-        .await
-        .unwrap();
-    let active_raw = db.get_metadata(PROOF).await.unwrap().unwrap();
-    let digest = catalog_plan_digest_from_observation(&active_raw, "PrimarySync").unwrap();
-    let record = {
-        let conn = db.acquire_lock("read complete epoch").unwrap();
-        crate::state::db::sync_epoch::read_library(&conn, "PrimarySync")
-            .unwrap()
-            .unwrap()
-    };
-    let nonce = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string();
-    let origin = CatalogOrigin::new(
-        digest.clone(),
-        record.epoch.clone(),
-        record.attempt.clone(),
-        nonce.clone(),
-    )
-    .unwrap();
+    let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+    let origin = fixture.install().await;
+    fixture.stage(&origin).await;
+    fixture.promote("staged").await;
+    let db = fixture.db.clone();
+    let nonce = origin.nonce.clone();
     let master_path = dir.path().join("master.jpg");
     std::fs::write(&master_path, b"catalog master").unwrap();
     let master = crate::test_helpers::TestAssetRecord::new("master")
@@ -1692,14 +1804,8 @@ async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
         )
         .unwrap();
     }
-    let boundary = format!("{:x}", Sha256::digest(b"catalog-boundary"));
     {
         let conn = db.acquire_lock("seed active catalog settlement").unwrap();
-        conn.execute(
-            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES(?1,'PrimarySync',?2,'policy',?3,'','','active','catalog_v2')",
-            rusqlite::params![nonce, origin.scope(), boundary],
-        )
-        .unwrap();
         conn.execute(
             "INSERT INTO source_revalidation_debt(round,id) VALUES(?1,'master')",
             [&nonce],
@@ -1763,7 +1869,7 @@ async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
         }
     }
     let evidence = |deleted: bool| CatalogPairEvidence {
-        database: "shared".into(),
+        database: "private".into(),
         zone: serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
         master: "master".into(),
         child: "child".into(),
@@ -2019,7 +2125,12 @@ async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
         .unwrap();
     }
     let due = db
-        .due_catalog_candidates(owner(), "PrimarySync".into(), origin, "policy".into())
+        .due_catalog_candidates(
+            owner(),
+            "PrimarySync".into(),
+            origin.clone(),
+            "policy".into(),
+        )
         .await
         .unwrap();
     let master_due = due
@@ -2031,13 +2142,7 @@ async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
         .settle_catalog_candidate(
             owner(),
             "PrimarySync".into(),
-            CatalogOrigin::new(
-                digest,
-                record.epoch.clone(),
-                record.attempt.clone(),
-                nonce.clone(),
-            )
-            .unwrap(),
+            origin,
             "policy".into(),
             master_due,
             CatalogSettlementAuthority::Deleted {
@@ -2061,4 +2166,681 @@ async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
         conn.execute_batch("DROP TRIGGER fail_catalog_deletion;")
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn fresh_catalog_origin_install_uses_real_context_and_atomic_fences() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    db.set_metadata("enum_config_hash", "policy").await.unwrap();
+    let zone = serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+    let mut library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/private".into(),
+        Arc::new(HashMap::new()),
+        Box::new(MockPhotosSession::new().ok(serde_json::json!({
+            "records":[{"recordName":"index","recordType":"CheckIndexingState","fields":{"state":{"value":"FINISHED"}}}]
+        }))
+        .ok(serde_json::json!({"zones":[{"zoneID":zone,"syncToken":"fresh-cursor"}]}))
+        .ok(serde_json::json!({"zones":[{"zoneID":zone,"syncToken":"fresh-cursor"}]}))
+        .ok(serde_json::json!({"zones":[{"zoneID":zone,"syncToken":"new-cursor"}]}))
+        .ok(serde_json::json!({"zones":[{"zoneID":zone,"syncToken":"failed-cursor"}]}))),
+        Arc::new(zone.clone()),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    library.shadow_capture = Some(ShadowCapture::new(db.clone(), owner(), "com"));
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: library.all(),
+        exclude_ids: Arc::default(),
+    };
+    let mut config = DownloadConfig::test_default();
+    config.directory = Arc::from(dir.path());
+    config.state_db = Some(db.clone());
+    config.library = Arc::from("PrimarySync");
+    let context = catalog_plan_context_for_source(
+        &[pass],
+        &config,
+        DownloadControls::download_hidden(),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let plan = FreshCatalogPlan {
+        account: context.account.clone(),
+        provider: context.provider.clone(),
+        database: context.database.clone(),
+        zone: context.zone.clone(),
+        scope: context.scope.clone(),
+        config_hash: context.config_hash.clone(),
+        metadata_enabled: context.metadata_enabled,
+        metadata_flags: context.metadata_flags,
+        passes: context
+            .passes
+            .iter()
+            .map(|pass| FreshCatalogPass {
+                key: pass.key.clone(),
+                kind: pass.kind.clone(),
+                scope: pass.scope.clone(),
+                excludes: pass.excludes.clone(),
+            })
+            .collect(),
+        profile: context.profile.clone(),
+    };
+    let baseline_scope = library.baseline_scope();
+    db.enroll_sync_epoch(vec![("PrimarySync".into(), baseline_scope.clone())])
+        .await
+        .unwrap();
+    match db
+        .sync_epoch_gate("PrimarySync".into(), baseline_scope.clone(), None)
+        .await
+        .unwrap()
+    {
+        crate::state::SyncEpochGate::Open => {}
+        other => panic!("expected fresh-install open gate, got {other:?}"),
+    }
+    let selected = GenerationSpec {
+        format: 2,
+        scope: context.scope.clone(),
+        zone: context.zone.clone(),
+        config_hash: context.config_hash.clone(),
+        basis: context.config_hash.clone(),
+        profile: context.profile.clone(),
+        metadata_enabled: context.metadata_enabled,
+        metadata_flags: context.metadata_flags,
+    };
+    let root = db
+        .begin_selection_generation(owner(), selected, BUDGET)
+        .await
+        .unwrap();
+    let receipt = db
+        .seal_observed_selection(owner(), root.id, true, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let proof = ObservationProof::inventory(vec![receipt.clone()])
+        .unwrap()
+        .bridge(
+            ObservationProof::delivery(receipt.clone())
+                .delta("before", "after")
+                .unwrap(),
+            "before",
+        )
+        .unwrap();
+    let save = transition(&db, "after").await;
+    db.commit_observation_transition(save, Some(proof), false)
+        .await
+        .unwrap();
+    let descriptor = db.get_metadata(PROOF).await.unwrap().unwrap();
+    assert_eq!(
+        catalog_plan_digest_from_observation(&descriptor, "PrimarySync"),
+        Some(crate::download::catalog_plan_digest_from_source_context(
+            &context
+        ))
+    );
+    let (epoch_raw, library_raw, epoch_id, attempt) = {
+        let conn = db.acquire_lock("read genuine epoch fences").unwrap();
+        let epoch = crate::state::db::sync_epoch::validate(&conn).unwrap();
+        let library = crate::state::db::sync_epoch::read_library(&conn, "PrimarySync")
+            .unwrap()
+            .unwrap();
+        (
+            serde_json::to_string(&epoch).unwrap(),
+            serde_json::to_string(&library).unwrap(),
+            epoch.epoch,
+            library.attempt,
+        )
+    };
+    let baseline_key = format!("baseline_cursor:v27:{epoch_id}:{baseline_scope}:policy:");
+    let mut expected_metadata = vec![
+        (
+            crate::state::db::sync_epoch::SYNC_EPOCH_KEY.to_owned(),
+            Some(epoch_raw),
+        ),
+        (
+            crate::state::db::sync_epoch::library_key("PrimarySync"),
+            Some(library_raw),
+        ),
+    ];
+    for key in [
+        "enum_config_hash",
+        "pending_enum_config_hash",
+        "config_hash",
+        "pending_download_config_hash",
+        TOKEN,
+        PROOF,
+        "download_ledger_scope:PrimarySync",
+    ] {
+        expected_metadata.push((key.into(), db.get_metadata(key).await.unwrap()));
+    }
+    let request = |fresh_cursor: &str, expected_baseline: Option<&str>, snapshot: &str| {
+        FreshCatalogOriginRequest {
+            library: "PrimarySync".into(),
+            plan: plan.clone(),
+            baseline_key: baseline_key.clone(),
+            preservation_config_hash: String::new(),
+            expected_baseline: expected_baseline.map(str::to_owned),
+            fresh_cursor: fresh_cursor.into(),
+            enum_hash: "policy".into(),
+            expected_epoch: epoch_id.clone(),
+            expected_attempt: attempt.clone(),
+            expected_metadata: expected_metadata.clone(),
+            expected_catalog_snapshot: snapshot.to_owned(),
+        }
+    };
+    let snapshot = db
+        .fresh_catalog_snapshot(owner(), "PrimarySync".into())
+        .await
+        .unwrap();
+    let boundary = library.fresh_baseline_cursor().await.unwrap();
+    let origin = db
+        .install_fresh_catalog_origin(owner(), request(&boundary, None, &snapshot))
+        .await
+        .unwrap();
+    let mut foreign_plan = plan.clone();
+    foreign_plan.profile["foreign-test-selection"] = serde_json::json!(true);
+    let foreign_origin = CatalogOrigin::new(
+        crate::state::db::source_revalidation::fresh_catalog_plan_digest(&foreign_plan),
+        epoch_id.clone(),
+        attempt.clone(),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .unwrap();
+    {
+        let conn = db.acquire_lock("verify fresh catalog origin").unwrap();
+        let (mode, phase, rounds): (String, String, i64) = conn
+            .query_row(
+                "SELECT (SELECT mode FROM source_revalidation_rounds WHERE id=?1),
+                        (SELECT phase FROM source_revalidation_rounds WHERE id=?1),
+                        (SELECT COUNT(*) FROM source_revalidation_rounds WHERE mode='catalog_v2')",
+                [origin.nonce.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (mode.as_str(), phase.as_str(), rounds),
+            ("catalog_v2", "marking", 1)
+        );
+        let key: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [&baseline_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(key, "fresh-cursor");
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES(?1,'old-debt',17)",
+            [&origin.nonce],
+        )
+        .unwrap();
+        for (id, mode, scope) in [
+            ("foreign-legacy", "legacy_unfiled_v1", "legacy-scope"),
+            ("foreign-unknown", "future_mode", "unknown-scope"),
+            ("foreign-malformed", "catalog_v2", "catalog:v2:malformed"),
+        ] {
+            conn.execute("INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES(?1,'PrimarySync',?2,'policy','foreign','high','after','active',?3)", rusqlite::params![id, scope, mode]).unwrap();
+        }
+        for id in ["foreign-legacy", "foreign-unknown"] {
+            conn.execute("INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES(?1,'foreign-debt',42)", [id]).unwrap();
+        }
+        conn.execute("INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES(?1,'PrimarySync',?2,'policy','foreign','high','after','active','catalog_v2')", rusqlite::params![foreign_origin.nonce, foreign_origin.scope()]).unwrap();
+        conn.execute("INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES(?1,'foreign-debt',42)", [&foreign_origin.nonce]).unwrap();
+    }
+    let stale = request("fresh-cursor", Some("fresh-cursor"), &snapshot);
+    assert!(
+        db.install_fresh_catalog_origin(owner(), stale)
+            .await
+            .is_err()
+    );
+    let snapshot = db
+        .fresh_catalog_snapshot(owner(), "PrimarySync".into())
+        .await
+        .unwrap();
+    let boundary = library.fresh_baseline_cursor().await.unwrap();
+    let resumed = db
+        .install_fresh_catalog_origin(owner(), request(&boundary, Some("fresh-cursor"), &snapshot))
+        .await
+        .unwrap();
+    assert_ne!(resumed, origin);
+    {
+        let conn = db.acquire_lock("verify same-boundary resume").unwrap();
+        let rounds: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_revalidation_rounds WHERE mode='catalog_v2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rounds, 4);
+        let copied: i64 = conn.query_row("SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id='old-debt'", [&resumed.nonce], |row| row.get(0)).unwrap();
+        assert_eq!(copied, 17);
+        conn.execute(
+            "UPDATE source_revalidation_debt SET next_retry_at=7 WHERE round=?1 AND id='old-debt'",
+            [&resumed.nonce],
+        )
+        .unwrap();
+    }
+    db.seed_source_revalidation(
+        owner(),
+        "PrimarySync".into(),
+        resumed.scope(),
+        "policy".into(),
+        CatalogOrigin::boundary("fresh-cursor"),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let prior_proof = ObservationProof::inventory(vec![receipt.clone()])
+        .unwrap()
+        .bridge(
+            ObservationProof::delivery(receipt.clone())
+                .delta("fresh-cursor", "old-active-token")
+                .unwrap(),
+            "fresh-cursor",
+        )
+        .unwrap()
+        .with_catalog_origin(resumed.clone());
+    let prior_staged = "pending_sync_token:v27:policy:PrimarySync";
+    let mut save = transition(&db, "old-active-token").await;
+    save.metadata_updates[0].0 = prior_staged.into();
+    save.expected_metadata.push((prior_staged.into(), None));
+    save.expected_metadata
+        .push((baseline_key.clone(), Some("fresh-cursor".into())));
+    db.commit_observation_transition(save, Some(prior_proof), false)
+        .await
+        .unwrap();
+    let mut promote = transition(&db, "old-active-token").await;
+    promote
+        .metadata_updates
+        .push(("enum_config_hash".into(), "policy".into()));
+    promote
+        .expected_metadata
+        .push((prior_staged.into(), Some("old-active-token".into())));
+    promote.metadata_deletes.push(prior_staged.into());
+    db.commit_observation_transition(promote, None, true)
+        .await
+        .unwrap();
+    let mut current_metadata = expected_metadata.clone();
+    for (key, value) in &mut current_metadata {
+        *value = db.get_metadata(key).await.unwrap();
+    }
+    let request = |fresh_cursor: &str, expected_baseline: Option<&str>, snapshot: &str| {
+        FreshCatalogOriginRequest {
+            library: "PrimarySync".into(),
+            plan: plan.clone(),
+            baseline_key: baseline_key.clone(),
+            preservation_config_hash: String::new(),
+            expected_baseline: expected_baseline.map(str::to_owned),
+            fresh_cursor: fresh_cursor.into(),
+            enum_hash: "policy".into(),
+            expected_epoch: epoch_id.clone(),
+            expected_attempt: attempt.clone(),
+            expected_metadata: current_metadata.clone(),
+            expected_catalog_snapshot: snapshot.into(),
+        }
+    };
+    let snapshot = db
+        .fresh_catalog_snapshot(owner(), "PrimarySync".into())
+        .await
+        .unwrap();
+    let boundary = library.fresh_baseline_cursor().await.unwrap();
+    let fresh = db
+        .install_fresh_catalog_origin(owner(), request(&boundary, Some("fresh-cursor"), &snapshot))
+        .await
+        .unwrap();
+    assert_ne!(fresh, origin);
+    let signals = db
+        .catalog_pending_signals(owner(), "PrimarySync".into())
+        .await
+        .unwrap();
+    assert_eq!(signals.len(), 1);
+    assert_eq!(signals[0].round, fresh.nonce);
+    let outcome = db
+        .catalog_source_outcome(owner(), "PrimarySync".into())
+        .await
+        .unwrap();
+    assert!(outcome.pending);
+    assert_eq!(outcome.retained, 2);
+    {
+        let conn = db.acquire_lock("verify old active superseded").unwrap();
+        let (old_phase, old_debt, key): (String, i64, String) = conn
+            .query_row(
+                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id=?1),
+                        (SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id='old-debt'),
+                        (SELECT value FROM metadata WHERE key=?2)",
+                [&resumed.nonce, &baseline_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (old_phase.as_str(), old_debt, key.as_str()),
+            ("abandoned", 7, "new-cursor")
+        );
+        let marking: (String, String) = conn
+            .query_row(
+                "SELECT phase,after_id FROM source_revalidation_rounds WHERE id=?1",
+                [&origin.nonce],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((marking.0.as_str(), marking.1.as_str()), ("abandoned", ""));
+        let original_deadline: i64 = conn.query_row("SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id='old-debt'", [&origin.nonce], |row| row.get(0)).unwrap();
+        assert_eq!(original_deadline, 17);
+        let foreign: i64 = conn.query_row("SELECT COUNT(*) FROM source_revalidation_rounds r WHERE r.id IN ('foreign-legacy','foreign-unknown','foreign-malformed') AND r.phase='active' AND r.boundary='foreign' AND r.high_id='high' AND r.after_id='after'", [], |row| row.get(0)).unwrap();
+        let foreign_debt: i64 = conn.query_row("SELECT COUNT(*) FROM source_revalidation_debt WHERE round IN ('foreign-legacy','foreign-unknown') AND id='foreign-debt' AND next_retry_at=42", [], |row| row.get(0)).unwrap();
+        assert_eq!((foreign, foreign_debt), (3, 2));
+        let foreign_catalog: (String, i64) = conn.query_row("SELECT r.phase,d.next_retry_at FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1 AND d.id='foreign-debt'", [&foreign_origin.nonce], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(
+            (foreign_catalog.0.as_str(), foreign_catalog.1),
+            ("active", 42)
+        );
+        let copied: i64 = conn.query_row("SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id='old-debt'", [&fresh.nonce], |row| row.get(0)).unwrap();
+        assert_eq!(copied, 7);
+    }
+    {
+        let conn = db.acquire_lock("install baseline write failure").unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER fail_fresh_baseline BEFORE INSERT ON metadata WHEN NEW.key='{baseline_key}' BEGIN SELECT RAISE(ABORT,'synthetic fresh baseline'); END;"
+        ))
+        .unwrap();
+    }
+    let snapshot = db
+        .fresh_catalog_snapshot(owner(), "PrimarySync".into())
+        .await
+        .unwrap();
+    let boundary = library.fresh_baseline_cursor().await.unwrap();
+    let failed_request = request(&boundary, Some("new-cursor"), &snapshot);
+    let error = db
+        .install_fresh_catalog_origin(owner(), failed_request)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("synthetic fresh baseline"));
+    {
+        let conn = db.acquire_lock("verify failed install preserved").unwrap();
+        let failed_key: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [&baseline_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rounds: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_revalidation_rounds WHERE mode='catalog_v2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((failed_key.as_str(), rounds), ("new-cursor", 5));
+        let (phase, deadline): (String, i64) = conn.query_row("SELECT r.phase,d.next_retry_at FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1 AND d.id='old-debt'", [&fresh.nonce], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!((phase.as_str(), deadline), ("marking", 7));
+        conn.execute_batch("DROP TRIGGER fail_fresh_baseline;")
+            .unwrap();
+    }
+    drop(config);
+    drop(library);
+    drop(db);
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        db.get_metadata(&baseline_key).await.unwrap().as_deref(),
+        Some("new-cursor")
+    );
+    {
+        let conn = db
+            .acquire_lock("verify fresh origin rollback after reopen")
+            .unwrap();
+        let rounds: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_revalidation_rounds WHERE mode='catalog_v2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let deadline: i64 = conn.query_row("SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id='old-debt'", [&resumed.nonce], |row| row.get(0)).unwrap();
+        assert_eq!((rounds, deadline), (5, 7));
+    }
+    let mut wrong_attempt = request("attempt-cursor", Some("new-cursor"), &snapshot);
+    wrong_attempt.expected_attempt = "00000000-0000-0000-0000-000000000000".into();
+    assert!(
+        db.install_fresh_catalog_origin(owner(), wrong_attempt)
+            .await
+            .is_err()
+    );
+    let mut wrong_plan = request("plan-cursor", Some("new-cursor"), &snapshot);
+    wrong_plan.plan.config_hash = "f".repeat(64);
+    assert!(
+        db.install_fresh_catalog_origin(owner(), wrong_plan)
+            .await
+            .is_err()
+    );
+    let mut wrong_pin = request("pin-cursor", Some("new-cursor"), &snapshot);
+    wrong_pin.plan.account = "other".into();
+    assert!(
+        db.install_fresh_catalog_origin(owner(), wrong_pin)
+            .await
+            .is_err()
+    );
+    let mut wrong_epoch = request("epoch-cursor", Some("new-cursor"), &snapshot);
+    wrong_epoch.expected_epoch = uuid::Uuid::new_v4().to_string();
+    assert!(
+        db.install_fresh_catalog_origin(owner(), wrong_epoch)
+            .await
+            .is_err()
+    );
+    let wrong_baseline = request("baseline-cursor", Some("stale"), &snapshot);
+    assert!(
+        db.install_fresh_catalog_origin(owner(), wrong_baseline)
+            .await
+            .is_err()
+    );
+    let mut wrong_descriptor = request("descriptor-cursor", Some("new-cursor"), &snapshot);
+    wrong_descriptor
+        .expected_metadata
+        .iter_mut()
+        .find(|(key, _)| key == PROOF)
+        .unwrap()
+        .1 = None;
+    assert!(
+        db.install_fresh_catalog_origin(owner(), wrong_descriptor)
+            .await
+            .is_err()
+    );
+
+    db.seed_source_revalidation(
+        owner(),
+        "PrimarySync".into(),
+        fresh.scope(),
+        "policy".into(),
+        CatalogOrigin::boundary("new-cursor"),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let proof = ObservationProof::inventory(vec![receipt.clone()])
+        .unwrap()
+        .bridge(
+            ObservationProof::delivery(receipt)
+                .delta("new-cursor", "staged-next")
+                .unwrap(),
+            "new-cursor",
+        )
+        .unwrap()
+        .with_catalog_origin(fresh.clone());
+    let staged = "pending_sync_token:v27:policy:PrimarySync";
+    let staged_descriptor = "observed_selection_staged:v27:policy:PrimarySync";
+    let mut save = transition(&db, "staged-next").await;
+    save.metadata_updates[0].0 = staged.into();
+    save.expected_metadata.push((staged.into(), None));
+    save.expected_metadata
+        .push((baseline_key.clone(), Some("new-cursor".into())));
+    db.commit_observation_transition(save, Some(proof), false)
+        .await
+        .unwrap();
+    let descriptor: Value =
+        serde_json::from_str(&db.get_metadata(staged_descriptor).await.unwrap().unwrap()).unwrap();
+    assert_eq!(descriptor["revalidation_round"], fresh.nonce);
+    let staged_snapshot = db
+        .fresh_catalog_snapshot(owner(), "PrimarySync".into())
+        .await
+        .unwrap();
+    assert!(
+        db.install_fresh_catalog_origin(
+            owner(),
+            request("refused", Some("new-cursor"), &staged_snapshot)
+        )
+        .await
+        .is_err()
+    );
+    let mut promote = transition(&db, "staged-next").await;
+    promote
+        .metadata_updates
+        .push(("enum_config_hash".into(), "policy".into()));
+    promote
+        .expected_metadata
+        .push((staged.into(), Some("staged-next".into())));
+    promote.metadata_deletes.push(staged.into());
+    {
+        let conn = db
+            .acquire_lock("inject genuine catalog promotion failure")
+            .unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_genuine_catalog_activation BEFORE UPDATE ON source_revalidation_rounds WHEN NEW.phase='active' BEGIN SELECT RAISE(ABORT,'synthetic genuine activation'); END;").unwrap();
+    }
+    let error = db
+        .commit_observation_transition(promote.clone(), None, true)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("synthetic genuine activation"));
+    assert_eq!(
+        db.get_metadata(TOKEN).await.unwrap().as_deref(),
+        Some("old-active-token")
+    );
+    assert!(db.get_metadata(staged_descriptor).await.unwrap().is_some());
+    {
+        let conn = db
+            .acquire_lock("remove genuine catalog promotion failure")
+            .unwrap();
+        conn.execute_batch("DROP TRIGGER fail_genuine_catalog_activation;")
+            .unwrap();
+    }
+    db.commit_observation_transition(promote, None, true)
+        .await
+        .unwrap();
+    let descriptor: Value =
+        serde_json::from_str(&db.get_metadata(PROOF).await.unwrap().unwrap()).unwrap();
+    assert_eq!(descriptor["revalidation_round"], fresh.nonce);
+    {
+        let conn = db.acquire_lock("verify actual catalog promotion").unwrap();
+        let phase: String = conn
+            .query_row(
+                "SELECT phase FROM source_revalidation_rounds WHERE id=?1",
+                [&fresh.nonce],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "active");
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES(?1,'new-debt',0)",
+            [&fresh.nonce],
+        )
+        .unwrap();
+    }
+    assert!(
+        db.due_catalog_candidates(
+            owner(),
+            "PrimarySync".into(),
+            resumed.clone(),
+            "policy".into()
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+    let candidates = db
+        .due_catalog_candidates(
+            owner(),
+            "PrimarySync".into(),
+            fresh.clone(),
+            "policy".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 2);
+    let new_candidate = candidates
+        .iter()
+        .find(|candidate| candidate.id == "new-debt")
+        .unwrap()
+        .clone();
+    assert!(
+        !db.settle_catalog_candidate(
+            owner(),
+            "PrimarySync".into(),
+            resumed.clone(),
+            "policy".into(),
+            new_candidate.clone(),
+            CatalogSettlementAuthority::Refused
+        )
+        .await
+        .unwrap()
+    );
+    let wrong_source = CatalogPairEvidence {
+        database: "shared".into(),
+        zone: serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+        master: "new-debt".into(),
+        child: "new-debt".into(),
+        master_type: "CPLMaster".into(),
+        child_type: "CPLAsset".into(),
+        reference_exact: true,
+        explicit_deleted: false,
+    };
+    assert!(
+        !db.settle_catalog_candidate(
+            owner(),
+            "PrimarySync".into(),
+            fresh.clone(),
+            "policy".into(),
+            new_candidate,
+            CatalogSettlementAuthority::Live {
+                evidence: wrong_source
+            }
+        )
+        .await
+        .unwrap()
+    );
+    let conn = db.acquire_lock("verify old catalog debt retained").unwrap();
+    let deadline: i64 = conn
+        .query_row(
+            "SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id='old-debt'",
+            [&resumed.nonce],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(deadline, 7);
+    let copied_deadline: i64 = conn
+        .query_row(
+            "SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id='old-debt'",
+            [&fresh.nonce],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(copied_deadline, 7);
+    let retained: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1 AND id='new-debt'",
+            [&fresh.nonce],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, 1);
 }

@@ -165,6 +165,7 @@ pub(crate) struct ObservationProof {
     // Ephemeral epoch-attempt binding claimed by the cycle gate. It is never
     // part of durable observation evidence.
     epoch_attempt: Option<String>,
+    catalog_origin: Option<crate::state::db::source_revalidation::CatalogOrigin>,
 }
 impl std::fmt::Debug for ObservationProof {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -183,6 +184,7 @@ impl ObservationProof {
             observed_at: chrono::Utc::now().timestamp(),
             fresh_inventory: true,
             epoch_attempt: None,
+            catalog_origin: None,
         })
     }
     pub(crate) fn delivery(receipt: AdmissionReceipt) -> Self {
@@ -193,12 +195,23 @@ impl ObservationProof {
             observed_at: chrono::Utc::now().timestamp(),
             fresh_inventory: false,
             epoch_attempt: None,
+            catalog_origin: None,
         }
     }
     /// Attach the per-library attempt claimed by the epoch gate. The value is
     /// in-memory only and is compared inside the staging transaction.
     pub(crate) fn with_epoch_attempt(mut self, attempt: Option<String>) -> Self {
         self.epoch_attempt = attempt;
+        self
+    }
+    /// Bind a completed baseline proof to the origin installed for that
+    /// inventory. The checkpoint transaction independently verifies the link.
+    #[allow(dead_code)] // L1 cycle integration is pending.
+    pub(crate) fn with_catalog_origin(
+        mut self,
+        origin: crate::state::db::source_revalidation::CatalogOrigin,
+    ) -> Self {
+        self.catalog_origin = Some(origin);
         self
     }
     pub(crate) fn combine_sources(mut self, other: Self) -> Option<Self> {
@@ -486,10 +499,10 @@ pub(crate) fn catalog_plan_digest_from_observation(raw: &str, library: &str) -> 
     Some(digest(canonical.to_string().as_bytes()))
 }
 
-pub(in crate::state::db) fn catalog_origin_current(
+pub(in crate::state::db) fn catalog_active_plan_matches(
     conn: &Connection,
     library: &str,
-    origin: &crate::state::db::source_revalidation::CatalogOrigin,
+    plan_digest: &str,
     enum_hash: &str,
 ) -> Result<bool, StateError> {
     let Some(token) = metadata(conn, &format!("sync_token:v27:{library}"))? else {
@@ -500,6 +513,69 @@ pub(in crate::state::db) fn catalog_origin_current(
         return Ok(false);
     };
     if saved.policy[0].as_deref() != Some(enum_hash) {
+        return Ok(false);
+    }
+    let Some(raw) = metadata(conn, &active_key)? else {
+        return Ok(false);
+    };
+    Ok(catalog_plan_digest_from_observation(&raw, library).as_deref() == Some(plan_digest))
+}
+
+pub(in crate::state::db) fn has_valid_staged_for_library(
+    conn: &Connection,
+    library: &str,
+) -> Result<bool, StateError> {
+    let keys: Vec<String> = conn
+        .prepare("SELECT key FROM metadata WHERE key LIKE 'pending_sync_token:v27:%'")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for key in keys {
+        let Some((hash, zone)) = key
+            .strip_prefix("pending_sync_token:v27:")
+            .and_then(|rest| rest.split_once(':'))
+        else {
+            continue;
+        };
+        if zone != library {
+            continue;
+        }
+        if let Some(token) = metadata(conn, &key)?
+            && valid(conn, &format!("{STAGED}{hash}:{zone}"), &token)?.is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(in crate::state::db) fn catalog_origin_current(
+    conn: &Connection,
+    library: &str,
+    origin: &crate::state::db::source_revalidation::CatalogOrigin,
+    enum_hash: &str,
+) -> Result<bool, StateError> {
+    if !matches!(crate::state::db::source_revalidation::CatalogOrigin::parse(&origin.scope()), Ok(parsed) if parsed == *origin)
+    {
+        return Ok(false);
+    }
+    let exact_round: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND scope=?3 AND enum_hash=?4 AND mode=?5 AND phase='active')",
+        params![origin.nonce, library, origin.scope(), enum_hash, super::super::source_revalidation::CATALOG_MODE],
+        |row| row.get(0),
+    )?;
+    if !exact_round {
+        return Ok(false);
+    }
+    let Some(token) = metadata(conn, &format!("sync_token:v27:{library}"))? else {
+        return Ok(false);
+    };
+    let active_key = format!("{ACTIVE}{library}");
+    let Some(saved) = valid(conn, &active_key, &token)? else {
+        return Ok(false);
+    };
+    if saved.policy[0].as_deref() != Some(enum_hash)
+        || saved.revalidation_round.as_deref() != Some(origin.nonce.as_str())
+    {
         return Ok(false);
     }
     let Some(raw) = metadata(conn, &active_key)? else {
@@ -519,6 +595,27 @@ pub(in crate::state::db) fn catalog_origin_current(
         && record.attempt == origin.attempt)
 }
 
+pub(in crate::state::db) fn catalog_source_matches(
+    conn: &Connection,
+    library: &str,
+    database: &str,
+    zone: &Value,
+) -> Result<bool, StateError> {
+    let Some(token) = metadata(conn, &format!("sync_token:v27:{library}"))? else {
+        return Ok(false);
+    };
+    let Some(saved) = valid(conn, &format!("{ACTIVE}{library}"), &token)? else {
+        return Ok(false);
+    };
+    Ok(!saved.plans.is_empty()
+        && saved.plans.iter().all(|plan| {
+            serde_json::from_str::<Value>(&plan.scope).is_ok_and(|scope| {
+                scope.get("database").and_then(Value::as_str) == Some(database)
+                    && scope.get("zone") == Some(zone)
+            })
+        }))
+}
+
 pub(in crate::state::db) fn revalidation_scope_current(
     conn: &Connection,
     library: &str,
@@ -534,21 +631,6 @@ pub(in crate::state::db) fn revalidation_scope_current(
     Ok(saved.policy[0].as_deref() == Some(enum_hash)
         && saved.plans.iter().any(|p| p.scope == scope))
 }
-#[cfg(test)]
-pub(crate) fn attach_revalidation_round_for_test(
-    conn: &Connection,
-    key: &str,
-    token: &str,
-    round: &str,
-) -> Result<bool, StateError> {
-    let Some(mut value) = valid(conn, key, token)? else {
-        return Ok(false);
-    };
-    value.revalidation_round = Some(round.to_owned());
-    store(conn, key, value)?;
-    Ok(true)
-}
-
 fn catalog_round_known(conn: &Connection, round: &str, library: &str) -> Result<bool, StateError> {
     let row: Option<(String, String)> = conn
         .query_row(
@@ -711,7 +793,27 @@ pub(in crate::state::db) fn prepare(
         Kind::Baseline { prior, next } => (prior, next, true),
         _ => return Ok(Prepared(out)),
     };
-    let revalidation_round: Option<String> = if baseline {
+    let revalidation_round: Option<String> = if baseline && proof.catalog_origin.is_some() {
+        let origin = proof
+            .catalog_origin
+            .as_ref()
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        let raw = serde_json::to_string(
+            &json!({"version":1,"account":first.account,"provider":first.provider,"plans":plans}),
+        )
+        .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+        let matching_plan = catalog_plan_digest_from_observation(&raw, zone).as_deref()
+            == Some(&origin.plan_digest);
+        let matching_epoch = sync_epoch::read_library(conn, zone)?.is_some_and(|record| {
+            matches!(record.state.as_str(), "pending" | "complete")
+                && record.epoch == origin.epoch
+                && record.attempt == origin.attempt
+        });
+        let matching_round: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND scope=?3 AND enum_hash=?4 AND boundary=?5 AND phase='observing' AND mode=?6)",
+            params![origin.nonce, zone, origin.scope(), first.policy[0], prior, super::super::source_revalidation::CATALOG_MODE], |row| row.get(0))?;
+        (matching_plan && matching_epoch && matching_round).then(|| origin.nonce.clone())
+    } else if baseline {
         conn.query_row("SELECT id FROM source_revalidation_rounds WHERE library=?1 AND scope=?2 AND enum_hash=?3 AND boundary=?4 AND phase='observing' ORDER BY id LIMIT 1", params![zone, first.plan.scope, first.policy[0], prior], |r| r.get(0)).optional()?
     } else {
         None
@@ -813,31 +915,38 @@ pub(in crate::state::db) fn apply(conn: &Connection, prepared: Prepared) -> Resu
                 if let Some((mode, scope, phase)) = catalog_round
                     && mode == super::super::source_revalidation::CATALOG_MODE
                 {
-                    let origin = super::super::source_revalidation::CatalogOrigin::parse(&scope)?;
-                    let raw = serde_json::to_string(&value)
-                        .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
-                    let plan_matches = catalog_plan_digest_from_observation(&raw, &value.library)
-                        .is_some_and(|digest| digest == origin.plan_digest);
-                    let epoch_matches = sync_epoch::read_library(conn, &value.library)?
-                        .is_some_and(|record| {
-                            matches!(record.state.as_str(), "pending" | "complete")
-                                && record.epoch == origin.epoch
-                                && record.attempt == origin.attempt
-                        });
-                    let owner_matches =
-                        owner_keys(conn)? == (value.account.clone(), value.provider.clone());
-                    let valid = plan_matches && epoch_matches && owner_matches;
-                    if phase == "observing" {
-                        if !valid {
-                            return Err(StateError::Invariant {
-                                operation: "commit_checkpoint_transition",
-                                detail: "catalog origin activation binding changed".into(),
+                    if let Ok(origin) =
+                        super::super::source_revalidation::CatalogOrigin::parse(&scope)
+                    {
+                        let raw = serde_json::to_string(&value)
+                            .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+                        let plan_matches =
+                            catalog_plan_digest_from_observation(&raw, &value.library)
+                                .is_some_and(|digest| digest == origin.plan_digest);
+                        let epoch_matches = sync_epoch::read_library(conn, &value.library)?
+                            .is_some_and(|record| {
+                                matches!(record.state.as_str(), "pending" | "complete")
+                                    && record.epoch == origin.epoch
+                                    && record.attempt == origin.attempt
                             });
-                        }
-                        conn.execute("UPDATE source_revalidation_rounds SET phase='active' WHERE id=?1 AND library=?2 AND phase='observing'", params![round, value.library])?;
-                    } else if phase == "active" {
-                        if !valid {
-                            // Optional stale active link: omit, do not veto.
+                        let owner_matches =
+                            owner_keys(conn)? == (value.account.clone(), value.provider.clone());
+                        let valid = plan_matches
+                            && epoch_matches
+                            && owner_matches
+                            && origin.nonce == *round;
+                        if phase == "observing" {
+                            if !valid {
+                                value.revalidation_round = None;
+                            } else {
+                                conn.execute("UPDATE source_revalidation_rounds SET phase='active' WHERE id=?1 AND library=?2 AND phase='observing'", params![round, value.library])?;
+                            }
+                        } else if phase == "active" {
+                            if !valid {
+                                // Optional stale active link: omit, do not veto.
+                                value.revalidation_round = None;
+                            }
+                        } else {
                             value.revalidation_round = None;
                         }
                     } else {
