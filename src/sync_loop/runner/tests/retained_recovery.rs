@@ -1760,6 +1760,16 @@ async fn retained_checkpoint_historical_metadata_does_not_require_preparation() 
             result.db_sync_token_advance_safe,
             "cycle {cycle}: {result:?}"
         );
+        if cycle == 0 {
+            assert!(
+                provider.retained.load(Ordering::SeqCst) > 0,
+                "the original retained cursor must actually be rejected"
+            );
+            assert!(
+                provider.queries.load(Ordering::SeqCst) > 0,
+                "the fresh inventory must process the current children"
+            );
+        }
         assert!(db.get_metadata(HOLD_KEY).await.unwrap().is_none());
         assert!(
             db.legacy_preservations(ZONE).await.unwrap().is_empty(),
@@ -1904,6 +1914,12 @@ async fn retained_checkpoint_hold_valid_old_replay_recovers_then_two_quiet_reope
             db.get_metadata(HOLD_KEY).await.unwrap().is_some(),
             cycle == 0
         );
+        if cycle <= 1 {
+            assert!(
+                provider.retained.load(Ordering::SeqCst) > 0,
+                "the rejected and then valid old replay must both reach the provider"
+            );
+        }
         if cycle > 0 {
             if cycle == 2 {
                 assert!(
