@@ -3313,6 +3313,12 @@ pub(crate) async fn run_cycle_with_witness(
                     path_reconciliation_cycle_safe = false;
                     continue;
                 }
+                if !matches!(
+                    error.downcast_ref::<download::FreshBaselineRequired>(),
+                    Some(download::FreshBaselineRequired::RejectedToken)
+                ) {
+                    return Err(error);
+                }
                 retained_main_rejected = true;
                 let mut prepared_baseline_fence = None;
                 let prepared: anyhow::Result<_> = Box::pin(async {

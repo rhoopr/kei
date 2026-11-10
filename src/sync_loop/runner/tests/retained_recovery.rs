@@ -54,6 +54,7 @@ struct RetainedSession {
     retained: Arc<AtomicUsize>,
     injected: Arc<AtomicBool>,
     priming: bool,
+    priming_successor: &'static str,
     reject_historical: bool,
     historical_rejected: Arc<AtomicUsize>,
 }
@@ -159,7 +160,7 @@ impl PhotosSession for RetainedSession {
         };
         Ok(json!({"zones": [{
             "zoneID": {"zoneName": ZONE, "ownerRecordName": "_defaultOwner"},
-            "syncToken": if token.is_none() {"fresh-source-anchor"} else if self.priming {PRIOR} else {"validated-old-replay"},
+            "syncToken": if token.is_none() {"fresh-source-anchor"} else if self.priming {self.priming_successor} else {"validated-old-replay"},
             "moreComing": false, "records": records
         }]}))
     }
@@ -542,10 +543,34 @@ impl Fixture {
             retained: Arc::new(AtomicUsize::new(0)),
             injected: Arc::new(AtomicBool::new(false)),
             priming: false,
+            priming_successor: PRIOR,
             reject_historical: false,
             historical_rejected: Arc::new(AtomicUsize::new(0)),
         }
     }
+}
+
+async fn retained_account_library(
+    db: &Arc<state::SqliteStateDb>,
+    owner: &state::db::account::AccountOwner,
+    provider: Box<dyn PhotosSession>,
+) -> crate::icloud::photos::PhotoLibrary {
+    let mut library = crate::icloud::photos::PhotoLibrary::new(
+        "https://example.com/database/1/photos/production/private".into(),
+        Arc::new(std::collections::HashMap::new()),
+        provider,
+        Arc::new(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db.clone(),
+        owner.clone(),
+        "com",
+    ));
+    library
 }
 
 // Each invocation drops its account-owned database, library, passes and builder
@@ -1389,16 +1414,73 @@ async fn retained_main_backoff_does_not_block_healthy_peer_progress() {
 #[tokio::test]
 async fn retained_checkpoint_expiry_holds_all_trigger_classes_and_quiet_reopen() {
     for trigger in [Trigger::Eligibility, Trigger::Sparse] {
-        let fixture = Fixture::new(trigger).await;
         let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
         let config = make_run_cycle_config();
+        let owner = run_cycle_account_owner();
+        let fixture = if trigger == Trigger::Sparse {
+            let mut fixture =
+                Fixture::new_with_owner_and_priming(trigger, Some(&owner), true).await;
+            {
+                let db = Arc::new(
+                    state::SqliteStateDb::open_owned(&fixture.database, &owner)
+                        .await
+                        .unwrap(),
+                );
+                let cancel = CancellationToken::new();
+                let mut provider = fixture.session(false, Fault::None, cancel.clone());
+                provider.priming = true;
+                let mut source = retained_account_library(&db, &owner, Box::new(provider)).await;
+                source.use_stub_indexing_for_test();
+                let mut selected =
+                    make_run_cycle_library_state_with_album(ZONE, CURSOR_KEY, source.all());
+                selected.library = source;
+                let builder = make_run_cycle_download_config_builder_with_options(
+                    &fixture.media,
+                    db.clone(),
+                    RunCycleDownloadConfigOptions {
+                        media: media_without_photo_downloads(),
+                        ..Default::default()
+                    },
+                );
+                let result = run_cycle(
+                    &[&selected],
+                    &config,
+                    Some(db.as_ref()),
+                    false,
+                    &builder,
+                    download::DownloadControls::download_hidden(),
+                    &shared,
+                    &cancel,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    result.db_sync_token_advance_safe,
+                    "owner-produced starting baseline: {result:?}"
+                );
+                assert_eq!(
+                    db.get_metadata(CURSOR_KEY).await.unwrap().as_deref(),
+                    Some(PRIOR)
+                );
+            }
+            seed_original_sparse_history(&mut fixture, &owner, PRIOR).await;
+            fixture
+        } else {
+            Fixture::new(trigger).await
+        };
         let old_hash = {
             let db = state::SqliteStateDb::open(&fixture.database).await.unwrap();
             db.get_metadata(ENUM_CONFIG_HASH_KEY).await.unwrap()
         };
         let mut receipt = None;
         for cycle in 0..8 {
-            let db = Arc::new(state::SqliteStateDb::open(&fixture.database).await.unwrap());
+            let db = Arc::new(if trigger == Trigger::Sparse {
+                state::SqliteStateDb::open_owned(&fixture.database, &owner)
+                    .await
+                    .unwrap()
+            } else {
+                state::SqliteStateDb::open(&fixture.database).await.unwrap()
+            });
             if [3, 5, 6, 7].contains(&cycle) {
                 let mut due: Value =
                     serde_json::from_str(&db.get_metadata(HOLD_KEY).await.unwrap().unwrap())
@@ -1409,15 +1491,27 @@ async fn retained_checkpoint_expiry_holds_all_trigger_classes_and_quiet_reopen()
             let before_cycle_hold = db.get_metadata(HOLD_KEY).await.unwrap();
             let cancel = CancellationToken::new();
             let provider = fixture.session(true, Fault::None, cancel.clone());
-            let mut library = make_run_cycle_library_state_with_album(
-                ZONE,
-                CURSOR_KEY,
-                make_full_album_with_boxed_session(ZONE, Box::new(provider.clone())),
-            );
-            library.library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
-                Box::new(provider.clone()),
-                ZONE,
-            );
+            let library = if trigger == Trigger::Sparse {
+                let mut source =
+                    retained_account_library(&db, &owner, Box::new(provider.clone())).await;
+                source.use_stub_indexing_for_test();
+                let mut selected =
+                    make_run_cycle_library_state_with_album(ZONE, CURSOR_KEY, source.all());
+                selected.library = source;
+                provider.requests.store(0, Ordering::SeqCst);
+                selected
+            } else {
+                let mut selected = make_run_cycle_library_state_with_album(
+                    ZONE,
+                    CURSOR_KEY,
+                    make_full_album_with_boxed_session(ZONE, Box::new(provider.clone())),
+                );
+                selected.library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+                    Box::new(provider.clone()),
+                    ZONE,
+                );
+                selected
+            };
             if cycle > 0 {
                 let mut precheck = crate::sync_loop::precheck::WatchPrecheck::SkipAll;
                 crate::sync_loop::precheck::include_pending_local_work(
@@ -1566,8 +1660,52 @@ async fn retained_checkpoint_expiry_holds_all_trigger_classes_and_quiet_reopen()
 #[tokio::test]
 async fn retained_checkpoint_historical_metadata_does_not_require_preparation() {
     let owner = run_cycle_account_owner();
-    let fixture = Fixture::new_with_owner(Trigger::Legacy, Some(&owner)).await;
+    let fixture = Fixture::new_with_owner_and_priming(Trigger::Legacy, Some(&owner), true).await;
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    {
+        // Produce the retained cursor with the same current provider inventory,
+        // selection and options before testing historical metadata preservation.
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&fixture.database, &owner)
+                .await
+                .unwrap(),
+        );
+        let cancel = CancellationToken::new();
+        let mut provider = fixture.session(false, Fault::None, cancel.clone());
+        provider.priming = true;
+        let source = retained_account_library(&db, &owner, Box::new(provider)).await;
+        let mut library = make_run_cycle_library_state_with_album(ZONE, CURSOR_KEY, source.all());
+        library.library = source;
+        let builder = make_run_cycle_download_config_builder_with_options(
+            &fixture.media,
+            db.clone(),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                ..Default::default()
+            },
+        );
+        let result = run_cycle(
+            &[&library],
+            &make_run_cycle_config(),
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.db_sync_token_advance_safe,
+            "starting historical baseline: {result:?}"
+        );
+        assert_eq!(
+            db.get_metadata(CURSOR_KEY).await.unwrap().as_deref(),
+            Some(PRIOR)
+        );
+    }
+    fixture.assert_preserved();
     for cycle in 0..3 {
         let db = Arc::new(
             state::SqliteStateDb::open_owned(&fixture.database, &owner)
@@ -1575,12 +1713,12 @@ async fn retained_checkpoint_historical_metadata_does_not_require_preparation() 
                 .unwrap(),
         );
         let cancel = CancellationToken::new();
-        let provider = fixture.session(true, Fault::None, cancel.clone());
-        let library = make_run_cycle_library_state_with_album(
-            ZONE,
-            CURSOR_KEY,
-            make_full_album_with_boxed_session(ZONE, Box::new(provider.clone())),
-        );
+        let mut provider = fixture.session(true, Fault::None, cancel.clone());
+        provider.priming = cycle == 0;
+        provider.priming_successor = "fresh-rank-anchor";
+        let source = retained_account_library(&db, &owner, Box::new(provider.clone())).await;
+        let mut library = make_run_cycle_library_state_with_album(ZONE, CURSOR_KEY, source.all());
+        library.library = source;
         let builder = make_run_cycle_download_config_builder_with_options(
             &fixture.media,
             db.clone(),
@@ -1606,7 +1744,11 @@ async fn retained_checkpoint_historical_metadata_does_not_require_preparation() 
         assert_eq!(result.stats.state_write_failures, 0);
         assert_eq!(result.stats.enumeration_errors, 0);
         assert!(!result.stats.enumeration_incomplete);
-        assert_eq!(result.stats.assets_seen, if cycle == 0 { 2 } else { 0 });
+        assert_eq!(
+            result.stats.assets_seen,
+            if cycle == 0 { 2 } else { 0 },
+            "cycle {cycle}: {result:?}"
+        );
         assert_eq!(
             result.stats.skipped.by_media_type,
             if cycle == 0 { 2 } else { 0 }
@@ -1652,10 +1794,65 @@ async fn retained_checkpoint_hold_valid_old_replay_recovers_then_two_quiet_reope
     // This control repairs a previously rejected OLD cursor. A valid fresh
     // inventory alone never repairs permanent historical-token expiry.
     let owner = run_cycle_account_owner();
-    let fixture = Fixture::new_with_owner(Trigger::Eligibility, Some(&owner)).await;
+    let fixture =
+        Fixture::new_with_owner_and_priming(Trigger::Eligibility, Some(&owner), true).await;
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
     let config = make_run_cycle_config();
-    for cycle in 0..4 {
+    {
+        // Establish the old cursor and old eligibility policy through a real
+        // baseline. The requested config and selected pass below are unchanged.
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&fixture.database, &owner)
+                .await
+                .unwrap(),
+        );
+        let cancel = CancellationToken::new();
+        let mut provider = fixture.session(false, Fault::None, cancel.clone());
+        provider.priming = true;
+        let source = retained_account_library(&db, &owner, Box::new(provider)).await;
+        let mut library = make_run_cycle_library_state_with_album(ZONE, CURSOR_KEY, source.all());
+        library.library = source;
+        let base = make_run_cycle_download_config_builder_with_options(
+            &fixture.media,
+            db.clone(),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                ..Default::default()
+            },
+        );
+        let builder = |mode, exclude, groups, library| {
+            let mut value = (*base(mode, exclude, groups, library)).clone();
+            value.edited = true;
+            Arc::new(value)
+        };
+        let mut old_config = make_run_cycle_config();
+        old_config.photos.edited = true;
+        let result = run_cycle(
+            &[&library],
+            &old_config,
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.db_sync_token_advance_safe,
+            "old eligibility baseline: {result:?}"
+        );
+        assert_eq!(
+            db.get_metadata(CURSOR_KEY).await.unwrap().as_deref(),
+            Some(PRIOR)
+        );
+        assert_ne!(
+            download::compute_config_hash(&old_config),
+            download::compute_config_hash(&config)
+        );
+    }
+    for cycle in 0..6 {
         let db = Arc::new(
             state::SqliteStateDb::open_owned(&fixture.database, &owner)
                 .await
@@ -1671,11 +1868,9 @@ async fn retained_checkpoint_hold_valid_old_replay_recovers_then_two_quiet_reope
         }
         let cancel = CancellationToken::new();
         let provider = fixture.session(cycle == 0, Fault::None, cancel.clone());
-        let library = make_run_cycle_library_state_with_album(
-            ZONE,
-            CURSOR_KEY,
-            make_full_album_with_boxed_session(ZONE, Box::new(provider.clone())),
-        );
+        let source = retained_account_library(&db, &owner, Box::new(provider.clone())).await;
+        let mut library = make_run_cycle_library_state_with_album(ZONE, CURSOR_KEY, source.all());
+        library.library = source;
         let builder = make_run_cycle_download_config_builder_with_options(
             &fixture.media,
             db.clone(),
@@ -1710,7 +1905,21 @@ async fn retained_checkpoint_hold_valid_old_replay_recovers_then_two_quiet_reope
             cycle == 0
         );
         if cycle > 0 {
-            assert!(result.db_sync_token_advance_safe);
+            if cycle == 2 {
+                assert!(
+                    !result.db_sync_token_advance_safe,
+                    "observed delta awaits its catalog comparison: {result:?}"
+                );
+                assert_eq!(
+                    result.stats.sync_token_blocked_reason,
+                    Some("catalog_bootstrap_pending")
+                );
+            } else {
+                assert!(
+                    result.db_sync_token_advance_safe,
+                    "cycle {cycle}: {result:?}"
+                );
+            }
             assert_eq!(
                 db.get_metadata(ENUM_CONFIG_HASH_KEY)
                     .await
@@ -1725,9 +1934,16 @@ async fn retained_checkpoint_hold_valid_old_replay_recovers_then_two_quiet_reope
                     .is_none()
             );
         }
-        if cycle >= 2 {
+        if cycle == 2 || cycle >= 4 {
             assert_eq!(provider.queries.load(Ordering::SeqCst), 0);
             assert_eq!(provider.inventories.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.retained.load(Ordering::SeqCst), 0);
+        }
+        if cycle == 3 {
+            assert!(
+                provider.queries.load(Ordering::SeqCst) > 0,
+                "saved catalog boundary must be compared"
+            );
             assert_eq!(provider.retained.load(Ordering::SeqCst), 0);
         }
         fixture.assert_preserved();
@@ -1828,15 +2044,27 @@ async fn retained_checkpoint_expiry_controls_never_promote_or_clear_debt() {
 #[derive(Clone)]
 struct UnaffectedSession {
     changes: Arc<AtomicUsize>,
+    priming: bool,
 }
 #[async_trait::async_trait]
 impl PhotosSession for UnaffectedSession {
-    async fn post(&self, url: &str, _: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
+    async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
+        let request: Value = serde_json::from_str(&body)?;
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(
+                json!({"records":[{"recordName":"index-state","fields":{"state":{"value":"FINISHED"}}}]}),
+            );
+        }
+        if url.ends_with("/zones/list") {
+            return Ok(
+                json!({"zones":[{"zoneID":{"zoneName":"SharedSync-CLEAN","ownerRecordName":"_defaultOwner"},"syncToken":"clean-zone-boundary","deleted":false}]}),
+            );
+        }
         if url.contains("/changes/zone?") {
             self.changes.fetch_add(1, Ordering::SeqCst);
             return Ok(json!({"zones":[{
                 "zoneID":{"zoneName":"SharedSync-CLEAN","ownerRecordName":"_defaultOwner"},
-                "syncToken":"clean-zone-successor","moreComing":false,"records":[]
+                "syncToken":if self.priming {"clean-zone-before"} else {"clean-zone-successor"},"moreComing":false,"records":[]
             }]}));
         }
         if url.contains("/internal/records/query/batch?") {
@@ -1849,19 +2077,104 @@ impl PhotosSession for UnaffectedSession {
     }
 }
 
+async fn clean_peer_states(
+    db: Arc<state::SqliteStateDb>,
+    owner: &state::db::account::AccountOwner,
+    primary: RetainedSession,
+    peer: UnaffectedSession,
+) -> (
+    crate::sync_cycle::LibraryState,
+    crate::sync_cycle::LibraryState,
+) {
+    let source = retained_account_library(&db, owner, Box::new(primary)).await;
+    let mut other = crate::icloud::photos::PhotoLibrary::new(
+        "https://example.com/database/1/photos/production/shared".into(),
+        Arc::new(std::collections::HashMap::new()),
+        Box::new(peer),
+        Arc::new(json!({"zoneName":"SharedSync-CLEAN","ownerRecordName":"_defaultOwner"})),
+        "shared".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    other.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db,
+        owner.clone(),
+        "com",
+    ));
+    let mut first = make_run_cycle_library_state_with_album(ZONE, CURSOR_KEY, source.all());
+    first.library = source;
+    let mut second = make_run_cycle_library_state_with_album(
+        "SharedSync-CLEAN",
+        "sync_token:v27:SharedSync-CLEAN",
+        other.all(),
+    );
+    second.library = other;
+    (first, second)
+}
+
 #[tokio::test]
 async fn retained_checkpoint_held_zone_does_not_block_clean_zone_or_clear_aggregate_hold() {
     let owner = run_cycle_account_owner();
-    let fixture = Fixture::new_with_owner(Trigger::Sparse, Some(&owner)).await;
+    let mut fixture =
+        Fixture::new_with_owner_and_priming(Trigger::Sparse, Some(&owner), true).await;
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
     {
-        let db = state::SqliteStateDb::open_owned(&fixture.database, &owner)
-            .await
-            .unwrap();
-        db.set_metadata("sync_token:v27:SharedSync-CLEAN", "clean-zone-before")
-            .await
-            .unwrap();
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&fixture.database, &owner)
+                .await
+                .unwrap(),
+        );
+        let cancel = CancellationToken::new();
+        let mut provider = fixture.session(false, Fault::None, cancel.clone());
+        provider.priming = true;
+        let (primary, clean) = clean_peer_states(
+            db.clone(),
+            &owner,
+            provider,
+            UnaffectedSession {
+                changes: Arc::new(AtomicUsize::new(0)),
+                priming: true,
+            },
+        )
+        .await;
+        let builder = make_run_cycle_download_config_builder_with_options(
+            &fixture.media,
+            db.clone(),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                ..Default::default()
+            },
+        );
+        let result = run_cycle(
+            &[&primary, &clean],
+            &make_run_cycle_config(),
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.db_sync_token_advance_safe,
+            "both source baselines must complete: {result:?}"
+        );
+        assert_eq!(
+            db.get_metadata(CURSOR_KEY).await.unwrap().as_deref(),
+            Some(PRIOR)
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:v27:SharedSync-CLEAN")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("clean-zone-before")
+        );
     }
+    seed_original_sparse_history(&mut fixture, &owner, PRIOR).await;
     for cycle in 0..3 {
         let db = Arc::new(
             state::SqliteStateDb::open_owned(&fixture.database, &owner)
@@ -1870,22 +2183,17 @@ async fn retained_checkpoint_held_zone_does_not_block_clean_zone_or_clear_aggreg
         );
         let cancel = CancellationToken::new();
         let primary_provider = fixture.session(true, Fault::None, cancel.clone());
-        let primary = make_run_cycle_library_state_with_album(
-            ZONE,
-            CURSOR_KEY,
-            make_full_album_with_boxed_session(ZONE, Box::new(primary_provider.clone())),
-        );
         let clean_changes = Arc::new(AtomicUsize::new(0));
-        let clean = make_run_cycle_library_state_with_album(
-            "SharedSync-CLEAN",
-            "sync_token:v27:SharedSync-CLEAN",
-            make_full_album_with_boxed_session(
-                "SharedSync-CLEAN",
-                Box::new(UnaffectedSession {
-                    changes: clean_changes.clone(),
-                }),
-            ),
-        );
+        let (primary, clean) = clean_peer_states(
+            db.clone(),
+            &owner,
+            primary_provider.clone(),
+            UnaffectedSession {
+                changes: clean_changes.clone(),
+                priming: false,
+            },
+        )
+        .await;
         let builder = make_run_cycle_download_config_builder_with_options(
             &fixture.media,
             db.clone(),
@@ -1919,7 +2227,8 @@ async fn retained_checkpoint_held_zone_does_not_block_clean_zone_or_clear_aggreg
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("clean-zone-successor")
+            Some("clean-zone-successor"),
+            "cycle {cycle}: {result:?}"
         );
         assert_eq!(
             clean_changes.load(Ordering::SeqCst),
@@ -2126,7 +2435,7 @@ async fn retained_checkpoint_provider_change_during_scan_remains_replayable_then
     let injected = Arc::new(AtomicBool::new(false));
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
     let mut admitted_specs = None;
-    for cycle in 0..6 {
+    for cycle in 0..8 {
         let db = Arc::new(
             state::SqliteStateDb::open_owned(&fixture.database, &owner)
                 .await
@@ -2222,14 +2531,31 @@ async fn retained_checkpoint_provider_change_during_scan_remains_replayable_then
                 "fresh rank inventory must not count as retained replay"
             );
         } else {
-            assert!(
-                result.db_sync_token_advance_safe,
-                "cycle {cycle}: {result:?}"
-            );
+            if cycle == 4 {
+                assert!(
+                    !result.db_sync_token_advance_safe,
+                    "the observed delta waits for the saved-boundary inventory and bridge: {result:?}"
+                );
+                assert_eq!(
+                    result.stats.sync_token_blocked_reason,
+                    Some("catalog_bootstrap_pending")
+                );
+            } else {
+                assert!(
+                    result.db_sync_token_advance_safe,
+                    "cycle {cycle}: {result:?}"
+                );
+            }
             assert_eq!(result.failed_count, 0);
             assert_eq!(result.stats.skipped.uncertain, 0);
-            assert_eq!(result.stats.assets_seen, usize::from(cycle == 3) as u64);
-            assert_eq!(result.stats.skipped.by_media_type, usize::from(cycle == 3));
+            assert_eq!(
+                result.stats.assets_seen,
+                usize::from(cycle == 3 || cycle == 5) as u64
+            );
+            assert_eq!(
+                result.stats.skipped.by_media_type,
+                usize::from(cycle == 3 || cycle == 5)
+            );
             if cycle == 3 {
                 let connection = rusqlite::Connection::open(&fixture.database).unwrap();
                 let mut statement = connection.prepare(
@@ -2282,9 +2608,20 @@ async fn retained_checkpoint_provider_change_during_scan_remains_replayable_then
                 assert_eq!(delivered.load(Ordering::SeqCst), 2);
             }
         }
-        if cycle == 1 || cycle >= 4 {
+        if cycle == 1 || cycle == 4 || cycle >= 6 {
             assert_eq!(base.queries.load(Ordering::SeqCst), 0);
             assert_eq!(base.retained.load(Ordering::SeqCst), 0);
+        }
+        if cycle == 5 {
+            assert!(
+                base.queries.load(Ordering::SeqCst) > 0,
+                "the saved boundary must run its own inventory"
+            );
+            assert_eq!(
+                base.retained.load(Ordering::SeqCst),
+                0,
+                "the rejected old cursor must not be replayed"
+            );
         }
         fixture.assert_preserved();
     }

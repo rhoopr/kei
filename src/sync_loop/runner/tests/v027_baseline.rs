@@ -705,7 +705,9 @@ async fn baseline_contract(
     let mut captured_metadata = None;
     for cycle in 0..if retained_operation {
         1
-    } else if current_sidecar_failure || recorded_only::enabled() {
+    } else if recorded_only::enabled() {
+        9
+    } else if current_sidecar_failure {
         4
     } else {
         3
@@ -752,7 +754,7 @@ async fn baseline_contract(
             );
             captured_metadata = Some((generation, rows));
         }
-        let cycle_records = if initial_failure && cycle > 0 {
+        let mut cycle_records = if initial_failure && cycle > 0 {
             let mut current = pair(
                 "current-existing",
                 "existing.JPG",
@@ -769,11 +771,20 @@ async fn baseline_contract(
         } else {
             records.clone()
         };
+        // The first baseline's concurrent arrival remains present in later
+        // inventories, including the resumed catalog comparison.
+        if recorded_only::enabled() && cycle >= 2 {
+            cycle_records.extend(concurrent.iter().cloned());
+        }
         let session = BaselineSession {
             database,
             cycle,
             inventory: Arc::new(cycle_records),
-            concurrent: Arc::new(concurrent.clone()),
+            concurrent: Arc::new(if recorded_only::enabled() && cycle >= 2 {
+                Vec::new()
+            } else {
+                concurrent.clone()
+            }),
             incremental_addition: Arc::new(if add_after_baseline {
                 pair(
                     "incremental-new",
@@ -879,7 +890,7 @@ async fn baseline_contract(
             if primary_template_change {
                 configured.edited_naming = crate::types::EditedNaming::Primary;
             }
-            if recorded_only::enabled() && cycle >= 2 {
+            if recorded_only::enabled() && cycle >= 4 {
                 configured.folder_structure = "changed-template".into();
             }
             #[cfg(feature = "xmp")]
@@ -1215,11 +1226,11 @@ async fn baseline_contract(
                 "foreign existing media plus genuinely missing inventory+concurrent content"
             );
         } else {
-            if recorded_only::enabled() && cycle == 2 {
+            if recorded_only::enabled() && (cycle == 2 || cycle == 4 || cycle == 6) {
                 assert_eq!(
                     session.inventory_starts.load(Ordering::SeqCst),
                     1,
-                    "new selected path policy requires one complete comparison"
+                    "each saved catalog boundary and the later new path policy require a complete comparison"
                 );
             } else {
                 assert_eq!(
@@ -1242,9 +1253,22 @@ async fn baseline_contract(
                 result.failed_count > 0,
                 "failed transfer must remain visible: {result:?}"
             );
+        } else if recorded_only::enabled() && (cycle == 1 || cycle == 5) {
+            assert_eq!(result.failed_count, 0, "{result:?}");
+            assert!(
+                !result.db_sync_token_advance_safe,
+                "the observed delta must wait for its saved-boundary inventory and bridge: {result:?}"
+            );
+            assert_eq!(
+                result.stats.sync_token_blocked_reason,
+                Some("catalog_bootstrap_pending")
+            );
         } else {
             assert_eq!(result.failed_count, 0, "{result:?}");
-            assert!(result.db_sync_token_advance_safe, "{result:?}");
+            assert!(
+                result.db_sync_token_advance_safe,
+                "cycle {cycle}: {result:?}"
+            );
         }
         assert_eq!(
             db.get_metadata(&token_key).await.unwrap().as_deref(),

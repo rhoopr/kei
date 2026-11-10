@@ -556,6 +556,11 @@ impl PhotoLibrary {
 
 #[cfg(test)]
 impl PhotoLibrary {
+    /// Preserve the indexing-ready stub precondition in account-bound cycle fixtures.
+    pub(crate) fn use_stub_indexing_for_test(&mut self) {
+        self.stub_indexing_finished = Some(true);
+    }
+
     /// Test-only constructor that bypasses the indexing check.
     pub(crate) fn new_stub(session: Box<dyn PhotosSession>) -> Self {
         Self {
