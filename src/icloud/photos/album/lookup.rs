@@ -574,14 +574,26 @@ fn strict_explicit_deletion(record: &Value, expected_type: &str) -> Result<bool,
     {
         return Err(());
     }
-    if let Some(deleted) = record.get("deleted") {
-        return match deleted.as_bool() {
-            Some(true) => Ok(true),
-            Some(false) => Ok(false),
-            None => Err(()),
-        };
+    let mut deleted = match record.get("deleted") {
+        Some(value) => value.as_bool().ok_or(())?,
+        None => false,
+    };
+    let fields = record
+        .get("fields")
+        .map(|value| value.as_object().ok_or(()))
+        .transpose()?;
+    for key in ["isDeleted", "isExpunged"] {
+        if let Some(field) = fields.and_then(|fields| fields.get(key)) {
+            let flag = match field.get("value").ok_or(())? {
+                Value::Bool(value) => *value,
+                Value::Number(value) if value.as_i64() == Some(0) => false,
+                Value::Number(value) if value.as_i64() == Some(1) => true,
+                _ => return Err(()),
+            };
+            deleted |= flag;
+        }
     }
-    returned_deletion(Some(record), expected_type)
+    Ok(deleted)
 }
 
 #[allow(dead_code)] // strict pair integration is gated; focused lookup tests exercise it.
@@ -671,6 +683,24 @@ impl PhotoAlbum {
                 reason: StrictCatalogRefusal::Malformed,
             });
         };
+        // Authentication on either requested member takes priority over a
+        // missing peer. Unrequested records cannot establish session failure.
+        if records.iter().any(|record| {
+            record
+                .get("recordName")
+                .and_then(Value::as_str)
+                .is_some_and(|name| {
+                    name == master_record_name.as_str() || name == child_record_name.as_str()
+                })
+                && matches!(
+                    record.get("serverErrorCode").and_then(Value::as_str),
+                    Some("AUTHENTICATION_REQUIRED" | "AUTHENTICATION_FAILED")
+                )
+        }) {
+            return with_rate(StrictCatalogPairResult::Refused {
+                reason: StrictCatalogRefusal::Authentication,
+            });
+        }
         let mut by_name: FxHashMap<&str, &Value> = FxHashMap::default();
         for record in records {
             let Some(name) = record.get("recordName").and_then(Value::as_str) else {

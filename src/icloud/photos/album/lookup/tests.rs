@@ -1535,6 +1535,27 @@ fn strict_live_child(child: &str, master: &str) -> Value {
     record
 }
 
+#[test]
+fn strict_deletion_flags_are_checked_independently_of_tombstone_false() {
+    for key in ["isDeleted", "isExpunged"] {
+        let mut record = strict_live_master("master");
+        record["deleted"] = json!(false);
+        record["fields"][key] = json!({"value":1,"type":"INT64"});
+        assert_eq!(
+            super::strict_explicit_deletion(&record, "CPLMaster"),
+            Ok(true)
+        );
+        record["fields"][key] = json!({"value":"bad","type":"STRING"});
+        assert!(super::strict_explicit_deletion(&record, "CPLMaster").is_err());
+        record["deleted"] = json!(true);
+        assert!(super::strict_explicit_deletion(&record, "CPLMaster").is_err());
+    }
+    let mut record = strict_live_master("master");
+    record["deleted"] = json!(false);
+    record["fields"] = json!("malformed");
+    assert!(super::strict_explicit_deletion(&record, "CPLMaster").is_err());
+}
+
 async fn strict_result(records: Vec<Value>) -> StrictCatalogPairResult {
     let album = strict_album(
         Box::new(MockPhotosSession::new().ok(json!({"records":records}))),

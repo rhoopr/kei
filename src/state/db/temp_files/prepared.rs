@@ -532,6 +532,49 @@ impl PreparedPublication {
         crate::fs_util::confined_path_key(&self.temporary.to_path()).map_err(|_error| invalid())?;
         Ok(())
     }
+
+    /// Unknown publication evidence cannot authorize deletion of any family.
+    pub(in crate::state::db) fn protects_family(
+        conn: &rusqlite::Connection,
+        library: &str,
+        ids: &std::collections::BTreeSet<String>,
+    ) -> Result<bool, StateError> {
+        let mut statement = conn.prepare(
+            "SELECT path,publication FROM owned_temp_files WHERE publication IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (key, encoded) = row?;
+            if encoded.len() > 64 * 1024 {
+                return Ok(true);
+            }
+            let Ok(proof) = serde_json::from_str::<Self>(&encoded) else {
+                return Ok(true);
+            };
+            if proof.validate().is_err()
+                || OwnedTempPathKey::from_path(&proof.temporary.to_path())
+                    .map_or(true, |path| path.0 != key)
+                || proof.binding.as_ref().is_some_and(|binding| {
+                    binding.library != proof.library
+                        || binding.state_id != proof.id
+                        || binding.validate(conn).is_err()
+                })
+            {
+                return Ok(true);
+            }
+            if proof.library == library
+                && (ids.contains(&proof.id)
+                    || proof.binding.as_ref().is_some_and(|binding| {
+                        ids.contains(&binding.child) || ids.contains(&binding.master)
+                    }))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 impl SqliteStateDb {
@@ -728,6 +771,65 @@ mod tests {
     use super::PreparedPublication;
     use crate::state::db::{TempFileOwnershipStore, provider_selection::SelectionPath};
     use crate::state::{SqliteStateDb, VersionSizeKey};
+
+    #[test]
+    fn catalog_guard_refuses_unknown_publication_and_allows_unrelated_valid_owner() {
+        let ids = std::collections::BTreeSet::from(["child".to_owned()]);
+        for bad in [
+            "not-json",
+            "{}",
+            r#"{"library":"other","id":"child","future":true}"#,
+        ] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE owned_temp_files(path BLOB NOT NULL,publication TEXT)",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO owned_temp_files VALUES(?1,?2)",
+                rusqlite::params![vec![1_u8], bad],
+            )
+            .unwrap();
+            assert!(PreparedPublication::protects_family(&conn, "PrimarySync", &ids).unwrap());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let temporary = dir.path().join("owned.part");
+        let mut proof = PreparedPublication {
+            binding: None,
+            library: "OtherLibrary".into(),
+            id: "child".into(),
+            version: "original".into(),
+            provider_checksum: "checksum".into(),
+            provider_size: 4,
+            temporary: SelectionPath::from_path(&temporary),
+            destination: SelectionPath::from_path(&dir.path().join("out.jpg")),
+            local_checksum: "a".repeat(64),
+            source_checksum: "b".repeat(64),
+        };
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE owned_temp_files(path BLOB NOT NULL,publication TEXT)")
+            .unwrap();
+        let key = super::OwnedTempPathKey::from_path(&temporary).unwrap().0;
+        conn.execute(
+            "INSERT INTO owned_temp_files VALUES(?1,?2)",
+            rusqlite::params![key, serde_json::to_string(&proof).unwrap()],
+        )
+        .unwrap();
+        assert!(!PreparedPublication::protects_family(&conn, "PrimarySync", &ids).unwrap());
+        assert!(PreparedPublication::protects_family(&conn, "OtherLibrary", &ids).unwrap());
+        // A family member's other rendition is protected too; version is not
+        // used as a filter for a deletion that can affect the entire family.
+        proof.library = "PrimarySync".into();
+        proof.id = "sibling".into();
+        proof.version = "medium".into();
+        conn.execute(
+            "UPDATE owned_temp_files SET publication=?1",
+            [serde_json::to_string(&proof).unwrap()],
+        )
+        .unwrap();
+        let family = std::collections::BTreeSet::from(["child".to_owned(), "sibling".to_owned()]);
+        assert!(PreparedPublication::protects_family(&conn, "PrimarySync", &family).unwrap());
+    }
 
     #[tokio::test]
     async fn prepared_transfer_survives_reopen_stale_cleanup_and_claim_conflicts() {

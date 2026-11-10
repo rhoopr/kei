@@ -407,6 +407,7 @@ fn catalog_owner_protected(
     conn: &Connection,
     library: &str,
     ids_json: &str,
+    ids: &std::collections::BTreeSet<String>,
 ) -> Result<bool, StateError> {
     let queries = [
         "SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id IN (SELECT value FROM json_each(?2)) AND status<>'downloaded')",
@@ -415,7 +416,7 @@ fn catalog_owner_protected(
         "SELECT EXISTS(SELECT 1 FROM metadata_capture_retries WHERE library=?1 AND asset_id IN (SELECT value FROM json_each(?2)))",
         "SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id IN (SELECT value FROM json_each(?2)) AND ((capture_repair_metadata_hash IS NOT NULL AND capture_repair_metadata_hash<>'') OR (capture_repair_output_checksum IS NOT NULL AND capture_repair_output_size IS NOT NULL) OR metadata_write_failed_at IS NOT NULL))",
         "SELECT EXISTS(SELECT 1 FROM asset_metadata_paths WHERE library=?1 AND id IN (SELECT value FROM json_each(?2)) AND ((capture_repair_metadata_hash IS NOT NULL AND capture_repair_metadata_hash<>'') OR (capture_repair_output_checksum IS NOT NULL AND capture_repair_output_size IS NOT NULL) OR metadata_write_failed_at IS NOT NULL))",
-        "SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE library=?1 AND (asset_id IN (SELECT value FROM json_each(?2)) OR master IN (SELECT value FROM json_each(?2))) AND ((admitted=1 AND (verified_media=0 OR verified_metadata=0)) OR prepared_hash IS NOT NULL OR prepared_checksum IS NOT NULL OR prepared_size IS NOT NULL))",
+        "SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE library=?1 AND (asset_id IN (SELECT value FROM json_each(?2)) OR master IN (SELECT value FROM json_each(?2))) AND ((admitted=1 AND (verified_media=0 OR verified_metadata=0)) OR prepared_hash IS NOT NULL OR prepared_checksum IS NOT NULL OR prepared_size IS NOT NULL OR frozen_metadata IS NOT NULL OR frozen_metadata_hash IS NOT NULL))",
         "SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE child IN (SELECT value FROM json_each(?2)) AND (outcome='deferred' OR admission='deferred'))",
         "SELECT EXISTS(SELECT 1 FROM provider_work_obligations WHERE library=?1 AND asset_id IN (SELECT value FROM json_each(?2)))",
         "SELECT EXISTS(SELECT 1 FROM primary_layout_bindings WHERE library=?1 AND (family IN (SELECT value FROM json_each(?2)) OR child IN (SELECT value FROM json_each(?2))))",
@@ -429,7 +430,7 @@ fn catalog_owner_protected(
             return Ok(true);
         }
     }
-    Ok(false)
+    super::temp_files::PreparedPublication::protects_family(conn, library, ids)
 }
 
 fn catalog_signals(
@@ -1716,7 +1717,7 @@ impl SqliteStateDb {
                     ids.extend(mapped);
                     let ids_json = serde_json::to_string(&ids)
                         .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
-                    if catalog_owner_protected(&tx, &library, &ids_json)? {
+                    if catalog_owner_protected(&tx, &library, &ids_json, &ids)? {
                         tx.execute(
                             "UPDATE source_revalidation_debt SET next_retry_at=?3 WHERE round=?1 AND id=?2",
                             params![

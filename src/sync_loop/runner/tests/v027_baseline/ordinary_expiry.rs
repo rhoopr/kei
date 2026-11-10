@@ -193,6 +193,22 @@ impl PhotosSession for SourceSession {
             {
                 self.cancel.cancel();
             }
+            if self.primary && self.events.lock().unwrap().contains(&"fresh-bridge") {
+                let result = match self.fault {
+                    OriginFault::RecordAuthMaster => {
+                        Some(("primary-old", "AUTHENTICATION_REQUIRED"))
+                    }
+                    OriginFault::RecordAuthChild => {
+                        Some(("asset-primary-old", "AUTHENTICATION_FAILED"))
+                    }
+                    OriginFault::RecordDenied => Some(("primary-old", "ACCESS_DENIED")),
+                    OriginFault::RecordUnknown => Some(("asset-primary-old", "SYNTHETIC_UNKNOWN")),
+                    _ => None,
+                };
+                if let Some((name, code)) = result {
+                    return Ok(json!({"records":[{"recordName":name,"serverErrorCode":code}]}));
+                }
+            }
             let requested = request["records"].as_array().unwrap();
             let mut records: Vec<_> = self
                 .current
@@ -216,16 +232,30 @@ impl PhotosSession for SourceSession {
             if matches!(
                 self.fault,
                 OriginFault::DeletedLookup
+                    | OriginFault::TopFalseDeleted
                     | OriginFault::DeletedProtected
+                    | OriginFault::PreparedPublication
                     | OriginFault::PreBoundaryDeleted
             ) && self.primary
                 && self.events.lock().unwrap().contains(&"fresh-bridge")
             {
                 for record in &mut records {
+                    if self.fault == OriginFault::TopFalseDeleted {
+                        record["deleted"] = json!(false);
+                    }
                     record["fields"]["isDeleted"] = json!({"value":1,"type":"INT64"});
                     record["fields"]["isExpunged"] = json!({"value":1,"type":"INT64"});
                     record["fields"]["dateExpunged"] =
                         json!({"value":1792541032000_i64,"type":"TIMESTAMP"});
+                }
+            }
+            if self.fault == OriginFault::TopFalseMalformed
+                && self.primary
+                && self.events.lock().unwrap().contains(&"fresh-bridge")
+            {
+                for record in &mut records {
+                    record["deleted"] = json!(false);
+                    record["fields"]["isDeleted"] = json!({"value":"malformed","type":"STRING"});
                 }
             }
             return Ok(json!({"records":records}));
@@ -245,12 +275,19 @@ enum OriginFault {
     RepeatBridge,
     RankChange,
     DeletedLookup,
+    TopFalseDeleted,
+    TopFalseMalformed,
     PreBoundaryDeleted,
     MarkerWriterProbe,
     DeletedProtected,
+    PreparedPublication,
     WrongScope,
     AuthLookup,
     CancelLookup,
+    RecordAuthMaster,
+    RecordAuthChild,
+    RecordDenied,
+    RecordUnknown,
 }
 
 #[tokio::test]
@@ -291,6 +328,37 @@ async fn m1_strict_deleted_pair_settles_only_confirmed_source_without_removing_m
 
 #[cfg(feature = "xmp")]
 #[tokio::test]
+async fn m1_strict_top_false_does_not_hide_photos_deletion() {
+    exercise_expiry(OriginFault::TopFalseDeleted).await;
+}
+
+#[tokio::test]
+async fn m1_strict_top_false_malformed_flag_retains_debt() {
+    exercise_expiry(OriginFault::TopFalseMalformed).await;
+}
+
+#[tokio::test]
+async fn m1_strict_record_master_auth_without_peer_preserves_reauthentication() {
+    exercise_expiry(OriginFault::RecordAuthMaster).await;
+}
+
+#[tokio::test]
+async fn m1_strict_record_child_auth_without_peer_preserves_reauthentication() {
+    exercise_expiry(OriginFault::RecordAuthChild).await;
+}
+
+#[tokio::test]
+async fn m1_strict_record_denial_without_peer_is_not_authentication() {
+    exercise_expiry(OriginFault::RecordDenied).await;
+}
+
+#[tokio::test]
+async fn m1_strict_record_unknown_without_peer_is_not_authentication() {
+    exercise_expiry(OriginFault::RecordUnknown).await;
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
 async fn m1_preboundary_deleted_pair_omitted_from_inventory_settles_after_bridge() {
     exercise_expiry(OriginFault::PreBoundaryDeleted).await;
 }
@@ -298,6 +366,12 @@ async fn m1_preboundary_deleted_pair_omitted_from_inventory_settles_after_bridge
 #[tokio::test]
 async fn m1_strict_deleted_pair_retains_pending_metadata_and_media() {
     exercise_expiry(OriginFault::DeletedProtected).await;
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn m1_strict_deleted_pair_retains_real_prepared_publication() {
+    exercise_expiry(OriginFault::PreparedPublication).await;
 }
 
 #[tokio::test]
@@ -352,9 +426,15 @@ async fn exercise_expiry(fault: OriginFault) {
     let mut retained_debt = None;
     let mut sidecar_snapshot = None;
     let mut baseline_marker = None;
+    let mut prepared = None;
     let deferred = matches!(
         fault,
-        OriginFault::WrongScope | OriginFault::DeletedProtected
+        OriginFault::WrongScope
+            | OriginFault::DeletedProtected
+            | OriginFault::PreparedPublication
+            | OriginFault::TopFalseMalformed
+            | OriginFault::RecordDenied
+            | OriginFault::RecordUnknown
     );
     let interrupted = matches!(
         fault,
@@ -365,8 +445,9 @@ async fn exercise_expiry(fault: OriginFault) {
     );
     let confirmed_deletion = matches!(
         fault,
-        OriginFault::DeletedLookup | OriginFault::PreBoundaryDeleted
+        OriginFault::DeletedLookup | OriginFault::TopFalseDeleted | OriginFault::PreBoundaryDeleted
     );
+    let clean_metadata = confirmed_deletion || fault == OriginFault::PreparedPublication;
     let recovery_phase = if interrupted { 2 } else { 1 };
     for phase in 0..recovery_phase + 3 {
         let db = Arc::new(
@@ -489,19 +570,19 @@ async fn exercise_expiry(fault: OriginFault) {
         let base = make_run_cycle_download_config_builder(&root, db.clone());
         let mut run_config = make_run_cycle_config();
         #[cfg(feature = "xmp")]
-        if confirmed_deletion {
+        if clean_metadata {
             run_config.runtime.refresh_metadata = phase == 0;
             run_config.metadata.xmp_sidecar = true;
         }
         let builder = |mode, exclude, groups, library| {
             let mut config = (*base(mode, exclude, groups, library)).clone();
             config.folder_structure = "none".into();
-            if confirmed_deletion {
+            if clean_metadata {
                 config.metadata = crate::config::MetadataConfig::default();
             }
             #[cfg(feature = "xmp")]
             {
-                config.metadata.xmp_sidecar = confirmed_deletion;
+                config.metadata.xmp_sidecar = clean_metadata;
             }
             Arc::new(config)
         };
@@ -559,7 +640,7 @@ async fn exercise_expiry(fault: OriginFault) {
                 "a completed fresh bridge must not create a retained checkpoint hold"
             );
         }
-        if confirmed_deletion && phase == 0 {
+        if clean_metadata && phase == 0 {
             let failures = download::drain_pending_metadata_rewrites(
                 db.as_ref(),
                 &root,
@@ -582,12 +663,19 @@ async fn exercise_expiry(fault: OriginFault) {
                 | OriginFault::RepeatBridge
                 | OriginFault::RankChange
                 | OriginFault::DeletedLookup
+                | OriginFault::TopFalseDeleted
+                | OriginFault::TopFalseMalformed
                 | OriginFault::PreBoundaryDeleted
                 | OriginFault::CheckpointGuard
                 | OriginFault::DeletedProtected
+                | OriginFault::PreparedPublication
                 | OriginFault::WrongScope
                 | OriginFault::AuthLookup
-                | OriginFault::CancelLookup,
+                | OriginFault::CancelLookup
+                | OriginFault::RecordAuthMaster
+                | OriginFault::RecordAuthChild
+                | OriginFault::RecordDenied
+                | OriginFault::RecordUnknown,
                 1,
             ) => 2,
             (OriginFault::Write, 1 | 2) => 1,
@@ -678,6 +766,43 @@ async fn exercise_expiry(fault: OriginFault) {
             )
             .await;
             assert!(precheck.should_sync_zone(PRIMARY));
+            if fault == OriginFault::PreparedPublication {
+                use crate::state::db::provider_selection::SelectionPath;
+                use crate::state::db::{PreparedPublication, TempFileOwnershipStore};
+                use sha2::{Digest, Sha256};
+                let (version, checksum, size): (String, String, i64) = {
+                    let conn = db
+                        .acquire_lock("read downloaded publication candidate")
+                        .unwrap();
+                    conn.query_row("SELECT version_size,checksum,size_bytes FROM assets WHERE library=?1 AND id='asset-primary-old' AND status='downloaded' AND is_deleted=0", [PRIMARY], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap()
+                };
+                let destination = root.join("prepared-recovery.JPG");
+                let temporary = crate::download::test_temp_download_path(
+                    &destination,
+                    &checksum,
+                    ".catalog-protected",
+                )
+                .unwrap();
+                std::fs::write(&temporary, MEDIA).unwrap();
+                db.claim_temp_file(&temporary).await.unwrap();
+                let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(MEDIA));
+                let proof = PreparedPublication {
+                    binding: None,
+                    library: PRIMARY.to_owned(),
+                    id: "asset-primary-old".to_owned(),
+                    version,
+                    provider_checksum: checksum,
+                    provider_size: size.try_into().unwrap(),
+                    temporary: SelectionPath::from_path(&temporary),
+                    destination: SelectionPath::from_path(&destination),
+                    local_checksum: digest.clone(),
+                    source_checksum: digest,
+                };
+                db.prepare_temp_publication(&temporary, &proof)
+                    .await
+                    .unwrap();
+                prepared = Some(proof);
+            }
             if fault == OriginFault::DeletedProtected {
                 let conn = db.acquire_lock("verify metadata protection").unwrap();
                 let protected: i64 = conn.query_row(
@@ -689,7 +814,7 @@ async fn exercise_expiry(fault: OriginFault) {
                     "the pending metadata owner must protect the family"
                 );
             }
-            if confirmed_deletion {
+            if clean_metadata {
                 let conn = db
                     .acquire_lock("verify unprotected deletion fixture")
                     .unwrap();
@@ -732,7 +857,29 @@ async fn exercise_expiry(fault: OriginFault) {
             )
             .await
             .unwrap();
-            assert_eq!(drained.session_expired, fault == OriginFault::AuthLookup);
+            if fault == OriginFault::PreparedPublication {
+                let conn = db
+                    .acquire_lock("verify deletion and publication custody")
+                    .unwrap();
+                let state: (i64, i64, i64) = conn.query_row(
+                    "SELECT (SELECT is_deleted FROM assets WHERE library=?1 AND id='asset-primary-old'), (SELECT COUNT(*) FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE r.library=?1 AND r.phase='active' AND d.id='asset-primary-old'), (SELECT COUNT(*) FROM owned_temp_files WHERE publication IS NOT NULL AND json_extract(publication,'$.library')=?1 AND json_extract(publication,'$.id')='asset-primary-old')",
+                    [PRIMARY], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                ).unwrap();
+                assert_eq!(
+                    state,
+                    (0, 1, 1),
+                    "the downloaded asset, active debt and prepared custody must remain"
+                );
+            }
+            assert_eq!(
+                drained.session_expired,
+                matches!(
+                    fault,
+                    OriginFault::AuthLookup
+                        | OriginFault::RecordAuthMaster
+                        | OriginFault::RecordAuthChild
+                )
+            );
             assert_eq!(drained.retained, usize::from(deferred));
             assert_eq!(
                 drained.retained_sources,
@@ -752,7 +899,12 @@ async fn exercise_expiry(fault: OriginFault) {
                 );
                 assert!(crate::sync_loop::runner::one_shot_partial_error(&result).is_some());
                 assert!(!result.can_advance_database_checkpoint());
-            } else if fault == OriginFault::AuthLookup {
+            } else if matches!(
+                fault,
+                OriginFault::AuthLookup
+                    | OriginFault::RecordAuthMaster
+                    | OriginFault::RecordAuthChild
+            ) {
                 assert!(result.session_expired);
                 assert!(!result.can_advance_database_checkpoint());
                 assert!(
@@ -776,9 +928,26 @@ async fn exercise_expiry(fault: OriginFault) {
                 )
                 .await
                 .unwrap(),
-                matches!(fault, OriginFault::AuthLookup | OriginFault::CancelLookup),
+                matches!(
+                    fault,
+                    OriginFault::AuthLookup
+                        | OriginFault::CancelLookup
+                        | OriginFault::RecordAuthMaster
+                        | OriginFault::RecordAuthChild
+                ),
                 "authentication and cancellation retain due debt; settled or deferred work is not immediately due"
             );
+        }
+        if let Some(proof) = &prepared {
+            use crate::state::db::TempFileOwnershipStore;
+            let version = crate::state::VersionSizeKey::from_str(&proof.version).unwrap();
+            assert_eq!(
+                db.get_prepared_publications(PRIMARY, &proof.id, version)
+                    .await
+                    .unwrap(),
+                vec![proof.clone()]
+            );
+            assert_eq!(std::fs::read(proof.temporary.to_path()).unwrap(), MEDIA);
         }
         let conn = db.acquire_lock("verify expiry checkpoint").unwrap();
         let epoch = crate::state::db::sync_epoch::read_library(&conn, PRIMARY)
@@ -927,7 +1096,13 @@ async fn exercise_expiry(fault: OriginFault) {
                 debt,
                 i64::from(
                     deferred
-                        || matches!(fault, OriginFault::AuthLookup | OriginFault::CancelLookup)
+                        || matches!(
+                            fault,
+                            OriginFault::AuthLookup
+                                | OriginFault::CancelLookup
+                                | OriginFault::RecordAuthMaster
+                                | OriginFault::RecordAuthChild
+                        )
                 )
             );
             if confirmed_deletion {
@@ -952,7 +1127,15 @@ async fn exercise_expiry(fault: OriginFault) {
                     .unwrap();
                 assert_eq!(peer_deleted, 0);
             }
-            if deferred || matches!(fault, OriginFault::AuthLookup | OriginFault::CancelLookup) {
+            if deferred
+                || matches!(
+                    fault,
+                    OriginFault::AuthLookup
+                        | OriginFault::CancelLookup
+                        | OriginFault::RecordAuthMaster
+                        | OriginFault::RecordAuthChild
+                )
+            {
                 let deadline: i64 = conn
                     .query_row(
                         "SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1",
@@ -1097,6 +1280,17 @@ async fn exercise_expiry(fault: OriginFault) {
                     &std::fs::metadata(path).unwrap().modified().unwrap(),
                     modified
                 );
+            }
+            if let Some(proof) = &prepared {
+                assert_eq!(std::fs::read(proof.temporary.to_path()).unwrap(), MEDIA);
+                let deleted: i64 = conn
+                    .query_row(
+                        "SELECT is_deleted FROM assets WHERE library=?1 AND id=?2",
+                        rusqlite::params![PRIMARY, proof.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(deleted, 0);
             }
         }
         if let Some((path, bytes, modified)) = &sidecar_snapshot {
