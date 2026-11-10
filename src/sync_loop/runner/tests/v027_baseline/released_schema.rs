@@ -4646,3 +4646,690 @@ async fn released_recovered_36_preserves_initial_history_and_progresses() {
         .scope(true, exercise_released_recovered_36())
         .await;
 }
+fn make_c13_album_app_config() -> crate::config::Config {
+    let data_dir = tempfile::tempdir().unwrap();
+    let globals = crate::config::GlobalArgs {
+        username: Some("baseline@example.invalid".to_string()),
+        domain: None,
+        data_dir: Some(data_dir.path().to_string_lossy().into_owned()),
+    };
+    let mut sync = crate::cli::SyncArgs::default();
+    sync.config_overrides.albums = vec!["Synthetic Album".to_string()];
+    sync.config_overrides.libraries = vec!["primary".to_string()];
+    sync.config_overrides.unfiled = Some(false);
+    crate::config::Config::build(&globals, &crate::cli::PasswordArgs::default(), sync, None)
+        .unwrap()
+}
+
+#[derive(Clone)]
+struct C13AlbumSession {
+    zone: &'static str,
+    album_record: &'static str,
+    album_name: String,
+    inventory: Arc<Vec<serde_json::Value>>,
+    delta: Arc<Vec<serde_json::Value>>,
+    cycle: usize,
+    pages: usize,
+    pages_served: Arc<AtomicUsize>,
+    records_served: Arc<AtomicUsize>,
+    requested: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+async fn c13_relation_page(session: &C13AlbumSession, page: usize) -> serde_json::Value {
+    let records: Vec<_> = (0..3)
+        .map(|index| {
+            json!({
+                "recordName": format!("c13-relation-{page}-{index}"),
+                "recordType": "CPLContainerRelation",
+                "fields": {
+                    "containerId": {"value": session.album_record},
+                    "itemId": {"value": if index == 0 { "asset-delta-master" } else { "delta-master" }}
+                }
+            })
+        })
+        .collect();
+    session
+        .records_served
+        .fetch_add(records.len(), std::sync::atomic::Ordering::SeqCst);
+    json!({"zones":[{"zoneID":{"zoneName":session.zone,"ownerRecordName":"_defaultOwner"},
+        "records":records,
+        "syncToken":format!("c13-hydration-{}", page + 1),
+        "moreComing": page + 1 < session.pages}]})
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for C13AlbumSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        let request: serde_json::Value = serde_json::from_str(&body)?;
+        if url.contains("/zones/list") {
+            return Ok(
+                json!({"zones":[{"zoneID":{"zoneName":self.zone,"ownerRecordName":"_defaultOwner"},
+                "syncToken":"c13-boundary","deleted":false}]}),
+            );
+        }
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(json!({"records":[{"recordName":"index",
+                "recordType":"CheckIndexingState",
+                "fields":{"state":{"value":"FINISHED"}}}]}));
+        }
+        if request["query"]["recordType"] == "CPLAlbumByPositionLive" {
+            return Ok(json!({"records":[{"recordName":self.album_record,
+                "recordType":"CPLAlbum",
+                "fields":{"albumNameEnc":{"value":base64::engine::general_purpose::STANDARD.encode(self.album_name.as_bytes())}}}]}));
+        }
+        if url.contains("/internal/records/query/batch") {
+            let total = self.inventory.len() as u64 / 2;
+            let batch = request["batch"].as_array().cloned().unwrap_or_default();
+            let counts: Vec<_> = batch
+                .iter()
+                .map(|_| json!({"records":[{"fields":{"itemCount":{"value":total}}}]}))
+                .collect();
+            return Ok(json!({"batch": counts}));
+        }
+        if url.contains("/records/query?") {
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                .unwrap_or(0);
+            let records = if offset == 0 {
+                self.inventory.as_ref().clone()
+            } else {
+                Vec::new()
+            };
+            return Ok(json!({"records":records,"syncToken":"c13-query-token"}));
+        }
+        if url.contains("/records/lookup?") {
+            let requested = request["records"].as_array().cloned().unwrap_or_default();
+            let names: Vec<_> = requested
+                .iter()
+                .map(|query| query["recordName"].clone())
+                .collect();
+            let records: Vec<_> = self
+                .inventory
+                .iter()
+                .chain(self.delta.iter())
+                .filter(|record| {
+                    requested
+                        .iter()
+                        .any(|query| query["recordName"] == record["recordName"])
+                })
+                .cloned()
+                .collect();
+            if self.cycle == 1
+                && names.iter().any(|name| {
+                    name.as_str() == Some("asset-delta-master")
+                        || name.as_str() == Some("delta-master")
+                })
+            {
+                self.requested.notify_one();
+                self.release.notified().await;
+            }
+            return Ok(json!({"records":records}));
+        }
+        if url.contains("/changes/zone?") {
+            if self.cycle == 0 {
+                return Ok(
+                    json!({"zones":[{"zoneID":{"zoneName":self.zone,"ownerRecordName":"_defaultOwner"},
+                    "records":[],
+                    "syncToken":"c13-after-0",
+                    "moreComing":false}]}),
+                );
+            }
+            if self.cycle == 1 {
+                let page = self.pages_served.load(std::sync::atomic::Ordering::SeqCst);
+                if page < self.pages {
+                    self.pages_served
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(c13_relation_page(self, page).await);
+                }
+                return Ok(
+                    json!({"zones":[{"zoneID":{"zoneName":self.zone,"ownerRecordName":"_defaultOwner"},
+                    "records":[],
+                    "syncToken":"c13-after-1",
+                    "moreComing":false}]}),
+                );
+            }
+            let records = if self.cycle == 2 {
+                self.delta.as_ref().clone()
+            } else {
+                Vec::new()
+            };
+            return Ok(
+                json!({"zones":[{"zoneID":{"zoneName":self.zone,"ownerRecordName":"_defaultOwner"},
+                "records":records,
+                "syncToken":format!("c13-after-{}", self.cycle),
+                "moreComing":false}]}),
+            );
+        }
+        anyhow::bail!("unexpected C13 endpoint: {url}")
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+/// C13 genuine-entry relation wait/cancel and normal replay.
+pub(in crate::sync_loop::runner::tests) async fn exercise_released_relation_cancel() {
+    use std::time::Duration;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    let protected = root.join("protected");
+    std::fs::create_dir_all(&protected).unwrap();
+    let old_path = protected.join("old.JPG");
+    let old_sidecar = protected.join("old.JPG.xmp");
+    let old_bytes = MEDIA.to_vec();
+    std::fs::write(&old_path, &old_bytes).unwrap();
+    std::fs::write(&old_sidecar, b"protected C13 sidecar").unwrap();
+    let old_mtime = (
+        std::fs::metadata(&old_path).unwrap().modified().unwrap(),
+        std::fs::metadata(&old_sidecar).unwrap().modified().unwrap(),
+    );
+
+    let source = dir.path().join("released.db");
+    let db_path = dir.path().join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        crate::state::schema::migrate_genuine_v28(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            28,
+            "initial genuine released schema"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key LIKE 'sync_token%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "no seeded current or legacy cursor"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key='sync_epoch:v1' OR key LIKE 'sync_epoch_library:v1:%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "no seeded completed epoch"
+        );
+        let receipts_table: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='download_receipts')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if receipts_table {
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM download_receipts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0,
+                "no seeded current receipts"
+            );
+        }
+        insert_released_asset(
+            &conn,
+            "PrimarySync",
+            "old-primary-master",
+            "original",
+            "old.JPG",
+            &old_path,
+            &old_bytes,
+            &signature(&old_bytes),
+            true,
+        );
+        conn.execute_batch(
+            "INSERT INTO asset_master_mappings VALUES ('PrimarySync','old-primary-child','old-primary-master',1700000000);
+             INSERT INTO asset_metadata_capture_revisions VALUES ('PrimarySync','old-primary-master',1,1700000000);
+             INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at,last_outcome)
+               VALUES('PrimarySync','old-ambiguous','[1,\"old-child\",\"SharedSync-absent\",\"owner\"]','[1,\"old-child\",\"SharedSync-absent\",\"owner\"]',7,1000,'[malformed');",
+        )
+        .unwrap();
+    }
+    let columns = released_columns(&source);
+    let legacy_rows = released_rows(&source, &columns);
+    crate::state::db::account::adopt_legacy(
+        &source,
+        &db_path,
+        &baseline_owner(),
+        "baseline@example.invalid",
+        "com",
+    )
+    .await
+    .unwrap();
+    assert_eq!(released_rows(&db_path, &columns), legacy_rows);
+
+    let protected_snapshot = || {
+        rows(
+            &db_path,
+            "SELECT * FROM assets WHERE library='PrimarySync' AND id='old-primary-master' ORDER BY version_size",
+        )
+        .into_iter()
+        .chain(rows(
+            &db_path,
+            "SELECT * FROM asset_metadata_paths WHERE library='PrimarySync' AND id='old-primary-master' ORDER BY version_size",
+        ))
+        .chain(rows(
+            &db_path,
+            "SELECT * FROM asset_master_mappings WHERE library='PrimarySync' AND asset_record_name='old-primary-child'",
+        ))
+        .chain(rows(
+            &db_path,
+            "SELECT * FROM asset_metadata_capture_revisions WHERE library='PrimarySync' AND asset_id='old-primary-master'",
+        ))
+        .chain(rows(
+            &db_path,
+            "SELECT * FROM unresolved_sparse_identities WHERE library='PrimarySync' ORDER BY source_record_name",
+        ))
+        .collect::<Vec<_>>()
+    };
+    let protected_before = protected_snapshot();
+
+    let server = crate::test_helpers::start_wiremock_or_skip("released C13 relation")
+        .await
+        .expect("acceptance server must bind");
+    for (endpoint, expected) in [("/album-current", 1), ("/delta-current", 1)] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(MEDIA)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(expected)
+            .mount(&server)
+            .await;
+    }
+    let checksum = signature(MEDIA);
+    let mut current = pair(
+        "album-master",
+        "album.JPG",
+        &format!("{}/album-current", server.uri()),
+        41,
+    );
+    current[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    current[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+    let mut delta = pair(
+        "delta-master",
+        "delta.JPG",
+        &format!("{}/delta-current", server.uri()),
+        42,
+    );
+    delta[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    delta[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+    for record in [&mut current, &mut delta] {
+        record[1]["fields"]["masterRef"]["value"]["zoneID"] =
+            json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+    }
+
+    let app_config = make_c13_album_app_config();
+    let selection = &app_config.filters.selection;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let requested = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let pages_served = Arc::new(AtomicUsize::new(0));
+    let records_served = Arc::new(AtomicUsize::new(0));
+    let pages = 2;
+    let token_key = sync_token_key("PrimarySync");
+
+    let make_library = |cycle: usize| {
+        let session = C13AlbumSession {
+            zone: "PrimarySync",
+            album_record: "album-c13",
+            album_name: "Synthetic Album".to_string(),
+            inventory: Arc::new(current.clone()),
+            delta: Arc::new(delta.clone()),
+            cycle,
+            pages,
+            pages_served: Arc::clone(&pages_served),
+            records_served: Arc::clone(&records_served),
+            requested: Arc::clone(&requested),
+            release: Arc::clone(&release),
+        };
+        async move {
+            PhotoLibrary::new(
+                "https://synthetic.example/database/1/photos/production/private".to_string(),
+                Arc::new(std::collections::HashMap::new()),
+                Box::new(session),
+                Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+                "private".into(),
+                crate::retry::RetryConfig::default(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Cycle 0: ordinary first baseline through the real album resolver.
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let library = make_library(0).await;
+    let mut library = library;
+    library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db.clone(),
+        baseline_owner(),
+        "com",
+    ));
+    let selected_zones = crate::commands::zone_name_set(std::slice::from_ref(&library));
+    let collection_zones = selected_zones.clone();
+    let scope = crate::commands::pass_scope_for_zone(
+        selection,
+        "PrimarySync",
+        &selected_zones,
+        &collection_zones,
+    );
+    assert!(scope.include_albums);
+    assert!(!scope.include_unfiled);
+    let context =
+        crate::commands::build_collection_context(selection, std::slice::from_ref(&library))
+            .await
+            .unwrap();
+    let plan = crate::commands::resolve_passes_for_scope(&library, selection, scope, &context, &[])
+        .await
+        .unwrap();
+    assert_eq!(plan.passes.len(), 1, "single selected album");
+    assert_eq!(plan.passes[0].kind, PassKind::Album);
+    assert_eq!(plan.passes[0].album.name.as_ref(), "Synthetic Album");
+    assert_eq!(
+        plan.passes[0].album.container_id(),
+        Some("album-c13"),
+        "relation routing uses the CloudKit folder record id"
+    );
+    let mut selected =
+        make_run_cycle_library_state_with_passes("PrimarySync", &token_key, plan.passes.clone());
+    selected.library = library;
+    let base = make_run_cycle_download_config_builder(&root, db.clone());
+    let builder = |mode, exclude, groups, zone| {
+        let mut config = (*base(mode, exclude, groups, zone)).clone();
+        config.folder_structure = "none".into();
+        Arc::new(config)
+    };
+    let result = run_cycle(
+        &[&selected],
+        &app_config,
+        Some(db.as_ref()),
+        false,
+        &builder,
+        download::DownloadControls::download_hidden(),
+        &shared,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.failed_count, 0, "{result:?}");
+    assert!(result.db_sync_token_advance_safe, "{result:?}");
+    let prior_token = db.get_metadata(&token_key).await.unwrap();
+    assert!(prior_token.is_some(), "baseline token");
+    let prior_config = db.get_metadata("config_hash").await.unwrap();
+    assert!(prior_config.is_some(), "baseline config hash");
+    assert_eq!(
+        std::fs::read(&old_path).unwrap(),
+        old_bytes,
+        "protected bytes"
+    );
+    assert_eq!(protected_snapshot(), protected_before);
+
+    // Cycle 1: later delta enters the paginated album relation scan and waits.
+    let library = make_library(1).await;
+    let mut library = library;
+    library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db.clone(),
+        baseline_owner(),
+        "com",
+    ));
+    let cycle_selected_zones = crate::commands::zone_name_set(std::slice::from_ref(&library));
+    let cycle_collection_zones = cycle_selected_zones.clone();
+    let cycle_scope = crate::commands::pass_scope_for_zone(
+        selection,
+        "PrimarySync",
+        &cycle_selected_zones,
+        &cycle_collection_zones,
+    );
+    let cycle_context =
+        crate::commands::build_collection_context(selection, std::slice::from_ref(&library))
+            .await
+            .unwrap();
+    let cycle_plan = crate::commands::resolve_passes_for_scope(
+        &library,
+        selection,
+        cycle_scope,
+        &cycle_context,
+        &[],
+    )
+    .await
+    .unwrap();
+    let mut selected =
+        make_run_cycle_library_state_with_passes("PrimarySync", &token_key, cycle_plan.passes);
+    selected.library = library;
+    let base = make_run_cycle_download_config_builder(&root, db.clone());
+    let builder = |mode, exclude, groups, zone| {
+        let mut config = (*base(mode, exclude, groups, zone)).clone();
+        config.folder_structure = "none".into();
+        Arc::new(config)
+    };
+    let (layer, diagnostics) = crate::support::test_capture::test_layer();
+    let _default = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+    let _worker_callsite_registration = tracing::Dispatch::new(tracing_subscriber::registry());
+    let cancel = CancellationToken::new();
+    let states = [&selected];
+    let mut cycle = Box::pin(run_cycle(
+        &states,
+        &app_config,
+        Some(db.as_ref()),
+        false,
+        &builder,
+        download::DownloadControls::download_hidden(),
+        &shared,
+        &cancel,
+    ));
+    tokio::select! {
+        () = requested.notified() => {}
+        result = cycle.as_mut() => panic!("relation gate was not reached: {result:?}"),
+        () = tokio::time::sleep(Duration::from_secs(5)) => {
+            release.notify_one();
+            panic!("relation gate was not reached within the fixture bound");
+        }
+    }
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(5), cycle.as_mut()).await;
+    let drained = result.is_ok();
+    release.notify_one();
+    let result = match result {
+        Ok(result) => result,
+        Err(_) => tokio::time::timeout(Duration::from_secs(5), cycle.as_mut())
+            .await
+            .expect("released relation scan must finish"),
+    }
+    .expect("cancelled relation cycle returns its checkpoint hold");
+    assert!(drained, "cancel must drain cooperatively");
+    assert!(result.stats.interrupted);
+    assert!(!result.db_sync_token_advance_safe);
+    assert_eq!(
+        db.get_metadata(&token_key).await.unwrap(),
+        prior_token,
+        "prior current token preserved"
+    );
+    assert_eq!(
+        db.get_metadata("config_hash").await.unwrap(),
+        prior_config,
+        "prior current config preserved"
+    );
+    assert_eq!(
+        pages_served.load(std::sync::atomic::Ordering::SeqCst),
+        pages
+    );
+    assert_eq!(
+        records_served.load(std::sync::atomic::Ordering::SeqCst),
+        pages * 3,
+        "bounded relation records observed during the wait"
+    );
+    let observations = diagnostics();
+    assert!(
+        observations.iter().any(|event| {
+            event["kind"] == "support_hydration_wait_v1"
+                && event["fields"]["phase"] == "album_relation"
+                && event["fields"]["outcome"] == "cancelled"
+        }),
+        "observable album_relation phase cancellation: {observations:?}"
+    );
+    let encoded = serde_json::to_string(&observations).unwrap();
+    for private in [
+        "album-c13",
+        "Synthetic Album",
+        "asset-delta-master",
+        "example.invalid",
+    ] {
+        assert!(!encoded.contains(private), "anonymous progress only");
+    }
+    assert_eq!(protected_snapshot(), protected_before);
+    assert_eq!(std::fs::read(&old_path).unwrap(), old_bytes);
+    assert_eq!(
+        std::fs::read(&old_sidecar).unwrap(),
+        b"protected C13 sidecar"
+    );
+    assert_eq!(
+        (
+            std::fs::metadata(&old_path).unwrap().modified().unwrap(),
+            std::fs::metadata(&old_sidecar).unwrap().modified().unwrap(),
+        ),
+        old_mtime
+    );
+    drop(cycle);
+    drop(selected);
+    drop(db);
+
+    // Reopen: valid response, current same-library item and fresh proof.
+    let mut receipts_after_recovery: Option<Vec<Vec<rusqlite::types::Value>>> = None;
+    for cycle in 2..5 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        let library = make_library(cycle).await;
+        let mut library = library;
+        library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+            db.clone(),
+            baseline_owner(),
+            "com",
+        ));
+        let selected_zones = crate::commands::zone_name_set(std::slice::from_ref(&library));
+        let collection_zones = selected_zones.clone();
+        let scope = crate::commands::pass_scope_for_zone(
+            selection,
+            "PrimarySync",
+            &selected_zones,
+            &collection_zones,
+        );
+        let context =
+            crate::commands::build_collection_context(selection, std::slice::from_ref(&library))
+                .await
+                .unwrap();
+        let cycle_plan =
+            crate::commands::resolve_passes_for_scope(&library, selection, scope, &context, &[])
+                .await
+                .unwrap();
+        let mut selected =
+            make_run_cycle_library_state_with_passes("PrimarySync", &token_key, cycle_plan.passes);
+        selected.library = library;
+        let base = make_run_cycle_download_config_builder(&root, db.clone());
+        let builder = |mode, exclude, groups, zone| {
+            let mut config = (*base(mode, exclude, groups, zone)).clone();
+            config.folder_structure = "none".into();
+            Arc::new(config)
+        };
+        let result = run_cycle(
+            &[&selected],
+            &app_config,
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
+        assert!(result.db_sync_token_advance_safe, "cycle {cycle}");
+        if cycle == 2 {
+            assert_eq!(result.stats.downloaded, 1, "delta media once");
+            let completed = db.get_downloaded_page(0, 100).await.unwrap();
+            let row = completed
+                .iter()
+                .find(|row| row.id.as_ref() == "asset-delta-master")
+                .expect("delta current media");
+            assert_eq!(
+                std::fs::read(row.local_path.as_ref().unwrap()).unwrap(),
+                MEDIA
+            );
+            let observation: i64 = db
+                .acquire_lock("fresh proof")
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM metadata WHERE key LIKE 'observed_selection:v27:%PrimarySync'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(observation, 1, "fresh current observation proof");
+            receipts_after_recovery = Some(rows(
+                &db_path,
+                "SELECT * FROM download_receipts ORDER BY id",
+            ));
+        } else {
+            assert_eq!(result.stats.downloaded, 0, "cycle {cycle}: quiet");
+            assert_eq!(
+                rows(&db_path, "SELECT * FROM download_receipts ORDER BY id"),
+                receipts_after_recovery.clone().unwrap(),
+                "cycle {cycle}: no receipt churn"
+            );
+        }
+        assert_eq!(protected_snapshot(), protected_before);
+        assert_eq!(std::fs::read(&old_path).unwrap(), old_bytes);
+    }
+    let requests = server.received_requests().await.unwrap();
+    let count = |path: &str| {
+        requests
+            .iter()
+            .filter(|request| request.method.as_str() == "GET" && request.url.path() == path)
+            .count()
+    };
+    assert_eq!(count("/album-current"), 1);
+    assert_eq!(count("/delta-current"), 1);
+    server.verify().await;
+    eprintln!(
+        "RELEASED_C13_REACHED pages={} records={} protected_rows={}",
+        pages_served.load(std::sync::atomic::Ordering::SeqCst),
+        records_served.load(std::sync::atomic::Ordering::SeqCst),
+        protected_snapshot().len()
+    );
+}
+
+#[tokio::test]
+async fn released_relation_cancel_and_normal_replay_28() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(true, Box::pin(exercise_released_relation_cancel()))
+        .await;
+}
