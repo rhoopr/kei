@@ -6271,6 +6271,41 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
         incomplete && frozen,
         "advancing verified media must retain requested metadata debt"
     );
+    let frozen_snapshot: (String, String, Option<String>) = f.db
+        .acquire_lock("snapshot frozen retry owner").unwrap().query_row(
+            "SELECT hex(frozen_metadata),frozen_metadata_hash,prepared_hash FROM provider_active_destinations WHERE child='asset-m' AND verified_media=1 AND verified_metadata=0 AND frozen_metadata IS NOT NULL LIMIT 1",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+    let frozen_passes = [destination_pass(&f, "A"), destination_pass(&f, "B")];
+    let selection = crate::selection::Selection {
+        albums: crate::selection::AlbumSelector::Named {
+            included: ["A".to_owned(), "B".to_owned()].into_iter().collect(),
+            excluded: Default::default(),
+        },
+        unfiled: false,
+        ..Default::default()
+    };
+    let lookup_before = f.session.calls.load(Ordering::SeqCst);
+    let gets_before = server.received_requests().await.unwrap().len();
+    assert!(
+        crate::download::replay_due_admitted_selection(
+            &reqwest::Client::new(),
+            &frozen_passes,
+            Some(&selection),
+            None,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), gets_before);
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), lookup_before);
+    assert_eq!(f.db.acquire_lock("frozen retry preserves proof").unwrap().query_row::<(String,String,Option<String>),_,_>(
+        "SELECT hex(frozen_metadata),frozen_metadata_hash,prepared_hash FROM provider_active_destinations WHERE child='asset-m' AND verified_media=1 AND verified_metadata=0 AND frozen_metadata IS NOT NULL LIMIT 1",
+        [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap(), frozen_snapshot);
     std::fs::remove_dir(&sidecar).unwrap();
     f.db.make_selection_retry_due(owner(), "asset-m".into())
         .await
@@ -10062,6 +10097,436 @@ async fn scoped_album_removal_explicit_refresh_preserves_owned_media() {
 #[tokio::test]
 async fn scoped_album_removal_explicit_embedded_refresh_preserves_capture_mtime() {
     Box::pin(scoped_membership_refresh_fixture(true)).await;
+}
+
+async fn admit_exact_retry_fixture(
+    f: &Fixture,
+    pass: &AlbumPass,
+    root: &crate::state::db::provider_generations::ActiveGeneration,
+    config: &super::DownloadConfig,
+) -> (String, std::path::PathBuf) {
+    use crate::state::db::provider_generations::{ActiveDecision, MAX_GENERATION_BYTES};
+    use crate::state::db::provider_selection::{SelectionDecision, SelectionDestination};
+    let key = crate::download::orchestration::generation::pass_key(pass);
+    let current = pass.album.confirm_catalog_asset("asset-m").await.unwrap();
+    let effective = config.with_pass(pass);
+    let mut planner = TaskPlanner::for_download(effective.state_db.as_deref())
+        .await
+        .unwrap();
+    let plan = planner
+        .plan_download_asset(&current.asset, &effective)
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    let path = plan.tasks[0].download_path.clone();
+    let records = plan
+        .tasks
+        .iter()
+        .map(|task| pending_record_for_task(&effective, &current.asset, task))
+        .collect();
+    let destinations = crate::download::filter::derive_expected_paths(&current.asset, &effective)
+        .into_iter()
+        .map(|expected| SelectionDestination {
+            version_size: expected.version_size.as_str().into(),
+            path: SelectionPath::from_path(&std::path::absolute(expected.path).unwrap()),
+            checksum: expected.checksum.into(),
+            size: expected.size,
+            metadata_hash: crate::download::filter::metadata_for_selected_version(
+                &current.asset,
+                &effective,
+                expected.version_size,
+            )
+            .metadata_hash
+            .clone()
+            .unwrap(),
+        })
+        .collect();
+    let sources = if root.spec.format == 1 {
+        f.db.selection_rank_sources(owner(), root.id.clone(), key.clone(), "asset-m".into())
+            .await
+            .unwrap()
+    } else {
+        Vec::new()
+    };
+    assert!(root.spec.format != 1 || !sources.is_empty());
+    let manifest = ActiveDecision {
+        state_id: "asset-m".into(),
+        sources,
+        decision: SelectionDecision {
+            pass_key: key.clone(),
+            child: "asset-m".into(),
+            master: Some("m".into()),
+            confirmation: Some(current.body),
+            outcome: SelectionOutcome::Selected,
+            reason: String::new(),
+            destinations,
+        },
+    };
+    assert!(
+        f.db.project_selection_decision(
+            owner(),
+            root.id.clone(),
+            manifest,
+            records,
+            MAX_GENERATION_BYTES
+        )
+        .await
+        .unwrap()
+        .admitted
+    );
+    (key, path)
+}
+
+#[tokio::test]
+async fn current_named_due_retry_without_fresh_relation_refuses_media() {
+    use crate::download::orchestration::generation::{
+        context_for_format, replay_due_admitted_selection,
+    };
+    let mut f = Fixture::new().await;
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_bytes(b"selected media".as_slice()),
+        )
+        .mount(&server)
+        .await;
+    *f.session.records.lock().unwrap() =
+        eligible_records("m", &format!("{}/selected", server.uri()));
+    f.pass = destination_pass(&f, "A");
+    let passes = std::slice::from_ref(&f.pass);
+    let context = context_for_format(passes, &f.config, controls(), 2)
+        .await
+        .unwrap()
+        .unwrap();
+    let run = context.start_for_test(passes, &f.config).await.unwrap();
+    let (key, path) = admit_exact_retry_fixture(&f, &f.pass, &run.root, &f.config).await;
+    let before =
+        f.db.selection_retry_identity(owner(), run.root.id.clone(), key.clone(), "asset-m".into())
+            .await
+            .unwrap()
+            .unwrap();
+    let before_lookup = f.session.calls.load(Ordering::SeqCst);
+    let selection = crate::selection::Selection {
+        albums: crate::selection::AlbumSelector::Named {
+            included: ["A".to_owned()].into_iter().collect(),
+            excluded: Default::default(),
+        },
+        unfiled: false,
+        ..Default::default()
+    };
+    let result = replay_due_admitted_selection(
+        &reqwest::Client::new(),
+        passes,
+        Some(&selection),
+        None,
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(result.is_none());
+    assert_eq!(server.received_requests().await.unwrap().len(), 0);
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), before_lookup);
+    assert!(!path.exists());
+    let after =
+        f.db.selection_retry_identity(owner(), run.root.id.clone(), key, "asset-m".into())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(before.admission_hash, after.admission_hash);
+    assert_eq!(before.manifest_hash, after.manifest_hash);
+    let mut changed_pass = f.pass.clone();
+    changed_pass.exclude_ids = Arc::new(["asset-m".to_owned()].into_iter().collect());
+    assert!(
+        replay_due_admitted_selection(
+            &reqwest::Client::new(),
+            std::slice::from_ref(&changed_pass),
+            Some(&selection),
+            None,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), before_lookup);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn current_unfiled_retry_holds_when_named_dedup_is_unresolved() {
+    use crate::download::orchestration::generation::{
+        context_for_format, replay_due_admitted_selection,
+    };
+    let f = Fixture::new().await;
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_bytes(b"selected media".as_slice()),
+        )
+        .mount(&server)
+        .await;
+    *f.session.records.lock().unwrap() =
+        eligible_records("m", &format!("{}/unfiled", server.uri()));
+    let passes = [destination_pass(&f, "A"), f.pass.clone()];
+    let context = context_for_format(&passes, &f.config, controls(), 2)
+        .await
+        .unwrap()
+        .unwrap();
+    let run = context.start_for_test(&passes, &f.config).await.unwrap();
+    let (key, path) = admit_exact_retry_fixture(&f, &passes[1], &run.root, &f.config).await;
+    let before =
+        f.db.selection_retry_identity(owner(), run.root.id.clone(), key.clone(), "asset-m".into())
+            .await
+            .unwrap()
+            .unwrap();
+    let lookup_before = f.session.calls.load(Ordering::SeqCst);
+    let selection = crate::selection::Selection {
+        albums: crate::selection::AlbumSelector::Named {
+            included: ["A".to_owned()].into_iter().collect(),
+            excluded: Default::default(),
+        },
+        unfiled: true,
+        ..Default::default()
+    };
+    assert!(
+        replay_due_admitted_selection(
+            &reqwest::Client::new(),
+            &passes,
+            Some(&selection),
+            None,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), lookup_before);
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(!path.exists());
+    let after =
+        f.db.selection_retry_identity(owner(), run.root.id.clone(), key, "asset-m".into())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(before.admission_hash, after.admission_hash);
+    assert_eq!(before.manifest_hash, after.manifest_hash);
+    let local_unfiled = std::slice::from_ref(&passes[1]);
+    let other_named = std::slice::from_ref(&passes[0]);
+    let all_plans = [local_unfiled, other_named];
+    assert!(
+        replay_due_admitted_selection(
+            &reqwest::Client::new(),
+            local_unfiled,
+            Some(&selection),
+            None,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        replay_due_admitted_selection(
+            &reqwest::Client::new(),
+            local_unfiled,
+            Some(&selection),
+            Some(&all_plans),
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), lookup_before);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn old_format_due_retry_uses_current_derived_policy_and_original_destination() {
+    use crate::download::orchestration::generation::{
+        context_for_format, replay_due_admitted_selection,
+    };
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let mut f = Fixture::new().await;
+    let server = wiremock::MockServer::start().await;
+    let media = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(media.as_slice()))
+        .mount(&server)
+        .await;
+    let mut records = eligible_records("m", &format!("{}/legacy", server.uri()));
+    records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+        json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(media)));
+    records[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(media.len());
+    *f.session.records.lock().unwrap() = records;
+    let mut album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: Arc::from("https://example.invalid"),
+            name: Arc::from(""),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(
+                json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}),
+            ),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(DestinationSelectionSession(f.session.clone())),
+    );
+    album.set_shadow_capture(f.capture.clone(), Arc::from("private"));
+    f.pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let globals = crate::config::GlobalArgs {
+        username: Some("synthetic@example.invalid".into()),
+        domain: None,
+        data_dir: Some(f.dir.path().to_string_lossy().into_owned()),
+    };
+    let app = crate::config::Config::build(
+        &globals,
+        &crate::cli::PasswordArgs::default(),
+        crate::cli::SyncArgs::default(),
+        None,
+    )
+    .unwrap();
+    let hashes = [
+        crate::download::compute_config_hash_for_unfiled(&app, false),
+        crate::download::compute_config_hash_for_unfiled(&app, true),
+    ];
+    assert_ne!(hashes[0], hashes[1]);
+    let mut old = f.config.clone();
+    old.enum_config_hash = Some(hashes[1].clone().into());
+    old.legacy_enum_hashes = Some([hashes[0].clone().into(), hashes[1].clone().into()]);
+    let passes = std::slice::from_ref(&f.pass);
+    let old_context = context_for_format(passes, &old, controls(), 1)
+        .await
+        .unwrap()
+        .unwrap();
+    let run = old_context.start_for_test(passes, &old).await.unwrap();
+    assert_eq!(run.root.spec.format, 1);
+    let key = crate::download::orchestration::generation::pass_key(&f.pass);
+    let ranked = f.pass.album.clone().with_rank_capture(&run.root.id, &key);
+    assert_eq!(ranked.photos(None).await.unwrap().len(), 1);
+    let (_, path) = admit_exact_retry_fixture(&f, &f.pass, &run.root, &old).await;
+    let mut current = old.clone();
+    current.enum_config_hash = Some(hashes[0].clone().into());
+    let current_context = context_for_format(passes, &current, controls(), 2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        run.root.spec.config_hash,
+        current_context.spec(&current, "unused".into()).config_hash
+    );
+    let selection = crate::selection::Selection {
+        albums: crate::selection::AlbumSelector::None,
+        ..Default::default()
+    };
+    let mut drift = current.clone();
+    drift.folder_structure = "different-policy".into();
+    assert!(
+        replay_due_admitted_selection(
+            &reqwest::Client::new(),
+            passes,
+            Some(&selection),
+            None,
+            Arc::new(drift),
+            controls(),
+            CancellationToken::new()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 0);
+    let before =
+        f.db.selection_retry_identity(owner(), run.root.id.clone(), key.clone(), "asset-m".into())
+            .await
+            .unwrap()
+            .unwrap();
+    let mut changed_pass = f.pass.clone();
+    changed_pass.exclude_ids = Arc::new(["asset-m".to_owned()].into_iter().collect());
+    assert!(
+        replay_due_admitted_selection(
+            &reqwest::Client::new(),
+            std::slice::from_ref(&changed_pass),
+            Some(&selection),
+            None,
+            Arc::new(current.clone()),
+            controls(),
+            CancellationToken::new()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let mut wrong_source = current.clone();
+    wrong_source.library = Arc::from("other-source");
+    assert!(
+        replay_due_admitted_selection(
+            &reqwest::Client::new(),
+            passes,
+            Some(&selection),
+            None,
+            Arc::new(wrong_source),
+            controls(),
+            CancellationToken::new()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let unchanged =
+        f.db.selection_retry_identity(owner(), run.root.id.clone(), key, "asset-m".into())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(before.admission_hash, unchanged.admission_hash);
+    assert_eq!(before.manifest_hash, unchanged.manifest_hash);
+    let result = replay_due_admitted_selection(
+        &reqwest::Client::new(),
+        passes,
+        Some(&selection),
+        None,
+        Arc::new(current),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .expect("valid historical root must retry");
+    assert_eq!(result.stats.downloaded, 1);
+    assert!(result.sync_token.is_none());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(std::fs::read(path).unwrap(), media);
+    assert_eq!(
+        f.db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("old-cursor")
+    );
+    eprintln!(
+        "OLD_FORMAT_RETRY format=1 current_hash_distinct=1 drift_get=0 valid_get=1 original_destination=1"
+    );
 }
 
 #[tokio::test]

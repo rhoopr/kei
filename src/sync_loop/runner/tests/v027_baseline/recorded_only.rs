@@ -3,6 +3,13 @@ use crate::icloud::photos::PhotoLibrary;
 use crate::state::SqliteStateDb;
 use serde_json::json;
 
+fn resolved_unfiled_only() -> crate::selection::Selection {
+    crate::selection::Selection {
+        albums: crate::selection::AlbumSelector::None,
+        ..crate::selection::Selection::default()
+    }
+}
+
 tokio::task_local! { static ENABLED: bool; }
 
 pub(super) fn enabled() -> bool {
@@ -936,6 +943,7 @@ async fn stock36_media_failure_backoff_and_window_fences() {
             identity.generation.clone(),
             Some("wrong-cursor".to_owned()),
             (due.pass_key.clone(), due.child.clone()),
+            0,
         )
         .await
         .unwrap(),
@@ -947,6 +955,7 @@ async fn stock36_media_failure_backoff_and_window_fences() {
             identity.generation.clone(),
             window.cursor.clone(),
             (due.pass_key.clone(), due.child.clone()),
+            0,
         )
         .await
         .unwrap()
@@ -1670,15 +1679,18 @@ async fn retained_root_window_is_unique_and_rotates() {
     let roots = db
         .retained_selection_roots(
             baseline_owner(),
-            spec.scope.clone(),
-            spec.config_hash.clone(),
-            root1.id.clone(),
-            Some(profile.clone()),
+            vec![crate::state::db::provider_generations::RetryRootSource {
+                scope: spec.scope.clone(),
+                config_hash: spec.config_hash.clone(),
+                excluded: root1.id.clone(),
+                profile: Some(profile.clone()),
+                legacy_hashes: Vec::new(),
+            }],
             7,
         )
         .await
         .unwrap();
-    let ids: Vec<_> = roots.iter().map(|root| root.id.clone()).collect();
+    let ids: Vec<_> = roots.iter().map(|(_, root, _)| root.id.clone()).collect();
     assert_eq!(ids, vec![root2.id.clone(), root3.id.clone()]);
     assert_eq!(
         ids.len(),
@@ -1687,15 +1699,18 @@ async fn retained_root_window_is_unique_and_rotates() {
     let rotated = db
         .retained_selection_roots(
             baseline_owner(),
-            spec.scope,
-            spec.config_hash,
-            root2.id.clone(),
-            Some(profile),
+            vec![crate::state::db::provider_generations::RetryRootSource {
+                scope: spec.scope,
+                config_hash: spec.config_hash,
+                excluded: root2.id.clone(),
+                profile: Some(profile),
+                legacy_hashes: Vec::new(),
+            }],
             7,
         )
         .await
         .unwrap();
-    let rotated_ids: Vec<_> = rotated.iter().map(|root| root.id.clone()).collect();
+    let rotated_ids: Vec<_> = rotated.iter().map(|(_, root, _)| root.id.clone()).collect();
     assert_eq!(rotated_ids, vec![root1.id.clone(), root3.id.clone()]);
     assert!(!rotated_ids.contains(&root2.id));
 }
@@ -1873,6 +1888,8 @@ async fn retry_function_preserves_auth_and_cancellation_without_ack_or_backoff()
     let auth = crate::download::replay_due_admitted_selection(
         &client,
         &passes,
+        Some(&resolved_unfiled_only()),
+        None,
         owner_config.clone(),
         controls,
         CancellationToken::new(),
@@ -1901,6 +1918,8 @@ async fn retry_function_preserves_auth_and_cancellation_without_ack_or_backoff()
     let quiet = crate::download::replay_due_admitted_selection(
         &client,
         &passes,
+        Some(&resolved_unfiled_only()),
+        None,
         owner_config,
         controls,
         cancelled,
@@ -2434,6 +2453,8 @@ async fn actual_retry_function_bounds_source_and_rotates_three_roots() {
     let first = crate::download::replay_due_admitted_selection(
         &client,
         passes,
+        Some(&resolved_unfiled_only()),
+        None,
         owner_config.clone(),
         controls,
         CancellationToken::new(),
@@ -2476,6 +2497,8 @@ async fn actual_retry_function_bounds_source_and_rotates_three_roots() {
     let historical = crate::download::replay_due_admitted_selection(
         &client,
         passes,
+        Some(&resolved_unfiled_only()),
+        None,
         owner_config.clone(),
         controls,
         CancellationToken::new(),
@@ -2535,6 +2558,8 @@ async fn actual_retry_function_bounds_source_and_rotates_three_roots() {
         let quiet = crate::download::replay_due_admitted_selection(
             &client,
             passes,
+            Some(&resolved_unfiled_only()),
+            None,
             owner_config.clone(),
             controls,
             CancellationToken::new(),
@@ -2560,6 +2585,8 @@ async fn actual_retry_function_bounds_source_and_rotates_three_roots() {
         crate::download::replay_due_admitted_selection(
             &client,
             restored.plan.passes.as_slice(),
+            Some(&resolved_unfiled_only()),
+            None,
             owner_config.clone(),
             controls,
             CancellationToken::new(),
@@ -2592,6 +2619,8 @@ async fn actual_retry_function_bounds_source_and_rotates_three_roots() {
             crate::download::replay_due_admitted_selection(
                 &client,
                 restored.plan.passes.as_slice(),
+                Some(&resolved_unfiled_only()),
+                None,
                 owner_config.clone(),
                 controls,
                 CancellationToken::new(),
@@ -2900,6 +2929,8 @@ async fn actual_pipeline_late_motion_failure_backs_off_failed_rendition_only() {
     let result = crate::download::replay_due_admitted_selection(
         &reqwest::Client::new(),
         &passes,
+        Some(&resolved_unfiled_only()),
+        None,
         owner_config.clone(),
         download::DownloadControls::download_hidden(),
         CancellationToken::new(),
@@ -3004,6 +3035,8 @@ async fn actual_pipeline_late_motion_failure_backs_off_failed_rendition_only() {
     crate::download::replay_due_admitted_selection(
         &reqwest::Client::new(),
         &passes,
+        Some(&resolved_unfiled_only()),
+        None,
         owner_config,
         download::DownloadControls::download_hidden(),
         CancellationToken::new(),
@@ -3201,5 +3234,207 @@ async fn actual_cleanup_recaptures_owner_after_confirmation_changes() {
     assert_eq!(verified, 0);
     eprintln!(
         "REFRESH_RETRY first_gets=1 refreshed_gets=1 confirmation_owner_updates=1 decision_attempts=2"
+    );
+}
+
+#[tokio::test]
+async fn current_due_retry_requires_resolved_unfiled_and_fresh_visibility() {
+    use super::{
+        MEDIA, ZONE, baseline_owner, make_run_cycle_config, make_run_cycle_download_config_builder,
+        make_shared_session_for_run_cycle, seed_existing_upgrade_db,
+    };
+    use crate::download;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use tokio_util::sync::CancellationToken;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let db_path = dir.path().join("state.db");
+    seed_existing_upgrade_db(&db_path);
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .mount(&server)
+        .await;
+    let full_queries = Arc::new(AtomicUsize::new(0));
+    let changes = Arc::new(AtomicUsize::new(0));
+    let seed = stock36_library_state(
+        db.clone(),
+        ZONE,
+        media_pair(
+            ZONE,
+            "seed-vis",
+            "seed.JPG",
+            &format!("{}/seed", server.uri()),
+        ),
+        Arc::clone(&full_queries),
+        Arc::clone(&changes),
+    )
+    .await;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    run_stock36_cycle(&db, &[&seed], &root, &shared, &make_run_cycle_config())
+        .await
+        .unwrap();
+    let (spec, key): (
+        crate::state::db::provider_generations::GenerationSpec,
+        String,
+    ) = {
+        let conn = db.acquire_lock("read current visibility policy").unwrap();
+        let (bytes, key): (Vec<u8>, String) = conn.query_row(
+            "SELECT g.specification,d.pass_key FROM provider_active_generations g JOIN provider_active_decisions d ON d.generation=g.id WHERE d.child='asset-seed-vis'", [],
+            |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        (serde_json::from_slice(&bytes).unwrap(), key)
+    };
+    let generation = db
+        .begin_selection_generation(
+            baseline_owner(),
+            spec,
+            crate::state::db::provider_generations::MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap();
+    const REFUSED: [&str; 9] = [
+        "hidden-vis",
+        "null-vis",
+        "unsupported-hidden",
+        "deleted-master",
+        "deleted-child",
+        "null-master",
+        "bad-deletion",
+        "global-excluded",
+        "resource-drift",
+    ];
+    let mut current = Vec::new();
+    for id in std::iter::once("good-vis").chain(REFUSED) {
+        let pair = media_pair(
+            ZONE,
+            id,
+            &format!("{id}.JPG"),
+            &format!("{}/{id}", server.uri()),
+        );
+        admit_due_media(
+            &db,
+            &generation.id,
+            &key,
+            ZONE,
+            &pair,
+            &root.join(format!("{id}.JPG")),
+            0,
+        )
+        .await;
+        let mut fresh = pair;
+        match id {
+            "hidden-vis" => fresh[1]["fields"]["isHidden"] = json!({"value":1}),
+            "null-vis" => fresh[1]["fields"]["isHidden"] = json!({"value":null}),
+            "unsupported-hidden" => fresh[1]["fields"]["isHidden"] = json!({"value":2}),
+            "deleted-master" => fresh[0]["fields"]["isDeleted"] = json!({"value":1}),
+            "deleted-child" => fresh[1]["fields"]["isDeleted"] = json!({"value":true}),
+            "null-master" => fresh[0]["fields"]["isDeleted"] = json!({"value":null}),
+            "bad-deletion" => fresh[1]["fields"]["isExpunged"] = json!({"value":null}),
+            "resource-drift" => {
+                fresh[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len() + 1)
+            }
+            _ => {}
+        }
+        current.extend(fresh);
+    }
+    let selected = stock36_library_state(
+        db.clone(),
+        ZONE,
+        current,
+        Arc::clone(&full_queries),
+        Arc::clone(&changes),
+    )
+    .await;
+    let selection = resolved_unfiled_only();
+    let collection = crate::commands::build_collection_context(&selection, &[])
+        .await
+        .unwrap();
+    let plan = crate::commands::resolve_passes_for_scope(
+        &selected.library,
+        &selection,
+        crate::commands::PassScope {
+            include_albums: false,
+            include_smart_folders: false,
+            include_unfiled: true,
+        },
+        &collection,
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.passes.len(), 1);
+    let base = make_run_cycle_download_config_builder(&root, db.clone());
+    let mut config = (*base(
+        download::SyncMode::Full,
+        Arc::new(rustc_hash::FxHashSet::default()),
+        Arc::new(download::AssetGroupings::default()),
+        Arc::from(ZONE),
+    ))
+    .clone();
+    config.exclude_asset_ids = Arc::new(["asset-global-excluded".to_owned()].into_iter().collect());
+    let config = Arc::new(config);
+    let controls = download::DownloadControls::download_hidden();
+    let before_gets = server.received_requests().await.unwrap().len();
+    let epoch_before = epoch_state(&db, ZONE);
+    let token_before = token(&db, ZONE);
+    let before_debt: Vec<_> = REFUSED
+        .iter()
+        .map(|id| decision_state(&db, &format!("asset-{id}")))
+        .collect();
+    assert!(
+        download::replay_due_admitted_selection(
+            &reqwest::Client::new(),
+            &plan.passes,
+            None,
+            None,
+            config.clone(),
+            controls,
+            CancellationToken::new()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), before_gets);
+    let retried = download::replay_due_admitted_selection(
+        &reqwest::Client::new(),
+        &plan.passes,
+        Some(&selection),
+        None,
+        config,
+        controls,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .expect("valid absent-flags peer must progress");
+    assert_eq!(retried.stats.downloaded, 1);
+    assert!(retried.sync_token.is_none());
+    assert_eq!(epoch_state(&db, ZONE), epoch_before);
+    assert_eq!(token(&db, ZONE), token_before);
+    let requests = server.received_requests().await.unwrap();
+    let new_paths: Vec<_> = requests[before_gets..]
+        .iter()
+        .map(|r| r.url.path())
+        .collect();
+    assert_eq!(new_paths, vec!["/good-vis"]);
+    assert_eq!(std::fs::read(root.join("good-vis.JPG")).unwrap(), MEDIA);
+    for (index, id) in REFUSED.iter().enumerate() {
+        assert_eq!(
+            decision_state(&db, &format!("asset-{id}")),
+            before_debt[index]
+        );
+        assert!(!root.join(format!("{id}.JPG")).exists());
+    }
+    eprintln!(
+        "CURRENT_VISIBILITY valid_get=1 hidden_null_deleted_badflag_global_resource_get=0 unresolved_plan_get=0"
     );
 }

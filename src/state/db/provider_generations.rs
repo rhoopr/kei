@@ -1925,6 +1925,14 @@ pub(crate) struct RootAdmissionReuse {
     pub(crate) validate_file: Box<dyn Fn() -> Result<(), StateError> + Send>,
 }
 
+pub(crate) struct RetryRootSource {
+    pub(crate) scope: String,
+    pub(crate) config_hash: String,
+    pub(crate) excluded: String,
+    pub(crate) profile: Option<Value>,
+    pub(crate) legacy_hashes: Vec<String>,
+}
+
 // Millisecond ties must not let a repeatedly refused root win the same
 // source-order tiebreaker on every wake.
 fn next_retry_rotation(conn: &Connection, generation: &str) -> Result<i64, StateError> {
@@ -2004,50 +2012,54 @@ impl SqliteStateDb {
     pub(crate) async fn retained_selection_roots(
         &self,
         owner: account::AccountOwner,
-        scope: String,
-        config_hash: String,
-        current: String,
-        compatible_profile: Option<Value>,
+        sources: Vec<RetryRootSource>,
         limit: u32,
-    ) -> Result<Vec<ActiveGeneration>, StateError> {
+    ) -> Result<Vec<(usize, ActiveGeneration, i64)>, StateError> {
         self.with_conn("reading retained selection root window", move |conn| {
-            let profile = compatible_profile
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
+            let mut seen = HashSet::new();
+            if sources.iter().any(|source| !seen.insert(&source.scope)) {
+                return invalid();
+            }
+            let values: Vec<_> = sources.iter().map(|source| serde_json::json!({
+                "scope":source.scope, "config":source.config_hash, "excluded":source.excluded,
+                "profile":source.profile, "legacy":source.legacy_hashes,
+            })).collect();
+            let encoded = serde_json::to_string(&values)
                 .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
             account::validate_authenticated(conn, &owner)?;
-            let ids: Vec<String> = conn
+            let ids: Vec<(i64, String, i64)> = conn
                 .prepare(
-                    "SELECT g.id FROM provider_active_generations g
-                     WHERE g.scope=?1 AND g.id<>?3
-                       AND (g.config_hash=?2
-                         OR (?5 IS NOT NULL
+                    "SELECT CAST(s.key AS INTEGER),g.id,g.last_replayed_at FROM provider_active_generations g
+                     JOIN json_each(?1) s ON g.scope=json_extract(s.value,'$.scope')
+                     WHERE g.id<>json_extract(s.value,'$.excluded')
+                       AND (g.config_hash=json_extract(s.value,'$.config')
+                         OR (json_type(s.value,'$.profile')='object'
                            AND json_extract(CAST(g.specification AS TEXT),'$.format')=2
-                           AND (json_extract(CAST(g.specification AS TEXT),'$.profile')=json(?5)
-                             OR (length(json_extract(?5,'$.admitted_retry_policy'))=64
-                               AND json_extract(?5,'$.admitted_retry_policy') NOT GLOB '*[^0-9a-f]*'
-                               AND json_extract(CAST(g.specification AS TEXT),'$.profile.admitted_retry_policy')=json_extract(?5,'$.admitted_retry_policy')))))
-                     ORDER BY g.last_replayed_at,g.created_at,g.id LIMIT ?6",
+                           AND (json_extract(CAST(g.specification AS TEXT),'$.profile')=json(json_extract(s.value,'$.profile'))
+                              OR (length(json_extract(s.value,'$.profile.admitted_retry_policy'))=64
+                                AND json_extract(s.value,'$.profile.admitted_retry_policy') NOT GLOB '*[^0-9a-f]*'
+                                AND json_extract(CAST(g.specification AS TEXT),'$.profile.admitted_retry_policy')=json_extract(s.value,'$.profile.admitted_retry_policy'))))
+                         OR (json_extract(CAST(g.specification AS TEXT),'$.format')=1
+                           AND g.config_hash IN (SELECT value FROM json_each(s.value,'$.legacy'))))
+                     ORDER BY g.last_replayed_at,g.created_at,g.id LIMIT ?2",
                 )?
-                .query_map(
-                    params![scope, config_hash, current, 0_i64, profile, i64::from(limit)],
-                    |row| row.get(0),
-                )?
+                .query_map(params![encoded, i64::from(limit)], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .collect::<Result<_, _>>()?;
             let mut roots = Vec::new();
-            for id in ids {
+            for (index, id, last_replayed) in ids {
+                let index = usize::try_from(index).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+                let source = sources.get(index).ok_or(StateError::ProviderSelectionInvalid)?;
                 let root = load_generation(conn, &id)?;
-                if root.spec.config_hash != config_hash
-                    && root.spec.format != 1
+                if root.spec.config_hash != source.config_hash
+                    && !(root.spec.format == 1 && source.legacy_hashes.contains(&root.spec.config_hash))
                     && (root.spec.format != 2
-                        || !compatible_profile.as_ref().is_some_and(|profile| {
+                        || !source.profile.as_ref().is_some_and(|profile| {
                             retained_profiles_compatible(&root.spec.profile, profile)
                         }))
                 {
                     return invalid();
                 }
-                roots.push(root);
+                roots.push((index, root, last_replayed));
             }
             Ok(roots)
         })
@@ -2059,11 +2071,21 @@ impl SqliteStateDb {
         owner: account::AccountOwner,
         generation: String,
     ) -> Result<(), StateError> {
+        self.rotate_retained_selection_root_at_least(owner, generation, 0)
+            .await
+    }
+
+    pub(crate) async fn rotate_retained_selection_root_at_least(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        floor: i64,
+    ) -> Result<(), StateError> {
         self.with_conn_mut("rotating incompatible retained root", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             account::validate_authenticated(&tx, &owner)?;
             load_generation(&tx, &generation)?;
-            let rotated_at = next_retry_rotation(&tx, &generation)?;
+            let rotated_at = next_retry_rotation(&tx, &generation)?.max(floor);
             tx.execute(
                 "UPDATE provider_active_generations SET last_replayed_at=?2 WHERE id=?1",
                 params![generation, rotated_at],
@@ -2381,6 +2403,7 @@ impl SqliteStateDb {
         generation: String,
         expected_cursor: Option<String>,
         last_examined: (String, String),
+        rotation_floor: i64,
     ) -> Result<bool, StateError> {
         self.with_conn_mut("acknowledging due admitted media window", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2397,7 +2420,7 @@ impl SqliteStateDb {
             }
             let cursor = serde_json::to_string(&last_examined)
                 .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
-            let rotated_at = next_retry_rotation(&tx, &generation)?;
+            let rotated_at = next_retry_rotation(&tx, &generation)?.max(rotation_floor);
             let changed = match expected_cursor {
                 Some(expected) => tx.execute(
                     "UPDATE provider_active_generations SET replay_after=?2,last_replayed_at=?3 WHERE id=?1 AND replay_after=?4",

@@ -62,6 +62,40 @@ fn lookup_members(body: &[u8], names: &[&str], zone: &Value) -> Result<Vec<Value
     Ok(out)
 }
 
+/// A fresh paired lookup can support the ordinary library-wide predicate only
+/// when neither record is deleted and the child is not hidden. Missing optional
+/// provider flags retain the application's existing false default; malformed
+/// supplied flags never grant selection authority.
+pub(crate) fn current_retry_visible(
+    body: &[u8],
+    child: &str,
+    master: &str,
+    zone: &Value,
+) -> Result<bool> {
+    let records = lookup_members(body, &[child, master], zone)?;
+    let [child, master] = records.as_slice() else {
+        anyhow::bail!("Incomplete current lookup pair");
+    };
+    let child_deleted = super::lookup::returned_deletion(Some(child), "CPLAsset")
+        .map_err(|()| anyhow::anyhow!("Invalid child deletion flag"))?;
+    let master_deleted = super::lookup::returned_deletion(Some(master), "CPLMaster")
+        .map_err(|()| anyhow::anyhow!("Invalid master deletion flag"))?;
+    let fields = child
+        .get("fields")
+        .and_then(Value::as_object)
+        .context("Invalid current child fields")?;
+    let hidden = match fields.get("isHidden") {
+        None => false,
+        Some(field) => match field.get("value") {
+            Some(Value::Bool(value)) => *value,
+            Some(Value::Number(value)) if value.as_i64() == Some(0) => false,
+            Some(Value::Number(value)) if value.as_i64() == Some(1) => true,
+            _ => anyhow::bail!("Invalid current hidden flag"),
+        },
+    };
+    Ok(!child_deleted && !master_deleted && !hidden)
+}
+
 /// Re-derive the paired current asset from retained bounded confirmation bytes.
 /// Caller supplies the authenticated request scope; any supplied record or
 /// relationship scope must agree. A complete pair is not an atomic snapshot.
@@ -333,7 +367,7 @@ impl PhotoAlbum {
             self.service_endpoint,
             queries::encode_params(&self.params)
         );
-        let request = json!({"zoneID":self.zone_id.as_ref(),"records":[{"recordName":relation}],"desiredKeys":["containerId","itemId"]});
+        let request = json!({"zoneID":self.zone_id.as_ref(),"records":[{"recordName":relation}],"desiredKeys":["containerId","itemId","isDeleted","isExpunged"]});
         let body = session::retry_post_changes_body(
             self.session.as_ref(),
             &url,
@@ -344,8 +378,11 @@ impl PhotoAlbum {
         .await?;
         let records = lookup_members(&body, &[relation], &self.zone_id)?;
         let record = records.first().context("Missing current album relation")?;
+        let deleted = super::lookup::returned_deletion(Some(record), "CPLContainerRelation")
+            .map_err(|()| anyhow::anyhow!("Invalid selecting relation deletion flag"))?;
         anyhow::ensure!(
-            record.get("recordType").and_then(Value::as_str) == Some("CPLContainerRelation")
+            !deleted
+                && record.get("recordType").and_then(Value::as_str) == Some("CPLContainerRelation")
                 && record
                     .pointer("/fields/containerId/value")
                     .and_then(Value::as_str)

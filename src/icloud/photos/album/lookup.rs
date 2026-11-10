@@ -354,7 +354,7 @@ fn resolution_evidence(resolution: &RecordResolution) -> ResolutionEvidence {
 
 // Returned records can carry deletion state as fields rather than a CloudKit
 // tombstone. Malformed flags are inconclusive, not permission to delete.
-fn returned_deletion(record: Option<&Value>, expected_type: &str) -> Result<bool, ()> {
+pub(super) fn returned_deletion(record: Option<&Value>, expected_type: &str) -> Result<bool, ()> {
     let Some(record) = record else {
         return Ok(false);
     };

@@ -423,6 +423,32 @@ async fn cross_zone_folder_change_preserves_pending_destination_on_reopen() {
     run_cross_zone_case(false, true, None).await;
 }
 
+tokio::task_local! { static HELD_DUE_RETRY: bool; }
+
+#[tokio::test]
+async fn cross_zone_held_due_retry_confirms_relation_and_source_link() {
+    HELD_DUE_RETRY
+        .scope(true, run_cross_zone_case(false, false, None))
+        .await;
+}
+
+#[tokio::test]
+async fn cross_zone_held_due_retry_refuses_wrong_current_relation() {
+    HELD_DUE_RETRY
+        .scope(true, run_cross_zone_case(false, false, Some("wrong-album")))
+        .await;
+}
+
+#[tokio::test]
+async fn cross_zone_held_due_retry_refuses_soft_deleted_relation() {
+    HELD_DUE_RETRY
+        .scope(
+            true,
+            run_cross_zone_case(false, false, Some("field-deleted")),
+        )
+        .await;
+}
+
 #[derive(Clone)]
 struct AddMemberSession(TwoAlbumSession);
 #[async_trait::async_trait]
@@ -642,6 +668,76 @@ async fn run_cross_zone_case(
             }
             Arc::new(config)
         };
+        if cycle == 1 && HELD_DUE_RETRY.try_with(|enabled| *enabled).unwrap_or(false) {
+            let selection = crate::selection::Selection {
+                albums: crate::selection::AlbumSelector::Named {
+                    included: ["First".to_owned(), "Second".to_owned()]
+                        .into_iter()
+                        .collect(),
+                    excluded: Default::default(),
+                },
+                unfiled: false,
+                ..Default::default()
+            };
+            let retry_config = builder(
+                download::SyncMode::Full,
+                Arc::new(rustc_hash::FxHashSet::default()),
+                Arc::new(download::AssetGroupings::default()),
+                Arc::from(OWNER),
+            );
+            let before_gets = shared_gets.load(Ordering::SeqCst);
+            let token_before = db.get_metadata(&sync_token_key(OWNER)).await.unwrap();
+            requests.lock().unwrap().clear();
+            let due = download::replay_due_admitted_selection(
+                &reqwest::Client::new(),
+                &selected.plan.passes,
+                Some(&selection),
+                None,
+                retry_config,
+                download::DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let lookup_requests = requests.lock().unwrap().clone();
+            assert!(
+                lookup_requests
+                    .iter()
+                    .any(|(url, body)| url.contains("/records/lookup?")
+                        && body["zoneID"]["zoneName"] == OWNER
+                        && body["desiredKeys"]
+                            == json!(["containerId", "itemId", "isDeleted", "isExpunged"])),
+                "fresh selecting relation must be requested"
+            );
+            assert_eq!(
+                db.get_metadata(&sync_token_key(OWNER)).await.unwrap(),
+                token_before
+            );
+            if refusal.is_some() {
+                assert!(due.is_none());
+                assert_eq!(shared_gets.load(Ordering::SeqCst), before_gets);
+                assert!(!root.join("First/shared.JPG").exists());
+            } else {
+                assert!(due.is_some());
+                assert_eq!(shared_gets.load(Ordering::SeqCst), before_gets + 1);
+                assert!(
+                    lookup_requests
+                        .iter()
+                        .any(|(url, body)| url.contains("/records/lookup?")
+                            && body["zoneID"]["zoneName"] == OWNER
+                            && body["records"].as_array().is_some_and(|records| records
+                                .iter()
+                                .any(|item| item["recordName"] == "asset-shared"))),
+                    "fresh selector-to-source link must be requested"
+                );
+                assert_eq!(std::fs::read(root.join("First/shared.JPG")).unwrap(), MEDIA);
+            }
+            eprintln!(
+                "CROSS_SOURCE_DUE relation_lookup=1 source_link={} media_get={}",
+                usize::from(refusal.is_none()),
+                usize::from(refusal.is_none())
+            );
+        }
         let result = run_cycle(
             &[&selected],
             &make_run_cycle_config(),
@@ -904,6 +1000,9 @@ impl PhotosSession for RefusedMembershipSession {
                     }
                     if self.1 == "wrong-album" {
                         record["fields"]["containerId"]["value"] = json!("not-selected");
+                    }
+                    if self.1 == "field-deleted" {
+                        record["fields"]["isDeleted"] = json!({"value":1});
                     }
                 }
                 if record["recordName"] == "asset-shared" && self.1 == "changed-source" {
