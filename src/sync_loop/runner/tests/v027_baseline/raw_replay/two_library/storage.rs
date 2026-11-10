@@ -1601,12 +1601,14 @@ fn pilot_pass_key(pass: &AlbumPass) -> String {
     )
 }
 
-fn pilot_snapshot(path: &Path) -> Vec<(&'static str, Vec<Vec<rusqlite::types::Value>>)> {
+fn pilot_snapshot(path: &Path) -> Vec<(&'static str, usize, [u8; 32])> {
+    use rusqlite::types::ValueRef;
+    use sha2::{Digest, Sha256};
     let conn = rusqlite::Connection::open(path).unwrap();
     [
         (
             "assets",
-            "SELECT library,id,version_size,checksum,size_bytes,status,local_path,local_checksum,download_checksum FROM assets WHERE id IN ('old-pilot-primary','old-pilot-shared') ORDER BY library,id",
+            "SELECT * FROM assets WHERE id IN ('old-pilot-primary','old-pilot-shared') ORDER BY library,id",
         ),
         (
             "asset_metadata_paths",
@@ -1614,7 +1616,7 @@ fn pilot_snapshot(path: &Path) -> Vec<(&'static str, Vec<Vec<rusqlite::types::Va
         ),
         (
             "provider_shadow_pages",
-            "SELECT id,scope,request_cursor,successor,more_coming,body_hash,body FROM provider_shadow_pages ORDER BY id",
+            "SELECT * FROM provider_shadow_pages ORDER BY id",
         ),
         (
             "provider_shadow_records",
@@ -1629,16 +1631,37 @@ fn pilot_snapshot(path: &Path) -> Vec<(&'static str, Vec<Vec<rusqlite::types::Va
     .map(|(label, sql)| {
         let mut statement = conn.prepare(sql).unwrap();
         let count = statement.column_count();
-        let rows = statement
-            .query_map([], |row| {
-                (0..count)
-                    .map(|index| row.get(index))
-                    .collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        (label, rows)
+        let mut rows = statement.query([]).unwrap();
+        let mut hash = Sha256::new();
+        let mut row_count = 0;
+        while let Some(row) = rows.next().unwrap() {
+            row_count += 1;
+            for index in 0..count {
+                let value = row.get_ref(index).unwrap();
+                match value {
+                    ValueRef::Null => hash.update([0]),
+                    ValueRef::Integer(value) => {
+                        hash.update([1]);
+                        hash.update(value.to_le_bytes());
+                    }
+                    ValueRef::Real(value) => {
+                        hash.update([2]);
+                        hash.update(value.to_bits().to_le_bytes());
+                    }
+                    ValueRef::Text(value) => {
+                        hash.update([3]);
+                        hash.update((value.len() as u64).to_le_bytes());
+                        hash.update(value);
+                    }
+                    ValueRef::Blob(value) => {
+                        hash.update([4]);
+                        hash.update((value.len() as u64).to_le_bytes());
+                        hash.update(value);
+                    }
+                }
+            }
+        }
+        (label, row_count, hash.finalize().into())
     })
     .collect()
 }
@@ -1676,6 +1699,27 @@ async fn pilot_seed_old_asset(db: &SqliteStateDb, library: &str, id: &str, root:
     reason = "synthetic query category counters are test evidence"
 )]
 async fn v027_mixed_shared_hidden_actual_resolver_pilot_preserves_old_raw_and_reopens() {
+    mixed_capacity_contract(2, 0, false).await;
+}
+
+#[tokio::test]
+#[ignore = "near-512 MiB mixed actual-resolver qualification; run explicitly on disposable storage"]
+async fn v027_mixed_shared_hidden_near_full_preserves_current_progress() {
+    mixed_capacity_contract(
+        32,
+        crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES - 8192,
+        true,
+    )
+    .await;
+}
+
+#[allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "synthetic query category counters are test evidence"
+)]
+async fn mixed_capacity_contract(page_count: usize, padding: usize, near_full: bool) {
+    let setup_started = std::time::Instant::now();
     let server = crate::start_wiremock_or_skip!();
     for endpoint in ["/pilot-primary", "/pilot-shared"] {
         Mock::given(method("GET"))
@@ -1697,26 +1741,33 @@ async fn v027_mixed_shared_hidden_actual_resolver_pilot_preserves_old_raw_and_re
         &baseline_owner(),
     ));
     let capture = ShadowCapture::new(db.clone(), baseline_owner(), "com");
-    for (primary, name, tag) in [(true, "primary", 61), (false, "shared", 62)] {
+    for index in 0..page_count {
+        let (primary, name, tag) = if index % 2 == 0 {
+            (true, "primary", 61)
+        } else {
+            (false, "shared", 62)
+        };
         let zone = pilot_zone(primary);
         let library_type = if primary { "private" } else { "shared" };
         let scope = capture.scope(library_type, &zone).unwrap();
         let mut records = pair(
-            &format!("old-pilot-{name}"),
-            &format!("old-pilot-{name}.JPG"),
+            &format!("old-pilot-{name}-{index}"),
+            &format!("old-pilot-{name}-{index}.JPG"),
             "https://invalid.example/old-pilot",
             tag,
         );
         records[1]["fields"]["masterRef"]["value"]["zoneID"] = zone.clone();
+        records[0]["fields"]["syntheticRetainedPadding"] = json!({"value":"p".repeat(padding)});
         let raw = serde_json::to_vec(&json!({"zones":[{"zoneID":zone,"records":records,
-            "syncToken":format!("old-pilot-{name}"),"moreComing":false}]}))
+            "syncToken":format!("old-pilot-{name}-{index}"),"moreComing":false}]}))
         .unwrap();
+        assert!(raw.len() <= crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES);
         capture
             .capture(
                 crate::icloud::photos::catalog_observed_page(
                     raw,
                     &scope,
-                    &format!("old-pilot-before-{name}"),
+                    &format!("old-pilot-before-{name}-{index}"),
                 )
                 .unwrap(),
             )
@@ -1727,6 +1778,30 @@ async fn v027_mixed_shared_hidden_actual_resolver_pilot_preserves_old_raw_and_re
     // clears them to make current progress.
     pilot_seed_old_asset(&db, PILOT_PRIMARY, "old-pilot-primary", &root).await;
     pilot_seed_old_asset(&db, PILOT_SHARED, "old-pilot-shared", &root).await;
+    let old_media: Vec<_> = ["old-pilot-primary", "old-pilot-shared"]
+        .into_iter()
+        .map(|id| {
+            let path = root.join(format!("{id}.JPG"));
+            let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+            (path, mtime)
+        })
+        .collect();
+    let old_charge: i64 = db
+        .acquire_lock("pilot historical charge")
+        .unwrap()
+        .query_row(
+            "SELECT SUM(charged_bytes) FROM provider_shadow_pages",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if near_full {
+        assert!(old_charge > 511 * 1024 * 1024 && old_charge < 512 * 1024 * 1024);
+    }
+    println!(
+        "C05_STOCK_SETUP pages={page_count} charged_bytes={old_charge} elapsed_ms={}",
+        setup_started.elapsed().as_millis()
+    );
     {
         let conn = db.acquire_lock("pilot genuine enrollment").unwrap();
         assert_eq!(
@@ -1737,6 +1812,22 @@ async fn v027_mixed_shared_hidden_actual_resolver_pilot_preserves_old_raw_and_re
             .unwrap(),
             1
         );
+        for library in [PILOT_PRIMARY, PILOT_SHARED] {
+            assert!(
+                crate::state::db::sync_epoch::read_library(&conn, library)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM metadata WHERE key=?1",
+                    [sync_token_key(library)],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                0
+            );
+        }
     }
     let mut before = None;
 
@@ -1772,10 +1863,15 @@ async fn v027_mixed_shared_hidden_actual_resolver_pilot_preserves_old_raw_and_re
     let mut expected_keys = Vec::new();
     let mut published: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
     for cycle in 0..3 {
+        let cycle_started = std::time::Instant::now();
         let db = Arc::new(
             SqliteStateDb::open_owned(&database, &baseline_owner())
                 .await
                 .unwrap(),
+        );
+        println!(
+            "C05_OPEN cycle={cycle} elapsed_ms={}",
+            cycle_started.elapsed().as_millis()
         );
         if cycle == 0 {
             // Capture after the owned open migrates the genuine v36 fixture,
@@ -1931,6 +2027,14 @@ async fn v027_mixed_shared_hidden_actual_resolver_pilot_preserves_old_raw_and_re
                 .map(pilot_pass_key)
                 .collect();
             println!("C05_PASS_KEYS {expected_keys:?}");
+        } else {
+            let keys: Vec<_> = primary_plan
+                .passes
+                .iter()
+                .chain(shared_plan.passes.iter())
+                .map(pilot_pass_key)
+                .collect();
+            assert_eq!(keys, expected_keys);
         }
         let mut primary_state = make_run_cycle_library_state_with_passes(
             PILOT_PRIMARY,
@@ -2098,17 +2202,43 @@ async fn v027_mixed_shared_hidden_actual_resolver_pilot_preserves_old_raw_and_re
             );
         }
         let after = pilot_snapshot(&database);
-        for ((label, expected), (_, actual)) in before.as_ref().unwrap().iter().zip(&after) {
-            assert_eq!(actual, expected, "old raw/history section changed: {label}");
-        }
         assert_eq!(
-            rusqlite::Connection::open(&database)
+            after,
+            *before.as_ref().unwrap(),
+            "old raw/history snapshot changed"
+        );
+        assert_eq!(
+            after
+                .iter()
+                .find(|(label, _, _)| *label == "provider_shadow_pages")
+                .unwrap()
+                .1,
+            page_count
+        );
+        assert_eq!(
+            db.acquire_lock("pilot unchanged charge")
                 .unwrap()
                 .query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_work_retries WHERE page_id IN (1,2)",
+                    "SELECT SUM(charged_bytes) FROM provider_shadow_pages",
                     [],
                     |row| row.get(0)
                 )
+                .unwrap(),
+            old_charge
+        );
+        for (path, mtime) in &old_media {
+            assert_eq!(std::fs::read(path).unwrap(), MEDIA);
+            assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), *mtime);
+        }
+        println!(
+            "C05_CYCLE cycle={cycle} old_pages={page_count} old_charge={old_charge} elapsed_ms={}",
+            cycle_started.elapsed().as_millis()
+        );
+        assert_eq!(
+            rusqlite::Connection::open(&database)
+                .unwrap()
+                .query_row::<i64, _, _>("SELECT count(*) FROM provider_work_retries", [], |row| row
+                    .get(0))
                 .unwrap(),
             0,
             "bare inert old raw must not become current retained work"
