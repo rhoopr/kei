@@ -68,6 +68,14 @@ pub use orchestration::models::{
 };
 #[cfg(test)]
 pub(crate) use orchestration::queue_projection::retained_work_config_hash_for_test;
+#[cfg(test)]
+pub(crate) fn test_temp_download_path(
+    destination: &std::path::Path,
+    checksum: &str,
+    suffix: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    file::temp_download_path(destination, checksum, suffix)
+}
 pub(crate) use orchestration::queue_projection::{has_due_retained_work, prepare_retained_sources};
 pub(crate) use orchestration::recent::requires_recovery as recent_selection_requires_recovery;
 pub(crate) use orchestration::reconciliation::recover_recorded_sources;

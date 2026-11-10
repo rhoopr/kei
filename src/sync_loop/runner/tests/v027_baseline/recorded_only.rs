@@ -983,6 +983,45 @@ async fn stock36_media_failure_backoff_and_window_fences() {
         exhausted.identities.is_empty(),
         "asset max attempts must filter before provider work"
     );
+    let unlimited = db
+        .due_admitted_media_window(baseline_owner(), identity.generation.clone(), 0, 64)
+        .await
+        .unwrap();
+    assert_eq!(
+        unlimited.identities.len(),
+        1,
+        "zero asset cap means unlimited"
+    );
+    for _ in 2..32 {
+        let current = db
+            .selection_retry_identity(
+                baseline_owner(),
+                identity.generation.clone(),
+                identity.pass_key.clone(),
+                "asset-fail".into(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            db.defer_selection_media_failure(baseline_owner(), captured_from_identity(&current))
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(decision_state(&db, "asset-fail").1, 32);
+    db.make_selection_retry_due(baseline_owner(), "asset-fail".to_owned())
+        .await
+        .unwrap();
+    let saturated = db
+        .due_admitted_media_window(baseline_owner(), identity.generation.clone(), 0, 64)
+        .await
+        .unwrap();
+    assert_eq!(
+        saturated.identities.len(),
+        1,
+        "saturated decision attempts do not exhaust the media item"
+    );
     assert_eq!(full_queries.load(Ordering::SeqCst), 1);
     assert!(calls.load(Ordering::SeqCst) > 0);
 }
@@ -1916,6 +1955,85 @@ impl crate::icloud::photos::PhotosSession for CountingRetrySession {
     }
 }
 
+#[derive(Clone)]
+struct RefreshMutationSession {
+    initial: super::ResetCycleSession,
+    refreshed: super::ResetCycleSession,
+    db: std::sync::Arc<SqliteStateDb>,
+    first_gets: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    mutated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mutation: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for RefreshMutationSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        use std::sync::atomic::Ordering;
+        if url.contains("/records/lookup?") && self.first_gets.load(Ordering::SeqCst) > 0 {
+            if !self.mutated.swap(true, Ordering::SeqCst) {
+                let (generation, pass): (String, String) = {
+                    let conn = self.db.acquire_lock("find refresh owner")?;
+                    conn.query_row("SELECT generation,pass_key FROM provider_active_decisions WHERE child='asset-refresh'", [], |r| Ok((r.get(0)?,r.get(1)?)))?
+                };
+                let before = self
+                    .db
+                    .selection_retry_identity(
+                        super::baseline_owner(),
+                        generation.clone(),
+                        pass.clone(),
+                        "asset-refresh".into(),
+                    )
+                    .await?
+                    .unwrap();
+                // A separately owned confirmation deferral lands after the first
+                // failed transfer and before the refreshed retry dispatch.
+                self.db
+                    .defer_selection_confirmation(
+                        super::baseline_owner(),
+                        generation.clone(),
+                        pass.clone(),
+                        "asset-refresh".into(),
+                    )
+                    .await?;
+                let after = self
+                    .db
+                    .selection_retry_identity(
+                        super::baseline_owner(),
+                        generation,
+                        pass,
+                        "asset-refresh".into(),
+                    )
+                    .await?
+                    .unwrap();
+                *self.mutation.lock().unwrap() =
+                    Some((before.admission_hash, after.admission_hash));
+            }
+            return crate::icloud::photos::PhotosSession::post(&self.refreshed, url, body, headers)
+                .await;
+        }
+        crate::icloud::photos::PhotosSession::post(&self.initial, url, body, headers).await
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[derive(Clone)]
+struct CountedGone(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl wiremock::Respond for CountedGone {
+    fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        wiremock::ResponseTemplate::new(410)
+    }
+}
+
 async fn admit_due_media(
     db: &SqliteStateDb,
     generation: &str,
@@ -2506,4 +2624,582 @@ async fn actual_retry_function_bounds_source_and_rotates_three_roots() {
     assert!(!root.join("wrong.JPG").exists());
     assert!(!root.join("future.JPG").exists());
     assert_eq!(full_queries.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn actual_pipeline_late_motion_failure_backs_off_failed_rendition_only() {
+    use super::{
+        MEDIA, ZONE, baseline_owner, make_run_cycle_config, make_run_cycle_download_config_builder,
+        make_shared_session_for_run_cycle, seed_existing_upgrade_db,
+    };
+    use crate::download;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let db_path = dir.path().join("state.db");
+    seed_existing_upgrade_db(&db_path);
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/still"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/motion"))
+        .respond_with(wiremock::ResponseTemplate::new(410))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/prepared"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .mount(&server)
+        .await;
+    let mut inventory = media_pair(ZONE, "live", "live.JPG", &format!("{}/still", server.uri()));
+    inventory[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
+        "downloadURL": format!("{}/motion", server.uri()), "size": MEDIA.len(), "fileChecksum": media_checksum()
+    }});
+    inventory[0]["fields"]["resOriginalVidComplFileType"] =
+        json!({"value":"com.apple.quicktime-movie"});
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let seed = media_pair(ZONE, "seed", "seed.JPG", &format!("{}/still", server.uri()));
+    let selected = stock36_library_state(
+        db.clone(),
+        ZONE,
+        seed,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    )
+    .await;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let mut config = make_run_cycle_config();
+    config.retry.max_retries = 0;
+    let base = make_run_cycle_download_config_builder(&root, db.clone());
+    let builder = |mode, excludes, groups, library| {
+        let mut config = (*base(mode, excludes, groups, library)).clone();
+        config.concurrent_downloads = 1;
+        config.retry.max_retries = 0;
+        Arc::new(config)
+    };
+    crate::sync_cycle::run_cycle(
+        &[&selected],
+        &config,
+        Some(db.as_ref()),
+        false,
+        &builder,
+        download::DownloadControls::download_hidden(),
+        &shared,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("seed cycle creates an authenticated current root");
+
+    use crate::state::VersionSizeKey;
+    use crate::state::db::provider_generations::{
+        ActiveDecision, GenerationSpec, MAX_GENERATION_BYTES,
+    };
+    use crate::state::db::provider_selection::{
+        SelectionDecision, SelectionDestination, SelectionOutcome, SelectionPath,
+    };
+    let (spec, pass_key): (GenerationSpec, String) = {
+        let conn = db
+            .acquire_lock("read actual current selection policy")
+            .unwrap();
+        let (bytes, key): (Vec<u8>, String) = conn.query_row(
+            "SELECT g.specification,d.pass_key FROM provider_active_generations g JOIN provider_active_decisions d ON d.generation=g.id WHERE d.child='asset-seed'", [],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        (serde_json::from_slice(&bytes).unwrap(), key)
+    };
+    let generation = db
+        .begin_selection_generation(baseline_owner(), spec.clone(), MAX_GENERATION_BYTES)
+        .await
+        .unwrap();
+    let body = serde_json::to_vec(&json!({"records":inventory})).unwrap();
+    let photo = crate::icloud::photos::current_asset(
+        &body,
+        "asset-live",
+        "live",
+        &json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"}),
+    )
+    .unwrap();
+    let mut destinations = Vec::new();
+    let mut records = Vec::new();
+    for (version, filename) in [
+        (VersionSizeKey::Original, "live.JPG"),
+        (VersionSizeKey::LiveOriginal, "live.MOV"),
+    ] {
+        let facts = &photo
+            .versions()
+            .iter()
+            .find(|(key, _)| VersionSizeKey::from(*key) == version)
+            .unwrap()
+            .1;
+        let metadata = photo.metadata_arc(version);
+        destinations.push(SelectionDestination {
+            version_size: version.as_str().into(),
+            path: SelectionPath::from_path(&root.join(filename)),
+            checksum: facts.checksum.to_string(),
+            size: facts.size,
+            metadata_hash: metadata.metadata_hash.clone().unwrap(),
+        });
+        records.push(
+            crate::test_helpers::TestAssetRecord::new("asset-live")
+                .library(ZONE)
+                .version_size(version)
+                .filename(filename)
+                .checksum(&facts.checksum)
+                .size(facts.size)
+                .created_at(photo.created())
+                .added_at(photo.added_date())
+                .metadata((*metadata).clone())
+                .build(),
+        );
+    }
+    let manifest = ActiveDecision {
+        state_id: "asset-live".into(),
+        sources: vec![],
+        decision: SelectionDecision {
+            pass_key: pass_key.clone(),
+            child: "asset-live".into(),
+            master: Some("live".into()),
+            confirmation: Some(body.clone()),
+            outcome: SelectionOutcome::Selected,
+            reason: String::new(),
+            destinations,
+        },
+    };
+    db.project_selection_decision_with_proof(
+        baseline_owner(),
+        generation.id.clone(),
+        manifest.clone(),
+        records.clone(),
+        None,
+        MAX_GENERATION_BYTES,
+    )
+    .await
+    .unwrap();
+    let before_identity = db
+        .selection_retry_identity(
+            baseline_owner(),
+            generation.id.clone(),
+            pass_key.clone(),
+            "asset-live".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before_identity.destinations.len(), 2);
+    let motion_destination = before_identity
+        .destinations
+        .iter()
+        .find(|d| d.version_size == "live_original")
+        .unwrap();
+    assert_eq!(motion_destination.path.to_path(), root.join("live.MOV"));
+    assert_eq!(motion_destination.checksum, media_checksum());
+    assert_eq!(motion_destination.size, MEDIA.len() as u64);
+    let owner_config = builder(
+        download::SyncMode::Full,
+        Arc::new(rustc_hash::FxHashSet::default()),
+        Arc::new(download::AssetGroupings::default()),
+        Arc::from(ZONE),
+    );
+    let prepared_pair = media_pair(
+        ZONE,
+        "prepared",
+        "prepared.JPG",
+        &format!("{}/prepared", server.uri()),
+    );
+    let prepared_path = root.join("prepared.JPG");
+    admit_due_media(
+        &db,
+        &generation.id,
+        &pass_key,
+        ZONE,
+        &prepared_pair,
+        &prepared_path,
+        0,
+    )
+    .await;
+    use crate::state::db::{PreparedPublication, TempFileOwnershipStore};
+    use sha2::{Digest, Sha256};
+    let prepared_temp = download::test_temp_download_path(
+        &prepared_path,
+        &media_checksum(),
+        &owner_config.temp_suffix,
+    )
+    .unwrap();
+    std::fs::write(&prepared_temp, MEDIA).unwrap();
+    db.claim_temp_file(&prepared_temp).await.unwrap();
+    let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(MEDIA));
+    let proof = PreparedPublication {
+        binding: None,
+        library: ZONE.into(),
+        id: "asset-prepared".into(),
+        version: "original".into(),
+        provider_checksum: media_checksum(),
+        provider_size: MEDIA.len() as u64,
+        temporary: SelectionPath::from_path(&prepared_temp),
+        destination: SelectionPath::from_path(&prepared_path),
+        local_checksum: digest.clone(),
+        source_checksum: digest,
+    };
+    db.prepare_temp_publication(&prepared_temp, &proof)
+        .await
+        .unwrap();
+    assert!(
+        db.claim_temp_file(&prepared_temp).await.is_err(),
+        "the real prepared journal must fence its staging owner"
+    );
+    let mut current_inventory =
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+    current_inventory.extend(prepared_pair);
+    let lookups = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let session = CountingRetrySession {
+        inner: super::ResetCycleSession {
+            zone: ZONE,
+            inventory: Arc::new(current_inventory),
+            full_queries: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            changes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_full: false,
+            auth_expired: false,
+            boundary: "inventory-last-page",
+        },
+        lookups: Arc::clone(&lookups),
+    };
+    let mut library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/private".into(),
+        Arc::new(std::collections::HashMap::new()),
+        Box::new(session),
+        Arc::new(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db.clone(),
+        baseline_owner(),
+        "com",
+    ));
+    let passes = [crate::commands::AlbumPass {
+        kind: crate::commands::PassKind::Unfiled,
+        album: library.all(),
+        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+    }];
+    let before_requests = server.received_requests().await.unwrap().len();
+    let result = crate::download::replay_due_admitted_selection(
+        &reqwest::Client::new(),
+        &passes,
+        owner_config.clone(),
+        download::DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .expect("actual retry must attempt both renditions");
+    assert_eq!(result.stats.downloaded, 1);
+    assert_eq!(
+        result.stats.failed, 2,
+        "motion transfer and prepared staging both reach their actual failure paths"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let paths: Vec<_> = requests[before_requests..]
+        .iter()
+        .map(|r| r.url.path())
+        .collect();
+    assert_eq!(paths.iter().filter(|path| **path == "/still").count(), 1);
+    assert_eq!(paths.iter().filter(|path| **path == "/motion").count(), 1);
+    assert_eq!(paths.iter().filter(|path| **path == "/prepared").count(), 0);
+    assert!(
+        lookups
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|name| name == "asset-prepared"),
+        "the prepared owner must reach actual retry confirmation"
+    );
+    assert_eq!(
+        paths.first(),
+        Some(&"/still"),
+        "the successful rendition must dispatch first"
+    );
+    assert_eq!(std::fs::read(&prepared_temp).unwrap(), MEDIA);
+    assert!(!prepared_path.exists());
+    assert_eq!(
+        db.get_prepared_publications(ZONE, "asset-prepared", VersionSizeKey::Original)
+            .await
+            .unwrap(),
+        vec![proof.clone()]
+    );
+    {
+        let conn = db
+            .acquire_lock("inspect exact live rendition backoff")
+            .unwrap();
+        let (reason, attempts, deadline): (String, i64, i64) = conn.query_row(
+        "SELECT reason, attempts, next_retry_at FROM provider_active_decisions WHERE child='asset-live'", [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+        let destinations: Vec<(String, bool)> = conn.prepare(
+        "SELECT version_size, verified_media FROM provider_active_destinations WHERE child='asset-live' ORDER BY version_size"
+    ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(
+            destinations,
+            vec![("live_original".into(), false), ("original".into(), true)]
+        );
+        let assets: Vec<(String, String)> = conn.prepare(
+        "SELECT version_size,status FROM assets WHERE library=?1 AND id='asset-live' ORDER BY version_size"
+    ).unwrap().query_map([ZONE], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(
+            assets,
+            vec![
+                ("live_original".into(), "failed".into()),
+                ("original".into(), "downloaded".into())
+            ]
+        );
+        assert_eq!(
+            reason, "download_failed",
+            "the actual late motion failure must retain its own capture"
+        );
+        assert_eq!(attempts, 1);
+        assert!(deadline > chrono::Utc::now().timestamp());
+    }
+    assert_eq!(std::fs::read(root.join("live.JPG")).unwrap(), MEDIA);
+    assert_eq!(
+        decision_state(&db, "asset-prepared"),
+        (String::new(), 0, 0, 0)
+    );
+    let after_identity = db
+        .selection_retry_identity(
+            baseline_owner(),
+            generation.id.clone(),
+            pass_key.clone(),
+            "asset-live".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_identity.generation, before_identity.generation);
+    assert_eq!(
+        after_identity.specification_hash,
+        before_identity.specification_hash
+    );
+    assert_eq!(after_identity.manifest_hash, before_identity.manifest_hash);
+    assert_ne!(
+        after_identity.admission_hash,
+        before_identity.admission_hash
+    );
+    assert_eq!(after_identity.destinations, before_identity.destinations);
+    let before_quiet = requests.len();
+    crate::download::replay_due_admitted_selection(
+        &reqwest::Client::new(),
+        &passes,
+        owner_config,
+        download::DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        before_quiet,
+        "no sibling is fetched after completion or before the decision deadline"
+    );
+    assert_eq!(
+        db.get_prepared_publications(ZONE, "asset-prepared", VersionSizeKey::Original)
+            .await
+            .unwrap(),
+        vec![proof]
+    );
+    let newer = db
+        .begin_selection_generation(baseline_owner(), spec, MAX_GENERATION_BYTES)
+        .await
+        .unwrap();
+    let projection = db
+        .project_selection_decision_with_proof(
+            baseline_owner(),
+            newer.id.clone(),
+            manifest,
+            records,
+            None,
+            MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap();
+    assert!(
+        projection.admitted,
+        "the same-resource successor must be an admitted owner"
+    );
+    let newer_before = db
+        .selection_retry_identity(
+            baseline_owner(),
+            newer.id.clone(),
+            pass_key.clone(),
+            "asset-live".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(newer_before.destinations, before_identity.destinations);
+    assert_ne!(newer_before.generation, before_identity.generation);
+    let mut stale = captured_from_identity(&before_identity);
+    stale.destination = motion_destination.clone();
+    assert!(
+        !db.defer_selection_media_failure(baseline_owner(), stale)
+            .await
+            .unwrap()
+    );
+    let old_after_stale = db
+        .selection_retry_identity(
+            baseline_owner(),
+            generation.id,
+            pass_key.clone(),
+            "asset-live".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let newer_after = db
+        .selection_retry_identity(baseline_owner(), newer.id, pass_key, "asset-live".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        old_after_stale.admission_hash,
+        after_identity.admission_hash
+    );
+    assert_eq!(newer_after.admission_hash, newer_before.admission_hash);
+    eprintln!(
+        "RENDITION_RETRY still_gets=1 motion_gets=1 prepared_gets=0 still_verified=1 motion_failed=1 decision_attempts=1 prepared_journal_preserved=1 stale_cross_root_writes=0"
+    );
+}
+
+#[tokio::test]
+async fn actual_cleanup_recaptures_owner_after_confirmation_changes() {
+    use super::{
+        ZONE, baseline_owner, make_run_cycle_download_config_builder, seed_existing_upgrade_db,
+    };
+    use crate::download;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio_util::sync::CancellationToken;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let db_path = dir.path().join("state.db");
+    seed_existing_upgrade_db(&db_path);
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let server = wiremock::MockServer::start().await;
+    let first_gets = Arc::new(AtomicUsize::new(0));
+    let refreshed_gets = Arc::new(AtomicUsize::new(0));
+    for (path, counter) in [("/first", &first_gets), ("/refreshed", &refreshed_gets)] {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(path))
+            .respond_with(CountedGone(Arc::clone(counter)))
+            .mount(&server)
+            .await;
+    }
+    let initial_records = media_pair(
+        ZONE,
+        "refresh",
+        "refresh.JPG",
+        &format!("{}/first", server.uri()),
+    );
+    let mut refreshed_records = initial_records.clone();
+    refreshed_records[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+        json!(format!("{}/refreshed", server.uri()));
+    let reset = |inventory| super::ResetCycleSession {
+        zone: ZONE,
+        inventory: Arc::new(inventory),
+        full_queries: Arc::new(AtomicUsize::new(0)),
+        changes: Arc::new(AtomicUsize::new(0)),
+        fail_full: false,
+        auth_expired: false,
+        boundary: "inventory-last-page",
+    };
+    let mutation = Arc::new(std::sync::Mutex::new(None));
+    let session = RefreshMutationSession {
+        initial: reset(initial_records),
+        refreshed: reset(refreshed_records),
+        db: db.clone(),
+        first_gets: Arc::clone(&first_gets),
+        mutated: Arc::new(AtomicBool::new(false)),
+        mutation: Arc::clone(&mutation),
+    };
+    let mut library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/private".into(),
+        Arc::new(std::collections::HashMap::new()),
+        Box::new(session),
+        Arc::new(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db.clone(),
+        baseline_owner(),
+        "com",
+    ));
+    let passes = [crate::commands::AlbumPass {
+        kind: crate::commands::PassKind::Unfiled,
+        album: library.all(),
+        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+    }];
+    let base = make_run_cycle_download_config_builder(&root, db.clone());
+    let mut config = (*base(
+        download::SyncMode::Full,
+        Arc::new(rustc_hash::FxHashSet::default()),
+        Arc::new(download::AssetGroupings::default()),
+        Arc::from(ZONE),
+    ))
+    .clone();
+    config.retry.max_retries = 0;
+    config.concurrent_downloads = 1;
+    download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes,
+        Arc::new(config),
+        download::DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_gets.load(Ordering::SeqCst), 1);
+    assert_eq!(refreshed_gets.load(Ordering::SeqCst), 1);
+    let (before, after) = mutation
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("confirmation mutation occurs between transfers");
+    assert_ne!(before, after);
+    let (reason, attempts, deadline, verified) = decision_state(&db, "asset-refresh");
+    assert_eq!(
+        reason, "download_failed",
+        "the final failed retry must use the refreshed pre-dispatch owner"
+    );
+    assert_eq!(
+        attempts, 2,
+        "the confirmation deferral and the later media failure each commit once"
+    );
+    assert!(deadline > chrono::Utc::now().timestamp());
+    assert_eq!(verified, 0);
+    eprintln!(
+        "REFRESH_RETRY first_gets=1 refreshed_gets=1 confirmation_owner_updates=1 decision_attempts=2"
+    );
 }

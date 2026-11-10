@@ -35,14 +35,18 @@ use crate::state::db::provider_selection::{
 const MAX_REPLAY_DECISIONS: u32 = 64;
 const DEFERRED_REASON: &str = "selection_generation_deferred";
 
-type CapturedMediaFailureCache = Arc<
-    std::sync::Mutex<
-        rustc_hash::FxHashMap<
-            (String, String, String),
-            Option<Arc<crate::download::pipeline::CapturedMediaFailure>>,
-        >,
-    >,
->;
+fn captured_failure_matches_task(
+    captured: &crate::download::pipeline::CapturedMediaFailure,
+    task: &filter::DownloadTask,
+) -> bool {
+    captured.task_key == super::url_refresh::RetryTaskKey::from(task)
+        && captured.state_id == task.asset_id.as_ref()
+        && captured.child == task.asset_record_name.as_ref()
+        && captured.destination.version_size == task.version_size.as_str()
+        && captured.destination.path == SelectionPath::from_path(&task.download_path)
+        && captured.destination.checksum == task.checksum.as_ref()
+        && captured.destination.size == task.size
+}
 
 #[cfg(test)]
 tokio::task_local! {
@@ -495,7 +499,6 @@ pub(crate) struct SelectionRun {
     fresh_confirmation: bool,
     pub(in crate::download) retained_retry: bool,
     retry_sources: Arc<std::sync::Mutex<SelectionRetrySources>>,
-    captured_media_failures: CapturedMediaFailureCache,
 }
 
 impl std::fmt::Debug for SelectionRun {
@@ -788,9 +791,6 @@ impl SelectionContext {
             fresh_confirmation: false,
             retained_retry: false,
             retry_sources: Arc::clone(&self.retry_sources),
-            captured_media_failures: Arc::new(std::sync::Mutex::new(
-                rustc_hash::FxHashMap::default(),
-            )),
         }))
     }
 
@@ -814,9 +814,6 @@ impl SelectionContext {
             fresh_confirmation,
             retained_retry,
             retry_sources: Arc::clone(&self.retry_sources),
-            captured_media_failures: Arc::new(std::sync::Mutex::new(
-                rustc_hash::FxHashMap::default(),
-            )),
         })
     }
 }
@@ -962,9 +959,6 @@ impl SelectionRun {
                     fresh_confirmation: true,
                     retained_retry: self.retained_retry,
                     retry_sources: self.retry_sources.clone(),
-                    captured_media_failures: Arc::new(std::sync::Mutex::new(
-                        rustc_hash::FxHashMap::default(),
-                    )),
                 });
                 return Ok((
                     run,
@@ -1084,9 +1078,6 @@ impl SelectionRun {
             fresh_confirmation: true,
             retained_retry: self.retained_retry,
             retry_sources: self.retry_sources.clone(),
-            captured_media_failures: Arc::new(std::sync::Mutex::new(
-                rustc_hash::FxHashMap::default(),
-            )),
         });
         Ok((
             run,
@@ -1329,20 +1320,8 @@ impl SelectionRun {
         if !run.albums.contains_key(pass_key) {
             return Ok(None);
         }
-        let cache_key = (
-            run.root.id.clone(),
-            pass_key.to_owned(),
-            task.asset_record_name.to_string(),
-        );
-        if let Some(cached) = run
-            .captured_media_failures
-            .lock()
-            .map_err(|_poisoned| anyhow::anyhow!("Media failure identity cache poisoned"))?
-            .get(&cache_key)
-            .cloned()
-        {
-            return Ok(cached);
-        }
+        // The decision can change between phase-one dispatch and a refreshed
+        // retry even when its task key and destination are unchanged.
         let identity = run
             .capture
             .db
@@ -1375,10 +1354,6 @@ impl SelectionRun {
                 destination: destination.clone(),
             }))
         });
-        run.captured_media_failures
-            .lock()
-            .map_err(|_poisoned| anyhow::anyhow!("Media failure identity cache poisoned"))?
-            .insert(cache_key, captured.clone());
         Ok(captured)
     }
 
@@ -1393,9 +1368,7 @@ impl SelectionRun {
             let Some(captured) = &failure.captured else {
                 continue;
             };
-            if captured.task_key
-                != crate::download::orchestration::url_refresh::RetryTaskKey::from(&failure.task)
-            {
+            if !captured_failure_matches_task(captured, &failure.task) {
                 continue;
             }
             tracing::debug!(
@@ -1404,11 +1377,12 @@ impl SelectionRun {
                 generation = %captured.generation,
                 "Recording admitted media failure backoff"
             );
-            if !seen.insert((
+            let decision = (
                 captured.generation.clone(),
                 captured.pass_key.clone(),
                 captured.child.clone(),
-            )) {
+            );
+            if seen.contains(&decision) {
                 continue;
             }
             let recorded = self
@@ -1428,7 +1402,9 @@ impl SelectionRun {
                     },
                 )
                 .await?;
-            if !recorded {
+            if recorded {
+                seen.insert(decision);
+            } else {
                 tracing::debug!(
                     target: "kei::download::pipeline",
                     generation = %captured.generation,
@@ -4581,6 +4557,69 @@ mod tests {
             proof_matches: false,
             ..base
         }));
+    }
+}
+
+#[cfg(test)]
+mod media_failure_capture_tests {
+    use std::sync::Arc;
+
+    use super::captured_failure_matches_task;
+    use crate::download::orchestration::test_support::retry_test_task;
+    use crate::download::orchestration::url_refresh::RetryTaskKey;
+    use crate::download::pipeline::CapturedMediaFailure;
+    use crate::state::VersionSizeKey;
+    use crate::state::db::provider_selection::{SelectionDestination, SelectionPath};
+
+    #[test]
+    fn capture_requires_exact_task_resource_and_owner() {
+        let task = retry_test_task("child", VersionSizeKey::Original, "same.jpg");
+        let captured = CapturedMediaFailure {
+            task_key: RetryTaskKey::from(&task),
+            generation: "root".into(),
+            specification_hash: "spec".into(),
+            pass_key: "pass".into(),
+            child: task.asset_record_name.to_string(),
+            state_id: task.asset_id.to_string(),
+            manifest_hash: "manifest".into(),
+            admission_hash: "admission".into(),
+            destination: SelectionDestination {
+                version_size: task.version_size.as_str().into(),
+                path: SelectionPath::from_path(&task.download_path),
+                checksum: task.checksum.to_string(),
+                size: task.size,
+                metadata_hash: "metadata".into(),
+            },
+        };
+        assert!(captured_failure_matches_task(&captured, &task));
+        let mut variations = Vec::new();
+        let mut changed = task.clone();
+        changed.checksum = "other".into();
+        variations.push(changed);
+        let mut changed = task.clone();
+        changed.size += 1;
+        variations.push(changed);
+        let mut changed = task.clone();
+        changed.asset_record_name = Arc::from("other-child");
+        variations.push(changed);
+        let mut changed = task.clone();
+        changed.asset_id = Arc::from("other-state");
+        variations.push(changed);
+        let mut changed = task.clone();
+        changed.library = Arc::from("other-zone");
+        variations.push(changed);
+        let mut changed = task.clone();
+        changed.version_size = VersionSizeKey::LiveOriginal;
+        variations.push(changed);
+        let mut changed = task.clone();
+        changed.download_path.set_file_name("other.jpg");
+        variations.push(changed);
+        for changed in variations {
+            assert!(!captured_failure_matches_task(&captured, &changed));
+        }
+        let mut fresh_url = task.clone();
+        fresh_url.url = "https://synthetic.example/refreshed".into();
+        assert!(captured_failure_matches_task(&captured, &fresh_url));
     }
 }
 
