@@ -1,20 +1,26 @@
 //! Full distinct stock history is not a current admission budget.
 use super::super::super::{MEDIA, baseline_owner, pair, zone};
 use super::{HEALTHY, HealthySession, healthy_zone, selected};
+use crate::commands::{
+    AlbumPass, PassKind, build_collection_context, collection_libraries, pass_scope_for_zone,
+    resolve_passes_for_scope, zone_name_set,
+};
 use crate::download;
-use crate::icloud::photos::{PhotosSession, inbox::ShadowCapture};
+use crate::icloud::photos::{PhotoLibrary, PhotosSession, inbox::ShadowCapture};
+use crate::selection::{AlbumSelector, Selection, SmartFolderSelector, parse_library_selector};
 use crate::state::SqliteStateDb;
 use crate::state::db::provider_inbox::CapturedPageId;
 use crate::state::db::provider_work::{MAX_WORK_BYTES, WorkAdmission, WorkPlan, WorkSource};
 use crate::sync_cycle::{run_cycle, sync_token_key};
 use crate::sync_loop::test_support::{
     make_run_cycle_config, make_run_cycle_download_config_builder,
-    make_shared_session_for_run_cycle,
+    make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle,
 };
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use tokio_util::sync::CancellationToken;
@@ -1438,5 +1444,691 @@ async fn run_cycle_ledger_transaction_preserves_cursor_debt_and_media_across_res
             .unwrap(),
             1
         );
+    }
+}
+
+const PILOT_PRIMARY: &str = "PrimarySync-pilot-mixed";
+const PILOT_SHARED: &str = "SharedSync-pilot-mixed";
+
+fn pilot_zone(primary: bool) -> Value {
+    json!({
+        "zoneName": if primary {PILOT_PRIMARY} else {PILOT_SHARED},
+        "ownerRecordName": if primary {"_defaultOwner"} else {"shared-owner"}
+    })
+}
+
+fn pilot_pair(id: &str, filename: &str, url: &str, zone: &Value, tag: u8) -> Vec<Value> {
+    let mut records = pair(id, filename, url, tag);
+    records[1]["fields"]["masterRef"]["value"]["zoneID"] = zone.clone();
+    records[1]["fields"]["isHidden"] = json!({"value":1,"type":"INT64"});
+    records
+}
+
+#[derive(Clone)]
+struct PilotSession {
+    zone: Value,
+    hidden: Arc<Vec<Value>>,
+    all: Arc<Vec<Value>>,
+    cycle: usize,
+    inventory: Arc<AtomicUsize>,
+    folders: Arc<AtomicUsize>,
+    boundaries: Arc<AtomicUsize>,
+    count_probes: Arc<AtomicUsize>,
+    lookups: Arc<AtomicUsize>,
+    changes: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for PilotSession {
+    async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
+        let request: Value = serde_json::from_str(&body)?;
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(
+                json!({"records":[{"recordName":"index","fields":{"state":{"value":"FINISHED"}}}]}),
+            );
+        }
+        if url.contains("/zones/list") {
+            self.boundaries.fetch_add(1, Ordering::SeqCst);
+            let name = self.zone["zoneName"].as_str().unwrap();
+            return Ok(
+                json!({"zones":[{"zoneID":self.zone,"syncToken":format!("{name}-boundary"),"deleted":false}]}),
+            );
+        }
+        if url.contains("/internal/records/query/batch") {
+            self.count_probes.fetch_add(1, Ordering::SeqCst);
+            let queries = request["batch"].as_array().unwrap();
+            for query in queries {
+                assert_eq!(query["zoneID"], self.zone);
+            }
+            let batch: Vec<_> = queries
+                .iter()
+                .map(|query| {
+                    let hidden = query.to_string().contains("HiddenByAssetDate");
+                    json!({"records":[{"fields":{"itemCount":{"value":if hidden {1} else {0}}}}]})
+                })
+                .collect();
+            return Ok(json!({"batch":batch}));
+        }
+        if url.contains("/records/query?") {
+            assert_eq!(request["zoneID"], self.zone);
+            let record_type = request["query"]["recordType"]
+                .as_str()
+                .expect("pilot records/query must name a recordType");
+            if record_type.contains("Container") {
+                return Ok(json!({"records":[],"syncToken":"containers"}));
+            }
+            if record_type == "CPLAlbumByPositionLive" {
+                // Album-list/folder discovery during actual pass resolution.
+                // It is not selected asset inventory and legitimately returns
+                // no user folders for this synthetic library.
+                self.folders.fetch_add(1, Ordering::SeqCst);
+                return Ok(json!({"records":[],"syncToken":"pilot-folders"}));
+            }
+            let hidden = match record_type {
+                "CPLAssetAndMasterHiddenByAssetDate" => true,
+                "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted" => false,
+                other => panic!("unexpected pilot records/query recordType: {other}"),
+            };
+            self.inventory.fetch_add(1, Ordering::SeqCst);
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                .unwrap_or(0);
+            let records = if offset == 0 && hidden {
+                self.hidden.as_ref().clone()
+            } else {
+                Vec::new()
+            };
+            if self.cycle == 0 {
+                eprintln!(
+                    "C05_ASSET_QUERY zone={} record_type={record_type} offset={offset} returned={}",
+                    self.zone["zoneName"].as_str().unwrap_or("unknown"),
+                    records.len() / 2
+                );
+            }
+            return Ok(json!({"records":records,"syncToken":"pilot-query"}));
+        }
+        if url.contains("/changes/zone?") {
+            let cursor = request["zones"][0]["syncToken"].as_str().unwrap();
+            let name = self.zone["zoneName"].as_str().unwrap();
+            let expected = if self.cycle == 0 {
+                format!("{name}-boundary")
+            } else {
+                format!("{name}-cycle-{}", self.cycle)
+            };
+            assert_eq!(cursor, expected);
+            self.changes.lock().unwrap().push(cursor.to_owned());
+            return Ok(json!({"zones":[{"zoneID":self.zone,"records":[],
+                "syncToken":format!("{name}-cycle-{}",self.cycle+1),"moreComing":false}]}));
+        }
+        if url.contains("/records/lookup?") {
+            assert_eq!(request["zoneID"], self.zone);
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            let requested = request["records"].as_array().unwrap();
+            let records: Vec<_> = self
+                .all
+                .iter()
+                .filter(|record| {
+                    requested
+                        .iter()
+                        .any(|item| item["recordName"] == record["recordName"])
+                })
+                .cloned()
+                .collect();
+            return Ok(json!({"records":records}));
+        }
+        anyhow::bail!("unexpected pilot endpoint")
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+fn pilot_pass_key(pass: &AlbumPass) -> String {
+    use sha2::Digest;
+    let mut excludes: Vec<String> = pass.exclude_ids.iter().cloned().collect();
+    excludes.sort_unstable();
+    format!(
+        "{:x}",
+        sha2::Sha256::digest(
+            json!({"kind":format!("{:?}",pass.kind),"scope":pass.album.selection_scope(),"excludes":excludes})
+                .to_string()
+                .as_bytes()
+        )
+    )
+}
+
+fn pilot_snapshot(path: &Path) -> Vec<(&'static str, Vec<Vec<rusqlite::types::Value>>)> {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    [
+        (
+            "assets",
+            "SELECT library,id,version_size,checksum,size_bytes,status,local_path,local_checksum,download_checksum FROM assets WHERE id IN ('old-pilot-primary','old-pilot-shared') ORDER BY library,id",
+        ),
+        (
+            "asset_metadata_paths",
+            "SELECT * FROM asset_metadata_paths WHERE id IN ('old-pilot-primary','old-pilot-shared') ORDER BY library,id",
+        ),
+        (
+            "provider_shadow_pages",
+            "SELECT id,scope,request_cursor,successor,more_coming,body_hash,body FROM provider_shadow_pages ORDER BY id",
+        ),
+        (
+            "provider_shadow_records",
+            "SELECT * FROM provider_shadow_records ORDER BY page_id,ordinal",
+        ),
+        (
+            "provider_shadow_receipts",
+            "SELECT * FROM provider_shadow_receipts ORDER BY scope",
+        ),
+    ]
+    .into_iter()
+    .map(|(label, sql)| {
+        let mut statement = conn.prepare(sql).unwrap();
+        let count = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                (0..count)
+                    .map(|index| row.get(index))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        (label, rows)
+    })
+    .collect()
+}
+
+async fn pilot_seed_old_asset(db: &SqliteStateDb, library: &str, id: &str, root: &Path) {
+    let path = root.join(format!("{id}.JPG"));
+    std::fs::write(&path, MEDIA).unwrap();
+    let hash = download::file::compute_sha256(&path).await.unwrap();
+    let conn = db.acquire_lock("pilot old released asset").unwrap();
+    conn.execute(
+        "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,local_path,local_checksum,download_checksum) \
+         VALUES(?1,?2,'original','pilot-old-provider',?3,1000,?4,'photo','downloaded',1000,?5,?6,?6)",
+        rusqlite::params![
+            library,
+            id,
+            format!("{id}.JPG"),
+            i64::try_from(MEDIA.len()).unwrap(),
+            path.to_str().unwrap(),
+            hash
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum,download_checksum,source_checksum) \
+         VALUES(?1,?2,'original',?3,'pilot-old-provider',?4,?4,?4)",
+        rusqlite::params![library, id, path.to_str().unwrap(), hash],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+#[allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "synthetic query category counters are test evidence"
+)]
+async fn v027_mixed_shared_hidden_actual_resolver_pilot_preserves_old_raw_and_reopens() {
+    let server = crate::start_wiremock_or_skip!();
+    for endpoint in ["/pilot-primary", "/pilot-shared"] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir(&root).unwrap();
+    let database = dir.path().join("state.db");
+    let primary_zone = pilot_zone(true);
+    let shared_zone = pilot_zone(false);
+
+    let db = Arc::new(SqliteStateDb::create_stock_v36_for_test(
+        &database,
+        &baseline_owner(),
+    ));
+    let capture = ShadowCapture::new(db.clone(), baseline_owner(), "com");
+    for (primary, name, tag) in [(true, "primary", 61), (false, "shared", 62)] {
+        let zone = pilot_zone(primary);
+        let library_type = if primary { "private" } else { "shared" };
+        let scope = capture.scope(library_type, &zone).unwrap();
+        let mut records = pair(
+            &format!("old-pilot-{name}"),
+            &format!("old-pilot-{name}.JPG"),
+            "https://invalid.example/old-pilot",
+            tag,
+        );
+        records[1]["fields"]["masterRef"]["value"]["zoneID"] = zone.clone();
+        let raw = serde_json::to_vec(&json!({"zones":[{"zoneID":zone,"records":records,
+            "syncToken":format!("old-pilot-{name}"),"moreComing":false}]}))
+        .unwrap();
+        capture
+            .capture(
+                crate::icloud::photos::catalog_observed_page(
+                    raw,
+                    &scope,
+                    &format!("old-pilot-before-{name}"),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    // Historical raw receipts are preserved. No fixture or production code
+    // clears them to make current progress.
+    pilot_seed_old_asset(&db, PILOT_PRIMARY, "old-pilot-primary", &root).await;
+    pilot_seed_old_asset(&db, PILOT_SHARED, "old-pilot-shared", &root).await;
+    {
+        let conn = db.acquire_lock("pilot genuine enrollment").unwrap();
+        assert_eq!(
+            conn.execute(
+                "DELETE FROM metadata WHERE key=?1",
+                [crate::state::db::sync_epoch::TEST_PREEXISTING_EPOCH_KEY]
+            )
+            .unwrap(),
+            1
+        );
+    }
+    let mut before = None;
+
+    let primary_hidden = Arc::new(pilot_pair(
+        "pilot-primary",
+        "pilot-primary.JPG",
+        &format!("{}/pilot-primary", server.uri()),
+        &primary_zone,
+        71,
+    ));
+    let shared_hidden = Arc::new(pilot_pair(
+        "pilot-shared",
+        "pilot-shared.JPG",
+        &format!("{}/pilot-shared", server.uri()),
+        &shared_zone,
+        72,
+    ));
+    let primary_all = Arc::new(primary_hidden.as_ref().clone());
+    let shared_all = Arc::new(shared_hidden.as_ref().clone());
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    let selection = Selection {
+        albums: AlbumSelector::None,
+        albums_explicit: false,
+        smart_folders: SmartFolderSelector::Named {
+            included: BTreeSet::from(["Hidden".to_string()]),
+            excluded: BTreeSet::new(),
+        },
+        smart_folders_explicit: true,
+        libraries: parse_library_selector(&["shared".to_string()]).unwrap(),
+        unfiled: true,
+    };
+    let mut counters = Vec::new();
+    let mut expected_keys = Vec::new();
+    let mut published: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+    for cycle in 0..3 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&database, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        if cycle == 0 {
+            // Capture after the owned open migrates the genuine v36 fixture,
+            // before the first production cycle mutates current state.
+            before = Some(pilot_snapshot(&database));
+            for library in [PILOT_PRIMARY, PILOT_SHARED] {
+                let conn = db
+                    .acquire_lock("pilot existing upgrade enrollment")
+                    .unwrap();
+                let epoch = crate::state::db::sync_epoch::read_library(&conn, library).unwrap();
+                if let Some(epoch) = epoch {
+                    assert_eq!(epoch.state, "pending");
+                    assert_eq!(epoch.reason, "existing_upgrade");
+                    assert!(epoch.completed_at.is_none());
+                    assert!(epoch.binding.is_none());
+                }
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        "SELECT count(*) FROM download_receipts",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    0,
+                    "genuine pilot must not seed current receipts"
+                );
+            }
+        }
+        let primary_inventory = Arc::new(AtomicUsize::new(0));
+        let shared_inventory = Arc::new(AtomicUsize::new(0));
+        let primary_folders = Arc::new(AtomicUsize::new(0));
+        let shared_folders = Arc::new(AtomicUsize::new(0));
+        let primary_boundaries = Arc::new(AtomicUsize::new(0));
+        let shared_boundaries = Arc::new(AtomicUsize::new(0));
+        let primary_count_probes = Arc::new(AtomicUsize::new(0));
+        let shared_count_probes = Arc::new(AtomicUsize::new(0));
+        let primary_lookups = Arc::new(AtomicUsize::new(0));
+        let shared_lookups = Arc::new(AtomicUsize::new(0));
+        let primary_changes = Arc::new(Mutex::new(Vec::new()));
+        let shared_changes = Arc::new(Mutex::new(Vec::new()));
+        let primary_session = PilotSession {
+            zone: primary_zone.clone(),
+            hidden: primary_hidden.clone(),
+            all: primary_all.clone(),
+            cycle,
+            inventory: primary_inventory.clone(),
+            folders: primary_folders.clone(),
+            boundaries: primary_boundaries.clone(),
+            count_probes: primary_count_probes.clone(),
+            lookups: primary_lookups.clone(),
+            changes: primary_changes.clone(),
+        };
+        let shared_pilot = PilotSession {
+            zone: shared_zone.clone(),
+            hidden: shared_hidden.clone(),
+            all: shared_all.clone(),
+            cycle,
+            inventory: shared_inventory.clone(),
+            folders: shared_folders.clone(),
+            boundaries: shared_boundaries.clone(),
+            count_probes: shared_count_probes.clone(),
+            lookups: shared_lookups.clone(),
+            changes: shared_changes.clone(),
+        };
+        let mut primary_library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/private".into(),
+            Arc::new(std::collections::HashMap::new()),
+            Box::new(primary_session),
+            Arc::new(primary_zone.clone()),
+            "private".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut shared_library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/shared".into(),
+            Arc::new(std::collections::HashMap::new()),
+            Box::new(shared_pilot),
+            Arc::new(shared_zone.clone()),
+            "shared".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        primary_library.shadow_capture =
+            Some(ShadowCapture::new(db.clone(), baseline_owner(), "com"));
+        shared_library.shadow_capture =
+            Some(ShadowCapture::new(db.clone(), baseline_owner(), "com"));
+        let selected_libraries = vec![shared_library.clone()];
+        let all_libraries = vec![primary_library.clone(), shared_library.clone()];
+        let collection = collection_libraries(&selection, &selected_libraries, &all_libraries);
+        let selected_zones = zone_name_set(&selected_libraries);
+        let collection_zones = zone_name_set(collection);
+        let context = build_collection_context(&selection, collection)
+            .await
+            .unwrap();
+        let primary_scope = pass_scope_for_zone(
+            &selection,
+            primary_library.zone_name(),
+            &selected_zones,
+            &collection_zones,
+        );
+        let shared_scope = pass_scope_for_zone(
+            &selection,
+            shared_library.zone_name(),
+            &selected_zones,
+            &collection_zones,
+        );
+        let primary_plan =
+            resolve_passes_for_scope(&primary_library, &selection, primary_scope, &context, &[])
+                .await
+                .unwrap();
+        let shared_plan =
+            resolve_passes_for_scope(&shared_library, &selection, shared_scope, &context, &[])
+                .await
+                .unwrap();
+        assert_eq!(
+            primary_plan
+                .passes
+                .iter()
+                .map(|pass| pass.kind)
+                .collect::<Vec<_>>(),
+            vec![PassKind::SmartFolder],
+            "Primary is unselected for Unfiled but explicit Hidden widens smart folders"
+        );
+        assert_eq!(
+            shared_plan
+                .passes
+                .iter()
+                .map(|pass| pass.kind)
+                .collect::<Vec<_>>(),
+            vec![PassKind::SmartFolder, PassKind::Unfiled],
+            "Shared is selected for both Hidden and Unfiled"
+        );
+        assert!(
+            primary_plan.passes[0].album.selection_scope()["list_type"]
+                .as_str()
+                .unwrap()
+                .contains("Hidden")
+        );
+        assert_eq!(
+            primary_plan.passes[0].album.selection_scope()["zone"],
+            primary_zone
+        );
+        for pass in &shared_plan.passes {
+            assert_eq!(pass.album.selection_scope()["zone"], shared_zone);
+        }
+        if cycle == 0 {
+            expected_keys = primary_plan
+                .passes
+                .iter()
+                .chain(shared_plan.passes.iter())
+                .map(pilot_pass_key)
+                .collect();
+            println!("C05_PASS_KEYS {expected_keys:?}");
+        }
+        let mut primary_state = make_run_cycle_library_state_with_passes(
+            PILOT_PRIMARY,
+            &sync_token_key(PILOT_PRIMARY),
+            primary_plan.passes,
+        );
+        primary_state.library = primary_library;
+        let mut shared_state = make_run_cycle_library_state_with_passes(
+            PILOT_SHARED,
+            &sync_token_key(PILOT_SHARED),
+            shared_plan.passes,
+        );
+        shared_state.library = shared_library;
+        let base = make_run_cycle_download_config_builder(&root, db.clone());
+        let builder = |mode, exclude, groups, library| {
+            let mut config = (*base(mode, exclude, groups, library)).clone();
+            config.folder_structure = "none".into();
+            config.retry.max_retries = 0;
+            #[cfg(feature = "xmp")]
+            {
+                config.metadata.xmp_sidecar = false;
+            }
+            Arc::new(config)
+        };
+        let result = run_cycle(
+            &[&primary_state, &shared_state],
+            &make_run_cycle_config(),
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        println!(
+            "C05_CATEGORIES cycle={cycle} primary_asset_inventory={} primary_folders={} primary_boundaries={} primary_count_probes={} primary_lookups={} shared_asset_inventory={} shared_folders={} shared_boundaries={} shared_count_probes={} shared_lookups={}",
+            primary_inventory.load(Ordering::SeqCst),
+            primary_folders.load(Ordering::SeqCst),
+            primary_boundaries.load(Ordering::SeqCst),
+            primary_count_probes.load(Ordering::SeqCst),
+            primary_lookups.load(Ordering::SeqCst),
+            shared_inventory.load(Ordering::SeqCst),
+            shared_folders.load(Ordering::SeqCst),
+            shared_boundaries.load(Ordering::SeqCst),
+            shared_count_probes.load(Ordering::SeqCst),
+            shared_lookups.load(Ordering::SeqCst),
+        );
+        if cycle == 0 {
+            assert_eq!(result.stats.downloaded, 2, "{result:?}");
+            assert!(result.can_advance_database_checkpoint(), "{result:?}");
+            for library in [PILOT_PRIMARY, PILOT_SHARED] {
+                let conn = db.acquire_lock("pilot first baseline complete").unwrap();
+                let epoch = crate::state::db::sync_epoch::read_library(&conn, library)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(epoch.state, "complete");
+                assert_eq!(epoch.reason, "existing_upgrade");
+                assert!(epoch.completed_at.is_some());
+            }
+            let receipts = rusqlite::Connection::open(&database)
+                .unwrap()
+                .prepare(
+                    "SELECT child,origin_pass,scope,native_path FROM download_receipts ORDER BY child",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(receipts.len(), 2, "{receipts:?}");
+            for (child, pass, scope, native) in receipts {
+                assert!(expected_keys.contains(&pass), "unexpected pass key {pass}");
+                assert!(scope.contains(PILOT_PRIMARY) || scope.contains(PILOT_SHARED));
+                assert!(matches!(
+                    child.as_str(),
+                    "asset-pilot-primary" | "asset-pilot-shared"
+                ));
+                let path = serde_json::from_str::<
+                    crate::state::db::provider_selection::SelectionPath,
+                >(&native)
+                .unwrap()
+                .to_path();
+                assert!(path.starts_with(&root));
+                assert_eq!(std::fs::read(&path).unwrap(), MEDIA);
+                published.push((
+                    path.clone(),
+                    std::fs::metadata(&path).unwrap().modified().unwrap(),
+                ));
+            }
+            assert!(
+                primary_inventory.load(Ordering::SeqCst) > 0,
+                "Primary must run selected asset inventory on the first baseline"
+            );
+            assert!(
+                shared_inventory.load(Ordering::SeqCst) >= 2,
+                "Shared must run Hidden plus Unfiled selected asset inventory on the first baseline"
+            );
+            assert_eq!(
+                primary_folders.load(Ordering::SeqCst),
+                1,
+                "actual resolver discovers Primary folders once"
+            );
+            assert_eq!(
+                shared_folders.load(Ordering::SeqCst),
+                0,
+                "shared zones skip user folder discovery"
+            );
+            assert_eq!(primary_boundaries.load(Ordering::SeqCst), 1);
+            assert_eq!(shared_boundaries.load(Ordering::SeqCst), 1);
+        } else {
+            assert_eq!(result.stats.downloaded, 0, "{result:?}");
+            assert_eq!(
+                primary_inventory.load(Ordering::SeqCst),
+                0,
+                "quiet reopen must not run selected asset inventory on Primary"
+            );
+            assert_eq!(
+                shared_inventory.load(Ordering::SeqCst),
+                0,
+                "quiet reopen must not run selected asset inventory on Shared"
+            );
+            assert_eq!(
+                primary_folders.load(Ordering::SeqCst),
+                1,
+                "quiet Primary still performs one real folder discovery"
+            );
+            assert_eq!(
+                shared_folders.load(Ordering::SeqCst),
+                0,
+                "quiet Shared performs no folder discovery"
+            );
+            assert_eq!(primary_boundaries.load(Ordering::SeqCst), 0);
+            assert_eq!(shared_boundaries.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                rusqlite::Connection::open(&database)
+                    .unwrap()
+                    .query_row::<i64, _, _>("SELECT count(*) FROM download_receipts", [], |row| row
+                        .get(0))
+                    .unwrap(),
+                2,
+                "quiet reopen must not add receipts"
+            );
+            for (path, mtime) in &published {
+                assert_eq!(std::fs::read(path).unwrap(), MEDIA);
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().modified().unwrap(),
+                    *mtime,
+                    "quiet reopen must not rewrite published media"
+                );
+            }
+        }
+        for library in [PILOT_PRIMARY, PILOT_SHARED] {
+            assert_eq!(
+                db.get_metadata(&sync_token_key(library)).await.unwrap(),
+                Some(format!("{library}-cycle-{}", cycle + 1))
+            );
+        }
+        let after = pilot_snapshot(&database);
+        for ((label, expected), (_, actual)) in before.as_ref().unwrap().iter().zip(&after) {
+            assert_eq!(actual, expected, "old raw/history section changed: {label}");
+        }
+        assert_eq!(
+            rusqlite::Connection::open(&database)
+                .unwrap()
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_work_retries WHERE page_id IN (1,2)",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            0,
+            "bare inert old raw must not become current retained work"
+        );
+        counters.push((
+            primary_inventory.load(Ordering::SeqCst),
+            shared_inventory.load(Ordering::SeqCst),
+            primary_changes.lock().unwrap().clone(),
+            shared_changes.lock().unwrap().clone(),
+        ));
+        server.verify().await;
+    }
+    assert!(counters[0].0 > 0);
+    assert!(counters[0].1 >= 2);
+    assert_eq!(counters[0].2, vec![format!("{PILOT_PRIMARY}-boundary")]);
+    assert_eq!(counters[0].3, vec![format!("{PILOT_SHARED}-boundary")]);
+    for (cycle, counter) in counters.iter().enumerate().skip(1) {
+        assert_eq!(counter.0, 0);
+        assert_eq!(counter.1, 0);
+        assert_eq!(counter.2, vec![format!("{PILOT_PRIMARY}-cycle-{cycle}")]);
+        assert_eq!(counter.3, vec![format!("{PILOT_SHARED}-cycle-{cycle}")]);
     }
 }
