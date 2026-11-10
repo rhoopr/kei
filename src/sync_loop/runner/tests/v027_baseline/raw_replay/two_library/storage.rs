@@ -1666,6 +1666,90 @@ fn pilot_snapshot(path: &Path) -> Vec<(&'static str, usize, [u8; 32])> {
     .collect()
 }
 
+#[allow(
+    clippy::print_stdout,
+    reason = "migration projection counts are test evidence"
+)]
+fn pilot_assert_migration_preserved(database: &Path, before: &Path) {
+    let conn = rusqlite::Connection::open(database).unwrap();
+    conn.execute(
+        "ATTACH DATABASE ?1 AS before_upgrade",
+        [before.to_str().unwrap()],
+    )
+    .unwrap();
+    for table in [
+        "provider_shadow_pages",
+        "provider_shadow_records",
+        "provider_shadow_receipts",
+        "provider_catalog_pages",
+        "provider_catalog_records",
+        "provider_work_receipts",
+        "provider_work_retries",
+        "assets",
+        "asset_metadata_paths",
+    ] {
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info(?1, 'before_upgrade') ORDER BY cid")
+            .unwrap()
+            .query_map([table], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(!columns.is_empty(), "missing released table {table}");
+        let current_columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info(?1, 'main') ORDER BY cid")
+            .unwrap()
+            .query_map([table], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for column in &columns {
+            assert!(
+                current_columns.contains(column),
+                "migration removed {table}.{column}"
+            );
+        }
+        let projection = columns
+            .iter()
+            .map(|column| {
+                let name = format!("\"{}\"", column.replace('"', "\"\""));
+                format!("typeof({name}),{name}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM before_upgrade.{table}"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let current_count: i64 = conn
+            .query_row(&format!("SELECT count(*) FROM main.{table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(current_count, count, "migration row count changed: {table}");
+        for (left, right) in [("before_upgrade", "main"), ("main", "before_upgrade")] {
+            let different: bool = conn
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT {projection} FROM {left}.{table} EXCEPT SELECT {projection} FROM {right}.{table})"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                !different,
+                "migration changed released projection: {table} ({left} to {right})"
+            );
+        }
+        println!(
+            "C05_MIGRATION table={table} rows={count} released_columns={}",
+            columns.len()
+        );
+    }
+}
+
 async fn pilot_seed_old_asset(db: &SqliteStateDb, library: &str, id: &str, root: &Path) {
     let path = root.join(format!("{id}.JPG"));
     std::fs::write(&path, MEDIA).unwrap();
@@ -1829,6 +1913,15 @@ async fn mixed_capacity_contract(page_count: usize, padding: usize, near_full: b
             );
         }
     }
+    let before_migration = dir.path().join("before-migration.db");
+    {
+        let conn = db
+            .acquire_lock("snapshot released migration input")
+            .unwrap();
+        assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+        conn.execute("VACUUM INTO ?1", [before_migration.to_str().unwrap()])
+            .unwrap();
+    }
     let mut before = None;
 
     let primary_hidden = Arc::new(pilot_pair(
@@ -1874,6 +1967,7 @@ async fn mixed_capacity_contract(page_count: usize, padding: usize, near_full: b
             cycle_started.elapsed().as_millis()
         );
         if cycle == 0 {
+            pilot_assert_migration_preserved(&database, &before_migration);
             // Capture after the owned open migrates the genuine v36 fixture,
             // before the first production cycle mutates current state.
             before = Some(pilot_snapshot(&database));
