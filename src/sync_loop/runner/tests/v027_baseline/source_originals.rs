@@ -37,6 +37,7 @@ const SHARED: &str = "SharedSync-c11-history";
 const SHARED_PATH: &str = "shared-history.JPG";
 const SHARED_BYTES: &[u8] = b"shared distinct-owner history bytes";
 const SHARED_NEW_BYTES: &[u8] = MEDIA;
+const PRIMARY: &str = "PrimarySync";
 
 fn hex(bytes: &[u8]) -> String {
     data_encoding::HEXLOWER.encode(&Sha256::digest(bytes))
@@ -252,8 +253,18 @@ async fn run_c11_quiet(
     shared: &crate::auth::SharedSession,
     boundary: &'static str,
 ) -> (crate::sync_cycle::CycleResult, usize) {
+    run_c11_quiet_in_zone(db, root, shared, boundary, ZONE).await
+}
+
+async fn run_c11_quiet_in_zone(
+    db: Arc<SqliteStateDb>,
+    root: &std::path::Path,
+    shared: &crate::auth::SharedSession,
+    boundary: &'static str,
+    zone_name: &'static str,
+) -> (crate::sync_cycle::CycleResult, usize) {
     let session = ResetCycleSession {
-        zone: ZONE,
+        zone: zone_name,
         inventory: Arc::new(Vec::new()),
         full_queries: Arc::new(AtomicUsize::new(0)),
         changes: Arc::new(AtomicUsize::new(0)),
@@ -266,7 +277,7 @@ async fn run_c11_quiet(
         "https://synthetic.example/database/1/photos/production/private".into(),
         Arc::new(std::collections::HashMap::new()),
         Box::new(session),
-        Arc::new(zone()),
+        Arc::new(json!({"zoneName":zone_name,"ownerRecordName":"_defaultOwner"})),
         "private".into(),
         crate::retry::RetryConfig::default(),
     )
@@ -278,8 +289,8 @@ async fn run_c11_quiet(
         "com",
     ));
     let mut state = make_run_cycle_library_state_with_passes(
-        ZONE,
-        &sync_token_key(ZONE),
+        zone_name,
+        &sync_token_key(zone_name),
         vec![crate::commands::AlbumPass {
             kind: crate::commands::PassKind::Unfiled,
             album: library.all(),
@@ -376,6 +387,26 @@ struct MissingSeed {
 }
 
 async fn seed_missing_original() -> MissingSeed {
+    seed_missing_originals(1, ZONE).await
+}
+
+fn original_identity(index: usize) -> (String, String, String) {
+    if index == 0 {
+        (
+            "original-master".into(),
+            "asset-original-child".into(),
+            "original.JPG".into(),
+        )
+    } else {
+        (
+            format!("original-master-{index}"),
+            format!("asset-original-child-{index}"),
+            format!("original-{index}.JPG"),
+        )
+    }
+}
+
+async fn seed_missing_originals(count: usize, zone_name: &str) -> MissingSeed {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("photos");
     std::fs::create_dir_all(&root).unwrap();
@@ -390,35 +421,50 @@ async fn seed_missing_original() -> MissingSeed {
     {
         let conn = rusqlite::Connection::open(&source).unwrap();
         crate::state::schema::migrate_genuine_v36(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,added_at,\
+        for index in 0..count {
+            let (master, child, filename) = original_identity(index);
+            let path = root.join(&filename);
+            conn.execute(
+                "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,added_at,\
              size_bytes,media_type,status,downloaded_at,local_path,last_seen_at,\
              local_checksum,download_checksum,download_attempts,last_error,source) \
-             VALUES(?1,'original-master','original',?2,'original.JPG',1700000000,1700000002,\
-             ?3,'photo','pending',1700000003,?4,1700000004,?5,?5,1,\
+             VALUES(?1,?2,'original',?3,?4,1700000000,1700000002,\
+             ?5,'photo','pending',1700000003,?6,1700000004,?7,?7,1,\
              'interrupted publication','icloud')",
-            rusqlite::params![
-                ZONE,
-                checksum,
-                MEDIA.len() as i64,
-                recorded.to_str().unwrap(),
-                local
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO asset_metadata_paths(library,id,version_size,local_path,\
+                rusqlite::params![
+                    zone_name,
+                    master,
+                    checksum,
+                    filename,
+                    MEDIA.len() as i64,
+                    path.to_str().unwrap(),
+                    local
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO asset_metadata_paths(library,id,version_size,local_path,\
              provider_checksum,local_checksum,download_checksum,source_checksum) \
-             VALUES(?1,'original-master','original',?2,?3,?4,?4,?4)",
-            rusqlite::params![ZONE, recorded.to_str().unwrap(), checksum, local],
-        )
-        .unwrap();
-        conn.execute_batch(&format!(
-            "INSERT INTO asset_master_mappings VALUES ('{ZONE}','asset-original-child','original-master',1700000000);
-             INSERT INTO legacy_master_state_owners VALUES ('{ZONE}','original-master','asset-original-child',1700000000);
-             INSERT INTO asset_metadata_capture_revisions VALUES ('{ZONE}','original-master',1,1700000000);"
-        ))
-        .unwrap();
+             VALUES(?1,?2,'original',?3,?4,?5,?5,?5)",
+                rusqlite::params![zone_name, master, path.to_str().unwrap(), checksum, local],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO asset_master_mappings VALUES (?1,?2,?3,1700000000)",
+                rusqlite::params![zone_name, child, master],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO legacy_master_state_owners VALUES (?1,?2,?3,1700000000)",
+                rusqlite::params![zone_name, master, child],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO asset_metadata_capture_revisions VALUES (?1,?2,1,1700000000)",
+                rusqlite::params![zone_name, master],
+            )
+            .unwrap();
+        }
         conn.execute(
             "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,added_at,\
              size_bytes,media_type,status,downloaded_at,local_path,last_seen_at,\
@@ -451,13 +497,39 @@ async fn seed_missing_original() -> MissingSeed {
              INSERT INTO asset_master_mappings VALUES ('{SHARED}','asset-shared-old-master','shared-old-master',1700000000);"
         ))
         .unwrap();
+        if count > 1 {
+            let same_path = root.join("shared-same.JPG");
+            std::fs::write(&same_path, MEDIA).unwrap();
+            conn.execute(
+                "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,added_at,\
+                 size_bytes,media_type,status,downloaded_at,local_path,last_seen_at,\
+                 local_checksum,download_checksum,source) VALUES(?1,'shared-same-master',\
+                 'original',?2,'shared-same.JPG',1700000000,1700000002,?3,'photo',\
+                 'downloaded',1700000003,?4,1700000004,?5,?5,'icloud')",
+                rusqlite::params![
+                    SHARED,
+                    checksum,
+                    MEDIA.len() as i64,
+                    same_path.to_str().unwrap(),
+                    local
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO asset_metadata_paths(library,id,version_size,local_path,\
+                 provider_checksum,local_checksum,download_checksum,source_checksum) \
+                 VALUES(?1,'shared-same-master','original',?2,?3,?4,?4,?4)",
+                rusqlite::params![SHARED, same_path.to_str().unwrap(), checksum, local],
+            )
+            .unwrap();
+        }
         for index in 0..100 {
             conn.execute(
                 "INSERT INTO unresolved_sparse_identities(library,source_record_name,\
                  original_evidence,observed_evidence,generation,first_seen_at,last_outcome) \
                  VALUES(?1,?2,?3,?3,1,1000,NULL)",
                 rusqlite::params![
-                    ZONE,
+                    zone_name,
                     format!("old-sparse-{index:03}"),
                     "[\"synthetic-released-shape\"]"
                 ],
@@ -466,7 +538,7 @@ async fn seed_missing_original() -> MissingSeed {
         }
         conn.execute(
             "INSERT INTO metadata VALUES(?1,?2)",
-            rusqlite::params![format!("sync_token:{ZONE}"), OLD_TOKEN],
+            rusqlite::params![format!("sync_token:{zone_name}"), OLD_TOKEN],
         )
         .unwrap();
         conn.execute(
@@ -746,6 +818,504 @@ async fn released_pending_missing_original_downloads_once_with_new_primary_item(
         hashes_before_quiet
     );
     drop(db);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OriginalProof {
+    Complete,
+    WrongSource,
+}
+
+#[derive(Clone)]
+struct SixOriginalSession {
+    inner: ResetCycleSession,
+    requests: Arc<Mutex<Vec<(String, Value)>>>,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for SixOriginalSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        let request: Value = serde_json::from_str(&body)?;
+        assert!(url.contains("/private/"), "{url}");
+        if url.contains("/records/query?") || url.contains("/records/lookup?") {
+            assert_eq!(
+                request["zoneID"],
+                json!({"zoneName":PRIMARY,"ownerRecordName":"_defaultOwner"})
+            );
+        }
+        if url.contains("/changes/zone?") {
+            assert_eq!(
+                request["zones"][0]["zoneID"],
+                json!({"zoneName":PRIMARY,"ownerRecordName":"_defaultOwner"})
+            );
+            assert!(
+                matches!(
+                    request["zones"][0]["syncToken"].as_str(),
+                    Some("c11-primary-before" | "reset-after-0")
+                ),
+                "baseline bridge must use the current Primary boundary: {request}"
+            );
+        }
+        self.requests
+            .lock()
+            .unwrap()
+            .push((url.to_owned(), request));
+        self.inner.post(url, body, headers).await
+    }
+
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+fn primary_receipts(conn: &rusqlite::Connection) -> Vec<String> {
+    conn.prepare("SELECT json_array(account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE library=?1 ORDER BY child,native_path")
+        .unwrap().query_map([PRIMARY], |row| row.get(0)).unwrap()
+        .collect::<rusqlite::Result<_>>().unwrap()
+}
+
+fn assert_primary_ledger(
+    conn: &rusqlite::Connection,
+    seed: &MissingSeed,
+    child: &str,
+    master: &str,
+    state_id: &str,
+    path: &std::path::Path,
+) {
+    let native = crate::state::db::provider_selection::SelectionPath::from_path(path)
+        .key()
+        .unwrap();
+    let owner = baseline_owner();
+    let (account, provider) = owner.authenticated_keys().unwrap();
+    let scope = serde_json::to_string(&json!({"format":1,"realm":"com","container":"com.apple.photos.cloud","environment":"production","database":"private","zone":{"zoneName":PRIMARY,"ownerRecordName":"_defaultOwner"}})).unwrap();
+    let (generation, pass, specification, sealed, ready): (String, String, Vec<u8>, i64, i64) = conn.query_row(
+        "SELECT g.id,d.pass_key,g.specification,g.sealed,g.checkpoint_ready FROM provider_active_generations g JOIN provider_active_decisions d ON d.generation=g.id JOIN provider_active_destinations w ON w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child JOIN download_receipts r ON r.library=w.library AND r.child=w.child AND r.master=w.master AND r.state_id=w.asset_id AND r.native_path=w.path AND r.origin_pass=d.pass_key WHERE g.account_key=?1 AND g.provider_key=?2 AND g.scope=?3 AND d.child=?4 AND d.outcome='selected' AND d.admission='admitted' AND w.library=?5 AND w.asset_id=?6 AND w.master=?7 AND w.version_size='original' AND w.path=?8 AND w.compat_path=?9 AND w.checksum=?10 AND w.size_bytes=?11 AND w.admitted=1 AND w.verified_media=1 AND w.local_checksum=?12 AND w.source_checksum=?12 AND r.account_key=?1 AND r.provider_key=?2 AND r.scope=?3 AND r.provider_checksum=?10 AND r.provider_size=?11 AND r.source_checksum=?12 AND r.local_checksum=?12",
+        rusqlite::params![account,provider,scope,child,PRIMARY,state_id,master,native,path.to_str().unwrap(),seed.checksum,MEDIA.len() as i64,seed.local],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+    ).unwrap_or_else(|error| panic!("missing exact current ledger for {child}: {error}"));
+    let spec: Value = serde_json::from_slice(&specification).unwrap();
+    assert_eq!(spec["format"], 2, "{spec}");
+    assert_eq!(
+        spec["zone"],
+        json!({"zoneName":PRIMARY,"ownerRecordName":"_defaultOwner"})
+    );
+    assert_eq!(spec["scope"], scope);
+    assert!(
+        spec["profile"]["passes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["key"] == pass && p["kind"] == "Unfiled"),
+        "pass={pass} spec={spec}"
+    );
+    assert!(!generation.is_empty());
+    assert_eq!((sealed, ready), (1, 1), "generation {generation}");
+}
+
+async fn six_originals_control(proof: OriginalProof) {
+    let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
+    let seed = seed_missing_originals(6, PRIMARY).await;
+    assert_eq!(seed.sparse_before.len(), 100);
+    let same_path = seed.root.join("shared-same.JPG");
+    let same_mtime = std::fs::metadata(&same_path).unwrap().modified().unwrap();
+    assert_eq!(std::fs::read(&same_path).unwrap(), MEDIA);
+    let server = crate::start_wiremock_or_skip!();
+    let mut inventory = Vec::new();
+    for index in 0..6 {
+        let (master, child, filename) = original_identity(index);
+        assert!(!seed.root.join(&filename).exists());
+        let endpoint = format!("/original-{index}");
+        Mock::given(method("GET"))
+            .and(path(&endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .expect(if proof == OriginalProof::WrongSource && index == 0 {
+                0
+            } else {
+                1
+            })
+            .mount(&server)
+            .await;
+        let mut records = pair(
+            &master,
+            &filename,
+            &format!("{}{endpoint}", server.uri()),
+            31,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(seed.checksum);
+        records[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+        records[1]["recordName"] = json!(child);
+        records[1]["fields"]["masterRef"]["value"]["zoneID"] =
+            json!({"zoneName":PRIMARY,"ownerRecordName":"_defaultOwner"});
+        if proof == OriginalProof::WrongSource && index == 0 {
+            records[1]["fields"]["masterRef"]["value"]["zoneID"] = zone_for(SHARED);
+        }
+        inventory.extend(records);
+    }
+    Mock::given(method("GET"))
+        .and(path("/new"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut new_item = pair(
+        "new-current",
+        "new.JPG",
+        &format!("{}/new", server.uri()),
+        32,
+    );
+    new_item[1]["fields"]["masterRef"]["value"]["zoneID"] =
+        json!({"zoneName":PRIMARY,"ownerRecordName":"_defaultOwner"});
+    new_item[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(seed.checksum);
+    new_item[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+    inventory.extend(new_item);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let session = SixOriginalSession {
+        inner: ResetCycleSession {
+            zone: PRIMARY,
+            inventory: Arc::new(inventory),
+            full_queries: Arc::new(AtomicUsize::new(0)),
+            changes: Arc::new(AtomicUsize::new(0)),
+            fail_full: false,
+            auth_expired: false,
+            boundary: "c11-primary-before",
+        },
+        requests: Arc::clone(&requests),
+    };
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&seed.db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let old_pending = {
+        let conn = db
+            .acquire_lock("inspect six-original initial state")
+            .unwrap();
+        let receipts: i64 = conn
+            .query_row("SELECT count(*) FROM download_receipts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(receipts, 0);
+        conn.query_row("SELECT status,local_path,checksum,size_bytes,local_checksum,download_checksum FROM assets WHERE library=?1 AND id='original-master' AND version_size='original'", [PRIMARY], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, String>(2)?,r.get::<_, i64>(3)?,r.get::<_, String>(4)?,r.get::<_, String>(5)?))).unwrap()
+    };
+    assert_eq!(
+        db.get_metadata(&sync_token_key(PRIMARY)).await.unwrap(),
+        None
+    );
+    let mut library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/private".into(),
+        Arc::new(std::collections::HashMap::new()),
+        Box::new(session),
+        Arc::new(json!({"zoneName":PRIMARY,"ownerRecordName":"_defaultOwner"})),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db.clone(),
+        baseline_owner(),
+        "com",
+    ));
+    let plan = resolve_passes_for_scope(
+        &library,
+        &Selection::default(),
+        PassScope {
+            include_albums: false,
+            include_smart_folders: false,
+            include_unfiled: true,
+        },
+        &CollectionContext {
+            collection_album_names: BTreeSet::new(),
+            selected_smart_folder_names: Vec::new(),
+        },
+        &[],
+    )
+    .await
+    .unwrap();
+    let mut state =
+        make_run_cycle_library_state_with_passes(PRIMARY, &sync_token_key(PRIMARY), plan.passes);
+    state.library = library;
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    let result = {
+        let base = make_run_cycle_download_config_builder(&seed.root, db.clone());
+        let builder = |mode, exclude, groups, zone| {
+            let mut config = (*base(mode, exclude, groups, zone)).clone();
+            config.folder_structure = "none".into();
+            Arc::new(config)
+        };
+        run_cycle(
+            &[&state],
+            &make_run_cycle_config(),
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+    };
+    eprintln!(
+        "six-original {proof:?}: downloaded={}, failed={}, state_write_failures={}",
+        result.stats.downloaded, result.failed_count, result.stats.state_write_failures
+    );
+    if proof == OriginalProof::WrongSource {
+        assert!(
+            trace
+                .events()
+                .iter()
+                .any(|event| event.level == tracing::Level::WARN
+                    && event
+                        .fields
+                        .get("message")
+                        .is_some_and(|message| message
+                            .contains("Could not persist deferred current identity"))
+                    && event.fields.get("state_error").is_some_and(
+                        |error| error.contains("Ambiguous or mismatched current lookup scope")
+                    ))
+        );
+    }
+    assert_eq!(
+        result.stats.downloaded,
+        if proof == OriginalProof::Complete {
+            7
+        } else {
+            6
+        },
+        "{result:?}"
+    );
+    let (current_token, receipts_before_quiet) = {
+        let conn = db.acquire_lock("inspect six-original outcomes").unwrap();
+        for index in 0..6 {
+            let (master, child, filename) = original_identity(index);
+            let path = seed.root.join(filename);
+            if proof == OriginalProof::WrongSource && index == 0 {
+                assert!(!path.exists());
+                let status: String = conn.query_row("SELECT status FROM assets WHERE library=?1 AND id=?2 AND version_size='original'", rusqlite::params![PRIMARY, master], |r| r.get(0)).unwrap();
+                assert_eq!(status, "pending");
+                let receipts: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM download_receipts WHERE library=?1 AND child=?2",
+                        rusqlite::params![PRIMARY, child],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(receipts, 0);
+                continue;
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), MEDIA);
+            let (status, saved_path): (String, String) = conn.query_row("SELECT status,local_path FROM assets WHERE library=?1 AND id=?2 AND version_size='original'", rusqlite::params![PRIMARY, master], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            assert_eq!(status, "downloaded");
+            assert_eq!(saved_path, path.to_str().unwrap());
+            let native = crate::state::db::provider_selection::SelectionPath::from_path(&path)
+                .key()
+                .unwrap();
+            let receipts: i64 = conn.query_row("SELECT count(*) FROM download_receipts WHERE library=?1 AND child=?2 AND master=?3 AND state_id=?3 AND version_size='original' AND native_path=?4 AND provider_checksum=?5 AND provider_size=?6 AND source_checksum=?7 AND local_checksum=?7", rusqlite::params![PRIMARY, child, master, native, seed.checksum, MEDIA.len() as i64, seed.local], |r| r.get(0)).unwrap();
+            assert_eq!(receipts, 1, "receipt for {master}");
+            if proof == OriginalProof::Complete {
+                assert_primary_ledger(&conn, &seed, &child, &master, &master, &path);
+            }
+        }
+        assert_eq!(std::fs::read(seed.root.join("new.JPG")).unwrap(), MEDIA);
+        let new_native = crate::state::db::provider_selection::SelectionPath::from_path(
+            &seed.root.join("new.JPG"),
+        )
+        .key()
+        .unwrap();
+        let new_receipts: i64 = conn.query_row("SELECT count(*) FROM download_receipts WHERE library=?1 AND child='asset-new-current' AND master='new-current' AND state_id='asset-new-current' AND version_size='original' AND native_path=?2 AND provider_checksum=?3 AND provider_size=?4 AND source_checksum=?5 AND local_checksum=?5", rusqlite::params![PRIMARY, new_native, seed.checksum, MEDIA.len() as i64, seed.local], |r| r.get(0)).unwrap();
+        assert_eq!(
+            new_receipts, 1,
+            "new Primary item has its own current proof"
+        );
+        if proof == OriginalProof::Complete {
+            assert_primary_ledger(
+                &conn,
+                &seed,
+                "asset-new-current",
+                "new-current",
+                "asset-new-current",
+                &seed.root.join("new.JPG"),
+            );
+        }
+        let decisions: Vec<String> = conn.prepare("SELECT child||'|'||outcome||'|'||admission||'|'||reason FROM provider_active_decisions ORDER BY child").unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        let epoch: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [crate::state::db::sync_epoch::library_key(PRIMARY)],
+                |r| r.get(0),
+            )
+            .ok();
+        let current_token: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [sync_token_key(PRIMARY)],
+                |r| r.get(0),
+            )
+            .ok();
+        if proof == OriginalProof::Complete {
+            assert_eq!(result.failed_count, 0, "{result:?}");
+            assert_eq!(current_token.as_deref(), Some("reset-after-0"));
+            let epoch: Value = serde_json::from_str(epoch.as_deref().unwrap()).unwrap();
+            assert_eq!(epoch["library"], PRIMARY);
+            assert_eq!(epoch["state"], "complete");
+            assert_eq!(epoch["reason"], "existing_upgrade");
+            assert_eq!(decisions.len(), 7);
+        } else {
+            assert!(!result.db_sync_token_advance_safe, "{result:?}");
+            assert_eq!(current_token, None);
+            assert!(requests.lock().unwrap().iter().any(|(url, body)| {
+                url.contains("/records/lookup?")
+                    && body["records"].as_array().is_some_and(|items| {
+                        items
+                            .iter()
+                            .any(|item| item["recordName"] == "asset-original-child")
+                    })
+            }));
+        }
+        let old_sparse: Vec<_> = sparse_rows(&conn).into_iter().filter(|row| matches!(&row[1], rusqlite::types::Value::Text(name) if name.starts_with("old-sparse-"))).collect();
+        assert_eq!(old_sparse, seed.sparse_before);
+        if proof == OriginalProof::WrongSource {
+            let current: Vec<_> = sparse_rows(&conn).into_iter().filter(|row| !matches!(&row[1], rusqlite::types::Value::Text(name) if name.starts_with("old-sparse-"))).collect();
+            assert!(
+                current.is_empty(),
+                "foreign observation must not mint current sparse identity"
+            );
+            assert!(
+                !decisions
+                    .iter()
+                    .any(|decision| decision.starts_with("asset-original-child|"))
+            );
+            assert!(result.failed_count > 0, "{result:?}");
+            assert_eq!(result.stats.state_write_failures, 2, "{result:?}");
+            assert!(result.stats.identity_incomplete, "{result:?}");
+        }
+        assert_eq!(shared_rows(&conn), seed.shared_before);
+        (current_token, primary_receipts(&conn))
+    };
+    let hashes = (
+        db.get_metadata(crate::download::DOWNLOAD_CONFIG_HASH_KEY)
+            .await
+            .unwrap(),
+        db.get_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY)
+            .await
+            .unwrap(),
+    );
+    drop(state);
+    drop(db);
+    if proof == OriginalProof::Complete {
+        for boundary in ["six-original-quiet-1", "six-original-quiet-2"] {
+            let reopened = Arc::new(
+                SqliteStateDb::open_owned(&seed.db_path, &baseline_owner())
+                    .await
+                    .unwrap(),
+            );
+            let (quiet, full) = run_c11_quiet_in_zone(
+                Arc::clone(&reopened),
+                &seed.root,
+                &shared_session,
+                boundary,
+                PRIMARY,
+            )
+            .await;
+            assert_eq!(quiet.failed_count, 0, "{quiet:?}");
+            assert_eq!(quiet.stats.downloaded, 0, "{quiet:?}");
+            assert_eq!(full, 0, "{quiet:?}");
+            assert_eq!(
+                (
+                    reopened
+                        .get_metadata(crate::download::DOWNLOAD_CONFIG_HASH_KEY)
+                        .await
+                        .unwrap(),
+                    reopened
+                        .get_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY)
+                        .await
+                        .unwrap()
+                ),
+                hashes
+            );
+            assert_eq!(
+                reopened
+                    .get_metadata(&sync_token_key(PRIMARY))
+                    .await
+                    .unwrap(),
+                current_token
+            );
+            let conn = reopened
+                .acquire_lock("inspect quiet primary receipts")
+                .unwrap();
+            assert_eq!(primary_receipts(&conn), receipts_before_quiet);
+            assert_eq!(sparse_rows(&conn), seed.sparse_before);
+            assert_eq!(shared_rows(&conn), seed.shared_before);
+        }
+    } else {
+        let reopened = SqliteStateDb::open_owned(&seed.db_path, &baseline_owner())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .get_metadata(&sync_token_key(PRIMARY))
+                .await
+                .unwrap(),
+            None
+        );
+        let conn = reopened
+            .acquire_lock("inspect retained foreign-source refusal")
+            .unwrap();
+        let retained = conn.query_row("SELECT status,local_path,checksum,size_bytes,local_checksum,download_checksum FROM assets WHERE library=?1 AND id='original-master' AND version_size='original'", [PRIMARY], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, String>(2)?,r.get::<_, i64>(3)?,r.get::<_, String>(4)?,r.get::<_, String>(5)?))).unwrap();
+        assert_eq!(retained, old_pending);
+        let epoch_state: String = conn
+            .query_row(
+                "SELECT json_extract(value,'$.state') FROM metadata WHERE key=?1",
+                [crate::state::db::sync_epoch::library_key(PRIMARY)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(epoch_state, "pending");
+        let current: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM provider_active_decisions WHERE child='asset-original-child'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(current, 0);
+        let current: i64 = conn.query_row("SELECT count(*) FROM unresolved_sparse_identities WHERE library=?1 AND source_record_name='asset-original-child'", [PRIMARY], |r| r.get(0)).unwrap();
+        assert_eq!(current, 0);
+        let current: i64 = conn.query_row("SELECT count(*) FROM download_receipts WHERE library=?1 AND child='asset-original-child'", [PRIMARY], |r| r.get(0)).unwrap();
+        assert_eq!(current, 0);
+        assert!(!seed.recorded.exists());
+        assert_eq!(sparse_rows(&conn), seed.sparse_before);
+        assert_eq!(shared_rows(&conn), seed.shared_before);
+    }
+    assert_eq!(std::fs::read(&same_path).unwrap(), MEDIA);
+    assert_eq!(
+        std::fs::metadata(&same_path).unwrap().modified().unwrap(),
+        same_mtime
+    );
+    assert_eq!(std::fs::read(&seed.shared_path).unwrap(), SHARED_BYTES);
+    assert_eq!(
+        std::fs::metadata(&seed.shared_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        seed.shared_mtime
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn six_missing_originals_and_new_primary_recover() {
+    six_originals_control(OriginalProof::Complete).await;
+}
+
+#[tokio::test]
+async fn six_missing_originals_refuse_wrong_source_reference() {
+    six_originals_control(OriginalProof::WrongSource).await;
 }
 
 #[tokio::test]
