@@ -5424,6 +5424,8 @@ mod legacy_scale;
 mod operational_holds;
 #[path = "v027_baseline/operational_holds_mixed.rs"]
 mod operational_holds_mixed;
+#[path = "v027_baseline/operational_preservation_hold.rs"]
+mod operational_preservation_hold;
 #[path = "v027_baseline/preservation_hold_owner.rs"]
 mod preservation_hold_owner;
 pub(super) mod released_schema;
