@@ -812,7 +812,7 @@ impl SqliteStateDb {
                 || owner_provider != provider_key
                 || request.plan.account != account_key
                 || request.plan.provider != provider_key
-                || request.plan.database != "private"
+                || !matches!(request.plan.database.as_str(), "private" | "shared")
                 || request.plan.zone.get("zoneName").and_then(serde_json::Value::as_str)
                     != Some(request.library.as_str())
                 || request.plan.zone.get("ownerRecordName").and_then(serde_json::Value::as_str)
@@ -825,7 +825,7 @@ impl SqliteStateDb {
             }
             let plan_scope: serde_json::Value = serde_json::from_str(&request.plan.scope)
                 .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
-            if plan_scope.get("zone") != Some(&request.plan.zone)
+            if ["zoneName", "ownerRecordName"].iter().any(|field| plan_scope.pointer(&format!("/zone/{field}")) != request.plan.zone.get(*field))
                 || plan_scope.get("database").and_then(serde_json::Value::as_str)
                     != Some(request.plan.database.as_str())
                 || request.plan.profile.get("passes")
@@ -837,6 +837,29 @@ impl SqliteStateDb {
                     operation: "install_fresh_catalog_origin",
                     detail: "catalog source scope changed".into(),
                 });
+            }
+            let projection = crate::icloud::photos::PhotoLibrary::provider_scope_projection(&request.plan.scope)
+                .ok_or(StateError::ProviderSelectionInvalid)?;
+            if projection != (
+                request.library.clone(),
+                request.plan.zone.get("ownerRecordName").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(),
+                request.plan.database.clone(),
+            ) {
+                return Err(StateError::ProviderSelectionInvalid);
+            }
+            let spec = super::provider_generations::GenerationSpec {
+                format: 2,
+                scope: request.plan.scope.clone(),
+                zone: request.plan.zone.clone(),
+                config_hash: request.plan.config_hash.clone(),
+                basis: request.plan.config_hash.clone(),
+                profile: request.plan.profile.clone(),
+                metadata_enabled: request.plan.metadata_enabled,
+                metadata_flags: request.plan.metadata_flags,
+            };
+            super::provider_generations::validate_catalog_plan(&tx, &spec, &request.library)?;
+            if super::provider_generations::observation::policy(&tx)?[0].as_deref() != Some(request.enum_hash.as_str()) {
+                return Err(StateError::ProviderSelectionInvalid);
             }
             let required = [
                 super::sync_epoch::SYNC_EPOCH_KEY.to_owned(),
@@ -876,7 +899,7 @@ impl SqliteStateDb {
             }
             let library_record = super::sync_epoch::read_library(&tx, &request.library)?
                 .ok_or(StateError::SyncEpochMismatch)?;
-            if library_record.state != "complete"
+            if !matches!(library_record.state.as_str(), "complete" | "pending")
                 || library_record.epoch != epoch.epoch
                 || library_record.attempt != request.expected_attempt
                 || library_record.baseline_scope != format!("{:x}", Sha256::digest(serde_json::json!({"database":request.plan.database,"zone":request.plan.zone}).to_string().as_bytes()))
@@ -935,7 +958,7 @@ impl SqliteStateDb {
                 });
             }
             let digest = fresh_catalog_plan_digest(&request.plan);
-            if !super::provider_generations::observation::catalog_active_plan_matches(
+            if library_record.state == "complete" && !super::provider_generations::observation::catalog_active_plan_matches(
                 &tx,
                 &request.library,
                 &digest,

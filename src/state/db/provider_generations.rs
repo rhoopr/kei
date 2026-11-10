@@ -299,6 +299,16 @@ fn validate_spec(spec: &GenerationSpec) -> Result<(), StateError> {
     Ok(())
 }
 
+pub(super) fn validate_catalog_plan(
+    conn: &Connection,
+    spec: &GenerationSpec,
+    library: &str,
+) -> Result<(), StateError> {
+    validate_spec(spec)?;
+    selector_binding::validate_owner(conn, spec)?;
+    guard_library_scope(conn, &spec.scope, library)
+}
+
 type DestinationProofRow = (
     Option<String>,
     Option<String>,

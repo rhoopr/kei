@@ -497,6 +497,475 @@ async fn catalog_optional_stale_carried_link_does_not_block_delta() {
     assert_eq!(row, ("abandoned".into(), 42));
 }
 
+#[tokio::test]
+async fn catalog_pending_shared_full_zone_install_and_required_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    prepare_existing_owned_database_for_test(&path, &owner()).unwrap();
+    let db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
+    db.set_metadata("enum_config_hash", "policy").await.unwrap();
+    let name = "SharedSync-example";
+    let zone = serde_json::json!({"zoneName":name,"ownerRecordName":"shared-owner", "zoneType":"extra-field"});
+    let mock = MockPhotosSession::new()
+        .ok(serde_json::json!({"records":[{"recordName":"index","recordType":"CheckIndexingState","fields":{"state":{"value":"FINISHED"}}}]}))
+        .ok(serde_json::json!({"zones":[{"zoneID":zone,"syncToken":"shared-boundary"}]}));
+    let mut library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/shared".into(),
+        Arc::new(HashMap::new()),
+        Box::new(mock),
+        Arc::new(zone.clone()),
+        "shared".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    library.shadow_capture = Some(ShadowCapture::new(db.clone(), owner(), "com"));
+    let hidden = library.albums().await.unwrap().remove("Hidden").unwrap();
+    let passes = vec![
+        AlbumPass {
+            kind: PassKind::SmartFolder,
+            album: hidden,
+            exclude_ids: Arc::default(),
+        },
+        AlbumPass {
+            kind: PassKind::Unfiled,
+            album: library.all(),
+            exclude_ids: Arc::default(),
+        },
+    ];
+    let mut config = DownloadConfig::test_default();
+    config.directory = Arc::from(dir.path());
+    config.state_db = Some(db.clone());
+    config.library = Arc::from(name);
+    let context = catalog_plan_context_for_source(
+        &passes,
+        &config,
+        DownloadControls::download_hidden(),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(context.passes.len(), 2);
+    let plan = FreshCatalogPlan {
+        account: context.account.clone(),
+        provider: context.provider.clone(),
+        database: context.database.clone(),
+        zone: context.zone.clone(),
+        scope: context.scope.clone(),
+        config_hash: context.config_hash.clone(),
+        metadata_enabled: context.metadata_enabled,
+        metadata_flags: context.metadata_flags,
+        profile: context.profile.clone(),
+        passes: context
+            .passes
+            .iter()
+            .map(|p| FreshCatalogPass {
+                key: p.key.clone(),
+                kind: p.kind.clone(),
+                scope: p.scope.clone(),
+                excludes: p.excludes.clone(),
+            })
+            .collect(),
+    };
+    let scope = library.baseline_scope();
+    db.enroll_sync_epoch(vec![(name.into(), scope.clone())])
+        .await
+        .unwrap();
+    let attempt = match db
+        .sync_epoch_gate(name.into(), scope.clone(), None)
+        .await
+        .unwrap()
+    {
+        crate::state::SyncEpochGate::Baseline { attempt } => attempt,
+        other => panic!("expected initial pending attempt, got {other:?}"),
+    };
+    let epoch = {
+        let conn = db.acquire_lock("read initial shared epoch").unwrap();
+        crate::state::db::sync_epoch::validate(&conn).unwrap().epoch
+    };
+    let baseline_key = format!("baseline_cursor:v27:{epoch}:{scope}:policy:");
+    let old = CatalogOrigin::new(
+        crate::state::db::source_revalidation::fresh_catalog_plan_digest(&plan),
+        epoch.clone(),
+        attempt.clone(),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .unwrap();
+    for id in ["census-a", "census-z"] {
+        let asset = crate::test_helpers::TestAssetRecord::new(id)
+            .library(name)
+            .build();
+        let media = dir.path().join(format!("{id}.jpg"));
+        std::fs::write(&media, b"retained media").unwrap();
+        db.upsert_seen(&asset).await.unwrap();
+        db.mark_downloaded(name, id, "original", &media, "synthetic", None)
+            .await
+            .unwrap();
+    }
+    {
+        let conn = db.acquire_lock("seed retained shared debt").unwrap();
+        conn.execute("INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES(?1,?2,?3,'policy','old-boundary','high','after','observing','catalog_v2')", rusqlite::params![old.nonce,name,old.scope()]).unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES(?1,'retained',42)",
+            [&old.nonce],
+        )
+        .unwrap();
+    }
+    let token_key = format!("sync_token:v27:{name}");
+    let proof_key = format!("observed_selection:v27:{name}");
+    let mut expected_metadata = Vec::new();
+    for key in [
+        crate::state::db::sync_epoch::SYNC_EPOCH_KEY.to_owned(),
+        crate::state::db::sync_epoch::library_key(name),
+        "enum_config_hash".into(),
+        "pending_enum_config_hash".into(),
+        "config_hash".into(),
+        "pending_download_config_hash".into(),
+        token_key.clone(),
+        proof_key.clone(),
+        format!("download_ledger_scope:{name}"),
+    ] {
+        expected_metadata.push((key.clone(), db.get_metadata(&key).await.unwrap()));
+    }
+    let snapshot = db
+        .fresh_catalog_snapshot(owner(), name.into())
+        .await
+        .unwrap();
+    let cursor = library.fresh_baseline_cursor().await.unwrap();
+    let request = FreshCatalogOriginRequest {
+        library: name.into(),
+        plan: plan.clone(),
+        baseline_key: baseline_key.clone(),
+        preservation_config_hash: String::new(),
+        expected_baseline: None,
+        fresh_cursor: cursor.clone(),
+        enum_hash: "policy".into(),
+        expected_epoch: epoch.clone(),
+        expected_attempt: attempt.clone(),
+        expected_metadata,
+        expected_catalog_snapshot: snapshot,
+    };
+    for changed in [
+        {
+            let mut r = request.clone();
+            r.plan.database = "private".into();
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.plan.zone["ownerRecordName"] = serde_json::json!("wrong-owner");
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.plan.account = "wrong-pin".into();
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.expected_attempt = uuid::Uuid::new_v4().to_string();
+            r
+        },
+        {
+            let mut r = request.clone();
+            r.expected_catalog_snapshot = "stale".into();
+            r
+        },
+    ] {
+        assert!(
+            db.install_fresh_catalog_origin(owner(), changed)
+                .await
+                .is_err()
+        );
+    }
+    {
+        let conn = db
+            .acquire_lock("inject shared baseline write fault")
+            .unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_shared_baseline BEFORE INSERT ON metadata WHEN NEW.key LIKE 'baseline_cursor:v27:%' BEGIN SELECT RAISE(ABORT,'baseline fault'); END").unwrap();
+    }
+    assert!(
+        db.install_fresh_catalog_origin(owner(), request.clone())
+            .await
+            .is_err()
+    );
+    {
+        let conn = db.acquire_lock("clear shared fault").unwrap();
+        conn.execute_batch("DROP TRIGGER fail_shared_baseline")
+            .unwrap();
+    }
+    let reopened = SqliteStateDb::open_owned(&path, &owner()).await.unwrap();
+    assert_eq!(reopened.get_metadata(&baseline_key).await.unwrap(), None);
+    {
+        let conn = reopened
+            .acquire_lock("verify rolled back shared origin")
+            .unwrap();
+        let row:(i64,String,i64) = conn.query_row("SELECT (SELECT COUNT(*) FROM source_revalidation_rounds),r.phase,d.next_retry_at FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1", [&old.nonce], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(row, (1, "observing".into(), 42));
+    }
+    let origin = db
+        .install_fresh_catalog_origin(owner(), request.clone())
+        .await
+        .unwrap();
+    assert_eq!(db.get_metadata(&token_key).await.unwrap(), None);
+    assert_eq!(db.get_metadata(&proof_key).await.unwrap(), None);
+    {
+        let conn = db.acquire_lock("verify shared pending transfer").unwrap();
+        let row:(String,i64,String,String,String) = conn.query_row("SELECT r.phase,d.next_retry_at,(SELECT phase FROM source_revalidation_rounds WHERE id=?2),r.high_id,r.after_id FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1", rusqlite::params![origin.nonce,old.nonce], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+        assert_eq!(
+            row,
+            (
+                "marking".into(),
+                42,
+                "abandoned".into(),
+                "census-z".into(),
+                String::new()
+            )
+        );
+    }
+    db.seed_source_revalidation(
+        owner(),
+        name.into(),
+        origin.scope(),
+        "policy".into(),
+        CatalogOrigin::boundary(&cursor),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    {
+        let conn = db.acquire_lock("verify complete shared census").unwrap();
+        let (phase, count, retained): (String, i64, i64) = conn.query_row("SELECT r.phase,(SELECT COUNT(*) FROM source_revalidation_debt WHERE round=r.id),(SELECT next_retry_at FROM source_revalidation_debt WHERE round=r.id AND id='retained') FROM source_revalidation_rounds r WHERE r.id=?1", [&origin.nonce], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!((phase.as_str(), count, retained), ("observing", 3, 42));
+    }
+    // A resource selected by Primary is not authority to attach the Shared
+    // origin to Primary's checkpoint, even when the source is authenticated.
+    let mut primary_spec = spec();
+    primary_spec.profile["current_download_metadata"] = serde_json::json!(1);
+    let primary_root = db
+        .begin_selection_generation(owner(), primary_spec, BUDGET)
+        .await
+        .unwrap();
+    let primary_receipt = db
+        .seal_observed_selection(owner(), primary_root.id, true, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let primary_proof = ObservationProof::inventory(vec![primary_receipt.clone()])
+        .unwrap()
+        .bridge(
+            ObservationProof::delivery(primary_receipt)
+                .delta("primary-start", "primary-active")
+                .unwrap(),
+            "primary-start",
+        )
+        .unwrap();
+    db.commit_observation_transition(
+        transition(&db, "primary-active").await,
+        Some(primary_proof),
+        false,
+    )
+    .await
+    .unwrap();
+    let prior_primary = db.get_metadata(PROOF).await.unwrap();
+    let primary_zone =
+        serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::new(HashMap::new()),
+            service_endpoint: Arc::from("https://synthetic.example/private"),
+            name: Arc::from("selected"),
+            list_type: Arc::from("CPLContainerRelationNotDeletedByAssetDate"),
+            obj_type: Arc::from("CPLContainerRelationNotDeletedByAssetDate"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(primary_zone),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: Some(Arc::from("selected-album")),
+            cross_zone_sources: vec![],
+        },
+        Box::new(MockPhotosSession::new()),
+    );
+    album.set_shadow_capture(
+        ShadowCapture::new(db.clone(), owner(), "com"),
+        Arc::from("private"),
+    );
+    let cross_pass = AlbumPass {
+        kind: PassKind::Album,
+        album: album.with_cross_zone_sources(vec![library.all()]),
+        exclude_ids: Arc::default(),
+    };
+    let mut primary_config = config.clone();
+    primary_config.library = Arc::from("PrimarySync");
+    let cross = catalog_plan_context_for_source(
+        &[cross_pass],
+        &primary_config,
+        DownloadControls::download_hidden(),
+        Some(name),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let cross_spec = GenerationSpec {
+        format: 2,
+        scope: cross.scope,
+        zone: cross.zone,
+        config_hash: cross.config_hash.clone(),
+        basis: cross.config_hash,
+        profile: cross.profile,
+        metadata_enabled: cross.metadata_enabled,
+        metadata_flags: cross.metadata_flags,
+    };
+    let cross_root = db
+        .begin_selection_generation(owner(), cross_spec, BUDGET)
+        .await
+        .unwrap();
+    let cross_receipt = db
+        .seal_observed_selection(owner(), cross_root.id, true, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let cross_proof = ObservationProof::inventory(vec![cross_receipt.clone()])
+        .unwrap()
+        .bridge(
+            ObservationProof::delivery(cross_receipt)
+                .delta(&cursor, "wrong-owner-token")
+                .unwrap(),
+            &cursor,
+        )
+        .unwrap()
+        .with_catalog_origin(origin.clone());
+    let mut cross_transition = transition(&db, "wrong-owner-token").await;
+    cross_transition
+        .expected_metadata
+        .push((baseline_key.clone(), Some(cursor.clone())));
+    assert!(
+        db.commit_observation_transition(cross_transition, Some(cross_proof), false)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        db.get_metadata(TOKEN).await.unwrap().as_deref(),
+        Some("primary-active")
+    );
+    assert_eq!(db.get_metadata(PROOF).await.unwrap(), prior_primary);
+    {
+        let conn = db.acquire_lock("verify cross-owner refusal").unwrap();
+        let (phase, count): (String, i64) = conn.query_row("SELECT r.phase,(SELECT COUNT(*) FROM source_revalidation_debt WHERE round=r.id) FROM source_revalidation_rounds r WHERE r.id=?1", [&origin.nonce], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!((phase.as_str(), count), ("observing", 3));
+    }
+    let spec = GenerationSpec {
+        format: 2,
+        scope: context.scope,
+        zone: context.zone,
+        config_hash: context.config_hash.clone(),
+        basis: context.config_hash,
+        profile: context.profile,
+        metadata_enabled: context.metadata_enabled,
+        metadata_flags: context.metadata_flags,
+    };
+    let root = db
+        .begin_selection_generation(owner(), spec, BUDGET)
+        .await
+        .unwrap();
+    let receipt = db
+        .seal_observed_selection(owner(), root.id, true, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let proof = ObservationProof::inventory(vec![receipt.clone()])
+        .unwrap()
+        .bridge(
+            ObservationProof::delivery(receipt)
+                .delta(&cursor, "shared-eof")
+                .unwrap(),
+            &cursor,
+        )
+        .unwrap()
+        .with_epoch_attempt(Some(attempt.clone()))
+        .with_catalog_origin(origin.clone());
+    let staged_key = format!("pending_sync_token:v27:policy:{name}");
+    let mut expected = Vec::new();
+    for key in [
+        "enum_config_hash",
+        "pending_enum_config_hash",
+        "config_hash",
+        "pending_download_config_hash",
+        token_key.as_str(),
+        staged_key.as_str(),
+        baseline_key.as_str(),
+    ] {
+        expected.push((key.into(), db.get_metadata(key).await.unwrap()));
+    }
+    let transition = CheckpointTransition {
+        expected_metadata: expected,
+        legacy_preservation_proofs: vec![],
+        legacy_config_hash: None,
+        sparse_identity_proofs: vec![],
+        metadata_updates: vec![(staged_key.clone(), "shared-eof".into())],
+        metadata_deletes: vec![],
+    };
+    db.commit_observation_transition(transition, Some(proof), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.sync_epoch_gate(name.into(), scope, None).await.unwrap(),
+        crate::state::SyncEpochGate::Promote { attempt }
+    );
+    let mut ready_request = request;
+    ready_request.expected_baseline = Some(cursor.clone());
+    ready_request.expected_catalog_snapshot = db
+        .fresh_catalog_snapshot(owner(), name.into())
+        .await
+        .unwrap();
+    for (key, value) in &mut ready_request.expected_metadata {
+        *value = db.get_metadata(key).await.unwrap();
+    }
+    assert!(
+        db.install_fresh_catalog_origin(owner(), ready_request)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        db.get_metadata(&baseline_key).await.unwrap().as_deref(),
+        Some(cursor.as_str())
+    );
+    let mut expected = Vec::new();
+    for key in [
+        "enum_config_hash",
+        "pending_enum_config_hash",
+        "config_hash",
+        "pending_download_config_hash",
+        token_key.as_str(),
+        staged_key.as_str(),
+        baseline_key.as_str(),
+    ] {
+        expected.push((key.to_owned(), db.get_metadata(key).await.unwrap()));
+    }
+    let promote = CheckpointTransition {
+        expected_metadata: expected,
+        legacy_preservation_proofs: vec![],
+        legacy_config_hash: None,
+        sparse_identity_proofs: vec![],
+        metadata_updates: vec![
+            (token_key.clone(), "shared-eof".into()),
+            ("enum_config_hash".into(), "policy".into()),
+        ],
+        metadata_deletes: vec![staged_key],
+    };
+    db.commit_observation_transition(promote, None, true)
+        .await
+        .unwrap();
+    let descriptor: Value =
+        serde_json::from_str(&db.get_metadata(&proof_key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(descriptor["revalidation_round"], origin.nonce);
+    assert_eq!(
+        db.get_metadata(&token_key).await.unwrap().as_deref(),
+        Some("shared-eof")
+    );
+}
+
 async fn strict_deleted_pair(db: Arc<SqliteStateDb>) -> CatalogSettlementAuthority {
     use crate::icloud::photos::{
         PhotoAlbum, PhotoAlbumConfig, ProviderRecordId, StrictCatalogPairResult,

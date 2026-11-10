@@ -678,6 +678,7 @@ pub(in crate::state::db) struct Prepared(Vec<(String, Descriptor)>);
 pub(in crate::state::db) struct RequiredCatalog {
     origin: crate::state::db::source_revalidation::CatalogOrigin,
     boundary: String,
+    baseline_scope: String,
     key: String,
     token_key: String,
     descriptor: Descriptor,
@@ -712,20 +713,23 @@ fn validate_required_catalog_row(
         .first()
         .and_then(Plan::selector)
         .ok_or_else(required_catalog_error)?;
-    let database = selector
-        .get("database")
-        .and_then(Value::as_str)
-        .ok_or_else(required_catalog_error)?;
-    let zone = selector.get("zone").ok_or_else(required_catalog_error)?;
-    let source_scope = digest(
-        json!({"database":database,"zone":zone})
-            .to_string()
-            .as_bytes(),
-    );
+    let selector_scope =
+        serde_json::to_string(&selector).map_err(|_invalid| required_catalog_error())?;
+    let selector_projection =
+        crate::icloud::photos::PhotoLibrary::provider_scope_projection(&selector_scope)
+            .ok_or_else(required_catalog_error)?;
+    if selector_projection.0 != descriptor.library
+        || descriptor.plans.iter().any(|plan| {
+            crate::icloud::photos::PhotoLibrary::provider_scope_projection(&plan.scope).as_ref()
+                != Some(&selector_projection)
+        })
+    {
+        return Err(required_catalog_error());
+    }
     if epoch.epoch != origin.epoch
         || record.epoch != epoch.epoch
         || record.attempt != origin.attempt
-        || record.baseline_scope != source_scope
+        || record.baseline_scope != required.baseline_scope
         || !matches!(record.state.as_str(), "pending" | "ready" | "complete")
     {
         return Err(required_catalog_error());
@@ -801,6 +805,7 @@ impl Prepared {
         let required = RequiredCatalog {
             origin: origin.clone(),
             boundary: prior.clone(),
+            baseline_scope: record.baseline_scope,
             key: key.clone(),
             token_key,
             descriptor: descriptor.clone(),
@@ -1094,7 +1099,7 @@ pub(in crate::state::db) fn apply(
                                 .is_some_and(|digest| digest == origin.plan_digest);
                         let epoch_matches = sync_epoch::read_library(conn, &value.library)?
                             .is_some_and(|record| {
-                                matches!(record.state.as_str(), "pending" | "complete")
+                                matches!(record.state.as_str(), "pending" | "ready" | "complete")
                                     && record.epoch == origin.epoch
                                     && record.attempt == origin.attempt
                             });
