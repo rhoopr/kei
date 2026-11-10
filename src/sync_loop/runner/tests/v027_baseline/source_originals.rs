@@ -8,6 +8,8 @@
 //! cannot supply that authority, the test must fail rather than seed current
 //! admission.
 
+mod current_delta;
+
 use super::{
     BaselineSession, MEDIA, OLD_TOKEN, ResetCycleSession, ZONE, baseline_owner, pair, zone,
 };
