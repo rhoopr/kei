@@ -2442,7 +2442,9 @@ async fn released_changed_master_has_no_original_destination_authority_36() {
 struct ProtectedSession {
     records: Arc<Vec<serde_json::Value>>,
     incremental: Arc<Vec<serde_json::Value>>,
+    zone_name: String,
     cycle: usize,
+    incremental_cycle: usize,
     inventories: Arc<AtomicUsize>,
 }
 
@@ -2456,8 +2458,10 @@ impl crate::icloud::photos::PhotosSession for ProtectedSession {
     ) -> anyhow::Result<serde_json::Value> {
         let request: serde_json::Value = serde_json::from_str(&body)?;
         if url.contains("/zones/list") {
-            return Ok(json!({"zones":[{"zoneID":zone(),
-                "syncToken":"protected-boundary","deleted":false}]}));
+            return Ok(
+                json!({"zones":[{"zoneID":{"zoneName":self.zone_name,"ownerRecordName":"_defaultOwner"},
+                "syncToken":"protected-boundary","deleted":false}]}),
+            );
         }
         if request["query"]["recordType"] == "CheckIndexingState" {
             return Ok(json!({"records":[{"recordName":"index",
@@ -2502,15 +2506,20 @@ impl crate::icloud::photos::PhotosSession for ProtectedSession {
             return Ok(json!({"records":records}));
         }
         if url.contains("/changes/zone?") {
-            let records = if self.cycle == 1 {
+            let records = if self.cycle == self.incremental_cycle
+                && (self.incremental_cycle != 0
+                    || request["zones"][0]["syncToken"] == "protected-boundary")
+            {
                 self.incremental.as_ref().clone()
             } else {
                 Vec::new()
             };
-            return Ok(json!({"zones":[{"zoneID":zone(),
+            return Ok(
+                json!({"zones":[{"zoneID":{"zoneName":self.zone_name,"ownerRecordName":"_defaultOwner"},
                 "records":records,
                 "syncToken":format!("protected-after-{}", self.cycle),
-                "moreComing":false}]}));
+                "moreComing":false}]}),
+            );
         }
         anyhow::bail!("unexpected protected-history endpoint: {url}")
     }
@@ -2712,7 +2721,9 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_protected_his
         let session = ProtectedSession {
             records: Arc::new(inventory.clone()),
             incremental: Arc::clone(&incremental),
+            zone_name: ZONE.to_string(),
             cycle,
+            incremental_cycle: 1,
             inventories: Arc::clone(&inventories),
         };
         let mut library = PhotoLibrary::new(
@@ -3034,7 +3045,9 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_preservation_
         let session = ProtectedSession {
             records: Arc::new(inventory.clone()),
             incremental: Arc::new(Vec::new()),
+            zone_name: ZONE.to_string(),
             cycle,
+            incremental_cycle: 1,
             inventories: Arc::clone(&inventories),
         };
         let mut library = PhotoLibrary::new(
@@ -4500,7 +4513,9 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_recovered_36(
         let session = ProtectedSession {
             records: Arc::new(inventory.clone()),
             incremental: Arc::new(Vec::new()),
+            zone_name: ZONE.to_string(),
             cycle,
+            incremental_cycle: 1,
             inventories: Arc::clone(&inventories),
         };
         let mut library = PhotoLibrary::new(
@@ -5331,5 +5346,508 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_relation_canc
 async fn released_relation_cancel_and_normal_replay_28() {
     super::PRESERVE_SHARED_CLAIMS
         .scope(true, Box::pin(exercise_released_relation_cancel()))
+        .await;
+}
+
+fn make_primary_unfiled_app_config() -> crate::config::Config {
+    let data_dir = tempfile::tempdir().unwrap();
+    let globals = crate::config::GlobalArgs {
+        username: Some("baseline@example.invalid".to_string()),
+        domain: None,
+        data_dir: Some(data_dir.path().to_string_lossy().into_owned()),
+    };
+    let mut sync = crate::cli::SyncArgs::default();
+    sync.config_overrides.albums = vec!["none".to_string()];
+    sync.config_overrides.libraries = vec!["primary".to_string()];
+    sync.config_overrides.unfiled = Some(true);
+    crate::config::Config::build(&globals, &crate::cli::PasswordArgs::default(), sync, None)
+        .unwrap()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stock28Catalog {
+    DownloadedCaptureHistory,
+    InconclusivePendingDownloads,
+}
+
+async fn exercise_stock28_old_debt(
+    old_assets: usize,
+    sparse_rows: usize,
+    capture_rows: usize,
+    catalog: Stock28Catalog,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    let protected = root.join("protected");
+    std::fs::create_dir_all(&protected).unwrap();
+    let old_path = protected.join("old.JPG");
+    let old_sidecar = protected.join("old.JPG.xmp");
+    let old_bytes = MEDIA.to_vec();
+    std::fs::write(&old_path, &old_bytes).unwrap();
+    std::fs::write(&old_sidecar, b"protected stock28 sidecar").unwrap();
+    let old_mtime = (
+        std::fs::metadata(&old_path).unwrap().modified().unwrap(),
+        std::fs::metadata(&old_sidecar).unwrap().modified().unwrap(),
+    );
+    let old_bytes_sha = sha256_hex(&old_bytes);
+    let mut old_catalog_files = Vec::new();
+
+    let source = dir.path().join("released.db");
+    let db_path = dir.path().join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        crate::state::schema::migrate_genuine_v28(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            28
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key LIKE 'sync_token%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key='sync_epoch:v1' OR key LIKE 'sync_epoch_library:v1:%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        insert_released_asset(
+            &conn,
+            "PrimarySync",
+            "old-protected-master",
+            "original",
+            "old.JPG",
+            &old_path,
+            &old_bytes,
+            &signature(&old_bytes),
+            true,
+        );
+        conn.execute_batch(
+            "INSERT INTO asset_master_mappings VALUES ('PrimarySync','old-protected-child','old-protected-master',1700000000);
+             INSERT INTO asset_metadata_capture_revisions VALUES ('PrimarySync','old-protected-master',1,1700000000);",
+        )
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            for index in 0..old_assets {
+                let id = format!("old-catalog-{index}");
+                let filename = format!("old-{index}.JPG");
+                if catalog == Stock28Catalog::InconclusivePendingDownloads {
+                    tx.execute(
+                        "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,source) \
+                         VALUES('PrimarySync',?1,'original',?2,?3,1700000000,1,'photo','pending',1700000000,'icloud')",
+                        rusqlite::params![id, format!("old-provider-{index}"), filename],
+                    ).unwrap();
+                } else {
+                    let path = protected.join(&filename);
+                    std::fs::write(&path, &old_bytes).unwrap();
+                    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                    insert_released_asset(
+                        &tx,
+                        "PrimarySync",
+                        &id,
+                        "original",
+                        &filename,
+                        &path,
+                        &old_bytes,
+                        &signature(&old_bytes),
+                        true,
+                    );
+                    old_catalog_files.push((path, modified));
+                }
+            }
+        }
+        {
+            let mut sparse = tx
+                .prepare(
+                    "INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at,last_outcome) \
+                     VALUES('PrimarySync',?1,'[malformed legacy evidence]','[malformed legacy evidence]',7,1000,'[invalid outcome')",
+                )
+                .unwrap();
+            for index in 0..sparse_rows {
+                sparse
+                    .execute(rusqlite::params![format!("old-sparse-{index}")])
+                    .unwrap();
+            }
+        }
+        {
+            for index in 0..capture_rows {
+                let (id, revision, evidence, last, next) =
+                    if catalog == Stock28Catalog::InconclusivePendingDownloads {
+                        (
+                            format!("old-capture-{index}"),
+                            0,
+                            "opaque old capture evidence".to_string(),
+                            1_700_000_000,
+                            1_700_003_600,
+                        )
+                    } else {
+                        let id = format!("old-catalog-{}", index % old_assets);
+                        let evidence = json!([
+                            id,
+                            null,
+                            [[
+                                "original",
+                                signature(&old_bytes),
+                                old_bytes.len(),
+                                1_700_000_002_000_i64
+                            ]]
+                        ])
+                        .to_string();
+                        (id, 1, evidence, 1_700_000_000, 1_700_003_600)
+                    };
+                tx.execute(
+                    "INSERT INTO metadata_capture_retries(library,asset_id,target_revision,evidence,generation,attempts,last_attempt_at,next_retry_at) \
+                     VALUES('PrimarySync',?1,?2,?3,1,1,?4,?5)",
+                    rusqlite::params![id, revision, evidence, last, next],
+                ).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        if catalog == Stock28Catalog::DownloadedCaptureHistory {
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM assets WHERE library='PrimarySync' AND id LIKE 'old-catalog-%' AND status='downloaded'", [], |r| r.get::<_, i64>(0)).unwrap(), i64::try_from(old_assets).unwrap());
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM asset_metadata_capture_revisions WHERE library='PrimarySync' AND asset_id LIKE 'old-catalog-%'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM metadata_capture_retries WHERE library='PrimarySync' AND asset_id LIKE 'old-catalog-%'", [], |r| r.get::<_, i64>(0)).unwrap(), i64::try_from(capture_rows).unwrap());
+        }
+    }
+    let mut columns = released_columns(&source);
+    {
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        for table in [
+            "unresolved_sparse_identities",
+            "metadata_capture_retries",
+            "metadata_capture_state",
+        ] {
+            let mut statement = conn
+                .prepare(&format!(
+                    "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+                ))
+                .unwrap();
+            let names = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            columns.push((table.to_owned(), names));
+        }
+    }
+    let legacy_rows = released_rows(&source, &columns);
+    crate::state::db::account::adopt_legacy(
+        &source,
+        &db_path,
+        &baseline_owner(),
+        "baseline@example.invalid",
+        "com",
+    )
+    .await
+    .unwrap();
+    assert_eq!(released_rows(&db_path, &columns), legacy_rows);
+
+    let old_snapshot = || {
+        rows(
+            &db_path,
+            "SELECT * FROM assets WHERE library IN ('PrimarySync','PrimaryLegacy') AND id LIKE 'old-%' ORDER BY library,id,version_size",
+        )
+        .into_iter()
+        .chain(rows(
+            &db_path,
+            "SELECT * FROM unresolved_sparse_identities WHERE library='PrimarySync' AND source_record_name LIKE 'old-sparse-%' ORDER BY source_record_name",
+        ))
+        .chain(rows(
+            &db_path,
+            "SELECT * FROM metadata_capture_retries WHERE library='PrimarySync' AND asset_id LIKE 'old-%' ORDER BY asset_id",
+        ))
+        .chain(rows(&db_path, "SELECT * FROM asset_metadata_paths WHERE library='PrimarySync' AND id LIKE 'old-%' ORDER BY id,version_size"))
+        .chain(rows(&db_path, "SELECT * FROM asset_master_mappings WHERE library='PrimarySync' AND master_record_name LIKE 'old-%' ORDER BY master_record_name"))
+        .chain(rows(&db_path, "SELECT * FROM asset_metadata_capture_revisions WHERE library='PrimarySync' AND asset_id LIKE 'old-%' ORDER BY asset_id"))
+        .collect::<Vec<_>>()
+    };
+    let old_before = old_snapshot();
+
+    let server = crate::test_helpers::start_wiremock_or_skip("stock28 old debt")
+        .await
+        .expect("acceptance server must bind");
+    for (endpoint, expected) in [
+        ("/current-new", 1),
+        (
+            "/bridge-new",
+            u64::from(catalog == Stock28Catalog::DownloadedCaptureHistory),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(MEDIA)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(expected)
+            .mount(&server)
+            .await;
+    }
+    let checksum = signature(MEDIA);
+    let mut current = pair(
+        "current-new-master",
+        "current-new.JPG",
+        &format!("{}/current-new", server.uri()),
+        51,
+    );
+    current[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    current[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+    let mut bridge = pair(
+        "bridge-new-master",
+        "bridge-new.JPG",
+        &format!("{}/bridge-new", server.uri()),
+        52,
+    );
+    bridge[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    bridge[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+    for record in [&mut current, &mut bridge] {
+        record[1]["fields"]["masterRef"]["value"]["zoneID"] =
+            json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+    }
+
+    let token_key = sync_token_key("PrimarySync");
+    let app_config = make_primary_unfiled_app_config();
+    let selection = &app_config.filters.selection;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let inventory = Arc::new(current);
+    let incremental = Arc::new(bridge);
+    let mut current_paths = BTreeMap::new();
+    let mut config_after = None;
+    for cycle in 0..4 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        let inventories = Arc::new(AtomicUsize::new(0));
+        let session = ProtectedSession {
+            records: Arc::clone(&inventory),
+            incremental: Arc::clone(&incremental),
+            zone_name: "PrimarySync".to_string(),
+            cycle,
+            incremental_cycle: if catalog == Stock28Catalog::InconclusivePendingDownloads {
+                1
+            } else {
+                0
+            },
+            inventories: Arc::clone(&inventories),
+        };
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/private".to_string(),
+            Arc::new(std::collections::HashMap::new()),
+            Box::new(session.clone()),
+            Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            "private".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+            db.clone(),
+            baseline_owner(),
+            "com",
+        ));
+        let selected_zones = crate::commands::zone_name_set(std::slice::from_ref(&library));
+        let collection_zones = selected_zones.clone();
+        let scope = crate::commands::pass_scope_for_zone(
+            selection,
+            "PrimarySync",
+            &selected_zones,
+            &collection_zones,
+        );
+        let context =
+            crate::commands::build_collection_context(selection, std::slice::from_ref(&library))
+                .await
+                .unwrap();
+        let plan =
+            crate::commands::resolve_passes_for_scope(&library, selection, scope, &context, &[])
+                .await
+                .unwrap();
+        let mut selected =
+            make_run_cycle_library_state_with_passes("PrimarySync", &token_key, plan.passes);
+        selected.library = library;
+        let base = make_run_cycle_download_config_builder(&root, db.clone());
+        let builder = |mode, exclude, groups, zone| {
+            let mut config = (*base(mode, exclude, groups, zone)).clone();
+            config.folder_structure = "none".into();
+            config.file_match_policy = crate::types::FileMatchPolicy::NameId7;
+            config.retry.max_retries = 0;
+            Arc::new(config)
+        };
+        let result = run_cycle(
+            &[&selected],
+            &app_config,
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        if catalog == Stock28Catalog::InconclusivePendingDownloads {
+            assert_eq!(cycle, 0);
+            assert_eq!(result.failed_count, 2 * old_assets, "{result:?}");
+            assert_eq!(result.stats.downloaded, 1, "{result:?}");
+        } else {
+            assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
+            assert_eq!(
+                result.stats.downloaded,
+                if cycle == 0 { 2 } else { 0 },
+                "cycle {cycle}: {result:?}"
+            );
+        }
+        assert!(result.db_sync_token_advance_safe, "cycle {cycle}");
+        assert_eq!(
+            db.get_metadata(&token_key).await.unwrap().as_deref(),
+            Some(format!("protected-after-{cycle}").as_str())
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+            None
+        );
+        let enum_hash = db.get_metadata("enum_config_hash").await.unwrap();
+        assert_eq!(
+            enum_hash.as_deref(),
+            Some(crate::download::compute_config_hash(&app_config).as_str())
+        );
+        let config = db
+            .get_metadata("config_hash")
+            .await
+            .unwrap()
+            .expect("normal path configuration checkpoint");
+        if let Some(prior) = &config_after {
+            assert_eq!(&config, prior, "quiet configuration checkpoint changed");
+        } else {
+            config_after = Some(config);
+        }
+        if catalog == Stock28Catalog::DownloadedCaptureHistory && cycle == 0 {
+            assert!(
+                inventories.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                "real selected inventory must run"
+            );
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let epoch = crate::state::db::sync_epoch::read_library(&conn, "PrimarySync")
+                .unwrap()
+                .expect("normal enrollment");
+            assert_eq!(epoch.reason, "existing_upgrade");
+            assert_eq!(epoch.state, "complete");
+            assert_eq!(epoch.baseline_scope, selected.library.baseline_scope());
+        }
+        assert_eq!(
+            old_snapshot(),
+            old_before,
+            "cycle {cycle}: old catalog/sparse/capture debt changed"
+        );
+        assert_eq!(
+            sha256_hex(&std::fs::read(&old_path).unwrap()),
+            old_bytes_sha
+        );
+        assert_eq!(
+            std::fs::read(&old_sidecar).unwrap(),
+            b"protected stock28 sidecar"
+        );
+        assert_eq!(
+            (
+                std::fs::metadata(&old_path).unwrap().modified().unwrap(),
+                std::fs::metadata(&old_sidecar).unwrap().modified().unwrap(),
+            ),
+            old_mtime
+        );
+        for (path, modified) in &old_catalog_files {
+            assert_eq!(std::fs::read(path).unwrap(), old_bytes);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+                *modified
+            );
+        }
+        let completed = db.get_downloaded_page(0, 100).await.unwrap();
+        if catalog == Stock28Catalog::InconclusivePendingDownloads {
+            let current = completed
+                .iter()
+                .find(|row| row.id.as_ref() == "asset-current-new-master")
+                .expect("current media is durable despite retained pending failures");
+            assert_eq!(
+                std::fs::read(current.local_path.as_ref().unwrap()).unwrap(),
+                MEDIA
+            );
+            drop(db);
+            let reopened = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap();
+            assert!(reopened.get_metadata(&token_key).await.unwrap().is_some());
+            assert_eq!(old_snapshot(), old_before);
+            break;
+        }
+        if cycle < 2 {
+            for id in ["asset-current-new-master", "asset-bridge-new-master"] {
+                let row = completed
+                    .iter()
+                    .find(|row| row.id.as_ref() == id)
+                    .unwrap_or_else(|| panic!("cycle {cycle}: missing {id}"));
+                let path = row.local_path.clone().unwrap();
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                let (prior_path, prior_modified) = current_paths
+                    .entry(id)
+                    .or_insert_with(|| (path.clone(), modified));
+                assert_eq!(&path, prior_path);
+                assert_eq!(modified, *prior_modified);
+                assert_eq!(std::fs::read(path).unwrap(), MEDIA);
+            }
+        } else {
+            assert_eq!(result.stats.downloaded, 0, "cycle {cycle}: quiet");
+            for (id, (prior, modified)) in &current_paths {
+                assert!(completed.iter().any(|row| row.id.as_ref() == *id && row.local_path.as_ref() == Some(prior)));
+                assert_eq!(std::fs::read(prior).unwrap(), MEDIA);
+                assert_eq!(
+                    std::fs::metadata(prior).unwrap().modified().unwrap(),
+                    *modified
+                );
+            }
+        }
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn released_stock28_small_old_debt_current_progress() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(
+            true,
+            Box::pin(exercise_stock28_old_debt(
+                8,
+                4,
+                2,
+                Stock28Catalog::DownloadedCaptureHistory,
+            )),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn released_stock28_inconclusive_pending_downloads_remain_partial() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(
+            true,
+            Box::pin(exercise_stock28_old_debt(
+                8,
+                4,
+                8,
+                Stock28Catalog::InconclusivePendingDownloads,
+            )),
+        )
         .await;
 }
