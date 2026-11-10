@@ -315,6 +315,138 @@ impl CatalogOwnerFixture {
     }
 }
 
+#[tokio::test]
+async fn catalog_required_origin_rolls_back_checkpoint_on_mismatch_and_sql_fault() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+    let origin = fixture.install().await;
+    fixture
+        .db
+        .seed_source_revalidation(
+            owner(),
+            "PrimarySync".into(),
+            origin.scope(),
+            fixture.policy.clone(),
+            CatalogOrigin::boundary("before"),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("add retained catalog debt")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES(?1,'retained',42)",
+            [&origin.nonce],
+        )
+        .unwrap();
+    }
+    let old_proof = fixture.db.get_metadata(PROOF).await.unwrap();
+    let proof = ObservationProof::inventory(vec![fixture.receipt.clone()])
+        .unwrap()
+        .bridge(
+            ObservationProof::delivery(fixture.receipt.clone())
+                .delta("before", "new-token")
+                .unwrap(),
+            "before",
+        )
+        .unwrap();
+    let mut save = transition(&fixture.db, "new-token").await;
+    save.expected_metadata
+        .push((fixture.baseline_key.clone(), Some("before".into())));
+
+    let mut wrong_plan = origin.clone();
+    wrong_plan.plan_digest = "a".repeat(64);
+    let mut wrong_epoch = origin.clone();
+    wrong_epoch.epoch = uuid::Uuid::new_v4().to_string();
+    let mut wrong_attempt = origin.clone();
+    wrong_attempt.attempt = uuid::Uuid::new_v4().to_string();
+    for bad in [wrong_plan, wrong_epoch, wrong_attempt] {
+        assert!(
+            fixture
+                .db
+                .commit_observation_transition(
+                    save.clone(),
+                    Some(proof.clone().with_catalog_origin(bad)),
+                    false
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fixture.db.get_metadata(TOKEN).await.unwrap().as_deref(),
+            Some("after")
+        );
+        assert_eq!(fixture.db.get_metadata(PROOF).await.unwrap(), old_proof);
+    }
+
+    for trigger in [
+        "CREATE TRIGGER required_origin_interleave AFTER UPDATE ON metadata WHEN NEW.key='sync_token:v27:PrimarySync' BEGIN UPDATE source_revalidation_rounds SET boundary='changed' WHERE mode='catalog_v2'; END",
+        "CREATE TRIGGER required_origin_interleave BEFORE INSERT ON metadata WHEN NEW.key='observed_selection:v27:PrimarySync' BEGIN SELECT RAISE(ABORT,'injected descriptor fault'); END",
+        "CREATE TRIGGER required_origin_interleave BEFORE UPDATE OF phase ON source_revalidation_rounds WHEN NEW.phase='active' BEGIN SELECT RAISE(IGNORE); END",
+    ] {
+        {
+            let conn = fixture
+                .db
+                .acquire_lock("inject required origin failure")
+                .unwrap();
+            conn.execute_batch(trigger).unwrap();
+        }
+        assert!(
+            fixture
+                .db
+                .commit_observation_transition(
+                    save.clone(),
+                    Some(proof.clone().with_catalog_origin(origin.clone())),
+                    false
+                )
+                .await
+                .is_err()
+        );
+        {
+            let conn = fixture
+                .db
+                .acquire_lock("remove required origin failure")
+                .unwrap();
+            conn.execute_batch("DROP TRIGGER required_origin_interleave")
+                .unwrap();
+        }
+        let reopened = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.get_metadata(TOKEN).await.unwrap().as_deref(),
+            Some("after")
+        );
+        assert_eq!(reopened.get_metadata(PROOF).await.unwrap(), old_proof);
+        let conn = reopened
+            .acquire_lock("check rolled back origin and debt")
+            .unwrap();
+        let row: (String, String, i64) = conn.query_row(
+            "SELECT r.phase,r.boundary,d.next_retry_at FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1 AND d.id='retained'",
+            [&origin.nonce], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            row,
+            ("observing".into(), CatalogOrigin::boundary("before"), 42)
+        );
+    }
+    fixture
+        .db
+        .commit_observation_transition(save, Some(proof.with_catalog_origin(origin.clone())), false)
+        .await
+        .unwrap();
+    let active: Value =
+        serde_json::from_str(&fixture.db.get_metadata(PROOF).await.unwrap().unwrap()).unwrap();
+    assert_eq!(active["revalidation_round"], origin.nonce);
+    assert_eq!(
+        fixture.db.get_metadata(TOKEN).await.unwrap().as_deref(),
+        Some("new-token")
+    );
+}
+
 async fn strict_deleted_pair(db: Arc<SqliteStateDb>) -> CatalogSettlementAuthority {
     use crate::icloud::photos::{
         PhotoAlbum, PhotoAlbumConfig, ProviderRecordId, StrictCatalogPairResult,

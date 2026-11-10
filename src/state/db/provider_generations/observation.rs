@@ -672,7 +672,143 @@ pub(in crate::state::db) fn invalidate(
 
 /// Prepared before token writes; applied inside that same transaction afterward.
 pub(in crate::state::db) struct Prepared(Vec<(String, Descriptor)>);
+
+/// Ephemeral obligation from an explicitly attached fresh catalog origin.
+/// Carried links from earlier descriptors never construct this guard.
+pub(in crate::state::db) struct RequiredCatalog {
+    origin: crate::state::db::source_revalidation::CatalogOrigin,
+    boundary: String,
+    key: String,
+    token_key: String,
+    descriptor: Descriptor,
+}
+
+fn required_catalog_error() -> StateError {
+    StateError::Invariant {
+        operation: "commit_checkpoint_transition",
+        detail: "required catalog origin is no longer qualified".into(),
+    }
+}
+
+fn validate_required_catalog_row(
+    conn: &Connection,
+    required: &RequiredCatalog,
+    phase: &str,
+) -> Result<(), StateError> {
+    let descriptor = &required.descriptor;
+    let origin = &required.origin;
+    if !matches!(crate::state::db::source_revalidation::CatalogOrigin::parse(&origin.scope()), Ok(parsed) if parsed == *origin)
+        || owner_keys(conn)? != (descriptor.account.clone(), descriptor.provider.clone())
+        || descriptor.policy != policy(conn)?
+        || descriptor.revalidation_round.as_deref() != Some(origin.nonce.as_str())
+    {
+        return Err(required_catalog_error());
+    }
+    let epoch = sync_epoch::validate(conn)?;
+    let record =
+        sync_epoch::read_library(conn, &descriptor.library)?.ok_or_else(required_catalog_error)?;
+    let selector = descriptor
+        .plans
+        .first()
+        .and_then(Plan::selector)
+        .ok_or_else(required_catalog_error)?;
+    let database = selector
+        .get("database")
+        .and_then(Value::as_str)
+        .ok_or_else(required_catalog_error)?;
+    let zone = selector.get("zone").ok_or_else(required_catalog_error)?;
+    let source_scope = digest(
+        json!({"database":database,"zone":zone})
+            .to_string()
+            .as_bytes(),
+    );
+    if epoch.epoch != origin.epoch
+        || record.epoch != epoch.epoch
+        || record.attempt != origin.attempt
+        || record.baseline_scope != source_scope
+        || !matches!(record.state.as_str(), "pending" | "ready" | "complete")
+    {
+        return Err(required_catalog_error());
+    }
+    let raw = serde_json::to_string(descriptor)
+        .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+    if catalog_plan_digest_from_observation(&raw, &descriptor.library).as_deref()
+        != Some(origin.plan_digest.as_str())
+    {
+        return Err(required_catalog_error());
+    }
+    let exact: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND scope=?3 AND enum_hash=?4 AND boundary=?5 AND mode=?6 AND phase=?7)",
+        params![origin.nonce, descriptor.library, origin.scope(), descriptor.policy[0], required.boundary, super::super::source_revalidation::CATALOG_MODE, phase],
+        |row| row.get(0),
+    )?;
+    if !exact {
+        return Err(required_catalog_error());
+    }
+    Ok(())
+}
+
 impl Prepared {
+    pub(in crate::state::db) fn require_catalog_origin(
+        &self,
+        conn: &Connection,
+        proof: Option<&ObservationProof>,
+        expected: &[(String, Option<String>)],
+        promote: bool,
+    ) -> Result<Option<RequiredCatalog>, StateError> {
+        let Some(proof) = proof else { return Ok(None) };
+        let Some(origin) = &proof.catalog_origin else {
+            return Ok(None);
+        };
+        let Kind::Baseline { prior, .. } = &proof.kind else {
+            return Err(required_catalog_error());
+        };
+        if promote {
+            return Err(required_catalog_error());
+        }
+        let [(key, descriptor)] = self.0.as_slice() else {
+            return Err(required_catalog_error());
+        };
+        let token_key = if let Some(zone) = key.strip_prefix(ACTIVE) {
+            format!("sync_token:v27:{zone}")
+        } else if let Some(rest) = key.strip_prefix(STAGED) {
+            format!("pending_sync_token:v27:{rest}")
+        } else {
+            return Err(required_catalog_error());
+        };
+        let record = sync_epoch::read_library(conn, &descriptor.library)?
+            .ok_or_else(required_catalog_error)?;
+        let enum_hash = descriptor.policy[0]
+            .as_deref()
+            .ok_or_else(required_catalog_error)?;
+        let baseline_prefix = format!(
+            "baseline_cursor:v27:{}:{}:{}:",
+            origin.epoch, record.baseline_scope, enum_hash
+        );
+        let boundary_matches = expected
+            .iter()
+            .filter(|(key, value)| {
+                key.starts_with(&baseline_prefix)
+                    && value.as_deref().is_some_and(|value| {
+                        !value.trim().is_empty() && digest(value.as_bytes()) == *prior
+                    })
+            })
+            .count()
+            == 1;
+        if !boundary_matches {
+            return Err(required_catalog_error());
+        }
+        let required = RequiredCatalog {
+            origin: origin.clone(),
+            boundary: prior.clone(),
+            key: key.clone(),
+            token_key,
+            descriptor: descriptor.clone(),
+        };
+        validate_required_catalog_row(conn, &required, "observing")?;
+        Ok(Some(required))
+    }
+
     /// Do not advance a matching baseline cursor while its candidate round lacks
     /// the completed baseline proof that would make it retryable.
     pub(in crate::state::db) fn guard_revalidation(
@@ -724,6 +860,35 @@ impl Prepared {
         }
         Ok(())
     }
+}
+
+pub(in crate::state::db) fn verify_required_catalog_before_apply(
+    conn: &Connection,
+    required: &RequiredCatalog,
+) -> Result<(), StateError> {
+    validate_required_catalog_row(conn, required, "observing")
+}
+
+pub(in crate::state::db) fn verify_required_catalog_after_apply(
+    conn: &Connection,
+    required: &RequiredCatalog,
+) -> Result<(), StateError> {
+    let phase = if required.key.starts_with(ACTIVE) {
+        "active"
+    } else {
+        "observing"
+    };
+    validate_required_catalog_row(conn, required, phase)?;
+    let token = metadata(conn, &required.token_key)?.ok_or_else(required_catalog_error)?;
+    let stored = valid(conn, &required.key, &token)?.ok_or_else(required_catalog_error)?;
+    if stored.revalidation_round.as_deref() != Some(required.origin.nonce.as_str())
+        || stored.cursor_hash != required.descriptor.cursor_hash
+        || stored.plans != required.descriptor.plans
+        || stored.policy != required.descriptor.policy
+    {
+        return Err(required_catalog_error());
+    }
+    Ok(())
 }
 pub(in crate::state::db) fn prepare(
     conn: &Connection,
@@ -893,7 +1058,11 @@ pub(in crate::state::db) fn prepare(
     }
     Ok(Prepared(out))
 }
-pub(in crate::state::db) fn apply(conn: &Connection, prepared: Prepared) -> Result<(), StateError> {
+pub(in crate::state::db) fn apply(
+    conn: &Connection,
+    prepared: Prepared,
+    required: Option<&RequiredCatalog>,
+) -> Result<(), StateError> {
     for (key, mut value) in prepared.0 {
         if value.policy != policy(conn)? && value.revalidation_round.is_some() {
             return Err(StateError::Invariant {
@@ -939,7 +1108,12 @@ pub(in crate::state::db) fn apply(conn: &Connection, prepared: Prepared) -> Resu
                             if !valid {
                                 value.revalidation_round = None;
                             } else {
-                                conn.execute("UPDATE source_revalidation_rounds SET phase='active' WHERE id=?1 AND library=?2 AND phase='observing'", params![round, value.library])?;
+                                let activated = conn.execute("UPDATE source_revalidation_rounds SET phase='active' WHERE id=?1 AND library=?2 AND phase='observing'", params![round, value.library])?;
+                                if required.is_some_and(|required| required.origin.nonce == *round)
+                                    && activated != 1
+                                {
+                                    return Err(required_catalog_error());
+                                }
                             }
                         } else if phase == "active" {
                             if !valid {

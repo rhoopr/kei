@@ -331,6 +331,12 @@ pub(crate) fn commit_observation_transition_in_tx(
         proof.as_ref(),
         promote,
     )?;
+    let required_catalog = prepared_observation.require_catalog_origin(
+        tx,
+        proof.as_ref(),
+        &transition.expected_metadata,
+        promote,
+    )?;
     prepared_observation.guard_revalidation(
         tx,
         &transition.metadata_updates,
@@ -427,7 +433,13 @@ pub(crate) fn commit_observation_transition_in_tx(
             .map_err(|e| StateError::query("commit_checkpoint_transition::delete", e))?;
     }
     observation::invalidate(tx, &changed_keys, old_policy)?;
-    observation::apply(tx, prepared_observation)?;
+    if let Some(required) = &required_catalog {
+        observation::verify_required_catalog_before_apply(tx, required)?;
+    }
+    observation::apply(tx, prepared_observation, required_catalog.as_ref())?;
+    if let Some(required) = &required_catalog {
+        observation::verify_required_catalog_after_apply(tx, required)?;
+    }
     for completion in epoch_completions {
         super::sync_epoch::complete(tx, &completion.library, &completion.attempt)?;
         tx.execute(
