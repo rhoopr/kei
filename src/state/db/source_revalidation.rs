@@ -9,6 +9,15 @@ pub(crate) const CATALOG_MODE: &str = "catalog_v2";
 pub(crate) const LEGACY_MODE: &str = "legacy_unfiled_v1";
 pub(crate) const CATALOG_SCOPE_PREFIX: &str = "catalog:v2:";
 
+#[cfg(test)]
+pub(crate) fn prepare_existing_owned_database_for_test(
+    path: &std::path::Path,
+    owner: &account::AccountOwner,
+) -> Result<(), StateError> {
+    drop(account::open(path, owner)?);
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CatalogOrigin {
     pub(crate) plan_digest: String,
@@ -448,6 +457,67 @@ fn catalog_signals(
     Ok(signals)
 }
 
+/// Validate an installed catalog census before resuming either marking or its
+/// completed observing phase. No cursor text or row nonce alone is authority.
+fn catalog_seed_phase(
+    conn: &Connection,
+    library: &str,
+    scope: &str,
+    enum_hash: &str,
+    boundary: &str,
+) -> Result<String, StateError> {
+    let refuse = || StateError::Invariant {
+        operation: "seed_source_revalidation",
+        detail: "catalog origin is missing or no longer qualified".into(),
+    };
+    let origin = CatalogOrigin::parse(scope)?;
+    let epoch = super::sync_epoch::validate(conn)?;
+    let record = super::sync_epoch::read_library(conn, library)?.ok_or_else(refuse)?;
+    if !matches!(record.state.as_str(), "pending" | "complete")
+        || record.epoch != epoch.epoch
+        || origin.epoch != epoch.epoch
+        || origin.attempt != record.attempt
+        || super::provider_generations::observation::policy(conn)?[0].as_deref() != Some(enum_hash)
+    {
+        return Err(refuse());
+    }
+    // A pending attempt has no ACTIVE descriptor. Its plan binding is the
+    // exact catalog scope installed by the fenced claim for this attempt.
+    // Complete attempts must also match the live ACTIVE source plan.
+    if record.state == "complete"
+        && !super::provider_generations::observation::catalog_active_plan_matches(
+            conn,
+            library,
+            &origin.plan_digest,
+            enum_hash,
+        )?
+    {
+        return Err(refuse());
+    }
+    let prefix = format!(
+        "baseline_cursor:v27:{}:{}:{}:",
+        epoch.epoch, record.baseline_scope, enum_hash
+    );
+    let mut statement =
+        conn.prepare("SELECT value FROM metadata WHERE substr(key,1,length(?1))=?1")?;
+    let saved = statement.query_map([prefix], |row| row.get::<_, String>(0))?;
+    let mut matching_boundary = false;
+    for cursor in saved {
+        let cursor = cursor?;
+        if !cursor.trim().is_empty() && CatalogOrigin::boundary(&cursor) == boundary {
+            matching_boundary = true;
+        }
+    }
+    if !matching_boundary {
+        return Err(refuse());
+    }
+    let phase: Option<String> = conn.query_row(
+        "SELECT phase FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND scope=?3 AND enum_hash=?4 AND boundary=?5 AND mode=?6 AND phase IN ('marking','observing')",
+        params![origin.nonce, library, scope, enum_hash, boundary, CATALOG_MODE], |row| row.get(0),
+    ).optional()?;
+    phase.ok_or_else(refuse)
+}
+
 pub(crate) fn has_due(conn: &rusqlite::Connection, library: &str) -> Result<bool, StateError> {
     let scopes: Vec<(String, String)> = conn.prepare("SELECT DISTINCT r.scope,r.enum_hash FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.library=?1 AND r.phase='active' AND r.mode=?3 AND r.enum_hash=COALESCE((SELECT value FROM metadata WHERE key='pending_enum_config_hash'),(SELECT value FROM metadata WHERE key='enum_config_hash')) AND d.next_retry_at<=?2")?
         .query_map(params![library, chrono::Utc::now().timestamp(), LEGACY_MODE], |r| Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
@@ -570,7 +640,7 @@ impl SqliteStateDb {
             let mut matching: Vec<ExistingCatalogRound> = Vec::new();
             if let Some(cursor) = claim.expected_baseline.as_deref() {
                 let boundary = CatalogOrigin::boundary(cursor);
-                let rows: Vec<ExistingCatalogRound> = tx
+                let rows: Vec<(String, String, String, String, String, String, String)> = tx
                     .prepare(
                         "SELECT id,scope,enum_hash,boundary,high_id,after_id,phase
                          FROM source_revalidation_rounds
@@ -585,32 +655,23 @@ impl SqliteStateDb {
                             boundary,
                             format!("{CATALOG_SCOPE_PREFIX}%")
                         ],
-                        |row| {
-                            let scope: String = row.get(1)?;
-                            let origin = CatalogOrigin::parse(&scope).map_err(|_error| {
-                                rusqlite::Error::InvalidColumnType(
-                                    1,
-                                    "scope".into(),
-                                    rusqlite::types::Type::Text,
-                                )
-                            })?;
-                            Ok(ExistingCatalogRound {
-                                id: row.get(0)?,
-                                scope,
-                                origin,
-                                enum_hash: row.get(2)?,
-                                boundary: row.get(3)?,
-                                high_id: row.get(4)?,
-                                after_id: row.get(5)?,
-                                phase: row.get(6)?,
-                            })
-                        },
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
                     )?
                     .collect::<Result<_, _>>()?;
-                matching = rows
-                    .into_iter()
-                    .filter(|round| round.origin.plan_digest == claim.plan_digest)
-                    .collect();
+                for (id, scope, enum_hash, boundary, high_id, after_id, phase) in rows {
+                    let Ok(origin) = CatalogOrigin::parse(&scope) else { continue };
+                    if library_before.state != "pending"
+                        || library_before.epoch != epoch.epoch
+                        || origin.epoch != epoch.epoch
+                        || origin.attempt != library_before.attempt
+                        || origin.nonce != id
+                        || origin.plan_digest != claim.plan_digest
+                        || enum_hash != claim.expected_enum_hash
+                    {
+                        continue;
+                    }
+                    matching.push(ExistingCatalogRound { id, scope, origin, enum_hash, boundary, high_id, after_id, phase });
+                }
             }
             if matching.len() > 1 {
                 return Err(StateError::Invariant {
@@ -619,14 +680,6 @@ impl SqliteStateDb {
                 });
             }
             let old = matching.first().cloned();
-            if let Some(old) = &old
-                && old.enum_hash != claim.expected_enum_hash
-            {
-                return Err(StateError::Invariant {
-                    operation: "claim_catalog_baseline",
-                    detail: "catalog origin policy changed".into(),
-                });
-            }
             let gate = super::sync_epoch::gate(
                 &tx,
                 &claim.library,
@@ -936,9 +989,23 @@ impl SqliteStateDb {
         shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<(), StateError> {
         let initial_owner = owner.clone();
+        let catalog = scope.starts_with("catalog:").then(|| {
+            (
+                library.clone(),
+                scope.clone(),
+                enum_hash.clone(),
+                boundary.clone(),
+            )
+        });
         let round = self.with_conn_mut("starting source revalidation", move |conn| {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             account::validate_authenticated(&tx,&initial_owner)?;
+            if scope.starts_with("catalog:") {
+                catalog_seed_phase(&tx, &library, &scope, &enum_hash, &boundary)?;
+                let origin = CatalogOrigin::parse(&scope)?;
+                tx.commit()?;
+                return Ok(origin.nonce);
+            }
             let existing:Option<String>=tx.query_row(
                 "SELECT id FROM source_revalidation_rounds WHERE library=?1 AND scope=?2 AND enum_hash=?3 AND boundary=?4 AND phase='marking' ORDER BY id LIMIT 1",
                 params![library,scope,enum_hash,boundary], |r| r.get(0)).optional()?;
@@ -960,9 +1027,14 @@ impl SqliteStateDb {
             }
             let id = round.clone();
             let owner = owner.clone();
+            let catalog = catalog.clone();
             let done=self.with_conn_mut("marking source revalidation page",move |conn| {
                 let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 account::validate_authenticated(&tx, &owner)?;
+                if let Some((library, scope, enum_hash, boundary)) = &catalog {
+                    let phase = catalog_seed_phase(&tx, library, scope, enum_hash, boundary)?;
+                    if phase == "observing" { tx.commit()?; return Ok(true); }
+                }
                 let (library,high,after,phase):(String,String,String,String)=tx.query_row(
                     "SELECT library,high_id,after_id,phase FROM source_revalidation_rounds WHERE id=?1",
                     [&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
