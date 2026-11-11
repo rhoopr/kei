@@ -1,6 +1,6 @@
 //! Source-scoped ownership evidence for operational reporting only.
 
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -22,6 +22,7 @@ pub(crate) struct SourceRequest {
     pub(crate) catalog_plan: Option<String>,
     pub(crate) enum_policy: String,
     pub(crate) active_token_key: Option<String>,
+    pub(crate) preservation_policy: Option<String>,
 }
 
 #[derive(Clone)]
@@ -233,6 +234,47 @@ fn inspect(
 ) -> Result<Option<(Vec<FutureOwner>, SourceAccounting)>, StateError> {
     if !source_valid(conn, request)? {
         return Ok(None);
+    }
+    if let Some(token_key) = &request.active_token_key {
+        let Some(library) = request
+            .specification
+            .zone
+            .get("zoneName")
+            .and_then(Value::as_str)
+        else {
+            return Ok(None);
+        };
+        let hold_key = format!(
+            "{}{library}",
+            crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
+        );
+        let hold: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [&hold_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let token: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [token_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(hold) = hold {
+            let Some(token) = token else {
+                return Ok(None);
+            };
+            if crate::sync_cycle::retained_checkpoint_blocks_health(
+                &hold,
+                &token,
+                &request.enum_policy,
+                request.preservation_policy.as_deref(),
+            ) {
+                return Ok(None);
+            }
+        }
     }
     validate_generation_headers(conn)?;
     let library = request

@@ -491,6 +491,32 @@ pub(super) fn capture_active_observation(
     {
         return Ok(None);
     }
+    if let Some(round) = saved.revalidation_round.as_deref() {
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT mode,scope FROM source_revalidation_rounds WHERE id=?1 AND library=?2",
+                params![round, library],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let current = match row {
+            Some((mode, scope)) if mode == super::super::source_revalidation::CATALOG_MODE => {
+                match super::super::source_revalidation::CatalogOrigin::parse(&scope) {
+                    Ok(origin) if origin.nonce == round => {
+                        catalog_origin_current(conn, library, &origin, enum_policy)?
+                    }
+                    _ => false,
+                }
+            }
+            Some((mode, _)) if mode == super::super::source_revalidation::LEGACY_MODE => {
+                legacy_round_current(conn, &saved, round)?
+            }
+            _ => false,
+        };
+        if !current {
+            return Ok(None);
+        }
+    }
     Ok(Some(ActiveObservation { token, descriptor }))
 }
 

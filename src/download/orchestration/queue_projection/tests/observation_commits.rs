@@ -351,6 +351,56 @@ impl CatalogOwnerFixture {
 }
 
 #[tokio::test]
+async fn owner_created_no_link_active_empty_census_allows_health_prework() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+    let raw = fixture.db.get_metadata(PROOF).await.unwrap().unwrap();
+    let descriptor: Value = serde_json::from_str(&raw).unwrap();
+    assert!(descriptor.get("revalidation_round").is_none());
+    let count: i64 = fixture
+        .db
+        .acquire_lock("inspect empty census")
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM source_revalidation_rounds WHERE library='PrimarySync'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+    let plan = &fixture.plan;
+    let request = crate::state::db::provider_generations::operational_hold::SourceRequest {
+        owner: owner(),
+        specification: GenerationSpec {
+            format: 2,
+            scope: plan.scope.clone(),
+            zone: plan.zone.clone(),
+            config_hash: plan.config_hash.clone(),
+            basis: plan.config_hash.clone(),
+            profile: plan.profile.clone(),
+            metadata_enabled: plan.metadata_enabled,
+            metadata_flags: plan.metadata_flags,
+        },
+        baseline_scope: fixture.library.baseline_scope(),
+        epoch: fixture.epoch.clone(),
+        attempt: fixture.attempt.clone(),
+        directory: dir.path().to_path_buf(),
+        catalog_plan: Some(crate::state::db::source_revalidation::fresh_catalog_plan_digest(plan)),
+        enum_policy: fixture.policy.clone(),
+        active_token_key: Some(TOKEN.to_owned()),
+        preservation_policy: None,
+    };
+    assert!(
+        fixture
+            .db
+            .operational_prework(request)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn catalog_required_origin_rolls_back_checkpoint_on_mismatch_and_sql_fault() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;

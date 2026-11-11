@@ -1467,6 +1467,467 @@ async fn operational_safe_hold_allows_authorized_no_changes_peer() {
 }
 
 #[tokio::test]
+async fn quiet_cycle_resets_per_sync_asset_counter_but_retains_future_decision() {
+    let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
+        .await
+        .expect("synthetic provider fixture");
+    assert!(
+        fixture
+            .run(0, false, false)
+            .await
+            .can_advance_database_checkpoint()
+    );
+    let mixed = fixture.run(1, false, false).await;
+    assert_eq!(mixed.stats.failed, 1, "{mixed:?}");
+    let checkpoint = fixture.db.get_metadata(&fixture.key).await.unwrap();
+    let read_state = |db: &SqliteStateDb| {
+        let conn = db.acquire_lock("read quiet retry projection").unwrap();
+        let asset: (String, i64, Option<String>) = conn.query_row(
+            "SELECT status,download_attempts,last_error FROM assets WHERE library=?1 AND id='asset-op-progress'",
+            [ZONE], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        let decision: (i64, i64, String) = conn.query_row(
+            "SELECT d.attempts,d.next_retry_at,json_array(d.generation,d.pass_key,d.child,d.manifest_hash,d.admission,d.admission_hash,w.path,w.checksum,w.size_bytes,w.admitted,w.verified_media) FROM provider_active_decisions d JOIN provider_active_destinations w USING(generation,pass_key,child) WHERE w.library=?1 AND w.asset_id='asset-op-progress' AND w.verified_media=0",
+            [ZONE], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        (asset, decision)
+    };
+    let before = read_state(&fixture.db);
+    assert_eq!(before.0.0, "failed");
+    assert!(before.0.1 > 0 && before.0.2.is_some());
+    assert!(before.1.0 > 0 && before.1.1 > chrono::Utc::now().timestamp());
+    let requests_before = fixture
+        ._server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/progress")
+        .count();
+    let inventory_before = fixture.inventory_queries.load(Ordering::SeqCst);
+    assert!(requests_before > 0);
+    drop(mixed);
+    let fixture = fixture.reopen().await;
+    // The production last-seen marker has one-second resolution. A later
+    // watch wake must not share the preceding cycle's timestamp.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let quiet = fixture.run(2, false, false).await;
+    assert_eq!(quiet.stats.failed, 0, "{quiet:?}");
+    let after = read_state(&fixture.db);
+    assert_eq!(after.0, ("pending".to_owned(), 0, None));
+    assert_eq!(after.1, before.1);
+    assert_eq!(
+        fixture.db.get_metadata(&fixture.key).await.unwrap(),
+        checkpoint
+    );
+    let requests_after = fixture
+        ._server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/progress")
+        .count();
+    assert_eq!(requests_after, requests_before);
+    assert_eq!(
+        fixture.inventory_queries.load(Ordering::SeqCst),
+        inventory_before
+    );
+    assert!(!fixture.root.join("progress.JPG").exists());
+    assert_eq!(
+        std::fs::read(fixture.root.join("baseline.JPG")).unwrap(),
+        MEDIA
+    );
+}
+
+#[tokio::test]
+async fn skipped_peer_foreign_linked_catalog_debt_refuses_capture() {
+    for missing in [false, true] {
+        let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
+            .await
+            .expect("synthetic peer fixture");
+        Mock::given(method("GET"))
+            .and(path("/peer-baseline"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .expect(1)
+            .mount(&fixture._server)
+            .await;
+        let baseline = fixture.run_two_filtered(0, false, false, false, true).await;
+        assert!(baseline.can_advance_database_checkpoint(), "{baseline:?}");
+        let expiry = fixture.run_two_filtered(3, false, false, false, true).await;
+        assert!(expiry.can_advance_database_checkpoint(), "{expiry:?}");
+        let descriptor_key = format!("observed_selection:v27:{PEER_ZONE}");
+        let descriptor = fixture
+            .db
+            .get_metadata(&descriptor_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_str(&descriptor).unwrap();
+        let round = value["revalidation_round"]
+            .as_str()
+            .expect("owner-linked round")
+            .to_owned();
+        let peer_key = sync_token_key(PEER_ZONE);
+        let token = fixture.db.get_metadata(&peer_key).await.unwrap();
+        let debt = {
+            let conn = fixture
+                .db
+                .acquire_lock("foreign linked catalog fault")
+                .unwrap();
+            let debt: (String, i64) = conn
+                .query_row(
+                    "SELECT id,next_retry_at FROM source_revalidation_debt WHERE round=?1 LIMIT 1",
+                    [&round],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("real owner-created linked debt");
+            if missing {
+                conn.pragma_update(None, "foreign_keys", false).unwrap();
+                assert_eq!(
+                    conn.execute(
+                        "UPDATE source_revalidation_rounds SET id=?2 WHERE id=?1 AND library=?3",
+                        rusqlite::params![round, format!("hidden-{round}"), PEER_ZONE]
+                    )
+                    .unwrap(),
+                    1
+                );
+                conn.pragma_update(None, "foreign_keys", true).unwrap();
+            } else {
+                assert_eq!(conn.execute("UPDATE source_revalidation_rounds SET library='ForeignSyntheticZone' WHERE id=?1 AND library=?2", rusqlite::params![round, PEER_ZONE]).unwrap(), 1);
+            }
+            debt
+        };
+        let mut held = fixture.run_two_filtered(4, false, false, true, true).await;
+        let peer = held
+            .sources
+            .iter()
+            .find(|source| source.zone_name == PEER_ZONE)
+            .unwrap();
+        assert!(!peer.reached && !peer.ordinary_committed);
+        assert!(
+            peer.operational_prework.is_none(),
+            "foreign linked round must refuse capture"
+        );
+        let shutdown = CancellationToken::new();
+        held.prepare_operational_tail(&fixture.shared, &shutdown)
+            .await
+            .unwrap();
+        assert!(
+            held.finish_operational_tail(&fixture.shared, &shutdown)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fixture.db.get_metadata(&peer_key).await.unwrap(), token);
+        assert_eq!(
+            fixture
+                .db
+                .get_metadata(&descriptor_key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(descriptor.as_str())
+        );
+        let after: (String, i64) = fixture
+            .db
+            .acquire_lock("check retained linked debt")
+            .unwrap()
+            .query_row(
+                "SELECT id,next_retry_at FROM source_revalidation_debt WHERE round=?1 LIMIT 1",
+                [&round],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after, debt);
+        if missing {
+            let conn = fixture
+                .db
+                .acquire_lock("restore hidden linked catalog row")
+                .unwrap();
+            conn.pragma_update(None, "foreign_keys", false).unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE source_revalidation_rounds SET id=?1 WHERE id=?2",
+                    rusqlite::params![round, format!("hidden-{round}")]
+                )
+                .unwrap(),
+                1
+            );
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            let intact: i64 = conn.query_row("SELECT COUNT(*) FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE r.id=?1", [&round], |row| row.get(0)).unwrap();
+            assert!(intact > 0);
+        }
+        assert_eq!(
+            std::fs::read(fixture.root.join("peer-baseline.JPG")).unwrap(),
+            MEDIA
+        );
+    }
+}
+
+#[tokio::test]
+async fn skipped_peer_linked_empty_round_drift_after_prepare_vetoes_health() {
+    let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
+        .await
+        .expect("synthetic peer fixture");
+    assert!(
+        fixture
+            .run_two(0, false, false)
+            .await
+            .can_advance_database_checkpoint()
+    );
+    let descriptor_key = format!("observed_selection:v27:{PEER_ZONE}");
+    let descriptor = fixture
+        .db
+        .get_metadata(&descriptor_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let value: Value = serde_json::from_str(&descriptor).unwrap();
+    let round = value["revalidation_round"]
+        .as_str()
+        .expect("owner-linked round")
+        .to_owned();
+    let token_key = sync_token_key(PEER_ZONE);
+    let token = fixture.db.get_metadata(&token_key).await.unwrap();
+    let mut held = fixture.run_two_filtered(1, false, false, true, false).await;
+    let shutdown = CancellationToken::new();
+    held.prepare_operational_tail(&fixture.shared, &shutdown)
+        .await
+        .unwrap();
+    assert!(held.operational_tail_prepared());
+    {
+        let conn = fixture.db.acquire_lock("drift linked empty round").unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1",
+                [&round],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "this test covers a linked empty census only");
+        assert_eq!(conn.execute("UPDATE source_revalidation_rounds SET library='ForeignSyntheticZone' WHERE id=?1 AND library=?2", rusqlite::params![round, PEER_ZONE]).unwrap(), 1);
+    }
+    assert!(
+        held.finish_operational_tail(&fixture.shared, &shutdown)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (health, report) = reported_health(&fixture, &held, "linked-round-drift.json").await;
+    assert!(health.last_success_at.is_none());
+    assert_eq!(report["status"], "partial_failure");
+    assert_eq!(report["stats"]["failed"], 1);
+    assert_eq!(fixture.db.get_metadata(&token_key).await.unwrap(), token);
+    assert_eq!(
+        fixture
+            .db
+            .get_metadata(&descriptor_key)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(descriptor.as_str())
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("baseline.JPG")).unwrap(),
+        MEDIA
+    );
+}
+
+#[tokio::test]
+async fn skipped_peer_current_empty_link_allows_unrelated_foreign_history() {
+    let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
+        .await
+        .expect("synthetic peer fixture");
+    assert!(
+        fixture
+            .run_two(0, false, false)
+            .await
+            .can_advance_database_checkpoint()
+    );
+    let descriptor_key = format!("observed_selection:v27:{PEER_ZONE}");
+    let descriptor = fixture
+        .db
+        .get_metadata(&descriptor_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let value: Value = serde_json::from_str(&descriptor).unwrap();
+    assert!(
+        value["revalidation_round"].as_str().is_some(),
+        "baseline owns an ACTIVE catalog link"
+    );
+    let scope = fixture
+        .db
+        .get_metadata(&format!("download_ledger_scope:{PEER_ZONE}"))
+        .await
+        .unwrap()
+        .unwrap()
+        .replace(PEER_ZONE, "ForeignSyntheticZone");
+    let policy = fixture
+        .db
+        .get_metadata("enum_config_hash")
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .db
+        .seed_source_revalidation(
+            baseline_owner(),
+            "ForeignSyntheticZone".to_owned(),
+            scope,
+            policy,
+            "foreign-boundary".to_owned(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let foreign: i64 = fixture
+        .db
+        .acquire_lock("check foreign history")
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM source_revalidation_rounds WHERE library='ForeignSyntheticZone'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(foreign, 1);
+    let mut held = fixture.run_two_filtered(1, false, false, true, false).await;
+    assert_eq!(held.stats.failed, 1);
+    // The aggregate cycle has already reported its own facts. Add an
+    // unrelated hold afterward to isolate the skipped-source owner guard.
+    crate::sync_cycle::persist_test_retained_checkpoint_hold(
+        fixture.db.as_ref(),
+        "ForeignSyntheticZone",
+        "foreign-cursor",
+        &download::compute_config_hash(&fixture.config),
+        &"b".repeat(64),
+    )
+    .await
+    .unwrap();
+    let guards = fixture.finish_mixed_tail(&mut held).await;
+    assert!(
+        guards.is_some(),
+        "unrelated foreign history must not veto the current empty link"
+    );
+    let (health, report) = reported_health(&fixture, &held, "foreign-history-health.json").await;
+    assert!(health.last_success_at.is_some());
+    assert_eq!(report["status"], "partial_failure");
+    assert_eq!(report["stats"]["failed"], 1);
+    assert_eq!(
+        fixture
+            .db
+            .get_metadata(&descriptor_key)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(descriptor.as_str())
+    );
+}
+
+#[tokio::test]
+async fn skipped_peer_matching_retained_hold_after_prepare_vetoes_health() {
+    let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
+        .await
+        .expect("synthetic peer fixture");
+    assert!(
+        fixture
+            .run_two(0, false, false)
+            .await
+            .can_advance_database_checkpoint()
+    );
+    let key = sync_token_key(PEER_ZONE);
+    let cursor = fixture.db.get_metadata(&key).await.unwrap().unwrap();
+    let descriptor_key = format!("observed_selection:v27:{PEER_ZONE}");
+    let descriptor = fixture.db.get_metadata(&descriptor_key).await.unwrap();
+    let mut held = fixture.run_two_filtered(1, false, false, true, false).await;
+    assert_eq!(held.stats.failed, 1);
+    let shutdown = CancellationToken::new();
+    held.prepare_operational_tail(&fixture.shared, &shutdown)
+        .await
+        .unwrap();
+    assert!(held.operational_tail_prepared());
+    let db: Arc<dyn download::DownloadStore> = fixture.db.clone();
+    let builder = make_run_cycle_download_config_builder(&fixture.root, db);
+    let mut probe = (*builder(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from(ZONE),
+    ))
+    .clone();
+    probe.folder_structure = "none".into();
+    probe.retry.max_retries = 0;
+    let enum_hash = download::compute_config_hash(&fixture.config);
+    let download_hash = download::hash_download_config(&probe);
+    let coverage = download::sync_coverage_fingerprint_json(
+        &fixture.config,
+        "icloud",
+        1,
+        &[ZONE.to_owned()],
+        &enum_hash,
+        &download_hash,
+    )
+    .unwrap();
+    let policy = json!([
+        1,
+        crate::state::METADATA_CAPTURE_REVISION,
+        coverage,
+        format!("{:?}", probe.metadata),
+        fixture.config.runtime.refresh_metadata,
+        fixture.config.runtime.repair_capture_timestamps,
+        fixture.config.runtime.repair_truncated
+    ]);
+    let preservation_hash = crate::sync_cycle::hash_legacy_preservation_policy(
+        &policy,
+        probe.legacy_preservation_allow_hardlinks,
+    );
+    crate::sync_cycle::persist_test_retained_checkpoint_hold(
+        fixture.db.as_ref(),
+        PEER_ZONE,
+        &cursor,
+        &enum_hash,
+        &preservation_hash,
+    )
+    .await
+    .unwrap();
+    let hold_key = format!(
+        "{}{PEER_ZONE}",
+        crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
+    );
+    let hold = fixture.db.get_metadata(&hold_key).await.unwrap().unwrap();
+    assert!(
+        held.finish_operational_tail(&fixture.shared, &shutdown)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!held.operational_safe_holds);
+    let (health, report) =
+        reported_health(&fixture, &held, "skipped-peer-retained-hold.json").await;
+    assert!(health.last_success_at.is_none());
+    assert_eq!(report["status"], "partial_failure");
+    assert_eq!(report["stats"]["failed"], 1);
+    assert_eq!(
+        fixture.db.get_metadata(&hold_key).await.unwrap().as_deref(),
+        Some(hold.as_str())
+    );
+    assert_eq!(
+        fixture.db.get_metadata(&key).await.unwrap().as_deref(),
+        Some(cursor.as_str())
+    );
+    assert_eq!(
+        fixture.db.get_metadata(&descriptor_key).await.unwrap(),
+        descriptor
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("baseline.JPG")).unwrap(),
+        MEDIA
+    );
+}
+
+#[tokio::test]
 async fn skipped_peer_active_observation_is_required_and_rechecked() {
     for invalidate_after_prepare in [false, true] {
         let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))

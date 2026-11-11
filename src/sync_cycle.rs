@@ -228,6 +228,40 @@ pub(crate) fn retained_checkpoint_hold_action(encoded: &str) -> &'static str {
     }
 }
 
+pub(crate) fn retained_checkpoint_blocks_health(
+    encoded: &str,
+    cursor: &str,
+    enum_hash: &str,
+    preservation_hash: Option<&str>,
+) -> bool {
+    let Ok(hold) = serde_json::from_str::<RetainedCheckpointHold>(encoded) else {
+        return true;
+    };
+    let digest = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    if hold.version != 1
+        || hold.attempt_count == 0
+        || hold.next_attempt_at < 0
+        || !digest(&hold.prior_cursor_sha256)
+        || !digest(&hold.enum_config_hash)
+        || hold
+            .preservation_config_hash
+            .as_deref()
+            .is_some_and(|value| !digest(value))
+    {
+        return true;
+    }
+    hold.matches(&RetainedCheckpointHold::new(
+        cursor,
+        enum_hash,
+        preservation_hash,
+    ))
+}
+
 fn retained_checkpoint_hold_key(zone: &str) -> String {
     format!("{RETAINED_CHECKPOINT_HOLD_PREFIX}{zone}")
 }
@@ -269,6 +303,19 @@ async fn persist_retained_checkpoint_hold(
     })
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn persist_test_retained_checkpoint_hold(
+    db: &dyn download::DownloadStore,
+    zone: &str,
+    cursor: &str,
+    enum_hash: &str,
+    preservation_hash: &str,
+) -> anyhow::Result<()> {
+    let hold = RetainedCheckpointHold::new(cursor, enum_hash, Some(preservation_hash));
+    persist_retained_checkpoint_hold(db, retained_checkpoint_hold_key(zone), &hold, Vec::new())
+        .await
 }
 const INVENTORY_DROP_THRESHOLD_PERCENT: f64 = 5.0;
 
@@ -1819,6 +1866,28 @@ pub(crate) async fn run_cycle_with_witness(
         )
     {
         let enum_policy = download::compute_config_hash(config);
+        let preservation_policy = if let Some(first) = library_states.first() {
+            let probe = build_download_config(
+                download::SyncMode::Full,
+                Arc::new(rustc_hash::FxHashSet::default()),
+                Arc::new(download::AssetGroupings::default()),
+                Arc::from(first.zone_name.as_str()),
+            );
+            let mut zones: Vec<String> = library_states
+                .iter()
+                .map(|library| library.zone_name.clone())
+                .collect();
+            zones.sort();
+            zones.dedup();
+            Some(preservation_policy_hash(
+                config,
+                &probe,
+                &zones,
+                &enum_policy,
+            )?)
+        } else {
+            None
+        };
         for expected in expected_sources.iter().filter(|source| {
             source.skip_authority == SkipAuthority::NoChanges && source.active_passes
         }) {
@@ -1857,6 +1926,7 @@ pub(crate) async fn run_cycle_with_witness(
                     attempt: &record.attempt,
                     enum_policy: &enum_policy,
                     active_token_key: Some(&state.sync_token_key),
+                    preservation_policy: preservation_policy.as_deref(),
                 },
             )
             .await
@@ -1972,27 +2042,12 @@ pub(crate) async fn run_cycle_with_witness(
                 .collect::<Vec<_>>();
             zones.sort();
             zones.dedup();
-            let coverage = download::sync_coverage_fingerprint_json(
+            preservation_config_hash = Some(preservation_policy_hash(
                 config,
-                "icloud",
-                1,
+                &probe_config,
                 &zones,
                 &enum_config_hash,
-                &download_config_hash,
-            )?;
-            let policy = serde_json::json!([
-                1,
-                state::METADATA_CAPTURE_REVISION,
-                coverage,
-                format!("{:?}", probe_config.metadata),
-                config.runtime.refresh_metadata,
-                config.runtime.repair_capture_timestamps,
-                config.runtime.repair_truncated
-            ]);
-            preservation_config_hash = Some(hash_legacy_preservation_policy(
-                &policy,
-                probe_config.legacy_preservation_allow_hardlinks,
-            ));
+            )?);
         }
 
         let legacy_download_config_hash = download::hash_legacy_download_config(&probe_config);
@@ -3334,6 +3389,7 @@ pub(crate) async fn run_cycle_with_witness(
                     attempt,
                     enum_policy: &enum_config_hash,
                     active_token_key: None,
+                    preservation_policy: None,
                 },
             )
             .await?;
@@ -5662,10 +5718,78 @@ pub(crate) fn hash_legacy_preservation_policy(
     data_encoding::HEXLOWER.encode(&hash.finalize())
 }
 
+fn preservation_policy_hash(
+    config: &crate::config::Config,
+    probe: &download::DownloadConfig,
+    zones: &[String],
+    enum_hash: &str,
+) -> anyhow::Result<String> {
+    let download_hash = download::hash_download_config(probe);
+    let coverage = download::sync_coverage_fingerprint_json(
+        config,
+        "icloud",
+        1,
+        zones,
+        enum_hash,
+        &download_hash,
+    )?;
+    let policy = serde_json::json!([
+        1,
+        state::METADATA_CAPTURE_REVISION,
+        coverage,
+        format!("{:?}", probe.metadata),
+        config.runtime.refresh_metadata,
+        config.runtime.repair_capture_timestamps,
+        config.runtime.repair_truncated
+    ]);
+    Ok(hash_legacy_preservation_policy(
+        &policy,
+        probe.legacy_preservation_allow_hardlinks,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::PassKind;
+
+    #[test]
+    fn retained_health_guard_distinguishes_matching_and_unrelated_policy() {
+        let policy = "a".repeat(64);
+        let preservation = "b".repeat(64);
+        let hold = RetainedCheckpointHold::new("cursor", &policy, Some(&preservation));
+        let encoded = serde_json::to_string(&hold).unwrap();
+        assert!(retained_checkpoint_blocks_health(
+            &encoded,
+            "cursor",
+            &policy,
+            Some(&preservation)
+        ));
+        assert!(!retained_checkpoint_blocks_health(
+            &encoded,
+            "other-cursor",
+            &policy,
+            Some(&preservation)
+        ));
+        assert!(!retained_checkpoint_blocks_health(
+            &encoded,
+            "cursor",
+            &"c".repeat(64),
+            Some(&preservation)
+        ));
+        assert!(!retained_checkpoint_blocks_health(
+            &encoded,
+            "cursor",
+            &policy,
+            Some(&"d".repeat(64))
+        ));
+        assert!(retained_checkpoint_blocks_health(
+            "invalid",
+            "cursor",
+            &policy,
+            Some(&preservation)
+        ));
+    }
 
     #[test]
     fn support_component_totals_keep_inventory_and_bridge_separate() {
