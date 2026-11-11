@@ -176,6 +176,16 @@ async fn cycle(
     crate::sync_loop::runner::drain_source_revalidation(&[&state], &shutdown)
         .await
         .unwrap();
+    let catalog = crate::sync_loop::runner::drain_catalog_source_revalidation(
+        &[&state],
+        &builder,
+        download::DownloadControls::download_hidden(),
+        &download::compute_config_hash(&config),
+        &shutdown,
+    )
+    .await
+    .unwrap();
+    crate::sync_loop::runner::apply_catalog_drain_outcome(&mut result, &[&state], catalog, false);
     result.revalidate_sparse_holds(Some(db.as_ref())).await;
     let guards = result
         .finish_operational_tail(shared, &shutdown)
@@ -599,6 +609,8 @@ async fn scenario(blocked_metadata: bool) -> Option<(crate::health::HealthStatus
         serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
     assert_eq!(report["status"], "partial_failure");
     assert_eq!(report["stats"]["failed"], 0);
+    assert_eq!(health.last_success_at.is_none(), blocked_metadata);
+    assert_eq!(health.consecutive_failures, u32::from(blocked_metadata));
     println!(
         "PRESERVATION_HELD pending={} failures={} sources={} reached={} ordinary_committed={} owner_rows=1 owner_paths=2 report=partial_failure exit=2 operational_safe={}",
         held.stats.unattributed_legacy_pending,
@@ -613,6 +625,7 @@ async fn scenario(blocked_metadata: bool) -> Option<(crate::health::HealthStatus
     drop(initial_guards);
     drop(held);
     drop(initial);
+    assert_eq!(Arc::strong_count(&db), 1);
     drop(db);
     let reopened = Arc::new(
         SqliteStateDb::open_owned(&database, &baseline_owner())
@@ -633,6 +646,52 @@ async fn scenario(blocked_metadata: bool) -> Option<(crate::health::HealthStatus
     );
     assert_eq!(quiet_scope, scope);
     assert_eq!(quiet_baseline, baseline_scope);
+    assert_eq!(
+        quiet.sources[0].operational_prework.is_some(),
+        !blocked_metadata
+    );
+    assert_eq!(quiet.operational_safe_holds, !blocked_metadata);
+    let reopened_report_path = root.join("preservation-reopened-report.json");
+    let reopened_reporter =
+        crate::cycle_reporter::CycleReporter::new(crate::cycle_reporter::CycleReporterConfig {
+            watch_mode: false,
+            report_path: Some(&reopened_report_path),
+            run_options: crate::report::RunOptions::from_config(&config),
+            health_dir: &root,
+            personality_mode: crate::personality::Mode::Off,
+            state_db: Some(reopened.as_ref()),
+            metrics_handle: None,
+            notifier: &notifier,
+        });
+    // A fresh health value must be decided by the reopened cycle, not inherited
+    // from the report made before the database was closed.
+    let mut reopened_health = crate::health::HealthStatus::new();
+    reopened_reporter
+        .report_completed_cycle(
+            &mut reopened_health,
+            crate::cycle_reporter::CycleFacts::from_cycle_result(
+                &quiet,
+                std::time::Duration::from_secs(1),
+            ),
+        )
+        .await;
+    assert!(reopened_health.last_sync_at.is_some());
+    assert_eq!(reopened_health.last_success_at.is_none(), blocked_metadata);
+    assert_eq!(
+        reopened_health.consecutive_failures,
+        u32::from(blocked_metadata)
+    );
+    let reopened_report: Value =
+        serde_json::from_slice(&std::fs::read(&reopened_report_path).unwrap()).unwrap();
+    assert_eq!(reopened_report["status"], "partial_failure");
+    assert_eq!(reopened_report["stats"]["downloaded"], 0);
+    assert_eq!(reopened_report["stats"]["failed"], 0);
+    let persisted_health: Value =
+        serde_json::from_slice(&std::fs::read(root.join("health.json")).unwrap()).unwrap();
+    assert_eq!(
+        persisted_health,
+        serde_json::to_value(&reopened_health).unwrap()
+    );
     let after_epoch = {
         let conn = reopened
             .acquire_lock("reopened preservation epoch")
@@ -670,8 +729,14 @@ async fn scenario(blocked_metadata: bool) -> Option<(crate::health::HealthStatus
     println!(
         "PRESERVATION_QUIET downloads=0 failed=0 pending=1 owner_rows=1 owner_paths=2 historical_rows_and_files_unchanged=true total_media_gets=1"
     );
+    println!(
+        "PRESERVATION_REOPENED_HEALTH pending_metadata={} failures={} success={} actual_completed_cycle=true",
+        blocked_metadata,
+        reopened_health.consecutive_failures,
+        reopened_health.last_success_at.is_some()
+    );
     server.verify().await;
-    Some((health, report))
+    Some((reopened_health, reopened_report))
 }
 
 #[tokio::test]
