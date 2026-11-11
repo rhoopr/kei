@@ -3685,6 +3685,82 @@ async fn pending_claim_fixture(
 }
 
 #[tokio::test]
+async fn reset_catalog_census_copy_is_atomic_and_retains_foreign_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, claim, origin, _) = pending_claim_fixture(dir.path()).await;
+    let foreign = CatalogOrigin::new(
+        origin.plan_digest.clone(),
+        uuid::Uuid::new_v4().to_string(),
+        origin.attempt.clone(),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .unwrap();
+    {
+        let conn = db.acquire_lock("prepare reset census control").unwrap();
+        conn.execute("INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES(?1,'PrimarySync',?2,'policy',?3,'foreign-high','foreign-after','marking','catalog_v2')", rusqlite::params![foreign.nonce,foreign.scope(),CatalogOrigin::boundary(claim.expected_baseline.as_deref().unwrap())]).unwrap();
+        conn.execute("INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES(?1,'foreign-asset',42)", [&foreign.nonce]).unwrap();
+        conn.execute_batch(&format!("CREATE TRIGGER fail_reset_census_copy BEFORE INSERT ON source_revalidation_debt WHEN NEW.round<>'{}' BEGIN SELECT RAISE(ABORT,'reset census copy fault'); END;", origin.nonce)).unwrap();
+    }
+    let error = db.reset_sync_tokens_atomic().await.unwrap_err();
+    assert!(error.to_string().contains("reset census copy fault"));
+    {
+        let conn = db.acquire_lock("verify reset census rollback").unwrap();
+        let record = crate::state::db::sync_epoch::read_library(&conn, "PrimarySync")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_string(&record).unwrap(),
+            claim.expected_library_json
+        );
+        let (phase, count): (String,i64) = conn.query_row("SELECT r.phase,COUNT(d.id) FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1 GROUP BY r.id", [&origin.nonce], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!((phase.as_str(), count), ("marking", 2));
+        conn.execute_batch("DROP TRIGGER fail_reset_census_copy")
+            .unwrap();
+    }
+    db.reset_sync_tokens_atomic().await.unwrap();
+    assert_eq!(
+        db.get_metadata(&claim.baseline_key).await.unwrap(),
+        claim.expected_baseline
+    );
+    drop(db);
+    let reopened = SqliteStateDb::open_owned(&dir.path().join("pending.db"), &owner())
+        .await
+        .unwrap();
+    let conn = reopened
+        .acquire_lock("verify reset census after reopen")
+        .unwrap();
+    let record = crate::state::db::sync_epoch::read_library(&conn, "PrimarySync")
+        .unwrap()
+        .unwrap();
+    assert_ne!(record.attempt, origin.attempt);
+    let (new_id, new_scope, phase): (String,String,String) = conn.query_row("SELECT id,scope,phase FROM source_revalidation_rounds WHERE library='PrimarySync' AND mode='catalog_v2' AND phase='marking' AND scope<>?1", [&foreign.scope()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    let transferred = CatalogOrigin::parse(&new_scope).unwrap();
+    assert_eq!(transferred.nonce, new_id);
+    assert_eq!(transferred.epoch, origin.epoch);
+    assert_eq!(transferred.attempt, record.attempt);
+    assert_eq!(transferred.plan_digest, origin.plan_digest);
+    assert_eq!(phase, "marking");
+    let debt: Vec<(String, i64)> = conn
+        .prepare("SELECT id,next_retry_at FROM source_revalidation_debt WHERE round=?1 ORDER BY id")
+        .unwrap()
+        .query_map([&new_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(debt, vec![("asset1".into(), 10), ("asset2".into(), 20)]);
+    let (old_phase, old_debt, foreign_phase, foreign_due): (String,i64,String,i64) = conn.query_row("SELECT (SELECT phase FROM source_revalidation_rounds WHERE id=?1),(SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1),(SELECT phase FROM source_revalidation_rounds WHERE id=?2),(SELECT next_retry_at FROM source_revalidation_debt WHERE round=?2 AND id='foreign-asset')", rusqlite::params![origin.nonce,foreign.nonce], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+    assert_eq!(
+        (
+            old_phase.as_str(),
+            old_debt,
+            foreign_phase.as_str(),
+            foreign_due
+        ),
+        ("abandoned", 2, "marking", 42)
+    );
+}
+
+#[tokio::test]
 async fn catalog_claim_transfers_only_qualified_owner_and_retains_foreign_rows() {
     let dir = tempfile::tempdir().unwrap();
     let (db, claim, origin, _) = pending_claim_fixture(dir.path()).await;
@@ -3941,6 +4017,49 @@ async fn catalog_claim_stale_ready_transfers_owned_census_and_valid_ready_promot
         )
         .unwrap();
     }
+    // Missing-boundary rotation must roll back the original READY binding,
+    // descriptor, staged token and debt together if the owner copy fails.
+    let staged_bytes = db.get_metadata(staged).await.unwrap().unwrap();
+    let descriptor_bytes = db.get_metadata(staged_descriptor).await.unwrap().unwrap();
+    {
+        let conn = db
+            .acquire_lock("inject missing-boundary copy fault")
+            .unwrap();
+        conn.execute("DELETE FROM metadata WHERE key=?1", [&claim.baseline_key])
+            .unwrap();
+        conn.execute_batch(&format!("CREATE TRIGGER fail_missing_baseline_copy BEFORE INSERT ON source_revalidation_debt WHEN NEW.round<>'{}' BEGIN SELECT RAISE(ABORT,'missing-boundary copy fault'); END;", origin.nonce)).unwrap();
+    }
+    claim.expected_baseline = None;
+    let error = db
+        .claim_catalog_baseline(owner(), claim.clone())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("missing-boundary copy fault"));
+    assert_eq!(
+        serde_json::to_string(&read_record()).unwrap(),
+        claim.expected_library_json
+    );
+    assert_eq!(
+        db.get_metadata(staged).await.unwrap().as_deref(),
+        Some(staged_bytes.as_str())
+    );
+    assert_eq!(
+        db.get_metadata(staged_descriptor).await.unwrap().as_deref(),
+        Some(descriptor_bytes.as_str())
+    );
+    {
+        let conn = db.acquire_lock("verify missing-boundary rollback").unwrap();
+        let (phase, debt): (String, i64) = conn.query_row("SELECT r.phase,COUNT(d.id) FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1 GROUP BY r.id", [&origin.nonce], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!((phase.as_str(), debt), ("observing", 2));
+        conn.execute_batch("DROP TRIGGER fail_missing_baseline_copy")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO metadata(key,value) VALUES(?1,?2)",
+            rusqlite::params![claim.baseline_key, boundary],
+        )
+        .unwrap();
+    }
+    claim.expected_baseline = Some(boundary.clone());
     db.set_metadata(staged, "ready-token").await.unwrap();
     assert!(db.get_metadata(staged_descriptor).await.unwrap().is_none());
     let stale = read_record();
@@ -4116,11 +4235,38 @@ async fn prior_inventory_proof_requires_matching_owner_plans_policy_and_boundary
             .await
             .unwrap()
     );
-    let delta = ObservationProof::delivery(receipt)
+    let delta = ObservationProof::delivery(receipt.clone())
         .delta("before", "after")
         .unwrap();
     assert!(proof.clone().bridge(delta.clone(), "before").is_some());
-    assert!(proof.bridge(delta, "other-boundary").is_none());
+    assert!(
+        proof
+            .clone()
+            .bridge(delta.clone(), "other-boundary")
+            .is_none()
+    );
+    let first = proof.clone().bridge(delta, "before").unwrap();
+    let second = proof
+        .clone()
+        .bridge(
+            ObservationProof::delivery(receipt.clone())
+                .delta("after", "final")
+                .unwrap(),
+            "after",
+        )
+        .unwrap();
+    let joined = first.clone().continue_baseline(second).unwrap();
+    assert!(joined.is_completed_baseline_for_boundary("PrimarySync", "final", "before"));
+    assert!(!joined.is_completed_baseline_for_boundary("PrimarySync", "final", "after"));
+    let wrong = proof
+        .bridge(
+            ObservationProof::delivery(receipt)
+                .delta("other", "final")
+                .unwrap(),
+            "other",
+        )
+        .unwrap();
+    assert!(first.continue_baseline(wrong).is_none());
 }
 
 #[tokio::test]

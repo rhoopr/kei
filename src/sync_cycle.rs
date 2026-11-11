@@ -2027,6 +2027,7 @@ pub(crate) async fn run_cycle_with_witness(
         active_cursor_fences.push((hold_key.clone(), None));
 
         let mut force_epoch_baseline = false;
+        let mut reset_epoch_baseline = false;
         let mut promote_only = false;
         let mut epoch_attempt: Option<String> = None;
         let mut qualification_reservation: Option<state::QualificationReservation> = None;
@@ -2155,12 +2156,117 @@ pub(crate) async fn run_cycle_with_witness(
                     state::SyncEpochGate::Open
                 }
             } else {
-                db.sync_epoch_gate(
-                    lib_state.zone_name.clone(),
-                    lib_state.library.baseline_scope(),
-                    config.watch.interval,
-                )
-                .await?
+                let catalog_gate = if let Some(epoch) = sync_epoch.as_deref()
+                    && !lib_state.plan_is_stale
+                    && !lib_state.plan_needs_refresh
+                    && checkpoint_transition_state_safe
+                {
+                    let epoch_raw = db.get_metadata(state::SYNC_EPOCH_KEY).await?;
+                    let library_raw = db
+                        .get_metadata(&state::db::sync_epoch::library_key(&lib_state.zone_name))
+                        .await?;
+                    if let (Some(epoch_raw), Some(library_raw)) = (epoch_raw, library_raw) {
+                        let library_record: state::db::sync_epoch::SyncEpochLibrary =
+                            serde_json::from_str(&library_raw)?;
+                        reset_epoch_baseline = library_record.reason == "sync_token_reset";
+                        if matches!(library_record.state.as_str(), "pending" | "ready") {
+                            let baseline_key = format!(
+                                "baseline_cursor:v27:{}:{}:{}:{}",
+                                epoch,
+                                lib_state.library.baseline_scope(),
+                                enum_config_hash,
+                                preservation_config_hash.as_deref().unwrap_or(""),
+                            );
+                            #[cfg(feature = "xmp")]
+                            let groupings =
+                                if config.metadata.embed_xmp || config.metadata.xmp_sidecar {
+                                    preload_asset_groupings(state_db, &lib_state.zone_name).await
+                                } else {
+                                    Arc::new(download::AssetGroupings::default())
+                                };
+                            #[cfg(not(feature = "xmp"))]
+                            let groupings = Arc::new(download::AssetGroupings::default());
+                            let probe = build_download_config(
+                                download::SyncMode::Full,
+                                Arc::new(rustc_hash::FxHashSet::default()),
+                                groupings,
+                                Arc::from(lib_state.zone_name.as_str()),
+                            );
+                            let probe = Arc::new(probe.check_ownership().await?);
+                            if let Some((capture, request)) = capture_catalog_request(
+                                lib_state,
+                                &probe,
+                                download_controls,
+                                db,
+                                epoch,
+                                &library_record.attempt,
+                                &baseline_key,
+                                &enum_config_hash,
+                                preservation_config_hash.as_deref(),
+                                &zone_metadata_fence,
+                                &path_metadata_at_start,
+                            )
+                            .await?
+                            {
+                                use state::db::source_revalidation::{
+                                    CatalogBaselineClaim, CatalogClaimOutcome,
+                                    fresh_catalog_plan_digest,
+                                };
+                                let claim = CatalogBaselineClaim {
+                                    library: request.library.clone(),
+                                    baseline_key: request.baseline_key.clone(),
+                                    expected_baseline: request.expected_baseline.clone(),
+                                    plan_digest: fresh_catalog_plan_digest(&request.plan),
+                                    expected_enum_hash: request.enum_hash.clone(),
+                                    expected_epoch: epoch.to_owned(),
+                                    expected_epoch_json: epoch_raw,
+                                    expected_library_json: library_raw,
+                                    expected_metadata: request.expected_metadata,
+                                    now: chrono::Utc::now().timestamp(),
+                                    watch_interval: config.watch.interval,
+                                };
+                                let outcome = capture
+                                    .db
+                                    .claim_catalog_baseline(capture.owner, claim)
+                                    .await?;
+                                Some(match outcome {
+                                    CatalogClaimOutcome::Transferred { attempt, .. }
+                                    | CatalogClaimOutcome::Baseline { attempt } => {
+                                        state::SyncEpochGate::Baseline { attempt }
+                                    }
+                                    CatalogClaimOutcome::Promote { attempt } => {
+                                        state::SyncEpochGate::Promote { attempt }
+                                    }
+                                    CatalogClaimOutcome::Defer { reason } => {
+                                        state::SyncEpochGate::Defer { reason }
+                                    }
+                                    CatalogClaimOutcome::Blocked { reason } => {
+                                        state::SyncEpochGate::Blocked { reason }
+                                    }
+                                    CatalogClaimOutcome::Open => state::SyncEpochGate::Open,
+                                })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(gate) = catalog_gate {
+                    gate
+                } else {
+                    db.sync_epoch_gate(
+                        lib_state.zone_name.clone(),
+                        lib_state.library.baseline_scope(),
+                        config.watch.interval,
+                    )
+                    .await?
+                }
             };
             let retry_during_hold = matches!(
                 &epoch_gate,
@@ -2785,6 +2891,7 @@ pub(crate) async fn run_cycle_with_witness(
                 (state_db, sync_epoch.as_deref(), epoch_attempt.as_deref())
         {
             let result: anyhow::Result<_> = Box::pin(async {
+                use anyhow::Context as _;
                 let Some((capture, mut request)) = capture_catalog_request(
                     lib_state,
                     &download_config,
@@ -2805,21 +2912,41 @@ pub(crate) async fn run_cycle_with_witness(
                 let resume = capture
                     .db
                     .catalog_resume(capture.owner.clone(), request.clone())
-                    .await?;
-                let (boundary, origin) = if let Some(resume) = resume {
+                    .await
+                    .context("reading pending catalog resume")?;
+                let (boundary, origin) = if let Some(resume) = resume.as_ref() && !reset_epoch_baseline {
                     anyhow::ensure!(
                         resume.relation
                             == state::db::source_revalidation::CatalogResumeRelation::PendingAttempt,
                         "Catalog resume is not a pending attempt"
                     );
-                    (resume.boundary, resume.origin)
+                    (resume.boundary.clone(), resume.origin.clone())
                 } else {
+                    if let Some(resume) = resume {
+                        anyhow::ensure!(
+                            resume.relation == state::db::source_revalidation::CatalogResumeRelation::PendingAttempt,
+                            "Reset catalog resume is not a pending attempt"
+                        );
+                        capture.db.seed_source_revalidation(
+                            capture.owner.clone(),
+                            lib_state.zone_name.clone(),
+                            resume.origin.scope(),
+                            enum_config_hash.clone(),
+                            state::db::source_revalidation::CatalogOrigin::boundary(&resume.boundary),
+                            shutdown_token.clone(),
+                        ).await?;
+                        anyhow::ensure!(!shutdown_token.is_cancelled(), "Reset catalog census interrupted");
+                        request.expected_catalog_snapshot = capture.db.fresh_catalog_snapshot(
+                            capture.owner.clone(), lib_state.zone_name.clone(),
+                        ).await?;
+                    }
                     let boundary = lib_state.library.fresh_baseline_cursor().await?;
                     request.fresh_cursor = boundary.clone();
                     let origin = capture
                         .db
                         .install_fresh_catalog_origin(capture.owner.clone(), request)
-                        .await?;
+                        .await
+                        .context("installing pending catalog origin")?;
                     (boundary, origin)
                 };
                 capture
@@ -2832,7 +2959,8 @@ pub(crate) async fn run_cycle_with_witness(
                         state::db::source_revalidation::CatalogOrigin::boundary(&boundary),
                         shutdown_token.clone(),
                     )
-                    .await?;
+                    .await
+                    .context("seeding pending catalog census")?;
                 anyhow::ensure!(
                     !shutdown_token.is_cancelled(),
                     "Pending catalog census interrupted"
@@ -3631,6 +3759,7 @@ pub(crate) async fn run_cycle_with_witness(
                 .clone()
                 .or_else(|| retained_cursor_at_start.clone());
             if let Some(mut prior_token) = prior_token.filter(|token| !token.trim().is_empty()) {
+                let mut initial_bridge = None;
                 for baseline_attempt in 0..2 {
                     let inventory_decision = source_checkpoint_decision(
                         &sync_result,
@@ -3648,7 +3777,7 @@ pub(crate) async fn run_cycle_with_witness(
                         && !sync_result.checkpoint.interrupted
                         && !lib_state.plan_is_stale;
                     if matches!(inventory_decision, SourceCheckpointDecision::Advance { .. })
-                        || complete_selected_window
+                        || (fresh_origin.is_none() && complete_selected_window)
                     {
                         #[cfg(test)]
                         if fresh_origin.is_some() {
@@ -3785,6 +3914,83 @@ pub(crate) async fn run_cycle_with_witness(
                         sync_result.accumulate(&bridge_result);
                         if fresh_origin.is_some() && bridge_result.checkpoint.inventory_rank_changed
                         {
+                            if baseline_attempt == 0
+                                && bridge_result.checkpoint.completed_delta_replay
+                                && matches!(
+                                    inventory_decision,
+                                    SourceCheckpointDecision::Advance { .. }
+                                )
+                                && !shutdown_token.is_cancelled()
+                                && let SourceCheckpointDecision::Advance { token, .. } =
+                                    &bridge_decision
+                                && let Some(proof) = sync_result
+                                    .checkpoint
+                                    .observation
+                                    .clone()
+                                    .zip(bridge_result.checkpoint.observation.clone())
+                                    .and_then(|(inventory, delta)| {
+                                        inventory.bridge(delta, &prior_token)
+                                    })
+                            {
+                                // The first EOF bounds a new rank traversal. Keep
+                                // both proofs in memory and leave the catalog's
+                                // original durable boundary untouched.
+                                initial_bridge = Some(proof);
+                                prior_token = token.clone();
+                                let previous = sync_result;
+                                let repeated = Box::pin(download::download_photos_with_sync(
+                                    &download_client,
+                                    &lib_state.plan.passes,
+                                    Arc::clone(&download_config),
+                                    download_controls,
+                                    shutdown_token.clone(),
+                                ))
+                                .await;
+                                sync_result = match repeated {
+                                    Ok(result) => result,
+                                    Err(error) => {
+                                        if retained_main_rejected
+                                            && !retained_checkpoint_reserved
+                                            && let (Some(db), Some(prior)) =
+                                                (state_db, retained_cursor_at_start.as_deref())
+                                        {
+                                            let mut hold = RetainedCheckpointHold::new(
+                                                prior,
+                                                &enum_config_hash,
+                                                preservation_config_hash.as_deref(),
+                                            );
+                                            hold.attempt_count = retained_checkpoint_attempt;
+                                            let expected = zone_metadata_fence
+                                                .iter()
+                                                .cloned()
+                                                .chain(path_metadata_at_start.iter().cloned())
+                                                .collect();
+                                            if let Err(hold_error) =
+                                                persist_retained_checkpoint_hold(
+                                                    db,
+                                                    hold_key.clone(),
+                                                    &hold,
+                                                    expected,
+                                                )
+                                                .await
+                                            {
+                                                return Err(error.context(format!(
+                                                    "Failed to retain rejected main checkpoint hold: {hold_error:#}"
+                                                )));
+                                            }
+                                        }
+                                        return Err(error);
+                                    }
+                                };
+                                sync_result.outcome = merge_download_outcomes(
+                                    &previous.outcome,
+                                    &sync_result.outcome,
+                                );
+                                sync_result.accumulate(&previous);
+                                sync_result.checkpoint.completed_delta_replay = false;
+                                sync_result.checkpoint.inventory_rank_changed = false;
+                                continue;
+                            }
                             // A catalog origin is bound to the original boundary.
                             // Do not rewrite that boundary independently of its owner.
                             sync_result.sync_token = None;
@@ -3898,6 +4104,12 @@ pub(crate) async fn run_cycle_with_witness(
                             }
                             block_for_retained_checkpoint(&mut sync_result.stats);
                         }
+                        if initial_bridge.is_some() && shutdown_token.is_cancelled() {
+                            sync_result.sync_token = None;
+                            sync_result.checkpoint.sync_token_blocked = true;
+                            sync_result.checkpoint.project(&mut sync_result.stats);
+                            break;
+                        }
                         if (fresh_origin.is_none() && !bridge_result.full_enumeration_ran)
                             || bridge_result.checkpoint.completed_delta_replay
                         {
@@ -3910,6 +4122,10 @@ pub(crate) async fn run_cycle_with_witness(
                                     .zip(bridge_result.checkpoint.observation.clone())
                                     .and_then(|(inventory, delta)| {
                                         inventory.bridge(delta, &prior_token)
+                                    })
+                                    .and_then(|proof| match initial_bridge.take() {
+                                        Some(first) => first.continue_baseline(proof),
+                                        None => Some(proof),
                                     })
                                     .map(|proof| match &fresh_origin {
                                         Some(origin) => proof.with_catalog_origin(origin.clone()),

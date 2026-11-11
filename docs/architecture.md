@@ -2135,6 +2135,17 @@ exact saved boundary. It checks the source, attempt, plan and fences and refuses
 ambiguous rounds. The saved boundary may differ from the retained ACTIVE token
 after expiry. A matching token does not by itself prove provider EOF; resuming
 still requires the full inventory and bridge before activation.
+If a completed fresh bridge changes rank order, the cycle may deliver that
+bridge's selected work, repeat the full inventory once, and bridge from the
+first EOF. The original catalog boundary remains unchanged. Both intervals
+must have matching source and plan evidence, and the checkpoint transaction
+still checks the original owner, epoch, attempt and boundary. A second rank
+change or incomplete source proof retains the original boundary. Transfer
+failures remain reported and may advance only when their retry work is durable
+and both interval decisions and owner proofs qualify. Smart-folder plans
+and selections that require their own additional inventory also retain it:
+their bridge does not provide the membership proof needed for this bounded
+path.
 During the attempt, the cycle retains the original typed MAIN rejection and
 original cursor as private facts while that recovery is unfinished. An
 interruption before the hold is written can delay recovery on an otherwise quiet

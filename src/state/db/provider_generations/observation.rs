@@ -307,6 +307,40 @@ impl ObservationProof {
         delta.supplemental.extend(self.supplemental);
         Some(delta)
     }
+
+    /// Join two completed baseline intervals around a repeated inventory.
+    /// The original boundary stays authoritative; the intermediate cursor is
+    /// only accepted when both independently completed proofs name it.
+    pub(crate) fn continue_baseline(self, mut next: Self) -> Option<Self> {
+        if self.plans()? != next.plans()? {
+            return None;
+        }
+        let Kind::Baseline {
+            prior,
+            next: middle,
+        } = &self.kind
+        else {
+            return None;
+        };
+        let Kind::Baseline {
+            prior: successor,
+            next: end,
+        } = &next.kind
+        else {
+            return None;
+        };
+        if middle != successor {
+            return None;
+        }
+        next.kind = Kind::Baseline {
+            prior: prior.clone(),
+            next: end.clone(),
+        };
+        next.supplemental.extend(self.base);
+        next.supplemental.extend(self.supplemental);
+        next.plans()?;
+        Some(next)
+    }
     fn plans(&self) -> Option<Vec<Plan>> {
         let first = self.base.first()?;
         let selector = first.plan.selector()?;
@@ -564,6 +598,100 @@ pub(in crate::state::db) fn has_valid_staged_for_library(
         }
     }
     Ok(false)
+}
+
+/// An abandoned catalog-linked descriptor from another attempt is retained
+/// evidence, not a promotion candidate for this pending catalog operation.
+/// Every other staged token remains a blocker.
+pub(in crate::state::db) fn has_blocking_staged_for_pending_catalog(
+    conn: &Connection,
+    library: &str,
+    epoch: &str,
+    attempt: &str,
+    enum_hash: &str,
+    plan_digest: &str,
+) -> Result<bool, StateError> {
+    let current = sync_epoch::validate(conn)?;
+    let Some(record) = sync_epoch::read_library(conn, library)? else {
+        return Ok(true);
+    };
+    if current.epoch != epoch
+        || record.epoch != epoch
+        || record.state != "pending"
+        || record.attempt != attempt
+        || record.binding.is_some()
+    {
+        return Ok(true);
+    }
+    let keys: Vec<String> = conn
+        .prepare("SELECT key FROM metadata WHERE key LIKE 'pending_sync_token:v27:%'")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for key in keys {
+        let Some((hash, zone)) = key
+            .strip_prefix("pending_sync_token:v27:")
+            .and_then(|rest| rest.split_once(':'))
+        else {
+            continue;
+        };
+        if zone != library {
+            continue;
+        }
+        let Some(token) = metadata(conn, &key)? else {
+            return Ok(true);
+        };
+        let Some(descriptor) = valid(conn, &format!("{STAGED}{hash}:{zone}"), &token)? else {
+            return Ok(true);
+        };
+        let Some(round) = descriptor.revalidation_round.as_deref() else {
+            return Ok(true);
+        };
+        let raw = serde_json::to_string(&descriptor)
+            .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+        if hash != enum_hash
+            || descriptor.policy[0].as_deref() != Some(enum_hash)
+            || !descriptor_own_source(&descriptor)?
+            || catalog_plan_digest_from_observation(&raw, library).as_deref() != Some(plan_digest)
+        {
+            return Ok(true);
+        }
+        let saved: Option<(String, String, String, String)> = conn
+            .query_row(
+                "SELECT scope,enum_hash,mode,phase FROM source_revalidation_rounds WHERE id=?1 AND library=?2",
+                params![round, library],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((scope, saved_policy, mode, phase)) = saved else {
+            return Ok(true);
+        };
+        let Ok(origin) = super::super::source_revalidation::CatalogOrigin::parse(&scope) else {
+            return Ok(true);
+        };
+        if mode != super::super::source_revalidation::CATALOG_MODE
+            || phase != "abandoned"
+            || origin.nonce != round
+            || saved_policy != enum_hash
+            || origin.plan_digest != plan_digest
+            || origin.epoch != epoch
+            || origin.attempt == attempt
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+pub(crate) fn test_pending_catalog_staged_block(
+    conn: &Connection,
+    library: &str,
+    epoch: &str,
+    attempt: &str,
+    enum_hash: &str,
+    plan_digest: &str,
+) -> Result<bool, StateError> {
+    has_blocking_staged_for_pending_catalog(conn, library, epoch, attempt, enum_hash, plan_digest)
 }
 
 pub(in crate::state::db) fn catalog_origin_current(

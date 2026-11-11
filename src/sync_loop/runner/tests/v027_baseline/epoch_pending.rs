@@ -3,7 +3,7 @@
 //! normal post-epoch path retries it exactly once.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use base64::Engine as _;
@@ -41,9 +41,43 @@ struct Fixture {
     inventory: Vec<Value>,
     full_queries: Arc<AtomicUsize>,
     changes: Arc<AtomicUsize>,
+    ok_lookups: Arc<AtomicUsize>,
     shared: crate::auth::session::SharedSession,
     fail_media: Vec<u8>,
     legacy_checksum: Option<String>,
+    reset_boundary: AtomicBool,
+}
+
+#[derive(Clone)]
+struct CountOkLookup {
+    inner: ResetCycleSession,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for CountOkLookup {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        if url.contains("/records/lookup?") {
+            let request: Value = serde_json::from_str(&body)?;
+            if request["records"].as_array().is_some_and(|records| {
+                records
+                    .iter()
+                    .any(|record| record["recordName"] == "asset-ok")
+            }) {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        crate::icloud::photos::PhotosSession::post(&self.inner, url, body, headers).await
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
 }
 
 struct BlockedDownload {
@@ -216,9 +250,11 @@ impl Fixture {
             inventory,
             full_queries: Arc::new(AtomicUsize::new(0)),
             changes: Arc::new(AtomicUsize::new(0)),
+            ok_lookups: Arc::new(AtomicUsize::new(0)),
             shared,
             fail_media,
             legacy_checksum: None,
+            reset_boundary: AtomicBool::new(false),
         }
     }
 
@@ -309,11 +345,6 @@ impl Fixture {
             .await
     }
 
-    async fn run_without_active_passes(&self, retry_failed: bool) -> CycleResult {
-        self.run_with_options_and_passes(retry_failed, false, false, false)
-            .await
-    }
-
     async fn run_with_options_and_passes(
         &self,
         retry_failed: bool,
@@ -321,20 +352,42 @@ impl Fixture {
         legal_repair: bool,
         include_pass: bool,
     ) -> CycleResult {
+        self.run_with_inventory_failure(retry_failed, cancel, legal_repair, include_pass, false)
+            .await
+    }
+
+    async fn run_with_inventory_failure(
+        &self,
+        retry_failed: bool,
+        cancel: bool,
+        legal_repair: bool,
+        include_pass: bool,
+        fail_full: bool,
+    ) -> CycleResult {
+        use crate::commands::{
+            build_collection_context, pass_scope_for_zone, resolve_passes_for_scope, zone_name_set,
+        };
         let db = self.open().await;
         let session = ResetCycleSession {
             zone: ZONE,
             inventory: Arc::new(self.inventory.clone()),
             full_queries: Arc::clone(&self.full_queries),
             changes: Arc::clone(&self.changes),
-            fail_full: false,
+            fail_full,
             auth_expired: false,
-            boundary: "inventory-last-page",
+            boundary: if self.reset_boundary.load(Ordering::SeqCst) {
+                "reset-fresh-boundary"
+            } else {
+                "inventory-last-page"
+            },
         };
         let mut library = PhotoLibrary::new(
             "https://synthetic.example/database/1/photos/production/private".into(),
             Arc::new(std::collections::HashMap::new()),
-            Box::new(session),
+            Box::new(CountOkLookup {
+                inner: session,
+                calls: Arc::clone(&self.ok_lookups),
+            }),
             Arc::new(super::zone()),
             "private".into(),
             crate::retry::RetryConfig::default(),
@@ -346,12 +399,21 @@ impl Fixture {
             baseline_owner(),
             "com",
         ));
+        let mut run_config = make_run_cycle_config();
+        run_config.filters.selection.albums = crate::selection::AlbumSelector::None;
+        run_config.filters.selection.unfiled = true;
         let passes = if include_pass {
-            vec![AlbumPass {
-                kind: PassKind::Unfiled,
-                album: library.all(),
-                exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
-            }]
+            let selection = &run_config.filters.selection;
+            let libraries = std::slice::from_ref(&library);
+            let zones = zone_name_set(libraries);
+            let context = build_collection_context(selection, libraries)
+                .await
+                .unwrap();
+            let scope = pass_scope_for_zone(selection, ZONE, &zones, &zones);
+            resolve_passes_for_scope(&library, selection, scope, &context, &[])
+                .await
+                .unwrap()
+                .passes
         } else {
             Vec::new()
         };
@@ -373,7 +435,6 @@ impl Fixture {
         if cancel {
             token.cancel();
         }
-        let mut run_config = make_run_cycle_config();
         if legal_repair {
             run_config.runtime.refresh_metadata = true;
             run_config.runtime.repair_capture_timestamps = true;
@@ -695,7 +756,7 @@ async fn epoch_defer_keeps_admitted_failed_destination_pending() {
     let completed = fixture.run(false, false).await;
     assert_eq!(completed.failed_count, 0, "{completed:?}");
     let after = fixture.snapshot().await;
-    assert_eq!(after.state, "complete");
+    assert_eq!(after.state, "complete", "{completed:?}");
     assert!(!after.binding_present);
     assert!(after.active_token.is_some());
     assert_ne!(after.active_token, before.active_token);
@@ -959,6 +1020,33 @@ async fn epoch_baseline_refuses_staging_after_reset_rotates_attempt() {
             .unwrap()
             .attempt
     };
+    let old_census = {
+        let db = fixture.open().await;
+        let conn = db
+            .acquire_lock("read reset in-flight catalog owner")
+            .unwrap();
+        let record = crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap();
+        let (id, scope, policy, boundary, phase): (String, String, String, String, String) = conn.query_row(
+            "SELECT id,scope,enum_hash,boundary,phase FROM source_revalidation_rounds WHERE library=?1 AND mode='catalog_v2' AND phase='observing'",
+            [ZONE], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).unwrap();
+        let origin = crate::state::db::source_revalidation::CatalogOrigin::parse(&scope).unwrap();
+        assert_eq!(origin.nonce, id);
+        assert_eq!(origin.epoch, record.epoch);
+        assert_eq!(origin.attempt, inflight_attempt);
+        let debt: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT id,next_retry_at FROM source_revalidation_debt WHERE round=?1 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([&id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        (id, scope, policy, boundary, phase, debt)
+    };
     let globals = GlobalArgs {
         username: Some("baseline@example.invalid".to_owned()),
         domain: Some(Domain::Com),
@@ -971,6 +1059,56 @@ async fn epoch_baseline_refuses_staging_after_reset_rotates_attempt() {
     let _old_cycle = cycle.await;
 
     let after = fixture.snapshot().await;
+    {
+        let db = fixture.open().await;
+        let conn = db
+            .acquire_lock("inspect reset retained catalog owner")
+            .unwrap();
+        let saved: (String, String, String, String, String) = conn.query_row(
+            "SELECT id,scope,enum_hash,boundary,phase FROM source_revalidation_rounds WHERE id=?1 AND library=?2",
+            rusqlite::params![old_census.0, ZONE], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).unwrap();
+        assert_eq!(
+            saved,
+            (
+                old_census.0.clone(),
+                old_census.1.clone(),
+                old_census.2.clone(),
+                old_census.3.clone(),
+                "abandoned".to_owned()
+            )
+        );
+        let debt: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT id,next_retry_at FROM source_revalidation_debt WHERE round=?1 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([&old_census.0], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(debt, old_census.5);
+        let (new_id, new_scope, phase): (String, String, String) = conn.query_row(
+            "SELECT id,scope,phase FROM source_revalidation_rounds WHERE library=?1 AND mode='catalog_v2' AND phase=?2 AND boundary=?3",
+            rusqlite::params![ZONE,old_census.4,old_census.3], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        let origin =
+            crate::state::db::source_revalidation::CatalogOrigin::parse(&new_scope).unwrap();
+        assert_eq!(origin.nonce, new_id);
+        assert_eq!(origin.attempt, after.attempt);
+        assert_eq!(phase, old_census.4);
+        let copied: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT id,next_retry_at FROM source_revalidation_debt WHERE round=?1 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([new_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(copied, debt);
+        eprintln!("RESET_OLD_CENSUS_PRESERVED debt_rows={}", debt.len());
+    }
     assert_ne!(
         after.attempt, inflight_attempt,
         "the reset must rotate the in-flight attempt"
@@ -997,9 +1135,36 @@ async fn epoch_baseline_refuses_staging_after_reset_rotates_attempt() {
     );
 
     fixture.force_due().await;
-    let _fresh = fixture.run(false, false).await;
+    fixture.reset_boundary.store(true, Ordering::SeqCst);
+    let interrupted = fixture
+        .run_with_inventory_failure(false, false, false, true, true)
+        .await;
+    assert!(!interrupted.db_sync_token_advance_safe, "{interrupted:?}");
+    {
+        let db = fixture.open().await;
+        let conn = db
+            .acquire_lock("inspect reset fresh boundary after reopen")
+            .unwrap();
+        let record = crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, "pending");
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM metadata WHERE key LIKE 'baseline_cursor:v27:%' AND value='reset-fresh-boundary'", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            count, 1,
+            "the new owner must persist the fresh provider boundary"
+        );
+        let scopes: Vec<String> = conn.prepare("SELECT scope FROM source_revalidation_rounds WHERE library=?1 AND mode='catalog_v2' AND phase='observing' AND boundary=?2").unwrap().query_map(rusqlite::params![ZONE,crate::state::db::source_revalidation::CatalogOrigin::boundary("reset-fresh-boundary")], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert!(scopes.iter().any(|scope| {
+            crate::state::db::source_revalidation::CatalogOrigin::parse(scope).is_ok_and(|origin| {
+                origin.epoch == record.epoch && origin.attempt == record.attempt
+            })
+        }));
+    }
+    fixture.force_due().await;
+    let fresh = fixture.run(false, false).await;
     let done = fixture.snapshot().await;
-    assert_eq!(done.state, "complete");
+    assert_eq!(done.state, "complete", "{fresh:?}");
     assert!(!done.binding_present);
     assert!(done.active_token.is_some());
     assert_eq!(
@@ -1027,13 +1192,61 @@ async fn stale_proof_baseline_precedes_pending_zone_token() {
     assert_eq!(before.state, "ready");
     let old_pending = before.pending_token.clone().expect("staged token");
 
-    {
+    let (
+        descriptor_key,
+        descriptor_bytes,
+        token_key,
+        token_bytes,
+        baseline_key,
+        old_origin,
+        old_debt,
+    ) = {
         let db = fixture.open().await;
         let conn = db.acquire_lock("make staged epoch proof stale").unwrap();
         let record = crate::state::db::sync_epoch::read_library(&conn, ZONE)
             .unwrap()
             .unwrap();
         let binding = record.binding.expect("staged binding");
+        let descriptor: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [&binding.descriptor_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&descriptor).unwrap();
+        let round = parsed["revalidation_round"]
+            .as_str()
+            .expect("production staged descriptor must own a catalog round");
+        let (scope, mode, phase): (String, String, String) = conn
+            .query_row(
+                "SELECT scope,mode,phase FROM source_revalidation_rounds WHERE id=?1 AND library=?2",
+                rusqlite::params![round, ZONE],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let origin = crate::state::db::source_revalidation::CatalogOrigin::parse(&scope).unwrap();
+        assert_eq!(origin.nonce, round);
+        assert_eq!(origin.epoch, record.epoch);
+        assert_eq!(origin.attempt, record.attempt);
+        assert_eq!(mode, "catalog_v2");
+        assert_eq!(phase, "observing");
+        let debt: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT id,next_retry_at FROM source_revalidation_debt WHERE round=?1 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([round], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let token: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [&binding.token_key],
+                |row| row.get(0),
+            )
+            .unwrap();
         conn.execute(
             "DELETE FROM metadata WHERE key=?1",
             [binding.baseline_key.as_str()],
@@ -1044,7 +1257,157 @@ async fn stale_proof_baseline_precedes_pending_zone_token() {
             [OLD_ENUM_HASH],
         )
         .unwrap();
+        (
+            binding.descriptor_key,
+            descriptor,
+            binding.token_key,
+            token,
+            binding.baseline_key,
+            origin,
+            debt,
+        )
+    };
+
+    // Fail only the later inventory, after the rotated owner has installed its
+    // own fresh boundary. Reopen before any new staged token can supersede the old one.
+    let interrupted = fixture
+        .run_with_inventory_failure(false, false, false, true, true)
+        .await;
+    assert!(!interrupted.db_sync_token_advance_safe, "{interrupted:?}");
+    {
+        let db = fixture.open().await;
+        let conn = db
+            .acquire_lock("inspect stale staged evidence after reopen")
+            .unwrap();
+        let record = crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, "pending");
+        assert_ne!(record.attempt, before.attempt);
+        assert!(record.binding.is_none());
+        let saved_descriptor: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [&descriptor_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let saved_token: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [&token_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved_descriptor, descriptor_bytes);
+        assert_eq!(saved_token, token_bytes);
+        let phase: String = conn
+            .query_row(
+                "SELECT phase FROM source_revalidation_rounds WHERE id=?1 AND library=?2",
+                rusqlite::params![old_origin.nonce, ZONE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "abandoned");
+        let debt: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT id,next_retry_at FROM source_revalidation_debt WHERE round=?1 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([&old_origin.nonce], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(debt, old_debt);
+        let fresh_cursor: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [&baseline_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fresh_cursor, "inventory-last-page");
+        let current_rounds: Vec<String> = conn.prepare("SELECT scope FROM source_revalidation_rounds WHERE library=?1 AND mode='catalog_v2' AND phase='observing'").unwrap().query_map([ZONE], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert!(current_rounds.iter().any(|scope| {
+            crate::state::db::source_revalidation::CatalogOrigin::parse(scope).is_ok_and(|origin| {
+                origin.epoch == record.epoch
+                    && origin.attempt == record.attempt
+                    && origin.plan_digest == old_origin.plan_digest
+            })
+        }));
+
+        let staged: serde_json::Value = serde_json::from_str(&descriptor_bytes).unwrap();
+        let enum_hash = staged["policy"][0].as_str().unwrap();
+        let blocks = |plan: &str| {
+            crate::state::db::provider_generations::observation::test_pending_catalog_staged_block(
+                &conn,
+                ZONE,
+                &record.epoch,
+                &record.attempt,
+                enum_hash,
+                plan,
+            )
+            .unwrap()
+        };
+        assert!(
+            !blocks(&old_origin.plan_digest),
+            "the owner-linked prior attempt is noncurrent after reopen"
+        );
+        assert!(blocks(&"f".repeat(64)), "a foreign plan remains blocked");
+        let mut current = old_origin.clone();
+        current.attempt = record.attempt.clone();
+        let mut foreign_epoch = old_origin.clone();
+        foreign_epoch.epoch = uuid::Uuid::new_v4().to_string();
+        let mut wrong_nonce = old_origin.clone();
+        wrong_nonce.nonce = uuid::Uuid::new_v4().to_string();
+        for (scope, mode, phase) in [
+            (current.scope(), "catalog_v2", "abandoned"),
+            (foreign_epoch.scope(), "catalog_v2", "abandoned"),
+            (wrong_nonce.scope(), "catalog_v2", "abandoned"),
+            ("catalog:v2:malformed".to_owned(), "catalog_v2", "abandoned"),
+            (old_origin.scope(), "legacy", "abandoned"),
+            (old_origin.scope(), "future", "abandoned"),
+            (old_origin.scope(), "catalog_v2", "observing"),
+        ] {
+            conn.execute_batch("SAVEPOINT staged_negative").unwrap();
+            conn.execute(
+                "UPDATE source_revalidation_rounds SET scope=?2,mode=?3,phase=?4 WHERE id=?1",
+                rusqlite::params![old_origin.nonce, scope, mode, phase],
+            )
+            .unwrap();
+            assert!(
+                blocks(&old_origin.plan_digest),
+                "unqualified round must block"
+            );
+            conn.execute_batch("ROLLBACK TO staged_negative; RELEASE staged_negative")
+                .unwrap();
+        }
+        conn.execute_batch("SAVEPOINT staged_negative").unwrap();
+        conn.execute(
+            "INSERT INTO metadata(key,value) VALUES(?1,'independent')",
+            [format!("pending_sync_token:v27:other:{ZONE}")],
+        )
+        .unwrap();
+        assert!(
+            blocks(&old_origin.plan_digest),
+            "an unlinked same-library staged token must block"
+        );
+        conn.execute_batch("ROLLBACK TO staged_negative; RELEASE staged_negative")
+            .unwrap();
+        conn.execute_batch("SAVEPOINT staged_negative").unwrap();
+        conn.execute(
+            "INSERT INTO metadata(key,value) VALUES(?1,'other-library')",
+            [format!("pending_sync_token:v27:other:{ZONE}:other")],
+        )
+        .unwrap();
+        assert!(
+            !blocks(&old_origin.plan_digest),
+            "a colon-suffixed library must not match"
+        );
+        conn.execute_batch("ROLLBACK TO staged_negative; RELEASE staged_negative")
+            .unwrap();
     }
+    fixture.force_due().await;
 
     let full_before = fixture.full_queries.load(Ordering::SeqCst);
     let changes_before = fixture.changes.load(Ordering::SeqCst);
@@ -1061,7 +1424,7 @@ async fn stale_proof_baseline_precedes_pending_zone_token() {
         "the full baseline may retry the admitted failed GET once"
     );
     let after = fixture.snapshot().await;
-    assert_ne!(after.state, "pending");
+    assert_eq!(after.state, "complete", "{cycle:?}");
     assert_ne!(after.active_token.as_deref(), Some(old_pending.as_str()));
 }
 
@@ -1268,6 +1631,19 @@ async fn capture_repair_applies_during_pending_epoch_and_leaves_epoch_pending() 
         let conn = db.acquire_lock("inspect repaired compact receipt").unwrap();
         receipt_evidence(&conn)
     };
+    let legacy_census = {
+        let db = fixture.open().await;
+        let conn = db.acquire_lock("inspect repair legacy census").unwrap();
+        let rows: Vec<(String, String, String, String, String, String)> = conn.prepare(
+            "SELECT r.id,r.scope,r.enum_hash,r.boundary,r.phase,COALESCE((SELECT json_group_array(json_array(id,next_retry_at)) FROM (SELECT id,next_retry_at FROM source_revalidation_debt WHERE round=r.id ORDER BY id)),'[]') FROM source_revalidation_rounds r WHERE r.library=?1 AND r.mode='legacy_unfiled_v1' ORDER BY r.id"
+        ).unwrap().query_map([ZONE], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the real explicit repair must retain its legacy census"
+        );
+        rows
+    };
     assert_eq!(
         repaired_receipt.0, 1,
         "the repaired asset must have exactly one compact receipt"
@@ -1283,12 +1659,17 @@ async fn capture_repair_applies_during_pending_epoch_and_leaves_epoch_pending() 
     // its own unresolved evidence.
     let repaired_bytes = std::fs::read(&ok_path).unwrap();
     let repaired_modified = std::fs::metadata(&ok_path).unwrap().modified().unwrap();
+    let lookups_before = fixture.ok_lookups.load(Ordering::SeqCst);
     fixture.force_due().await;
     let normal = fixture.run(false, false).await;
     assert_eq!(normal.failed_count, 0, "{normal:?}");
     assert_eq!(normal.stats.downloaded, 0, "{normal:?}");
-    assert_eq!(fixture.full_queries.load(Ordering::SeqCst), 3);
+    assert_eq!(fixture.full_queries.load(Ordering::SeqCst), 3, "{normal:?}");
     assert_eq!(fixture.ok_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        fixture.ok_lookups.load(Ordering::SeqCst) > lookups_before,
+        "the current source must confirm the repaired asset before legacy debt is retired"
+    );
     let completed = fixture.snapshot().await;
     assert_eq!(completed.state, "complete");
     assert!(!completed.binding_present);
@@ -1313,6 +1694,32 @@ async fn capture_repair_applies_during_pending_epoch_and_leaves_epoch_pending() 
     let completed_receipt = {
         let db = fixture.open().await;
         let conn = db.acquire_lock("inspect reused compact receipt").unwrap();
+        let legacy_after: Vec<(String, String, String, String, String, String)> = conn.prepare(
+            "SELECT r.id,r.scope,r.enum_hash,r.boundary,r.phase,COALESCE((SELECT json_group_array(json_array(id,next_retry_at)) FROM (SELECT id,next_retry_at FROM source_revalidation_debt WHERE round=r.id ORDER BY id)),'[]') FROM source_revalidation_rounds r WHERE r.library=?1 AND r.mode='legacy_unfiled_v1' ORDER BY r.id"
+        ).unwrap().query_map([ZONE], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(legacy_after.len(), 1);
+        assert_eq!(
+            (
+                &legacy_after[0].0,
+                &legacy_after[0].1,
+                &legacy_after[0].2,
+                &legacy_after[0].3,
+                &legacy_after[0].4
+            ),
+            (
+                &legacy_census[0].0,
+                &legacy_census[0].1,
+                &legacy_census[0].2,
+                &legacy_census[0].3,
+                &legacy_census[0].4
+            ),
+            "the separate legacy round remains intact"
+        );
+        assert_eq!(legacy_census[0].5, "[[\"asset-ok\",0]]");
+        assert_eq!(
+            legacy_after[0].5, "[]",
+            "only the freshly confirmed legacy identity is retired"
+        );
         receipt_evidence(&conn)
     };
     assert_eq!(
@@ -1893,39 +2300,7 @@ async fn identity_hold_keeps_zero_failed_count_and_real_hold() {
 
 #[tokio::test]
 async fn retained_hold_keeps_zero_failed_count_and_real_hold() {
-    let fixture = Fixture::new(false).await;
-    let baseline = fixture.run(false, false).await;
-    assert_eq!(baseline.stats.downloaded, 1, "{baseline:?}");
-    {
-        let db = fixture.open().await;
-        db.set_metadata(
-            "last_recovery_action",
-            "retained_checkpoint_retry_exhausted",
-        )
-        .await
-        .unwrap();
-    }
-
-    let held = fixture.run_without_active_passes(false).await;
-    assert_eq!(
-        held.failed_count, 0,
-        "a retained checkpoint hold must not invent a failure count: {held:?}"
-    );
-    assert_eq!(held.stats.failed, 0, "{held:?}");
-    let hold = held
-        .holds
-        .iter()
-        .find(|hold| hold.kind == crate::sync_cycle::LibraryHoldKind::RetainedCheckpoint)
-        .expect("actual retained checkpoint hold fact");
-    assert_eq!(hold.source, ZONE);
-    assert_eq!(hold.ordinal, 0);
-    assert_eq!(hold.reason, "retained_checkpoint_retry_exhausted");
-    assert!(held.stats.sync_token_blocked);
-    let facts = crate::cycle_reporter::CycleFacts::from_cycle_result(
-        &held,
-        std::time::Duration::from_secs(1),
-    );
-    assert_eq!(facts.status, crate::cycle_reporter::CycleStatus::Failed);
+    super::ordinary_expiry::exercise_retained_hold_reporting().await;
 }
 
 #[tokio::test]

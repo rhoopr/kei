@@ -1542,9 +1542,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operational_health_requires_accounted_work_and_preserves_backup_failure() {
+    async fn operational_health_rejects_counts_without_owner_attestation() {
         for kind in [
-            "accounted",
+            "counts_only",
             "unsafe",
             "state_write",
             "auth",
@@ -1591,7 +1591,7 @@ mod tests {
             }
             assert_eq!(
                 crate::metrics::health_status_for_test(&metrics).await,
-                if kind == "accounted" { 200 } else { 503 },
+                503,
                 "{kind}"
             );
             let report = parse_json(&report_path);

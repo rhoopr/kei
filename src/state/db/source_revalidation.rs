@@ -199,6 +199,43 @@ fn catalog_snapshot(conn: &Connection, library: &str) -> Result<String, StateErr
     Ok(format!("{:x}", hash.finalize()))
 }
 
+/// Carry only the epoch owner's exact in-flight census into its new attempt.
+/// The old round and debt remain as history; no cursor or observation is proved.
+pub(super) fn transfer_epoch_catalog_census(
+    conn: &Connection,
+    library: &str,
+    epoch: &str,
+    old_attempt: &str,
+    new_attempt: &str,
+) -> Result<(), StateError> {
+    let rows: Vec<(String, String, String, String, String, String, String)> = conn
+        .prepare("SELECT id,scope,enum_hash,boundary,high_id,after_id,phase FROM source_revalidation_rounds WHERE library=?1 AND mode=?2 AND phase IN ('marking','observing') ORDER BY id")?
+        .query_map(params![library, CATALOG_MODE], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)))?
+        .collect::<Result<_, _>>()?;
+    for (id, scope, policy, boundary, high, after, phase) in rows {
+        let Ok(old) = CatalogOrigin::parse(&scope) else {
+            continue;
+        };
+        if old.nonce != id || old.epoch != epoch || old.attempt != old_attempt {
+            continue;
+        }
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let new = CatalogOrigin::new(
+            old.plan_digest,
+            epoch.to_owned(),
+            new_attempt.to_owned(),
+            nonce.clone(),
+        )?;
+        conn.execute("INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![nonce,library,new.scope(),policy,boundary,high,after,phase,CATALOG_MODE])?;
+        conn.execute("INSERT INTO source_revalidation_debt(round,id,next_retry_at) SELECT ?1,id,next_retry_at FROM source_revalidation_debt WHERE round=?2", params![nonce,id])?;
+        conn.execute(
+            "UPDATE source_revalidation_rounds SET phase='abandoned' WHERE id=?1",
+            [&id],
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn fresh_catalog_plan_digest(plan: &FreshCatalogPlan) -> String {
     let zone_name = plan
         .zone
@@ -692,21 +729,28 @@ impl SqliteStateDb {
                 });
             }
             let mut matching: Vec<ExistingCatalogRound> = Vec::new();
-            if let Some(cursor) = claim.expected_baseline.as_deref() {
-                let boundary = CatalogOrigin::boundary(cursor);
+            let claimed_boundary = claim.expected_baseline.as_deref().map(CatalogOrigin::boundary)
+                .or_else(|| {
+                    (library_before.state == "ready")
+                        .then_some(library_before.binding.as_ref())
+                        .flatten()
+                        .filter(|binding| binding.baseline_key == claim.baseline_key)
+                        .map(|binding| binding.baseline_sha256.clone())
+                });
+            if claimed_boundary.is_some() || library_before.reason == "sync_token_reset" {
                 let rows: Vec<(String, String, String, String, String, String, String)> = tx
                     .prepare(
                         "SELECT id,scope,enum_hash,boundary,high_id,after_id,phase
                          FROM source_revalidation_rounds
                          WHERE library=?1 AND mode=?2 AND phase!='abandoned'
-                           AND boundary=?3 AND scope LIKE ?4
+                           AND (?3 IS NULL OR boundary=?3) AND scope LIKE ?4
                          ORDER BY id",
                     )?
                     .query_map(
                         params![
                             &claim.library,
                             CATALOG_MODE,
-                            boundary,
+                            claimed_boundary,
                             format!("{CATALOG_SCOPE_PREFIX}%")
                         ],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
@@ -746,7 +790,7 @@ impl SqliteStateDb {
                     if library_before.state == "ready"
                         && library_before.binding.as_ref().is_none_or(|binding| {
                             binding.baseline_key != claim.baseline_key
-                                || claim.expected_baseline.as_deref().is_none_or(|cursor| {
+                                || claim.expected_baseline.as_deref().is_some_and(|cursor| {
                                     CatalogOrigin::boundary(cursor) != binding.baseline_sha256
                                 })
                         })
@@ -777,6 +821,12 @@ impl SqliteStateDb {
                         && old.origin.attempt == library_before.attempt
                         && matches!(old.phase.as_str(), "marking" | "observing")
                     {
+                        if claim.expected_baseline.is_none() && old.phase == "marking" {
+                            return Err(StateError::Invariant {
+                                operation: "claim_catalog_baseline",
+                                detail: "unfinished catalog census lost its boundary".into(),
+                            });
+                        }
                         let nonce = uuid::Uuid::new_v4().to_string();
                         let new_scope = CatalogOrigin::new(
                             claim.plan_digest.clone(),
@@ -1043,9 +1093,7 @@ impl SqliteStateDb {
                 });
             }
             let expected_key = format!("baseline_cursor:v27:{}:{}:{}:{}", epoch.epoch, library_record.baseline_scope, request.enum_hash, request.preservation_config_hash);
-            if request.baseline_key != expected_key
-                || super::provider_generations::observation::has_valid_staged_for_library(&tx, &request.library)?
-            {
+            if request.baseline_key != expected_key {
                 return Err(StateError::Invariant { operation: "install_fresh_catalog_origin", detail: "catalog baseline key or staged promotion changed".into() });
             }
             let epoch_raw = serde_json::to_string(&epoch)
@@ -1091,6 +1139,18 @@ impl SqliteStateDb {
                 });
             }
             let digest = fresh_catalog_plan_digest(&request.plan);
+            let staged_blocks = if library_record.state == "pending"
+                && matches!(operation, CatalogOriginOperation::Resume | CatalogOriginOperation::Fresh)
+            {
+                super::provider_generations::observation::has_blocking_staged_for_pending_catalog(
+                    &tx, &request.library, &epoch.epoch, &library_record.attempt, &request.enum_hash, &digest,
+                )?
+            } else {
+                super::provider_generations::observation::has_valid_staged_for_library(&tx, &request.library)?
+            };
+            if staged_blocks {
+                return Err(StateError::Invariant { operation: "install_fresh_catalog_origin", detail: "catalog baseline key or staged promotion changed".into() });
+            }
             if library_record.state == "complete" && !super::provider_generations::observation::catalog_active_plan_matches(
                 &tx,
                 &request.library,
@@ -1118,13 +1178,29 @@ impl SqliteStateDb {
                 let rows: Vec<(String,String,String,String,String)> = tx.prepare(
                     "SELECT id,scope,enum_hash,mode,phase FROM source_revalidation_rounds WHERE library=?1 AND boundary=?2 AND phase!='abandoned' ORDER BY id"
                 )?.query_map(params![request.library,hash], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?.collect::<Result<_,_>>()?;
-                let [(id, scope, enum_hash, mode, phase)] = rows.as_slice() else {
-                    if rows.is_empty() {
+                let mut catalog_rows = Vec::new();
+                let mut legacy_rows = 0usize;
+                for row in &rows {
+                    let (_, scope, enum_hash, mode, phase) = row;
+                    if mode == LEGACY_MODE && scope == &request.plan.scope
+                        && enum_hash == &request.enum_hash && phase == "observing"
+                    {
+                        legacy_rows += 1;
+                    } else {
+                        catalog_rows.push(row);
+                    }
+                }
+                if legacy_rows > 1 {
+                    return Err(StateError::SyncEpochMismatch);
+                }
+                let [row] = catalog_rows.as_slice() else {
+                    if catalog_rows.is_empty() {
                         tx.commit()?;
                         return Ok(CatalogOriginOperationResult::Resume(None));
                     }
                     return Err(StateError::SyncEpochMismatch);
                 };
+                let (id, scope, enum_hash, mode, phase) = *row;
                 let origin = CatalogOrigin::parse(scope)?;
                 if mode != CATALOG_MODE || enum_hash != &request.enum_hash || origin.nonce != *id
                     || origin.plan_digest != digest || origin.epoch != epoch.epoch

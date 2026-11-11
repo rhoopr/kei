@@ -522,6 +522,8 @@ async fn current_same_child_without_master_retains_scoped_retry_after_reopen() {
         .unwrap()
         .modified()
         .unwrap();
+    // The completed cycle retains its operational prework owner until dropped.
+    drop(delta);
     assert_eq!(Arc::strong_count(&db), 1);
     drop(db);
     let db = Arc::new(
@@ -598,6 +600,7 @@ async fn current_same_child_without_master_retains_scoped_retry_after_reopen() {
             .unwrap(),
         peer_mtime
     );
+    drop(quiet);
     assert_eq!(Arc::strong_count(&db), 1);
     drop(db);
     let db = Arc::new(
@@ -669,6 +672,7 @@ async fn current_same_child_without_master_retains_scoped_retry_after_reopen() {
         assert_eq!(std::fs::read(path).unwrap(), MEDIA);
         assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), *mtime);
     }
+    drop(resolved_cycle);
     assert_eq!(Arc::strong_count(&db), 1);
     drop(db);
     let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())

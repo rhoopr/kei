@@ -1213,6 +1213,14 @@ pub(crate) fn reset_libraries_for_token_reset(
             return Err(StateError::SyncEpochMismatch);
         }
         let old_attempt = record.attempt.clone();
+        let new_attempt = uuid::Uuid::new_v4().to_string();
+        super::source_revalidation::transfer_epoch_catalog_census(
+            conn,
+            &library,
+            &epoch.epoch,
+            &old_attempt,
+            &new_attempt,
+        )?;
         if let Some(binding) = record.binding.take() {
             let encoded =
                 serde_json::to_string(&binding).map_err(|_error| StateError::SyncEpochMismatch)?;
@@ -1262,7 +1270,7 @@ pub(crate) fn reset_libraries_for_token_reset(
         }
         record.state = "pending".to_owned();
         record.reason = "sync_token_reset".to_owned();
-        record.attempt = uuid::Uuid::new_v4().to_string();
+        record.attempt = new_attempt;
         record.attempts = 0;
         record.next_attempt_at = now;
         record.last_outcome = Some("reset_sync_token".to_owned());
@@ -1316,6 +1324,7 @@ impl SqliteStateDb {
     ) -> Result<SyncEpochGate, StateError> {
         self.with_conn_mut("gating sync epoch library", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let before = read_library(&tx, &library)?;
             let gate = gate(
                 &tx,
                 &library,
@@ -1323,6 +1332,18 @@ impl SqliteStateDb {
                 chrono::Utc::now().timestamp(),
                 watch_interval,
             )?;
+            if let (Some(before), SyncEpochGate::Baseline { attempt }) = (&before, &gate)
+                && before.state == "pending"
+                && before.attempt != *attempt
+            {
+                super::source_revalidation::transfer_epoch_catalog_census(
+                    &tx,
+                    &library,
+                    &before.epoch,
+                    &before.attempt,
+                    attempt,
+                )?;
+            }
             tx.commit()?;
             Ok(gate)
         })
@@ -2377,6 +2398,7 @@ mod tests {
         .unwrap();
         conn.execute_batch(super::super::source_revalidation::DDL)
             .unwrap();
+        super::super::source_revalidation::ensure_catalog_mode_column_for_test(&conn).unwrap();
         conn.execute(
             "INSERT INTO account_owner VALUES(1,1,'account-a',?1)",
             ["a".repeat(64)],

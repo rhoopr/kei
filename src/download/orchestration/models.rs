@@ -153,7 +153,7 @@ pub(crate) struct DownloadControls {
     pub(crate) reporting: DownloadReporting,
     /// Return an incremental fallback to the cycle before replacement inventory.
     pub(crate) defer_fallback_to_cycle: bool,
-    /// Retain a changed fresh-boundary bridge rather than starting another inventory.
+    /// Deliver a changed fresh-boundary bridge only when it needs no independent inventory.
     pub(crate) defer_changed_fresh_bridge_inventory: bool,
 }
 

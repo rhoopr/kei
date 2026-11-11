@@ -4467,36 +4467,6 @@ pub(super) async fn after_delta(
         .selection_context
         .as_ref()
         .context("Missing selection context")?;
-    if controls.defer_changed_fresh_bridge_inventory && delta.inventory_rank_changed {
-        // Do not acknowledge this delta or enumerate again. The original
-        // boundary remains available to replay all changes on the next wake.
-        let mut stats = SyncStats {
-            state_write_failures: delta.state_transition_failures,
-            identity_incomplete: delta.identity_incomplete,
-            interrupted: cancel.is_cancelled(),
-            ..SyncStats::default()
-        };
-        if let Some(reason) = delta.token_unsafe_reason {
-            block_sync_token_for_incremental_delta(&mut stats, reason);
-        }
-        let mut result = SyncResult::from_incremental_execution(
-            if delta.state_transition_failures > 0 {
-                DownloadOutcome::PartialFailure {
-                    failed_count: delta.state_transition_failures,
-                }
-            } else {
-                DownloadOutcome::Success
-            },
-            None,
-            stats,
-            delta.sparse_identity_proofs,
-            delta.sparse_current,
-            delta.sync_token.is_some(),
-            true,
-        );
-        result.block_incremental_token("baseline_changed_during_inventory");
-        return Ok(result);
-    }
     if delta.missing_successor && context.format != 2 {
         // Legacy selection cannot deliver a partial source replay safely.
         return Err(crate::icloud::photos::error::MissingChangesSuccessor.into());
@@ -4545,6 +4515,42 @@ pub(super) async fn after_delta(
         proof_matches,
     });
     let repeat_inventory = needs_inventory && !reuse_inventory_proof && !delta.missing_successor;
+    if controls.defer_changed_fresh_bridge_inventory
+        && delta.inventory_rank_changed
+        && (repeat_inventory
+            || context.format != 2
+            || passes.iter().any(|pass| pass.kind == PassKind::SmartFolder))
+    {
+        // A selection-owned inventory cannot stand in for delivery of the
+        // actual delta assets. Keep the original boundary until both can be
+        // accounted without exceeding the bounded rank traversal.
+        let mut stats = SyncStats {
+            state_write_failures: delta.state_transition_failures,
+            identity_incomplete: delta.identity_incomplete,
+            interrupted: cancel.is_cancelled(),
+            ..SyncStats::default()
+        };
+        if let Some(reason) = delta.token_unsafe_reason {
+            block_sync_token_for_incremental_delta(&mut stats, reason);
+        }
+        let mut result = SyncResult::from_incremental_execution(
+            if delta.state_transition_failures > 0 {
+                DownloadOutcome::PartialFailure {
+                    failed_count: delta.state_transition_failures,
+                }
+            } else {
+                DownloadOutcome::Success
+            },
+            None,
+            stats,
+            delta.sparse_identity_proofs,
+            delta.sparse_current,
+            delta.sync_token.is_some(),
+            true,
+        );
+        result.block_incremental_token("baseline_changed_during_inventory");
+        return Ok(result);
+    }
     if reuse_inventory_proof {
         tracing::debug!(
             "Reusing completed full-inventory proof for the recent bridge; skipping duplicate inventory"
@@ -4593,6 +4599,7 @@ pub(super) async fn after_delta(
         && delta.inventory_rank_changed
         && !repeat_inventory
         && !delta.missing_successor
+        && !controls.defer_changed_fresh_bridge_inventory
     {
         let smart_passes: Vec<_> = passes
             .iter()

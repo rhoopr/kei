@@ -919,12 +919,36 @@ async fn v027_bound_other_rendition_custody_or_natural_retry() {
     ).await;
 }
 
+#[tokio::test]
+async fn v027_bridge_only_item_is_accounted_when_repeat_inventory_omits_it() {
+    mixed_shared_hidden_baseline_variant(
+        json!({"zoneName":ZONE,"ownerRecordName":"synthetic-shared-owner","zoneType":"synthetic-shared-zone"}),
+        MixedSelection::BridgeOnly,
+    ).await;
+}
+
+#[tokio::test]
+async fn v027_second_rank_change_retains_original_source_and_peer_progress() {
+    mixed_shared_hidden_baseline_variant(
+        json!({"zoneName":ZONE,"ownerRecordName":"synthetic-shared-owner","zoneType":"synthetic-shared-zone"}),
+        MixedSelection::BridgeTwice,
+    ).await;
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MixedSelection {
     SharedWithUnfiled,
     BothWithUnfiled,
     BothHiddenOnly,
     BoundPublication,
+    BridgeOnly,
+    BridgeTwice,
+}
+
+impl MixedSelection {
+    fn bridge_test(self) -> bool {
+        matches!(self, Self::BridgeOnly | Self::BridgeTwice)
+    }
 }
 
 async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
@@ -949,9 +973,13 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
         Selection {
             albums: AlbumSelector::None,
             albums_explicit: false,
-            smart_folders: SmartFolderSelector::Named {
-                included: BTreeSet::from(["Hidden".to_string()]),
-                excluded: BTreeSet::new(),
+            smart_folders: if variant.bridge_test() {
+                SmartFolderSelector::None
+            } else {
+                SmartFolderSelector::Named {
+                    included: BTreeSet::from(["Hidden".to_string()]),
+                    excluded: BTreeSet::new(),
+                }
             },
             smart_folders_explicit: true,
             libraries: LibrarySelector {
@@ -1022,6 +1050,8 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
         zone: String,
         boundary: String,
         current: Arc<Vec<Value>>,
+        bridge_only: Arc<Vec<Value>>,
+        repeat_bridge: bool,
         current_on_hidden: bool,
         deleted: Arc<Vec<Value>>,
         lookups: Arc<AtomicUsize>,
@@ -1103,7 +1133,17 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
                 if record_type == "CPLAlbumByPositionLive" {
                     return Ok(json!({"records":[]}));
                 }
-                self.inventory.lock().unwrap().push(record_type.to_owned());
+                let start = request["query"]["filterBy"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|filter| filter["fieldName"] == "startRank")
+                    .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                    .unwrap_or(0);
+                self.inventory.lock().unwrap().push(format!(
+                    "{record_type}|{}|{start}",
+                    self.changes.load(Ordering::SeqCst)
+                ));
                 let records = if self.current_pass(&request) {
                     self.current.as_ref().clone()
                 } else {
@@ -1125,7 +1165,7 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
                     self.zone
                 );
                 return Ok(json!({"zones":[{"zoneID":self.zone_id,
-                    "records":[],
+                    "records":if bridge == 0 || (bridge == 1 && self.repeat_bridge) { self.bridge_only.as_ref().clone() } else { Vec::new() },
                     "syncToken":format!("after-{}-{}",self.zone,bridge+1),
                     "moreComing":false}]}));
             }
@@ -1282,6 +1322,8 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
                 zone: name.to_owned(),
                 boundary: format!("before-{name}"),
                 current: Arc::new(Vec::new()),
+                bridge_only: Arc::new(Vec::new()),
+                repeat_bridge: false,
                 current_on_hidden: false,
                 deleted: Arc::new(deleted),
                 lookups: Arc::new(AtomicUsize::new(0)),
@@ -1450,6 +1492,14 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
             .mount(&server)
             .await;
     }
+    if variant.bridge_test() {
+        Mock::given(method("GET"))
+            .and(path("/bridge-only"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
 
     let dir = if variant == MixedSelection::BoundPublication {
         if let Some(parent) = std::env::var_os("KEI_R2_RETAIN_ROOT") {
@@ -1537,10 +1587,23 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
         "primary-current.JPG",
         &format!("{}/primary-current", server.uri()),
         92,
-        true,
+        !variant.bridge_test(),
     );
+    let bridge_only = if variant.bridge_test() {
+        mixed_pair(
+            &shared_zone_id,
+            "bridge-only",
+            "bridge-only.JPG",
+            &format!("{}/bridge-only", server.uri()),
+            93,
+            false,
+        )
+    } else {
+        Vec::new()
+    };
     let mut shared_lookup_records = deleted_lookup_records(&shared_zone_id);
     shared_lookup_records.extend(shared_current.iter().cloned());
+    shared_lookup_records.extend(bridge_only.iter().cloned());
     let shared_deleted = Arc::new(shared_lookup_records);
     let primary_deleted = Arc::new(primary_current.clone());
     let shared_lookups = Arc::new(AtomicUsize::new(0));
@@ -1555,6 +1618,8 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
         zone: ZONE.into(),
         boundary: format!("before-{ZONE}"),
         current: Arc::new(shared_current),
+        bridge_only: Arc::new(bridge_only),
+        repeat_bridge: variant == MixedSelection::BridgeTwice,
         current_on_hidden: variant == MixedSelection::BothHiddenOnly,
         deleted: Arc::clone(&shared_deleted),
         lookups: Arc::clone(&shared_lookups),
@@ -1568,7 +1633,9 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
         zone: PRIMARY.into(),
         boundary: format!("before-{PRIMARY}"),
         current: Arc::new(primary_current),
-        current_on_hidden: true,
+        bridge_only: Arc::new(Vec::new()),
+        repeat_bridge: false,
+        current_on_hidden: !variant.bridge_test(),
         deleted: Arc::clone(&primary_deleted),
         lookups: Arc::clone(&primary_lookups),
         requested: Arc::clone(&primary_requests),
@@ -1646,7 +1713,9 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
     };
     assert_eq!(
         kinds(&shared_plan),
-        if variant == MixedSelection::BothHiddenOnly {
+        if variant.bridge_test() {
+            vec![PassKind::Unfiled]
+        } else if variant == MixedSelection::BothHiddenOnly {
             vec![PassKind::SmartFolder]
         } else {
             vec![PassKind::SmartFolder, PassKind::Unfiled]
@@ -1655,7 +1724,9 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
     );
     assert_eq!(
         kinds(&primary_plan),
-        if matches!(
+        if variant.bridge_test() {
+            vec![PassKind::Unfiled]
+        } else if matches!(
             variant,
             MixedSelection::BothWithUnfiled | MixedSelection::BoundPublication
         ) {
@@ -1697,6 +1768,89 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
     )
     .await
     .unwrap();
+
+    if variant == MixedSelection::BridgeTwice {
+        assert!(
+            !result.db_sync_token_advance_safe,
+            "a second rank change must retain the source boundary: {result:?}"
+        );
+        assert_eq!(shared_session.changes.load(Ordering::SeqCst), 2);
+        let inventory = shared_inventory.lock().unwrap().clone();
+        eprintln!("SECOND_RANK_INVENTORY={inventory:?}");
+        let starts: Vec<_> = inventory
+            .iter()
+            .filter(|query| query.ends_with("|0"))
+            .collect();
+        assert_eq!(
+            starts.len(),
+            2,
+            "only one additional rank inventory is allowed: {inventory:?}"
+        );
+        assert_eq!(db.get_metadata(&sync_token_key(ZONE)).await.unwrap(), None);
+        assert_eq!(
+            db.get_metadata(&sync_token_key(PRIMARY))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(format!("after-{PRIMARY}-1").as_str())
+        );
+        assert_eq!(
+            std::fs::read(root.join("primary-current.JPG")).unwrap(),
+            MEDIA
+        );
+        assert_eq!(std::fs::read(root.join("bridge-only.JPG")).unwrap(), MEDIA);
+        let before = {
+            let conn = db
+                .acquire_lock("verify repeated rank-change custody")
+                .unwrap();
+            let origin: (String, String) = conn.query_row(
+                "SELECT r.phase,m.value FROM source_revalidation_rounds r JOIN metadata m ON m.key LIKE 'baseline_cursor:v27:%' WHERE r.library=?1 AND r.mode='catalog_v2' AND r.phase='observing' AND m.value=?2",
+                rusqlite::params![ZONE, format!("before-{ZONE}")], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            let peer: i64 = conn.query_row("SELECT COUNT(*) FROM download_receipts WHERE library=?1 AND child='asset-primary-current'",[PRIMARY],|row|row.get(0)).unwrap();
+            assert_eq!(peer, 1);
+            let bridge: i64 = conn.query_row("SELECT COUNT(*) FROM download_receipts WHERE library=?1 AND child='asset-bridge-only' AND master='bridge-only' AND version_size='original'",[ZONE],|row|row.get(0)).unwrap();
+            assert_eq!(bridge, 1, "first bridge work must remain durably recorded");
+            origin
+        };
+        let bridge_path = root.join("bridge-only.JPG");
+        let bridge_mtime = std::fs::metadata(&bridge_path).unwrap().modified().unwrap();
+        drop(result);
+        drop(shared_state);
+        drop(primary_state);
+        drop(collection_context);
+        drop(selected_libraries);
+        drop(all_libraries);
+        drop(base);
+        assert_eq!(Arc::strong_count(&db), 1);
+        drop(db);
+        let reopened = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.get_metadata(&sync_token_key(ZONE)).await.unwrap(),
+            None
+        );
+        {
+            let conn = reopened
+                .acquire_lock("reopen repeated rank-change custody")
+                .unwrap();
+            let after: (String,String) = conn.query_row(
+            "SELECT r.phase,m.value FROM source_revalidation_rounds r JOIN metadata m ON m.key LIKE 'baseline_cursor:v27:%' WHERE r.library=?1 AND r.mode='catalog_v2' AND r.phase='observing' AND m.value=?2",
+            rusqlite::params![ZONE,format!("before-{ZONE}")], |row|Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+            assert_eq!(after, before);
+            let bridge: i64 = conn.query_row("SELECT COUNT(*) FROM download_receipts WHERE library=?1 AND child='asset-bridge-only' AND master='bridge-only' AND version_size='original'",[ZONE],|row|row.get(0)).unwrap();
+            assert_eq!(bridge, 1);
+        }
+        assert_eq!(std::fs::read(&bridge_path).unwrap(), MEDIA);
+        assert_eq!(
+            std::fs::metadata(&bridge_path).unwrap().modified().unwrap(),
+            bridge_mtime
+        );
+        server.verify().await;
+        return;
+    }
 
     {
         let conn = db.acquire_lock("inspect mixed-source baseline").unwrap();
@@ -1855,7 +2009,12 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(cursor, format!("after-{library}-1"));
+            let initial_bridge = if variant == MixedSelection::BridgeOnly && library == ZONE {
+                2
+            } else {
+                1
+            };
+            assert_eq!(cursor, format!("after-{library}-{initial_bridge}"));
             let (scope, native, source, local): (String, String, String, String) = conn.query_row(
                 "SELECT scope,native_path,source_checksum,local_checksum FROM download_receipts WHERE library=?1 AND child=?2 AND master=?3 AND version_size='original'",
                 rusqlite::params![library, child, master], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
@@ -1889,12 +2048,17 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
                 .any(|record_type| record_type.contains(selected_shared)),
             "the intended Shared pass must produce current media"
         );
+        let selected_primary = if variant == MixedSelection::BridgeOnly {
+            "WithoutHiddenOrDeleted"
+        } else {
+            "Hidden"
+        };
         assert!(
             primary_inventory
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|record_type| record_type.contains("Hidden"))
+                .any(|record_type| record_type.contains(selected_primary))
         );
         eprintln!("B-CANON shared{shared_probe:?} primary{primary_probe:?}");
 
@@ -2214,6 +2378,36 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
         std::fs::read(root.join("primary-current.JPG")).unwrap(),
         MEDIA
     );
+    if variant == MixedSelection::BridgeOnly {
+        assert_eq!(std::fs::read(root.join("bridge-only.JPG")).unwrap(), MEDIA);
+        let conn = db
+            .acquire_lock("verify bridge-only source receipt")
+            .unwrap();
+        let (scope, native, source, local): (String, String, String, String) = conn.query_row(
+            "SELECT scope,native_path,source_checksum,local_checksum FROM download_receipts WHERE library=?1 AND child='asset-bridge-only' AND master='bridge-only' AND version_size='original'",
+            [ZONE], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            PhotoLibrary::provider_scope_projection(&scope),
+            Some((
+                ZONE.to_owned(),
+                shared_zone_id["ownerRecordName"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                "shared".to_owned()
+            ))
+        );
+        assert_eq!(
+            serde_json::from_str::<crate::state::db::provider_selection::SelectionPath>(&native)
+                .unwrap()
+                .to_path(),
+            root.join("bridge-only.JPG")
+        );
+        use sha2::{Digest, Sha256};
+        let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(MEDIA));
+        assert_eq!((source, local), (hash.clone(), hash));
+    }
     if variant != MixedSelection::SharedWithUnfiled {
         let state_snapshot = |db: &SqliteStateDb| {
             let conn = db
@@ -2223,7 +2417,7 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
             for sql in [
                 "SELECT r.id,r.library,r.scope,r.phase,d.id,d.next_retry_at FROM source_revalidation_rounds r LEFT JOIN source_revalidation_debt d ON d.round=r.id ORDER BY r.id,d.id",
                 "SELECT library,id,version_size,local_path,is_deleted,deleted_at,metadata_hash FROM assets WHERE library='SharedSync-v027-synthetic' AND id='shared-live-master' ORDER BY version_size",
-                "SELECT library,child,master,version_size,native_path,source_checksum,local_checksum,proof_hash FROM download_receipts WHERE child IN ('asset-shared-current','asset-primary-current') ORDER BY library,child",
+                "SELECT library,child,master,version_size,native_path,source_checksum,local_checksum,proof_hash FROM download_receipts WHERE child IN ('asset-shared-current','asset-primary-current','asset-bridge-only') ORDER BY library,child",
             ] {
                 let mut stmt = conn.prepare(sql).unwrap();
                 let rows = stmt
@@ -2254,6 +2448,12 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
                 std::fs::read(&path).unwrap(),
                 std::fs::metadata(&path).unwrap().modified().unwrap(),
             )
+        });
+        let bridge_snapshot = (variant == MixedSelection::BridgeOnly).then(|| {
+            let path = root.join("bridge-only.JPG");
+            let bytes = std::fs::read(&path).unwrap();
+            let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+            (path, bytes, mtime)
         });
         drop(shared_state);
         drop(primary_state);
@@ -2364,7 +2564,15 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
                         .await
                         .unwrap()
                         .as_deref(),
-                    Some(format!("after-{name}-{pass}").as_str())
+                    Some(
+                        format!(
+                            "after-{name}-{}",
+                            pass + usize::from(
+                                variant == MixedSelection::BridgeOnly && name == ZONE
+                            )
+                        )
+                        .as_str()
+                    )
                 );
                 let descriptor = reopened
                     .get_metadata(&format!("observed_selection:v27:{name}"))
@@ -2379,7 +2587,11 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
                 retained_state,
                 "quiet cycles must preserve exact old family, catalog debt and current receipts"
             );
-            for (path, bytes, mtime) in snapshots.iter().chain(deleted_snapshots.iter()) {
+            for (path, bytes, mtime) in snapshots
+                .iter()
+                .chain(deleted_snapshots.iter())
+                .chain(bridge_snapshot.iter())
+            {
                 assert_eq!(&std::fs::read(path).unwrap(), bytes);
                 assert_eq!(&std::fs::metadata(path).unwrap().modified().unwrap(), mtime);
             }

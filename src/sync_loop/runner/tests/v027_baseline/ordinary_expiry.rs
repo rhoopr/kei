@@ -253,14 +253,15 @@ impl PhotosSession for SourceSession {
                     record["zoneID"]["ownerRecordName"] = json!("foreign-owner");
                 }
             }
-            if matches!(
-                self.fault,
-                OriginFault::DeletedLookup
-                    | OriginFault::TopFalseDeleted
-                    | OriginFault::DeletedProtected
-                    | OriginFault::PreparedPublication
-                    | OriginFault::PreBoundaryDeleted
-            ) && self.primary
+            if (self.fault.is_deleted_lookup()
+                || matches!(
+                    self.fault,
+                    OriginFault::TopFalseDeleted
+                        | OriginFault::DeletedProtected
+                        | OriginFault::PreparedPublication
+                        | OriginFault::PreBoundaryDeleted
+                ))
+                && self.primary
                 && self.events.lock().unwrap().contains(&"fresh-bridge")
             {
                 for record in &mut records {
@@ -298,6 +299,7 @@ enum OriginFault {
     CheckpointGuard,
     RepeatBridge,
     RankChange,
+    #[cfg(feature = "xmp")]
     DeletedLookup,
     TopFalseDeleted,
     TopFalseMalformed,
@@ -323,6 +325,19 @@ enum OriginFault {
     RecordAuthChild,
     RecordDenied,
     RecordUnknown,
+}
+
+impl OriginFault {
+    fn is_deleted_lookup(self) -> bool {
+        #[cfg(feature = "xmp")]
+        {
+            self == Self::DeletedLookup
+        }
+        #[cfg(not(feature = "xmp"))]
+        {
+            false
+        }
+    }
 }
 
 #[tokio::test]
@@ -387,6 +402,10 @@ async fn m1_bounded_catalog_page_reports_the_remaining_sixty_fifth_candidate() {
 
 #[tokio::test]
 async fn m1_replacement_error_retains_original_cursor_hold() {
+    exercise_expiry(OriginFault::ReplacementError).await;
+}
+
+pub(super) async fn exercise_retained_hold_reporting() {
     exercise_expiry(OriginFault::ReplacementError).await;
 }
 
@@ -566,10 +585,11 @@ async fn exercise_expiry(fault: OriginFault) {
             | OriginFault::RepeatBridge
             | OriginFault::RankChange
     );
-    let confirmed_deletion = matches!(
-        fault,
-        OriginFault::DeletedLookup | OriginFault::TopFalseDeleted | OriginFault::PreBoundaryDeleted
-    );
+    let confirmed_deletion = fault.is_deleted_lookup()
+        || matches!(
+            fault,
+            OriginFault::TopFalseDeleted | OriginFault::PreBoundaryDeleted
+        );
     let clean_metadata = confirmed_deletion || fault == OriginFault::PreparedPublication;
     let recovery_phase = if interrupted { 2 } else { 1 };
     for phase in 0..recovery_phase + 3 {
@@ -702,12 +722,16 @@ async fn exercise_expiry(fault: OriginFault) {
             states.push(state);
         }
         let base = make_run_cycle_download_config_builder(&root, db.clone());
-        let mut run_config = make_run_cycle_config();
+        let run_config = make_run_cycle_config();
         #[cfg(feature = "xmp")]
-        if clean_metadata {
-            run_config.runtime.refresh_metadata = phase == 0;
-            run_config.metadata.xmp_sidecar = true;
-        }
+        let run_config = {
+            let mut run_config = run_config;
+            if clean_metadata {
+                run_config.runtime.refresh_metadata = phase == 0;
+                run_config.metadata.xmp_sidecar = true;
+            }
+            run_config
+        };
         if fault == OriginFault::DeletedProtected {
             assert!(!run_config.runtime.refresh_metadata);
             assert_metadata_disabled(&run_config.metadata);
@@ -1003,7 +1027,17 @@ async fn exercise_expiry(fault: OriginFault) {
                     );
                 }
             }
-            if fault == OriginFault::BridgeError {
+            if matches!(
+                fault,
+                OriginFault::BridgeError | OriginFault::ReplacementError
+            ) {
+                if fault == OriginFault::ReplacementError {
+                    reopened
+                        .acquire_lock("remove replacement-only injected fault")
+                        .unwrap()
+                        .execute_batch("DROP TRIGGER fail_replacement_generation")
+                        .unwrap();
+                }
                 let peer_before = reopened
                     .get_metadata(&sync_token_key(SHARED))
                     .await
@@ -1120,11 +1154,23 @@ async fn exercise_expiry(fault: OriginFault) {
                 .await
                 .unwrap();
                 assert_eq!(follow.failed_count, 0, "{follow:?}");
-                assert!(
-                    follow.holds.iter().any(|hold| hold.source == PRIMARY
-                        && hold.kind == crate::sync_cycle::LibraryHoldKind::RetainedCheckpoint),
-                    "{follow:?}"
+                let hold = follow
+                    .holds
+                    .iter()
+                    .find(|hold| {
+                        hold.source == PRIMARY
+                            && hold.kind == crate::sync_cycle::LibraryHoldKind::RetainedCheckpoint
+                    })
+                    .unwrap_or_else(|| panic!("missing original-source retained hold: {follow:?}"));
+                assert_eq!(hold.ordinal, 0);
+                assert_eq!(hold.reason, "retained_checkpoint_expired");
+                assert_eq!(follow.stats.failed, 0);
+                assert!(follow.stats.sync_token_blocked);
+                let facts = crate::cycle_reporter::CycleFacts::from_cycle_result(
+                    &follow,
+                    std::time::Duration::from_secs(1),
                 );
+                assert_eq!(facts.status, crate::cycle_reporter::CycleStatus::Failed);
                 assert_eq!(
                     reopened.get_metadata(&key).await.unwrap(),
                     raw,
@@ -1209,7 +1255,6 @@ async fn exercise_expiry(fault: OriginFault) {
                 OriginFault::None
                 | OriginFault::RepeatBridge
                 | OriginFault::RankChange
-                | OriginFault::DeletedLookup
                 | OriginFault::TopFalseDeleted
                 | OriginFault::TopFalseMalformed
                 | OriginFault::PreBoundaryDeleted
@@ -1231,6 +1276,7 @@ async fn exercise_expiry(fault: OriginFault) {
                 | OriginFault::RecordUnknown,
                 1,
             ) => 2,
+            (fault, 1) if fault.is_deleted_lookup() => 2,
             (OriginFault::Write, 1 | 2) => 1,
             _ => 0,
         };

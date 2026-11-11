@@ -1206,6 +1206,16 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_schema(
     server.verify().await;
 }
 
+#[tokio::test]
+async fn released_tail_corruption_retains_unverified_still_across_bounded_bridge() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(
+            true,
+            exercise_released_schema(ReleasedSchemaCase::TailCorruption),
+        )
+        .await;
+}
+
 fn passed_foreign_rows(database: &Path) -> Vec<Vec<rusqlite::types::Value>> {
     rows(
         database,
