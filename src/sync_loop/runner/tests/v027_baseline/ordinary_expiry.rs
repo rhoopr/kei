@@ -243,6 +243,7 @@ impl PhotosSession for SourceSession {
                 OriginFault::WrongScope
                     | OriginFault::FutureDebt
                     | OriginFault::CatalogUnknownDebt
+                    | OriginFault::CatalogUnknownLinked
                     | OriginFault::ManyDebt
                     | OriginFault::WakeDebt
             ) && self.primary
@@ -307,6 +308,7 @@ enum OriginFault {
     WrongScope,
     FutureDebt,
     CatalogUnknownDebt,
+    CatalogUnknownLinked,
     WakeClean,
     WakeDebt,
     ManyDebt,
@@ -361,6 +363,11 @@ async fn m1_future_catalog_debt_remains_visible_after_reopen_without_early_looku
 #[tokio::test]
 async fn m1_unknown_catalog_mode_keeps_current_owned_debt_visible() {
     exercise_expiry(OriginFault::CatalogUnknownDebt).await;
+}
+
+#[tokio::test]
+async fn m1_unknown_linked_mode_and_scope_keep_current_debt_visible() {
+    exercise_expiry(OriginFault::CatalogUnknownLinked).await;
 }
 
 #[tokio::test]
@@ -532,6 +539,7 @@ async fn exercise_expiry(fault: OriginFault) {
         OriginFault::WrongScope
             | OriginFault::FutureDebt
             | OriginFault::CatalogUnknownDebt
+            | OriginFault::CatalogUnknownLinked
             | OriginFault::WakeDebt
             | OriginFault::ManyDebt
             | OriginFault::DeletedProtected
@@ -1192,6 +1200,7 @@ async fn exercise_expiry(fault: OriginFault) {
                 | OriginFault::WrongScope
                 | OriginFault::FutureDebt
                 | OriginFault::CatalogUnknownDebt
+                | OriginFault::CatalogUnknownLinked
                 | OriginFault::WakeClean
                 | OriginFault::WakeDebt
                 | OriginFault::ManyDebt
@@ -1411,7 +1420,11 @@ async fn exercise_expiry(fault: OriginFault) {
             assert_eq!(debt_after, debt_before);
             return;
         }
-        if fault == OriginFault::CatalogUnknownDebt && phase > recovery_phase {
+        if matches!(
+            fault,
+            OriginFault::CatalogUnknownDebt | OriginFault::CatalogUnknownLinked
+        ) && phase > recovery_phase
+        {
             let before_lookups = events
                 .lock()
                 .unwrap()
@@ -1459,9 +1472,52 @@ async fn exercise_expiry(fault: OriginFault) {
             );
             assert_eq!(current_plan.zone["zoneName"], PRIMARY);
             assert_eq!(origin.scope(), before.1);
-            db.acquire_lock("simulate future mode on owner-created catalog round").unwrap().execute(
-                "UPDATE source_revalidation_rounds SET mode='future_catalog_mode' WHERE id=?1 AND mode='catalog_v2'", [&before.0],
-            ).unwrap();
+            let active_key = format!("observed_selection:v27:{PRIMARY}");
+            let active = db.get_metadata(&active_key).await.unwrap().unwrap();
+            let descriptor: Value = serde_json::from_str(&active).unwrap();
+            assert_eq!(descriptor["revalidation_round"], before.0);
+            let token = db
+                .get_metadata(&sync_token_key(PRIMARY))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut expected = before.clone();
+            if fault == OriginFault::CatalogUnknownLinked {
+                expected.1 = "future-scope-v999:opaque".to_owned();
+                assert_eq!(db.acquire_lock("simulate unknown linked round encodings").unwrap().execute(
+                    "UPDATE source_revalidation_rounds SET mode='future_catalog_mode',scope=?2 WHERE id=?1 AND mode='catalog_v2'", rusqlite::params![before.0, expected.1],
+                ).unwrap(), 1);
+            } else {
+                assert_eq!(db.acquire_lock("simulate future mode on owner-created catalog round").unwrap().execute(
+                    "UPDATE source_revalidation_rounds SET mode='future_catalog_mode' WHERE id=?1 AND mode='catalog_v2'", [&before.0],
+                ).unwrap(), 1);
+            }
+            let full_rows = |db: &SqliteStateDb| {
+                let conn = db
+                    .acquire_lock("snapshot all linked round and debt columns")
+                    .unwrap();
+                let mut stmt = conn.prepare("SELECT r.*,d.* FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1 ORDER BY d.id").unwrap();
+                stmt.query_map([&before.0], |row| {
+                    (0..row.as_ref().column_count())
+                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+            };
+            let exact_rows = full_rows(&db);
+            assert_eq!(
+                db.get_metadata(&active_key).await.unwrap().as_deref(),
+                Some(active.as_str())
+            );
+            assert_eq!(
+                db.get_metadata(&sync_token_key(PRIMARY))
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(token.as_str())
+            );
             let quiet = crate::sync_loop::runner::quiet_catalog_cycle(
                 &[&states[0], &states[1]],
                 &builder,
@@ -1515,8 +1571,24 @@ async fn exercise_expiry(fault: OriginFault) {
             assert_eq!(remaining.retained_sources, vec![PRIMARY]);
             assert_eq!(
                 snapshot(&db),
-                before,
+                expected,
                 "unknown mode must preserve exact identity and deadline"
+            );
+            assert_eq!(
+                full_rows(&db),
+                exact_rows,
+                "all round and debt columns must remain unchanged"
+            );
+            assert_eq!(
+                db.get_metadata(&active_key).await.unwrap().as_deref(),
+                Some(active.as_str())
+            );
+            assert_eq!(
+                db.get_metadata(&sync_token_key(PRIMARY))
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(token.as_str())
             );
             assert_eq!(
                 events
@@ -2592,5 +2664,318 @@ async fn valid_token_bootstraps_from_actual_eof_and_reopens_quietly() {
             1,
             "EOF bootstrap must not request a replacement boundary"
         );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct EofMediaSession {
+    inner: EofBootstrapSession,
+    records: Arc<Vec<Value>>,
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait::async_trait]
+impl PhotosSession for EofMediaSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        let request: Value = serde_json::from_str(&body)?;
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return self.inner.post(url, body, headers).await;
+        }
+        if url.contains("/internal/records/query/batch") {
+            let count = if self.inner.events.lock().unwrap().contains(&"delta-eof") {
+                0
+            } else {
+                1
+            };
+            let batch: Vec<_> = request["batch"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|_| json!({"records":[{"fields":{"itemCount":{"value":count}}}]}))
+                .collect();
+            return Ok(json!({"batch":batch}));
+        }
+        if url.contains("/records/lookup?") {
+            let requested = request["records"].as_array().unwrap();
+            let records: Vec<_> = self
+                .records
+                .iter()
+                .filter(|record| {
+                    requested
+                        .iter()
+                        .any(|item| item["recordName"] == record["recordName"])
+                })
+                .cloned()
+                .collect();
+            return Ok(json!({"records":records}));
+        }
+        let mut response = self.inner.post(url, body, headers).await?;
+        if url.contains("/records/query?")
+            && request["query"]["recordType"] != "CPLAlbumByPositionLive"
+            && !self.inner.events.lock().unwrap().contains(&"delta-eof")
+        {
+            let rank = request["query"]["filterBy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                .unwrap_or(0);
+            if rank == 0 {
+                response["records"] = json!(self.records.as_ref());
+            }
+        }
+        Ok(response)
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn valid_main_resume_bridge_error_does_not_create_rejection_hold() {
+    use fs4::fs_std::FileExt;
+
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/eof-old"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("media");
+    std::fs::create_dir(&root).unwrap();
+    let database = dir.path().join("state.db");
+    let source = json!({"zoneName":EOF_ZONE,"ownerRecordName":"_defaultOwner"});
+    let records = Arc::new(media(
+        "eof-old",
+        &format!("{}/eof-old", server.uri()),
+        &source,
+        89,
+    ));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+    let mut original_media = None;
+    let mut preserved_round = None;
+    let hold_key = format!(
+        "{}{EOF_ZONE}",
+        crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
+    );
+    for phase in 0..4 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&database, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/private".into(),
+            Arc::default(),
+            Box::new(EofMediaSession {
+                inner: EofBootstrapSession {
+                    db: db.clone(),
+                    events: events.clone(),
+                    zone: source.clone(),
+                    successor: "after-D",
+                },
+                records: records.clone(),
+            }),
+            Arc::new(source.clone()),
+            "private".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        library.shadow_capture = Some(ShadowCapture::new(db.clone(), baseline_owner(), "com"));
+        if phase == 0 {
+            db.enroll_sync_epoch(vec![(EOF_ZONE.into(), library.baseline_scope())])
+                .await
+                .unwrap();
+        }
+        let hidden = library.albums().await.unwrap().remove("Hidden").unwrap();
+        let pass = crate::commands::AlbumPass {
+            kind: PassKind::SmartFolder,
+            album: hidden,
+            exclude_ids: Arc::default(),
+        };
+        let mut state = make_run_cycle_library_state_with_passes(
+            EOF_ZONE,
+            &sync_token_key(EOF_ZONE),
+            vec![pass],
+        );
+        state.library = library;
+        let base = make_run_cycle_download_config_builder(&root, db.clone());
+        let journal_lock = Mutex::new(None::<std::fs::File>);
+        let before_fault = Mutex::new(None::<(String, String, String, i64)>);
+        let builder = |mode: download::SyncMode, exclude, groups, zone: Arc<str>| {
+            if phase == 2
+                && zone.as_ref() == EOF_ZONE
+                && matches!(&mode, download::SyncMode::Incremental { zone_sync_token } if zone_sync_token == "after-D")
+                && events.lock().unwrap().contains(&"bootstrap-inventory")
+            {
+                let conn = db
+                    .acquire_lock("inspect real resumed census before bridge")
+                    .unwrap();
+                let row: (String, String, String, i64) = conn.query_row(
+                    "SELECT r.id,r.scope,d.id,d.next_retry_at FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.library=?1 AND r.mode='catalog_v2' AND r.phase='observing'",
+                    [EOF_ZONE], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+                ).unwrap();
+                assert!(before_fault.lock().unwrap().replace(row).is_none());
+                drop(conn);
+                let fault_dir = root.join("resume-journal-fault");
+                std::fs::create_dir(&fault_dir).unwrap();
+                download::file::seed_test_replacement_journal(
+                    &fault_dir.join("target"),
+                    &fault_dir.join("part"),
+                    b"fixture original",
+                    b"fixture replacement",
+                )
+                .unwrap();
+                let journal = std::fs::read_dir(&fault_dir)
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .map(|entry| entry.path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".kei-replace-")
+                    })
+                    .unwrap();
+                let manifest = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(journal.join("manifest.json"))
+                    .unwrap();
+                assert!(manifest.try_lock_exclusive().unwrap());
+                assert!(journal_lock.lock().unwrap().replace(manifest).is_none());
+            }
+            base(mode, exclude, groups, zone)
+        };
+        let trace = (phase == 2).then(crate::test_helpers::TracingCapture::install);
+        let result = run_cycle(
+            &[&state],
+            &make_run_cycle_config(),
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &session,
+            &CancellationToken::new(),
+        )
+        .await;
+        if phase == 0 {
+            result.unwrap();
+            let path: String = db.acquire_lock("find real downloaded baseline").unwrap().query_row(
+                "SELECT local_path FROM assets WHERE library=?1 AND id='asset-eof-old' AND status='downloaded'", [EOF_ZONE], |row| row.get(0),
+            ).unwrap();
+            let path = std::path::PathBuf::from(path);
+            assert_eq!(std::fs::read(&path).unwrap(), MEDIA);
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            original_media = Some((path, modified));
+        } else if phase == 1 {
+            result.unwrap();
+            assert_eq!(
+                db.get_metadata(&sync_token_key(EOF_ZONE))
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("after-D")
+            );
+            assert!(db.get_metadata(&hold_key).await.unwrap().is_none());
+            assert!(events.lock().unwrap().contains(&"delta-eof"));
+        } else if phase == 2 {
+            let error =
+                result.expect_err("the actual resumed bridge must return the busy journal error");
+            assert!(
+                format!("{error:#}").contains("Replacement journal is busy"),
+                "{error:#}"
+            );
+            let captured = trace.as_ref().unwrap().0.events();
+            let inventory = captured
+                .iter()
+                .find(|event| event.message() == Some("test fresh bridge inventory accepted"))
+                .expect("actual resumed bridge gate");
+            assert_eq!(inventory.field("retained_main_rejected"), Some("false"));
+            assert_eq!(inventory.field("observation"), Some("true"));
+            assert!(captured.iter().any(|event| event.message()
+                == Some("test fresh bridge returned error")
+                && event.field("fresh_origin") == Some("true")));
+            assert!(
+                !captured
+                    .iter()
+                    .any(|event| event.message() == Some("test typed retained main rejection"))
+            );
+            let saved = before_fault
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("real observing origin and debt before bridge");
+            let after: (String, String, String, i64) = db.acquire_lock("verify resumed debt after error").unwrap().query_row(
+                "SELECT r.id,r.scope,d.id,d.next_retry_at FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.library=?1 AND r.mode='catalog_v2' AND r.phase='observing'",
+                [EOF_ZONE], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            ).unwrap();
+            assert_eq!(after, saved);
+            assert_eq!(
+                db.get_metadata(&sync_token_key(EOF_ZONE))
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("after-D")
+            );
+            assert!(
+                db.get_metadata(&hold_key).await.unwrap().is_none(),
+                "a valid original MAIN must not acquire a rejected-cursor hold"
+            );
+            preserved_round = Some(saved);
+        } else {
+            result.unwrap();
+            assert_eq!(
+                db.get_metadata(&sync_token_key(EOF_ZONE))
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("bridged-final")
+            );
+            assert!(db.get_metadata(&hold_key).await.unwrap().is_none());
+            assert!(events.lock().unwrap().contains(&"bootstrap-bridge"));
+        }
+        if let Some((path, modified)) = &original_media {
+            assert_eq!(std::fs::read(path).unwrap(), MEDIA);
+            assert_eq!(
+                &std::fs::metadata(path).unwrap().modified().unwrap(),
+                modified
+            );
+        }
+        drop(state);
+        drop(base);
+        drop(journal_lock);
+        assert_eq!(Arc::strong_count(&db), 1);
+        drop(db);
+        if phase == 2 {
+            let reopened = SqliteStateDb::open_owned(&database, &baseline_owner())
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened
+                    .get_metadata(&sync_token_key(EOF_ZONE))
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("after-D")
+            );
+            assert!(reopened.get_metadata(&hold_key).await.unwrap().is_none());
+            let after: (String, String, String, i64) = reopened.acquire_lock("verify resumed debt after reopen").unwrap().query_row(
+                "SELECT r.id,r.scope,d.id,d.next_retry_at FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.library=?1 AND r.mode='catalog_v2' AND r.phase='observing'",
+                [EOF_ZONE], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            ).unwrap();
+            assert_eq!(Some(after), preserved_round);
+        }
     }
 }

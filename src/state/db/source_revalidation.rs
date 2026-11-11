@@ -1479,18 +1479,21 @@ impl SqliteStateDb {
             if super::provider_generations::observation::catalog_active_plan_matches(
                 &tx, &library, &plan_digest, &enum_hash,
             )? {
+                let linked_round = super::provider_generations::observation::selected_catalog_health_link(
+                    &tx, &library, &plan_digest, &enum_hash,
+                )?;
                 let mut other = tx.prepare(
-                    "SELECT r.id,r.scope,r.phase,r.enum_hash,COUNT(d.id),MIN(d.next_retry_at)
+                    "SELECT r.id,r.scope,r.phase,r.enum_hash,COUNT(d.id),MIN(d.next_retry_at),r.mode
                      FROM source_revalidation_rounds r LEFT JOIN source_revalidation_debt d ON d.round=r.id
                      WHERE r.library=?1 AND r.mode!=?2 AND r.phase IN ('marking','observing','active')
                      GROUP BY r.id,r.scope,r.phase,r.enum_hash",
                 )?;
                 let rows = other.query_map(params![library, CATALOG_MODE], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, Option<i64>>(5)?))
+                        row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, Option<i64>>(5)?, row.get::<_, String>(6)?))
                 })?;
                 for row in rows {
-                    let (round, scope, phase, policy, count, due) = row?;
+                    let (round, scope, phase, policy, count, due, mode) = row?;
                     let legacy_scope = super::provider_generations::observation::revalidation_scope_current(
                             &tx, &library, &scope, &enum_hash,
                         )?;
@@ -1500,8 +1503,10 @@ impl SqliteStateDb {
                                 origin.epoch == record.epoch && origin.attempt == record.attempt
                             })
                     });
-                    if policy != enum_hash
-                        || !(legacy_scope || catalog_scope)
+                    let unclassified_link = mode != LEGACY_MODE
+                        && !legacy_scope && !catalog_scope
+                        && linked_round.as_deref() == Some(round.as_str());
+                    if (!unclassified_link && (policy != enum_hash || !(legacy_scope || catalog_scope)))
                         || (phase == "active" && count == 0)
                     {
                         continue;

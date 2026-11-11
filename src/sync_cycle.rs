@@ -1982,6 +1982,7 @@ pub(crate) async fn run_cycle_with_witness(
             None
         };
         let mut retained_checkpoint_attempt = 1;
+        let mut retained_checkpoint_reserved = false;
         let hold_key = retained_checkpoint_hold_key(&lib_state.zone_name);
         let retained_hold_at_start = if let Some(db) = state_db {
             db.get_metadata(&hold_key).await?
@@ -2384,6 +2385,7 @@ pub(crate) async fn run_cycle_with_witness(
                     && let Some((_, expected)) = zone_metadata_fence.last_mut()
                 {
                     *expected = Some(serde_json::to_string(&current)?);
+                    retained_checkpoint_reserved = true;
                 }
                 if deferred || reservation_failed {
                     if reservation_failed {
@@ -3538,8 +3540,9 @@ pub(crate) async fn run_cycle_with_witness(
                 match replacement {
                     Ok(result) => result,
                     Err(error) => {
-                        if let (Some(db), Some(prior)) =
-                            (state_db, retained_cursor_at_start.as_deref())
+                        if !retained_checkpoint_reserved
+                            && let (Some(db), Some(prior)) =
+                                (state_db, retained_cursor_at_start.as_deref())
                         {
                             let mut hold = RetainedCheckpointHold::new(
                                 prior,
@@ -3731,11 +3734,14 @@ pub(crate) async fn run_cycle_with_witness(
                                     fresh_origin = fresh_origin.is_some(),
                                     "test fresh bridge returned error"
                                 );
-                                if let (Some(_), Some(db), Some(prior)) = (
-                                    fresh_origin.as_ref(),
-                                    state_db,
-                                    retained_cursor_at_start.as_deref(),
-                                ) {
+                                if retained_main_rejected
+                                    && !retained_checkpoint_reserved
+                                    && let (Some(_), Some(db), Some(prior)) = (
+                                        fresh_origin.as_ref(),
+                                        state_db,
+                                        retained_cursor_at_start.as_deref(),
+                                    )
+                                {
                                     let mut hold = RetainedCheckpointHold::new(
                                         prior,
                                         &enum_config_hash,

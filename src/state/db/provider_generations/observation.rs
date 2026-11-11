@@ -521,6 +521,24 @@ pub(in crate::state::db) fn catalog_active_plan_matches(
     Ok(catalog_plan_digest_from_observation(&raw, library).as_deref() == Some(plan_digest))
 }
 
+/// The validated current descriptor's link is negative health evidence only.
+/// It does not validate the linked round's encoding or authorize settlement.
+pub(in crate::state::db) fn selected_catalog_health_link(
+    conn: &Connection,
+    library: &str,
+    plan_digest: &str,
+    enum_hash: &str,
+) -> Result<Option<String>, StateError> {
+    if !catalog_active_plan_matches(conn, library, plan_digest, enum_hash)? {
+        return Ok(None);
+    }
+    let Some(token) = metadata(conn, &format!("sync_token:v27:{library}"))? else {
+        return Ok(None);
+    };
+    Ok(valid(conn, &format!("{ACTIVE}{library}"), &token)?
+        .and_then(|descriptor| descriptor.revalidation_round))
+}
+
 pub(in crate::state::db) fn has_valid_staged_for_library(
     conn: &Connection,
     library: &str,

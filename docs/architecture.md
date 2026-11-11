@@ -2098,6 +2098,9 @@ plan and policy. A recognized optional catalog link can be omitted when stale
 without vetoing an independently valid checkpoint; an omitted link cannot
 authorize drain. Legacy, unknown and malformed rows retain their conservative
 checkpoint guards.
+For health, a validated current descriptor's explicit round link also retains
+unclassified debt when its mode and scope are unknown. The link alone does not
+authorize settlement or checkpoint advancement.
 
 The fresh-origin operation accepts a complete epoch with a matching ACTIVE plan
 or the current pending attempt without an ACTIVE descriptor. The caller captures
