@@ -15,6 +15,8 @@ mod precheck;
 mod reconcile;
 mod reporting;
 mod runner;
+#[cfg(test)]
+pub(crate) use runner::quiet_catalog_cycle_for_test;
 mod session;
 mod watch;
 

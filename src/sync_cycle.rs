@@ -1922,7 +1922,7 @@ pub(crate) async fn run_cycle_with_witness(
     let mut active_cursor_fences = Vec::new();
 
     for (library_ordinal, lib_state) in library_states.iter().copied().enumerate() {
-        if shutdown_token.is_cancelled() {
+        if cycle_session_expired || shutdown_token.is_cancelled() {
             break;
         }
 
@@ -2102,6 +2102,9 @@ pub(crate) async fn run_cycle_with_witness(
                             "indexing qualification",
                         )
                         .await;
+                        if cycle_session_expired || shutdown_token.is_cancelled() {
+                            break;
+                        }
                     }
                     continue;
                 }
@@ -2303,6 +2306,9 @@ pub(crate) async fn run_cycle_with_witness(
                             "deferred epoch",
                         )
                         .await;
+                        if cycle_session_expired || shutdown_token.is_cancelled() {
+                            break;
+                        }
                     }
                     db.set_metadata(LAST_RECOVERY_ACTION_KEY, "source_epoch_deferred")
                         .await?;
@@ -2501,6 +2507,9 @@ pub(crate) async fn run_cycle_with_witness(
                     "epoch promotion",
                 )
                 .await;
+                if cycle_session_expired || shutdown_token.is_cancelled() {
+                    break;
+                }
             }
             if replay_ok
                 && local.failures == 0
@@ -2545,6 +2554,9 @@ pub(crate) async fn run_cycle_with_witness(
                         );
                     }
                 }
+            }
+            if cycle_session_expired || shutdown_token.is_cancelled() {
+                break;
             }
             let unresolved = sparse_identity_holds_current(
                 db,
@@ -3341,6 +3353,8 @@ pub(crate) async fn run_cycle_with_witness(
                     return Err(error);
                 }
                 retained_main_rejected = true;
+                #[cfg(test)]
+                tracing::debug!("test typed retained main rejection");
                 let mut prepared_baseline_fence = None;
                 let prepared: anyhow::Result<_> = Box::pin(async {
                     let db = state_db
@@ -3633,6 +3647,24 @@ pub(crate) async fn run_cycle_with_witness(
                     if matches!(inventory_decision, SourceCheckpointDecision::Advance { .. })
                         || complete_selected_window
                     {
+                        #[cfg(test)]
+                        if fresh_origin.is_some() {
+                            tracing::debug!(
+                                full = sync_result.full_enumeration_ran,
+                                advance = matches!(
+                                    inventory_decision,
+                                    SourceCheckpointDecision::Advance { .. }
+                                ),
+                                complete_window = complete_selected_window,
+                                enumeration_incomplete =
+                                    sync_result.checkpoint.enumeration_incomplete,
+                                enumeration_errors = sync_result.checkpoint.enumeration_errors,
+                                state_write_failures = sync_result.checkpoint.state_write_failures,
+                                observation = sync_result.checkpoint.observation.is_some(),
+                                retained_main_rejected,
+                                "test fresh bridge inventory accepted"
+                            );
+                        }
                         let mut bridge_config = build_download_config(
                             download::SyncMode::Incremental {
                                 zone_sync_token: prior_token.clone(),
@@ -3693,7 +3725,43 @@ pub(crate) async fn run_cycle_with_witness(
                                 );
                                 break;
                             }
-                            Err(error) => return Err(error),
+                            Err(error) => {
+                                #[cfg(test)]
+                                tracing::debug!(
+                                    fresh_origin = fresh_origin.is_some(),
+                                    "test fresh bridge returned error"
+                                );
+                                if let (Some(_), Some(db), Some(prior)) = (
+                                    fresh_origin.as_ref(),
+                                    state_db,
+                                    retained_cursor_at_start.as_deref(),
+                                ) {
+                                    let mut hold = RetainedCheckpointHold::new(
+                                        prior,
+                                        &enum_config_hash,
+                                        preservation_config_hash.as_deref(),
+                                    );
+                                    hold.attempt_count = retained_checkpoint_attempt;
+                                    let expected = zone_metadata_fence
+                                        .iter()
+                                        .cloned()
+                                        .chain(path_metadata_at_start.iter().cloned())
+                                        .collect();
+                                    if let Err(hold_error) = persist_retained_checkpoint_hold(
+                                        db,
+                                        hold_key.clone(),
+                                        &hold,
+                                        expected,
+                                    )
+                                    .await
+                                    {
+                                        return Err(error.context(format!(
+                                            "Failed to retain rejected main checkpoint hold: {hold_error:#}"
+                                        )));
+                                    }
+                                }
+                                return Err(error);
+                            }
                         };
                         observe_sync_component(
                             "delta_bridge",

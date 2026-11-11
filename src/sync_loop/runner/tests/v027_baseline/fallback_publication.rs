@@ -261,7 +261,7 @@ async fn v027_cross_zone_album_modified_publications_reopen_without_get_or_ident
             config.metadata.set_exif_datetime = true;
             Arc::new(config)
         };
-        let result = run_cycle(
+        let mut result = run_cycle(
             &[&selected],
             &make_run_cycle_config(),
             Some(db.as_ref()),
@@ -273,6 +273,28 @@ async fn v027_cross_zone_album_modified_publications_reopen_without_get_or_ident
         )
         .await
         .unwrap();
+        if cycle == 0 {
+            let controls = download::DownloadControls::download_hidden();
+            let drained = crate::sync_loop::runner::drain_catalog_source_revalidation(
+                &[&selected],
+                &builder,
+                controls,
+                &download::compute_config_hash(&make_run_cycle_config()),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("the real runner tail must retain unsupported cross-zone authority without aborting the cycle");
+            crate::sync_loop::runner::apply_catalog_drain_outcome(
+                &mut result,
+                &[&selected],
+                drained,
+                false,
+            );
+            assert!(
+                crate::sync_loop::runner::one_shot_partial_error(&result).is_some(),
+                "unsupported source authority must remain visible"
+            );
+        }
         assert_eq!(
             result.failed_count,
             0,

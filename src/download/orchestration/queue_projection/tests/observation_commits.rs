@@ -1888,6 +1888,258 @@ async fn catalog_hint_current_legacy_link_preserves_ordinary_delta_and_debt() {
     }
 }
 
+#[derive(Clone)]
+struct QuietLegacySession(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for QuietLegacySession {
+    async fn post(
+        &self,
+        _url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let request: Value = serde_json::from_str(&body)?;
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(
+                serde_json::json!({"records":[{"recordName":"index","fields":{"state":{"value":"FINISHED"}}}]}),
+            );
+        }
+        anyhow::bail!("quiet legacy inspection must not contact the provider")
+    }
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+async fn quiet_current_legacy_census(unknown_mode: bool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
+    let media = dir.path().join("legacy.jpg");
+    std::fs::write(&media, b"retained legacy bytes").unwrap();
+    let asset = crate::test_helpers::TestAssetRecord::new("legacy-child")
+        .library("PrimarySync")
+        .build();
+    fixture.db.upsert_seen(&asset).await.unwrap();
+    fixture
+        .db
+        .mark_downloaded(
+            "PrimarySync",
+            "legacy-child",
+            "original",
+            &media,
+            "synthetic",
+            None,
+        )
+        .await
+        .unwrap();
+    let boundary = fixture.library.fresh_baseline_cursor().await.unwrap();
+    fixture
+        .db
+        .set_metadata(&fixture.baseline_key, &boundary)
+        .await
+        .unwrap();
+    fixture
+        .db
+        .seed_source_revalidation(
+            owner(),
+            "PrimarySync".into(),
+            fixture.plan.scope.clone(),
+            "policy".into(),
+            CatalogOrigin::boundary(&boundary),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let proof = ObservationProof::inventory(vec![fixture.receipt.clone()])
+        .unwrap()
+        .bridge(
+            ObservationProof::delivery(fixture.receipt.clone())
+                .delta(&boundary, "legacy-active")
+                .unwrap(),
+            &boundary,
+        )
+        .unwrap();
+    let mut save = transition(&fixture.db, "legacy-active").await;
+    save.expected_metadata
+        .push((fixture.baseline_key.clone(), Some(boundary)));
+    fixture
+        .db
+        .commit_observation_transition(save, Some(proof), false)
+        .await
+        .unwrap();
+    let candidates = fixture
+        .db
+        .due_source_revalidation(owner(), "PrimarySync".into(), fixture.plan.scope.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "actual owner-created legacy debt must be due"
+    );
+    fixture
+        .db
+        .settle_source_revalidation(owner(), candidates.into_iter().next().unwrap(), None, false)
+        .await
+        .unwrap();
+    let snapshot = |db: &SqliteStateDb| -> (String, String, i64) {
+        db.acquire_lock("legacy quiet debt snapshot").unwrap().query_row(
+            "SELECT r.id,r.mode,d.next_retry_at FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.library='PrimarySync' AND r.phase='active' AND d.id='legacy-child'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap()
+    };
+    let before = snapshot(&fixture.db);
+    assert!(
+        before.2 > chrono::Utc::now().timestamp(),
+        "real refusal must set a future deadline"
+    );
+    drop(fixture);
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(snapshot(&db), before, "legacy owner survives reopen");
+    if unknown_mode {
+        db.acquire_lock("simulate future mode on the actual selected round")
+            .unwrap()
+            .execute(
+                "UPDATE source_revalidation_rounds SET mode='future_mode' WHERE id=?1",
+                [&before.0],
+            )
+            .unwrap();
+    }
+    let before = snapshot(&db);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/private".into(),
+        Arc::new(HashMap::new()),
+        Box::new(QuietLegacySession(calls.clone())),
+        Arc::new(serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    library.shadow_capture = Some(ShadowCapture::new(db.clone(), owner(), "com"));
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: library.all(),
+        exclude_ids: Arc::default(),
+    };
+    let state = crate::sync_cycle::LibraryState {
+        library,
+        cross_zone_libraries: Vec::new(),
+        pass_scope: crate::commands::PassScope {
+            include_albums: false,
+            include_smart_folders: false,
+            include_unfiled: true,
+        },
+        zone_name: "PrimarySync".into(),
+        sync_token_key: TOKEN.into(),
+        plan: crate::commands::AlbumPlan { passes: vec![pass] },
+        plan_is_stale: false,
+        plan_needs_refresh: false,
+    };
+    let mut template = DownloadConfig::test_default();
+    template.directory = Arc::from(dir.path());
+    template.state_db = Some(db.clone());
+    template.library = Arc::from("PrimarySync");
+    let builder = |_, _, _, _| Arc::new(template.clone());
+    let before_calls = calls.load(Ordering::SeqCst);
+    let quiet = crate::sync_loop::quiet_catalog_cycle_for_test(
+        &[&state],
+        &builder,
+        DownloadControls::download_hidden(),
+        "policy",
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .expect("selected legacy or unknown-mode debt must not become quiet success");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        before_calls,
+        "future work must not trigger provider lookup"
+    );
+    assert_eq!(snapshot(&db), before);
+    assert_eq!(std::fs::read(&media).unwrap(), b"retained legacy bytes");
+    assert_eq!(quiet.failed_count, 0);
+    let notifier = crate::notifications::Notifier::new(None);
+    let report = dir.path().join("quiet-legacy.json");
+    let globals = crate::config::GlobalArgs {
+        username: Some("synthetic@example.invalid".into()),
+        domain: None,
+        data_dir: None,
+    };
+    let sync = crate::cli::SyncArgs {
+        config_overrides: crate::config::SyncConfigOverrides {
+            download_dir: Some(dir.path().display().to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let config =
+        crate::config::Config::build(&globals, &crate::cli::PasswordArgs::default(), sync, None)
+            .unwrap();
+    let reporter =
+        crate::cycle_reporter::CycleReporter::new(crate::cycle_reporter::CycleReporterConfig {
+            watch_mode: true,
+            report_path: Some(&report),
+            run_options: crate::report::RunOptions::from_config(&config),
+            health_dir: dir.path(),
+            personality_mode: crate::personality::Mode::Off,
+            state_db: Some(db.as_ref()),
+            metrics_handle: None,
+            notifier: &notifier,
+        });
+    let mut health = crate::health::HealthStatus::new();
+    reporter
+        .report_completed_cycle(
+            &mut health,
+            crate::cycle_reporter::CycleFacts::from_cycle_result(&quiet, std::time::Duration::ZERO),
+        )
+        .await;
+    let output: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+    assert_eq!(output["status"], "partial_failure");
+    assert_eq!(output["stats"]["failed"], 0);
+    assert!(health.last_success_at.is_none());
+    db.acquire_lock("classify unrelated historical debt")
+        .unwrap()
+        .execute(
+            "UPDATE source_revalidation_rounds SET enum_hash='historical-policy' WHERE id=?1",
+            [&before.0],
+        )
+        .unwrap();
+    let historical = crate::sync_loop::quiet_catalog_cycle_for_test(
+        &[&state],
+        &builder,
+        DownloadControls::download_hidden(),
+        "policy",
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        historical.is_none(),
+        "unrelated historical policy must not veto current health"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), before_calls);
+}
+
+#[tokio::test]
+async fn quiet_current_legacy_future_debt_is_visible() {
+    quiet_current_legacy_census(false).await;
+}
+
+#[tokio::test]
+async fn quiet_current_unknown_mode_is_visible() {
+    quiet_current_legacy_census(true).await;
+}
+
 #[tokio::test]
 async fn catalog_resume_returns_actual_saved_expiry_boundary() {
     let dir = tempfile::tempdir().unwrap();

@@ -160,6 +160,9 @@ impl PhotosSession for SourceSession {
         }
         if url.contains("/changes/zone?") {
             let cursor = request["zones"][0]["syncToken"].as_str().unwrap();
+            if !self.primary {
+                self.events.lock().unwrap().push("peer-delta");
+            }
             if self.primary && self.phase > 0 && cursor == format!("{PRIMARY}-1") {
                 self.events.lock().unwrap().push("rejected");
                 return Ok(json!({"zones":[{"zoneID":source,"serverErrorCode":"BAD_REQUEST"}]}));
@@ -237,7 +240,11 @@ impl PhotosSession for SourceSession {
                 .collect();
             if matches!(
                 self.fault,
-                OriginFault::WrongScope | OriginFault::FutureDebt | OriginFault::ManyDebt
+                OriginFault::WrongScope
+                    | OriginFault::FutureDebt
+                    | OriginFault::CatalogUnknownDebt
+                    | OriginFault::ManyDebt
+                    | OriginFault::WakeDebt
             ) && self.primary
                 && self.events.lock().unwrap().contains(&"fresh-bridge")
             {
@@ -299,9 +306,15 @@ enum OriginFault {
     PreparedPublication,
     WrongScope,
     FutureDebt,
+    CatalogUnknownDebt,
+    WakeClean,
+    WakeDebt,
     ManyDebt,
     ReplacementError,
     ReplacementHoldError,
+    BridgeError,
+    BridgeHoldError,
+    BridgeBusy,
     AuthLookup,
     CancelLookup,
     RecordAuthMaster,
@@ -346,6 +359,21 @@ async fn m1_future_catalog_debt_remains_visible_after_reopen_without_early_looku
 }
 
 #[tokio::test]
+async fn m1_unknown_catalog_mode_keeps_current_owned_debt_visible() {
+    exercise_expiry(OriginFault::CatalogUnknownDebt).await;
+}
+
+#[tokio::test]
+async fn watch_idle_clean_defers_plan_refresh_without_aborting() {
+    exercise_expiry(OriginFault::WakeClean).await;
+}
+
+#[tokio::test]
+async fn watch_idle_future_debt_and_changed_peer_preserve_progress() {
+    exercise_expiry(OriginFault::WakeDebt).await;
+}
+
+#[tokio::test]
 async fn m1_bounded_catalog_page_reports_the_remaining_sixty_fifth_candidate() {
     exercise_expiry(OriginFault::ManyDebt).await;
 }
@@ -358,6 +386,24 @@ async fn m1_replacement_error_retains_original_cursor_hold() {
 #[tokio::test]
 async fn m1_replacement_error_reports_hold_write_failure() {
     exercise_expiry(OriginFault::ReplacementHoldError).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn m1_fresh_bridge_error_retains_original_cursor_hold() {
+    exercise_expiry(OriginFault::BridgeError).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn m1_fresh_bridge_error_reports_hold_write_failure() {
+    exercise_expiry(OriginFault::BridgeHoldError).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn m1_fresh_bridge_busy_replacement_journal_retains_original_hold() {
+    exercise_expiry(OriginFault::BridgeBusy).await;
 }
 
 #[cfg(feature = "xmp")]
@@ -440,6 +486,9 @@ async fn exercise_expiry(fault: OriginFault) {
             OriginFault::MarkerWriterProbe
                 | OriginFault::ReplacementError
                 | OriginFault::ReplacementHoldError
+                | OriginFault::BridgeError
+                | OriginFault::BridgeHoldError
+                | OriginFault::BridgeBusy
         ) {
             mock.mount(&server).await;
         } else {
@@ -482,6 +531,8 @@ async fn exercise_expiry(fault: OriginFault) {
         fault,
         OriginFault::WrongScope
             | OriginFault::FutureDebt
+            | OriginFault::CatalogUnknownDebt
+            | OriginFault::WakeDebt
             | OriginFault::ManyDebt
             | OriginFault::DeletedProtected
             | OriginFault::PreparedPublication
@@ -638,7 +689,65 @@ async fn exercise_expiry(fault: OriginFault) {
             run_config.runtime.refresh_metadata = phase == 0;
             run_config.metadata.xmp_sidecar = true;
         }
-        let builder = |mode, exclude, groups, library| {
+        let bridge_lock = Mutex::new(None::<std::fs::File>);
+        let builder = |mode: download::SyncMode, exclude, groups, library: Arc<str>| {
+            #[cfg(target_os = "linux")]
+            if matches!(
+                fault,
+                OriginFault::BridgeBusy | OriginFault::BridgeError | OriginFault::BridgeHoldError
+            ) && phase == 1
+                && library.as_ref() == PRIMARY
+                && matches!(&mode, download::SyncMode::Incremental { zone_sync_token } if zone_sync_token == "fresh-primary")
+            {
+                use fs4::fs_std::FileExt;
+                assert!(events.lock().unwrap().contains(&"rejected"));
+                {
+                    let conn = db
+                        .acquire_lock("check pre-bridge source and origin")
+                        .unwrap();
+                    let cursor: String = conn
+                        .query_row(
+                            "SELECT value FROM metadata WHERE key=?1",
+                            [sync_token_key(PRIMARY)],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(cursor, format!("{PRIMARY}-1"));
+                    let origins: i64 = conn.query_row("SELECT COUNT(*) FROM source_revalidation_rounds r JOIN metadata m ON m.key LIKE 'baseline_cursor:v27:%' WHERE r.library=?1 AND r.mode='catalog_v2' AND r.phase='observing' AND m.value='fresh-primary'", [PRIMARY], |row| row.get(0)).unwrap();
+                    assert_eq!(origins, 1);
+                    if fault == OriginFault::BridgeHoldError {
+                        conn.execute_batch("CREATE TRIGGER fail_bridge_hold BEFORE INSERT ON metadata WHEN NEW.key='retained_checkpoint_hold:v27:PrimarySync-expiry' BEGIN SELECT RAISE(ABORT,'synthetic bridge hold write failure'); END;").unwrap();
+                    }
+                }
+                let directory = root.join("bridge-journal-fault");
+                std::fs::create_dir(&directory).unwrap();
+                download::file::seed_test_replacement_journal(
+                    &directory.join("target"),
+                    &directory.join("part"),
+                    b"original fixture",
+                    b"replacement fixture",
+                )
+                .unwrap();
+                let journal = std::fs::read_dir(&directory)
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .map(|entry| entry.path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".kei-replace-")
+                    })
+                    .unwrap();
+                let manifest = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(journal.join("manifest.json"))
+                    .unwrap();
+                assert!(manifest.try_lock_exclusive().unwrap());
+                assert!(bridge_lock.lock().unwrap().replace(manifest).is_none());
+                events.lock().unwrap().push("bridge-call");
+            }
             let mut config = (*base(mode, exclude, groups, library)).clone();
             config.folder_structure = "none".into();
             if clean_metadata {
@@ -650,8 +759,14 @@ async fn exercise_expiry(fault: OriginFault) {
             }
             Arc::new(config)
         };
-        let trace = (fault == OriginFault::MarkerWriterProbe)
-            .then(crate::test_helpers::TracingCapture::install);
+        let trace = matches!(
+            fault,
+            OriginFault::MarkerWriterProbe
+                | OriginFault::BridgeBusy
+                | OriginFault::BridgeError
+                | OriginFault::BridgeHoldError
+        )
+        .then(crate::test_helpers::TracingCapture::install);
         let result = run_cycle(
             &[&states[0], &states[1]],
             &run_config,
@@ -663,7 +778,9 @@ async fn exercise_expiry(fault: OriginFault) {
             &shutdown,
         )
         .await;
-        if let Some((capture, _guard)) = &trace {
+        if fault == OriginFault::MarkerWriterProbe
+            && let Some((capture, _guard)) = &trace
+        {
             assert!(
                 capture.contains_event(|event| {
                     event.message() == Some("Failed to record asset")
@@ -693,16 +810,56 @@ async fn exercise_expiry(fault: OriginFault) {
         if phase == 1
             && matches!(
                 fault,
-                OriginFault::ReplacementError | OriginFault::ReplacementHoldError
+                OriginFault::ReplacementError
+                    | OriginFault::ReplacementHoldError
+                    | OriginFault::BridgeError
+                    | OriginFault::BridgeHoldError
+                    | OriginFault::BridgeBusy
             )
         {
             let error = result
                 .expect_err("replacement generation must fail after typed original rejection");
             let text = format!("{error:#}");
-            assert!(
-                text.contains("synthetic replacement generation failure"),
-                "{text}"
-            );
+            if matches!(
+                fault,
+                OriginFault::BridgeBusy | OriginFault::BridgeError | OriginFault::BridgeHoldError
+            ) {
+                assert!(text.contains("Replacement journal is busy"), "{text}");
+                assert!(events.lock().unwrap().contains(&"bridge-call"));
+                let captured = trace.as_ref().unwrap().0.events();
+                let index = |message| {
+                    captured
+                        .iter()
+                        .position(|event| event.message() == Some(message))
+                        .unwrap_or_else(|| panic!("missing {message}: {captured:?}"))
+                };
+                let typed = index("test typed retained main rejection");
+                let inventory = index("test fresh bridge inventory accepted");
+                let returned = index("test fresh bridge returned error");
+                assert!(typed < inventory && inventory < returned, "{captured:?}");
+                assert_eq!(captured[inventory].field("full"), Some("true"));
+                assert_eq!(captured[inventory].field("advance"), Some("true"));
+                assert_eq!(
+                    captured[inventory].field("enumeration_incomplete"),
+                    Some("false")
+                );
+                assert_eq!(captured[inventory].field("enumeration_errors"), Some("0"));
+                assert_eq!(captured[inventory].field("state_write_failures"), Some("0"));
+                assert_eq!(captured[inventory].field("observation"), Some("true"));
+                assert_eq!(
+                    captured[inventory].field("retained_main_rejected"),
+                    Some("true")
+                );
+                assert_eq!(captured[returned].field("fresh_origin"), Some("true"));
+                eprintln!(
+                    "typed main rejection -> complete observed inventory -> fresh bridge returned busy-journal error before checkpoint"
+                );
+            } else {
+                assert!(
+                    text.contains("synthetic replacement generation failure"),
+                    "{text}"
+                );
+            }
             assert!(events.lock().unwrap().contains(&"rejected"));
             let (key, raw, original) = {
                 let conn = db.acquire_lock("verify replacement error hold").unwrap();
@@ -726,10 +883,17 @@ async fn exercise_expiry(fault: OriginFault) {
                         row.get(0)
                     })
                     .ok();
-                if fault == OriginFault::ReplacementHoldError {
+                if matches!(
+                    fault,
+                    OriginFault::ReplacementHoldError | OriginFault::BridgeHoldError
+                ) {
                     assert!(raw.is_none());
                     assert!(
-                        text.contains("synthetic hold write failure"),
+                        text.contains(if fault == OriginFault::BridgeHoldError {
+                            "synthetic bridge hold write failure"
+                        } else {
+                            "synthetic hold write failure"
+                        }),
                         "hold-write failure must be visible: {text}"
                     );
                 } else {
@@ -762,15 +926,18 @@ async fn exercise_expiry(fault: OriginFault) {
             drop(all);
             drop(selected);
             drop(base);
+            drop(bridge_lock);
             assert_eq!(
                 Arc::strong_count(&db),
                 1,
                 "all source owners must close before reopen"
             );
             drop(db);
-            let reopened = SqliteStateDb::open_owned(&database, &baseline_owner())
-                .await
-                .unwrap();
+            let reopened = Arc::new(
+                SqliteStateDb::open_owned(&database, &baseline_owner())
+                    .await
+                    .unwrap(),
+            );
             assert_eq!(reopened.get_metadata(&key).await.unwrap(), raw);
             assert_eq!(
                 reopened
@@ -780,11 +947,202 @@ async fn exercise_expiry(fault: OriginFault) {
                     .as_deref(),
                 Some(original.as_str())
             );
-            let conn = reopened
-                .acquire_lock("verify replacement origin after reopen")
-                .unwrap();
-            let debt: i64 = conn.query_row("SELECT COUNT(*) FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE r.library=?1 AND r.phase='observing'", [PRIMARY], |row| row.get(0)).unwrap();
+            let debt: i64 = {
+                let conn = reopened
+                    .acquire_lock("verify replacement origin after reopen")
+                    .unwrap();
+                conn.query_row("SELECT COUNT(*) FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE r.library=?1 AND r.phase='observing'", [PRIMARY], |row| row.get(0)).unwrap()
+            };
             assert_eq!(debt, 1);
+            if matches!(
+                fault,
+                OriginFault::BridgeBusy | OriginFault::BridgeError | OriginFault::BridgeHoldError
+            ) {
+                assert_eq!(
+                    std::fs::read(root.join("bridge-journal-fault/target")).unwrap(),
+                    b"original fixture"
+                );
+                assert_eq!(
+                    std::fs::read(root.join("bridge-journal-fault/part")).unwrap(),
+                    b"replacement fixture"
+                );
+                if fault == OriginFault::BridgeHoldError {
+                    eprintln!(
+                        "reopened: original cursor and absent failed hold unchanged; origin debt=1; journal fixture bytes retained"
+                    );
+                } else {
+                    eprintln!(
+                        "reopened: original cursor and fenced hold unchanged; origin debt=1; journal fixture bytes retained"
+                    );
+                }
+            }
+            if fault == OriginFault::BridgeError {
+                let peer_before = reopened
+                    .get_metadata(&sync_token_key(SHARED))
+                    .await
+                    .unwrap();
+                let rejected_before = events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| **event == "rejected")
+                    .count();
+                let peer_calls_before = events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| **event == "peer-delta")
+                    .count();
+                let follow_cancel = CancellationToken::new();
+                let mut follow_libraries = Vec::new();
+                for primary in [true, false] {
+                    let source = zone(primary);
+                    let name = if primary { "primary" } else { "shared" };
+                    let old = format!("{name}-old");
+                    let new = format!("{name}-new");
+                    let mock = SourceSession {
+                        primary,
+                        phase: 2,
+                        fault: OriginFault::None,
+                        current: Arc::new(media(
+                            &old,
+                            &format!("{}/{old}", server.uri()),
+                            &source,
+                            if primary { 71 } else { 72 },
+                        )),
+                        added: Arc::new(media(
+                            &new,
+                            &format!("{}/{new}", server.uri()),
+                            &source,
+                            if primary { 73 } else { 74 },
+                        )),
+                        events: events.clone(),
+                        db: reopened.clone(),
+                        cancel: follow_cancel.clone(),
+                    };
+                    let mut library = PhotoLibrary::new(
+                        format!(
+                            "https://synthetic.example/database/1/photos/production/{}",
+                            if primary { "private" } else { "shared" }
+                        ),
+                        Arc::default(),
+                        Box::new(mock),
+                        Arc::new(source),
+                        if primary { "private" } else { "shared" }.into(),
+                        crate::retry::RetryConfig::default(),
+                    )
+                    .await
+                    .unwrap();
+                    library.shadow_capture = Some(ShadowCapture::new(
+                        reopened.clone(),
+                        baseline_owner(),
+                        "com",
+                    ));
+                    follow_libraries.push(library);
+                }
+                let follow_selected = vec![follow_libraries[1].clone()];
+                let follow_context = build_collection_context(
+                    &selection,
+                    collection_libraries(&selection, &follow_selected, &follow_libraries),
+                )
+                .await
+                .unwrap();
+                let follow_selected_zones = zone_name_set(&follow_selected);
+                let follow_collection_zones = zone_name_set(collection_libraries(
+                    &selection,
+                    &follow_selected,
+                    &follow_libraries,
+                ));
+                let mut follow_states = Vec::new();
+                for library in follow_libraries {
+                    let name = library.zone_name().to_owned();
+                    let scope = pass_scope_for_zone(
+                        &selection,
+                        &name,
+                        &follow_selected_zones,
+                        &follow_collection_zones,
+                    );
+                    let plan =
+                        resolve_passes_for_scope(&library, &selection, scope, &follow_context, &[])
+                            .await
+                            .unwrap();
+                    let mut state = make_run_cycle_library_state_with_passes(
+                        &name,
+                        &sync_token_key(&name),
+                        plan.passes,
+                    );
+                    state.library = library;
+                    follow_states.push(state);
+                }
+                let follow_base = make_run_cycle_download_config_builder(&root, reopened.clone());
+                let follow_builder = |mode, exclude, groups, library| {
+                    let mut config = (*follow_base(mode, exclude, groups, library)).clone();
+                    config.folder_structure = "none".into();
+                    Arc::new(config)
+                };
+                let follow = run_cycle(
+                    &[&follow_states[0], &follow_states[1]],
+                    &run_config,
+                    Some(reopened.as_ref()),
+                    false,
+                    &follow_builder,
+                    download::DownloadControls::download_hidden(),
+                    &session,
+                    &follow_cancel,
+                )
+                .await
+                .unwrap();
+                assert_eq!(follow.failed_count, 0, "{follow:?}");
+                assert!(
+                    follow.holds.iter().any(|hold| hold.source == PRIMARY
+                        && hold.kind == crate::sync_cycle::LibraryHoldKind::RetainedCheckpoint),
+                    "{follow:?}"
+                );
+                assert_eq!(
+                    reopened.get_metadata(&key).await.unwrap(),
+                    raw,
+                    "natural before-due wake must not rewrite deadline"
+                );
+                assert_eq!(
+                    reopened
+                        .get_metadata(&sync_token_key(PRIMARY))
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some(original.as_str())
+                );
+                let peer_after = reopened
+                    .get_metadata(&sync_token_key(SHARED))
+                    .await
+                    .unwrap();
+                assert_ne!(peer_after, peer_before, "healthy peer must advance");
+                assert_eq!(peer_after.as_deref(), Some(format!("{SHARED}-3").as_str()));
+                assert_eq!(
+                    events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|event| **event == "rejected")
+                        .count(),
+                    rejected_before
+                );
+                assert!(
+                    events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|event| **event == "peer-delta")
+                        .count()
+                        > peer_calls_before
+                );
+                for (path, modified) in &published {
+                    assert_eq!(std::fs::read(path).unwrap(), MEDIA);
+                    assert_eq!(
+                        &std::fs::metadata(path).unwrap().modified().unwrap(),
+                        modified
+                    );
+                }
+            }
             return;
         }
         let mut result = result.unwrap();
@@ -833,6 +1191,9 @@ async fn exercise_expiry(fault: OriginFault) {
                 | OriginFault::PreparedPublication
                 | OriginFault::WrongScope
                 | OriginFault::FutureDebt
+                | OriginFault::CatalogUnknownDebt
+                | OriginFault::WakeClean
+                | OriginFault::WakeDebt
                 | OriginFault::ManyDebt
                 | OriginFault::AuthLookup
                 | OriginFault::CancelLookup
@@ -903,6 +1264,277 @@ async fn exercise_expiry(fault: OriginFault) {
             }
         } else {
             assert!(result.can_advance_database_checkpoint(), "{result:?}");
+        }
+        if matches!(fault, OriginFault::WakeClean | OriginFault::WakeDebt) && phase > recovery_phase
+        {
+            let before_lookups = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| **event == "lookup")
+                .count();
+            let debt_before: Vec<(String, i64)> = {
+                let conn = db.acquire_lock("read wake debt before inspection").unwrap();
+                let mut statement = conn.prepare("SELECT d.id,d.next_retry_at FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE r.library=?1 AND r.phase='active' ORDER BY d.id").unwrap();
+                statement
+                    .query_map([PRIMARY], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap()
+            };
+            crate::sync_loop::runner::defer_watch_plan_refresh(&mut states);
+            let mut precheck = crate::sync_loop::precheck::WatchPrecheck::SkipAll;
+            crate::sync_loop::precheck::include_pending_provider_work(
+                &mut precheck,
+                &states,
+                &builder,
+                download::DownloadControls::download_hidden(),
+            )
+            .await;
+            assert!(matches!(
+                precheck,
+                crate::sync_loop::precheck::WatchPrecheck::SkipAll
+            ));
+            let quiet = crate::sync_loop::runner::quiet_catalog_cycle(
+                &[&states[0], &states[1]],
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &download::compute_config_hash(&run_config),
+                &shutdown,
+            )
+            .await
+            .expect("a normal post-idle wake must not abort");
+            assert!(
+                states
+                    .iter()
+                    .all(|state| state.plan_needs_refresh && !state.plan_is_stale)
+            );
+            if fault == OriginFault::WakeClean {
+                assert!(
+                    quiet.is_none(),
+                    "fully settled quiet source remains healthy"
+                );
+                assert!(debt_before.is_empty());
+                return;
+            }
+            let quiet = quiet.expect("future selected debt must remain a visible partial");
+            assert_eq!(quiet.failed_count, 0);
+            assert!(!quiet.holds.is_empty());
+            assert!(!quiet.operational_safe_holds);
+            let notifier = crate::notifications::Notifier::new(None);
+            let report_path = dir.path().join("post-idle-report.json");
+            let reporter = crate::cycle_reporter::CycleReporter::new(
+                crate::cycle_reporter::CycleReporterConfig {
+                    watch_mode: true,
+                    report_path: Some(&report_path),
+                    run_options: crate::report::RunOptions::from_config(&run_config),
+                    health_dir: dir.path(),
+                    personality_mode: crate::personality::Mode::Off,
+                    state_db: Some(db.as_ref()),
+                    metrics_handle: None,
+                    notifier: &notifier,
+                },
+            );
+            let mut health = crate::health::HealthStatus::new();
+            reporter
+                .report_completed_cycle(
+                    &mut health,
+                    crate::cycle_reporter::CycleFacts::from_cycle_result(
+                        &quiet,
+                        std::time::Duration::ZERO,
+                    ),
+                )
+                .await;
+            let report: Value =
+                serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+            assert_eq!(report["status"], "partial_failure");
+            assert_eq!(report["stats"]["failed"], 0);
+            assert!(health.last_success_at.is_none());
+            let changed = rustc_hash::FxHashSet::from_iter([SHARED.to_owned()]);
+            crate::sync_loop::planning::refresh_needed_library_plans(
+                &mut states,
+                &selection,
+                &context,
+                Some(&changed),
+                &mut 0,
+            )
+            .await;
+            assert!(states[0].plan_needs_refresh && !states[0].plan_is_stale);
+            assert!(!states[1].plan_needs_refresh && !states[1].plan_is_stale);
+            let mut peer = run_cycle(
+                &[&states[1]],
+                &run_config,
+                Some(db.as_ref()),
+                false,
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &session,
+                &shutdown,
+            )
+            .await
+            .unwrap();
+            assert_eq!(peer.failed_count, 0);
+            let drained = crate::sync_loop::runner::drain_catalog_source_revalidation(
+                &[&states[0], &states[1]],
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &download::compute_config_hash(&run_config),
+                &shutdown,
+            )
+            .await
+            .expect("unchanged source must not abort a changed peer");
+            crate::sync_loop::runner::apply_catalog_drain_outcome(
+                &mut peer,
+                &[&states[0], &states[1]],
+                drained,
+                false,
+            );
+            assert!(crate::sync_loop::runner::one_shot_partial_error(&peer).is_some());
+            assert_eq!(
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| **event == "lookup")
+                    .count(),
+                before_lookups
+            );
+            let debt_after: Vec<(String, i64)> = {
+                let conn = db.acquire_lock("read wake debt after inspection").unwrap();
+                let mut statement = conn.prepare("SELECT d.id,d.next_retry_at FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE r.library=?1 AND r.phase='active' ORDER BY d.id").unwrap();
+                statement
+                    .query_map([PRIMARY], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap()
+            };
+            assert_eq!(debt_after, debt_before);
+            return;
+        }
+        if fault == OriginFault::CatalogUnknownDebt && phase > recovery_phase {
+            let before_lookups = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| **event == "lookup")
+                .count();
+            let snapshot = |db: &SqliteStateDb| -> (String, String, String, String, i64) {
+                db.acquire_lock("snapshot current catalog-mode debt").unwrap().query_row(
+                    "SELECT r.id,r.scope,r.enum_hash,d.id,d.next_retry_at FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.library=?1 AND r.phase='active' AND r.mode IN ('catalog_v2','future_catalog_mode')",
+                    [PRIMARY], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+                ).unwrap()
+            };
+            let before = snapshot(&db);
+            assert!(before.4 > chrono::Utc::now().timestamp());
+            let origin =
+                crate::state::db::source_revalidation::CatalogOrigin::parse(&before.1).unwrap();
+            assert_eq!(origin.nonce, before.0);
+            let epoch: Value = serde_json::from_str(
+                &db.get_metadata(&crate::state::db::sync_epoch::library_key(PRIMARY))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(epoch["epoch"], origin.epoch);
+            assert_eq!(epoch["attempt"], origin.attempt);
+            let current_config = builder(
+                download::SyncMode::Full,
+                Arc::new(rustc_hash::FxHashSet::default()),
+                Arc::new(download::AssetGroupings::default()),
+                Arc::from(PRIMARY),
+            );
+            let current_plan = download::catalog_plan_context_for_source(
+                &states[0].plan.passes,
+                &current_config,
+                download::DownloadControls::download_hidden(),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                origin.plan_digest,
+                download::catalog_plan_digest_from_source_context(&current_plan)
+            );
+            assert_eq!(current_plan.zone["zoneName"], PRIMARY);
+            assert_eq!(origin.scope(), before.1);
+            db.acquire_lock("simulate future mode on owner-created catalog round").unwrap().execute(
+                "UPDATE source_revalidation_rounds SET mode='future_catalog_mode' WHERE id=?1 AND mode='catalog_v2'", [&before.0],
+            ).unwrap();
+            let quiet = crate::sync_loop::runner::quiet_catalog_cycle(
+                &[&states[0], &states[1]],
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &download::compute_config_hash(&run_config),
+                &shutdown,
+            )
+            .await
+            .unwrap()
+            .expect("current unknown catalog-mode debt must be visible");
+            assert_eq!(quiet.failed_count, 0);
+            assert!(!quiet.operational_safe_holds);
+            let notifier = crate::notifications::Notifier::new(None);
+            let report_path = dir.path().join("unknown-catalog-report.json");
+            let reporter = crate::cycle_reporter::CycleReporter::new(
+                crate::cycle_reporter::CycleReporterConfig {
+                    watch_mode: true,
+                    report_path: Some(&report_path),
+                    run_options: crate::report::RunOptions::from_config(&run_config),
+                    health_dir: dir.path(),
+                    personality_mode: crate::personality::Mode::Off,
+                    state_db: Some(db.as_ref()),
+                    metrics_handle: None,
+                    notifier: &notifier,
+                },
+            );
+            let mut health = crate::health::HealthStatus::new();
+            reporter
+                .report_completed_cycle(
+                    &mut health,
+                    crate::cycle_reporter::CycleFacts::from_cycle_result(
+                        &quiet,
+                        std::time::Duration::ZERO,
+                    ),
+                )
+                .await;
+            let report: Value =
+                serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+            assert_eq!(report["status"], "partial_failure");
+            assert_eq!(report["stats"]["failed"], 0);
+            assert!(health.last_success_at.is_none());
+            let remaining = crate::sync_loop::runner::drain_catalog_source_revalidation(
+                &[&states[0], &states[1]],
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &download::compute_config_hash(&run_config),
+                &shutdown,
+            )
+            .await
+            .unwrap();
+            assert_eq!(remaining.retained_sources, vec![PRIMARY]);
+            assert_eq!(
+                snapshot(&db),
+                before,
+                "unknown mode must preserve exact identity and deadline"
+            );
+            assert_eq!(
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| **event == "lookup")
+                    .count(),
+                before_lookups
+            );
+            for (path, modified) in &published {
+                assert_eq!(std::fs::read(path).unwrap(), MEDIA);
+                assert_eq!(
+                    &std::fs::metadata(path).unwrap().modified().unwrap(),
+                    modified
+                );
+            }
+            return;
         }
         if fault == OriginFault::FutureDebt && phase > recovery_phase {
             let lookups_before = events
@@ -984,18 +1616,18 @@ async fn exercise_expiry(fault: OriginFault) {
                 .is_none(),
                 "explicit capture repair keeps its existing selection policy"
             );
-            assert!(
-                crate::sync_loop::runner::quiet_catalog_cycle(
-                    &[&states[0]],
-                    &builder,
-                    download::DownloadControls::download_hidden(),
-                    &download::compute_config_hash(&run_config),
-                    &shutdown,
-                )
-                .await
-                .is_err(),
-                "a stale selected catalog plan cannot certify health"
-            );
+            let stale = crate::sync_loop::runner::quiet_catalog_cycle(
+                &[&states[0]],
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &download::compute_config_hash(&run_config),
+                &shutdown,
+            )
+            .await
+            .unwrap()
+            .expect("a stale selected catalog plan must remain a visible hold");
+            assert!(!stale.holds.is_empty());
+            assert!(!stale.operational_safe_holds);
             states[0].plan_is_stale = false;
             let quiet = crate::sync_loop::runner::quiet_catalog_cycle(
                 &[&states[0], &states[1]],
@@ -1355,7 +1987,10 @@ async fn exercise_expiry(fault: OriginFault) {
             initial_origin = Some(origin);
             if matches!(
                 fault,
-                OriginFault::ReplacementError | OriginFault::ReplacementHoldError
+                OriginFault::ReplacementError
+                    | OriginFault::ReplacementHoldError
+                    | OriginFault::BridgeError
+                    | OriginFault::BridgeHoldError
             ) {
                 for id in ["primary-old", "shared-old"] {
                     let native: String = conn

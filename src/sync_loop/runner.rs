@@ -143,12 +143,40 @@ struct CatalogDrainOutcome {
     rate_limited: usize,
     retained: usize,
     retained_sources: Vec<String>,
+    unavailable_sources: Vec<String>,
+}
+
+impl CatalogDrainOutcome {
+    fn retain_unavailable(&mut self, library: &LibraryState) {
+        self.retained = self.retained.saturating_add(1);
+        self.retained_sources.push(library.zone_name.clone());
+        self.unavailable_sources.push(library.zone_name.clone());
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CatalogVisit {
     DrainDue,
     Inspect,
+}
+
+fn defer_watch_plan_refresh(libraries: &mut [LibraryState]) {
+    for library in libraries {
+        library.plan_needs_refresh = true;
+    }
+}
+
+#[cfg(test)]
+struct WatchLoopTestControl {
+    shutdown: tokio_util::sync::CancellationToken,
+    sleep: std::time::Duration,
+    waits: Arc<std::sync::atomic::AtomicUsize>,
+    auth: std::sync::Mutex<Option<crate::auth::AuthResult>>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static WATCH_LOOP_TEST_CONTROL: WatchLoopTestControl;
 }
 
 async fn drain_catalog_source_revalidation(
@@ -204,10 +232,10 @@ async fn catalog_source_revalidation(
         {
             continue;
         }
-        anyhow::ensure!(
-            !library.plan_is_stale && !library.plan_needs_refresh,
-            "Selected catalog plan is not current"
-        );
+        if library.plan_is_stale {
+            outcome.retain_unavailable(library);
+            continue;
+        }
         let retained_before = outcome.retained;
         let Some(plan) = download::catalog_plan_context_for_source(
             &library.plan.passes,
@@ -217,7 +245,8 @@ async fn catalog_source_revalidation(
         )
         .await?
         else {
-            anyhow::bail!("Selected catalog plan authority is unavailable");
+            outcome.retain_unavailable(library);
+            continue;
         };
         let mut source = None;
         for pass in &library.plan.passes {
@@ -230,7 +259,8 @@ async fn catalog_source_revalidation(
             }
         }
         let Some((pass, capture)) = source else {
-            anyhow::bail!("Selected catalog source authority is unavailable");
+            outcome.retain_unavailable(library);
+            continue;
         };
         let digest = download::catalog_plan_digest_from_source_context(&plan);
         let signals = capture
@@ -239,6 +269,7 @@ async fn catalog_source_revalidation(
             .await?;
         for signal in signals {
             if visit == CatalogVisit::Inspect
+                || library.plan_needs_refresh
                 || signal.phase != "active"
                 || signal.due_at > chrono::Utc::now().timestamp()
             {
@@ -373,14 +404,23 @@ fn apply_catalog_drain_outcome(
             .iter()
             .position(|library| &library.zone_name == source)
         {
+            let unavailable = outcome.unavailable_sources.contains(source);
             crate::sync_cycle::record_selected_hold(
                 &mut cycle.holds,
                 &mut cycle.stats,
                 source,
                 ordinal,
                 crate::sync_cycle::LibraryHoldKind::BaselinePending,
-                "catalog_revalidation_pending",
-                "source revalidation retained unconfirmed work for retry",
+                if unavailable {
+                    "catalog_authority_unavailable"
+                } else {
+                    "catalog_revalidation_pending"
+                },
+                if unavailable {
+                    "selected source revalidation authority is unavailable"
+                } else {
+                    "source revalidation retained unconfirmed work for retry"
+                },
                 false,
             );
         }
@@ -427,6 +467,24 @@ async fn quiet_catalog_cycle(
     };
     apply_catalog_drain_outcome(&mut cycle, libraries, outcome, shutdown.is_cancelled());
     Ok(Some(Box::new(cycle)))
+}
+
+#[cfg(test)]
+pub(crate) async fn quiet_catalog_cycle_for_test(
+    libraries: &[&LibraryState],
+    build_download_config: &crate::sync_cycle::BuildDownloadConfigFn<'_>,
+    controls: download::DownloadControls,
+    enum_hash: &str,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<Option<Box<crate::sync_cycle::CycleResult>>> {
+    quiet_catalog_cycle(
+        libraries,
+        build_download_config,
+        controls,
+        enum_hash,
+        shutdown,
+    )
+    .await
 }
 
 /// Run the sync command: authenticate, enumerate photos, download, and
@@ -616,6 +674,25 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .then(|| password::decide_save_password_action(&source));
     let password_provider = make_password_provider(source, input_mode);
 
+    #[cfg(test)]
+    let test_auth = WATCH_LOOP_TEST_CONTROL
+        .try_with(|control| control.auth.lock().expect("watch test auth lock").take())
+        .ok();
+    #[cfg(test)]
+    let auth_result = match test_auth {
+        Some(Some(result)) => result,
+        Some(None) => anyhow::bail!("watch test authentication was already consumed"),
+        None => {
+            super::session::authenticate_initial_session(
+                &config,
+                &password_provider,
+                &notifier,
+                input_mode,
+            )
+            .await?
+        }
+    };
+    #[cfg(not(test))]
     let auth_result = super::session::authenticate_initial_session(
         &config,
         &password_provider,
@@ -917,6 +994,13 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         ),
     );
 
+    #[cfg(test)]
+    let shutdown_token = match WATCH_LOOP_TEST_CONTROL.try_with(|control| control.shutdown.clone())
+    {
+        Ok(token) => token,
+        Err(_) => shutdown::install_signal_handler(sd_notifier, config.ui.personality_mode)?,
+    };
+    #[cfg(not(test))]
     let shutdown_token = shutdown::install_signal_handler(sd_notifier, config.ui.personality_mode)?;
     if shutdown_token.is_cancelled() {
         return Ok(());
@@ -964,7 +1048,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .watch
         .interval
         .map(|secs| chrono::Duration::seconds((secs * 2) as i64));
-    let (metrics_handle, metrics_task) = if config.watch.interval.is_some() {
+    let start_metrics = config.watch.interval.is_some();
+    #[cfg(test)]
+    let start_metrics = start_metrics && WATCH_LOOP_TEST_CONTROL.try_with(|_| ()).is_err();
+    let (metrics_handle, metrics_task) = if start_metrics {
         let (h, t, _addr) = crate::metrics::spawn_server(
             config.server.bind,
             config.server.port,
@@ -1381,8 +1468,19 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
             sd_notifier.notify_status(&format!("Waiting {interval} seconds..."));
             tracing::info!(interval_secs = interval, "Waiting before next cycle");
+            #[cfg(test)]
+            let duration = WATCH_LOOP_TEST_CONTROL
+                .try_with(|control| {
+                    control
+                        .waits
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    control.sleep
+                })
+                .unwrap_or_else(|_| std::time::Duration::from_secs(interval));
+            #[cfg(not(test))]
+            let duration = std::time::Duration::from_secs(interval);
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+                () = tokio::time::sleep(duration) => {}
                 () = shutdown_token.cancelled() => {
                     tracing::info!("Shutdown during wait, exiting...");
                     break;
@@ -1390,15 +1488,20 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
 
             // Validate session before next cycle; re-authenticate if expired.
+            #[cfg(test)]
+            if WATCH_LOOP_TEST_CONTROL.try_with(|_| ()).is_ok() {
+                shared_session.read().await.reacquire_lock()?;
+            } else {
+                reacquire_session(&shared_session, &config, &password_provider, input_mode).await?;
+            }
+            #[cfg(not(test))]
             reacquire_session(&shared_session, &config, &password_provider, input_mode).await?;
 
             // Mark album/pass plans stale after an idle sleep, but defer the
             // CloudKit refresh until `changes/database` says a selected
             // library actually has work. Quiet watch cycles can then go back
             // to sleep without listing albums for every selected library.
-            for lib_state in &mut library_states {
-                lib_state.plan_needs_refresh = true;
-            }
+            defer_watch_plan_refresh(&mut library_states);
         } else {
             break;
         }

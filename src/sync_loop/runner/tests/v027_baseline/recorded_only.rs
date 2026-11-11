@@ -1722,6 +1722,93 @@ struct AuthLookupSession {
     lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeldLookupFault {
+    Auth,
+    State,
+    Cancel,
+}
+
+#[derive(Clone)]
+struct HeldLookupSession {
+    inner: AuthLookupSession,
+    fault: HeldLookupFault,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for HeldLookupSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        if url.contains("/records/lookup?") && self.fault != HeldLookupFault::Auth {
+            self.inner
+                .lookups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fault == HeldLookupFault::Cancel {
+                self.cancel.cancel();
+                anyhow::bail!("synthetic confirmation interrupted");
+            }
+            return Err(crate::state::error::StateError::ProviderSelectionInvalid.into());
+        }
+        crate::icloud::photos::PhotosSession::post(&self.inner, url, body, headers).await
+    }
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[derive(Clone)]
+struct FailIfPolledSession {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    healthy: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for FailIfPolledSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        let request: serde_json::Value = serde_json::from_str(&body)?;
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(
+                json!({"records":[{"recordName":"index-state","recordType":"CheckIndexingState","fields":{"state":{"value":"FINISHED"}}}]}),
+            );
+        }
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.healthy {
+            let zone =
+                json!({"zoneName":"SharedSync-auth-stop-peer","ownerRecordName":"_defaultOwner"});
+            if url.contains("/internal/records/query/batch") {
+                return Ok(json!({"batch":[{"records":[{"fields":{"itemCount":{"value":0}}}]}]}));
+            }
+            if url.contains("/zones/list") {
+                return Ok(
+                    json!({"zones":[{"zoneID":zone,"syncToken":"peer-boundary","deleted":false}]}),
+                );
+            }
+            if url.contains("/records/query?") {
+                return Ok(json!({"records":[],"syncToken":"peer-inventory"}));
+            }
+            if url.contains("/changes/zone?") {
+                return Ok(
+                    json!({"zones":[{"zoneID":zone,"syncToken":"peer-after","records":[],"moreComing":false}]}),
+                );
+            }
+        }
+        anyhow::bail!("synthetic later-source provider failure")
+    }
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::icloud::photos::PhotosSession for AuthLookupSession {
     async fn post(
@@ -1773,6 +1860,20 @@ impl crate::icloud::photos::PhotosSession for AuthLookupSession {
 
 #[tokio::test]
 async fn held_cycle_surfaces_admitted_retry_auth_without_ack_or_fake_failure() {
+    exercise_held_cycle_retry_fault(HeldLookupFault::Auth).await;
+}
+
+#[tokio::test]
+async fn held_cycle_surfaces_retry_state_error_without_ack_or_fake_media_failure() {
+    exercise_held_cycle_retry_fault(HeldLookupFault::State).await;
+}
+
+#[tokio::test]
+async fn held_cycle_cancellation_during_retry_stops_peer_without_ack_or_backoff() {
+    exercise_held_cycle_retry_fault(HeldLookupFault::Cancel).await;
+}
+
+async fn exercise_held_cycle_retry_fault(fault: HeldLookupFault) {
     use super::{
         ZONE, baseline_owner, make_run_cycle_config, make_run_cycle_library_state_with_passes,
         make_shared_session_for_run_cycle, seed_existing_upgrade_db, sync_token_key,
@@ -1864,12 +1965,17 @@ async fn held_cycle_surfaces_admitted_retry_auth_without_ack_or_fake_failure() {
         "the actual admitted decision survives reopen"
     );
     let lookups = Arc::new(AtomicUsize::new(0));
+    let shutdown = tokio_util::sync::CancellationToken::new();
     let mut library = PhotoLibrary::new(
         "https://synthetic.example/database/1/photos/production/private".into(),
         Arc::new(std::collections::HashMap::new()),
-        Box::new(AuthLookupSession {
-            zone: ZONE,
-            lookups: lookups.clone(),
+        Box::new(HeldLookupSession {
+            inner: AuthLookupSession {
+                zone: ZONE,
+                lookups: lookups.clone(),
+            },
+            fault,
+            cancel: shutdown.clone(),
         }),
         Arc::new(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})),
         "private".into(),
@@ -1890,9 +1996,61 @@ async fn held_cycle_surfaces_admitted_retry_auth_without_ack_or_fake_failure() {
     let mut selected =
         make_run_cycle_library_state_with_passes(ZONE, &sync_token_key(ZONE), vec![pass]);
     selected.library = library;
-    let retried = run_stock36_cycle(&db, &[&selected], &root, &shared, &config)
-        .await
-        .unwrap();
+    const PEER: &str = "SharedSync-auth-stop-peer";
+    let peer_calls = Arc::new(AtomicUsize::new(0));
+    let mut peer_library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/shared".into(),
+        Arc::new(std::collections::HashMap::new()),
+        Box::new(FailIfPolledSession {
+            calls: peer_calls.clone(),
+            healthy: fault == HeldLookupFault::State,
+        }),
+        Arc::new(json!({"zoneName":PEER,"ownerRecordName":"_defaultOwner"})),
+        "shared".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    peer_library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db.clone(),
+        baseline_owner(),
+        "com",
+    ));
+    let peer_pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: peer_library.all(),
+        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+    };
+    let mut peer =
+        make_run_cycle_library_state_with_passes(PEER, &sync_token_key(PEER), vec![peer_pass]);
+    peer.library = peer_library;
+    assert_eq!(peer_calls.load(Ordering::SeqCst), 0);
+    let builder = super::make_run_cycle_download_config_builder(&root, db.clone());
+    let selected_sources = vec![&selected, &peer];
+    let retried = crate::sync_cycle::run_cycle(
+        &selected_sources,
+        &config,
+        Some(db.as_ref()),
+        false,
+        &builder,
+        crate::download::DownloadControls::download_hidden(),
+        &shared,
+        &shutdown,
+    )
+    .await
+    .unwrap();
+    if fault == HeldLookupFault::State {
+        assert!(
+            peer_calls.load(Ordering::SeqCst) > 0,
+            "a generic state error must not stop a healthy peer"
+        );
+    } else {
+        assert_eq!(
+            peer_calls.load(Ordering::SeqCst),
+            0,
+            "authentication or cancellation must stop later provider sources"
+        );
+    }
     assert_eq!(
         lookups.load(Ordering::SeqCst),
         1,
@@ -1910,6 +2068,32 @@ async fn held_cycle_surfaces_admitted_retry_auth_without_ack_or_fake_failure() {
     );
     assert_eq!(epoch_state(&db, ZONE), "pending");
     assert!(token(&db, ZONE).is_none());
+    if fault == HeldLookupFault::State {
+        assert!(
+            !retried.session_expired,
+            "state failure is not authentication: {retried:?}"
+        );
+        assert_eq!(
+            retried.failed_count, 1,
+            "the operational error must be visible: {retried:?}"
+        );
+        assert_eq!(
+            retried.stats.failed, 0,
+            "confirmation error must not invent a media failure"
+        );
+        return;
+    }
+    if fault == HeldLookupFault::Cancel {
+        assert!(shutdown.is_cancelled());
+        assert!(!retried.session_expired);
+        assert!(
+            retried.stats.interrupted,
+            "cancellation must remain visible: {retried:?}"
+        );
+        assert_eq!(retried.failed_count, 0);
+        assert_eq!(retried.stats.failed, 0);
+        return;
+    }
     assert!(
         retried.session_expired,
         "held retry must preserve typed authentication: {retried:?}"

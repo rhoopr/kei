@@ -1473,6 +1473,48 @@ impl SqliteStateDb {
                 }
             }
             drop(stmt);
+            // Legacy and future modes cannot be settled by the catalog drain.
+            // Report only rounds bound to the current selected descriptor and
+            // source scope; unrelated historical rounds are not a library veto.
+            if super::provider_generations::observation::catalog_active_plan_matches(
+                &tx, &library, &plan_digest, &enum_hash,
+            )? {
+                let mut other = tx.prepare(
+                    "SELECT r.id,r.scope,r.phase,r.enum_hash,COUNT(d.id),MIN(d.next_retry_at)
+                     FROM source_revalidation_rounds r LEFT JOIN source_revalidation_debt d ON d.round=r.id
+                     WHERE r.library=?1 AND r.mode!=?2 AND r.phase IN ('marking','observing','active')
+                     GROUP BY r.id,r.scope,r.phase,r.enum_hash",
+                )?;
+                let rows = other.query_map(params![library, CATALOG_MODE], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, Option<i64>>(5)?))
+                })?;
+                for row in rows {
+                    let (round, scope, phase, policy, count, due) = row?;
+                    let legacy_scope = super::provider_generations::observation::revalidation_scope_current(
+                            &tx, &library, &scope, &enum_hash,
+                        )?;
+                    let catalog_scope = CatalogOrigin::parse(&scope).ok().is_some_and(|origin| {
+                        origin.nonce == round && origin.plan_digest == plan_digest
+                            && epoch.as_ref().is_some_and(|record| {
+                                origin.epoch == record.epoch && origin.attempt == record.attempt
+                            })
+                    });
+                    if policy != enum_hash
+                        || !(legacy_scope || catalog_scope)
+                        || (phase == "active" && count == 0)
+                    {
+                        continue;
+                    }
+                    output.pending = true;
+                    output.retained = output.retained.saturating_add(
+                        u64::try_from(count).map_err(|_error| StateError::ProviderSelectionInvalid)?,
+                    );
+                    if let Some(due) = due {
+                        output.next_due_at = Some(output.next_due_at.map_or(due, |prior| prior.min(due)));
+                    }
+                }
+            }
             tx.commit()?;
             Ok(output)
         }).await
