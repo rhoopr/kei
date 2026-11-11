@@ -1283,7 +1283,7 @@ Shared Photo Library is not a source deletion or master identity. No automatic
 cross-zone recovery or checkpoint relaxation is added.
 
 A complete inventory followed by an explicitly rejected retained cursor creates
-`retained_checkpoint_hold:<zone>`. The versioned receipt contains a cursor
+`retained_checkpoint_hold:v27:<zone>`. The versioned receipt contains a cursor
 fingerprint, requested enumeration/preservation policy hashes, an attempt count,
 and the next attempt deadline; it contains no provider identity or cursor value. Unchanged
 held zones defer provider, inventory and legacy preparation work for one hour.
@@ -1297,10 +1297,14 @@ provider work. Genuine policy or active cursor changes permit bounded re-evaluat
 generations, transfer retries and sparse/deletion evidence remain intact.
 
 A fresh inventory and its counts cannot establish lost historical deletion
-facts or resolve this hold. Permanently rejected boundaries remain actionable
-holds; this protocol does not rebootstrap them. A successful validated replay
-of the retained boundary removes the hold in the same transaction that stages
-or activates its successor. Transaction-time metadata comparisons fence both
+facts or release this hold. The separate catalog recovery path needs its own
+current source identity, complete inventory, bridge and checkpoint proof. If
+the original retained MAIN cursor is positively rejected and that recovery
+remains unqualified, the cycle keeps the original cursor binding in the bounded
+hold. An error for a different historical sparse cursor does not establish MAIN
+rejection. A successful validated replay of the retained boundary removes the
+hold in the same transaction that stages or activates its successor.
+Transaction-time metadata comparisons fence both
 hold staging and checkpoint promotion against changes to the planned cursor
 and enumeration configuration, including the exact staged candidate read during
 aggregate promotion. Existing legacy/sparse generation validation
@@ -2131,6 +2135,11 @@ exact saved boundary. It checks the source, attempt, plan and fences and refuses
 ambiguous rounds. The saved boundary may differ from the retained ACTIVE token
 after expiry. A matching token does not by itself prove provider EOF; resuming
 still requires the full inventory and bridge before activation.
+During the attempt, the cycle retains the original typed MAIN rejection and
+original cursor as private facts while that recovery is unfinished. An
+interruption before the hold is written can delay recovery on an otherwise quiet
+watch; it does not retire the retained ACTIVE checkpoint, debt or admitted work.
+This path does not promise a wake at every crash window.
 
 When the epoch gate claims a due pending attempt or a stale READY attempt, a
 qualified marking or observing catalog round can transfer its boundary, census
@@ -2833,12 +2842,15 @@ cursor fences and any newly observed obligation.
 
 `/healthz` and `health.json` describe operational sync health. Their success
 clock and consecutive failure count are not a backup-completeness certificate.
-A completed current cycle with durably accounted transfer failures can be
-operationally healthy while its report remains `partial_failure` and its pending
-work remains visible in the database metrics. Only the cycle owner's checkpoint
-accounting evidence can qualify this exception; equal failure counts alone cannot.
-Authentication, interruption, unsafe checkpoints, state-write failures and
-incomplete enumeration remain operational failures. Existing five-failure and
+A completed cycle can be operationally healthy with safely retained current
+sparse identity, protected preservation work or durably accounted transfer
+failures. Every configured source and every incomplete obligation must pass the
+existing owners' accounting checks. Transfer failures must match their exact
+destination and durable successor; equal failure counts alone cannot qualify the
+exception. The report remains `partial_failure`, one-shot sync exits 2, and failed
+asset counts still describe real media failures. Unknown work, unqualified
+catalog work and genuine provider, authentication, state-write, unsafe
+publication or cancellation failures veto the exception. Existing five-failure and
 stale-success HTTP503 thresholds remain unchanged. Before the first cycle the
 endpoint reports startup, not completed backup readiness. There is no separate
 readiness endpoint.

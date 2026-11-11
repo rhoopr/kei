@@ -895,11 +895,39 @@ async fn v027_mixed_shared_hidden_baseline_censuses_distinct_full_zone() {
     .await;
 }
 
+#[tokio::test]
+async fn v027_both_sources_hidden_and_unfiled_use_actual_resolver() {
+    mixed_shared_hidden_baseline_variant(
+        json!({"zoneName":ZONE,"ownerRecordName":"synthetic-shared-owner","zoneType":"synthetic-shared-zone"}),
+        MixedSelection::BothWithUnfiled,
+    ).await;
+}
+
+#[tokio::test]
+async fn v027_both_sources_hidden_only_use_actual_resolver() {
+    mixed_shared_hidden_baseline_variant(
+        json!({"zoneName":ZONE,"ownerRecordName":"synthetic-shared-owner","zoneType":"synthetic-shared-zone"}),
+        MixedSelection::BothHiddenOnly,
+    ).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MixedSelection {
+    SharedWithUnfiled,
+    BothWithUnfiled,
+    BothHiddenOnly,
+}
+
 async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
+    mixed_shared_hidden_baseline_variant(shared_zone_id, MixedSelection::SharedWithUnfiled).await;
+}
+
+async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: MixedSelection) {
     use crate::commands::{
         build_collection_context, collection_libraries, pass_scope_for_zone,
         resolve_passes_for_scope, zone_name_set,
     };
+    use crate::icloud::photos::inbox::ShadowCapture;
     use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
     use std::collections::BTreeSet;
     use std::sync::Mutex;
@@ -971,6 +999,8 @@ async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
         lookups: Arc<AtomicUsize>,
         requested: Arc<Mutex<Vec<Vec<String>>>>,
         changes: Arc<AtomicUsize>,
+        inventory: Arc<Mutex<Vec<String>>>,
+        expected_database: Option<&'static str>,
     }
     impl MixedSession {
         fn current_pass(&self, request: &Value) -> bool {
@@ -996,6 +1026,12 @@ async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
             let request: Value = serde_json::from_str(&body)?;
+            if let Some(database) = self.expected_database {
+                assert!(
+                    url.contains(&format!("/photos/production/{database}")),
+                    "request must use its source database: {url}"
+                );
+            }
             if url.contains("/zones/list") {
                 return Ok(
                     json!({"zones":[{"zoneID":self.zone_id,"syncToken":self.boundary,"deleted":false}]}),
@@ -1039,6 +1075,7 @@ async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
                 if record_type == "CPLAlbumByPositionLive" {
                     return Ok(json!({"records":[]}));
                 }
+                self.inventory.lock().unwrap().push(record_type.to_owned());
                 let records = if self.current_pass(&request) {
                     self.current.as_ref().clone()
                 } else {
@@ -1047,6 +1084,7 @@ async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
                 return Ok(json!({"records":records,"syncToken":"inventory-last-page"}));
             }
             if url.contains("/changes/zone?") {
+                assert_eq!(request["zones"][0]["zoneID"], self.zone_id);
                 let bridge = self.changes.fetch_add(1, Ordering::SeqCst);
                 let expected = if bridge == 0 {
                     self.boundary.clone()
@@ -1168,7 +1206,7 @@ async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
         "shared-current.JPG",
         &format!("{}/shared-current", server.uri()),
         91,
-        false,
+        variant == MixedSelection::BothHiddenOnly,
     );
     let primary_current = mixed_pair(
         &primary_zone_id,
@@ -1186,17 +1224,21 @@ async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
     let primary_lookups = Arc::new(AtomicUsize::new(0));
     let shared_requests = Arc::new(Mutex::new(Vec::new()));
     let primary_requests = Arc::new(Mutex::new(Vec::new()));
+    let shared_inventory = Arc::new(Mutex::new(Vec::new()));
+    let primary_inventory = Arc::new(Mutex::new(Vec::new()));
 
     let shared_session = MixedSession {
         zone_id: shared_zone_id.clone(),
         zone: ZONE.into(),
         boundary: format!("before-{ZONE}"),
         current: Arc::new(shared_current),
-        current_on_hidden: false,
+        current_on_hidden: variant == MixedSelection::BothHiddenOnly,
         deleted: Arc::clone(&shared_deleted),
         lookups: Arc::clone(&shared_lookups),
         requested: Arc::clone(&shared_requests),
         changes: Arc::new(AtomicUsize::new(0)),
+        inventory: Arc::clone(&shared_inventory),
+        expected_database: (variant != MixedSelection::SharedWithUnfiled).then_some("shared"),
     };
     let primary_session = MixedSession {
         zone_id: primary_zone_id.clone(),
@@ -1208,12 +1250,19 @@ async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
         lookups: Arc::clone(&primary_lookups),
         requested: Arc::clone(&primary_requests),
         changes: Arc::new(AtomicUsize::new(0)),
+        inventory: Arc::clone(&primary_inventory),
+        expected_database: Some("private"),
     };
 
     let mut shared_library = PhotoLibrary::new(
-        "https://synthetic.example/database/1/photos/production/private".into(),
+        if variant == MixedSelection::SharedWithUnfiled {
+            "https://synthetic.example/database/1/photos/production/private"
+        } else {
+            "https://synthetic.example/database/1/photos/production/shared"
+        }
+        .into(),
         Arc::default(),
-        Box::new(shared_session),
+        Box::new(shared_session.clone()),
         Arc::new(shared_zone_id.clone()),
         "shared".into(),
         crate::retry::RetryConfig::default(),
@@ -1223,8 +1272,8 @@ async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
     let mut primary_library = PhotoLibrary::new(
         "https://synthetic.example/database/1/photos/production/private".into(),
         Arc::default(),
-        Box::new(primary_session),
-        Arc::new(primary_zone_id),
+        Box::new(primary_session.clone()),
+        Arc::new(primary_zone_id.clone()),
         "private".into(),
         crate::retry::RetryConfig::default(),
     )
@@ -1244,14 +1293,18 @@ async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
         },
         smart_folders_explicit: true,
         libraries: LibrarySelector {
-            primary: false,
+            primary: variant != MixedSelection::SharedWithUnfiled,
             shared_all: true,
             named: BTreeSet::new(),
             excluded: BTreeSet::new(),
         },
-        unfiled: true,
+        unfiled: variant != MixedSelection::BothHiddenOnly,
     };
-    let selected_libraries = vec![shared_library.clone()];
+    let selected_libraries = if variant == MixedSelection::SharedWithUnfiled {
+        vec![shared_library.clone()]
+    } else {
+        vec![primary_library.clone(), shared_library.clone()]
+    };
     let all_libraries = vec![primary_library.clone(), shared_library.clone()];
     let collection = collection_libraries(&selection, &selected_libraries, &all_libraries);
     let collection_context = build_collection_context(&selection, collection)
@@ -1285,13 +1338,21 @@ async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
     };
     assert_eq!(
         kinds(&shared_plan),
-        vec![PassKind::SmartFolder, PassKind::Unfiled],
-        "M1 shared source must resolve Hidden+Unfiled from the actual resolver"
+        if variant == MixedSelection::BothHiddenOnly {
+            vec![PassKind::SmartFolder]
+        } else {
+            vec![PassKind::SmartFolder, PassKind::Unfiled]
+        },
+        "shared source must resolve the selected passes from the actual resolver"
     );
     assert_eq!(
         kinds(&primary_plan),
-        vec![PassKind::SmartFolder],
-        "M1 primary source must resolve Hidden only from the actual resolver"
+        if variant == MixedSelection::BothWithUnfiled {
+            vec![PassKind::SmartFolder, PassKind::Unfiled]
+        } else {
+            vec![PassKind::SmartFolder]
+        },
+        "primary source must resolve the selected passes from the actual resolver"
     );
 
     let mut shared_state =
@@ -1458,6 +1519,72 @@ async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
             &serde_json::from_str(primary_descriptor.as_ref().unwrap()).unwrap(),
             &primary_state.plan.passes,
         );
+        for (library, child, master, database, owner, destination) in [
+            (
+                ZONE,
+                "asset-shared-current",
+                "shared-current",
+                "shared",
+                shared_zone_id["ownerRecordName"].as_str().unwrap(),
+                root.join("shared-current.JPG"),
+            ),
+            (
+                PRIMARY,
+                "asset-primary-current",
+                "primary-current",
+                "private",
+                "_defaultOwner",
+                root.join("primary-current.JPG"),
+            ),
+        ] {
+            let cursor: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key=?1",
+                    [sync_token_key(library)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(cursor, format!("after-{library}-1"));
+            let (scope, native, source, local): (String, String, String, String) = conn.query_row(
+                "SELECT scope,native_path,source_checksum,local_checksum FROM download_receipts WHERE library=?1 AND child=?2 AND master=?3 AND version_size='original'",
+                rusqlite::params![library, child, master], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            ).unwrap();
+            assert_eq!(
+                PhotoLibrary::provider_scope_projection(&scope),
+                Some((library.to_owned(), owner.to_owned(), database.to_owned()))
+            );
+            assert_eq!(
+                serde_json::from_str::<crate::state::db::provider_selection::SelectionPath>(
+                    &native
+                )
+                .unwrap()
+                .to_path(),
+                destination
+            );
+            use sha2::{Digest, Sha256};
+            let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(MEDIA));
+            assert_eq!(source, hash);
+            assert_eq!(local, hash);
+        }
+        let shared_pass = shared_inventory.lock().unwrap();
+        let selected_shared = if variant == MixedSelection::BothHiddenOnly {
+            "Hidden"
+        } else {
+            "WithoutHiddenOrDeleted"
+        };
+        assert!(
+            shared_pass
+                .iter()
+                .any(|record_type| record_type.contains(selected_shared)),
+            "the intended Shared pass must produce current media"
+        );
+        assert!(
+            primary_inventory
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|record_type| record_type.contains("Hidden"))
+        );
         eprintln!("B-CANON shared{shared_probe:?} primary{primary_probe:?}");
 
         assert_eq!(
@@ -1531,6 +1658,189 @@ async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
         std::fs::read(root.join("primary-current.JPG")).unwrap(),
         MEDIA
     );
+    if variant != MixedSelection::SharedWithUnfiled {
+        let state_snapshot = |db: &SqliteStateDb| {
+            let conn = db
+                .acquire_lock("snapshot mixed quiet history and receipts")
+                .unwrap();
+            let mut result = Vec::new();
+            for sql in [
+                "SELECT r.id,r.library,r.scope,r.phase,d.id,d.next_retry_at FROM source_revalidation_rounds r LEFT JOIN source_revalidation_debt d ON d.round=r.id ORDER BY r.id,d.id",
+                "SELECT library,id,version_size,local_path,is_deleted,deleted_at,metadata_hash FROM assets WHERE library='SharedSync-v027-synthetic' AND id='shared-live-master' ORDER BY version_size",
+                "SELECT library,child,master,version_size,native_path,source_checksum,local_checksum,proof_hash FROM download_receipts WHERE child IN ('asset-shared-current','asset-primary-current') ORDER BY library,child",
+            ] {
+                let mut stmt = conn.prepare(sql).unwrap();
+                let rows = stmt
+                    .query_map([], |row| {
+                        (0..row.as_ref().column_count())
+                            .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                result.push(rows);
+            }
+            result
+        };
+        let retained_state = state_snapshot(&db);
+        let inventory_counts = (
+            shared_inventory.lock().unwrap().len(),
+            primary_inventory.lock().unwrap().len(),
+        );
+        let snapshots = [
+            root.join("shared-current.JPG"),
+            root.join("primary-current.JPG"),
+        ]
+        .map(|path| {
+            (
+                path.clone(),
+                std::fs::read(&path).unwrap(),
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+            )
+        });
+        drop(shared_state);
+        drop(primary_state);
+        drop(collection_context);
+        drop(selected_libraries);
+        drop(all_libraries);
+        drop(base);
+        assert_eq!(
+            Arc::strong_count(&db),
+            1,
+            "all owner handles must close before quiet reopen"
+        );
+        drop(db);
+        for pass in 2..=3 {
+            let reopened = Arc::new(
+                SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                    .await
+                    .unwrap(),
+            );
+            let mut shared_library = PhotoLibrary::new(
+                "https://synthetic.example/database/1/photos/production/shared".into(),
+                Arc::default(),
+                Box::new(shared_session.clone()),
+                Arc::new(shared_zone_id.clone()),
+                "shared".into(),
+                crate::retry::RetryConfig::default(),
+            )
+            .await
+            .unwrap();
+            let mut primary_library = PhotoLibrary::new(
+                "https://synthetic.example/database/1/photos/production/private".into(),
+                Arc::default(),
+                Box::new(primary_session.clone()),
+                Arc::new(primary_zone_id.clone()),
+                "private".into(),
+                crate::retry::RetryConfig::default(),
+            )
+            .await
+            .unwrap();
+            shared_library.shadow_capture = Some(ShadowCapture::new(
+                reopened.clone(),
+                baseline_owner(),
+                "com",
+            ));
+            primary_library.shadow_capture = Some(ShadowCapture::new(
+                reopened.clone(),
+                baseline_owner(),
+                "com",
+            ));
+            let selected = vec![primary_library.clone(), shared_library.clone()];
+            let all = vec![primary_library.clone(), shared_library.clone()];
+            let collection = collection_libraries(&selection, &selected, &all);
+            let context = build_collection_context(&selection, collection)
+                .await
+                .unwrap();
+            let selected_zones = zone_name_set(&selected);
+            let collection_zones = zone_name_set(collection);
+            let mut states = Vec::new();
+            for library in [shared_library, primary_library] {
+                let name = library.zone_name().to_owned();
+                let scope =
+                    pass_scope_for_zone(&selection, &name, &selected_zones, &collection_zones);
+                let plan = resolve_passes_for_scope(&library, &selection, scope, &context, &[])
+                    .await
+                    .unwrap();
+                let mut state = make_run_cycle_library_state_with_passes(
+                    &name,
+                    &sync_token_key(&name),
+                    plan.passes,
+                );
+                state.library = library;
+                states.push(state);
+            }
+            let base = make_run_cycle_download_config_builder(&root, reopened.clone());
+            let builder = |mode, exclude, groups, library| {
+                let mut config = (*base(mode, exclude, groups, library)).clone();
+                config.folder_structure = "none".into();
+                config.folder_structure_albums = Arc::from("none");
+                config.folder_structure_smart_folders = Arc::from("none");
+                Arc::new(config)
+            };
+            let result = run_cycle(
+                &[&states[0], &states[1]],
+                &make_run_cycle_config(),
+                Some(reopened.as_ref()),
+                false,
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &shared,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.failed_count, 0);
+            assert_eq!(result.stats.downloaded, 0);
+            assert_eq!(
+                (
+                    shared_inventory.lock().unwrap().len(),
+                    primary_inventory.lock().unwrap().len()
+                ),
+                inventory_counts,
+                "quiet reopens must not repeat either source inventory"
+            );
+            for name in [ZONE, PRIMARY] {
+                assert_eq!(
+                    reopened
+                        .get_metadata(&sync_token_key(name))
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some(format!("after-{name}-{pass}").as_str())
+                );
+                let descriptor = reopened
+                    .get_metadata(&format!("observed_selection:v27:{name}"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let descriptor: Value = serde_json::from_str(&descriptor).unwrap();
+                assert_eq!(descriptor["library"], name);
+            }
+            assert_eq!(
+                state_snapshot(&reopened),
+                retained_state,
+                "quiet cycles must preserve exact old family, catalog debt and current receipts"
+            );
+            for (path, bytes, mtime) in snapshots.iter().chain(deleted_snapshots.iter()) {
+                assert_eq!(&std::fs::read(path).unwrap(), bytes);
+                assert_eq!(&std::fs::metadata(path).unwrap().modified().unwrap(), mtime);
+            }
+            // A completed cycle may retain its prework snapshot and its DB owner.
+            drop(result);
+            drop(states);
+            drop(context);
+            drop(selected);
+            drop(all);
+            drop(base);
+            assert_eq!(
+                Arc::strong_count(&reopened),
+                1,
+                "each quiet cycle must close all owner handles"
+            );
+        }
+    }
     server.verify().await;
 }
 

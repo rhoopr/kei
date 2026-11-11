@@ -483,6 +483,17 @@ async fn m1_strict_lookup_cancellation_preserves_debt_and_interruption_priority(
 }
 
 async fn exercise_expiry(fault: OriginFault) {
+    fn assert_metadata_disabled(metadata: &crate::config::MetadataConfig) {
+        assert!(!metadata.set_exif_datetime);
+        assert!(!metadata.set_exif_rating);
+        assert!(!metadata.set_exif_gps);
+        assert!(!metadata.set_exif_description);
+        #[cfg(feature = "xmp")]
+        {
+            assert!(!metadata.embed_xmp);
+            assert!(!metadata.xmp_sidecar);
+        }
+    }
     let server = crate::start_wiremock_or_skip!();
     for id in ["primary-old", "primary-new", "shared-old", "shared-new"] {
         let mock = Mock::given(method("GET"))
@@ -697,6 +708,10 @@ async fn exercise_expiry(fault: OriginFault) {
             run_config.runtime.refresh_metadata = phase == 0;
             run_config.metadata.xmp_sidecar = true;
         }
+        if fault == OriginFault::DeletedProtected {
+            assert!(!run_config.runtime.refresh_metadata);
+            assert_metadata_disabled(&run_config.metadata);
+        }
         let bridge_lock = Mutex::new(None::<std::fs::File>);
         let builder = |mode: download::SyncMode, exclude, groups, library: Arc<str>| {
             #[cfg(target_os = "linux")]
@@ -764,6 +779,10 @@ async fn exercise_expiry(fault: OriginFault) {
             #[cfg(feature = "xmp")]
             {
                 config.metadata.xmp_sidecar = clean_metadata;
+            }
+            if fault == OriginFault::DeletedProtected {
+                assert!(!config.refresh_metadata);
+                assert_metadata_disabled(&config.metadata);
             }
             Arc::new(config)
         };
