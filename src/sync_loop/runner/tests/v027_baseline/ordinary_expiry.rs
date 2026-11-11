@@ -316,8 +316,22 @@ enum OriginFault {
     ManyDebt,
     ReplacementError,
     ReplacementHoldError,
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "bridge fault injection uses the Linux process-pause harness"
+        )
+    )]
     BridgeError,
     BridgeHoldError,
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "bridge fault injection uses the Linux process-pause harness"
+        )
+    )]
     BridgeBusy,
     AuthLookup,
     CancelLookup,

@@ -1000,6 +1000,7 @@ async fn prepared_replace_authorization_finalize_failure_retains_reopen_recovery
     drop(fixture.dir);
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
 enum CompletedLinkBinding {
     Exact,
@@ -1007,6 +1008,7 @@ enum CompletedLinkBinding {
     Missing,
 }
 
+#[cfg(target_os = "linux")]
 struct CompletedLinkFixture {
     dir: TempDir,
     db_path: PathBuf,
@@ -1019,6 +1021,7 @@ struct CompletedLinkFixture {
     proof: PreparedPublication,
 }
 
+#[cfg(target_os = "linux")]
 fn completed_link_status(db: &SqliteStateDb, id: &str) -> String {
     db.acquire_lock("read completed link status")
         .unwrap()
@@ -1030,6 +1033,7 @@ fn completed_link_status(db: &SqliteStateDb, id: &str) -> String {
         .unwrap()
 }
 
+#[cfg(target_os = "linux")]
 async fn completed_link_fixture(binding_mode: CompletedLinkBinding) -> CompletedLinkFixture {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("state.db");

@@ -670,6 +670,7 @@ async fn pending_upgrade_qualification_process_death_worker() {
     let _ = run_pending_upgrade_indexing_cycle(db, session, false, &photos, &shared).await;
 }
 
+#[cfg(target_os = "linux")]
 fn seed_process_death_fixture(root: &std::path::Path) -> std::path::PathBuf {
     let dir = root.join("child");
     std::fs::create_dir_all(dir.join("photos")).unwrap();

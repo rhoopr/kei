@@ -46,9 +46,11 @@ pub(in crate::download) use sidecar::create_layout_sidecar;
 pub(in crate::download) use embedded::publication_pause;
 
 #[cfg(all(test, feature = "xmp"))]
+pub(crate) use crate::download::metadata::test_sidecar_attempts;
+#[cfg(all(test, feature = "xmp", unix))]
 pub(crate) use crate::download::metadata::{
     TestPreparationFault, test_corrupt_publication_once, test_fail_before_sidecar_probe_once,
-    test_fail_sidecar_preparation_once, test_fail_source_gps_once, test_sidecar_attempts,
+    test_fail_sidecar_preparation_once, test_fail_source_gps_once,
 };
 
 #[cfg(all(test, feature = "xmp"))]
@@ -110,7 +112,9 @@ pub(crate) async fn test_metadata_budget<F: std::future::Future>(
 }
 
 #[cfg(all(test, feature = "xmp"))]
-pub(crate) use sidecar::{test_sidecar_entries, test_sidecar_successes};
+pub(crate) use sidecar::test_sidecar_entries;
+#[cfg(all(test, feature = "xmp", unix))]
+pub(crate) use sidecar::test_sidecar_successes;
 
-#[cfg(all(test, feature = "xmp"))]
+#[cfg(all(test, feature = "xmp", unix))]
 pub(crate) use crate::download::file::test_sidecar_publications;

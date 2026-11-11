@@ -4045,7 +4045,13 @@ async fn scoped_bad_admitted_adjusted_recovers_after_reopen() {
 async fn scoped_distinct_admitted_edits_publish_current_and_preserve_old_debt() {
     use rusqlite::OptionalExtension;
     use std::collections::BTreeSet;
-    use std::os::unix::fs::MetadataExt;
+    fn identity(path: &std::path::Path) -> (crate::fs_util::FileIdentity, std::time::SystemTime) {
+        let file = std::fs::File::open(path).unwrap();
+        (
+            crate::fs_util::file_identity(&file).unwrap(),
+            file.metadata().unwrap().modified().unwrap(),
+        )
+    }
     fn rows(
         conn: &rusqlite::Connection,
         sql: &str,
@@ -4246,8 +4252,7 @@ async fn scoped_distinct_admitted_edits_publish_current_and_preserve_old_debt() 
     .await;
     assert_eq!(initial.failed_count, 0);
     assert_bytes(&original, ORIGINAL);
-    let metadata = std::fs::metadata(&original).unwrap();
-    let original_identity = (metadata.ino(), metadata.mtime(), metadata.mtime_nsec());
+    let original_identity = identity(&original);
     let conn =
         rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
@@ -4304,11 +4309,7 @@ async fn scoped_distinct_admitted_edits_publish_current_and_preserve_old_debt() 
     );
     let assert_original = |conn: &rusqlite::Connection| {
         assert_bytes(&original, ORIGINAL);
-        let metadata = std::fs::metadata(&original).unwrap();
-        assert_eq!(
-            (metadata.ino(), metadata.mtime(), metadata.mtime_nsec()),
-            original_identity
-        );
+        assert_eq!(identity(&original), original_identity);
         assert_eq!(receipt(conn), original_receipt);
     };
     let calls = Arc::new(AtomicUsize::new(0));
@@ -4347,8 +4348,7 @@ async fn scoped_distinct_admitted_edits_publish_current_and_preserve_old_debt() 
             eprintln!("OLDER_DEBT_FAILED_GET root={root_id} pass={} S={} checksum={} admitted=1 media=0",expected_pass,s.display(),provider_hash(EDIT_ONE));
         }
         assert_bytes(&p,ORIGINAL);
-        let metadata=std::fs::metadata(&p).unwrap();
-        assert_eq!((metadata.ino(),metadata.mtime(),metadata.mtime_nsec()),original_identity);
+        assert_eq!(identity(&p),original_identity);
         assert_eq!(receipt(&conn),proof);
         assert_eq!(conn.query_row("SELECT count(*) FROM download_receipts WHERE version_size='adjusted'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
         seen.fetch_add(1,Ordering::SeqCst);
@@ -4549,8 +4549,7 @@ async fn scoped_distinct_admitted_edits_publish_current_and_preserve_old_debt() 
         );
         (r, proof)
     };
-    let metadata = std::fs::metadata(&r).unwrap();
-    let r_identity = (metadata.ino(), metadata.mtime(), metadata.mtime_nsec());
+    let r_identity = identity(&r);
     let mut reconsidered_old_obligations = BTreeSet::new();
     for round in 0..2 {
         let before_schedule = {
@@ -4629,11 +4628,7 @@ async fn scoped_distinct_admitted_edits_publish_current_and_preserve_old_debt() 
             assert_original(&conn);
             assert_bytes(&r, EDIT_TWO);
             assert!(!s.exists());
-            let metadata = std::fs::metadata(&r).unwrap();
-            assert_eq!(
-                (metadata.ino(), metadata.mtime(), metadata.mtime_nsec()),
-                r_identity
-            );
+            assert_eq!(identity(&r), r_identity);
             assert_eq!(immutable_debt(&conn), old_snapshot);
             assert_eq!(policy(&conn), fence);
             assert_eq!(
