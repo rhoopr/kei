@@ -252,10 +252,23 @@ fn peer_receipt(conn: &rusqlite::Connection) -> String {
 #[tokio::test]
 async fn current_same_child_without_master_retains_scoped_retry_after_reopen() {
     let server = crate::start_wiremock_or_skip!();
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("photos");
+    let retained = std::env::var_os("KEI_C11_NATURAL_DUE_ROOT");
+    let dir = if let Some(parent) = &retained {
+        tempfile::Builder::new()
+            .prefix("c11-natural-")
+            .tempdir_in(parent)
+            .unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
+    let directory = if retained.is_some() {
+        dir.keep()
+    } else {
+        dir.path().to_owned()
+    };
+    let root = directory.join("photos");
     std::fs::create_dir(&root).unwrap();
-    let db_path = dir.path().join("state.db");
+    let db_path = directory.join("state.db");
     let mut records = Vec::new();
     for index in 0..6 {
         let name = format!("baseline-{index}");
@@ -697,5 +710,92 @@ async fn current_same_child_without_master_retains_scoped_retry_after_reopen() {
         7,
         "only the initial six media and one peer were requested"
     );
+    if retained.is_some() {
+        drop(db);
+        let wait = sparse_before.next_retry_at - chrono::Utc::now().timestamp() + 1;
+        assert!((1..=3601).contains(&wait));
+        eprintln!(
+            "C11_NATURAL_WAIT path={} deadline={} wait_seconds={wait}",
+            directory.display(),
+            sparse_before.next_retry_at
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
+        for reopen in 0..3 {
+            let db = Arc::new(
+                SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                    .await
+                    .unwrap(),
+            );
+            let cursor = db
+                .get_metadata(&sync_token_key(PRIMARY))
+                .await
+                .unwrap()
+                .unwrap();
+            let lookup_before = requests.lock().unwrap().len();
+            let result = cycle(
+                db.clone(),
+                &root,
+                make_session(Phase::Resolved, cursor),
+                &shared,
+            )
+            .await;
+            assert_eq!(result.failed_count, 0, "{result:?}");
+            assert_eq!(result.stats.downloaded, 0, "{result:?}");
+            assert!(!result.stats.identity_incomplete, "{result:?}");
+            assert!(result.db_sync_token_advance_safe, "{result:?}");
+            assert_eq!(
+                db.get_metadata(&sync_token_key(PRIMARY))
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("current-delta-after")
+            );
+            {
+                let conn = db.acquire_lock("verify natural sparse settlement").unwrap();
+                let pending: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM unresolved_sparse_identities WHERE epoch=1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(pending, 0);
+                assert_eq!(marker(&conn), None);
+                assert_eq!(historical_rows(&conn), old_rows);
+                assert_eq!(peer_receipt(&conn), peer_proof);
+            }
+            if reopen == 0 {
+                assert!(
+                    requests.lock().unwrap()[lookup_before..]
+                        .iter()
+                        .any(|(url, body)| url.contains("/records/lookup?")
+                            && body["records"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|record| record["recordName"] == CHILD))
+                );
+            }
+            assert_eq!(full.load(Ordering::SeqCst), inventory_before);
+            assert_eq!(server.received_requests().await.unwrap().len(), 7);
+            for (path, mtime) in &snapshots {
+                assert_eq!(std::fs::read(path).unwrap(), MEDIA);
+                assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), *mtime);
+            }
+            assert_eq!(std::fs::read(root.join("peer.JPG")).unwrap(), MEDIA);
+            assert_eq!(
+                std::fs::metadata(root.join("peer.JPG"))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                peer_mtime
+            );
+            drop(result);
+            assert_eq!(Arc::strong_count(&db), 1);
+            eprintln!(
+                "C11_NATURAL_SETTLED reopen={reopen} checkpoint=current-delta-after media_gets=7 inventory_unchanged=true"
+            );
+        }
+    }
     server.verify().await;
 }

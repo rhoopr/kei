@@ -331,3 +331,355 @@ async fn real_watch_wakes_with_future_debt_and_selective_peer_progress() {
     assert!(shutdown.is_cancelled());
     assert!(provider.database_checks.load(Ordering::SeqCst) >= 4);
 }
+
+#[derive(Clone)]
+struct ReleasedCatalogProvider(WatchProvider);
+
+#[test]
+#[ignore = "stages a synthetic released36 input at an explicitly assigned runtime path"]
+fn stage_released36_motion_runtime_input() {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("KEI_MOTION_STAGE_ROOT").expect("assigned runtime root"),
+    );
+    let fixture = root.join("fixture/h-final-candidate");
+    let username = "tester-fixture-h2@example.invalid";
+    let owner = crate::state::db::account::AccountOwner::authenticated(
+        username,
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-h2-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let database = fixture
+        .join("data")
+        .join(format!("{}.db", crate::account::namespace(username, "com")));
+    assert!(!database.exists());
+    let stock = crate::state::SqliteStateDb::create_stock_v36_for_test(&database, &owner);
+    let media = fixture.join("media/preexisting.jpg");
+    std::fs::write(&media, super::MEDIA).unwrap();
+    std::fs::write(fixture.join("media/preexisting.jpg.xmp"),br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><description>preserved custom metadata</description></x:xmpmeta>"#).unwrap();
+    let conn = stock.acquire_lock("released36 runtime input").unwrap();
+    assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+    conn.execute(
+        "DELETE FROM metadata WHERE key=?1",
+        [crate::state::db::sync_epoch::TEST_PREEXISTING_EPOCH_KEY],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,downloaded_at,local_path,last_seen_at) VALUES ('PrimarySync','old-preserved-master','original','old-resource','preexisting.jpg',1700000000,?1,'photo','downloaded',1700000001,?2,1700000001)",rusqlite::params![super::MEDIA.len() as i64,media.to_str().unwrap()]).unwrap();
+    let input = fixture.join("input");
+    std::fs::create_dir(&input).unwrap();
+    conn.execute(
+        "VACUUM INTO ?1",
+        [input.join("released36.db").to_str().unwrap()],
+    )
+    .unwrap();
+    eprintln!(
+        "C01_RELEASED_INPUT schema=36 current_epoch_absent=true current_receipts_absent=true path={}",
+        database.display()
+    );
+}
+
+impl Respond for ReleasedCatalogProvider {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let primary = !request.url.path().contains("/shared/");
+        if request.url.path().ends_with("/changes/zone") {
+            assert_eq!(body["zones"][0]["zoneID"], zone(primary));
+        } else if request.url.path().ends_with("/records/query")
+            || request.url.path().ends_with("/records/lookup")
+        {
+            // PhotosService's provisional indexing probe precedes authenticated
+            // private-zone discovery. All selected work must use the full owner.
+            if primary
+                && body["query"]["recordType"] == "CheckIndexingState"
+                && body["zoneID"].get("ownerRecordName").is_none()
+            {
+                assert_eq!(body["zoneID"], json!({"zoneName": PRIMARY}));
+            } else {
+                assert_eq!(body["zoneID"], zone(primary));
+            }
+        }
+        if request.url.path().ends_with("/records/lookup") {
+            assert_eq!(body["zoneID"], zone(primary));
+            let requested = body["records"].as_array().unwrap();
+            if requested
+                .iter()
+                .any(|r| r["recordName"] == "released-master")
+            {
+                assert!(
+                    !primary,
+                    "the released Shared family cannot borrow Primary proof"
+                );
+                assert!(
+                    requested
+                        .iter()
+                        .any(|r| r["recordName"] == "released-child")
+                );
+                return ResponseTemplate::new(200).set_body_json(json!({"records":[
+                    {"recordName":"released-master","recordType":"CPLMaster","zoneID":zone(false),"fields":{
+                        "isDeleted":{"value":1},"isExpunged":{"value":1},"dateExpunged":{"value":1700000000000_i64}}},
+                    {"recordName":"released-child","recordType":"CPLAsset","zoneID":zone(false),"fields":{
+                        "masterRef":{"value":{"recordName":"released-master","zoneID":zone(false)}},
+                        "isDeleted":{"value":1},"isExpunged":{"value":1},"dateExpunged":{"value":1700000000000_i64}}}
+                ]}));
+            }
+        }
+        if request.url.path().ends_with("/records/query") {
+            let kind = body["query"]["recordType"].as_str().unwrap_or("");
+            if kind.contains("CPLAssetAndMaster") {
+                let rank = body["query"]["filterBy"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|f| f["fieldName"] == "startRank")
+                    .and_then(|f| f["fieldValue"]["value"].as_u64())
+                    .unwrap_or(0);
+                let mut found = if kind.contains("HiddenBy") && rank == 0 {
+                    records(primary, &self.0.server)
+                } else {
+                    Vec::new()
+                };
+                for record in &mut found {
+                    record["fields"]["isHidden"] = json!({"value":1,"type":"INT64"});
+                }
+                return ResponseTemplate::new(200).set_body_json(
+                    json!({"records":found,"syncToken":if primary {"p-active"} else {"s-active"}}),
+                );
+            }
+        }
+        if request.url.path().ends_with("/records/lookup") {
+            let names = body["records"].as_array().unwrap();
+            let mut found = records(primary, &self.0.server);
+            found.retain(|r| {
+                names
+                    .iter()
+                    .any(|name| name["recordName"] == r["recordName"])
+            });
+            for record in &mut found {
+                record["fields"]["isHidden"] = json!({"value":1,"type":"INT64"});
+            }
+            return ResponseTemplate::new(200).set_body_json(json!({"records":found}));
+        }
+        self.0.respond(request)
+    }
+}
+
+#[tokio::test]
+async fn released36_mixed_selections_reach_real_runner_catalog_tail_and_quiet_reopens() {
+    for (libraries, unfiled) in [("shared", true), ("all", true), ("all", false)] {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path().join("media");
+        std::fs::create_dir(&media).unwrap();
+        let server = wiremock::MockServer::start().await;
+        for id in ["watch-primary", "watch-peer"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(super::MEDIA))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let provider = WatchProvider {
+            server: server.uri(),
+            stage: Arc::new(AtomicUsize::new(0)),
+            rejected: Arc::new(AtomicBool::new(false)),
+            primary_change: Arc::new(AtomicBool::new(false)),
+            peer_change: Arc::new(AtomicBool::new(false)),
+            strict_lookups: Arc::new(AtomicUsize::new(0)),
+            peer_deltas: Arc::new(AtomicUsize::new(0)),
+            database_checks: Arc::new(AtomicUsize::new(0)),
+        };
+        Mock::given(method("POST"))
+            .respond_with(ReleasedCatalogProvider(provider))
+            .mount(&server)
+            .await;
+        let username = "baseline@example.invalid";
+        let namespace = crate::account::namespace(username, "com");
+        let db_path = directory.path().join(format!("{namespace}.db"));
+        super::seed_existing_upgrade_db(&db_path);
+        let originals = [
+            ("original", "released.jpg", super::MEDIA),
+            (
+                "live_original",
+                "released.mov",
+                b"original motion".as_slice(),
+            ),
+        ];
+        let mut snapshots = Vec::new();
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+            for (version, name, bytes) in originals {
+                let file = media.join(name);
+                std::fs::write(&file, bytes).unwrap();
+                snapshots.push((
+                    file.clone(),
+                    bytes.to_vec(),
+                    std::fs::metadata(&file).unwrap().modified().unwrap(),
+                ));
+                conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,downloaded_at,local_path,last_seen_at) VALUES (?1,'released-master',?2,'old-provider',?3,1700000000,?4,'photo','downloaded',1700000001,?5,1700000001)",
+                    rusqlite::params![PEER,version,name,bytes.len() as i64,file.to_str().unwrap()]).unwrap();
+            }
+            conn.execute("INSERT INTO asset_master_mappings VALUES (?1,'released-child','released-master',1700000001)",[PEER]).unwrap();
+            conn.execute("INSERT INTO legacy_master_state_owners VALUES (?1,'released-master','released-child',1700000001)",[PEER]).unwrap();
+        }
+        let config_path = directory.path().join("config.toml");
+        let report = directory.path().join("report.json");
+        let quoted =
+            |path: &std::path::Path| toml::Value::String(path.display().to_string()).to_string();
+        std::fs::write(&config_path,format!(
+            "[auth]\nusername=\"{username}\"\n[download]\ndirectory={}\nfolder_structure=\"none\"\n[filters]\nlibraries=[\"{libraries}\"]\nalbums=[\"none\"]\nsmart_folders=[\"Hidden\"]\nunfiled={unfiled}\n[report]\njson={}\n[server]\nport=0\n[ui]\nfriendly=false\nprogress_bar=false\n", quoted(&media),quoted(&report))).unwrap();
+        let globals = crate::config::GlobalArgs {
+            username: Some(username.into()),
+            domain: None,
+            data_dir: Some(directory.path().display().to_string()),
+        };
+        let mut query_count = 0;
+        for reopen in 0..3 {
+            let session = crate::auth::session::Session::new(
+                directory.path(),
+                username,
+                "https://example.invalid",
+                None,
+            )
+            .await
+            .unwrap();
+            let data = serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-baseline"},"webservices":{"ckdatabasews":{"url":server.uri()}}})).unwrap();
+            let control = crate::sync_loop::runner::WatchLoopTestControl {
+                shutdown: CancellationToken::new(),
+                sleep: std::time::Duration::from_secs(1),
+                waits: Arc::new(AtomicUsize::new(0)),
+                auth: std::sync::Mutex::new(Some(crate::auth::AuthResult {
+                    session,
+                    data,
+                    requires_2fa: false,
+                })),
+            };
+            let args = crate::sync_loop::SyncArgs {
+                is_one_shot: true,
+                service_mode: false,
+                pw: crate::cli::PasswordArgs::default(),
+                sync: crate::cli::SyncArgs::default(),
+                toml_config: crate::config::load_toml_config(&config_path, true).unwrap(),
+                config_explicitly_set: true,
+                config_path: config_path.clone(),
+                redact_password: Arc::new(std::sync::Mutex::new(None)),
+                personality_mode: crate::personality::Mode::Off,
+                friendly_request: Some(false),
+                input_mode: crate::InputMode::NoInput,
+            };
+            crate::sync_loop::runner::WATCH_LOOP_TEST_CONTROL
+                .scope(
+                    control,
+                    Box::pin(crate::sync_loop::run_sync(&globals, args)),
+                )
+                .await
+                .unwrap();
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let deleted:i64=conn.query_row("SELECT count(*) FROM assets WHERE library=?1 AND id='released-master' AND is_deleted=1 AND deleted_at IS NOT NULL",[PEER],|r|r.get(0)).unwrap();
+            assert_eq!(
+                deleted, 2,
+                "whole released family must settle through real runner tail"
+            );
+            let debt: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM source_revalidation_debt WHERE id='released-master'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(debt, 0);
+            for (file, bytes, mtime) in &snapshots {
+                assert_eq!(&std::fs::read(file).unwrap(), bytes);
+                assert_eq!(std::fs::metadata(file).unwrap().modified().unwrap(), *mtime);
+            }
+            for (library, id, token) in [
+                (PRIMARY, "watch-primary", "p-active"),
+                (PEER, "watch-peer", "s-active"),
+            ] {
+                let current_path = media.join("Hidden").join(format!("{id}.JPG"));
+                assert_eq!(std::fs::read(&current_path).unwrap(), super::MEDIA);
+                if reopen == 0 {
+                    snapshots.push((
+                        current_path.clone(),
+                        super::MEDIA.to_vec(),
+                        std::fs::metadata(&current_path)
+                            .unwrap()
+                            .modified()
+                            .unwrap(),
+                    ));
+                }
+                let saved: String = conn
+                    .query_row(
+                        "SELECT value FROM metadata WHERE key=?1",
+                        [crate::sync_cycle::sync_token_key(library)],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(saved, token);
+                let receipts: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM download_receipts WHERE library=?1 AND child=?2",
+                        rusqlite::params![library, format!("asset-{id}")],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(receipts, 1);
+                let (scope, native, hash): (String, String, String) = conn.query_row(
+                    "SELECT scope,native_path,source_checksum FROM download_receipts WHERE library=?1 AND child=?2",
+                    rusqlite::params![library,format!("asset-{id}")],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                ).unwrap();
+                let expected_database = if library == PRIMARY {
+                    "private"
+                } else {
+                    "shared"
+                };
+                let expected_owner = if library == PRIMARY {
+                    "_defaultOwner"
+                } else {
+                    "peer-owner"
+                };
+                assert_eq!(
+                    crate::icloud::photos::PhotoLibrary::provider_scope_projection(&scope),
+                    Some((
+                        library.into(),
+                        expected_owner.into(),
+                        expected_database.into()
+                    ))
+                );
+                assert_eq!(
+                    serde_json::from_str::<crate::state::db::provider_selection::SelectionPath>(
+                        &native
+                    )
+                    .unwrap()
+                    .to_path(),
+                    current_path
+                );
+                assert_eq!(
+                    hash,
+                    crate::download::file::compute_sha256(&current_path)
+                        .await
+                        .unwrap()
+                );
+            }
+            let requests = server.received_requests().await.unwrap();
+            let inventory = requests
+                .iter()
+                .filter(|r| {
+                    r.url.path().ends_with("/records/query")
+                        && String::from_utf8_lossy(&r.body).contains("CPLAssetAndMaster")
+                })
+                .count();
+            if reopen == 0 {
+                query_count = inventory;
+            }
+            assert_eq!(
+                inventory, query_count,
+                "quiet reopens cannot repeat DATA inventory"
+            );
+            eprintln!(
+                "C16_REAL_RUNNER libraries={libraries} unfiled={unfiled} reopen={reopen} deleted_renditions=2 preserved=true own_source_receipts=2"
+            );
+        }
+        server.verify().await;
+    }
+}

@@ -304,6 +304,155 @@ async fn v027_genuine_existing_upgrade_near_full_preserves_current_progress() {
 tokio::task_local! { static ASSESS_DUE_HYDRATION: bool; }
 
 #[tokio::test]
+#[ignore = "waits for the real released retained-work deadline; explicit qualification"]
+async fn released36_matching_due_retained_work_keeps_current_progress() {
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/due-peer"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir(&root).unwrap();
+    let original = root.join("original.JPG");
+    std::fs::write(&original, MEDIA).unwrap();
+    let original_mtime = std::fs::metadata(&original).unwrap().modified().unwrap();
+    let database = dir.path().join("state.db");
+    stock(&database, &root, 8192, true).await;
+    let deadline: i64 = rusqlite::Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT next_retry_at FROM provider_work_retries WHERE page_id=1 AND ordinal=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let wait = deadline - chrono::Utc::now().timestamp() + 1;
+    assert!((1..=3601).contains(&wait));
+    eprintln!("C05_NATURAL_WAIT deadline={deadline} seconds={wait}");
+    tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let mut records = pair(
+        "due-peer",
+        "due-peer.JPG",
+        &format!("{}/due-peer", server.uri()),
+        77,
+    );
+    records[1]["fields"]["masterRef"]["value"]["zoneID"] = healthy_zone();
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let inventory = Arc::new(AtomicUsize::new(0));
+    let mut history = None;
+    let mut retry = None;
+    let mut published = None;
+    let mut inventory_after = 0;
+    for cycle in 0..3 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&database, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        let old = old_snapshot(&db);
+        if let Some(before) = &history {
+            assert_eq!(&old, before);
+        } else {
+            history = Some(old);
+        }
+        let session = HealthySession {
+            cycle,
+            records: Arc::new(records.clone()),
+            delta: Arc::new(Vec::new()),
+            inventory: inventory.clone(),
+            changes: Arc::new(AtomicUsize::new(0)),
+            boundaries: Arc::new(AtomicUsize::new(0)),
+        };
+        let current = selected(
+            db.clone(),
+            healthy_zone(),
+            Box::new(CountHistoricalLookups {
+                inner: session,
+                count: lookups.clone(),
+            }),
+        )
+        .await;
+        let base = make_run_cycle_download_config_builder(&root, db.clone());
+        let builder = |mode, exclude, groups, name| {
+            let mut config = (*base(mode, exclude, groups, name)).clone();
+            configure(&mut config);
+            Arc::new(config)
+        };
+        let result = run_cycle(
+            &[&current],
+            &make_run_cycle_config(),
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failed_count, 0, "{result:?}");
+        assert_eq!(
+            result.stats.downloaded,
+            usize::from(cycle == 0),
+            "{result:?}"
+        );
+        assert!(
+            db.get_metadata(&sync_token_key(HEALTHY))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            1,
+            "matching due work must really reach lookup exactly once"
+        );
+        let current_retry: (i64, i64, i64) = db.acquire_lock("natural retained retry").unwrap().query_row(
+            "SELECT attempts,last_attempt_at,next_retry_at FROM provider_work_retries WHERE page_id=1 AND ordinal=1",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(current_retry.0, 2);
+        assert!(current_retry.1 >= deadline);
+        assert_eq!(current_retry.2 - current_retry.1, 7200);
+        if let Some(before) = &retry {
+            assert_eq!(&current_retry, before);
+        } else {
+            retry = Some(current_retry);
+        }
+        assert_eq!(old_snapshot(&db), *history.as_ref().unwrap());
+        assert_eq!(std::fs::read(&original).unwrap(), MEDIA);
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().modified().unwrap(),
+            original_mtime
+        );
+        let path = root.join("due-peer.JPG");
+        assert_eq!(std::fs::read(&path).unwrap(), MEDIA);
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        if let Some(before) = published {
+            assert_eq!(mtime, before);
+        } else {
+            published = Some(mtime);
+        }
+        if cycle == 0 {
+            inventory_after = inventory.load(Ordering::SeqCst);
+        }
+        assert_eq!(inventory.load(Ordering::SeqCst), inventory_after);
+        eprintln!(
+            "C05_MATCHING_DUE cycle={cycle} historical_lookups=1 current_media_gets=1 retained_retry={retry:?}"
+        );
+        drop(result);
+        drop(current);
+        drop(base);
+        assert_eq!(Arc::strong_count(&db), 1);
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
 #[ignore = "near-512 MiB historical hydration composition; run explicitly on disposable storage"]
 async fn v027_near_full_due_hydration_preserves_independent_current_progress() {
     ASSESS_DUE_HYDRATION
@@ -461,14 +610,35 @@ async fn storage_contract_with_stock(
         "STOCK_SETUP charged_bytes={budget} elapsed_ms={}",
         setup_started.elapsed().as_millis()
     );
-    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let check_health = ASSESS_HEALTH.try_with(|value| *value).unwrap_or(false);
+    let mut cycle_config = make_run_cycle_config();
+    let (_session_dir, shared) = if check_health {
+        cycle_config.auth.username = "baseline@example.invalid".into();
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = crate::auth::session::Session::new(
+            directory.path(),
+            "baseline@example.invalid",
+            "https://www.icloud.com",
+            None,
+        )
+        .await
+        .unwrap();
+        session
+            .bind_principal(
+                &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-baseline"}})).unwrap(),
+                None,
+            )
+            .unwrap();
+        (directory, Arc::new(tokio::sync::RwLock::new(session)))
+    } else {
+        make_shared_session_for_run_cycle().await
+    };
     let mut before = None;
     let mut measurements = Vec::new();
     let mut published = Vec::new();
     let mut stable_pending = None;
     let mut stable_overhead = None;
     let mut completed_companion_receipt = None;
-    let check_health = ASSESS_HEALTH.try_with(|value| *value).unwrap_or(false);
     let mut health = crate::health::HealthStatus::new();
     let mut metrics = crate::metrics::MetricsHandle::new(None);
     let notifier = crate::notifications::Notifier::new(None);
@@ -711,7 +881,7 @@ async fn storage_contract_with_stock(
         };
         let result = run_cycle(
             &selected_states,
-            &make_run_cycle_config(),
+            &cycle_config,
             Some(db.as_ref()),
             false,
             &builder,
@@ -805,7 +975,7 @@ async fn storage_contract_with_stock(
             measurements.push(measure(&db, &database, "fault-before-reopen"));
             continue;
         }
-        let result = result.unwrap();
+        let mut result = result.unwrap();
         if genuine_upgrade && cycle == 0 {
             let conn = db
                 .acquire_lock("genuine upgrade completed its first baseline")
@@ -845,6 +1015,34 @@ async fn storage_contract_with_stock(
             );
         }
         if check_health {
+            let shutdown = CancellationToken::new();
+            result
+                .prepare_operational_tail(&shared, &shutdown)
+                .await
+                .unwrap();
+            crate::sync_loop::runner::drain_source_revalidation(&selected_states, &shutdown)
+                .await
+                .unwrap();
+            let catalog = crate::sync_loop::runner::drain_catalog_source_revalidation(
+                &selected_states,
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &download::compute_config_hash(&cycle_config),
+                &shutdown,
+            )
+            .await
+            .unwrap();
+            crate::sync_loop::runner::apply_catalog_drain_outcome(
+                &mut result,
+                &selected_states,
+                catalog,
+                false,
+            );
+            result.revalidate_sparse_holds(Some(db.as_ref())).await;
+            let _journal_guards = result
+                .finish_operational_tail(&shared, &shutdown)
+                .await
+                .unwrap();
             if cycle == 3 {
                 health = crate::health::HealthStatus::new();
                 metrics = crate::metrics::MetricsHandle::new(None);

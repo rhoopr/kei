@@ -456,6 +456,16 @@ async fn stock36_only_failed_media_keeps_validated_baseline_token_accounted() {
 #[ignore = "explicit slow held-epoch qualification; run with --ignored"]
 async fn stock36_held_identity_baseline_replays_due_admitted_media_without_inventory_or_promotion()
 {
+    held_identity_retry(false).await;
+}
+
+#[tokio::test]
+#[ignore = "waits for the real admitted motion deadline; explicit qualification"]
+async fn released36_held_motion_retries_at_natural_deadline_without_inventory() {
+    held_identity_retry(true).await;
+}
+
+async fn held_identity_retry(natural_motion: bool) {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -506,6 +516,20 @@ async fn stock36_held_identity_baseline_replays_due_admitted_media_without_inven
         "fail.JPG",
         &format!("{}/fail", server.uri()),
     );
+    if natural_motion {
+        Mock::given(method("GET"))
+            .and(path("/still"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let resource = inventory[0]["fields"]["resOriginalRes"].clone();
+        inventory[0]["fields"]["resOriginalVidComplRes"] = resource;
+        inventory[0]["fields"]["resOriginalVidComplFileType"] =
+            json!({"value":"com.apple.quicktime-movie"});
+        inventory[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+            json!(format!("{}/still", server.uri()));
+    }
     inventory.extend(media_pair(
         SUPPORT,
         "progress",
@@ -549,6 +573,30 @@ async fn stock36_held_identity_baseline_replays_due_admitted_media_without_inven
     config.retry.max_retries = 0;
     config.filters.selection = resolved_unfiled_only();
 
+    if natural_motion {
+        // The first real source attempt is held before this new Live Photo
+        // appears. Its next ordinary attempt admits the motion work; source
+        // backoff then exceeds the new item's first retry without clock edits.
+        let prelude = stock36_library_state(
+            db.clone(),
+            SUPPORT,
+            inventory[2..].to_vec(),
+            support_full.clone(),
+            support_changes.clone(),
+        )
+        .await;
+        let result = run_stock36_cycle(&db, &[&prelude, &peer], &root, &shared, &config)
+            .await
+            .unwrap();
+        assert_eq!(epoch_state(&db, SUPPORT), "pending");
+        assert_eq!(token(&db, SUPPORT), None);
+        let wait = epoch_next_attempt(&db, SUPPORT) - chrono::Utc::now().timestamp() + 1;
+        assert!((1..=3601).contains(&wait));
+        eprintln!("C01_SOURCE_PRELUDE_WAIT seconds={wait} new_motion_not_yet_observed=true");
+        drop(result);
+        drop(prelude);
+        tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
+    }
     let first = run_stock36_cycle(&db, &[&support, &peer], &root, &shared, &config)
         .await
         .expect("held first baseline must return a result");
@@ -556,7 +604,11 @@ async fn stock36_held_identity_baseline_replays_due_admitted_media_without_inven
     let first_support_state = epoch_state(&db, SUPPORT);
     let first_support_token = token(&db, SUPPORT);
     let first_support_epoch_next = epoch_next_attempt(&db, SUPPORT);
-    let first_fail = decision_state(&db, "asset-fail");
+    let first_fail = if natural_motion {
+        motion_decision_state(&db)
+    } else {
+        decision_state(&db, "asset-fail")
+    };
     let first_progress = destination_state(&db, "asset-progress");
     let first_peer_state = epoch_state(&db, PEER);
     let first_peer_token = token(&db, PEER);
@@ -592,7 +644,40 @@ async fn stock36_held_identity_baseline_replays_due_admitted_media_without_inven
         "the peer library keeps its own checkpoint progress"
     );
 
+    let motion_before = if natural_motion {
+        let conn = db
+            .acquire_lock("record original motion owner and destination")
+            .unwrap();
+        let row: (String, String, String, String, i64) = conn.query_row(
+            "SELECT generation,pass_key,child,path,verified_media FROM provider_active_destinations WHERE child='asset-fail' AND version_size='live_original'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).unwrap();
+        assert_eq!(row.4, 0);
+        Some(row)
+    } else {
+        None
+    };
+    let still_before = natural_motion.then(|| {
+        let path = downloaded_path(&db, SUPPORT, "asset-fail");
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), MEDIA);
+        (path, mtime)
+    });
+    if natural_motion {
+        let wait = first_fail.2 - chrono::Utc::now().timestamp() + 1;
+        assert!((1..=14401).contains(&wait));
+        assert!(
+            first_support_epoch_next > first_fail.2,
+            "retry must precede independent source deadline"
+        );
+        eprintln!(
+            "C01_NATURAL_WAIT seconds={wait} item_deadline={} epoch_deadline={first_support_epoch_next}",
+            first_fail.2
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
+    }
     allow.store(true, Ordering::SeqCst);
+    drop(first);
     drop(support);
     drop(peer);
     drop(db);
@@ -604,7 +689,7 @@ async fn stock36_held_identity_baseline_replays_due_admitted_media_without_inven
     let support = stock36_library_state(
         db.clone(),
         SUPPORT,
-        inventory,
+        inventory.clone(),
         Arc::clone(&support_full),
         Arc::clone(&support_changes),
     )
@@ -617,9 +702,11 @@ async fn stock36_held_identity_baseline_replays_due_admitted_media_without_inven
         Arc::clone(&peer_changes),
     )
     .await;
-    db.make_selection_retry_due(baseline_owner(), "asset-fail".to_owned())
-        .await
-        .unwrap();
+    if !natural_motion {
+        db.make_selection_retry_due(baseline_owner(), "asset-fail".to_owned())
+            .await
+            .unwrap();
+    }
     assert!(
         epoch_next_attempt(&db, SUPPORT) > chrono::Utc::now().timestamp(),
         "the due item must be ahead of the future epoch deadline"
@@ -631,7 +718,11 @@ async fn stock36_held_identity_baseline_replays_due_admitted_media_without_inven
 
     let second_support_state = epoch_state(&db, SUPPORT);
     let second_support_token = token(&db, SUPPORT);
-    let second_fail = decision_state(&db, "asset-fail");
+    let second_fail = if natural_motion {
+        motion_decision_state(&db)
+    } else {
+        decision_state(&db, "asset-fail")
+    };
     let second_peer_token = token(&db, PEER);
     eprintln!(
         "L7 held deadline-boundary retry: failed={} support_epoch={second_support_state} support_token={second_support_token:?} fail={second_fail:?} support_full={} peer_token={second_peer_token:?} peer_full={} calls={}",
@@ -662,6 +753,92 @@ async fn stock36_held_identity_baseline_replays_due_admitted_media_without_inven
         second_peer_token.is_some(),
         "the peer keeps its own checkpoint progress"
     );
+    if let (Some(original), Some((still, mtime))) = (motion_before, still_before) {
+        let row: (String, String, String, String, i64) = db.acquire_lock("settled original motion destination").unwrap().query_row(
+            "SELECT generation,pass_key,child,path,verified_media FROM provider_active_destinations WHERE child='asset-fail' AND version_size='live_original'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).unwrap();
+        assert_eq!(
+            (&row.0, &row.1, &row.2, &row.3),
+            (&original.0, &original.1, &original.2, &original.3)
+        );
+        assert_eq!(row.4, 1);
+        assert_eq!(std::fs::read(&still).unwrap(), MEDIA);
+        assert_eq!(
+            std::fs::metadata(&still).unwrap().modified().unwrap(),
+            mtime
+        );
+        let motion: crate::state::db::provider_selection::SelectionPath =
+            serde_json::from_str(&row.3).unwrap();
+        assert_eq!(std::fs::read(motion.to_path()).unwrap(), MEDIA);
+        assert_eq!(still.file_stem(), motion.to_path().file_stem());
+        let motion_path = motion.to_path();
+        let motion_mtime = std::fs::metadata(&motion_path).unwrap().modified().unwrap();
+        eprintln!(
+            "C01_NATURAL_SETTLED original_destination=true still_gets=1 inventory_unchanged=true baseline=pending checkpoint=held"
+        );
+        drop(second);
+        drop(support);
+        drop(peer);
+        assert_eq!(Arc::strong_count(&db), 1);
+        drop(db);
+        for reopen in 0..2 {
+            let db = Arc::new(
+                SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                    .await
+                    .unwrap(),
+            );
+            let support = stock36_library_state(
+                db.clone(),
+                SUPPORT,
+                inventory.clone(),
+                support_full.clone(),
+                support_changes.clone(),
+            )
+            .await;
+            let peer = stock36_library_state(
+                db.clone(),
+                PEER,
+                media_pair(PEER, "peer", "peer.JPG", &format!("{}/peer", server.uri())),
+                peer_full.clone(),
+                peer_changes.clone(),
+            )
+            .await;
+            let quiet = run_stock36_cycle(&db, &[&support, &peer], &root, &shared, &config)
+                .await
+                .unwrap();
+            assert_eq!(quiet.failed_count, 0, "{quiet:?}");
+            assert_eq!(quiet.stats.downloaded, 0, "{quiet:?}");
+            assert_eq!(support_full.load(Ordering::SeqCst), first_support_full);
+            assert_eq!(token(&db, SUPPORT), None);
+            assert_eq!(epoch_state(&db, SUPPORT), "pending");
+            assert_eq!(std::fs::read(&still).unwrap(), MEDIA);
+            assert_eq!(
+                std::fs::metadata(&still).unwrap().modified().unwrap(),
+                mtime
+            );
+            assert_eq!(std::fs::read(&motion_path).unwrap(), MEDIA);
+            assert_eq!(
+                std::fs::metadata(&motion_path).unwrap().modified().unwrap(),
+                motion_mtime
+            );
+            drop(quiet);
+            drop(support);
+            drop(peer);
+            assert_eq!(Arc::strong_count(&db), 1);
+            eprintln!(
+                "C01_NATURAL_QUIET reopen={reopen} media_unchanged=true inventory_unchanged=true checkpoint=held"
+            );
+        }
+        server.verify().await;
+    }
+}
+
+fn motion_decision_state(db: &SqliteStateDb) -> (String, i64, i64, i64) {
+    db.acquire_lock("read motion decision").unwrap().query_row(
+        "SELECT d.reason,d.attempts,d.next_retry_at,w.verified_media FROM provider_active_decisions d JOIN provider_active_destinations w USING(generation,pass_key,child) WHERE d.child='asset-fail' AND w.version_size='live_original'",
+        [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    ).unwrap()
 }
 
 /// A resolved current master gives the affected library its own fresh baseline

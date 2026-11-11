@@ -189,6 +189,63 @@ fn selected_album(
     }
 }
 
+/// These fixtures start with an ordinary inventory, without a catalog origin.
+/// Complete the production bootstrap and its inventory/bridge before measuring
+/// incremental membership changes or quiet reopens against that baseline.
+async fn complete_album_catalog(
+    selected: &crate::sync_cycle::LibraryState,
+    db: &SqliteStateDb,
+    builder: &crate::sync_cycle::BuildDownloadConfigFn<'_>,
+    shared: &crate::auth::SharedSession,
+    unconfirmed: usize,
+) {
+    for phase in 0..2 {
+        let result = run_cycle(
+            &[selected],
+            &make_run_cycle_config(),
+            Some(db),
+            false,
+            builder,
+            download::DownloadControls::download_hidden(),
+            shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.stats.downloaded, 0,
+            "catalog setup must reuse the completed media: {result:?}"
+        );
+        let uncertain = if phase == 0 { 0 } else { unconfirmed };
+        assert_eq!(result.stats.skipped.uncertain, uncertain, "{result:?}");
+        assert_eq!(result.failed_count, uncertain, "{result:?}");
+        if phase == 0 {
+            assert!(!result.can_advance_database_checkpoint(), "{result:?}");
+            assert!(
+                result
+                    .holds
+                    .iter()
+                    .all(|hold| hold.reason == "catalog_bootstrap_pending"),
+                "{result:?}"
+            );
+        } else {
+            assert!(!result.has_selected_holds(), "{result:?}");
+            assert!(
+                result
+                    .sources
+                    .iter()
+                    .all(|source| source.ordinary_committed),
+                "{result:?}"
+            );
+            assert_eq!(
+                result.can_advance_database_checkpoint(),
+                unconfirmed == 0,
+                "{result:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn v027_album_relation_only_changes_route_new_copies_and_unfiled_after_reopen() {
     album_contract(false, false).await;
@@ -415,6 +472,9 @@ async fn album_contract(interrupt_membership: bool, interrupt_inventory: bool) {
             assert_eq!(&std::fs::read(path).unwrap(), bytes);
             assert_eq!(&std::fs::metadata(path).unwrap().modified().unwrap(), mtime);
         }
+        if cycle == 0 {
+            complete_album_catalog(&selected, &db, &builder, &shared, 0).await;
+        }
     }
     server.verify().await;
 }
@@ -621,6 +681,9 @@ async fn v027_shared_asset_in_two_selected_albums_keeps_historical_paths_on_quie
             !observed[0].pending_metadata,
             "iteration {iteration}: {result:?}"
         );
+        if iteration == 0 {
+            complete_album_catalog(&selected, &db, &builder, &shared_session, 0).await;
+        }
     }
 
     server.verify().await;
@@ -811,7 +874,9 @@ async fn initial_album_confirmation_retry(legacy: bool) {
         let outstanding=db.acquire_lock("actual runner deferred observations").unwrap().query_row::<i64,_,_>(
             "SELECT count(*) FROM provider_active_decisions WHERE child='asset-album-a' AND admission='deferred'",[],|r|r.get(0)).unwrap();
         if iteration < 2 {
-            assert_eq!(outstanding, 1);
+            // The initial observation and the subsequent catalog inventory
+            // each retain their unresolved owner until exact confirmation.
+            assert_eq!(outstanding, if iteration == 0 { 1 } else { 2 });
             assert_eq!(result.stats.downloaded, 0);
             assert_eq!(root.join("A/album-a.JPG").exists(), legacy);
             if iteration == 0 {
@@ -864,6 +929,10 @@ async fn initial_album_confirmation_retry(legacy: bool) {
                 baseline_ranks,
                 "pending work must not force another inventory"
             );
+        } else {
+            complete_album_catalog(&selected, &db, &builder, &shared, 1).await;
+            baseline_ranks = ranks.load(Ordering::SeqCst);
+            failed_lookups = lookups.load(Ordering::SeqCst);
         }
     }
 }
@@ -956,6 +1025,29 @@ async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
 }
 
 async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: MixedSelection) {
+    mixed_shared_hidden_baseline_input(shared_zone_id, variant, false).await;
+}
+
+#[tokio::test]
+async fn released36_mixed_selection_preserves_pre_migration_live_families() {
+    for variant in [
+        MixedSelection::SharedWithUnfiled,
+        MixedSelection::BothWithUnfiled,
+        MixedSelection::BothHiddenOnly,
+    ] {
+        mixed_shared_hidden_baseline_input(
+            json!({"zoneName":ZONE,"ownerRecordName":"synthetic-shared-owner","zoneType":"synthetic-shared-zone"}),
+            variant,
+            true,
+        ).await;
+    }
+}
+
+async fn mixed_shared_hidden_baseline_input(
+    shared_zone_id: Value,
+    variant: MixedSelection,
+    released_input: bool,
+) {
     use crate::commands::{
         build_collection_context, collection_libraries, pass_scope_for_zone,
         resolve_passes_for_scope, zone_name_set,
@@ -1042,6 +1134,92 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
                 }
             }),
         ]
+    }
+
+    async fn current_bound_motion(
+        db: Arc<SqliteStateDb>,
+        zone: &Value,
+        url: &str,
+    ) -> crate::icloud::photos::PhotoAsset {
+        use crate::icloud::photos::{ProviderRecordId, RecordLookupRequest, RecordResolution};
+        #[derive(Clone)]
+        struct CurrentPair {
+            zone: Value,
+            records: Vec<Value>,
+        }
+        #[async_trait::async_trait]
+        impl PhotosSession for CurrentPair {
+            async fn post(
+                &self,
+                url: &str,
+                body: String,
+                _: &[(&str, &str)],
+            ) -> anyhow::Result<Value> {
+                assert!(url.contains("/shared/records/lookup?"));
+                let request: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(request["zoneID"], self.zone);
+                let names = request["records"].as_array().unwrap();
+                assert_eq!(names.len(), 2);
+                for expected in [DELETED_MASTER, DELETED_CHILD] {
+                    assert!(names.iter().any(|record| record["recordName"] == expected));
+                }
+                Ok(json!({"records":self.records}))
+            }
+            fn clone_box(&self) -> Box<dyn PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+        let mut records = mixed_pair(
+            zone,
+            DELETED_MASTER,
+            "prepared-alternate.JPG",
+            url,
+            90,
+            false,
+        );
+        records[0]["fields"]["resOriginalVidComplRes"] =
+            records[0]["fields"]["resOriginalRes"].clone();
+        records[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+            json!(format!("{url}-still"));
+        records[0]["fields"]["resOriginalVidComplFileType"] =
+            json!({"value":"com.apple.quicktime-movie"});
+        let mut album = PhotoAlbum::new(
+            PhotoAlbumConfig {
+                params: Arc::default(),
+                service_endpoint: "https://synthetic.example/database/1/photos/production/shared"
+                    .into(),
+                name: Arc::from(""),
+                list_type: "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),
+                obj_type: "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
+                query_filter: None,
+                page_size: 200,
+                zone_id: Arc::new(zone.clone()),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(CurrentPair {
+                zone: zone.clone(),
+                records,
+            }),
+        );
+        album.set_shadow_capture(
+            ShadowCapture::new(db, baseline_owner(), "com"),
+            "shared".into(),
+        );
+        let mut batch = album
+            .resolve_records(&[RecordLookupRequest::paired(
+                ProviderRecordId::new(DELETED_MASTER),
+                ProviderRecordId::new(DELETED_MASTER),
+                ProviderRecordId::new(DELETED_CHILD),
+            )])
+            .await;
+        assert!(batch.complete);
+        assert_eq!(batch.results.len(), 1);
+        let (_, RecordResolution::Present(asset)) = batch.results.pop().unwrap() else {
+            panic!("bound recovery requires the current exact source pair");
+        };
+        asset
     }
 
     #[derive(Clone)]
@@ -1215,16 +1393,19 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
         for (before, after) in before.iter().zip(finalized) {
             let before: Value = serde_json::from_str(before.as_str().unwrap()).unwrap();
             let after: Value = serde_json::from_str(after.as_str().unwrap()).unwrap();
-            for column in [0, 1, 2, 3, 5, 6, 7] {
+            for column in [0, 2, 3, 5, 6, 7] {
                 assert_eq!(
                     before[column], after[column],
                     "publication must preserve the family's identity and metadata"
                 );
             }
             if before[0] == "live_original" {
+                assert_eq!(before[1], "failed");
+                assert_eq!(after[1], "downloaded");
                 assert_ne!(before[4], after[4]);
                 assert_eq!(after[4], proof.destination.to_path().to_str().unwrap());
             } else {
+                assert_eq!(before[1], after[1]);
                 assert_eq!(before[4], after[4]);
             }
         }
@@ -1501,7 +1682,7 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
             .await;
     }
 
-    let dir = if variant == MixedSelection::BoundPublication {
+    let mut dir = if variant == MixedSelection::BoundPublication {
         if let Some(parent) = std::env::var_os("KEI_R2_RETAIN_ROOT") {
             tempfile::Builder::new()
                 .prefix("r2-family-")
@@ -1513,10 +1694,42 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
     } else {
         tempfile::tempdir().unwrap()
     };
+    if variant == MixedSelection::BoundPublication
+        && std::env::var_os("KEI_R2_RETAIN_ROOT").is_some()
+    {
+        dir.disable_cleanup(true);
+        eprintln!("R2_FIXTURE_ROOT={}", dir.path().display());
+    }
     let root = dir.path().join("media");
     std::fs::create_dir(&root).unwrap();
     let db_path = dir.path().join("state.db");
     super::seed_existing_upgrade_db(&db_path);
+    if released_input {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+        for (version, name, bytes) in [
+            ("original", "live.jpg", b"synthetic still".as_slice()),
+            ("live_original", "live.mov", b"synthetic motion".as_slice()),
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            conn.execute(
+                "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,added_at,size_bytes,media_type,status,downloaded_at,local_path,last_seen_at,local_checksum,download_checksum) VALUES (?1,?2,?3,?4,?5,1700000000,1700000000,?6,'photo','downloaded',1700000001,?7,1700000001,'synthetic-local','synthetic-local')",
+                rusqlite::params![ZONE, DELETED_MASTER, version, super::generation(90), name, MEDIA.len() as i64, path.to_str().unwrap()],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum,download_checksum) VALUES (?1,?2,?3,?4,?5,'synthetic-local','synthetic-local')",
+                rusqlite::params![ZONE, DELETED_MASTER, version, path.to_str().unwrap(), super::generation(90)],
+            ).unwrap();
+        }
+        conn.execute("INSERT INTO asset_master_mappings(library,asset_record_name,master_record_name,updated_at) VALUES (?1,?2,?3,1700000001)", rusqlite::params![ZONE, DELETED_CHILD, DELETED_MASTER]).unwrap();
+        conn.execute("INSERT INTO legacy_master_state_owners(library,master_record_name,asset_record_name,claimed_at) VALUES (?1,?2,?3,1700000001)", rusqlite::params![ZONE, DELETED_MASTER, DELETED_CHILD]).unwrap();
+        conn.execute(
+            "VACUUM INTO ?1",
+            [dir.path().join("released36-input.db").to_str().unwrap()],
+        )
+        .unwrap();
+    }
     let db = Arc::new(
         SqliteStateDb::open_owned(&db_path, &baseline_owner())
             .await
@@ -1528,42 +1741,44 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
         b"synthetic still".as_slice(),
         b"synthetic motion".as_slice(),
     ];
-    for ((version, name), (path, bytes)) in [
-        (crate::state::VersionSizeKey::Original, "live.jpg"),
-        (crate::state::VersionSizeKey::LiveOriginal, "live.mov"),
-    ]
-    .into_iter()
-    .zip(deleted_paths.iter().zip(deleted_bytes))
-    {
-        std::fs::write(path, bytes).unwrap();
-        let record = crate::test_helpers::TestAssetRecord::new(DELETED_MASTER)
-            .library(ZONE)
-            .version_size(version)
-            .added_at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap())
-            .filename(name)
-            .checksum(&super::generation(90))
-            .size(MEDIA.len() as u64)
-            .build();
-        db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded(
-            ZONE,
-            DELETED_MASTER,
-            version.as_str(),
-            path,
-            "synthetic-local",
-            None,
-        )
-        .await
-        .unwrap();
-    }
-    db.upsert_asset_master_mapping(ZONE, DELETED_CHILD, DELETED_MASTER)
-        .await
-        .unwrap();
-    assert!(
-        db.claim_legacy_master_state_owner(ZONE, DELETED_MASTER, DELETED_CHILD)
+    if !released_input {
+        for ((version, name), (path, bytes)) in [
+            (crate::state::VersionSizeKey::Original, "live.jpg"),
+            (crate::state::VersionSizeKey::LiveOriginal, "live.mov"),
+        ]
+        .into_iter()
+        .zip(deleted_paths.iter().zip(deleted_bytes))
+        {
+            std::fs::write(path, bytes).unwrap();
+            let record = crate::test_helpers::TestAssetRecord::new(DELETED_MASTER)
+                .library(ZONE)
+                .version_size(version)
+                .added_at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap())
+                .filename(name)
+                .checksum(&super::generation(90))
+                .size(MEDIA.len() as u64)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_downloaded(
+                ZONE,
+                DELETED_MASTER,
+                version.as_str(),
+                path,
+                "synthetic-local",
+                None,
+            )
             .await
-            .unwrap()
-    );
+            .unwrap();
+        }
+        db.upsert_asset_master_mapping(ZONE, DELETED_CHILD, DELETED_MASTER)
+            .await
+            .unwrap();
+        assert!(
+            db.claim_legacy_master_state_owner(ZONE, DELETED_MASTER, DELETED_CHILD)
+                .await
+                .unwrap()
+        );
+    }
     let deleted_snapshots = deleted_paths.map(|path| {
         (
             path.clone(),
@@ -2123,12 +2338,9 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
             )
             .await
             .unwrap();
-        let destination = root.join("prepared-alternate.mov");
+        let destination = root.join("prepared-alternate.MOV");
         let temporary =
             download::test_temp_download_path(&destination, &checksum, ".family-custody").unwrap();
-        std::fs::write(&temporary, MEDIA).unwrap();
-        std::fs::File::open(&temporary).unwrap().sync_all().unwrap();
-        db.claim_temp_file(&temporary).await.unwrap();
         let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(MEDIA));
         let proof = PreparedPublication {
             binding: Some(binding),
@@ -2142,9 +2354,36 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
             local_checksum: hash.clone(),
             source_checksum: hash,
         };
-        db.prepare_temp_publication(&temporary, &proof)
-            .await
-            .unwrap();
+        let collision = destination.clone();
+        Mock::given(method("GET"))
+            .and(path("/prepared-motion"))
+            .respond_with(move |_: &wiremock::Request| {
+                // The occupant arrives after task selection and before publish.
+                std::fs::write(&collision, b"injected foreign occupant").unwrap();
+                ResponseTemplate::new(200).set_body_bytes(MEDIA)
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let current = current_bound_motion(
+            db.clone(),
+            &shared_zone_id,
+            &format!("{}/prepared-motion", server.uri()),
+        )
+        .await;
+        let outcome = download::run_bound_publication_for_test(
+            db.clone(),
+            &proof,
+            &format!("{}/prepared-motion", server.uri()),
+            &current,
+        )
+        .await;
+        assert_eq!(outcome, (0, 1));
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"injected foreign occupant"
+        );
+        assert_eq!(std::fs::read(&temporary).unwrap(), MEDIA);
         assert_eq!(
             db.get_prepared_publications(
                 ZONE,
@@ -2155,7 +2394,7 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
             .unwrap(),
             vec![proof.clone()]
         );
-        assert!(!destination.exists());
+        eprintln!("R2_REAL_PIPELINE collision_refused=true prepared_by_transfer=true");
         Some((proof, round))
     } else {
         None
@@ -2222,7 +2461,10 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
         };
         assert!(deadline > chrono::Utc::now().timestamp());
         assert_eq!(std::fs::read(proof.temporary.to_path()).unwrap(), MEDIA);
-        assert!(!proof.destination.to_path().exists());
+        assert_eq!(
+            std::fs::read(proof.destination.to_path()).unwrap(),
+            b"injected foreign occupant"
+        );
         drop(shared_state);
         drop(primary_state);
         drop(collection_context);
@@ -2236,9 +2478,11 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
             "all owner handles must close before publication recovery"
         );
         drop(db);
-        let reopened = SqliteStateDb::open_owned(&db_path, &baseline_owner())
-            .await
-            .unwrap();
+        let reopened = Arc::new(
+            SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap(),
+        );
         assert_eq!(
             reopened
                 .get_prepared_publications(
@@ -2260,26 +2504,25 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
             )
             .unwrap();
         assert_eq!(saved_deadline, deadline);
-        download::test_publish_part_no_overwrite(
-            &proof.temporary.to_path(),
-            &proof.destination.to_path(),
+        // Remove only the injected collision. The normal pending-publication
+        // owner must recover the prepared part before a task may reuse it.
+        std::fs::remove_file(proof.destination.to_path()).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/prepared-recovery"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let current = current_bound_motion(
+            reopened.clone(),
+            &shared_zone_id,
+            &format!("{}/prepared-recovery", server.uri()),
         )
-        .await
-        .unwrap();
+        .await;
+        download::recover_bound_publication_for_test(&reopened, &proof, &current).await;
         assert!(!proof.temporary.to_path().exists());
         assert_eq!(std::fs::read(proof.destination.to_path()).unwrap(), MEDIA);
-        reopened
-            .mark_verified_download(
-                ZONE,
-                DELETED_MASTER,
-                "live_original",
-                &proof.destination.to_path(),
-                &proof.local_checksum,
-                Some(&proof.source_checksum),
-                false,
-            )
-            .await
-            .unwrap();
+        eprintln!("R2_REAL_PIPELINE recovery_published=true finalized_by_pending_owner=true");
         assert!(
             reopened
                 .get_prepared_publications(

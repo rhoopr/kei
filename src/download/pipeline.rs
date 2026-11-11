@@ -24,6 +24,8 @@ pub(in crate::download) use task::{DownloadSingleContext, download_single_task};
 
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+pub(crate) use test_support::{recover_bound_publication_for_test, run_bound_publication_for_test};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MediaFailureCause {

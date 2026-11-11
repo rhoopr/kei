@@ -24,6 +24,9 @@ use crate::sync_loop::test_support::{
 
 const OLD: &str = "old-preservation-master";
 
+#[cfg(feature = "xmp")]
+tokio::task_local! { static REAL_SIDECAR_FAILURE: bool; }
+
 #[derive(Clone)]
 struct Session {
     baseline: Arc<Vec<Value>>,
@@ -145,7 +148,9 @@ async fn cycle(
         config.retry.max_retries = 0;
         #[cfg(feature = "xmp")]
         {
-            config.metadata.xmp_sidecar = false;
+            config.metadata.xmp_sidecar = REAL_SIDECAR_FAILURE
+                .try_with(|enabled| *enabled)
+                .unwrap_or(false);
         }
         Arc::new(config)
     };
@@ -374,6 +379,17 @@ async fn scenario(blocked_metadata: bool) -> Option<(crate::health::HealthStatus
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("media");
     std::fs::create_dir(&root).unwrap();
+    #[cfg(feature = "xmp")]
+    let real_io = REAL_SIDECAR_FAILURE
+        .try_with(|enabled| *enabled)
+        .unwrap_or(false);
+    #[cfg(not(feature = "xmp"))]
+    let real_io = false;
+    if real_io {
+        // A real occupied directory at the sidecar path refuses publication.
+        // The existing media and all preservation options remain unchanged.
+        std::fs::create_dir(root.join("current.JPG.xmp")).unwrap();
+    }
     let database = dir.path().join("state.db");
     let db = Arc::new(
         SqliteStateDb::open_owned(&database, &baseline_owner())
@@ -404,8 +420,17 @@ async fn scenario(blocked_metadata: bool) -> Option<(crate::health::HealthStatus
     let (initial, scope, baseline_scope, cursors, initial_guards) =
         cycle(&db, &root, &shared, &baseline, 0).await;
     assert_eq!(initial.stats.downloaded, 1, "{initial:?}");
-    assert_eq!(initial.failed_count, 0);
-    assert!(initial.can_advance_database_checkpoint());
+    if real_io {
+        assert!(
+            initial.failed_count > 0,
+            "the real writer failure must remain visible: {initial:?}"
+        );
+        assert!(!initial.can_advance_database_checkpoint());
+        eprintln!("C15_INITIAL_IO_FAILURE {initial:?}");
+    } else {
+        assert_eq!(initial.failed_count, 0);
+        assert!(initial.can_advance_database_checkpoint());
+    }
     assert_eq!(cursors, ["preservation-boundary"]);
     let epoch = db.sync_epoch_id().await.unwrap().unwrap();
     let before_epoch = {
@@ -475,9 +500,16 @@ async fn scenario(blocked_metadata: bool) -> Option<(crate::health::HealthStatus
             selected,
             "the current peer must have actual selection evidence"
         );
-        db.record_metadata_write_failure(ZONE, &peer_id, &version)
-            .await
-            .unwrap();
+        if !real_io {
+            db.record_metadata_write_failure(ZONE, &peer_id, &version)
+                .await
+                .unwrap();
+        } else {
+            assert!(root.join("current.JPG.xmp").is_dir());
+            eprintln!(
+                "C15_REAL_METADATA_IO media_published=true sidecar_directory_preserved=true state_failure_not_seeded=true"
+            );
+        }
         let receipts = peer_receipts(&db, &peer_id);
         assert_peer_failure(&db, &peer, &peer_id, &version, peer_mtime, &receipts);
         Some((peer, peer_id, version, peer_mtime, receipts))
@@ -664,6 +696,17 @@ async fn protected_pending_metadata_refuses_operational_health() {
     let (health, report) = Box::pin(scenario(true))
         .await
         .expect("protected metadata fixture must execute");
+    assert_eq!(report["status"], "partial_failure");
+    assert!(health.last_success_at.is_none());
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn real_sidecar_io_failure_with_preservation_refuses_health_after_reopen() {
+    let (health, report) = REAL_SIDECAR_FAILURE
+        .scope(true, Box::pin(scenario(true)))
+        .await
+        .expect("real sidecar I/O fixture must execute");
     assert_eq!(report["status"], "partial_failure");
     assert!(health.last_success_at.is_none());
 }

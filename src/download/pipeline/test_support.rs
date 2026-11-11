@@ -16,6 +16,139 @@ use crate::state::{
     ReportStateStore, SyncRunStats, SyncTokenStore, TempFileOwnershipStore,
 };
 
+/// Exercise transfer, prepared publication, and finalization for an explicitly
+/// bound retry task. The caller supplies expected bytes; only the real transfer
+/// computes and persists publication evidence.
+pub(crate) async fn run_bound_publication_for_test(
+    db: Arc<crate::state::SqliteStateDb>,
+    expected: &crate::state::db::PreparedPublication,
+    url: &str,
+    asset: &crate::icloud::photos::PhotoAsset,
+) -> (usize, usize) {
+    let binding = expected.binding.as_ref().expect("bound retry fixture");
+    assert_eq!(asset.asset_record_name(), binding.child);
+    assert_eq!(asset.id(), binding.master);
+    assert_eq!(asset.state_id(), expected.id);
+    let mut config = crate::download::DownloadConfig::test_default();
+    config.directory = expected
+        .destination
+        .to_path()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+        .into();
+    config.folder_structure = "none".into();
+    config.library = expected.library.as_str().into();
+    let paths = crate::download::filter::derive_expected_paths(asset, &config);
+    let motion = paths
+        .iter()
+        .find(|path| path.version_size == crate::state::VersionSizeKey::LiveOriginal)
+        .unwrap();
+    assert_eq!(motion.path, expected.destination.to_path());
+    assert_eq!(motion.checksum.as_ref(), expected.provider_checksum);
+    assert_eq!(motion.size, expected.provider_size);
+    let task = crate::download::filter::DownloadTask {
+        require_created_entry: false,
+        url: url.into(),
+        download_path: expected.destination.to_path(),
+        replacement_fingerprint: None,
+        pending_cross_parent_root: None,
+        superseded_requested_path: None,
+        publication_binding: Some(Arc::new(binding.clone())),
+        checksum: expected.provider_checksum.clone().into(),
+        asset_id: expected.id.as_str().into(),
+        asset_record_name: binding.child.as_str().into(),
+        library: expected.library.as_str().into(),
+        metadata: Arc::default(),
+        size: expected.provider_size,
+        created_local: chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .unwrap()
+            .fixed_offset(),
+        version_size: crate::state::VersionSizeKey::LiveOriginal,
+        media_type: crate::state::MediaType::LivePhotoVideo,
+    };
+    let client = reqwest::Client::new();
+    let retry = crate::retry::RetryConfig {
+        max_retries: 0,
+        ..Default::default()
+    };
+    let result = super::run_download_pass(
+        super::PassConfig {
+            prior_auth_errors: 0,
+            url_obtained_at: Default::default(),
+            client: &client,
+            retry_config: &retry,
+            metadata: super::MetadataFlags::empty(),
+            mark_capture_repair_after_download: false,
+            concurrency: 1,
+            reporting: crate::download::DownloadReporting::hidden(),
+            temp_suffix: ".family-custody".into(),
+            shutdown_token: CancellationToken::new(),
+            state_db: Some(db.clone()),
+            rate_limit_counter: Arc::default(),
+            bandwidth_limiter: None,
+            library: expected.library.as_str().into(),
+            selection_run: None,
+            selection_pass: None,
+        },
+        vec![task],
+    )
+    .await;
+    assert_eq!(result.state_write_failures, 0);
+    if !result.failed.is_empty() {
+        let error: Option<String> = db
+            .acquire_lock("bound retry failure evidence")
+            .unwrap()
+            .query_row(
+                "SELECT last_error FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
+                rusqlite::params![expected.library, expected.id, expected.version],
+                |row| row.get(0),
+            )
+            .unwrap();
+        eprintln!("R2_REAL_PIPELINE failure={error:?}");
+    }
+    (result.downloaded, result.failed.len())
+}
+
+pub(crate) async fn recover_bound_publication_for_test(
+    db: &crate::state::SqliteStateDb,
+    expected: &crate::state::db::PreparedPublication,
+    asset: &crate::icloud::photos::PhotoAsset,
+) {
+    let binding = expected.binding.as_ref().expect("bound retry fixture");
+    assert_eq!(asset.asset_record_name(), binding.child);
+    assert_eq!(asset.id(), binding.master);
+    assert_eq!(asset.state_id(), expected.id);
+    let destination = expected.destination.to_path();
+    let mut config = crate::download::DownloadConfig::test_default();
+    config.directory = destination.parent().unwrap().to_path_buf().into();
+    config.folder_structure = "none".into();
+    config.library = expected.library.as_str().into();
+    config.ownership_check = Some(
+        crate::download::planner::OwnershipCheck::inspect(db)
+            .await
+            .unwrap(),
+    );
+    let mut planner = crate::download::planner::TaskPlanner::for_download(Some(db))
+        .await
+        .unwrap();
+    let result = super::recover_current_pending_publication(
+        db,
+        &config,
+        asset,
+        &mut planner,
+        crate::state::VersionSizeKey::LiveOriginal,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result,
+        Some(super::adoption::PendingOnDiskAdoption::Adopted(destination))
+    );
+}
+
 pub(super) async fn build_zero_download_outcome(
     streaming_result: StreamingResult,
     controls: DownloadControls,
