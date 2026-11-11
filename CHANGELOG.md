@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0-beta.1]
+
+Beta prerelease for opt-in testing. Read the [upgrade guide](docs/v0.30.0-beta.1-upgrade.md) before opening existing state.
+
 ### Changed
 
 - SQLite schema 44 adds source-revalidation mode metadata. Stop every writer and keep a matched cold backup of configuration, state, SQLite companions and media before upgrading. A schema 43 binary cannot open schema 44. Existing rounds, debt, epoch state and checkpoints are preserved. Mixed-version operation and downgrade are not supported.
@@ -19,8 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Updated bundled SQLite and Rustix for current security advisories, and refreshed vulnerable fuzz-only lockfile dependencies, including Rustls.
+- Recovered eligible admitted media independently of a held source baseline, while preserving source identity, retry deadlines and checkpoint fences.
+- Added bounded source revalidation after a positively rejected retained cursor. Incomplete or ambiguous source evidence remains held.
+- Reported partial backups separately from operational health. Healthy service reporting requires current accounting for every selected source and does not certify historical backup completeness.
 - Reset during an in-flight epoch baseline now refuses the older attempt and leaves the library pending. The next due baseline completes with a fresh attempt while retaining local receipts and pending obligations.
 - Different provider assets no longer share a path solely because their bytes match. Proven same-asset reuse and existing files are preserved; an unproved match may download a separate copy once.
+
+### Known limitations
+
+- Cross-namespace reuse without another download remains unsupported where provider identity cannot be established. Ambiguous historical metadata is preserved, not automatically repaired.
+- Operational health and backup completeness are separate. Eligible current work can progress while historical identity, metadata or source checkpoints remain held.
+- Qualification does not certify every reporter outcome, historical repair, NFS deployment or host-service installation. Keep retained obligations and existing media; do not reset state to force completion.
 
 ## [0.26.0] - 2026-10-22
 

@@ -1,6 +1,6 @@
 [package]
 name = "kei"
-version = "0.26.1-dev"
+version = "0.30.0-beta.1"
 edition = "2024"
 # src/download/paths.rs calls str::floor_char_boundary, stabilized in 1.91.
 # Cargo refuses to build on older toolchains with a clean error naming this
@@ -143,7 +143,7 @@ dirs = "6"
 async-trait = "0.1"
 
 # SQLite state tracking
-rusqlite = { version = "0.39", features = ["bundled", "backup"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup"] }
 
 # Binary plist decoding for iCloud *Enc fields (location, keywords, etc.)
 plist = "1"
@@ -180,7 +180,7 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 dotenvy = "0.15"
-rusqlite = { version = "0.39", features = ["bundled", "backup"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup"] }
 http = "1"
 wiremock = "0.6"
 tracing-test = "0.2"

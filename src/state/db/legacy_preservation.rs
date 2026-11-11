@@ -134,7 +134,7 @@ pub(super) fn snapshot_rows(
     id: &str,
 ) -> Result<Value, StateError> {
     let mut stmt = conn.prepare(sql)?;
-    let columns: Vec<_> = stmt.column_names().into_iter().map(str::to_owned).collect();
+    let columns: Vec<_> = stmt.column_names().map(str::to_owned).collect();
     let count = columns.len();
     let mut rows = stmt
         .query_map(params![library, id], |row| {

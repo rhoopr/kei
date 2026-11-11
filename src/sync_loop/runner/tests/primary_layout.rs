@@ -13338,11 +13338,7 @@ async fn review501_legacy_changed_extensions_and_aliases_preserve_after_revert()
             )
             .unwrap();
             let mut statement = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
-            let columns: Vec<_> = statement
-                .column_names()
-                .into_iter()
-                .map(str::to_owned)
-                .collect();
+            let columns: Vec<_> = statement.column_names().map(str::to_owned).collect();
             statement
                 .query_map([], |row| {
                     let mut fields = serde_json::Map::new();
@@ -16091,7 +16087,7 @@ async fn recorded_authorized_metadata_refresh_recovers_without_repeating_flag() 
                 let mut stmt = conn
                     .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))
                     .unwrap();
-                let names: Vec<_> = stmt.column_names().into_iter().map(str::to_owned).collect();
+                let names: Vec<_> = stmt.column_names().map(str::to_owned).collect();
                 let values = stmt.query_map([], |row| {
                     let mut fields = serde_json::Map::new();
                     for (index, name) in names.iter().enumerate() {

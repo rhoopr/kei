@@ -102,6 +102,26 @@ pub(crate) fn indexing_materialization_key(zone: &str) -> String {
     format!("indexing_materialization_required:{zone}")
 }
 
+#[must_use]
+fn classify_baseline_state_fault(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<state::error::StateError>(),
+        Some(
+            state::error::StateError::Query { .. }
+                | state::error::StateError::Migration(_)
+                | state::error::StateError::LockPoisoned(_)
+                | state::error::StateError::Spawn(_)
+        )
+    )
+}
+
+#[must_use]
+fn classify_fresh_baseline_error(
+    error: &anyhow::Error,
+) -> Option<&download::FreshBaselineRequired> {
+    error.downcast_ref::<download::FreshBaselineRequired>()
+}
+
 /// Observe readiness and durably retain every RUNNING observation, even if a
 /// later readiness request fails before enumeration starts.
 pub(crate) async fn prepare_indexing_reconciliation(
@@ -3156,15 +3176,7 @@ pub(crate) async fn run_cycle_with_witness(
                         cycle_session_expired = true;
                         break;
                     }
-                    if matches!(
-                        error.downcast_ref::<state::error::StateError>(),
-                        Some(
-                            state::error::StateError::Query { .. }
-                                | state::error::StateError::Migration(_)
-                                | state::error::StateError::LockPoisoned(_)
-                                | state::error::StateError::Spawn(_)
-                        )
-                    ) {
+                    if classify_baseline_state_fault(&error) {
                         cycle_stats.state_write_failures =
                             cycle_stats.state_write_failures.saturating_add(1);
                         operational_state_fault = true;
@@ -3582,15 +3594,7 @@ pub(crate) async fn run_cycle_with_witness(
                         cycle_stats.interrupted = true;
                         break;
                     }
-                    if matches!(
-                        error.downcast_ref::<state::error::StateError>(),
-                        Some(
-                            state::error::StateError::Query { .. }
-                                | state::error::StateError::Migration(_)
-                                | state::error::StateError::LockPoisoned(_)
-                                | state::error::StateError::Spawn(_)
-                        )
-                    ) {
+                    if classify_baseline_state_fault(&error) {
                         cycle_stats.state_write_failures =
                             cycle_stats.state_write_failures.saturating_add(1);
                         operational_state_fault = true;
@@ -3623,11 +3627,7 @@ pub(crate) async fn run_cycle_with_witness(
         .await;
         let mut sync_result = match initial_result {
             Ok(result) => result,
-            Err(error)
-                if error
-                    .downcast_ref::<download::FreshBaselineRequired>()
-                    .is_some() =>
-            {
+            Err(error) if classify_fresh_baseline_error(&error).is_some() => {
                 // The rejected interval is owned by the fresh-boundary path,
                 // not by the pre-stream hint for a completed delta.
                 bootstrap_candidate = None;
@@ -3635,7 +3635,7 @@ pub(crate) async fn run_cycle_with_witness(
                     return Err(error);
                 };
                 if matches!(
-                    error.downcast_ref::<download::FreshBaselineRequired>(),
+                    classify_fresh_baseline_error(&error),
                     Some(download::FreshBaselineRequired::StaticFallback)
                 ) {
                     record_selected_hold(
@@ -3654,7 +3654,7 @@ pub(crate) async fn run_cycle_with_witness(
                     continue;
                 }
                 if !matches!(
-                    error.downcast_ref::<download::FreshBaselineRequired>(),
+                    classify_fresh_baseline_error(&error),
                     Some(download::FreshBaselineRequired::RejectedToken)
                 ) {
                     return Err(error);
@@ -3773,15 +3773,7 @@ pub(crate) async fn run_cycle_with_witness(
                             cycle_session_expired = true;
                             break;
                         }
-                        if matches!(
-                            error.downcast_ref::<state::error::StateError>(),
-                            Some(
-                                state::error::StateError::Query { .. }
-                                    | state::error::StateError::Migration(_)
-                                    | state::error::StateError::LockPoisoned(_)
-                                    | state::error::StateError::Spawn(_)
-                            )
-                        ) {
+                        if classify_baseline_state_fault(&error) {
                             cycle_stats.state_write_failures =
                                 cycle_stats.state_write_failures.saturating_add(1);
                             operational_state_fault = true;
@@ -4011,11 +4003,7 @@ pub(crate) async fn run_cycle_with_witness(
                         .await;
                         let bridge_result = match bridge_result {
                             Ok(result) => result,
-                            Err(error)
-                                if error
-                                    .downcast_ref::<download::FreshBaselineRequired>()
-                                    .is_some() =>
-                            {
+                            Err(error) if classify_fresh_baseline_error(&error).is_some() => {
                                 sync_result.sync_token = None;
                                 sync_result.checkpoint.sync_token_blocked = true;
                                 sync_result.checkpoint.project(&mut sync_result.stats);

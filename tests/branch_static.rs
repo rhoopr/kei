@@ -2178,10 +2178,13 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_api_error",
         "classify_auth_flow_error",
         "classify_auth_retry_error",
+        "classify_baseline_state_fault",
         "classify_cli_parse_exit",
         "classify_conditional_publish_error",
         "classify_download_task_error",
+        "classify_due_media_error",
         "classify_exit_error",
+        "classify_fresh_baseline_error",
         "classify_heif_metadata_limit",
         "classify_incremental_error",
         "classify_missing_changes_successor",
@@ -2198,6 +2201,8 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_sync_auth_error",
         "is_session_error",
         "map_library_init_error",
+        // Pipeline-owned transfer classification excludes authentication and local I/O.
+        "media_failure_cause",
     ]
     .into_iter()
     .map(String::from)
