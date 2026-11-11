@@ -911,11 +911,20 @@ async fn v027_both_sources_hidden_only_use_actual_resolver() {
     ).await;
 }
 
+#[tokio::test]
+async fn v027_bound_other_rendition_custody_or_natural_retry() {
+    mixed_shared_hidden_baseline_variant(
+        json!({"zoneName":ZONE,"ownerRecordName":"synthetic-shared-owner","zoneType":"synthetic-shared-zone"}),
+        MixedSelection::BoundPublication,
+    ).await;
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MixedSelection {
     SharedWithUnfiled,
     BothWithUnfiled,
     BothHiddenOnly,
+    BoundPublication,
 }
 
 async fn mixed_shared_hidden_baseline_census(shared_zone_id: Value) {
@@ -935,6 +944,25 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
     const PRIMARY: &str = "PrimarySync";
     const DELETED_MASTER: &str = "shared-live-master";
     const DELETED_CHILD: &str = "asset-shared-live-master";
+
+    fn mixed_selection(variant: MixedSelection) -> Selection {
+        Selection {
+            albums: AlbumSelector::None,
+            albums_explicit: false,
+            smart_folders: SmartFolderSelector::Named {
+                included: BTreeSet::from(["Hidden".to_string()]),
+                excluded: BTreeSet::new(),
+            },
+            smart_folders_explicit: true,
+            libraries: LibrarySelector {
+                primary: variant != MixedSelection::SharedWithUnfiled,
+                shared_all: true,
+                named: BTreeSet::new(),
+                excluded: BTreeSet::new(),
+            },
+            unfiled: variant != MixedSelection::BothHiddenOnly,
+        }
+    }
 
     fn mixed_pair(
         zone_id: &Value,
@@ -1129,6 +1157,290 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
         }
     }
 
+    if variant == MixedSelection::BoundPublication
+        && let Some(path) = std::env::var_os("KEI_R2_RESUME_ROOT")
+    {
+        use crate::state::db::{PreparedPublication, TempFileOwnershipStore};
+        use sha2::{Digest, Sha256};
+        let dir = std::path::PathBuf::from(path);
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("r2-state.json")).unwrap()).unwrap();
+        let proof: PreparedPublication = serde_json::from_value(saved["proof"].clone()).unwrap();
+        let round = saved["round"].as_str().unwrap();
+        let deadline = saved["deadline"].as_i64().unwrap();
+        assert_eq!(saved["zone"], shared_zone_id);
+        let before = saved["family_before"].as_array().unwrap();
+        let finalized = saved["finalized_family"].as_array().unwrap();
+        assert_eq!((before.len(), finalized.len()), (2, 2));
+        for (before, after) in before.iter().zip(finalized) {
+            let before: Value = serde_json::from_str(before.as_str().unwrap()).unwrap();
+            let after: Value = serde_json::from_str(after.as_str().unwrap()).unwrap();
+            for column in [0, 1, 2, 3, 5, 6, 7] {
+                assert_eq!(
+                    before[column], after[column],
+                    "publication must preserve the family's identity and metadata"
+                );
+            }
+            if before[0] == "live_original" {
+                assert_ne!(before[4], after[4]);
+                assert_eq!(after[4], proof.destination.to_path().to_str().unwrap());
+            } else {
+                assert_eq!(before[4], after[4]);
+            }
+        }
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&dir.join("state.db"), &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        let (actual_deadline, family): (i64, Vec<String>) = {
+            let conn = db
+                .acquire_lock("verify saved family and original retry deadline")
+                .unwrap();
+            let due = conn
+                .query_row(
+                    "SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id=?2",
+                    rusqlite::params![round, DELETED_MASTER],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut stmt = conn.prepare("SELECT json_array(version_size,status,checksum,size_bytes,local_path,is_deleted,deleted_at,metadata_hash) FROM assets WHERE library=?1 AND id=?2 ORDER BY version_size").unwrap();
+            let family = stmt
+                .query_map(rusqlite::params![ZONE, DELETED_MASTER], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            (due, family)
+        };
+        assert_eq!(actual_deadline, deadline);
+        assert_eq!(
+            serde_json::to_value(&family).unwrap(),
+            saved["finalized_family"]
+        );
+        assert!(
+            db.get_prepared_publications(
+                ZONE,
+                DELETED_MASTER,
+                crate::state::VersionSizeKey::LiveOriginal
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(!proof.temporary.to_path().exists());
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&Sha256::digest(
+                std::fs::read(proof.destination.to_path()).unwrap()
+            )),
+            proof.local_checksum
+        );
+        let published_mtime = std::fs::metadata(proof.destination.to_path())
+            .unwrap()
+            .modified()
+            .unwrap();
+        let check_old_files = || {
+            for file in saved["old_files"].as_array().unwrap() {
+                let path = std::path::Path::new(file["path"].as_str().unwrap());
+                assert_eq!(
+                    data_encoding::HEXLOWER.encode(&Sha256::digest(std::fs::read(path).unwrap())),
+                    file["sha256"].as_str().unwrap()
+                );
+                assert_eq!(
+                    std::fs::metadata(path)
+                        .unwrap()
+                        .modified()
+                        .unwrap()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos(),
+                    u128::from(file["mtime_ns"].as_u64().unwrap())
+                );
+            }
+        };
+        check_old_files();
+        let metadata_snapshot = || {
+            let conn = db.acquire_lock("snapshot family metadata paths").unwrap();
+            let mut stmt = conn.prepare("SELECT json_array(version_size,local_path,provider_checksum,local_checksum,download_checksum,metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size) FROM asset_metadata_paths WHERE library=?1 AND id=?2 ORDER BY version_size,local_path").unwrap();
+            stmt.query_map(rusqlite::params![ZONE, DELETED_MASTER], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let metadata_before = metadata_snapshot();
+        assert_eq!(
+            metadata_before.len(),
+            3,
+            "both old metadata paths and the new path must remain recorded"
+        );
+        let primary_zone = json!({"zoneName":PRIMARY,"ownerRecordName":"_defaultOwner"});
+        let shared_requests = Arc::new(Mutex::new(Vec::new()));
+        let source = |zone_id: Value, name: &str, database: &'static str, deleted: Vec<Value>| {
+            MixedSession {
+                zone_id,
+                zone: name.to_owned(),
+                boundary: format!("before-{name}"),
+                current: Arc::new(Vec::new()),
+                current_on_hidden: false,
+                deleted: Arc::new(deleted),
+                lookups: Arc::new(AtomicUsize::new(0)),
+                requested: if name == ZONE {
+                    shared_requests.clone()
+                } else {
+                    Arc::new(Mutex::new(Vec::new()))
+                },
+                changes: Arc::new(AtomicUsize::new(1)),
+                inventory: Arc::new(Mutex::new(Vec::new())),
+                expected_database: Some(database),
+            }
+        };
+        let mut shared_library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/shared".into(),
+            Arc::default(),
+            Box::new(source(
+                shared_zone_id.clone(),
+                ZONE,
+                "shared",
+                deleted_lookup_records(&shared_zone_id),
+            )),
+            Arc::new(shared_zone_id.clone()),
+            "shared".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut primary_library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/private".into(),
+            Arc::default(),
+            Box::new(source(primary_zone.clone(), PRIMARY, "private", Vec::new())),
+            Arc::new(primary_zone),
+            "private".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        shared_library.shadow_capture =
+            Some(ShadowCapture::new(db.clone(), baseline_owner(), "com"));
+        primary_library.shadow_capture =
+            Some(ShadowCapture::new(db.clone(), baseline_owner(), "com"));
+        let selection = mixed_selection(variant);
+        let selected = vec![primary_library.clone(), shared_library.clone()];
+        let all = vec![primary_library.clone(), shared_library.clone()];
+        let collection = collection_libraries(&selection, &selected, &all);
+        let context = build_collection_context(&selection, collection)
+            .await
+            .unwrap();
+        let selected_zones = zone_name_set(&selected);
+        let collection_zones = zone_name_set(collection);
+        let mut states = Vec::new();
+        for library in [shared_library, primary_library] {
+            let name = library.zone_name().to_owned();
+            let scope = pass_scope_for_zone(&selection, &name, &selected_zones, &collection_zones);
+            let plan = resolve_passes_for_scope(&library, &selection, scope, &context, &[])
+                .await
+                .unwrap();
+            let mut source = make_run_cycle_library_state_with_passes(
+                &name,
+                &sync_token_key(&name),
+                plan.passes,
+            );
+            source.library = library;
+            states.push(source);
+        }
+        let media = dir.join("media");
+        let base = make_run_cycle_download_config_builder(&media, db.clone());
+        let builder = |mode, exclude, groups, library| {
+            let mut config = (*base(mode, exclude, groups, library)).clone();
+            config.folder_structure = "none".into();
+            config.folder_structure_albums = Arc::from("none");
+            config.folder_structure_smart_folders = Arc::from("none");
+            Arc::new(config)
+        };
+        let token = db.get_metadata(&sync_token_key(ZONE)).await.unwrap();
+        let outcome = crate::sync_loop::runner::drain_catalog_source_revalidation(
+            &[&states[0], &states[1]],
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &download::compute_config_hash(&make_run_cycle_config()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        if chrono::Utc::now().timestamp() < deadline {
+            assert_eq!(outcome.retained, 1);
+            assert!(
+                shared_requests.lock().unwrap().is_empty(),
+                "future debt must not be looked up"
+            );
+            let unchanged: i64 = db
+                .acquire_lock("verify future debt remains unchanged")
+                .unwrap()
+                .query_row(
+                    "SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id=?2",
+                    rusqlite::params![round, DELETED_MASTER],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unchanged, deadline);
+            assert_eq!(db.get_metadata(&sync_token_key(ZONE)).await.unwrap(), token);
+            assert_eq!(metadata_snapshot(), metadata_before);
+            eprintln!("R2_NATURAL_RETRY_NOT_DUE deadline={deadline}");
+            return;
+        }
+        assert_eq!(outcome.retained, 0);
+        assert!(
+            shared_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|names| names.iter().any(|x| x == DELETED_MASTER)
+                    && names.iter().any(|x| x == DELETED_CHILD)),
+            "strict retry must ask for the exact family pair"
+        );
+        {
+            let conn = db
+                .acquire_lock("verify eligible strict family settlement")
+                .unwrap();
+            let deleted: Vec<(String,i64)> = conn.prepare("SELECT version_size,is_deleted FROM assets WHERE library=?1 AND id=?2 ORDER BY version_size").unwrap()
+            .query_map(rusqlite::params![ZONE,DELETED_MASTER],|row|Ok((row.get(0)?,row.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            assert_eq!(
+                deleted,
+                vec![("live_original".to_owned(), 1), ("original".to_owned(), 1)]
+            );
+            let remaining: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1 AND id=?2",
+                    rusqlite::params![round, DELETED_MASTER],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining, 0);
+            let receipt: i64 = conn.query_row("SELECT COUNT(*) FROM download_receipts WHERE library=?1 AND state_id=?2 AND version_size='live_original' AND local_checksum=?3",rusqlite::params![ZONE,DELETED_MASTER,proof.local_checksum],|row|row.get(0)).unwrap();
+            assert_eq!(receipt, 1);
+            let other_source: i64 = conn.query_row("SELECT COUNT(*) FROM download_receipts WHERE library=?1 AND child='asset-primary-current' AND master='primary-current'",[PRIMARY],|row|row.get(0)).unwrap();
+            assert_eq!(other_source, 1);
+        }
+        assert_eq!(db.get_metadata(&sync_token_key(ZONE)).await.unwrap(), token);
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&Sha256::digest(
+                std::fs::read(proof.destination.to_path()).unwrap()
+            )),
+            proof.local_checksum
+        );
+        assert_eq!(
+            std::fs::metadata(proof.destination.to_path())
+                .unwrap()
+                .modified()
+                .unwrap(),
+            published_mtime
+        );
+        assert_eq!(metadata_snapshot(), metadata_before);
+        check_old_files();
+        eprintln!("R2_NATURAL_RETRY_SETTLED deadline={deadline}");
+        return;
+    }
+
     let server = crate::start_wiremock_or_skip!();
     for id in ["shared-current", "primary-current"] {
         Mock::given(method("GET"))
@@ -1139,7 +1451,18 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
             .await;
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = if variant == MixedSelection::BoundPublication {
+        if let Some(parent) = std::env::var_os("KEI_R2_RETAIN_ROOT") {
+            tempfile::Builder::new()
+                .prefix("r2-family-")
+                .tempdir_in(parent)
+                .unwrap()
+        } else {
+            tempfile::tempdir().unwrap()
+        }
+    } else {
+        tempfile::tempdir().unwrap()
+    };
     let root = dir.path().join("media");
     std::fs::create_dir(&root).unwrap();
     let db_path = dir.path().join("state.db");
@@ -1284,22 +1607,7 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
     shared_library.shadow_capture = Some(capture());
     primary_library.shadow_capture = Some(capture());
 
-    let selection = Selection {
-        albums: AlbumSelector::None,
-        albums_explicit: false,
-        smart_folders: SmartFolderSelector::Named {
-            included: BTreeSet::from(["Hidden".to_string()]),
-            excluded: BTreeSet::new(),
-        },
-        smart_folders_explicit: true,
-        libraries: LibrarySelector {
-            primary: variant != MixedSelection::SharedWithUnfiled,
-            shared_all: true,
-            named: BTreeSet::new(),
-            excluded: BTreeSet::new(),
-        },
-        unfiled: variant != MixedSelection::BothHiddenOnly,
-    };
+    let selection = mixed_selection(variant);
     let selected_libraries = if variant == MixedSelection::SharedWithUnfiled {
         vec![shared_library.clone()]
     } else {
@@ -1347,7 +1655,10 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
     );
     assert_eq!(
         kinds(&primary_plan),
-        if variant == MixedSelection::BothWithUnfiled {
+        if matches!(
+            variant,
+            MixedSelection::BothWithUnfiled | MixedSelection::BoundPublication
+        ) {
             vec![PassKind::SmartFolder, PassKind::Unfiled]
         } else {
             vec![PassKind::SmartFolder]
@@ -1593,6 +1904,116 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
         );
     }
 
+    let protected = if variant == MixedSelection::BoundPublication {
+        use crate::state::db::{
+            PreparedPublication, PublicationBinding, TempFileOwnershipStore,
+            provider_selection::SelectionPath,
+        };
+        use sha2::{Digest, Sha256};
+        let (scope, pass, checksum, size, round, due): (String, String, String, i64, String, i64) = {
+            let conn = db
+                .acquire_lock("read actual selected source and alternate rendition")
+                .unwrap();
+            let (scope, pass) = conn.query_row(
+                "SELECT scope,origin_pass FROM download_receipts WHERE library=?1 AND child='asset-shared-current' AND master='shared-current' AND version_size='original'", [ZONE],
+                |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            let (checksum, size) = conn.query_row(
+                "SELECT checksum,size_bytes FROM assets WHERE library=?1 AND id=?2 AND version_size='live_original' AND status='downloaded' AND is_deleted=0",
+                rusqlite::params![ZONE, DELETED_MASTER], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            let (round, due) = conn.query_row(
+                "SELECT r.id,d.next_retry_at FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.library=?1 AND r.mode='catalog_v2' AND r.phase='active' AND d.id=?2",
+                rusqlite::params![ZONE, DELETED_MASTER], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            (scope, pass, checksum, size, round, due)
+        };
+        assert!(
+            due <= chrono::Utc::now().timestamp(),
+            "the real candidate must initially be due"
+        );
+        assert_eq!(
+            PhotoLibrary::provider_scope_projection(&scope),
+            Some((
+                ZONE.to_owned(),
+                shared_zone_id["ownerRecordName"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                "shared".to_owned()
+            ))
+        );
+        let binding = db
+            .bind_publication(
+                baseline_owner(),
+                PublicationBinding {
+                    account_key: String::new(),
+                    provider_key: String::new(),
+                    scope,
+                    library: ZONE.to_owned(),
+                    child: DELETED_CHILD.to_owned(),
+                    master: DELETED_MASTER.to_owned(),
+                    state_id: DELETED_MASTER.to_owned(),
+                    origin_pass: pass,
+                },
+            )
+            .await
+            .unwrap();
+        let destination = root.join("prepared-alternate.mov");
+        let temporary =
+            download::test_temp_download_path(&destination, &checksum, ".family-custody").unwrap();
+        std::fs::write(&temporary, MEDIA).unwrap();
+        std::fs::File::open(&temporary).unwrap().sync_all().unwrap();
+        db.claim_temp_file(&temporary).await.unwrap();
+        let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(MEDIA));
+        let proof = PreparedPublication {
+            binding: Some(binding),
+            library: ZONE.to_owned(),
+            id: DELETED_MASTER.to_owned(),
+            version: "live_original".to_owned(),
+            provider_checksum: checksum,
+            provider_size: size.try_into().unwrap(),
+            temporary: SelectionPath::from_path(&temporary),
+            destination: SelectionPath::from_path(&destination),
+            local_checksum: hash.clone(),
+            source_checksum: hash,
+        };
+        db.prepare_temp_publication(&temporary, &proof)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_prepared_publications(
+                ZONE,
+                DELETED_MASTER,
+                crate::state::VersionSizeKey::LiveOriginal
+            )
+            .await
+            .unwrap(),
+            vec![proof.clone()]
+        );
+        assert!(!destination.exists());
+        Some((proof, round))
+    } else {
+        None
+    };
+
+    let family_before = if protected.is_some() {
+        let conn = db
+            .acquire_lock("snapshot protected family before strict settlement")
+            .unwrap();
+        let mut stmt = conn.prepare("SELECT json_array(version_size,status,checksum,size_bytes,local_path,is_deleted,deleted_at,metadata_hash) FROM assets WHERE library=?1 AND id=?2 ORDER BY version_size").unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params![ZONE, DELETED_MASTER], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        Some(rows)
+    } else {
+        None
+    };
     let requests_before_drain = shared_requests.lock().unwrap().len();
     let catalog = crate::sync_loop::runner::drain_catalog_source_revalidation(
         &[&shared_state, &primary_state],
@@ -1611,6 +2032,141 @@ async fn mixed_shared_hidden_baseline_variant(shared_zone_id: Value, variant: Mi
                 && names.iter().any(|name| name == DELETED_CHILD)),
         "the typed drain must request the exact source pair"
     );
+    if let Some((proof, round)) = protected {
+        use crate::state::db::TempFileOwnershipStore;
+        assert_eq!(catalog.retained, 1);
+        assert_eq!(catalog.retained_sources, vec![ZONE]);
+        let deadline: i64 = {
+            let conn = db
+                .acquire_lock("verify protected family and retained debt")
+                .unwrap();
+            let mut stmt = conn.prepare("SELECT json_array(version_size,status,checksum,size_bytes,local_path,is_deleted,deleted_at,metadata_hash) FROM assets WHERE library=?1 AND id=?2 ORDER BY version_size").unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params![ZONE, DELETED_MASTER], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(Some(rows), family_before);
+            conn.query_row(
+                "SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id=?2",
+                rusqlite::params![round, DELETED_MASTER],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(deadline > chrono::Utc::now().timestamp());
+        assert_eq!(std::fs::read(proof.temporary.to_path()).unwrap(), MEDIA);
+        assert!(!proof.destination.to_path().exists());
+        drop(shared_state);
+        drop(primary_state);
+        drop(collection_context);
+        drop(selected_libraries);
+        drop(all_libraries);
+        drop(base);
+        drop(result);
+        assert_eq!(
+            Arc::strong_count(&db),
+            1,
+            "all owner handles must close before publication recovery"
+        );
+        drop(db);
+        let reopened = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .get_prepared_publications(
+                    ZONE,
+                    DELETED_MASTER,
+                    crate::state::VersionSizeKey::LiveOriginal
+                )
+                .await
+                .unwrap(),
+            vec![proof.clone()]
+        );
+        let saved_deadline: i64 = reopened
+            .acquire_lock("reopened exact protected debt")
+            .unwrap()
+            .query_row(
+                "SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id=?2",
+                rusqlite::params![round, DELETED_MASTER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved_deadline, deadline);
+        download::test_publish_part_no_overwrite(
+            &proof.temporary.to_path(),
+            &proof.destination.to_path(),
+        )
+        .await
+        .unwrap();
+        assert!(!proof.temporary.to_path().exists());
+        assert_eq!(std::fs::read(proof.destination.to_path()).unwrap(), MEDIA);
+        reopened
+            .mark_verified_download(
+                ZONE,
+                DELETED_MASTER,
+                "live_original",
+                &proof.destination.to_path(),
+                &proof.local_checksum,
+                Some(&proof.source_checksum),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            reopened
+                .get_prepared_publications(
+                    ZONE,
+                    DELETED_MASTER,
+                    crate::state::VersionSizeKey::LiveOriginal
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let later: i64 = reopened
+            .acquire_lock("verify finalized debt remains deferred")
+            .unwrap()
+            .query_row(
+                "SELECT next_retry_at FROM source_revalidation_debt WHERE round=?1 AND id=?2",
+                rusqlite::params![round, DELETED_MASTER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(later, deadline);
+        for (path, bytes, mtime) in &deleted_snapshots {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+            assert_eq!(&std::fs::metadata(path).unwrap().modified().unwrap(), mtime);
+        }
+        let finalized_family: Vec<String> = {
+            let conn = reopened.acquire_lock("snapshot finalized family").unwrap();
+            let mut stmt = conn.prepare("SELECT json_array(version_size,status,checksum,size_bytes,local_path,is_deleted,deleted_at,metadata_hash) FROM assets WHERE library=?1 AND id=?2 ORDER BY version_size").unwrap();
+            stmt.query_map(rusqlite::params![ZONE, DELETED_MASTER], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let old_files:Vec<_> = deleted_snapshots.iter().map(|(path, bytes, mtime)| {
+            use sha2::{Digest, Sha256};
+            json!({"path":path,"sha256":data_encoding::HEXLOWER.encode(&Sha256::digest(bytes)),"mtime_ns":mtime.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()})
+        }).collect();
+        drop(reopened);
+        let state = json!({"round":round,"deadline":deadline,"zone":shared_zone_id,"proof":proof,"family_before":family_before,"finalized_family":finalized_family,"old_files":old_files});
+        std::fs::write(
+            dir.path().join("r2-state.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        server.verify().await;
+        if std::env::var_os("KEI_R2_RETAIN_ROOT").is_some() {
+            let path = dir.keep();
+            eprintln!("R2_RETAINED_ROOT={} R2_DEADLINE={deadline}", path.display());
+        }
+        return;
+    }
     assert_eq!(catalog.retained, 0);
 
     {

@@ -81,6 +81,13 @@ pub(crate) fn test_temp_download_path(
 ) -> anyhow::Result<std::path::PathBuf> {
     file::temp_download_path(destination, checksum, suffix)
 }
+#[cfg(test)]
+pub(crate) async fn test_publish_part_no_overwrite(
+    part: &std::path::Path,
+    destination: &std::path::Path,
+) -> anyhow::Result<()> {
+    file::rename_part_to_final(part, destination).await
+}
 pub(crate) use orchestration::queue_projection::{has_due_retained_work, prepare_retained_sources};
 pub(crate) use orchestration::recent::requires_recovery as recent_selection_requires_recovery;
 pub(crate) use orchestration::reconciliation::recover_recorded_sources;
