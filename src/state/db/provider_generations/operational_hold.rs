@@ -21,6 +21,7 @@ pub(crate) struct SourceRequest {
     pub(crate) directory: PathBuf,
     pub(crate) catalog_plan: Option<String>,
     pub(crate) enum_policy: String,
+    pub(crate) active_token_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -47,6 +48,7 @@ pub(crate) struct SourcePrework {
     request: SourceRequest,
     futures: Vec<FutureOwner>,
     protected_retries: Vec<ProtectedRetry>,
+    active_observation: Option<super::observation::ActiveObservation>,
 }
 
 #[cfg(test)]
@@ -519,12 +521,27 @@ impl SqliteStateDb {
     ) -> Result<Option<SourcePrework>, StateError> {
         self.with_conn_mut("capturing source operational ownership", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let active_observation = if let Some(key) = &request.active_token_key {
+                let Some(observation) = super::observation::capture_active_observation(
+                    &tx,
+                    key,
+                    &request.specification,
+                    &request.enum_policy,
+                )?
+                else {
+                    return Ok(None);
+                };
+                Some(observation)
+            } else {
+                None
+            };
             Ok(
                 inspect(&tx, &request, None, &[], None, false)?.map(|(futures, accounting)| {
                     SourcePrework {
                         request,
                         futures,
                         protected_retries: accounting.protected_retries,
+                        active_observation,
                     }
                 }),
             )
@@ -541,6 +558,17 @@ impl SqliteStateDb {
     ) -> Result<Option<SourceAccounting>, StateError> {
         self.with_conn_mut("revalidating source operational ownership", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            if let Some(key) = &prework.request.active_token_key {
+                let current = super::observation::capture_active_observation(
+                    &tx,
+                    key,
+                    &prework.request.specification,
+                    &prework.request.enum_policy,
+                )?;
+                if current.as_ref() != prework.active_observation.as_ref() || current.is_none() {
+                    return Ok(None);
+                }
+            }
             Ok(inspect(
                 &tx,
                 &prework.request,

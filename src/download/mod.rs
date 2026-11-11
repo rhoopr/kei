@@ -55,8 +55,8 @@ pub(crate) use orchestration::generation::{
     catalog_plan_digest_from_source_context,
 };
 pub(crate) use orchestration::generation::{
-    OperationalPrework, has_current_observation, has_due as has_due_selection_work,
-    operational_prework,
+    OperationalBasis, OperationalPrework, has_current_observation,
+    has_due as has_due_selection_work, operational_prework,
 };
 pub(crate) use orchestration::maintenance::{
     RefreshTailOutcome, drain_pending_metadata_rewrites, drain_pending_metadata_rewrites_witnessed,

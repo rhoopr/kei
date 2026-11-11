@@ -453,6 +453,47 @@ fn descriptor_key(token: &str) -> Option<String> {
                 .map(|s| format!("{STAGED}{s}"))
         })
 }
+
+/// Exact ACTIVE observation captured for a health-only skipped source.
+/// It is transient and must never be rendered or used as checkpoint authority.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct ActiveObservation {
+    token: String,
+    descriptor: String,
+}
+
+pub(super) fn capture_active_observation(
+    conn: &Connection,
+    token_key: &str,
+    spec: &GenerationSpec,
+    enum_policy: &str,
+) -> Result<Option<ActiveObservation>, StateError> {
+    let Some(library) = spec.zone.get("zoneName").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if spec.format != 2 || token_key != format!("sync_token:v27:{library}") {
+        return Ok(None);
+    }
+    validate_spec(spec)?;
+    let key = format!("{ACTIVE}{library}");
+    let Some(token) = metadata(conn, token_key)?.filter(|token| !token.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let Some(descriptor) = metadata(conn, &key)? else {
+        return Ok(None);
+    };
+    let Some(saved) = valid(conn, &key, &token)? else {
+        return Ok(None);
+    };
+    if saved.plans != [Plan::of(spec)]
+        || saved.policy[0].as_deref() != Some(enum_policy)
+        || !descriptor_own_source(&saved)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(ActiveObservation { token, descriptor }))
+}
+
 fn valid(conn: &Connection, key: &str, token: &str) -> Result<Option<Descriptor>, StateError> {
     let Some(raw) = metadata(conn, key)? else {
         return Ok(None);

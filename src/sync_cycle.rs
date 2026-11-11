@@ -494,6 +494,47 @@ fn current_retry_plan_universe<'a>(
     )
 }
 
+// A deferred watch plan may be inspected for health only. Unlike retry
+// authority, this does not require a just-refreshed plan: the state owner must
+// match the cached plan against its exact current ACTIVE observation instead.
+fn current_health_source_universe(
+    all: &[&LibraryState],
+    reached: &[&LibraryState],
+    expected: &[ExpectedSource],
+) -> bool {
+    !all.is_empty()
+        && all.len() == expected.len()
+        && !all.iter().any(|state| state.plan_is_stale)
+        && reached.iter().all(|state| {
+            all.iter()
+                .filter(|full| std::ptr::eq(**full, *state))
+                .count()
+                == 1
+                && reached
+                    .iter()
+                    .filter(|other| std::ptr::eq(**other, *state))
+                    .count()
+                    == 1
+        })
+        && expected.iter().all(|source| {
+            let mut matches = all
+                .iter()
+                .filter(|state| state.zone_name == source.zone_name);
+            let (Some(state), None) = (matches.next(), matches.next()) else {
+                return false;
+            };
+            expected
+                .iter()
+                .filter(|other| other.zone_name == source.zone_name)
+                .count()
+                == 1
+                && state.library.baseline_scope() == source.baseline_scope
+                && has_active_passes(state) == source.active_passes
+                && (source.skip_authority == SkipAuthority::Reached)
+                    == reached.iter().any(|item| std::ptr::eq(*item, *state))
+        })
+}
+
 #[derive(Clone)]
 pub(crate) struct SourceOutcome {
     pub(crate) zone_name: String,
@@ -508,6 +549,7 @@ pub(crate) struct SourceOutcome {
     pub(crate) media_failures: Vec<download::pipeline::AccountedMediaFailure>,
     pub(crate) media_failure_unaccounted: bool,
     operational_active: bool,
+    operational_no_changes: bool,
     operational_eligible: bool,
     operational_other_error: bool,
     operational_pre_tail_paths: Option<Vec<(std::path::PathBuf, std::path::PathBuf)>>,
@@ -607,9 +649,17 @@ impl CycleResult {
                 return Ok(None);
             }
             if !source.operational_eligible
-                || !source.reached
+                || (!source.reached && !source.operational_no_changes)
                 || source.operational_other_error
                 || source.media_failure_unaccounted
+                || (source.operational_no_changes
+                    && (source.reached
+                        || source.ordinary_committed
+                        || !source.media_failures.is_empty()
+                        || self
+                            .holds
+                            .iter()
+                            .any(|hold| hold.source == source.zone_name)))
             {
                 return Ok(None);
             }
@@ -641,7 +691,7 @@ impl CycleResult {
             }
             // Preservation alone is not proof that the source made ordinary
             // progress. Sparse holds instead require a completed delta below.
-            if !sparse && !source.ordinary_committed {
+            if !sparse && !source.ordinary_committed && !source.operational_no_changes {
                 return Ok(None);
             }
             let witness = if sparse {
@@ -1749,11 +1799,85 @@ pub(crate) async fn run_cycle_with_witness(
             media_failures: Vec::new(),
             media_failure_unaccounted: false,
             operational_active: expected.active_passes,
+            operational_no_changes: false,
             operational_eligible: false,
             operational_other_error: false,
             operational_pre_tail_paths: None,
         })
         .collect();
+    // Capture skipped-source authority before any reached source can mutate
+    // owner state. This is health evidence only and does not mark it reached.
+    if !config.runtime.dry_run
+        && !config.runtime.only_print_filenames
+        && !is_retry_failed
+        && let (Some(all), Some(db), Some(epoch)) =
+            (all_library_states, state_db, sync_epoch.as_deref())
+        && current_health_source_universe(all, library_states, expected_sources)
+        && matches!(
+            db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY).await,
+            Ok(None)
+        )
+    {
+        let enum_policy = download::compute_config_hash(config);
+        for expected in expected_sources.iter().filter(|source| {
+            source.skip_authority == SkipAuthority::NoChanges && source.active_passes
+        }) {
+            let Some(state) = all
+                .iter()
+                .find(|state| state.zone_name == expected.zone_name)
+            else {
+                continue;
+            };
+            let Ok(Some(raw)) = db
+                .get_metadata(&state::db::sync_epoch::library_key(&state.zone_name))
+                .await
+            else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_str::<state::db::sync_epoch::SyncEpochLibrary>(&raw)
+            else {
+                continue;
+            };
+            let download_config = build_download_config(
+                download::SyncMode::Full,
+                Arc::new(rustc_hash::FxHashSet::default()),
+                Arc::new(download::AssetGroupings::default()),
+                Arc::from(state.zone_name.as_str()),
+            );
+            let Ok(download_config) = download_config.check_ownership().await else {
+                continue;
+            };
+            let Ok(Some(prework)) = download::operational_prework(
+                &state.plan.passes,
+                &download_config,
+                download_controls,
+                download::OperationalBasis {
+                    baseline_scope: &expected.baseline_scope,
+                    epoch,
+                    attempt: &record.attempt,
+                    enum_policy: &enum_policy,
+                    active_token_key: Some(&state.sync_token_key),
+                },
+            )
+            .await
+            else {
+                continue;
+            };
+            if !std::ptr::eq(
+                std::ptr::from_ref(db).cast::<()>(),
+                Arc::as_ptr(&prework.db).cast::<()>(),
+            ) {
+                continue;
+            }
+            if let Some(source) = sources
+                .iter_mut()
+                .find(|source| source.zone_name == expected.zone_name)
+            {
+                source.operational_no_changes = true;
+                source.operational_prework = Some(prework);
+            }
+        }
+    }
     let mut sparse_identity_proofs = Vec::new();
 
     let cycle_has_stale_plan = library_states.iter().any(|s| s.plan_is_stale);
@@ -3204,10 +3328,13 @@ pub(crate) async fn run_cycle_with_witness(
                 &lib_state.plan.passes,
                 &download_config,
                 download_controls,
-                &source.baseline_scope,
-                epoch,
-                attempt,
-                &enum_config_hash,
+                download::OperationalBasis {
+                    baseline_scope: &source.baseline_scope,
+                    epoch,
+                    attempt,
+                    enum_policy: &enum_config_hash,
+                    active_token_key: None,
+                },
             )
             .await?;
             if let Some(prework) = &source.operational_prework {
@@ -5707,6 +5834,64 @@ mod tests {
         peer.plan_needs_refresh = false;
         peer.plan_is_stale = true;
         assert!(current_retry_plan_universe(&[&primary, &peer], &reached, &sources).is_none());
+    }
+
+    #[test]
+    fn health_source_universe_accepts_deferred_but_not_stale_or_ambiguous_peer() {
+        let primary = make_library_state(true);
+        let mut peer = make_library_state(true);
+        peer.zone_name = "SharedSync-peer".into();
+        peer.library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+            Box::new(crate::test_helpers::MockPhotosSession::new()),
+            "SharedSync-peer",
+        );
+        peer.plan_needs_refresh = true;
+        let sources = [
+            ExpectedSource {
+                zone_name: primary.zone_name.clone(),
+                baseline_scope: primary.library.baseline_scope(),
+                active_passes: true,
+                skip_authority: SkipAuthority::Reached,
+            },
+            ExpectedSource {
+                zone_name: peer.zone_name.clone(),
+                baseline_scope: peer.library.baseline_scope(),
+                active_passes: true,
+                skip_authority: SkipAuthority::NoChanges,
+            },
+        ];
+        assert!(current_health_source_universe(
+            &[&primary, &peer],
+            &[&primary],
+            &sources
+        ));
+        assert!(current_retry_plan_universe(&[&primary, &peer], &[&primary], &sources).is_none());
+        assert!(!current_health_source_universe(
+            &[&primary],
+            &[&primary],
+            &sources
+        ));
+        assert!(!current_health_source_universe(
+            &[&primary, &peer],
+            &[&primary, &primary],
+            &sources
+        ));
+        assert!(!current_health_source_universe(
+            &[&primary, &peer],
+            &[&primary, &peer],
+            &sources
+        ));
+        assert!(!current_health_source_universe(
+            &[&primary, &peer],
+            &[&primary],
+            &[sources[0].clone(), sources[0].clone()]
+        ));
+        peer.plan_is_stale = true;
+        assert!(!current_health_source_universe(
+            &[&primary, &peer],
+            &[&primary],
+            &sources
+        ));
     }
 
     #[test]

@@ -251,14 +251,19 @@ pub(crate) async fn context(
 }
 
 /// Capture the exact source owner before dispatch without admitting work.
+pub(crate) struct OperationalBasis<'a> {
+    pub(crate) baseline_scope: &'a str,
+    pub(crate) epoch: &'a str,
+    pub(crate) attempt: &'a str,
+    pub(crate) enum_policy: &'a str,
+    pub(crate) active_token_key: Option<&'a str>,
+}
+
 pub(crate) async fn operational_prework(
     passes: &[AlbumPass],
     config: &DownloadConfig,
     controls: DownloadControls,
-    baseline_scope: &str,
-    epoch: &str,
-    attempt: &str,
-    enum_policy: &str,
+    basis: OperationalBasis<'_>,
 ) -> Result<Option<OperationalPrework>> {
     let Some(context) = context(passes, config, controls).await? else {
         return Ok(None);
@@ -271,14 +276,15 @@ pub(crate) async fn operational_prework(
     let request = crate::state::db::provider_generations::operational_hold::SourceRequest {
         owner: context.capture.owner.clone(),
         specification: context.spec(config, context.config_hash.clone()),
-        baseline_scope: baseline_scope.to_owned(),
-        epoch: epoch.to_owned(),
-        attempt: attempt.to_owned(),
+        baseline_scope: basis.baseline_scope.to_owned(),
+        epoch: basis.epoch.to_owned(),
+        attempt: basis.attempt.to_owned(),
         directory: config.directory.to_path_buf(),
         catalog_plan: context
             .catalog_plan_context(config)
             .map(|plan| catalog_plan_digest_from_source_context(&plan)),
-        enum_policy: enum_policy.to_owned(),
+        enum_policy: basis.enum_policy.to_owned(),
+        active_token_key: basis.active_token_key.map(str::to_owned),
     };
     let Some(prework) = context.capture.db.operational_prework(request).await? else {
         return Ok(None);

@@ -675,6 +675,18 @@ impl Fixture {
     }
 
     async fn run_two(&self, cycle: usize, provider_error: bool, peer_first: bool) -> CycleResult {
+        self.run_two_filtered(cycle, provider_error, peer_first, false, false)
+            .await
+    }
+
+    async fn run_two_filtered(
+        &self,
+        cycle: usize,
+        provider_error: bool,
+        peer_first: bool,
+        skip_peer: bool,
+        peer_media: bool,
+    ) -> CycleResult {
         self.peer_errors.store(0, Ordering::SeqCst);
         let primary = self
             .library_state(
@@ -699,17 +711,31 @@ impl Fixture {
             )
             .await;
         let peer_key = sync_token_key(PEER_ZONE);
-        let peer = self
+        let peer_baseline = if peer_media {
+            let mut records = pair(
+                "op-peer-baseline",
+                "peer-baseline.JPG",
+                &format!("{}/peer-baseline", self._server.uri()),
+                46,
+            );
+            records[0]["zoneID"] = zone_for(PEER_ZONE);
+            records[1]["zoneID"] = zone_for(PEER_ZONE);
+            records[1]["fields"]["masterRef"]["value"]["zoneID"] = zone_for(PEER_ZONE);
+            Arc::new(records)
+        } else {
+            Arc::clone(&self.baseline)
+        };
+        let mut peer = self
             .library_state(
                 Session {
-                    baseline: Arc::clone(&self.baseline),
+                    baseline: peer_baseline,
                     progress: Arc::clone(&self.progress),
                     hold_child: Arc::clone(&self.hold_child),
                     hold_pair: Arc::clone(&self.hold_pair),
                     followup_child: Arc::clone(&self.followup_child),
                     recovery_events: Arc::clone(&self.recovery_events),
                     zone_name: PEER_ZONE.to_owned(),
-                    empty: true,
+                    empty: !peer_media,
                     cycle,
                     fail_inventory: false,
                     provider_error,
@@ -721,6 +747,7 @@ impl Fixture {
                 &peer_key,
             )
             .await;
+        peer.plan_needs_refresh = skip_peer;
         let db: Arc<dyn download::DownloadStore> = self.db.clone();
         let base = make_run_cycle_download_config_builder(&self.root, db);
         let builder = |mode, exclude, groups, zone| {
@@ -734,6 +761,37 @@ impl Fixture {
         } else {
             vec![&primary, &peer]
         };
+        if skip_peer {
+            let expected = vec![
+                ExpectedSource {
+                    zone_name: primary.zone_name.clone(),
+                    baseline_scope: primary.library.baseline_scope(),
+                    active_passes: true,
+                    skip_authority: SkipAuthority::Reached,
+                },
+                ExpectedSource {
+                    zone_name: peer.zone_name.clone(),
+                    baseline_scope: peer.library.baseline_scope(),
+                    active_passes: true,
+                    skip_authority: SkipAuthority::NoChanges,
+                },
+            ];
+            return Box::pin(run_cycle_with_witness(
+                &[&primary],
+                &self.config,
+                Some(self.db.as_ref()),
+                false,
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &self.shared,
+                &CancellationToken::new(),
+                Arc::new(download::MetadataWriterWitness::default()),
+                &expected,
+                Some(&states),
+            ))
+            .await
+            .unwrap();
+        }
         run_cycle(
             &states,
             &self.config,
@@ -1406,4 +1464,402 @@ async fn operational_safe_hold_allows_authorized_no_changes_peer() {
         cycle_facts(&held)
     );
     report_health(&fixture, &held).await;
+}
+
+#[tokio::test]
+async fn skipped_peer_active_observation_is_required_and_rechecked() {
+    for invalidate_after_prepare in [false, true] {
+        let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
+            .await
+            .expect("synthetic peer fixture");
+        let baseline = fixture.run_two(0, false, false).await;
+        assert!(baseline.can_advance_database_checkpoint(), "{baseline:?}");
+        let peer_key = sync_token_key(PEER_ZONE);
+        let checkpoint = fixture.db.get_metadata(&peer_key).await.unwrap();
+        let descriptor_key = format!("observed_selection:v27:{PEER_ZONE}");
+        assert!(
+            fixture
+                .db
+                .get_metadata(&descriptor_key)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        if !invalidate_after_prepare {
+            fixture
+                .db
+                .set_metadata(&descriptor_key, "invalid")
+                .await
+                .unwrap();
+        }
+        let mut held = fixture.run_two_filtered(1, false, false, true, false).await;
+        assert_eq!(held.stats.failed, 1, "{held:?}");
+        let peer = held
+            .sources
+            .iter()
+            .find(|source| source.zone_name == PEER_ZONE)
+            .unwrap();
+        assert!(!peer.reached && !peer.ordinary_committed);
+        assert_eq!(peer.operational_prework.is_some(), invalidate_after_prepare);
+        let shutdown = CancellationToken::new();
+        held.prepare_operational_tail(&fixture.shared, &shutdown)
+            .await
+            .unwrap();
+        assert_eq!(held.operational_tail_prepared(), invalidate_after_prepare);
+        if invalidate_after_prepare {
+            fixture
+                .db
+                .set_metadata(&descriptor_key, "invalid")
+                .await
+                .unwrap();
+        }
+        assert!(
+            held.finish_operational_tail(&fixture.shared, &shutdown)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!held.operational_safe_holds);
+        let (health, report) =
+            reported_health(&fixture, &held, "skipped-peer-invalid-active.json").await;
+        assert!(health.last_success_at.is_none());
+        assert_eq!(report["status"], "partial_failure");
+        assert_eq!(report["stats"]["failed"], 1);
+        assert_eq!(
+            fixture.db.get_metadata(&peer_key).await.unwrap(),
+            checkpoint
+        );
+        assert_eq!(
+            std::fs::read(fixture.root.join("baseline.JPG")).unwrap(),
+            MEDIA
+        );
+    }
+}
+
+#[tokio::test]
+async fn skipped_peer_new_unknown_sparse_debt_vetoes_guarded_health() {
+    use crate::state::{SparseEvidence, SparseSourceId};
+
+    let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
+        .await
+        .expect("synthetic peer fixture");
+    let baseline = fixture.run_two(0, false, false).await;
+    assert!(baseline.can_advance_database_checkpoint(), "{baseline:?}");
+    let peer_key = sync_token_key(PEER_ZONE);
+    let checkpoint = fixture.db.get_metadata(&peer_key).await.unwrap();
+    let mut held = fixture.run_two_filtered(1, false, false, true, false).await;
+    let shutdown = CancellationToken::new();
+    held.prepare_operational_tail(&fixture.shared, &shutdown)
+        .await
+        .unwrap();
+    assert!(held.operational_tail_prepared());
+    let source = SparseSourceId::new("synthetic-unknown-peer-child");
+    fixture
+        .db
+        .observe_sparse_identity(
+            PEER_ZONE,
+            &source,
+            &SparseEvidence::new("synthetic-unknown".to_owned()),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        held.finish_operational_tail(&fixture.shared, &shutdown)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!held.operational_safe_holds);
+    assert_eq!(
+        fixture.db.sparse_identities(PEER_ZONE).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        fixture.db.get_metadata(&peer_key).await.unwrap(),
+        checkpoint
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("baseline.JPG")).unwrap(),
+        MEDIA
+    );
+}
+
+#[tokio::test]
+async fn skipped_peer_rechecks_the_exact_valid_active_observation() {
+    let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
+        .await
+        .expect("synthetic peer fixture");
+    assert!(
+        fixture
+            .run_two(0, false, false)
+            .await
+            .can_advance_database_checkpoint()
+    );
+    let peer_key = sync_token_key(PEER_ZONE);
+    let checkpoint = fixture.db.get_metadata(&peer_key).await.unwrap();
+    let mut held = fixture.run_two_filtered(1, false, false, true, false).await;
+    let shutdown = CancellationToken::new();
+    held.prepare_operational_tail(&fixture.shared, &shutdown)
+        .await
+        .unwrap();
+    assert!(held.operational_tail_prepared());
+    let key = format!("observed_selection:v27:{PEER_ZONE}");
+    let original = fixture.db.get_metadata(&key).await.unwrap().unwrap();
+    let value: serde_json::Value = serde_json::from_str(&original).unwrap();
+    let changed = serde_json::to_string_pretty(&value).unwrap();
+    assert_ne!(original, changed);
+    {
+        let conn = fixture
+            .db
+            .acquire_lock("change peer descriptor bytes")
+            .unwrap();
+        conn.execute(
+            "UPDATE metadata SET value=?1 WHERE key=?2",
+            rusqlite::params![changed, key],
+        )
+        .unwrap();
+        let peer = held
+            .sources
+            .iter()
+            .find(|source| source.zone_name == PEER_ZONE)
+            .unwrap();
+        let evidence = peer
+            .operational_prework
+            .as_ref()
+            .unwrap()
+            .prework
+            .census_evidence_for_test(&conn)
+            .unwrap();
+        assert!(
+            evidence.1,
+            "the logically unchanged descriptor remains valid for its real source"
+        );
+    }
+    assert!(
+        held.finish_operational_tail(&fixture.shared, &shutdown)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!held.operational_safe_holds);
+    assert_eq!(
+        fixture.db.get_metadata(&peer_key).await.unwrap(),
+        checkpoint
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("baseline.JPG")).unwrap(),
+        MEDIA
+    );
+}
+
+#[tokio::test]
+async fn skipped_peer_owner_pin_drift_refuses_mixed_health() {
+    let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
+        .await
+        .expect("synthetic peer fixture");
+    assert!(
+        fixture
+            .run_two(0, false, false)
+            .await
+            .can_advance_database_checkpoint()
+    );
+    let checkpoint = fixture
+        .db
+        .get_metadata(&sync_token_key(PEER_ZONE))
+        .await
+        .unwrap();
+    let mut held = fixture.run_two_filtered(1, false, false, true, false).await;
+    let peer = held
+        .sources
+        .iter_mut()
+        .find(|source| source.zone_name == PEER_ZONE)
+        .unwrap();
+    let prework = peer
+        .operational_prework
+        .as_mut()
+        .expect("actual skipped owner prework");
+    let other =
+        serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"other-provider"}})).unwrap();
+    prework.owner = crate::state::db::account::AccountOwner::authenticated(
+        "baseline@example.invalid",
+        "com",
+        &other,
+    )
+    .unwrap();
+    let shutdown = CancellationToken::new();
+    held.prepare_operational_tail(&fixture.shared, &shutdown)
+        .await
+        .unwrap();
+    assert!(!held.operational_tail_prepared());
+    assert!(
+        held.finish_operational_tail(&fixture.shared, &shutdown)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!held.operational_safe_holds);
+    assert_eq!(
+        fixture
+            .db
+            .get_metadata(&sync_token_key(PEER_ZONE))
+            .await
+            .unwrap(),
+        checkpoint
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("baseline.JPG")).unwrap(),
+        MEDIA
+    );
+}
+
+#[tokio::test]
+async fn skipped_peer_unclassified_owner_debt_is_retained() {
+    let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
+        .await
+        .expect("synthetic peer fixture");
+    Mock::given(method("GET"))
+        .and(path("/peer-baseline"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(1)
+        .mount(&fixture._server)
+        .await;
+    assert!(
+        fixture
+            .run_two_filtered(0, false, false, false, true)
+            .await
+            .can_advance_database_checkpoint()
+    );
+    let checkpoint = fixture
+        .db
+        .get_metadata(&sync_token_key(PEER_ZONE))
+        .await
+        .unwrap()
+        .unwrap();
+    let scope = fixture
+        .db
+        .get_metadata(&format!("download_ledger_scope:{PEER_ZONE}"))
+        .await
+        .unwrap()
+        .unwrap();
+    let policy = fixture
+        .db
+        .get_metadata("enum_config_hash")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut held = fixture.run_two_filtered(1, false, false, true, true).await;
+    let shutdown = CancellationToken::new();
+    held.prepare_operational_tail(&fixture.shared, &shutdown)
+        .await
+        .unwrap();
+    assert!(held.operational_tail_prepared());
+    fixture
+        .db
+        .seed_source_revalidation(
+            baseline_owner(),
+            PEER_ZONE.to_owned(),
+            scope,
+            policy,
+            checkpoint.clone(),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+    let before = {
+        let conn = fixture
+            .db
+            .acquire_lock("simulate unknown peer census mode")
+            .unwrap();
+        let changed = conn.execute(
+            "UPDATE source_revalidation_rounds SET mode='future_catalog_mode' WHERE library=?1 AND phase='observing'",
+            [PEER_ZONE],
+        ).unwrap();
+        assert!(changed > 0);
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE r.library=?1 AND r.mode='future_catalog_mode'",
+            [PEER_ZONE], |row| row.get(0),
+        ).unwrap();
+        assert!(count > 0, "owner-created peer debt must exist");
+        count
+    };
+    assert!(
+        held.finish_operational_tail(&fixture.shared, &shutdown)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!held.operational_safe_holds);
+    let after: i64 = fixture.db.acquire_lock("verify unknown peer debt").unwrap().query_row(
+        "SELECT count(*) FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE r.library=?1 AND r.mode='future_catalog_mode'",
+        [PEER_ZONE], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(after, before);
+    assert_eq!(
+        fixture
+            .db
+            .get_metadata(&sync_token_key(PEER_ZONE))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(checkpoint.as_str())
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("peer-baseline.JPG")).unwrap(),
+        MEDIA
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn skipped_peer_real_journal_vetoes_mixed_health() {
+    let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
+        .await
+        .expect("synthetic peer fixture");
+    Mock::given(method("GET"))
+        .and(path("/peer-baseline"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(1)
+        .mount(&fixture._server)
+        .await;
+    let baseline = fixture.run_two_filtered(0, false, false, false, true).await;
+    assert!(baseline.can_advance_database_checkpoint(), "{baseline:?}");
+    let target = fixture.root.join("peer-baseline.JPG");
+    assert_eq!(std::fs::read(&target).unwrap(), MEDIA);
+    let checkpoint = fixture
+        .db
+        .get_metadata(&sync_token_key(PEER_ZONE))
+        .await
+        .unwrap();
+    let mut held = fixture.run_two_filtered(1, false, false, true, true).await;
+    let shutdown = CancellationToken::new();
+    held.prepare_operational_tail(&fixture.shared, &shutdown)
+        .await
+        .unwrap();
+    assert!(held.operational_tail_prepared());
+    let part = fixture.root.join("peer-journal.part");
+    crate::download::file::seed_test_replacement_journal(
+        &target,
+        &part,
+        MEDIA,
+        b"synthetic replacement",
+    )
+    .unwrap();
+    assert!(
+        held.finish_operational_tail(&fixture.shared, &shutdown)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!held.operational_safe_holds);
+    assert_eq!(std::fs::read(&target).unwrap(), MEDIA);
+    assert_eq!(std::fs::read(&part).unwrap(), b"synthetic replacement");
+    assert_eq!(
+        fixture
+            .db
+            .get_metadata(&sync_token_key(PEER_ZONE))
+            .await
+            .unwrap(),
+        checkpoint
+    );
 }
