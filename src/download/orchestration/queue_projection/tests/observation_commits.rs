@@ -1913,7 +1913,14 @@ impl crate::icloud::photos::PhotosSession for QuietLegacySession {
     }
 }
 
-async fn quiet_current_legacy_census(unknown_mode: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LegacyCensusCase {
+    Legacy,
+    UnknownMode,
+    MalformedScope,
+}
+
+async fn quiet_current_legacy_census(case: LegacyCensusCase) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let dir = tempfile::tempdir().unwrap();
     let fixture = CatalogOwnerFixture::new(dir.path(), "policy", false).await;
@@ -2003,7 +2010,27 @@ async fn quiet_current_legacy_census(unknown_mode: bool) {
             .unwrap(),
     );
     assert_eq!(snapshot(&db), before, "legacy owner survives reopen");
-    if unknown_mode {
+    let active_key = "observed_selection:v27:PrimarySync";
+    let active = db.get_metadata(active_key).await.unwrap().unwrap();
+    let descriptor: Value = serde_json::from_str(&active).unwrap();
+    assert_eq!(descriptor["revalidation_round"], before.0);
+    let token = db.get_metadata(TOKEN).await.unwrap().unwrap();
+    let original_scope: String = db
+        .acquire_lock("read owner-created legacy scope")
+        .unwrap()
+        .query_row(
+            "SELECT scope FROM source_revalidation_rounds WHERE id=?1",
+            [&before.0],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        PhotoLibrary::provider_scope_projection(&original_scope)
+            .unwrap()
+            .0,
+        "PrimarySync"
+    );
+    if case == LegacyCensusCase::UnknownMode {
         db.acquire_lock("simulate future mode on the actual selected round")
             .unwrap()
             .execute(
@@ -2011,8 +2038,36 @@ async fn quiet_current_legacy_census(unknown_mode: bool) {
                 [&before.0],
             )
             .unwrap();
+    } else if case == LegacyCensusCase::MalformedScope {
+        assert_eq!(db.acquire_lock("simulate malformed scope on the actual selected round").unwrap().execute(
+            "UPDATE source_revalidation_rounds SET scope='future-malformed-scope' WHERE id=?1 AND mode='legacy_unfiled_v1' AND enum_hash='policy'",
+            [&before.0],
+        ).unwrap(), 1);
     }
     let before = snapshot(&db);
+    let rows = |db: &SqliteStateDb| {
+        let conn = db
+            .acquire_lock("snapshot selected legacy round and debt")
+            .unwrap();
+        let mut stmt = conn.prepare("SELECT r.*,d.* FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id=?1 ORDER BY d.id").unwrap();
+        stmt.query_map([&before.0], |row| {
+            (0..row.as_ref().column_count())
+                .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    };
+    let exact_rows = rows(&db);
+    assert_eq!(
+        db.get_metadata(active_key).await.unwrap().as_deref(),
+        Some(active.as_str())
+    );
+    assert_eq!(
+        db.get_metadata(TOKEN).await.unwrap().as_deref(),
+        Some(token.as_str())
+    );
     let calls = Arc::new(AtomicUsize::new(0));
     let mut library = PhotoLibrary::new(
         "https://synthetic.example/database/1/photos/production/private".into(),
@@ -2066,6 +2121,19 @@ async fn quiet_current_legacy_census(unknown_mode: bool) {
         "future work must not trigger provider lookup"
     );
     assert_eq!(snapshot(&db), before);
+    assert_eq!(
+        rows(&db),
+        exact_rows,
+        "the selected round and debt must remain unchanged"
+    );
+    assert_eq!(
+        db.get_metadata(active_key).await.unwrap().as_deref(),
+        Some(active.as_str())
+    );
+    assert_eq!(
+        db.get_metadata(TOKEN).await.unwrap().as_deref(),
+        Some(token.as_str())
+    );
     assert_eq!(std::fs::read(&media).unwrap(), b"retained legacy bytes");
     assert_eq!(quiet.failed_count, 0);
     let notifier = crate::notifications::Notifier::new(None);
@@ -2107,6 +2175,11 @@ async fn quiet_current_legacy_census(unknown_mode: bool) {
     assert_eq!(output["status"], "partial_failure");
     assert_eq!(output["stats"]["failed"], 0);
     assert!(health.last_success_at.is_none());
+    if case == LegacyCensusCase::MalformedScope {
+        assert_eq!(rows(&db), exact_rows);
+        assert_eq!(calls.load(Ordering::SeqCst), before_calls);
+        return;
+    }
     db.acquire_lock("classify unrelated historical debt")
         .unwrap()
         .execute(
@@ -2128,16 +2201,54 @@ async fn quiet_current_legacy_census(unknown_mode: bool) {
         "unrelated historical policy must not veto current health"
     );
     assert_eq!(calls.load(Ordering::SeqCst), before_calls);
+    if case == LegacyCensusCase::Legacy {
+        let mut foreign: Value = serde_json::from_str(&original_scope).unwrap();
+        foreign["zone"]["zoneName"] = "PrimarySync-foreign".into();
+        let foreign = foreign.to_string();
+        assert_eq!(
+            PhotoLibrary::provider_scope_projection(&foreign).unwrap().0,
+            "PrimarySync-foreign"
+        );
+        assert_eq!(
+            db.acquire_lock("classify a known foreign legacy scope")
+                .unwrap()
+                .execute(
+                    "UPDATE source_revalidation_rounds SET enum_hash='policy',scope=?2 WHERE id=?1",
+                    rusqlite::params![before.0, foreign],
+                )
+                .unwrap(),
+            1
+        );
+        let foreign_result = crate::sync_loop::quiet_catalog_cycle_for_test(
+            &[&state],
+            &builder,
+            DownloadControls::download_hidden(),
+            "policy",
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            foreign_result.is_none(),
+            "a known valid foreign scope must not veto current health"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), before_calls);
+    }
 }
 
 #[tokio::test]
 async fn quiet_current_legacy_future_debt_is_visible() {
-    quiet_current_legacy_census(false).await;
+    quiet_current_legacy_census(LegacyCensusCase::Legacy).await;
 }
 
 #[tokio::test]
 async fn quiet_current_unknown_mode_is_visible() {
-    quiet_current_legacy_census(true).await;
+    quiet_current_legacy_census(LegacyCensusCase::UnknownMode).await;
+}
+
+#[tokio::test]
+async fn quiet_current_linked_legacy_malformed_scope_debt_is_visible() {
+    quiet_current_legacy_census(LegacyCensusCase::MalformedScope).await;
 }
 
 #[tokio::test]

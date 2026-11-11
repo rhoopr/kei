@@ -1503,9 +1503,10 @@ impl SqliteStateDb {
                                 origin.epoch == record.epoch && origin.attempt == record.attempt
                             })
                     });
-                    let unclassified_link = mode != LEGACY_MODE
-                        && !legacy_scope && !catalog_scope
-                        && linked_round.as_deref() == Some(round.as_str());
+                    let unclassified_link = !legacy_scope && !catalog_scope
+                        && linked_round.as_deref() == Some(round.as_str())
+                        && (mode != LEGACY_MODE
+                            || crate::icloud::photos::PhotoLibrary::provider_scope_projection(&scope).is_none());
                     if (!unclassified_link && (policy != enum_hash || !(legacy_scope || catalog_scope)))
                         || (phase == "active" && count == 0)
                     {
