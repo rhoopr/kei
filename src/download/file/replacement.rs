@@ -557,7 +557,7 @@ static TEST_SIDECAR_PUBLICATIONS: std::sync::OnceLock<
         >,
     >,
 > = std::sync::OnceLock::new();
-#[cfg(all(test, feature = "xmp"))]
+#[cfg(all(test, feature = "xmp", unix))]
 pub(crate) fn test_sidecar_publications(
     path: &std::path::Path,
 ) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {

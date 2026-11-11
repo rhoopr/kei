@@ -16,7 +16,7 @@ static TEST_SIDECAR_SUCCESSES: std::sync::OnceLock<
         >,
     >,
 > = std::sync::OnceLock::new();
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn test_sidecar_successes(path: &Path) -> Arc<std::sync::atomic::AtomicUsize> {
     let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     TEST_SIDECAR_SUCCESSES

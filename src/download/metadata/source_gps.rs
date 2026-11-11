@@ -10,7 +10,7 @@ use std::path::Path;
 static TEST_GPS_FAILURES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 > = std::sync::OnceLock::new();
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn test_fail_source_gps_once(path: &Path) {
     TEST_GPS_FAILURES
         .get_or_init(Default::default)

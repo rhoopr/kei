@@ -83,7 +83,7 @@ pub(super) fn fire_test_metadata_tail_hook(root: &std::path::Path, after_priorit
 static TEST_DENY_ONCE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 > = std::sync::OnceLock::new();
-#[cfg(all(test, feature = "xmp"))]
+#[cfg(all(test, feature = "xmp", unix))]
 pub(crate) fn test_deny_metadata_writer_once(path: &std::path::Path) {
     TEST_DENY_ONCE
         .get_or_init(Default::default)
@@ -101,7 +101,7 @@ pub(super) fn take_test_writer_denial(path: &std::path::Path) -> bool {
 #[cfg(all(test, feature = "xmp"))]
 pub(crate) use queued::test_metadata_suppressions;
 
-#[cfg(all(test, feature = "xmp"))]
+#[cfg(all(test, feature = "xmp", unix))]
 pub(crate) async fn test_metadata_budget<F: std::future::Future>(
     budget: usize,
     future: F,
