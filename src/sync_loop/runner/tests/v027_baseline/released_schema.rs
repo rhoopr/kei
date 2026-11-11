@@ -1207,6 +1207,26 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_schema(
 }
 
 #[tokio::test]
+async fn released_foreign_owner_history_recovers_after_upgrade_and_restart() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(
+            true,
+            exercise_released_schema(ReleasedSchemaCase::ForeignOwnerNegative),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn released_current_identity_history_reuses_media_after_upgrade_and_restart() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(
+            true,
+            exercise_released_schema(ReleasedSchemaCase::CurrentIdentityReuse),
+        )
+        .await;
+}
+
+#[tokio::test]
 async fn released_tail_corruption_retains_unverified_still_across_bounded_bridge() {
     super::PRESERVE_SHARED_CLAIMS
         .scope(
