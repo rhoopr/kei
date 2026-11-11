@@ -13,6 +13,10 @@ python3 scripts/docs/wiki_docs.py --wiki /path/to/kei-wiki
 
 `docs/wiki-contract.json` declares the supported stable version, its code revision, the reviewed guide revision, the exact wiki snapshot, a compatibility baseline, development reference revision, historical exceptions and explicit command argv fixtures. Check a candidate in a worktree at the declared `wiki_revision`; uncommitted candidate edits are inspected too. The output records the wiki HEAD. Require a clean final worktree when recording publication evidence.
 
+When Home also documents a beta command surface, `stable.commands_heading` names the stable command table checked against the pinned stable source. It defaults to `Commands`. The live Home/binary guard checks the `Commands` table against the candidate binary; both tables must match their respective releases.
+
+`stable.guide_revisions` pins a page-specific guide revision when a gateway explicitly targets a different release. Other pages still require `stable.guide_revision`.
+
 The checker reads commands and long flags from the pinned CLI source, checks nested command names against their source enums, scans literal shell examples, parses TOML snippets, checks dictionary key coverage and basic example types against the pinned dictionary, checks local page/heading links and pinned repository path/fragments, rejects mutable main/master blob links, and preserves every baseline Markdown filename and heading anchor. It never evaluates shell text or follows network links. Review historical exceptions individually; stale exception entries fail the check.
 
 For supplementary offline parser checks against an already-built binary:

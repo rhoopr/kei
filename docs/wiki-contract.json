@@ -2,10 +2,14 @@
   "schema_version": 1,
   "stable": {
     "version": "0.25.3",
+    "commands_heading": "Stable v0.25.3 commands",
     "source_revision": "a2081bfd109993c76f34ac13b12ee15b48c86008",
-    "guide_revision": "2c59e9962ea926b810abc814ab34aeea3658d08a"
+    "guide_revision": "2c59e9962ea926b810abc814ab34aeea3658d08a",
+    "guide_revisions": {
+      "Migration-from-Python": "cc3faff80d237aedcaa07a6d30e791550d1d9f07"
+    }
   },
-  "wiki_revision": "c51f350bba04688b0d5f9abad1f469ea0bac5a59",
+  "wiki_revision": "8c9dbc1f34d07ecb1b016c672ce7b56f0601e18d",
   "compatibility_revision": "5e7decd371ff186d8ca87600e2efeaa6920a283b",
   "development_revision": "1d6187e2b7899f4cd55d94e382056558cd524b16",
   "actions": {

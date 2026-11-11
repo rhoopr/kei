@@ -288,7 +288,11 @@ def validate(repo, wiki, contract, binary=None):
     source_enum = cli.split("pub enum Command {", 1)[1].split("\n}\n", 1)[0]
     commands = [re.sub(r"(?<!^)(?=[A-Z])", "-", c).lower()
                 for c in re.findall(r"(?m)^    ([A-Z][A-Za-z]+)(?:\s*\{|\()", source_enum)]
-    home = pages["Home"].split("## Commands\n", 1)[1].split("\n## ", 1)[0]
+    heading = profile.get("commands_heading", "Commands")
+    marker = f"## {heading}\n"
+    if marker not in pages["Home"]:
+        raise ContractError(f"Home command heading is missing: {heading}")
+    home = pages["Home"].split(marker, 1)[1].split("\n## ", 1)[0]
     if commands != re.findall(r"(?m)^\| \[`([^`]+)`", home):
         raise ContractError("Home command order differs from pinned source")
     compatibility_files = compatibility_anchors = 0
@@ -306,11 +310,12 @@ def validate(repo, wiki, contract, binary=None):
         guides = {"backup-maintenance.md", "docker-first-backup.md", "metadata.md",
                   "migration-from-icloudpd.md"}
         for name, text in pages.items():
+            guide_revision = profile.get("guide_revisions", {}).get(name, profile["guide_revision"])
             for target in links(text):
                 url = urlsplit(target)
                 if (url.netloc == "github.com" and url.path.startswith("/rhoopr/kei/blob/")
                         and url.path.split("/")[-1] in guides
-                        and profile["guide_revision"] not in url.path):
+                        and guide_revision not in url.path):
                     raise ContractError(f"{name}: stale canonical guide revision")
     legacy = {name for name, text in pages.items()
               if name.startswith("CLI") and "removed in v0.20" in text}

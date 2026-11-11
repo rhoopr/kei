@@ -63,6 +63,32 @@ class WikiDocsTests(unittest.TestCase):
         result = self.check()
         self.assertEqual((result["pages"], result["commands"], result["toml_examples"]), (3, 1, 1))
 
+    def test_release_scoped_command_table_still_checks_exact_surface(self):
+        self.mutate("Home.md", '\n## Stable commands\n\n| [`sync`](Sync) | Sync |\n')
+        self.contract["stable"]["commands_heading"] = "Stable commands"
+        self.assertEqual(self.check()["commands"], 1)
+        self.mutate("Home.md", '| [`removed`](Sync) | Unsupported |\n')
+        with self.assertRaisesRegex(docs.ContractError, "command order"):
+            self.check()
+        self.contract["stable"]["commands_heading"] = "Missing commands"
+        with self.assertRaisesRegex(docs.ContractError, "heading is missing"):
+            self.check()
+
+    def test_page_specific_guide_pin_rejects_other_revisions(self):
+        guides = self.repo / "docs"
+        guides.mkdir()
+        (guides / "backup-maintenance.md").write_text("# Maintenance\n")
+        subprocess.check_call(["git", "-C", str(self.repo), "add", "docs/backup-maintenance.md"])
+        guide_revision = self.commit(self.repo)
+        self.contract["stable"]["guide_revision"] = self.revision
+        self.contract["stable"]["guide_revisions"] = {"Sync": guide_revision}
+        link = f"[guide](https://github.com/rhoopr/kei/blob/{guide_revision}/docs/backup-maintenance.md)"
+        self.mutate("Sync.md", f"\n{link}\n")
+        self.check()
+        self.mutate("Home.md", f"\n{link}\n")
+        with self.assertRaisesRegex(docs.ContractError, "Home: stale canonical guide"):
+            self.check()
+
     def test_broken_page_and_anchor_are_rejected(self):
         for target in ["Absent", "Sync#absent", "#absent"]:
             with self.subTest(target=target), self.assertRaises(docs.ContractError):
