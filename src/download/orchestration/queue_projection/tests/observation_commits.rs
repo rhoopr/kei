@@ -388,7 +388,6 @@ async fn owner_created_no_link_active_empty_census_allows_health_prework() {
         catalog_plan: Some(crate::state::db::source_revalidation::fresh_catalog_plan_digest(plan)),
         enum_policy: fixture.policy.clone(),
         active_token_key: Some(TOKEN.to_owned()),
-        preservation_policy: None,
     };
     assert!(
         fixture

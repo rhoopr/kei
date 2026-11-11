@@ -228,17 +228,17 @@ pub(crate) fn retained_checkpoint_hold_action(encoded: &str) -> &'static str {
     }
 }
 
+#[must_use]
 pub(crate) fn retained_checkpoint_blocks_health(
     encoded: &str,
     cursor: &str,
     enum_hash: &str,
-    preservation_hash: Option<&str>,
 ) -> bool {
     let Ok(hold) = serde_json::from_str::<RetainedCheckpointHold>(encoded) else {
         return true;
     };
-    let digest = |value: &str| {
-        value.len() == 64
+    let digest = |value: &str, length: usize| {
+        value.len() == length
             && value
                 .bytes()
                 .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
@@ -246,19 +246,22 @@ pub(crate) fn retained_checkpoint_blocks_health(
     if hold.version != 1
         || hold.attempt_count == 0
         || hold.next_attempt_at < 0
-        || !digest(&hold.prior_cursor_sha256)
-        || !digest(&hold.enum_config_hash)
+        || !digest(&hold.prior_cursor_sha256, 64)
+        || !digest(&hold.enum_config_hash, 16)
         || hold
             .preservation_config_hash
             .as_deref()
-            .is_some_and(|value| !digest(value))
+            .is_some_and(|value| !digest(value, 64))
     {
         return true;
     }
+    // A skipped wake cannot reconstruct the reached-zone set used by the
+    // hold's preservation fingerprint. A mismatch is not proof that a hold
+    // for this cursor and enumeration policy is unrelated.
     hold.matches(&RetainedCheckpointHold::new(
         cursor,
         enum_hash,
-        preservation_hash,
+        hold.preservation_config_hash.as_deref(),
     ))
 }
 
@@ -1866,28 +1869,6 @@ pub(crate) async fn run_cycle_with_witness(
         )
     {
         let enum_policy = download::compute_config_hash(config);
-        let preservation_policy = if let Some(first) = library_states.first() {
-            let probe = build_download_config(
-                download::SyncMode::Full,
-                Arc::new(rustc_hash::FxHashSet::default()),
-                Arc::new(download::AssetGroupings::default()),
-                Arc::from(first.zone_name.as_str()),
-            );
-            let mut zones: Vec<String> = library_states
-                .iter()
-                .map(|library| library.zone_name.clone())
-                .collect();
-            zones.sort();
-            zones.dedup();
-            Some(preservation_policy_hash(
-                config,
-                &probe,
-                &zones,
-                &enum_policy,
-            )?)
-        } else {
-            None
-        };
         for expected in expected_sources.iter().filter(|source| {
             source.skip_authority == SkipAuthority::NoChanges && source.active_passes
         }) {
@@ -1926,7 +1907,6 @@ pub(crate) async fn run_cycle_with_witness(
                     attempt: &record.attempt,
                     enum_policy: &enum_policy,
                     active_token_key: Some(&state.sync_token_key),
-                    preservation_policy: preservation_policy.as_deref(),
                 },
             )
             .await
@@ -2042,12 +2022,27 @@ pub(crate) async fn run_cycle_with_witness(
                 .collect::<Vec<_>>();
             zones.sort();
             zones.dedup();
-            preservation_config_hash = Some(preservation_policy_hash(
+            let coverage = download::sync_coverage_fingerprint_json(
                 config,
-                &probe_config,
+                "icloud",
+                1,
                 &zones,
                 &enum_config_hash,
-            )?);
+                &download_config_hash,
+            )?;
+            let policy = serde_json::json!([
+                1,
+                state::METADATA_CAPTURE_REVISION,
+                coverage,
+                format!("{:?}", probe_config.metadata),
+                config.runtime.refresh_metadata,
+                config.runtime.repair_capture_timestamps,
+                config.runtime.repair_truncated
+            ]);
+            preservation_config_hash = Some(hash_legacy_preservation_policy(
+                &policy,
+                probe_config.legacy_preservation_allow_hardlinks,
+            ));
         }
 
         let legacy_download_config_hash = download::hash_legacy_download_config(&probe_config);
@@ -3389,7 +3384,6 @@ pub(crate) async fn run_cycle_with_witness(
                     attempt,
                     enum_policy: &enum_config_hash,
                     active_token_key: None,
-                    preservation_policy: None,
                 },
             )
             .await?;
@@ -5718,36 +5712,6 @@ pub(crate) fn hash_legacy_preservation_policy(
     data_encoding::HEXLOWER.encode(&hash.finalize())
 }
 
-fn preservation_policy_hash(
-    config: &crate::config::Config,
-    probe: &download::DownloadConfig,
-    zones: &[String],
-    enum_hash: &str,
-) -> anyhow::Result<String> {
-    let download_hash = download::hash_download_config(probe);
-    let coverage = download::sync_coverage_fingerprint_json(
-        config,
-        "icloud",
-        1,
-        zones,
-        enum_hash,
-        &download_hash,
-    )?;
-    let policy = serde_json::json!([
-        1,
-        state::METADATA_CAPTURE_REVISION,
-        coverage,
-        format!("{:?}", probe.metadata),
-        config.runtime.refresh_metadata,
-        config.runtime.repair_capture_timestamps,
-        config.runtime.repair_truncated
-    ]);
-    Ok(hash_legacy_preservation_policy(
-        &policy,
-        probe.legacy_preservation_allow_hardlinks,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5755,39 +5719,54 @@ mod tests {
 
     #[test]
     fn retained_health_guard_distinguishes_matching_and_unrelated_policy() {
-        let policy = "a".repeat(64);
+        let directory = tempfile::tempdir().unwrap();
+        let globals = crate::config::GlobalArgs {
+            username: Some("test@example.invalid".to_owned()),
+            domain: None,
+            data_dir: Some(directory.path().to_string_lossy().into_owned()),
+        };
+        let mut config = crate::config::Config::build(
+            &globals,
+            &crate::cli::PasswordArgs::default(),
+            crate::cli::SyncArgs::default(),
+            None,
+        )
+        .unwrap();
+        let policy = download::compute_config_hash(&config);
+        config.photos.edited = !config.photos.edited;
+        let other_policy = download::compute_config_hash(&config);
         let preservation = "b".repeat(64);
         let hold = RetainedCheckpointHold::new("cursor", &policy, Some(&preservation));
         let encoded = serde_json::to_string(&hold).unwrap();
         assert!(retained_checkpoint_blocks_health(
-            &encoded,
-            "cursor",
-            &policy,
-            Some(&preservation)
+            &encoded, "cursor", &policy
         ));
         assert!(!retained_checkpoint_blocks_health(
             &encoded,
             "other-cursor",
-            &policy,
-            Some(&preservation)
+            &policy
         ));
         assert!(!retained_checkpoint_blocks_health(
             &encoded,
             "cursor",
-            &"c".repeat(64),
-            Some(&preservation)
+            &other_policy
         ));
-        assert!(!retained_checkpoint_blocks_health(
-            &encoded,
+        let other_preservation =
+            RetainedCheckpointHold::new("cursor", &policy, Some(&"d".repeat(64)));
+        assert!(retained_checkpoint_blocks_health(
+            &serde_json::to_string(&other_preservation).unwrap(),
             "cursor",
-            &policy,
-            Some(&"d".repeat(64))
+            &policy
         ));
         assert!(retained_checkpoint_blocks_health(
-            "invalid",
+            "invalid", "cursor", &policy
+        ));
+        let mut malformed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        malformed["enum_config_hash"] = serde_json::Value::String("a".repeat(64));
+        assert!(retained_checkpoint_blocks_health(
+            &malformed.to_string(),
             "cursor",
-            &policy,
-            Some(&preservation)
+            &policy
         ));
     }
 

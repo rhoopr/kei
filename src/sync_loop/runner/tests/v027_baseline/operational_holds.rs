@@ -1826,6 +1826,266 @@ async fn skipped_peer_current_empty_link_allows_unrelated_foreign_history() {
     );
 }
 
+fn fixture_hold_preservation_hash(fixture: &Fixture, zones: &[String]) -> String {
+    let db: Arc<dyn download::DownloadStore> = fixture.db.clone();
+    let builder = make_run_cycle_download_config_builder(&fixture.root, db);
+    let mut probe = (*builder(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from(ZONE),
+    ))
+    .clone();
+    probe.folder_structure = "none".into();
+    probe.retry.max_retries = 0;
+    let enum_hash = download::compute_config_hash(&fixture.config);
+    let download_hash = download::hash_download_config(&probe);
+    let coverage = download::sync_coverage_fingerprint_json(
+        &fixture.config,
+        "icloud",
+        1,
+        zones,
+        &enum_hash,
+        &download_hash,
+    )
+    .unwrap();
+    let policy = json!([
+        1,
+        crate::state::METADATA_CAPTURE_REVISION,
+        coverage,
+        format!("{:?}", probe.metadata),
+        fixture.config.runtime.refresh_metadata,
+        fixture.config.runtime.repair_capture_timestamps,
+        fixture.config.runtime.repair_truncated
+    ]);
+    crate::sync_cycle::hash_legacy_preservation_policy(
+        &policy,
+        probe.legacy_preservation_allow_hardlinks,
+    )
+}
+
+#[tokio::test]
+async fn skipped_peer_unrelated_real_hold_does_not_veto_health() {
+    for different_cursor in [true, false] {
+        let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
+            .await
+            .expect("synthetic peer fixture");
+        assert!(
+            fixture
+                .run_two(0, false, false)
+                .await
+                .can_advance_database_checkpoint()
+        );
+        let token_key = sync_token_key(PEER_ZONE);
+        let cursor = fixture.db.get_metadata(&token_key).await.unwrap().unwrap();
+        let enum_hash = download::compute_config_hash(&fixture.config);
+        assert_eq!(enum_hash.len(), 16, "actual enumeration hash shape");
+        let mut other_config = make_run_cycle_config();
+        other_config.photos.edited = !other_config.photos.edited;
+        let other_enum_hash = download::compute_config_hash(&other_config);
+        assert_eq!(other_enum_hash.len(), 16);
+        assert_ne!(other_enum_hash, enum_hash);
+        let mut held = fixture.run_two_filtered(1, false, false, true, false).await;
+        let shutdown = CancellationToken::new();
+        held.prepare_operational_tail(&fixture.shared, &shutdown)
+            .await
+            .unwrap();
+        assert!(held.operational_tail_prepared());
+        let preservation =
+            fixture_hold_preservation_hash(&fixture, &[PEER_ZONE.to_owned(), ZONE.to_owned()]);
+        crate::sync_cycle::persist_test_retained_checkpoint_hold(
+            fixture.db.as_ref(),
+            PEER_ZONE,
+            if different_cursor {
+                "other-real-cursor"
+            } else {
+                &cursor
+            },
+            if different_cursor {
+                &enum_hash
+            } else {
+                &other_enum_hash
+            },
+            &preservation,
+        )
+        .await
+        .unwrap();
+        let hold_key = format!(
+            "{}{PEER_ZONE}",
+            crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
+        );
+        let hold = fixture.db.get_metadata(&hold_key).await.unwrap().unwrap();
+        let guards = held
+            .finish_operational_tail(&fixture.shared, &shutdown)
+            .await
+            .unwrap();
+        assert!(
+            guards.is_some(),
+            "valid same-zone hold for another cursor or enum policy is unrelated"
+        );
+        let (health, report) = reported_health(&fixture, &held, "unrelated-peer-hold.json").await;
+        assert!(health.last_success_at.is_some());
+        assert_eq!(report["status"], "partial_failure");
+        assert_eq!(report["stats"]["failed"], 1);
+        assert_eq!(
+            fixture.db.get_metadata(&hold_key).await.unwrap().as_deref(),
+            Some(hold.as_str())
+        );
+        assert_eq!(
+            fixture
+                .db
+                .get_metadata(&token_key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(cursor.as_str())
+        );
+        assert_eq!(
+            std::fs::read(fixture.root.join("baseline.JPG")).unwrap(),
+            MEDIA
+        );
+    }
+}
+
+#[tokio::test]
+async fn skipped_peer_real_rejected_cursor_hold_from_reached_wake_vetoes_health() {
+    use sha2::{Digest, Sha256};
+
+    let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
+        .await
+        .expect("synthetic peer fixture");
+    assert!(
+        fixture
+            .run_two(0, false, false)
+            .await
+            .can_advance_database_checkpoint()
+    );
+    let token_key = sync_token_key(PEER_ZONE);
+    let cursor = fixture.db.get_metadata(&token_key).await.unwrap().unwrap();
+    let descriptor_key = format!("observed_selection:v27:{PEER_ZONE}");
+    let descriptor = fixture.db.get_metadata(&descriptor_key).await.unwrap();
+    let epoch_key = crate::state::db::sync_epoch::library_key(PEER_ZONE);
+    let epoch = fixture.db.get_metadata(&epoch_key).await.unwrap();
+    let mut held = fixture.run_two_filtered(1, false, false, true, false).await;
+    assert_eq!(held.stats.failed, 1);
+    let shutdown = CancellationToken::new();
+    held.prepare_operational_tail(&fixture.shared, &shutdown)
+        .await
+        .unwrap();
+    assert!(held.operational_tail_prepared());
+    let prework = held
+        .sources
+        .iter()
+        .find(|source| source.zone_name == PEER_ZONE)
+        .unwrap()
+        .operational_prework
+        .as_ref()
+        .unwrap()
+        .prework
+        .clone();
+    assert!(
+        fixture
+            .db
+            .operational_accounting(prework.clone(), vec![], None, false)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let rejected = fixture.run_two(1, true, false).await;
+    assert!(
+        fixture.peer_errors.load(Ordering::SeqCst) > 0,
+        "actual peer rejection"
+    );
+    assert!(rejected.holds.iter().any(|hold| hold.source == PEER_ZONE
+        && hold.kind == crate::sync_cycle::LibraryHoldKind::RetainedCheckpoint));
+    let hold_key = format!(
+        "{}{PEER_ZONE}",
+        crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
+    );
+    let raw = fixture
+        .db
+        .get_metadata(&hold_key)
+        .await
+        .unwrap()
+        .expect("owner-persisted peer hold");
+    let hold: Value = serde_json::from_str(&raw).unwrap();
+    let enum_hash = download::compute_config_hash(&fixture.config);
+    assert_eq!(enum_hash.len(), 16);
+    assert_eq!(hold["enum_config_hash"], enum_hash);
+    assert_eq!(
+        hold["prior_cursor_sha256"],
+        data_encoding::HEXLOWER.encode(&Sha256::digest(cursor.as_bytes()))
+    );
+    assert_eq!(
+        hold["preservation_config_hash"],
+        fixture_hold_preservation_hash(&fixture, &[PEER_ZONE.to_owned(), ZONE.to_owned()])
+    );
+    assert_ne!(
+        hold["preservation_config_hash"],
+        fixture_hold_preservation_hash(&fixture, &[ZONE.to_owned()])
+    );
+    assert!(hold["next_attempt_at"].as_i64().unwrap() > chrono::Utc::now().timestamp());
+    assert_eq!(
+        fixture
+            .db
+            .get_metadata(&token_key)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(cursor.as_str())
+    );
+    assert_eq!(
+        fixture.db.get_metadata(&descriptor_key).await.unwrap(),
+        descriptor
+    );
+    assert_eq!(fixture.db.get_metadata(&epoch_key).await.unwrap(), epoch);
+    drop(rejected);
+    assert!(
+        crate::sync_cycle::retained_checkpoint_blocks_health(&raw, &cursor, &enum_hash),
+        "the actual reached-peer hold must not be called unrelated merely because the visit set changed"
+    );
+    assert!(
+        fixture
+            .db
+            .operational_accounting(prework, vec![], None, false)
+            .await
+            .unwrap()
+            .is_none(),
+        "real reached-peer hold must veto the skipped peer owner despite changed visit set"
+    );
+    assert!(
+        held.finish_operational_tail(&fixture.shared, &shutdown)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (health, report) = reported_health(&fixture, &held, "real-reached-peer-hold.json").await;
+    assert!(health.last_success_at.is_none());
+    assert_eq!(report["status"], "partial_failure");
+    assert_eq!(report["stats"]["failed"], 1);
+    assert_eq!(
+        fixture.db.get_metadata(&hold_key).await.unwrap().as_deref(),
+        Some(raw.as_str())
+    );
+    assert_eq!(
+        fixture
+            .db
+            .get_metadata(&token_key)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(cursor.as_str())
+    );
+    assert_eq!(
+        fixture.db.get_metadata(&descriptor_key).await.unwrap(),
+        descriptor
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("baseline.JPG")).unwrap(),
+        MEDIA
+    );
+}
+
 #[tokio::test]
 async fn skipped_peer_matching_retained_hold_after_prepare_vetoes_health() {
     let fixture = Fixture::with_progress(|_| ResponseTemplate::new(500))
@@ -1848,41 +2108,10 @@ async fn skipped_peer_matching_retained_hold_after_prepare_vetoes_health() {
         .await
         .unwrap();
     assert!(held.operational_tail_prepared());
-    let db: Arc<dyn download::DownloadStore> = fixture.db.clone();
-    let builder = make_run_cycle_download_config_builder(&fixture.root, db);
-    let mut probe = (*builder(
-        download::SyncMode::Full,
-        Arc::default(),
-        Arc::default(),
-        Arc::from(ZONE),
-    ))
-    .clone();
-    probe.folder_structure = "none".into();
-    probe.retry.max_retries = 0;
     let enum_hash = download::compute_config_hash(&fixture.config);
-    let download_hash = download::hash_download_config(&probe);
-    let coverage = download::sync_coverage_fingerprint_json(
-        &fixture.config,
-        "icloud",
-        1,
-        &[ZONE.to_owned()],
-        &enum_hash,
-        &download_hash,
-    )
-    .unwrap();
-    let policy = json!([
-        1,
-        crate::state::METADATA_CAPTURE_REVISION,
-        coverage,
-        format!("{:?}", probe.metadata),
-        fixture.config.runtime.refresh_metadata,
-        fixture.config.runtime.repair_capture_timestamps,
-        fixture.config.runtime.repair_truncated
-    ]);
-    let preservation_hash = crate::sync_cycle::hash_legacy_preservation_policy(
-        &policy,
-        probe.legacy_preservation_allow_hardlinks,
-    );
+    assert_eq!(enum_hash.len(), 16, "actual enumeration hash shape");
+    let preservation_hash =
+        fixture_hold_preservation_hash(&fixture, &[PEER_ZONE.to_owned(), ZONE.to_owned()]);
     crate::sync_cycle::persist_test_retained_checkpoint_hold(
         fixture.db.as_ref(),
         PEER_ZONE,

@@ -257,7 +257,6 @@ pub(crate) struct OperationalBasis<'a> {
     pub(crate) attempt: &'a str,
     pub(crate) enum_policy: &'a str,
     pub(crate) active_token_key: Option<&'a str>,
-    pub(crate) preservation_policy: Option<&'a str>,
 }
 
 pub(crate) async fn operational_prework(
@@ -286,7 +285,6 @@ pub(crate) async fn operational_prework(
             .map(|plan| catalog_plan_digest_from_source_context(&plan)),
         enum_policy: basis.enum_policy.to_owned(),
         active_token_key: basis.active_token_key.map(str::to_owned),
-        preservation_policy: basis.preservation_policy.map(str::to_owned),
     };
     let Some(prework) = context.capture.db.operational_prework(request).await? else {
         return Ok(None);

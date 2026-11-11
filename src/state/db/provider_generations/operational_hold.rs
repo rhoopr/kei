@@ -22,7 +22,6 @@ pub(crate) struct SourceRequest {
     pub(crate) catalog_plan: Option<String>,
     pub(crate) enum_policy: String,
     pub(crate) active_token_key: Option<String>,
-    pub(crate) preservation_policy: Option<String>,
 }
 
 #[derive(Clone)]
@@ -270,7 +269,6 @@ fn inspect(
                 &hold,
                 &token,
                 &request.enum_policy,
-                request.preservation_policy.as_deref(),
             ) {
                 return Ok(None);
             }
