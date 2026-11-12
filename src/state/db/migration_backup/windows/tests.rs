@@ -181,7 +181,12 @@ fn owned_migration_backup_windows_directory_publication_never_overwrites() {
     let root = tempfile::tempdir().unwrap();
     let stage = root.path().join("backup.partial");
     let mut guard = create_private_dir(&stage).unwrap();
-    std::fs::write(stage.join("manifest.json"), b"prepared but not complete").unwrap();
+    let manifest_stage = stage.join("manifest.json.part");
+    std::fs::write(&manifest_stage, b"prepared but not complete").unwrap();
+    // The no-delete directory guard must permit entry writes by the native
+    // manifest move, as well as the final bundle move below.
+    crate::fs_util::move_file_no_replace_blocking(&manifest_stage, &stage.join("manifest.json"))
+        .unwrap();
     let published = root.path().join("backup");
     drop(create_private_dir(&published).unwrap());
     std::fs::write(published.join("kept"), b"previous evidence").unwrap();

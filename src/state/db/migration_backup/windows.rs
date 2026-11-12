@@ -47,8 +47,10 @@ impl Stage {
         // Open the rename-compatible handle while the original no-delete handle
         // still pins the populated stage name. This open requests no DELETE
         // access, so it does not conflict with the original sharing restriction.
-        let rename_handle =
-            directory(self.confinement.path(), FILE_SHARE_READ | FILE_SHARE_DELETE)?;
+        let rename_handle = directory(
+            self.confinement.path(),
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?;
         if file_identity(&rename_handle)? != self.identity {
             return Err(io::Error::other(
                 "Backup stage changed identity before publication; migration was refused. Preserve the stage and stop other directory writers before retrying",
@@ -60,7 +62,7 @@ impl Stage {
         #[cfg(test)]
         tests::after_handoff(self.confinement.path())?;
         move_file_no_replace_blocking(self.confinement.path(), destination.path())?;
-        let output = directory(destination.path(), FILE_SHARE_READ)?;
+        let output = directory(destination.path(), FILE_SHARE_READ | FILE_SHARE_WRITE)?;
         if file_identity(&output)? != self.identity {
             return Err(io::Error::other(
                 "Published backup directory changed identity from the original populated stage; migration was refused. Preserve both backup paths and stop other directory writers before retrying",
@@ -184,7 +186,9 @@ pub(super) fn create_private_dir(path: &Path) -> io::Result<Stage> {
         .parent()
         .ok_or_else(|| io::Error::other("Backup directory has no parent"))?;
     let guard = ConfinedPath::open(parent, path, ConfinedParents::Existing)?;
-    let parent_handle = directory(parent, FILE_SHARE_READ)?;
+    // Rename opens its destination parent for directory-entry writes. Permit
+    // that access while withholding DELETE sharing to keep the parent pinned.
+    let parent_handle = directory(parent, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
     let mut flags = 0;
     // SAFETY: parent_handle stays live and flags is valid writable output.
     // Null optional outputs have zero lengths, as required by the API.
@@ -217,7 +221,9 @@ pub(super) fn create_private_dir(path: &Path) -> io::Result<Stage> {
     if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    let directory = directory(path, FILE_SHARE_READ)?;
+    // Manifest publication also needs write access to this directory. Denying
+    // DELETE, not WRITE, keeps the populated stage name fixed until handoff.
+    let directory = directory(path, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
     let identity = file_identity(&directory)?;
     Ok(Stage {
         confinement: guard,
