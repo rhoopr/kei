@@ -42,10 +42,10 @@ fn owner() -> account::AccountOwner {
     .unwrap()
 }
 
-fn seed(root: &Path) -> Connection {
+fn seed(root: &Path, schema_version: i32) -> Connection {
     let (conn, fresh) = account::open(&root.join("state.db"), &owner()).unwrap();
     assert!(fresh);
-    for version in 1..=35 {
+    for version in 1..=schema_version {
         schema::migrate_to_version(&conn, 0, version).unwrap();
     }
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
@@ -119,7 +119,7 @@ fn bundles(root: &Path, state: BundleState) -> Vec<PathBuf> {
 async fn owned_migration_backup_windows_wal_config_restore_and_quiet_reopens() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    let source = seed(root);
+    let source = seed(root, 35);
     let context = load_toml_config_with_source(&root.join("custom.toml"), true)
         .unwrap()
         .1;
@@ -183,7 +183,7 @@ async fn owned_migration_backup_windows_wal_config_restore_and_quiet_reopens() {
 async fn owned_migration_backup_windows_storage_failure_retains_partial_then_recovers() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    let conn = seed(root);
+    let conn = seed(root, 35);
     let context = load_toml_config_with_source(&root.join("missing.toml"), false)
         .unwrap()
         .1;
@@ -241,10 +241,87 @@ fn owned_migration_backup_windows_manifest_paths_round_trip_native_units() {
 }
 
 #[tokio::test]
+async fn owned_migration_backup_windows_late_failure_rolls_back_wal_and_delete_then_recovers() {
+    for mode in ["WAL", "DELETE"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let conn = seed(root, 34);
+        conn.pragma_update(None, "journal_mode", mode).unwrap();
+        conn.execute_batch("CREATE TABLE provider_transport_canonical (unknown BLOB); INSERT INTO provider_transport_canonical VALUES (X'F00D');").unwrap();
+        let context = load_toml_config_with_source(&root.join("custom.toml"), true)
+            .unwrap()
+            .1;
+        let config = std::fs::read(root.join("custom.toml")).unwrap();
+        let result =
+            SqliteStateDb::open_owned_with_config(&root.join("state.db"), &owner(), &context).await;
+        let Err(StateError::BackedUpMigration { backup, .. }) = result else {
+            panic!("{mode}: late schema failure must retain a complete backup");
+        };
+        assert!(backup.join("manifest.json").is_file());
+        assert!(bundles(root, Partial).is_empty());
+        assert_eq!(schema::get_schema_version(&conn).unwrap(), 34);
+        assert_history(&conn);
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM sqlite_schema WHERE name='primary_layout_operations'",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            0,
+            "{mode}: schema-35 DDL must roll back with schema-36 failure"
+        );
+        assert_eq!(
+            conn.query_row::<Vec<u8>, _, _>(
+                "SELECT unknown FROM provider_transport_canonical",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            [0xf0, 0x0d]
+        );
+        assert_eq!(
+            conn.pragma_query_value::<String, _>(None, "journal_mode", |row| row.get(0))
+                .unwrap(),
+            mode.to_lowercase()
+        );
+        let snapshot = Connection::open(backup.join("state.db")).unwrap();
+        assert_history(&snapshot);
+        assert_eq!(schema::get_schema_version(&snapshot).unwrap(), 34);
+        drop(snapshot);
+        let saved = std::fs::read(backup.join("state.db")).unwrap();
+        conn.execute_batch("DROP TABLE provider_transport_canonical")
+            .unwrap();
+        drop(conn);
+        for _ in 0..3 {
+            let reopened =
+                SqliteStateDb::open_owned_with_config(&root.join("state.db"), &owner(), &context)
+                    .await
+                    .unwrap();
+            let conn = reopened
+                .acquire_lock("Windows migration rollback recovery")
+                .unwrap();
+            assert_history(&conn);
+            assert_eq!(
+                schema::get_schema_version(&conn).unwrap(),
+                schema::SCHEMA_VERSION
+            );
+        }
+        assert_eq!(bundles(root, Complete).len(), 2);
+        assert_eq!(std::fs::read(backup.join("state.db")).unwrap(), saved);
+        assert_eq!(std::fs::read(root.join("custom.toml")).unwrap(), config);
+        assert_eq!(
+            std::fs::read(root.join("kept.jpg")).unwrap(),
+            b"existing media"
+        );
+    }
+}
+
+#[tokio::test]
 async fn owned_migration_backup_windows_stage_substitution_refuses_migration_then_recovers() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    let conn = seed(root);
+    let conn = seed(root, 35);
     let context = load_toml_config_with_source(&root.join("custom.toml"), true)
         .unwrap()
         .1;
@@ -377,7 +454,7 @@ async fn owned_migration_backup_windows_process_termination_preserves_partial_an
     ] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        let conn = seed(root);
+        let conn = seed(root, 35);
         let context = load_toml_config_with_source(&root.join("custom.toml"), true)
             .unwrap()
             .1;
