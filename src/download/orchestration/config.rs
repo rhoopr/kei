@@ -130,9 +130,8 @@ fn hash_shared_fields(hasher: &mut sha2::Sha256, version: u8, f: &SharedHashFiel
     // because the enumeration hash already owns date eligibility; the legacy
     // caller supplies them only to reproduce the v2 shape.
     //
-    // Dates are truncated to day precision before hashing so that relative
-    // intervals like "20d" (resolved to now-minus-20-days at parse time)
-    // produce a stable hash across consecutive runs on the same day.
+    // Preserve day-precision instant hashing for compatibility with stored
+    // fingerprints, including historical relative-date boundaries.
     hash_optional_created_date_filter(hasher, f.skip_created_before);
     hash_optional_created_date_filter(hasher, f.skip_created_after);
     hasher.update([u8::from(f.force_resolution)]);

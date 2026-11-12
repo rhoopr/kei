@@ -21,6 +21,7 @@ Drastically simplify Kei's sync engine: delete execution paths, remove redundant
 7. Keep each slice independently reviewable and runnable. Use short-lived child branches or atomic commits as agreed; do not accumulate all phases into another giant PR.
 8. An intermediate release must never silently lose previously supported behavior. If a replacement needs several preparatory slices, keep those bounded and name the final deletion slice before starting them. Temporary code needs an owner and removal condition.
 9. Do not add switches for every decision below. Defaults, simple exclusions, and explicit operations should replace overlapping modes.
+10. Errors should explain how to resolve the problem: name the affected setting or operation and give a supported configuration edit or command. Apply this to changed diagnostics in each slice. Never recommend a repair flag that does not exist; broader diagnostic cleanup is separate work.
 
 ## Agreed product contract
 
@@ -154,3 +155,142 @@ Slice 11 reporting corrections that are independent of the new flow may ship ear
 Execute slice 0 only. Read the repository instructions and this document, run `cargo check`, inspect the actual main-based owners and consumers, and select a small first removal slice. Report its exact files/options/state, behavior it retires, retained guarantees, migration treatment, acceptance commands and any product decision still required. Update this plan with evidence and a short baseline/removal matrix. Ask for approval of the bounded production slice before deleting code or changing public contracts. Do not restart the paused beta repair work.
 
 The stopping condition is a verified, source-bound deletion plan for the first production slice, not an architectural framework or a partially implemented replacement engine.
+
+## Slice 0 findings (2026-11-11)
+
+Status: discovery complete; slice 1a subsequently approved below. The interview contract above remains the target. The first slice below is only part of delivery slice 1.
+
+### Baseline and evidence limits
+
+- Checkout: `/home/robhooper/dev/kei-sync-simplify`, branch `work/v0.30.0-sync-simplify`, initially clean. HEAD `002c9d3456211534ee1d6e0c8cbdb038b47572dc` is the planning-document commit directly above the recorded source baseline `3cdd14f31d826fe77c18519910806bbe51fea8e9`. The package reports `0.26.1-dev`; v0.30 is the delivery goal, not the current binary version.
+- Read `AGENTS.md`, `CONTRIBUTING.md`, architecture owners/flows/invariants/impact sections, and the test guide. Two read-only native tasks traced execution/state and configuration respectively. No old-beta checkout or private evidence was inspected or changed.
+- `cargo check`: passed, default features, Linux, 31.83 seconds including initial compilation.
+- `cargo test --lib download::file::publication::tests::`: 4 passed, covering successful landing, identical-byte collision, differing-byte refusal and missing staging file.
+- `cargo test --lib unresolved_identity_survives_restart_and_other_zone_success_then_recovers`: 1 passed through the runner regression. This is bounded synthetic evidence for retained identity debt and healthy-peer progress, not qualification of the historical reports.
+- `cargo test --lib run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_steady_state`: 1 passed through the production cycle regression.
+- `just test scenario config-docs`: 3 passed (supported example settings, migration guidance, contributor commands).
+- `cargo fmt --all --check`: passed. `cargo clippy --all-targets --all-features -- -D warnings`: passed.
+- No failures occurred in these checks. The complete offline gate, live provider tests, real service checks, and release qualification were not run. Public issue text was not fetched because no resolution is being attributed. Historical observations remain unresolved evidence, separate from these current baseline results.
+
+### Actual execution and authority
+
+Source references below describe this baseline; symbols are the durable navigation anchors.
+
+1. `src/lib.rs` dispatches sync and setup's immediate sync to `sync_loop::run_sync`; `src/service/run.rs` uses the same entry. `src/sync_loop/runner.rs:296-390` opens authenticated account-owned state, attaches `ShadowCapture`, and aborts on state-open failure. Only dry-run deliberately supplies no database. There is no active public `--stateless` or `--no-state` option to remove.
+2. The runner replays the retained catalog (`runner.rs:514`), plans library passes, performs database precheck and local drift wakeups, then calls `run_cycle` (`:705`). Metadata refresh has a separate tail (`:723`); scoped database-token persistence follows cycle evidence (`:758-765`). `src/sync_loop/planning.rs` delegates pass policy to `src/commands/service.rs`.
+3. `src/sync_cycle.rs` owns configuration reconciliation, source enumeration choice and checkpoint decisions. It calls `download_photos_with_sync` after optional path reconciliation (`:1474-1509`) and again for the retained-cursor bridge (`:1619`). `source_checkpoint_decision` and `state/db/checkpoints.rs::commit_checkpoint_transition` retain checkpoint authority.
+4. `src/download/orchestration/dispatch.rs:357-695` recovers interrupted publications/layouts, runs capture repair, resets retries, projects retained provider work, and selects active-generation or ordinary full/incremental routes. Incremental streaming and collecting remain separate policy paths in `incremental.rs`; targeted album and smart-folder backfills add further routes.
+5. `TaskPlanner` and `pipeline/producer.rs` derive tasks and write pending rows, mappings, membership and reservations. Streaming producer/consumer execution and explicit retry passes share `pipeline/task.rs`, `file/transfer.rs`, and `finalize.rs`. `finalize_downloaded_with_proof` calls `mark_verified_download`; failure records retry work rather than treating a landed file as durably complete.
+6. Provider observations enter `icloud/photos/album/changes.rs` before emission, through `inbox.rs` into `provider_inbox.rs` and `provider_catalog.rs`. `queue_projection.rs` revalidates retained identities against current provider records before writing selection shadows and admitted work. `generation.rs` also drives active physical destinations. These are live consumers, not a removable archive-only subsystem.
+
+The publication owner remains `download/file/publication.rs::publish_part_to_final`: no-overwrite landing, fingerprint comparison for collisions and parent-directory fsync. Transfer retains `.part` identity, length/content/checksum checks and safe resume. State finalization follows publication. Conditional replacement and interrupted-layout journals retain their separate concurrent-change proof. None of these guarantees is a deletion target.
+
+### Removal matrix
+
+Each row names a future deletion boundary, not permission to delete now. State names are search anchors; tables with live obligations must be converted or drained before their writers disappear.
+
+| Existing responsibility and source | Surviving owner | Code, state or options to remove | Retained behavior and dependency |
+| --- | --- | --- | --- |
+| Relative selection: `cli.rs::RecentLimit`, `config/resolve.rs`, `config/runtime.rs::parse_created_date_filter` | Existing input/resolution owners and fixed-date eligibility | `Days`, days serialization/translation/conflicts, relative clock arithmetic and setup invitation | Fixed capture dates and explicit datetimes; proposed first slice below. No database change. |
+| Newest-N: `orchestration/full.rs:528-674`, `recent.rs`, `incremental.rs:795-960`, `generation.rs:1344-1428` | Fixed selection in configuration and planner | Sync `recent`, `recent_scope`, global frontier/per-filter caps, `recent_selection_recovery:<zone>` writer and recovery dispatch | Keep bounded enumeration and checkpoint proof. Later approval must explicitly decide `import-existing --recent N`, a separate sampling consumer. |
+| Rendition/filename/media matrices: `config/resolve.rs`, `filter/eligibility.rs`, `filter/versions.rs`, `filter/expected_paths.rs` | Existing rendition selector and eligibility owner | TOML `resolution`, `live_resolution`, `force_resolution`, `filename_exclude`, `media`, and superseded `raw_policy`, `edited`, `alternative`, `edited_naming` combinations after exact replacement approval | Original/current-edit/available RAW-JPEG contract and simple exclusions. Preserve historical rendition/resource identity and pending rows; do not delete provider variants with user options. |
+| Optional state and adoption: `sync_loop/runner.rs:296-390`, `state/db/account.rs`, `commands/import.rs` | Existing authenticated startup/adoption boundary | Writable optional-store branches after dry-run gets an explicit read-only planning contract; repeated runtime legacy interpretation | Ordinary sync already requires state. No fictional stateless flag removal. Automatic verified adoption, backup and failure rollback require a separate approved slice. |
+| Full/incremental and special backfills: `orchestration/dispatch.rs`, `full.rs`, `incremental.rs` | Existing orchestration, provider normalization and `TaskPlanner` | Duplicate downstream streaming/collecting policy and superseded targeted-album/smart-folder orchestration | Keep distinct provider transports where necessary, membership evidence, natural EOF, cancellation and malformed-record holds. |
+| Raw pages and historical catalog indexing: `icloud/photos/inbox.rs`, `state/db/provider_inbox.rs:699-859`, `provider_catalog.rs:71-162` | Provider adapter plus transactional current source facts | New `capture_shadow_page` writes to `provider_shadow_pages/records/receipts`; per-page `provider_catalog_records/references/debt/pages` history once consumers are replaced | Preserve unresolved original evidence and provenance. Stop generating redundant history only after replay/admission no longer requires it; receipts are not checkpoint authority. |
+| Shadow selection and retained work: `orchestration/queue_projection.rs:100-278`, `state/db/provider_selection.rs:388-473`, `provider_work.rs:205-364` | Planner plus one existing transactional due-work admission owner | `capture_selection_shadow`, equivalence replay and their `provider_selection_*` shadow writers; competing `provider_work_receipts/obligations/scan/retries` scheduling when superseded | Retain current lookup confirmation, asset/mapping writes, metadata obligations, conflicts and generation fences. Current retained-work admission covers a restricted private Unfiled profile, not all libraries. |
+| Active generations and copies: `orchestration/generation.rs`, `state/db/provider_generations.rs` | Planner decisions and physical-destination state/finalization | Superseded `provider_selection_rank_*` replay, repeated declarations, redundant `provider_active_generations/decisions/sources` writers after responsibility transfer | `provider_active_destinations` holds real per-copy paths and media/metadata completion. It is not disposable shadow state; canonical asset rows alone cannot replace it. Exact schema consolidation remains undecided. |
+| Competing retries: `orchestration/recovery.rs`, `download/retry.rs`, `pipeline/pass.rs`, `state/db/assets.rs:367-425` | Existing exact retry-task resolver and shared executor | Retry-only orchestration/reset mode, append-only-after-success scheduling, duplicate URL-refresh pass construction, runtime legacy backfill after migration | Bounded cycle attempts, durable unknown identity and independent completed peers. `prepare_for_retry` already resets transfer attempts each cycle; do not claim a transfer lifetime cap exists. |
+| Checkpoint/config/recovery: `sync_cycle.rs`, `state/db/checkpoints.rs:108-173` | Cycle checkpoint authority and transactional state store | Superseded path-config staging/reconciliation keys and duplicate inventory/bridge policies; finite `retained_checkpoint_hold` exhaustion when replaced | This hold is distinct from transfer retry counts. Preserve stale-plan fences, atomic activation, explicit deletion proof and required protocol bridging until reviewed rescan/replay proof replaces them. |
+| Paths/layouts: `orchestration/reconciliation.rs`, `primary_layout.rs`, `state/db/primary_layout.rs:282-445` | Recorded per-copy destinations in planner; existing safe file handover | Template/root/filename re-derivation of established paths and alternate layout dispatch; superseded layout writers only after pending operations migrate | `primary_layout_operations/members/claims/preserved/bindings/superseded_paths` include ownership and interrupted-publication evidence. Preserve it, user edits and all required copies. |
+| Legacy attribution: `sync_cycle.rs:1253-1312`, `download/legacy_preservation.rs`, `state/db/legacy_preservation.rs:481-662` | Upgrade/adoption boundary with retained protected-path evidence | Normal-cycle `LegacyCycle::begin/certify/finish`, `complete_legacy_inventory`, recurring mapping backfill and legacy coverage activation after conversion | Preserve `unattributed_legacy`, paths and provenance. Unknown historical ownership cannot be guessed or discarded; independently identified current children must progress. |
+| Metadata: `orchestration/maintenance.rs`, `metadata_rewrite/queued.rs`, full/collecting/runner drain callers | Existing managed-field writers plus one per-path completion/retry owner | Periodic revision backfills, duplicate drain scheduling and redundant revision retry writers after migration | Keep successfully landed media, unrelated fields and prepared-output recovery. `asset_metadata_paths` also holds source/publication evidence. Default-write policy needs explicit instruction alignment. |
+| Local recovery/watch: `sync_loop/reconcile.rs:92-203`, runner and watch owners | Runner scheduling, selected-file existence recovery and explicit integrity command | Truncated-file repair during sync, periodic diagnostic cadence, `local_drift_probe_offset_v1` once replaced, metadata-specific follow-up cycles | Current drift probe samples size/existence, not full hashes or every selected file. Preserve quiet-cloud wakeups and missing-file recovery; completeness and operational health remain distinct. |
+
+Historical evidence must remain separate from current work. Old raw pages and manifests do not establish the newest provider version. Confirmed transfers, per-copy metadata debt, sparse references and interrupted publications remain actionable even when discovered through history. `generation.rs::hold_retained_debt` currently couples retained debt to checkpoint holds; removing that coupling requires replay/restart proof. `delta.rs` already applies explicit source/family deletion through the state owner. Preserve those facts and all local media; inventory absence is never deletion evidence.
+
+### Configuration consumers and corrected assumptions
+
+- Input flows through `cli.rs` and `config/input.rs`, then `config/resolve.rs` into runtime types. Setup and `config/persistence.rs` write durable TOML. `commands/config_cmd.rs` resolves and serializes `config show`; startup in `lib.rs` handles parse failures, with an existing diagnostic exception for doctor.
+- Relative `recent` becomes an instant boundary at config-build time. Direct `skip_created_before/after = "Nd"` reaches the same parser. The runner captures resolved bounds once (`runner.rs:406-407`); this is not a continuously moving window in an already-running watch process.
+- Fixed bounds pass through `filter/config.rs`, `filter/eligibility.rs:100-111`, `orchestration/full.rs:623-674` and `orchestration/selection.rs:300-301`. Provider enumeration receives limits/bounds rather than relative-date text. Keep conservative date enumeration and bounded-stream checkpoint vetoes.
+- Bounds affect configuration/coverage fingerprints in `orchestration/config.rs`, scoped prechecks in `sync_loop/precheck.rs`, selection generations, retained-work projection and recent recovery. Their serialized fixed-date/instant formats must remain unchanged in the first slice.
+- Media and filename settings are TOML today; apparent CLI overrides often belong to test-only/internal construction. Tests already reject `--size`, `--force-size`, `--filename-exclude` and former rendition switches. There are no current environment bindings for the selected recent/date settings.
+- `version_with_fallback` can fall back from a requested rendition to original. Do not describe it as always substituting a smaller image. RAW alignment can swap logical Original/Alternative while preserving distinct provider resource keys.
+- Import shares photo/path/media resolution, but `PathDerivationConfig::from_path_fields` initializes date and filename filters empty. Import already rejects days-form recent and supports count sampling. Shared types alone do not prove identical sync/import selection behavior.
+- Docker CMD (`Dockerfile:87`) and Linux service `ExecStart` (`src/service/linux.rs:124`) use service/config entry points without relative literals. The Homebrew formula generated by `.github/workflows/release.yml:298-333` installs `bin/kei` and tests version/help without selection arguments. Read-only inspection of `rhoopr/homebrew-kei/main/Formula/kei.rb` during slice 1a confirmed the same invocation shape in the published v0.26.0 formula. No packaging change is needed for this slice.
+
+## Approved first production slice: remove relative-date selection
+
+Approval status: approved by the user, including production/test deletion, public input removal and refusal-based upgrade. The user additionally requires actionable errors that explain how to resolve the problem. This is slice 1a, independently deliverable before newest-N or rendition changes. It removes one clock-dependent selection policy and its overlapping input forms. It does not satisfy the full slice 1 acceptance matrix by itself.
+
+### Exact scope
+
+| File | Approved change |
+| --- | --- |
+| `src/cli.rs` | Remove `RecentLimit::Days` and successful relative parse/display/serialization arms. Reject `--recent Nd`; preserve positive count parsing and integer/string input round trips. Update sync/service-shared and import help. |
+| `src/config/resolve.rs` | Remove days-to-bound translation, days conflicts and days-specific scope validation. Preserve fixed-bound precedence, count scope validation and contradictory-window reporting. |
+| `src/config/runtime.rs` | Remove relative interval arithmetic from `parse_created_date_filter`; keep date-only and explicit datetime parsing and `CreatedDateFilter` fingerprints. |
+| `src/config/input.rs` | Reject retired relative strings in both TOML date fields before CLI precedence can mask them. Use the existing input owner and direct validation, with no migration registry or runtime legacy variant. |
+| `src/commands/import.rs` | Remove the now-unreachable Days-specific rejection branch; preserve count sampling and existing import selection semantics. |
+| `src/setup.rs` | Remove relative-date prompt text and route rejection through existing date validation. |
+| Tests in those owners, `src/config/persistence.rs`, `tests/behavioral/configuration.rs`, and relevant CLI integration tests | Replace successful relative-policy tests with refusal tests. Convert positive persistence/config-show fixtures to fixed dates while retaining their original round-trip purpose. Add startup preservation/precedence acceptance below. |
+| `README.md`, `example.config.toml`, `docs/migration-from-icloudpd.md`, `docs/architecture.md`, `implementation_plan.md` | Describe fixed boundaries, supported count behavior for this intermediate slice, and the explicit old-setting diagnostic. Preserve historical changelog and old-version descriptions as history. |
+
+Remove all relative forms together: sync/service `--recent Nd`, TOML `[filters].recent = "Nd"`, and `Nd` in both `--skip-created-before` / `--skip-created-after` and their TOML fields. Keep `YYYY-MM-DD` and `YYYY-MM-DDTHH:MM:SS`; the latter is currently host-local, not RFC3339. No new dependency, schema/table/key, execution engine, publication policy or metadata default is needed.
+
+Count-form `recent`, `recent_scope`, fixed dates, media matrices and existing adoption remain supported in this intermediate slice. The named deletion condition for count support is the separately approved newest-N slice, including its durable recovery receipt and the import-sampling decision. Do not turn this bounded input change into that larger removal.
+
+### Upgrade and rollback
+
+Approved behavior: fail before authentication, provider requests, state opening/migration or media work when retired relative settings are present. Name the key and recommend an explicit fixed boundary. Preserve the config bytes, state and media; a fixed CLI override must not hide an obsolete TOML value. Doctor retains its existing ability to report an invalid config without entering sync.
+
+Suggested diagnostic: `Relative date windows are no longer supported. Set an explicit fixed boundary in skip_created_before or skip_created_after. Configuration was not changed.`
+
+There is no exact behavior-preserving automatic conversion from a relative boundary across future starts to a fixed date. Do not remove the limit, freeze it to today's date, or infer an intended capture date from a stored instant. The user approved refusal as a bounded exception to the general automatic-upgrade requirement. Any later automatic conversion needs its own agreed semantics.
+
+No state/config rewrite or backup is performed by this refusal-only slice because it mutates neither. Existing historical hashes and instant evidence remain intact; supported settings retain identical hashes and serialization. Before any successful sync using a user-changed fixed boundary, the unchanged old config/state/media remain a rollback point. After such a sync, this slice makes no new media rollback guarantee; restoring only an older binary/config is not a rollback of later file work.
+
+### Acceptance and deletion accounting
+
+1. Reject relative values through sync CLI, service-run CLI, TOML, config-show and setup validation. Include both date bounds, `recent`, and a retired TOML value masked by a valid fixed CLI override. Diagnostics identify the unsupported setting.
+2. Exercise the real binary with populated synthetic config/state/media. Assert nonzero refusal, no authentication/provider access, unchanged config/database/media bytes, and no new sync artifacts. Include an invocation that would otherwise be ready to sync so an unrelated missing-credential error cannot satisfy the assertion.
+3. Accept fixed lower/upper capture dates and host-local datetimes. Preserve inclusive capture-local eligibility, conservative provider bounds, contradictory-range reporting and original TOML persistence. Run the existing production date-expansion/reopen/steady-state regression; excluded local files remain untouched.
+4. Retain count parsing, scope and import sampling; run the existing recent reopen/convergence and Live Photo companion recovery regressions. This input slice must not change successful-component completion or retry identity.
+5. Preserve golden hashes for supported configurations and inspect actual `sync --help`, `service run --help`, and `import-existing --help`. Recheck Docker CMD, Linux ExecStart and packaging consumers; no new runtime wrapper is permitted.
+6. Search `RecentLimit::Days`, `recent_days`, relative prompt/help examples and all `parse_created_date_filter` callers. Remaining relative literals belong only to rejection tests or explicitly historical docs. No successful relative runtime branch survives.
+
+Focused implementation checks: `cargo test --lib config::`; `cargo test --lib cli::tests::recent`; `cargo test --lib bundled_date_filters_select_exact_assets`; `cargo test --lib run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_steady_state`; `cargo test --lib recent_scope_overflow_reopens_then_increases_removes_and_converges`; `cargo test --lib recent_one_asset_keeps_both_companion_renditions_and_recovers_unchanged_tail`; `cargo test --lib golden_`; `cargo test --test cli`; `cargo test --test behavioral config_show`; the new startup-refusal test by exact name; `just test scenario config-docs`; formatting and all-target/all-feature Clippy. These are future acceptance commands, except where separately recorded in the baseline above. Confirm each filter selects tests. Hosted CI owns broader offline qualification.
+
+Before/after accounting for this slice: relative selection policy 1 -> 0; accepted relative entry forms 6 -> 0 (three CLI values and three TOML values); clock-dependent date-resolution branch 1 -> 0; days-to-date translation route 1 -> 0; database tables/keys/active writers unchanged; sync execution routes unchanged; dependencies unchanged. Record actual production lines added/deleted at implementation review, not an invented estimate. The retained count policy and unchanged engine routes must remain visible in the final accounting.
+
+Approval received for this exact production/test deletion scope and public input removal, refusal of old relative config as the bounded upgrade exception, and retention of fixed host-local datetimes and count-form recent during this intermediate slice. Implementation is limited to slice 1a; later slices still need their own approval.
+
+### Slice 1a implementation evidence
+
+- Removed relative recent representation, serialization, translation/conflict handling and clock arithmetic. Fixed-date inputs retain their existing runtime types and hash formats; count-form recent remains supported.
+- Saved relative TOML is rejected by the input owner before precedence. Both CLI date flags validate through the existing date parser during Clap parsing. Rejection messages name the setting or flag and explain how to remove the limit or use fixed dates; recent errors also give a supported count alternative.
+- A read-only 6.1 Sol review found that initial CLI date rejection happened after support-recording files and the data directory could be created. Moving date validation into Clap resolved that finding on static re-review. The completed binary regressions also verify unchanged populated state/media/config, no support artifacts, and no creation of an absent data directory on CLI refusal.
+- The simplification pass removed a now-redundant intermediate lower-bound variable. No additional engine, migration dispatcher, dependency, database writer or schema change was introduced.
+- The refusal matrix executes 27 real-binary invocations across sync/service CLI, TOML, config-show, masked TOML overrides and absent data directories. A supported fixed-date/count control reaches the offline authentication boundary, rather than passing because the fixture cannot reach sync. Import-relative rejection now runs offline; provider-dependent import tests remain ignored.
+- Final read-only 6.1 Sol review of the completed test changes found no correctness or acceptance gaps. That review inspected source and assertions; it did not independently rerun tests.
+- Production-section diff against HEAD, including comments and excluding test modules: 76 lines added, 89 deleted, net 13 removed. Relative selection policy and all six accepted relative input forms are removed. Engine execution routes and database tables/keys/writers are unchanged. The larger removal targets remain future slices.
+- Cross-file coherence check: no `RecentLimit::Days`, successful relative resolution, or relative setup/help invitation remains. Supported date/count serialization and six golden hash tests pass. Remaining relative literals are rejection cases, upgrade instructions, or historical release documentation. Actual sync/service/import help and `sync --recent 30d` were inspected; the latter exits 2 with removal/fixed-date/count instructions. Docker, systemd and Homebrew consumer checks are recorded above.
+
+| Slice 1a check | Result |
+| --- | --- |
+| `cargo check` | Passed |
+| `cargo test --lib config:: --quiet` | 381 passed |
+| `cargo test --lib cli::tests:: --quiet` | 181 passed |
+| `cargo test --lib setup::tests:: --quiet` | 43 passed |
+| `cargo test --test cli --quiet` | 136 passed |
+| `cargo test --test behavioral configuration:: --quiet` | 66 passed |
+| `cargo test --test import_existing_live --quiet` | 15 passed, 15 ignored; no live tests run |
+| Four named date-selection/date-expansion/recent-convergence/Live Photo regressions listed in acceptance above | Each passed, 1 test per command |
+| `cargo test --lib golden_ --quiet` | 6 passed |
+| `just test scenario config-docs` | 3 passed |
+| `cargo test --test behavioral relative_ --quiet` after replacing boolean test-helper arguments with named input cases | 3 passed, preserving the full refusal matrix |
+| `cargo fmt --all --check` | Passed after fixing three formatting differences |
+| `cargo clippy --all-targets --all-features -- -D warnings` | Passed on final Rust changes |
+| `git diff --check` | Passed |
+
+Counts are per command and overlap. These are focused Linux checks, not full offline, live-provider or release qualification. Qualification preceded commit and push. The user subsequently authorized committing and pushing this branch, then proposing the next slice. That authorization does not include implementing the next slice, opening a PR, changing main or releasing.

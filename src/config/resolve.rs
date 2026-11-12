@@ -723,39 +723,15 @@ impl Config {
         let persistent_skip_created_before =
             toml_filters.and_then(|f| f.skip_created_before.clone());
         let persistent_skip_created_after = toml_filters.and_then(|f| f.skip_created_after.clone());
-        let explicit_skip_created_before_str = sync
+        let skip_created_before_str = sync
             .skip_created_before
             .or_else(|| persistent_skip_created_before.clone());
 
-        // Split the RecentLimit: Count(n) is a post-enumeration cap held on
-        // config.recent. Days(n) translates into a skip_created_before cutoff
-        // since "last N days" = "skip everything created before N days ago".
-        // Reject combining the two forms on the same invocation so user
-        // intent stays unambiguous.
-        let (recent, recent_days) = match recent_raw {
-            None => (None, None),
-            Some(crate::cli::RecentLimit::Count(n)) => (Some(n), None),
-            Some(crate::cli::RecentLimit::Days(n)) => {
-                anyhow::ensure!(
-                    explicit_skip_created_before_str.is_none(),
-                    "`--recent {n}d` and `--skip-created-before` do the same thing. Pick one."
-                );
-                (None, Some(n))
-            }
-        };
+        let recent = recent_raw.map(|crate::cli::RecentLimit::Count(n)| n);
         anyhow::ensure!(
             recent_raw.is_some() || !recent_scope_was_set,
-            "`recent_scope` only applies when `recent` is set."
+            "`recent_scope` only applies when `recent` is set. Set a count with recent = 100 or --recent 100, or remove recent_scope / --recent-scope."
         );
-        anyhow::ensure!(
-            !matches!(recent_raw, Some(crate::cli::RecentLimit::Days(_))) || !recent_scope_was_set,
-            "`recent_scope` only applies to count-form `recent` values, not `Nd` day windows."
-        );
-        let skip_created_before_str = if let Some(n) = recent_days {
-            Some(format!("{n}d"))
-        } else {
-            explicit_skip_created_before_str
-        };
         let skip_created_after_str = sync
             .skip_created_after
             .or_else(|| persistent_skip_created_after.clone());
@@ -763,11 +739,13 @@ impl Config {
         let skip_created_before = skip_created_before_str
             .as_deref()
             .map(parse_created_date_filter)
-            .transpose()?;
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("skip_created_before / --skip-created-before: {e}"))?;
         let skip_created_after = skip_created_after_str
             .as_deref()
             .map(parse_created_date_filter)
-            .transpose()?;
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("skip_created_after / --skip-created-after: {e}"))?;
 
         if let (Some(before), Some(after)) = (&skip_created_before, &skip_created_after)
             && before.is_strictly_after(*after)
@@ -3038,24 +3016,19 @@ mod tests {
         );
     }
     #[test]
-    fn test_build_skip_dates_interval_syntax_from_toml() {
-        let toml_str = r#"
-            [filters]
-            skip_created_before = "30d"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        let CreatedDateFilter::Instant(before) = cfg.filters.skip_created_before.unwrap() else {
-            panic!("day interval must resolve to an instant");
-        };
-        let expected = chrono::Utc::now() - chrono::Duration::days(30);
-        assert!((before - expected).num_seconds().abs() < 2);
+    fn test_toml_skip_dates_reject_relative_syntax_before_resolution() {
+        for key in ["skip_created_before", "skip_created_after"] {
+            let err = toml::from_str::<TomlConfig>(&format!("[filters]\n{key} = \"30d\"\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("filters.{key}")), "{err}");
+            assert!(
+                err.contains("Relative date windows are no longer supported"),
+                "{err}"
+            );
+            assert!(err.contains("Remove this date limit"), "{err}");
+            assert!(err.contains("YYYY-MM-DD"), "{err}");
+        }
     }
     #[test]
     fn test_build_invalid_date_from_toml_errors() {
@@ -4156,42 +4129,39 @@ mod tests {
         );
     }
     #[test]
-    fn test_build_recent_days_populates_skip_created_before() {
+    fn test_build_relative_skip_created_before_rejected() {
         let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Days(30));
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert!(
-            cfg.filters.recent.is_none(),
-            "Days form must not populate recent (count-only field)"
-        );
-        assert!(
-            cfg.filters.skip_created_before.is_some(),
-            "Days form must populate skip_created_before cutoff"
-        );
-        // The cutoff should be ~30 days ago; give it a wide window to avoid
-        // flakiness on slow CI.
-        let CreatedDateFilter::Instant(cutoff) = cfg.filters.skip_created_before.unwrap() else {
-            panic!("recent day window must resolve to an instant");
-        };
-        let now = chrono::Utc::now();
-        let delta = now.signed_duration_since(cutoff);
-        assert!(
-            delta.num_days() >= 29 && delta.num_days() <= 31,
-            "cutoff should be ~30 days ago; got {} days",
-            delta.num_days()
-        );
-    }
-    #[test]
-    fn test_build_recent_days_conflicts_with_skip_created_before() {
-        let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Days(30));
-        sync.skip_created_before = Some("2024-01-01".to_string());
+        sync.skip_created_before = Some("30d".to_string());
         let err = Config::build(&default_globals(), &default_password(), sync, None)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--recent 30d"), "{err}");
-        assert!(err.contains("--skip-created-before"), "{err}");
-        assert!(err.contains("Pick one"), "{err}");
+        assert!(
+            err.contains("skip_created_before / --skip-created-before"),
+            "{err}"
+        );
+        assert!(
+            err.contains("Relative date windows are no longer supported"),
+            "{err}"
+        );
+        assert!(err.contains("YYYY-MM-DD"), "{err}");
+    }
+    #[test]
+    fn test_build_relative_skip_created_after_rejected_with_fixed_lower_bound() {
+        let mut sync = default_sync();
+        sync.skip_created_before = Some("2024-01-01".to_string());
+        sync.skip_created_after = Some("30d".to_string());
+        let err = Config::build(&default_globals(), &default_password(), sync, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("skip_created_after / --skip-created-after"),
+            "{err}"
+        );
+        assert!(
+            err.contains("Relative date windows are no longer supported"),
+            "{err}"
+        );
+        assert!(err.contains("YYYY-MM-DD"), "{err}");
     }
     #[test]
     fn test_build_recent_count_orthogonal_with_skip_created_before() {
@@ -4205,21 +4175,23 @@ mod tests {
         assert!(cfg.filters.skip_created_before.is_some());
     }
     #[test]
-    fn test_build_recent_days_from_toml() {
+    fn test_toml_relative_recent_rejected_even_with_fixed_date_bound() {
         let toml_str = r#"
             [filters]
             recent = "14d"
+            skip_created_before = "2024-01-01"
         "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert!(cfg.filters.recent.is_none());
-        assert!(cfg.filters.skip_created_before.is_some());
+        let err = toml::from_str::<TomlConfig>(toml_str)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Relative date windows are no longer supported for recent"),
+            "{err}"
+        );
+        assert!(
+            err.contains("Remove recent from [filters] or omit --recent"),
+            "{err}"
+        );
     }
     #[test]
     fn test_build_recent_count_from_toml_integer() {
@@ -4256,38 +4228,39 @@ mod tests {
         assert!(err.contains("recent"), "{err}");
     }
     #[test]
-    fn test_build_recent_scope_with_days_rejected() {
+    fn test_toml_relative_recent_rejected_before_scope_resolution() {
         let toml_str = r#"
             [filters]
             recent = "14d"
             recent_scope = "per-filter"
         "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let err = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("recent_scope"), "{err}");
-        assert!(err.contains("count-form"), "{err}");
+        let err = toml::from_str::<TomlConfig>(toml_str)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Relative date windows are no longer supported for recent"),
+            "{err}"
+        );
+        assert!(err.contains("recent = 100"), "{err}");
     }
     #[test]
-    fn test_build_recent_days_conflicts_with_toml_skip_created_before() {
-        // CLI Days form should also conflict with a TOML skip_created_before.
+    fn test_build_recent_count_combines_with_toml_skip_created_before() {
         let toml_str = r#"
             [filters]
             skip_created_before = "2024-01-01"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Days(7));
-        let err = Config::build(&default_globals(), &default_password(), sync, Some(&toml))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--recent 7d"), "{err}");
+        sync.recent = Some(crate::cli::RecentLimit::Count(7));
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        assert_eq!(cfg.filters.recent, Some(7));
+        assert_eq!(
+            cfg.filters.skip_created_before,
+            Some(CreatedDateFilter::CaptureDate(
+                NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()
+            ))
+        );
     }
     #[test]
     fn test_build_live_photos_only_with_live_skip_rejected() {

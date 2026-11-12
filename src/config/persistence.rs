@@ -625,7 +625,7 @@ mod tests {
             recent = 100
             recent_scope = "per-filter"
             skip_created_before = "2024-01-01"
-            skip_created_after = "30d"
+            skip_created_after = "2025-06-01T14:30:00"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
@@ -643,7 +643,21 @@ mod tests {
             Some(crate::cli::RecentScope::PerFilter)
         );
         assert_eq!(filters.skip_created_before.as_deref(), Some("2024-01-01"));
-        assert_eq!(filters.skip_created_after.as_deref(), Some("30d"));
+        assert_eq!(
+            filters.skip_created_after.as_deref(),
+            Some("2025-06-01T14:30:00")
+        );
+        let encoded = ::toml::to_string(&serialized).unwrap();
+        let reopened: TomlConfig = ::toml::from_str(&encoded).unwrap();
+        let reopened_filters = reopened.filters.as_ref().unwrap();
+        assert_eq!(
+            reopened_filters.skip_created_before,
+            filters.skip_created_before
+        );
+        assert_eq!(
+            reopened_filters.skip_created_after,
+            filters.skip_created_after
+        );
     }
     #[test]
     fn test_to_toml_roundtrip_media() {

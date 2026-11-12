@@ -155,8 +155,8 @@ filename_exclude = []
 
 # Option: filters.recent
 # Default value: unset
-# Valid values: positive integer count such as 100, or day window string such as "30d"
-# Description: Permanently limits sync to recent assets. Count form is a candidate cap; day form maps to skip_created_before.
+# Valid values: positive integer count such as 100
+# Description: Permanently limits sync to recent assets with a candidate cap. Remove this setting for no count limit; use fixed date bounds below for a date range.
 # recent = 100
 
 # Option: filters.recent_scope
@@ -167,14 +167,14 @@ filename_exclude = []
 
 # Option: filters.skip_created_before
 # Default value: unset
-# Valid values: YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, or day interval such as 30d
-# Description: Skips assets created before this cutoff. Date-only values compare the capture-local calendar date; explicit datetimes and relative intervals compare the instant.
+# Valid values: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
+# Description: Skips assets created before this fixed cutoff. Date-only values compare the capture-local calendar date; host-local datetimes compare the instant. Remove this setting for no lower bound.
 # skip_created_before = "2024-01-01"
 
 # Option: filters.skip_created_after
 # Default value: unset
-# Valid values: YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, or day interval such as 7d
-# Description: Skips assets created after this cutoff. Date-only values compare the capture-local calendar date; explicit datetimes and relative intervals compare the instant.
+# Valid values: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
+# Description: Skips assets created after this fixed cutoff. Date-only values compare the capture-local calendar date; host-local datetimes compare the instant. Remove this setting for no upper bound.
 # skip_created_after = "2024-12-31"
 
 [photos]

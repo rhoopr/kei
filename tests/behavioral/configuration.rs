@@ -1,6 +1,9 @@
 //! Configuration commands, precedence, persistence, and logging resolution.
 
-use super::{clean_cmd, sync_cmd_for_validation, write_fake_two_factor_config, write_sync_config};
+use super::{
+    clean_cmd, create_state_db, insert_asset, sync_cmd_for_validation,
+    write_fake_two_factor_config, write_sync_config,
+};
 use crate::common;
 use predicates::prelude::{PredicateBooleanExt, predicate};
 
@@ -1132,7 +1135,7 @@ fn config_show_emits_libraries_when_repeatable_named_zone() {
 #[test]
 fn config_show_round_trips_persistent_recent_and_dates() {
     let (stdout, _) = run_config_show(
-        "\n[filters]\nrecent = 100\nrecent_scope = \"per-filter\"\nskip_created_before = \"2024-01-01\"\nskip_created_after = \"30d\"\n",
+        "\n[filters]\nrecent = 100\nrecent_scope = \"per-filter\"\nskip_created_before = \"2024-01-01\"\nskip_created_after = \"2025-06-01T14:30:00\"\n",
     );
     assert!(stdout.contains("recent = 100"), "stdout: {stdout}");
     assert!(
@@ -1144,8 +1147,236 @@ fn config_show_round_trips_persistent_recent_and_dates() {
         "stdout: {stdout}"
     );
     assert!(
-        stdout.contains("skip_created_after = \"30d\""),
+        stdout.contains("skip_created_after = \"2025-06-01T14:30:00\""),
         "stdout: {stdout}"
+    );
+}
+
+enum RelativeInput {
+    Cli,
+    Toml,
+    OverriddenToml,
+}
+
+fn assert_relative_refusal_preserves_archive(command: &[&str], key: &str, input: RelativeInput) {
+    let saved = !matches!(input, RelativeInput::Cli);
+    let overrides = matches!(input, RelativeInput::OverriddenToml);
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = write_fake_two_factor_config(dir.path(), "test@example.invalid");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    let media_path = dir.path().join("photos/existing.JPG");
+    std::fs::write(&media_path, b"synthetic existing photo").unwrap();
+    std::fs::write(dir.path().join("photos/existing.JPG.xmp"), b"user metadata").unwrap();
+    let conn = create_state_db(&data_dir, "test@example.invalid");
+    insert_asset(
+        &conn,
+        "existing",
+        "downloaded",
+        "existing.JPG",
+        Some(media_path.to_str().unwrap()),
+        None,
+        None,
+    );
+    insert_asset(
+        &conn,
+        "retry",
+        "failed",
+        "retry.JPG",
+        None,
+        Some("retained retry"),
+        None,
+    );
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES ('sync_token:PrimarySync', 'retained-cursor')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    if saved {
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        std::fs::write(
+            &config_path,
+            format!("{config}\n[filters]\n{key} = \"30d\"\n"),
+        )
+        .unwrap();
+    }
+    let snapshot = || {
+        common::walkdir(dir.path())
+            .into_iter()
+            .map(|path| {
+                let bytes = std::fs::read(&path).unwrap();
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                (path, bytes, modified)
+            })
+            .collect::<Vec<_>>()
+    };
+    let entries = || {
+        [dir.path(), data_dir.as_path(), media_path.parent().unwrap()]
+            .into_iter()
+            .map(|path| {
+                let mut entries = std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                entries.sort();
+                entries
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = snapshot();
+    let entries_before = entries();
+    let mut cmd = clean_cmd();
+    cmd.env("KEI_DATA_DIR", &data_dir)
+        .env("RUST_LOG", "kei=debug")
+        .env("KEI_UNSTABLE_FAKE_TWO_FACTOR_REQUIRED_FOR_TESTS", "1")
+        .args(command)
+        .arg("--config")
+        .arg(&config_path);
+    let flag = format!("--{}", key.replace('_', "-"));
+    if !saved {
+        cmd.args([flag.as_str(), "30d"]);
+    }
+    if overrides {
+        cmd.args([
+            "--recent",
+            "100",
+            "--skip-created-before",
+            "2024-01-01",
+            "--skip-created-after",
+            "2025-01-01",
+        ]);
+    }
+    let code = if saved { 1 } else { 2 };
+    let output = cmd.assert().code(code).get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Relative date windows are no longer supported"),
+        "{command:?} {key} saved={saved} overrides={overrides}: {stderr}"
+    );
+    assert!(stderr.contains(key) || stderr.contains(&flag), "{stderr}");
+    assert!(stderr.contains("YYYY-MM-DD"), "{stderr}");
+    if key == "recent" {
+        assert!(
+            stderr.contains("Remove recent from [filters] or omit --recent"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("recent = 100 or --recent 100"), "{stderr}");
+    } else {
+        assert!(
+            stderr.contains("Remove this date limit from [filters] or omit its CLI flag"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("host-local datetime (YYYY-MM-DDTHH:MM:SS)"),
+            "{stderr}"
+        );
+    }
+    for auth_marker in [
+        "Starting kei",
+        "Authenticating",
+        "Offline 2FA-required test seam enabled",
+        "No password was available",
+        "kei login get-code",
+    ] {
+        assert!(
+            !stderr.contains(auth_marker),
+            "refusal reached sync/authentication ({auth_marker}): {stderr}"
+        );
+    }
+    assert!(
+        output.stdout.is_empty(),
+        "refusal must not emit a resolved or rewritten config"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "refusal must preserve config, media, metadata and populated state, with no new artifacts"
+    );
+    assert_eq!(
+        entries(),
+        entries_before,
+        "refusal must not create support directories"
+    );
+    if !saved {
+        let absent_data_dir = dir.path().join("absent-data");
+        cmd.env("KEI_DATA_DIR", &absent_data_dir)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "Relative date windows are no longer supported",
+            ));
+        assert!(
+            !absent_data_dir.exists(),
+            "CLI refusal must precede data/support initialization"
+        );
+        assert_eq!(snapshot(), before);
+        assert_eq!(entries(), entries_before);
+    }
+}
+
+#[test]
+fn relative_cli_refusal_preserves_config_state_and_media_before_auth() {
+    for command in [&["sync"][..], &["service", "run"][..]] {
+        for key in ["recent", "skip_created_before", "skip_created_after"] {
+            assert_relative_refusal_preserves_archive(command, key, RelativeInput::Cli);
+        }
+    }
+}
+
+#[test]
+fn relative_toml_refusal_preserves_config_state_and_media_before_auth() {
+    for command in [
+        &["sync"][..],
+        &["service", "run"][..],
+        &["config", "show"][..],
+    ] {
+        for key in ["recent", "skip_created_before", "skip_created_after"] {
+            assert_relative_refusal_preserves_archive(command, key, RelativeInput::Toml);
+        }
+    }
+}
+
+#[test]
+fn relative_toml_refusal_cannot_be_masked_by_fixed_cli_overrides() {
+    for command in [&["sync"][..], &["service", "run"][..]] {
+        for key in ["recent", "skip_created_before", "skip_created_after"] {
+            assert_relative_refusal_preserves_archive(command, key, RelativeInput::OverriddenToml);
+        }
+    }
+}
+
+#[test]
+fn fixed_date_sync_control_reaches_offline_auth_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = write_fake_two_factor_config(dir.path(), "test@example.invalid");
+    let output = clean_cmd()
+        .env("KEI_DATA_DIR", dir.path().join("data"))
+        .env("RUST_LOG", "kei=debug")
+        .env("KEI_UNSTABLE_FAKE_TWO_FACTOR_REQUIRED_FOR_TESTS", "1")
+        .args(["sync", "--config"])
+        .arg(config_path)
+        .args([
+            "--recent",
+            "100",
+            "--skip-created-before",
+            "2024-01-01",
+            "--skip-created-after",
+            "2025-01-01T14:30:00",
+        ])
+        .assert()
+        .code(3)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let auth_marker = if cfg!(debug_assertions) {
+        "Offline 2FA-required test seam enabled"
+    } else {
+        "No password was available"
+    };
+    assert!(
+        stderr.contains(auth_marker),
+        "supported fixed dates must pass configuration validation and reach the auth boundary: {stderr}"
     );
 }
 

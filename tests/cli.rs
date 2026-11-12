@@ -120,9 +120,27 @@ fn sync_help_succeeds() {
         .stdout(predicate::str::contains("--friendly"))
         .stdout(predicate::str::contains("--recent"))
         .stdout(predicate::str::contains("capture-local calendar date"))
-        .stdout(predicate::str::contains("explicit datetimes"))
-        .stdout(predicate::str::contains("relative intervals"))
+        .stdout(predicate::str::contains("host-local datetimes"))
+        .stdout(predicate::str::contains("relative intervals").not())
+        .stdout(predicate::str::contains("30d").not())
         .stdout(predicate::str::contains("--download-dir").not());
+}
+
+#[test]
+fn service_and_import_help_do_not_advertise_relative_windows() {
+    for args in [
+        &["service", "run", "--help"][..],
+        &["import-existing", "--help"][..],
+    ] {
+        common::cmd()
+            .args(args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--recent"))
+            .stdout(predicate::str::contains("30d").not())
+            .stdout(predicate::str::contains("Nd").not())
+            .stdout(predicate::str::contains("relative intervals").not());
+    }
 }
 
 #[test]

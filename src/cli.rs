@@ -96,15 +96,11 @@ fn parse_2fa_code(s: &str) -> Result<String, String> {
 
 /// Limit on which assets a sync pass processes.
 ///
-/// `--recent 100` is a count limit (top N most-recent assets). `--recent 30d`
-/// is a days limit (assets created in the last 30 days) and translates to a
-/// `skip_created_before` cutoff at `Config::build` time.
+/// `--recent 100` is a count limit (top N most-recent assets).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecentLimit {
     /// Take the N most-recent assets by creation date.
     Count(u32),
-    /// Take assets created in the last N days.
-    Days(u32),
 }
 
 /// Explicit legacy-state adoption. No automatic account inference or overwrite.
@@ -145,37 +141,29 @@ pub enum RecentScope {
     PerFilter,
 }
 
-/// Parse `--recent N` (count) or `--recent Nd` (days). Clap `value_parser`.
-///
-/// Rejects zero, empty, and unknown suffixes. Only `d` (days) is supported
-/// today; this keeps the syntax open for future units without locking us in.
+/// Parse a positive `--recent N` count. Clap `value_parser`.
 pub(crate) fn parse_recent_limit(s: &str) -> Result<RecentLimit, String> {
     if s.is_empty() {
-        return Err("must not be empty".to_string());
+        return Err("must not be empty; use a positive count such as 100, or remove recent to omit the count limit".to_string());
     }
-    let (num_str, is_days) = if let Some(stripped) = s.strip_suffix('d') {
-        (stripped, true)
-    } else {
-        (s, false)
-    };
-    let n: u32 = num_str
+    if s.ends_with('d') {
+        return Err("Relative date windows are no longer supported for recent. Remove recent from [filters] or omit --recent; for sync, use a fixed date range with skip_created_before/skip_created_after in [filters] or --skip-created-before/--skip-created-after (YYYY-MM-DD). For a count limit, use recent = 100 or --recent 100.".to_string());
+    }
+    let n: u32 = s
         .parse()
-        .map_err(|_e| format!("expected a positive integer or `Nd` form (got `{s}`)"))?;
+        .map_err(|_e| format!("expected a positive integer (got `{s}`); use a count such as 100, or remove recent to omit the count limit"))?;
     if n == 0 {
-        return Err(format!("must be greater than zero (got `{s}`)"));
+        return Err(format!(
+            "must be greater than zero (got `{s}`); use a count such as 100, or remove recent to omit the count limit"
+        ));
     }
-    Ok(if is_days {
-        RecentLimit::Days(n)
-    } else {
-        RecentLimit::Count(n)
-    })
+    Ok(RecentLimit::Count(n))
 }
 
 impl std::fmt::Display for RecentLimit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Count(n) => write!(f, "{n}"),
-            Self::Days(n) => write!(f, "{n}d"),
         }
     }
 }
@@ -186,7 +174,6 @@ impl serde::Serialize for RecentLimit {
             // Count serializes as a bare integer so TOML round-trips cleanly
             // for the common case (`recent = 100`, not `recent = "100"`).
             Self::Count(n) => s.serialize_u32(*n),
-            Self::Days(n) => s.serialize_str(&format!("{n}d")),
         }
     }
 }
@@ -201,7 +188,9 @@ impl<'de> serde::Deserialize<'de> for RecentLimit {
             Str(String),
         }
         match Raw::deserialize(d)? {
-            Raw::Int(0) => Err(D::Error::custom("`recent` must be greater than zero")),
+            Raw::Int(0) => Err(D::Error::custom(
+                "`recent` must be greater than zero; use recent = 100, or remove recent to omit the count limit",
+            )),
             Raw::Int(n) => Ok(Self::Count(n)),
             Raw::Str(s) => parse_recent_limit(&s).map_err(D::Error::custom),
         }
@@ -232,14 +221,18 @@ pub struct PasswordArgs {
     pub password_command: Option<String>,
 }
 
+/// Validate date syntax before startup can create support or state directories.
+fn parse_created_date_argument(s: &str) -> Result<String, String> {
+    crate::config::parse_created_date_filter(s).map_err(|error| error.to_string())?;
+    Ok(s.to_owned())
+}
+
 /// Arguments for the sync command.
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SyncArgs {
-    /// Limit to recent assets (e.g. `--recent 100`) or use a days window
-    /// (e.g. `--recent 30d`).
+    /// Limit to recent assets (e.g. `--recent 100`).
     /// This is not a global exact file count - filters and live-photo parts
-    /// can change the final number of downloaded files. Days form maps to
-    /// `--skip-created-before` internally.
+    /// can change the final number of downloaded files.
     #[arg(long, value_parser = parse_recent_limit)]
     pub recent: Option<RecentLimit>,
 
@@ -259,13 +252,13 @@ pub struct SyncArgs {
     pub no_progress_bar: bool,
 
     /// Skip assets before this cutoff. Date-only values compare the capture-local calendar date;
-    /// explicit datetimes and relative intervals compare the instant (e.g., 2025-01-02 or 20d).
-    #[arg(long)]
+    /// host-local datetimes compare the instant (e.g., 2025-01-02T14:30:00).
+    #[arg(long, value_parser = parse_created_date_argument)]
     pub skip_created_before: Option<String>,
 
     /// Skip assets after this cutoff. Date-only values compare the capture-local calendar date;
-    /// explicit datetimes and relative intervals compare the instant (e.g., 2025-01-02 or 20d).
-    #[arg(long)]
+    /// host-local datetimes compare the instant (e.g., 2025-01-02T14:30:00).
+    #[arg(long, value_parser = parse_created_date_argument)]
     pub skip_created_after: Option<String>,
 
     /// Only print filenames without downloading
@@ -416,8 +409,7 @@ pub struct ImportArgs {
     #[arg(long = "library", value_parser = non_empty_string)]
     pub libraries: Vec<String>,
 
-    /// Number of recent photos to check (`--recent 100`). The `--recent Nd`
-    /// days form is only supported in `sync`; import-existing errors on use.
+    /// Number of recent photos to check (`--recent 100`).
     #[arg(long, value_parser = parse_recent_limit)]
     pub recent: Option<RecentLimit>,
 
@@ -1131,15 +1123,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_recent_limit_days_suffix() {
-        assert_eq!(parse_recent_limit("30d").unwrap(), RecentLimit::Days(30));
-        assert_eq!(parse_recent_limit("1d").unwrap(), RecentLimit::Days(1));
+    fn parse_recent_limit_rejects_days_with_resolution() {
+        for value in ["30d", "1d", "0d", "999999999999999999999d"] {
+            let err = parse_recent_limit(value).unwrap_err();
+            assert!(
+                err.contains("Relative date windows are no longer supported"),
+                "{err}"
+            );
+            assert!(
+                err.contains("Remove recent from [filters] or omit --recent"),
+                "{err}"
+            );
+            assert!(
+                err.contains("--skip-created-before/--skip-created-after (YYYY-MM-DD)"),
+                "{err}"
+            );
+            assert!(err.contains("recent = 100 or --recent 100"), "{err}");
+        }
     }
 
     #[test]
     fn parse_recent_limit_rejects_zero() {
         assert!(parse_recent_limit("0").unwrap_err().contains("zero"));
-        assert!(parse_recent_limit("0d").unwrap_err().contains("zero"));
     }
 
     #[test]
@@ -1149,8 +1154,7 @@ mod tests {
 
     #[test]
     fn parse_recent_limit_rejects_unknown_suffix() {
-        // Only `d` is accepted today. Other units (w, m, y) would need
-        // explicit design decisions around month/year boundaries.
+        // Recent accepts counts only, not time units.
         assert!(parse_recent_limit("3w").is_err());
         assert!(parse_recent_limit("1y").is_err());
         assert!(parse_recent_limit("2m").is_err());
@@ -1176,13 +1180,21 @@ mod tests {
     }
 
     #[test]
-    fn recent_limit_toml_parses_days_string() {
+    fn recent_limit_toml_rejects_days_string() {
         #[derive(serde::Deserialize)]
         struct Wrap {
-            recent: RecentLimit,
+            #[serde(rename = "recent")]
+            _recent: RecentLimit,
         }
-        let got: Wrap = toml::from_str(r#"recent = "30d""#).unwrap();
-        assert_eq!(got.recent, RecentLimit::Days(30));
+        let err = toml::from_str::<Wrap>(r#"recent = "30d""#)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("Relative date windows are no longer supported for recent"),
+            "{err}"
+        );
+        assert!(err.contains("recent = 100"), "{err}");
     }
 
     #[test]
@@ -1210,8 +1222,11 @@ mod tests {
 
     #[test]
     fn recent_limit_display_roundtrip() {
-        assert_eq!(RecentLimit::Count(100).to_string(), "100");
-        assert_eq!(RecentLimit::Days(30).to_string(), "30d");
+        for count in [1, 100, u32::MAX] {
+            let limit = RecentLimit::Count(count);
+            assert_eq!(limit.to_string(), count.to_string());
+            assert_eq!(parse_recent_limit(&limit.to_string()).unwrap(), limit);
+        }
     }
 
     #[test]
@@ -1250,9 +1265,19 @@ mod tests {
     }
 
     #[test]
-    fn recent_limit_serializes_days_as_string() {
-        let json = serde_json::to_string(&RecentLimit::Days(7)).unwrap();
-        assert_eq!(json, "\"7d\"");
+    fn recent_limit_toml_count_string_roundtrips_as_integer() {
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct Wrap {
+            recent: RecentLimit,
+        }
+        let got: Wrap = toml::from_str(r#"recent = "100""#).unwrap();
+        assert_eq!(got.recent, RecentLimit::Count(100));
+        let serialized = toml::to_string(&got).unwrap();
+        assert_eq!(serialized, "recent = 100\n");
+        assert_eq!(
+            toml::from_str::<Wrap>(&serialized).unwrap().recent,
+            got.recent
+        );
     }
 
     fn base_args() -> Vec<&'static str> {
@@ -2073,6 +2098,45 @@ mod tests {
             panic!("expected Sync command");
         };
         assert_eq!(sync.skip_created_after.as_deref(), Some("2025-06-01"));
+    }
+
+    #[test]
+    fn date_arguments_reject_relative_and_invalid_fixed_values_before_startup() {
+        for command in [&["kei", "sync"][..], &["kei", "service", "run"][..]] {
+            for flag in ["--skip-created-before", "--skip-created-after"] {
+                for value in ["30d", "2025-02-30", "not-a-date"] {
+                    let args: Vec<_> = command.iter().copied().chain([flag, value]).collect();
+                    let err = Cli::try_parse_from(args).unwrap_err();
+                    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+                    let message = err.to_string();
+                    assert!(message.contains(flag), "{message}");
+                    assert!(message.contains("fixed date"), "{message}");
+                    assert!(
+                        message.contains("remove") || message.contains("Remove"),
+                        "{message}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn date_arguments_preserve_fixed_date_and_datetime_text() {
+        for value in ["2024-01-01", "2025-06-01T14:30:00"] {
+            let cli = parse(&[
+                "kei",
+                "sync",
+                "--skip-created-before",
+                value,
+                "--skip-created-after",
+                value,
+            ]);
+            let Command::Sync { sync, .. } = cli.command else {
+                panic!("expected sync command");
+            };
+            assert_eq!(sync.skip_created_before.as_deref(), Some(value));
+            assert_eq!(sync.skip_created_after.as_deref(), Some(value));
+        }
     }
     #[test]
     fn test_albums_multiple() {

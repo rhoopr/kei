@@ -988,9 +988,10 @@ fn ask_date_range(answers: &mut SetupAnswers) -> anyhow::Result<()> {
 
 /// One of the two date-range prompts (`skip_created_before` /
 /// `skip_created_after`). Returns the trimmed value or `None` for blank.
-/// The `(ISO date ...)` suffix is uniform across both prompts.
+/// The fixed-date syntax hint is uniform across both prompts.
 fn date_prompt(label: &str) -> anyhow::Result<Option<String>> {
-    let prompt = format!("{label} (ISO date, datetime, or Nd interval; blank = no limit)");
+    let prompt =
+        format!("{label} (YYYY-MM-DD or host-local YYYY-MM-DDTHH:MM:SS; blank = no limit)");
     let raw: String = Input::new()
         .with_prompt(prompt)
         .default(String::new())
@@ -2206,7 +2207,7 @@ mod tests {
             force_resolution: true,
             raw_policy: Some(RawPolicy::PreferJpeg),
             recent: Some(50),
-            skip_created_before: Some("30d".to_string()),
+            skip_created_before: Some("2024-01-01".to_string()),
             skip_created_after: Some("2025-06-01".to_string()),
             watch_interval: Some(600),
             notify_systemd: true,
@@ -2277,7 +2278,7 @@ mod tests {
             "empty libraries vec must produce a comment, not an array"
         );
         assert_eq!(filters.recent, Some(crate::cli::RecentLimit::Count(50)));
-        assert_eq!(filters.skip_created_before.as_deref(), Some("30d"));
+        assert_eq!(filters.skip_created_before.as_deref(), Some("2024-01-01"));
         assert_eq!(filters.skip_created_after.as_deref(), Some("2025-06-01"));
 
         let photos = parsed.photos.unwrap();
@@ -2797,9 +2798,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_date_or_blank_accepts_relative_interval() {
-        assert!(validate_date_or_blank("30d").is_ok());
-        assert!(validate_date_or_blank("1d").is_ok());
+    fn validate_date_or_blank_rejects_relative_interval_with_resolution() {
+        for value in ["30d", "1d", " 30d "] {
+            let err = validate_date_or_blank(value).unwrap_err();
+            assert!(
+                err.contains("Relative date windows are no longer supported"),
+                "{err}"
+            );
+            assert!(err.contains("Remove this date limit"), "{err}");
+            assert!(err.contains("YYYY-MM-DD"), "{err}");
+        }
     }
 
     #[test]

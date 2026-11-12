@@ -348,16 +348,12 @@ impl std::fmt::Debug for Config {
     }
 }
 
-/// Parse a date-only capture boundary, host-local datetime, or relative interval.
+/// Parse a fixed date-only capture boundary or host-local datetime.
 pub(crate) fn parse_created_date_filter(s: &str) -> anyhow::Result<CreatedDateFilter> {
-    if let Some(days_str) = s.strip_suffix('d')
-        && let Ok(days) = days_str.parse::<u64>()
-    {
-        let days = i64::try_from(days)
-            .map_err(|_e| anyhow::anyhow!("Date interval '{s}' is too large"))?;
-        return Ok(CreatedDateFilter::Instant(
-            Utc::now() - chrono::Duration::days(days),
-        ));
+    if s.ends_with('d') {
+        anyhow::bail!(
+            "Relative date windows are no longer supported. Remove this date limit from [filters] or omit its CLI flag, or replace it with a fixed date (YYYY-MM-DD) or host-local datetime (YYYY-MM-DDTHH:MM:SS)."
+        );
     }
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         return Ok(CreatedDateFilter::CaptureDate(date));
@@ -368,7 +364,7 @@ pub(crate) fn parse_created_date_filter(s: &str) -> anyhow::Result<CreatedDateFi
         return Ok(CreatedDateFilter::Instant(local.with_timezone(&Utc)));
     }
     anyhow::bail!(
-        "Could not parse '{s}' as a date. Use a date like 2025-01-02, a datetime like 2025-01-02T14:30:00, or an interval like 20d."
+        "Could not parse '{s}' as a date. Use a fixed date like 2025-01-02 or a host-local datetime like 2025-01-02T14:30:00, or remove this date limit."
     )
 }
 
@@ -469,15 +465,23 @@ mod tests {
         );
     }
     #[test]
-    fn test_parse_interval_days() {
-        let before = Utc::now();
-        let CreatedDateFilter::Instant(dt) = parse_created_date_filter("10d").unwrap() else {
-            panic!("relative interval must resolve to an instant");
-        };
-        let after = Utc::now();
-        let expected = before - chrono::Duration::days(10);
-        assert!(dt >= expected - chrono::Duration::seconds(1));
-        assert!(dt <= after - chrono::Duration::days(10) + chrono::Duration::seconds(1));
+    fn test_parse_relative_days_rejected_with_resolution() {
+        for value in ["10d", "0d", "999999999999999999999d"] {
+            let err = parse_created_date_filter(value).unwrap_err().to_string();
+            assert!(
+                err.contains("Relative date windows are no longer supported"),
+                "{err}"
+            );
+            assert!(
+                err.contains("Remove this date limit from [filters] or omit its CLI flag"),
+                "{err}"
+            );
+            assert!(err.contains("YYYY-MM-DD"), "{err}");
+            assert!(
+                err.contains("host-local datetime (YYYY-MM-DDTHH:MM:SS)"),
+                "{err}"
+            );
+        }
     }
     #[test]
     fn test_parse_invalid_date() {

@@ -120,8 +120,37 @@ pub(crate) struct TomlFilters {
     pub filename_exclude: Option<Vec<String>>,
     pub recent: Option<crate::cli::RecentLimit>,
     pub recent_scope: Option<crate::cli::RecentScope>,
+    #[serde(default, deserialize_with = "deserialize_created_before")]
     pub skip_created_before: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_created_after")]
     pub skip_created_after: Option<String>,
+}
+
+fn deserialize_created_before<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    deserialize_fixed_date(deserializer, "filters.skip_created_before")
+}
+
+fn deserialize_created_after<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    deserialize_fixed_date(deserializer, "filters.skip_created_after")
+}
+
+// Validate at input, before a CLI override can hide an unsupported saved limit.
+fn deserialize_fixed_date<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+    key: &str,
+) -> Result<Option<String>, D::Error> {
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = &value
+        && value.ends_with('d')
+    {
+        super::runtime::parse_created_date_filter(value)
+            .map_err(|error| <D::Error as serde::de::Error>::custom(format!("{key}: {error}")))?;
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

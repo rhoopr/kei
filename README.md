@@ -104,7 +104,9 @@ username = "you@example.com"
 directory = "~/Photos/iCloud"
 ```
 
-This uses your primary library, all its regular albums, and photos and videos outside those albums. Keep settings you want to reuse in the configuration file. To limit one run to the last 30 days, use `kei sync --recent 30d`.
+This uses your primary library, all its regular albums, and photos and videos outside those albums. Keep settings you want to reuse in the configuration file. To limit one run to a fixed capture-date range, use `kei sync --skip-created-before 2025-01-01 --skip-created-after 2025-01-31`. Both dates are inclusive.
+
+Relative date windows such as `30d` are no longer supported. Remove `recent`, `skip_created_before` or `skip_created_after` from `[filters]` to omit that limit, or replace relative date limits with fixed dates. For a count limit, `recent = 100` remains supported. Kei rejects retired relative settings even when a command-line value would override them; rejection leaves configuration, state and media unchanged.
 
 For a daily unattended run, add this table to your existing config:
 

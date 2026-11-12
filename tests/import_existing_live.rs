@@ -553,33 +553,29 @@ fn import_recent_limit_caps_scan() {
     });
 }
 
-/// `--recent <N>d` (date filter) is rejected with a clear bail message,
-/// matching the explicit handling we added to the binary. No fixture
-/// required: the bail happens before any I/O against the download dir.
+/// Retired date windows fail at CLI parsing without credentials or provider I/O.
 #[test]
-#[ignore]
 fn import_recent_days_form_is_rejected() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let test_root = tempdir().unwrap();
-        let download_dir = test_root.path().join("photos");
-        std::fs::create_dir_all(&download_dir).unwrap();
-        import_cmd(
-            &username,
-            &password,
-            &cookie_dir,
-            &download_dir,
-            test_root.path(),
-            &["--recent", "30d"],
-        )
-        .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
+    let test_root = tempdir().unwrap();
+    common::cmd()
+        .env_remove("ICLOUD_USERNAME")
+        .env_remove("ICLOUD_PASSWORD")
+        .env("KEI_DATA_DIR", test_root.path())
+        .args(["import-existing", "--recent", "30d"])
+        .timeout(Duration::from_secs(10))
         .assert()
-        .failure()
+        .code(2)
         .stderr(predicate::str::contains(
-            "is not supported for import-existing",
-        ));
-    });
+            "Relative date windows are no longer supported for recent",
+        ))
+        .stderr(predicate::str::contains("omit --recent"))
+        .stderr(predicate::str::contains("--recent 100"));
+    assert!(
+        std::fs::read_dir(test_root.path())
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 /// Truncating one of the fixture's files makes that version come up

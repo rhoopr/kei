@@ -1503,6 +1503,8 @@ use a conservative UTC enumeration bound and then apply the exact resolved
 calendar-date filter, so enumeration safety does not depend on the backup host
 timezone.
 
+Selection date inputs are fixed: `YYYY-MM-DD` means a capture-local calendar date, and `YYYY-MM-DDTHH:MM:SS` means a host-local datetime. `config/runtime.rs::parse_created_date_filter` owns these semantics. Relative `Nd` inputs are rejected with instructions to remove the limit or use a fixed boundary. TOML relative-date rejection runs in `config/input.rs` before CLI precedence, so an override cannot hide a retired saved setting. `recent` retains count selection only; removing relative syntax changes neither date fingerprints nor checkpoint coverage rules.
+
 Capture-local path rendering does not change the download config hash, so a
 sync that sees no other drift stays incremental and never re-enumerates an
 already-downloaded asset. Date-only created bounds change the eligibility hash

@@ -1087,15 +1087,7 @@ pub(crate) async fn run_import_existing(
         }),
     );
 
-    let recent_count: Option<u32> = match args.recent {
-        None => None,
-        Some(crate::cli::RecentLimit::Count(n)) => Some(n),
-        Some(crate::cli::RecentLimit::Days(n)) => {
-            anyhow::bail!(
-                "`--recent {n}d` is not supported for import-existing because it scans existing files instead of filtering by iCloud date. Use a count like `--recent 1000` instead."
-            );
-        }
-    };
+    let recent_count = args.recent.map(|crate::cli::RecentLimit::Count(n)| n);
 
     // Bail clearly on missing/non-dir; `dir_cache::read_dir_entries`
     // swallows read errors and would otherwise report "0 files matched".
