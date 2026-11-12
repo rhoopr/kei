@@ -1130,7 +1130,10 @@ mod tests {
         {
             let conn = Connection::open(&path).unwrap();
             crate::state::schema::migrate(&conn).unwrap();
-            assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+            assert_eq!(
+                crate::state::schema::get_schema_version(&conn).unwrap(),
+                crate::state::schema::SCHEMA_VERSION
+            );
             assert_eq!(
                 conn.query_row::<i64, _, _>(
                     "SELECT count(*) FROM provider_transport_aliases",
@@ -1313,7 +1316,10 @@ mod tests {
             .await
             .unwrap();
         let conn = db.acquire_lock("oversized projection oracle").unwrap();
-        assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+        assert_eq!(
+            crate::state::schema::get_schema_version(&conn).unwrap(),
+            crate::state::schema::SCHEMA_VERSION
+        );
         assert_eq!(
             conn.query_row::<i64, _, _>(
                 "SELECT count(*) FROM provider_transport_aliases",
@@ -1409,7 +1415,10 @@ mod tests {
             crate::state::schema::migrate(&conn).unwrap();
         }
         let conn = Connection::open(&path).unwrap();
-        assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+        assert_eq!(
+            crate::state::schema::get_schema_version(&conn).unwrap(),
+            crate::state::schema::SCHEMA_VERSION
+        );
         assert_eq!(
             conn.query_row::<i64, _, _>(
                 "SELECT count(*) FROM provider_transport_aliases",
@@ -1586,7 +1595,10 @@ mod tests {
         capture.capacity = budget;
         {
             let conn = db.acquire_lock("post migration full inbox").unwrap();
-            assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+            assert_eq!(
+                crate::state::schema::get_schema_version(&conn).unwrap(),
+                crate::state::schema::SCHEMA_VERSION
+            );
             assert_eq!(
                 conn.query_row::<i64, _, _>(
                     "SELECT count(*) FROM provider_shadow_pages",
@@ -1712,7 +1724,10 @@ mod tests {
             .await
             .unwrap();
         let conn = reopened.acquire_lock("reopened full inbox").unwrap();
-        assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+        assert_eq!(
+            crate::state::schema::get_schema_version(&conn).unwrap(),
+            crate::state::schema::SCHEMA_VERSION
+        );
         assert_eq!(charged_sum(&conn), after_new);
         assert_eq!(
             conn.query_row::<i64, _, _>(
