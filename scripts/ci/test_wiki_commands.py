@@ -9,10 +9,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/check-wiki-commands.sh"
-COMMANDS = "sync login list password reset migrate-state config status doctor support-export manifest import-existing verify reconcile install uninstall service".split()
+COMMANDS = ["sync", "login", "list", "password", "reset", "migrate-state", "config", "status", "doctor", "support-export", "manifest", "import-existing", "verify", "reconcile", "install", "uninstall", "service"]
 
 
 class WikiCommandsTests(unittest.TestCase):
