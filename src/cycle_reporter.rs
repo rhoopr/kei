@@ -421,6 +421,7 @@ mod tests {
     fn run_options() -> RunOptions {
         let download_dir = tempfile::tempdir().unwrap();
         let globals = crate::config::GlobalArgs {
+            config_source: Default::default(),
             username: Some("reporter@example.com".to_string()),
             domain: None,
             data_dir: None,

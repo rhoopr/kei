@@ -6,6 +6,7 @@ use crate::cli::SyncArgs;
 
 pub(super) fn default_globals() -> GlobalArgs {
     GlobalArgs {
+        config_source: Default::default(),
         username: Some("u@example.com".to_string()),
         domain: None,
         data_dir: None,

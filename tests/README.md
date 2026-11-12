@@ -767,6 +767,14 @@ and existing media across database reopen.
 
 ## State-transition proof
 
+Owned-schema backup checks run with `cargo test --lib owned_migration_backup` and `cargo test --test behavioral migration_backup`. They use existing file-backed databases, committed WAL rows and exact startup configuration bytes through the production writable opener. They check independent snapshot restoration, writer exclusion, backup failure before migration, late migration rollback, private permissions, no-overwrite publication and unchanged reopens. On Linux, subprocess checks kill the owner at six backup/migration boundaries and reopen the resulting state. These are process-interruption checks, not power-loss qualification.
+
+The behavioral backup matrix is enabled on Unix and Windows and covers eight writable command routes and configuration-file versus no-file startup. A portable classification regression checks that `.partial` directories remain incomplete even when they contain a manifest. CLI/environment overrides and credentials are outside the backup contract. Windows-specific fixtures cover ACLs, publication and SQLite-backed recovery. Native Windows execution remains pending; cross-compilation of filesystem helpers alone does not qualify the complete upgrade path.
+
+Windows stage-substitution regressions replace the populated directory before publication and require identity refusal. The production-opener fixture checks unchanged source schema, database/WAL, configuration and media, preserved backup and foreign evidence, then recovery and two quiet reopens. Helper controls check parent confinement and legitimate publication. Source-bound helper/regression compilation passed; the complete Windows workspace build and native execution remain pending.
+
+The Linux DELETE-mode interruption regression forces migration page spill before killing the production opener. Correct-account and wrong-account reopen attempts must both preserve the database and hot journal when ownership cannot be read safely. The fixture then restores the verified snapshot and checks successful migration and two unchanged reopens. It checks the generated restoration guidance, including preservation of rollback journals. It does not execute an older kei binary or prove power-loss recovery.
+
 Changes to durable configuration, filesystem paths, media publication,
 metadata, SQLite state, retry work, or provider checkpoints require a
 state-transition proof through the production call graph. The test must cover

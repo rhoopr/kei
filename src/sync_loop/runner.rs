@@ -62,12 +62,22 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         download::CaptureTimestampRepair::Preserve
     };
 
-    // On first run (no config file), persist bootstrap values so subsequent
-    // runs don't need the same env again. Only when the user explicitly chose
-    // a config path (--config), to avoid surprise writes at the default
-    // location during tests or one-off runs.
+    // Keep fresh-install auto-config behavior, but never create a previously
+    // absent config ahead of the recovery backup for retained state.
+    let defer_first_run_config = if !toml_existed && config_explicitly_set {
+        let path = state::db::account::state_path(
+            &config.auth.cookie_directory,
+            &config.auth.username,
+            config.auth.domain.as_str(),
+        )
+        .await?;
+        tokio::fs::try_exists(path).await?
+    } else {
+        false
+    };
     if !toml_existed
         && config_explicitly_set
+        && !defer_first_run_config
         && let Err(e) =
             config::persist_first_run_config(&config_path, &config, cli_data_dir.as_deref())
     {
@@ -306,11 +316,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             config.auth.domain.as_str(),
         )
         .await?;
-        match state::SqliteStateDb::open_owned(
+        match state::SqliteStateDb::open_owned_with_config(
             &db_path,
             account_owner
                 .as_ref()
                 .ok_or(state::error::StateError::AccountIdentityUnavailable)?,
+            &globals.config_source,
         )
         .await
         {
@@ -388,6 +399,15 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
         }
     };
+
+    // Persist first-run settings only after the state upgrade boundary: an old
+    // owned database must be backed up before creating a previously absent config.
+    if defer_first_run_config
+        && let Err(e) =
+            config::persist_first_run_config(&config_path, &config, cli_data_dir.as_deref())
+    {
+        tracing::warn!(error = %e, "Failed to save first-run config");
+    }
 
     // First-sync notice: tell users on the `PrimarySync` default about any
     // shared libraries they could be syncing. Runs once per data dir,

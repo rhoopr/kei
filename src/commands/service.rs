@@ -2473,6 +2473,7 @@ libraries = ["shared"]
         )
         .unwrap();
         let globals = crate::config::GlobalArgs {
+            config_source: Default::default(),
             username: None,
             domain: None,
             data_dir: Some(cookie_dir.path().to_string_lossy().into_owned()),

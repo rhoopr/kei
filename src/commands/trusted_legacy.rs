@@ -33,7 +33,15 @@ pub(crate) async fn run(
             signal_cancel.cancel();
         }
     });
-    let result = execute(args, &config, &path, &owner, &cancel).await;
+    let result = execute(
+        args,
+        &config,
+        &path,
+        &owner,
+        &cancel,
+        &globals.config_source,
+    )
+    .await;
     signal.abort();
     result
 }
@@ -44,6 +52,7 @@ async fn execute(
     path: &std::path::Path,
     owner: &state::db::account::AccountOwner,
     cancel: &CancellationToken,
+    source: &config::ConfigSource,
 ) -> anyhow::Result<()> {
     match args.action {
         cli::TrustedLegacyAction::Plan { library, output } => {
@@ -75,7 +84,7 @@ async fn execute(
                 serde_json::from_slice(&bytes).context("Invalid trusted legacy file plan")?;
             // Validate ownership/schema before any writable open.
             drop(state::SqliteStateDb::open_owned_read_only(path, owner).await?);
-            let db = state::SqliteStateDb::open_owned(path, owner).await?;
+            let db = state::SqliteStateDb::open_owned_with_config(path, owner, source).await?;
             let count = trusted_legacy::apply(
                 &db,
                 plan,

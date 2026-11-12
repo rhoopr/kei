@@ -105,9 +105,12 @@ pub(crate) async fn run_reset_sync_token(
         }
     }
 
-    let db =
-        state::SqliteStateDb::open_owned(&db_path, &super::super::get_account_owner(globals, toml))
-            .await?;
+    let db = state::SqliteStateDb::open_owned_with_config(
+        &db_path,
+        &super::super::get_account_owner(globals, toml),
+        &globals.config_source,
+    )
+    .await?;
     db.set_metadata("db_sync_token", "").await?;
     let cleared = db.delete_metadata_by_prefix("sync_token:").await?;
     let scoped_cleared = db.delete_scoped_db_sync_tokens().await?;

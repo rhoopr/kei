@@ -160,6 +160,7 @@ impl Fixture {
         let media = root.join("media");
         std::fs::create_dir_all(&media).unwrap();
         let globals = crate::config::GlobalArgs {
+            config_source: Default::default(),
             username: Some(USER.into()),
             domain: None,
             data_dir: Some(root.join("state").display().to_string()),

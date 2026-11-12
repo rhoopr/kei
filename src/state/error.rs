@@ -52,6 +52,10 @@ pub enum StateError {
     )]
     AccountOwnerMismatch,
     #[error(
+        "SQLite rollback recovery is required before account ownership can be verified; refusing writable recovery. Stop every kei process and state writer. Preserve this database and its -journal/-wal/-shm files together. If a complete .kei-schema-backup-* bundle exists beside this database, verify its original database path and checksums, then follow restore.txt to restore matching state/config. Never delete a journal or bypass ownership validation. Without a verified matching backup, keep all files and seek offline recovery assistance."
+    )]
+    AccountRollbackRecoveryRequired(#[source] rusqlite::Error),
+    #[error(
         "Fresh authentication did not provide a usable account identity; state cannot be bound safely."
     )]
     AccountIdentityUnavailable,
@@ -71,6 +75,36 @@ pub enum StateError {
         "Could not read the explicit legacy database as valid SQLite state; source files remain intact."
     )]
     AccountMigrationSourceUnreadable,
+
+    #[error(
+        "Cannot back up state before schema migration: startup config context is unavailable. Restart kei with a readable --config file, or with the intended no-file configuration. No migration was applied."
+    )]
+    MigrationConfigUnavailable,
+    #[error(
+        "Could not lock state for pre-migration backup: {0}. Stop other state writers, check storage access, then retry. No application schema migration was applied."
+    )]
+    MigrationLock(#[source] rusqlite::Error),
+    #[cfg(not(any(unix, windows)))]
+    #[error(
+        "Cannot safely back up state before schema migration on this platform. Keep the previous kei version and unchanged state/config; automatic migration requires supported private-file and durable-publication primitives."
+    )]
+    MigrationBackupUnsupported,
+    #[error(
+        "Cannot complete the pre-migration backup at {path}: {source}. Check free space and directory permissions, stop competing state writers, then retry. No migration was applied. Directories ending in .partial, or bundles without manifest.json, are incomplete and must not be restored."
+    )]
+    MigrationBackup {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "Could not migrate state; the pre-migration backup is retained at {backup}. Stop kei and read restore.txt in that bundle before restoring state/config: {source}"
+    )]
+    BackedUpMigration {
+        backup: PathBuf,
+        #[source]
+        source: Box<StateError>,
+    },
 
     /// Failed to create the parent directory for the database file.
     ///

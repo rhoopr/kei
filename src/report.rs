@@ -300,6 +300,7 @@ mod tests {
     fn run_options_from_config_uses_schema_v2_option_names() {
         let download_dir = tempfile::tempdir().expect("download dir");
         let globals = crate::config::GlobalArgs {
+            config_source: Default::default(),
             username: Some("report@example.com".to_string()),
             domain: None,
             data_dir: None,
@@ -344,6 +345,7 @@ mod tests {
     fn run_options_from_config_reports_media_selection() {
         let download_dir = tempfile::tempdir().expect("download dir");
         let globals = crate::config::GlobalArgs {
+            config_source: Default::default(),
             username: Some("report@example.com".to_string()),
             domain: None,
             data_dir: None,

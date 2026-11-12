@@ -1605,7 +1605,9 @@ mod tests {
                 assert!(
                     matches!(
                         crate::state::SqliteStateDb::open_owned(&path, &owner).await,
-                        Err(StateError::ProviderInboxInvalid)
+                        Err(StateError::BackedUpMigration { source, backup })
+                            if matches!(*source, StateError::ProviderInboxInvalid)
+                                && backup.join("manifest.json").is_file()
                     ),
                     "{key}: unsupported identity must refuse migration"
                 );

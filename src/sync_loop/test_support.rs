@@ -429,6 +429,7 @@ pub(super) fn make_recording_run_cycle_download_config_builder(
 pub(super) fn make_run_cycle_config() -> config::Config {
     let data_dir = tempfile::tempdir().expect("config data dir");
     let globals = config::GlobalArgs {
+        config_source: Default::default(),
         username: Some("test@example.com".to_string()),
         domain: None,
         data_dir: Some(data_dir.path().to_string_lossy().into_owned()),

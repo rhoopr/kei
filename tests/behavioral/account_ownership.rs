@@ -366,6 +366,203 @@ fn seed_restore(root: &Path, account: &Account, server: &str) -> Account {
     seed(root, account.username, account.label, server)
 }
 
+#[cfg(any(unix, windows))]
+fn migration_backup_bundles(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".kei-schema-backup-")
+        })
+        .partition(|path| {
+            path.is_dir()
+                && path
+                    .extension()
+                    .is_none_or(|extension| extension != "partial")
+                && path.join("manifest.json").is_file()
+        })
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn migration_backup_discovery_requires_final_directory_and_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let complete = root.join(".kei-schema-backup-complete");
+    let partial = root.join(".kei-schema-backup-prepared.partial");
+    let unmarked = root.join(".kei-schema-backup-unmarked");
+    let unrelated = root.join("unrelated");
+    for path in [&complete, &partial, &unrelated, &unmarked] {
+        std::fs::create_dir(path).unwrap();
+    }
+    for path in [&complete, &partial, &unrelated] {
+        std::fs::write(path.join("manifest.json"), b"{}").unwrap();
+    }
+    let (saved, mut incomplete) = migration_backup_bundles(root);
+    assert_eq!(saved, [complete]);
+    incomplete.sort();
+    let mut expected = vec![partial.clone(), unmarked];
+    expected.sort();
+    assert_eq!(incomplete, expected);
+    assert_eq!(std::fs::read(partial.join("manifest.json")).unwrap(), b"{}");
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_backup_every_writable_cli_path_preserves_matching_config_and_wal_history() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(OfflinePhotos)
+        .mount(&server)
+        .await;
+    let paths: &[&[&str]] = &[
+        &["status", "--downloaded", "--pending"],
+        &["verify"],
+        &["reconcile"],
+        &["doctor", "--json"],
+        &["import-existing", "--force-empty"],
+        &[
+            "sync",
+            "--no-progress-bar",
+            "--skip-created-before",
+            "2020-01-01",
+        ],
+        &["service", "run", "--retry-failed"],
+        &["reset", "sync-token", "--yes"],
+    ];
+    for args in paths {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let account = seed(root, ACCOUNTS[0], "A", &server.uri());
+        let mut config_bytes = std::fs::read(&account.config).unwrap();
+        config_bytes.extend_from_slice(b"\r\n# exact private input, not a regenerated config\r\n");
+        std::fs::write(&account.config, &config_bytes).unwrap();
+        let conn = Connection::open(&account.path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        // Remove precisely schema 36's additions; this is a populated old
+        // application schema, not a version bump added for the backup feature.
+        conn.execute_batch("DROP TABLE provider_transport_aliases; DROP TABLE provider_transport_canonical;
+            PRAGMA user_version=35;
+            CREATE TABLE future_unknown(payload BLOB); INSERT INTO future_unknown VALUES (X'00FF07');").unwrap();
+        assert!(
+            std::fs::metadata(account.path.with_extension("db-wal"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        let before = state(&account.path);
+        success(&command(root, &account, args));
+        let (saved, incomplete) = migration_backup_bundles(root);
+        assert!(
+            incomplete.is_empty(),
+            "{args:?}: incomplete bundles: {incomplete:?}"
+        );
+        assert_eq!(
+            saved.len(),
+            1,
+            "{args:?}: must reach the shared backup boundary"
+        );
+        let bundle = &saved[0];
+        assert!(bundle.join("manifest.json").exists());
+        assert_eq!(
+            std::fs::read(bundle.join("config.toml")).unwrap(),
+            config_bytes,
+            "{args:?}: actual --config source"
+        );
+        assert_eq!(
+            state(&bundle.join("state.db")),
+            before,
+            "{args:?}: pre-command receipts and history"
+        );
+        let snapshot = Connection::open(bundle.join("state.db")).unwrap();
+        assert_eq!(
+            snapshot
+                .query_row::<i32, _, _>("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+            35
+        );
+        assert_eq!(
+            snapshot
+                .query_row::<Vec<u8>, _, _>("SELECT payload FROM future_unknown", [], |row| row
+                    .get(0))
+                .unwrap(),
+            [0, 255, 7]
+        );
+        assert!(!bundle.join("state.db-wal").exists());
+        let snapshot_bytes = std::fs::read(bundle.join("state.db")).unwrap();
+        assert_eq!(
+            conn.query_row::<i32, _, _>("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+            super::HELPER_SCHEMA_VERSION
+        );
+        for _ in 0..2 {
+            success(&command(root, &account, args));
+            let (reopened, incomplete) = migration_backup_bundles(root);
+            assert!(
+                incomplete.is_empty(),
+                "{args:?}: incomplete bundles: {incomplete:?}"
+            );
+            assert_eq!(
+                reopened.len(),
+                1,
+                "{args:?}: quiet reopens do not back up again"
+            );
+            assert_eq!(
+                std::fs::read(bundle.join("state.db")).unwrap(),
+                snapshot_bytes
+            );
+        }
+        assert_eq!(std::fs::read(&account.config).unwrap(), config_bytes);
+        assert_eq!(
+            std::fs::read(&account.media).unwrap(),
+            b"known media belonging only to account A"
+        );
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn migration_backup_no_file_context_stays_absent_until_retained_state_is_backed_up() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = seed(root, ACCOUNTS[0], "A", "http://127.0.0.1:1");
+    let conn = Connection::open(&account.path).unwrap();
+    conn.execute_batch("DROP TABLE provider_transport_aliases; DROP TABLE provider_transport_canonical; PRAGMA user_version=35;").unwrap();
+    std::fs::remove_file(&account.config).unwrap();
+    let original = std::fs::read(&account.path).unwrap();
+    let refused = command(root, &account, &["sync"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("Set [download].directory"));
+    assert!(
+        !account.config.exists(),
+        "retained state must not acquire an auto-config before backup"
+    );
+    assert_eq!(std::fs::read(&account.path).unwrap(), original);
+    let (saved, incomplete) = migration_backup_bundles(root);
+    assert!(saved.is_empty() && incomplete.is_empty());
+    success(&command(root, &account, &["status"]));
+    let (saved, incomplete) = migration_backup_bundles(root);
+    assert!(incomplete.is_empty(), "incomplete bundles: {incomplete:?}");
+    assert_eq!(saved.len(), 1);
+    let bundle = &saved[0];
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["config"]["kind"], "absent");
+    assert!(!bundle.join("config.toml").exists());
+    assert!(!account.config.exists());
+    for _ in 0..2 {
+        success(&command(root, &account, &["status"]));
+        let (reopened, incomplete) = migration_backup_bundles(root);
+        assert_eq!(reopened, saved);
+        assert!(incomplete.is_empty(), "incomplete bundles: {incomplete:?}");
+        assert!(!account.config.exists());
+    }
+}
+
 #[test]
 fn account_ownership_exact_alias_spellings_remain_separate_with_same_provider_pin() {
     let directory = tempfile::tempdir().unwrap();

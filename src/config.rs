@@ -10,7 +10,11 @@ mod paths;
 mod persistence;
 mod resolve;
 mod runtime;
+mod source;
 mod templates;
+
+pub(crate) use input::load_toml_config_with_source;
+pub(crate) use source::ConfigSource;
 
 #[cfg(test)]
 mod test_support;

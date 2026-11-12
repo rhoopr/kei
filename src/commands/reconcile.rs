@@ -223,9 +223,12 @@ pub(crate) async fn run_reconcile(
         return Ok(());
     }
 
-    let db =
-        state::SqliteStateDb::open_owned(&db_path, &super::super::get_account_owner(globals, toml))
-            .await?;
+    let db = state::SqliteStateDb::open_owned_with_config(
+        &db_path,
+        &super::super::get_account_owner(globals, toml),
+        &globals.config_source,
+    )
+    .await?;
     let summary = db.get_summary().await?;
 
     if args.dry_run {

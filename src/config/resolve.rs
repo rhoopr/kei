@@ -3145,6 +3145,7 @@ mod tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let globals = GlobalArgs {
+            config_source: Default::default(),
             username: None,
             domain: None,
             data_dir: None,
@@ -3165,6 +3166,7 @@ mod tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let globals = GlobalArgs {
+            config_source: Default::default(),
             username: Some("cli@example.com".to_string()),
             domain: Some(Domain::Com),
             data_dir: Some("/cli/data".to_string()),
@@ -3190,6 +3192,7 @@ mod tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let globals = GlobalArgs {
+            config_source: Default::default(),
             username: None,
             domain: None,
             data_dir: None,
@@ -3204,6 +3207,7 @@ mod tests {
     #[test]
     fn test_resolve_auth_defaults_when_both_absent() {
         let globals = GlobalArgs {
+            config_source: Default::default(),
             username: None,
             domain: None,
             data_dir: None,

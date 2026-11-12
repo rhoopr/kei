@@ -16,6 +16,67 @@ pub(crate) enum FileIdentity {
     Legacy { volume: u32, index: u64 },
 }
 
+/// Absolute, extended-length Win32 paths without losing native UTF-16 units.
+#[cfg(windows)]
+pub(crate) fn windows_api_path(path: &Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+
+    if path.as_os_str().encode_wide().any(|unit| unit == 0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains NUL",
+        ));
+    }
+    // GetFullPathNameW resolves relative paths and Win32 separators/components
+    // without filesystem traversal. Already verbatim paths stay unchanged.
+    let absolute = std::path::absolute(path)?;
+    let wide: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+    let prefix = match absolute.components().next() {
+        Some(Component::Prefix(prefix)) => prefix.kind(),
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows publication requires an absolute path",
+            ));
+        }
+    };
+    let mut result: Vec<u16> = match prefix {
+        Prefix::Disk(_) => r"\\?\".encode_utf16().chain(wide).collect(),
+        Prefix::UNC(_, _) => r"\\?\UNC\"
+            .encode_utf16()
+            .chain(wide.into_iter().skip(2))
+            .collect(),
+        Prefix::Verbatim(_)
+        | Prefix::VerbatimUNC(_, _)
+        | Prefix::VerbatimDisk(_)
+        | Prefix::DeviceNS(_) => wide,
+    };
+    result.push(0);
+    Ok(result)
+}
+
+/// Same-volume native write-through promotion, refusing an occupied target.
+#[cfg(windows)]
+pub(crate) fn move_file_no_replace_blocking(
+    part_path: &Path,
+    final_path: &Path,
+) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let part = windows_api_path(part_path)?;
+    let final_path = windows_api_path(final_path)?;
+    // SAFETY: both paths are live NUL-terminated absolute Windows strings.
+    // WRITE_THROUGH requests native disk publication; omitting REPLACE_EXISTING
+    // and COPY_ALLOWED refuses replacement and cross-volume copy fallback.
+    let rc = unsafe { MoveFileExW(part.as_ptr(), final_path.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if rc != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Count directory entries referring to this opened file, without path lookup.
 pub(crate) fn file_link_count(file: &std::fs::File) -> std::io::Result<u64> {
     #[cfg(unix)]

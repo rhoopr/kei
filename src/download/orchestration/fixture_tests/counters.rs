@@ -84,6 +84,7 @@ async fn assert_reporting(
     let report_path = dir.join("sync_report.json");
     let config = crate::config::Config::build(
         &crate::config::GlobalArgs {
+            config_source: Default::default(),
             username: Some("counter-fixture@example.invalid".into()),
             domain: None,
             data_dir: Some(dir.to_string_lossy().into_owned()),

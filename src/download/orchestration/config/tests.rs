@@ -296,6 +296,7 @@ fn test_compute_config_hash_matches_hash_download_config() {
 
     let dl_config = test_config();
     let globals = crate::config::GlobalArgs {
+        config_source: Default::default(),
         username: Some("u@example.com".to_string()),
         domain: None,
         data_dir: Some("/tmp".to_string()),
@@ -359,6 +360,7 @@ fn build_config_with(
     use crate::config::GlobalArgs;
 
     let globals = GlobalArgs {
+        config_source: Default::default(),
         username: Some("test@example.com".to_string()),
         domain: None,
         data_dir: Some(cookie_dir.to_string_lossy().into_owned()),

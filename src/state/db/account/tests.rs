@@ -340,6 +340,7 @@ async fn state_commands_refuse_misplaced_owned_database_before_reset_or_export()
     std::fs::copy(&path_a, &path_b).unwrap();
     let before = std::fs::read(&path_b).unwrap();
     let globals = crate::config::GlobalArgs {
+        config_source: Default::default(),
         username: Some(b.to_string()),
         domain: None,
         data_dir: Some(directory.path().to_str().unwrap().to_string()),

@@ -65,6 +65,8 @@ pub(crate) fn validate_download_dir(path: &Path) -> anyhow::Result<()> {
 /// settings out of public global CLI flags.
 #[derive(Debug, Clone)]
 pub(crate) struct GlobalArgs {
+    /// Captured with startup parsing, never regenerated from resolved settings.
+    pub config_source: super::ConfigSource,
     pub username: Option<String>,
     pub domain: Option<Domain>,
     pub data_dir: Option<String>,
@@ -73,6 +75,7 @@ pub(crate) struct GlobalArgs {
 impl GlobalArgs {
     pub fn from_bootstrap_env() -> Self {
         Self {
+            config_source: super::ConfigSource::Unavailable,
             username: std::env::var("ICLOUD_USERNAME").ok(),
             domain: None,
             data_dir: std::env::var("KEI_DATA_DIR").ok(),

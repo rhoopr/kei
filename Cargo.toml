@@ -168,10 +168,9 @@ keyring = { version = "3", features = ["sync-secret-service"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
 windows-service = "0.7"
-# Used only for the named ERROR_* constants returned by windows-service
-# error variants (1060, 1063). 0.52 matches the version windows-service
-# 0.7 already brings in transitively, so no extra version in the build.
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+# Native file publication and private migration-backup ACLs. Keep the version
+# shared with windows-service; these features add no crate or version.
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_SystemServices"] }
 
 [dev-dependencies]
 assert_cmd = "2"

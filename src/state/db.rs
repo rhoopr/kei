@@ -22,6 +22,7 @@ mod legacy_preservation;
 mod membership;
 mod metadata;
 mod metadata_capture_retry;
+mod migration_backup;
 mod pending_publication;
 pub(crate) mod provider_catalog;
 pub(crate) mod provider_generations;
@@ -98,9 +99,30 @@ impl std::fmt::Debug for SqliteStateDb {
 }
 
 impl SqliteStateDb {
+    // Test fixtures without a command startup explicitly model no config file.
+    // Production has no context-free migration-capable open.
+    #[cfg(test)]
     pub(crate) async fn open_owned(
         path: &Path,
         owner: &account::AccountOwner,
+    ) -> Result<Self, StateError> {
+        Self::open_owned_with_config(
+            path,
+            owner,
+            &crate::config::ConfigSource::Absent {
+                path: PathBuf::from("test-no-config.toml"),
+            },
+        )
+        .await
+    }
+
+    /// Upgrade owned state only after durably preserving its old SQLite snapshot
+    /// and actual startup config input. Unavailable config refuses an existing
+    /// old schema; fresh and current databases need no recovery copy.
+    pub(crate) async fn open_owned_with_config(
+        path: &Path,
+        owner: &account::AccountOwner,
+        config: &crate::config::ConfigSource,
     ) -> Result<Self, StateError> {
         let path = path.to_path_buf();
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -113,11 +135,53 @@ impl SqliteStateDb {
         }
         let cloned_path = path.clone();
         let owner = owner.clone();
+        let config = config.clone();
         let conn = tokio::task::spawn_blocking(move || {
-            let conn = account::open(&cloned_path, &owner)?;
+            let (mut conn, fresh) = account::open(&cloned_path, &owner)?;
+            let version = schema::get_schema_version(&conn)?;
+            if version > schema::SCHEMA_VERSION {
+                return Err(StateError::UnsupportedSchemaVersion {
+                    found: version,
+                    expected: schema::SCHEMA_VERSION,
+                });
+            }
+            if version < schema::SCHEMA_VERSION {
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(StateError::MigrationLock)?;
+                account::validate(&tx, &owner)?;
+                let version = schema::get_schema_version(&tx)?;
+                let backup = if !fresh && version < schema::SCHEMA_VERSION {
+                    Some(migration_backup::create(&cloned_path, &config, version)?)
+                } else {
+                    None
+                };
+                if let Some(backup) = &backup {
+                    tracing::info!(path = %backup.display(), "Pre-migration state/config backup saved; see restore.txt before restoring");
+                }
+                let migrated = schema::migrate(&tx).and_then(|()| {
+                    #[cfg(all(test, target_os = "linux"))]
+                    crate::test_helpers::process_death_point("schema-migration-before-commit");
+                    tx.commit().map_err(StateError::Migration)
+                });
+                if let Err(source) = migrated {
+                    return Err(match backup {
+                        Some(backup) => StateError::BackedUpMigration {
+                            backup,
+                            source: Box::new(source),
+                        },
+                        None => source,
+                    });
+                }
+                #[cfg(all(test, target_os = "linux"))]
+                crate::test_helpers::process_death_point("schema-migration-committed");
+            }
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
-            schema::migrate(&conn)?;
+            conn.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                false,
+            )?;
             Ok::<_, StateError>(conn)
         })
         .await??;

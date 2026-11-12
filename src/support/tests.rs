@@ -252,6 +252,7 @@ fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
     use crate::types::{FileMatchPolicy, LivePhotoMode, RawPolicy};
     let dir = tempfile::tempdir().unwrap();
     let globals = crate::config::GlobalArgs {
+        config_source: Default::default(),
         username: Some("PRIVATE_USER".into()),
         domain: None,
         data_dir: Some(dir.path().to_string_lossy().into_owned()),

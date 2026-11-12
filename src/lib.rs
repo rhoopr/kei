@@ -743,7 +743,8 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
     // Keep the guard until dispatch returns so fast commands drain their logs.
     // BarSuspendingStderr pauses progress rendering around each log write.
     let (make_writer, _writer_guard, redact_password) = build_redacting_writer(BarSuspendingStderr);
-    let globals = config::GlobalArgs::from_bootstrap_env();
+    let mut globals = config::GlobalArgs::from_bootstrap_env();
+    globals.config_source = config.source.clone();
     let recording = matches!(
         &cli.command,
         cli::Command::Sync { .. }
@@ -808,6 +809,7 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
 
 /// Config discovery facts and the load result, including recoverable doctor errors.
 struct StartupConfig {
+    source: config::ConfigSource,
     path: PathBuf,
     explicitly_set: bool,
     used_docker_fallback: bool,
@@ -848,14 +850,17 @@ fn load_startup_config(cli: &cli::Cli) -> anyhow::Result<StartupConfig> {
         !config_path.exists() && config_path.parent().is_some_and(std::path::Path::is_dir);
     let config_required = config_explicitly_set && !can_auto_create;
     let is_doctor_command = matches!(cli.command, cli::Command::Doctor(_));
-    let (toml_config, toml_config_error) =
-        match config::load_toml_config(&config_path, config_required) {
-            Ok(config) => (config, None),
-            Err(e) if is_doctor_command => (None, Some(e.to_string())),
+    let (toml_config, source, toml_config_error) =
+        match config::load_toml_config_with_source(&config_path, config_required) {
+            Ok((config, source)) => (config, source, None),
+            Err(e) if is_doctor_command => {
+                (None, config::ConfigSource::Unavailable, Some(e.to_string()))
+            }
             Err(e) => return Err(e),
         };
 
     Ok(StartupConfig {
+        source,
         path: config_path,
         explicitly_set: config_explicitly_set,
         used_docker_fallback,
@@ -998,6 +1003,8 @@ async fn dispatch_command(
         load_error: toml_config_error,
         ..
     } = config;
+    let mut globals = globals.clone();
+    let globals = &mut globals;
     let StartupOutput {
         personality_mode,
         friendly_request,
@@ -1089,7 +1096,10 @@ async fn dispatch_command(
                         one_shot_password,
                     } => {
                         // Reload TOML from the newly written config
-                        toml_config = config::load_toml_config(&cfg_path, true)?;
+                        let (loaded, source) =
+                            config::load_toml_config_with_source(&cfg_path, true)?;
+                        toml_config = loaded;
+                        globals.config_source = source;
                         let sync_pw = cli::PasswordArgs {
                             password: one_shot_password.map(|p| p.expose_secret().to_string()),
                             ..cli::PasswordArgs::default()

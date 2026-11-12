@@ -199,6 +199,13 @@ pub(crate) struct TomlServer {
 /// Load a TOML config file. Returns `Ok(None)` if the file doesn't exist
 /// and `required` is false. Errors if the file doesn't exist and `required` is true.
 pub(crate) fn load_toml_config(path: &Path, required: bool) -> anyhow::Result<Option<TomlConfig>> {
+    load_toml_config_with_source(path, required).map(|(config, _source)| config)
+}
+
+pub(crate) fn load_toml_config_with_source(
+    path: &Path,
+    required: bool,
+) -> anyhow::Result<(Option<TomlConfig>, super::ConfigSource)> {
     use anyhow::Context;
 
     match std::fs::read_to_string(path) {
@@ -233,9 +240,20 @@ pub(crate) fn load_toml_config(path: &Path, required: bool) -> anyhow::Result<Op
                     }
                 }
             }
-            Ok(Some(config))
+            Ok((
+                Some(config),
+                super::ConfigSource::File {
+                    path: std::path::absolute(path)?,
+                    bytes: contents.into_bytes().into(),
+                },
+            ))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => Ok((
+            None,
+            super::ConfigSource::Absent {
+                path: std::path::absolute(path)?,
+            },
+        )),
         Err(e) => Err(e).context(format!("Could not read config file {}", path.display()))?,
     }
 }

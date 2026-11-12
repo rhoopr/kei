@@ -341,6 +341,20 @@ Legacy session and encrypted credential files are preserved and ignored;
 keyring identity remains unchanged. See [account migration](account-state-migration.md)
 for operator steps and compatibility limits.
 
+### Owned-schema upgrade backups
+
+`config/source.rs` retains the exact configuration bytes loaded at startup, or the absence of a configuration file. Debug output redacts both bytes and paths. Command dispatch passes this context to `SqliteStateDb::open_owned_with_config`; production has no context-free writable opener. CLI overrides, environment values and credentials are not included in the snapshot.
+
+For an existing older schema, the opener validates account ownership and holds a SQLite immediate transaction through backup publication and migration commit. `state/db/migration_backup.rs` copies the committed database through a separate read connection, including WAL content, into a private `.kei-schema-backup-<uuid>` directory beside the database. It writes the loaded configuration or records its absence, restoration instructions, and a checksum manifest. Exclusive creation prevents replacing earlier evidence. On Unix, files and directories are synced before the completion manifest is published without replacement. On Windows, creation-time protected owner-only ACLs secure the bundle and its contents; a native write-through, no-overwrite directory move publishes the completed `.partial` stage. A directory ending in `.partial`, or a bundle without `manifest.json`, is incomplete. Failed or interrupted bundles are retained.
+
+Backup failure refuses migration. Migration failure rolls back the upgrade transaction and retains the completed backup. Fresh and already-current databases do not create upgrade backups. Missing configuration context refuses an old-schema upgrade. Platforms outside Unix and Windows refuse old-schema upgrades. Windows storage must support persistent ACLs. The Windows publication contract uses the repository's native write-through operation; it does not claim POSIX directory-fsync equivalence or physical power-loss survival. Native Windows runtime qualification remains pending.
+
+Windows publication retains the populated stage's original identity and parent confinement through the directory move. Before releasing its no-delete handle, it opens and validates a rename-compatible handle. The published directory must match the original identity; substituting another directory cannot authorize migration.
+
+Restore instructions are in each bundle's `restore.txt`. Stop every state writer, verify the manifest checksums and matching database/account, and preserve the current database together with its `-journal`, `-wal` and `-shm` companions before installing the standalone snapshot. Never attach newer companions to the restored database. Restore the recorded configuration with a compatible previous binary and reapply invocation/environment settings separately. The bundle contains no media; rollback is supported before subsequent media or metadata changes, or with a separately matched media backup.
+
+An interrupted DELETE-mode migration can leave a hot rollback journal. If SQLite requires writable recovery before the account-owner header can be read, the opener refuses with restoration guidance. It does not recover a potentially foreign database before validating ownership. Preserve the journal; deleting it or forcing writable recovery bypasses this boundary. Restore a verified, matching backup instead.
+
 ### Observed incremental shadow capture
 
 After opening an authenticated, account-owned database, sync attaches capture to

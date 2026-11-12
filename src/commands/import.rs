@@ -1130,7 +1130,10 @@ pub(crate) async fn run_import_existing(
         domain.as_str(),
         &auth_result.data,
     )?;
-    let db = Arc::new(state::SqliteStateDb::open_owned(&db_path, &owner).await?);
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned_with_config(&db_path, &owner, &globals.config_source)
+            .await?,
+    );
     tracing::debug!(path = %db_path.display(), "State database opened");
 
     // `kei import-existing` runs without the friendly download bar; off-mode
@@ -5091,6 +5094,7 @@ mod build_config_tests {
 
         let sync = SyncArgs::default();
         let globals = GlobalArgs {
+            config_source: Default::default(),
             username: Some("u@example.com".to_string()),
             domain: None,
             data_dir: None,
@@ -5148,6 +5152,7 @@ mod build_config_tests {
 
         let sync = SyncArgs::default();
         let globals = GlobalArgs {
+            config_source: Default::default(),
             username: Some("u@example.com".to_string()),
             domain: None,
             data_dir: None,
