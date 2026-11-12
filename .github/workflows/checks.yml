@@ -206,9 +206,8 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Check live wiki command documentation
         run: |
-          git clone --depth=1 https://github.com/rhoopr/kei.wiki.git /tmp/kei-wiki
-          cargo build --bin kei
-          scripts/check-wiki-commands.sh target/debug/kei /tmp/kei-wiki
+          git clone --depth=1 https://github.com/rhoopr/kei.wiki.git "$RUNNER_TEMP/kei-wiki"
+          scripts/check-wiki-commands.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/kei-wiki"
       - run: cargo doc --no-deps --all-features
 
   catalogs:

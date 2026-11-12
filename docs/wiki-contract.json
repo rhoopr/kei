@@ -8,6 +8,18 @@
   "wiki_revision": "c51f350bba04688b0d5f9abad1f469ea0bac5a59",
   "compatibility_revision": "5e7decd371ff186d8ca87600e2efeaa6920a283b",
   "development_revision": "1d6187e2b7899f4cd55d94e382056558cd524b16",
+  "live_home_profiles": [
+    {
+      "heading": "Stable v0.25.3 commands",
+      "version": "0.25.3",
+      "source_revision": "a2081bfd109993c76f34ac13b12ee15b48c86008"
+    },
+    {
+      "heading": "Commands",
+      "version": "0.30.0-beta.1",
+      "source_revision": "43c900b8b3e065aa86d79856b4f97965b60ee2d9"
+    }
+  ],
   "actions": {
     "login": [
       "get-code",
