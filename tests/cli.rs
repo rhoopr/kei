@@ -118,7 +118,7 @@ fn sync_help_succeeds() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--friendly"))
-        .stdout(predicate::str::contains("--recent"))
+        .stdout(predicate::str::contains("--recent").not())
         .stdout(predicate::str::contains("capture-local calendar date"))
         .stdout(predicate::str::contains("host-local datetimes"))
         .stdout(predicate::str::contains("relative intervals").not())
@@ -136,7 +136,6 @@ fn service_and_import_help_do_not_advertise_relative_windows() {
             .args(args)
             .assert()
             .success()
-            .stdout(predicate::str::contains("--recent"))
             .stdout(predicate::str::contains("30d").not())
             .stdout(predicate::str::contains("Nd").not())
             .stdout(predicate::str::contains("relative intervals").not());
@@ -703,7 +702,6 @@ fn removed_boolean_sync_flag_fails() {
 #[test]
 fn value_sync_flags_accepted() {
     let pairs = [
-        ("--recent", "10"),
         ("--skip-created-before", "2024-01-01"),
         ("--skip-created-after", "2025-01-01"),
     ];
@@ -1093,7 +1091,13 @@ fn auth_flags_rejected_on_all_subcommands() {
 #[test]
 fn retry_failed_accepts_sync_flags() {
     common::cmd()
-        .args(["sync", "--retry-failed", "--recent", "10", "--help"])
+        .args([
+            "sync",
+            "--retry-failed",
+            "--skip-created-before",
+            "2025-01-01",
+            "--help",
+        ])
         .assert()
         .success();
 }

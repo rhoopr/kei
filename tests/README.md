@@ -264,22 +264,9 @@ replays. Each entry records its provenance and relationships among the provider
 family, SQLite evidence, files, and configuration. The runner instantiates those
 relationships using the existing synthetic recovery fixture.
 
-Eight default seeds draw 1-18 faults with replacement from nine events. They vary
-length, repetition, missing child evidence, invalid dates, visibility, temporary
-recent-item filtering, interrupted lookup, and failed refresh. Every history has
-the same required ambiguity/deferred/failed-refresh prefix and valid/two-quiet
-cycle tail. The prefix establishes a known durable owner; generated faults test
-that retained owner's recovery, not arbitrary attribution of unknown families.
-The original four fixed schedules remain separately runnable. Together, the six
-tests execute 192 production cycles. The initial all-feature run took 7.02 seconds
-with a warm build cache; compilation is excluded.
+Eight default seeds draw 1-18 faults with replacement from nine events. They vary length, repetition, missing child evidence, invalid dates, visibility, temporary fixed-date filtering, interrupted lookup, and failed refresh. Every history has the same required ambiguity/deferred/failed-refresh prefix and valid/two-quiet cycle tail. The prefix establishes a known durable owner; generated faults test that retained owner's recovery, not arbitrary attribution of unknown families. The original four fixed schedules remain separately runnable. Together, the six tests execute 192 production cycles. The initial all-feature run took 7.02 seconds with a warm build cache; compilation is excluded.
 
-All histories enter the production cycle and reopen SQLite after every operation.
-The oracle uses fixture facts to check exact ownership, status, dates, checksums,
-retry/revision state, checkpoints, original bytes, unrelated sidecar bytes, and
-bounded work. Recovery must complete on the first valid tail cycle. Two further
-cycles must not repeat metadata hydration, repair, or download. Configuration
-changes here cover recent-item selection only; metadata writers remain disabled.
+All histories enter the production cycle and reopen SQLite after every operation. The oracle uses fixture facts to check exact ownership, status, dates, checksums, retry/revision state, checkpoints, original bytes, unrelated sidecar bytes, and bounded work. Recovery must complete on the first valid tail cycle. Two further cycles must not repeat metadata hydration, repair, or download. Configuration changes here cover fixed-date selection only; metadata writers remain disabled.
 
 Run the focused slice with `just test scenario identity-recovery`. Replay a seed:
 
@@ -726,44 +713,17 @@ perform no new lookup or download and preserve existing media, sidecar, old
 cursor and unrelated debt. Metadata-only wake-up remains with its option-aware
 precheck rather than forcing disabled writers to run.
 
-These tests qualify bounded supported-path admission and targeted queue recovery.
-They do not claim recent-cap semantics, named-album or shared-endpoint admission,
-capture-owned cursor promotion, snapshot absence, pruning, historical retention
-or acknowledgment of unrecoverable debt.
+These tests qualify bounded supported-path admission and targeted queue recovery. They do not claim named-album or shared-endpoint admission, capture-owned cursor promotion, snapshot absence, pruning, historical retention or acknowledgment of unrecoverable debt.
 
-## Recent count selection recovery
+## Count retirement and guarded inventory
 
-The recent overflow fixture starts with owned, populated SQLite/media and a
-retained source cursor. Shuffled multi-page deltas, overlapping albums and an
-unfiled pass enter the actual dispatcher. Independent expected paths distinguish
-library-wide top N before filters from up to N per filter; duplicate album copies
-and a Live Photo companion distinguish assets from output-file counts. Reopening
-with unchanged provider deltas increases and removes the cap, recovers omitted
-work, and checks two quiet cycles without additional byte requests or inventory
-once current EOF evidence qualifies the receipt.
-The actual CLI history uses its existing name-id7 skip policy for synthetic
-local files and checks the selected paths, scoped catalog/receipt/checkpoint,
-unchanged bytes/mtime, other account and unselected pending scope. It does not
-claim that a filename skip creates downloaded-state or verifies source bytes;
-fresh publication/checksum/finalization are asserted in dispatcher histories.
+`cargo test --lib sync_loop::runner::tests::inventory_reconciliation::` exercises the production cycle and dispatcher with account-owned file-backed SQLite, historical media, unrelated sidecars, retained retry evidence and a source cursor. Schema-36 fixtures upgrade to schema 37, retaining exact old receipt bytes for malformed, future-version and already-complete-but-mismatched payloads. Matching, missing and mismatched enumeration hashes cannot hide the new presence-only inventory obligation. A separate schema-owner test checks exact old-key prefix matching, existing-request preservation and no reseeding after completion.
 
-The recent recovery receipt is fixed-size hashed account-database-local evidence,
-not a retained list of selected or discarded records. Pending, malformed, future
-version, changed scope/exclusions and failed successor commits force current
-inventory. Receipt/task write failures and cancellation preserve the prior
-cursor and historical media, then reopen through the same production owner.
-Actual cycle tests cover exact EOF and enumeration-hash drift with a rank token
-that differs from the completed changes/zone successor. Quiet watch prechecks
-wake only the affected selected zone. Unknown catalog records and old-epoch debt
-remain retained. Sparse/deletion cycle controls keep recent enabled and provide
-coherent current inventories. A valid media asset still publishes while an
-unrelated source identity remains unresolved; its source checkpoint and recent
-receipt remain held. These histories grant no absence, deletion or expired-history
-proof. Truncated windows still hold the existing checkpoint and may repeat
-inventory. Catalog-owned selection generations remain a later stage.
-Global-frontier dispatcher controls cover 401/403/421 session recovery and a
-non-session failure with no fallback, preserving the cursor, pending receipt
-and existing media across database reopen.
+The shared/private histories require replay from P to S, one current inventory, and a terminal raw-empty replay from S. Query tokens differ from source successors. A multi-page rank displacement and an unknown raw record that emits no asset event must retain the request and trusted cursor. Later quiet evidence recovers the omitted asset exactly once. Healthy media still publishes when initial delta identity, transfer or state work fails; those failures cannot qualify the inventory. The private-generation case bounds the attempt without implicit extra generation scans.
+
+Request-clear transaction failure, cancellation, changed configuration and changed request values preserve the request and prior album membership across SQLite reopen. Successful retirement completes deferred membership in the same fenced transaction. Two quiet reopened cycles check exact downloaded bytes, receipt preservation, no repeated guarded replay and no duplicate transfers. Missing-cursor coverage retains the request through the ordinary first run. Fixed-date coverage can retire the current request while source/database checkpoints remain bounded; unrelated historical validation can also remain held after retirement. These are current-work proofs, not provider snapshot, complete deletion-history, power-loss or live-account qualification.
+
+`cargo test --test behavioral retired_sync_count_inputs_preserve_archive_before_auth_or_startup_writes` checks sync/service flags and saved `recent` / `recent_scope` against a populated archive. Rejection must precede authentication and startup writes, preserve config/state/media, and give fixed-date guidance. CLI and config tests keep positive import-only sampling separate from the retired sync settings. Generated config and the example must omit both retired keys.
 
 ## State-transition proof
 
@@ -837,17 +797,7 @@ canonical database inode. This proves process-interruption recovery, not
 power-loss durability or automatic orphan cleanup. Other platforms run the
 owner, CLI and quiet-cycle tests without the Linux SIGKILL matrix.
 
-The `smart_reconciliation` production-cycle tests use file-backed SQLite,
-pre-existing downloaded media and a changed smart-folder path template. Bounded
-cases change recent eligibility or a lower date bound, preserve the excluded
-provider tail, reopen state each cycle and check retained old media, atomic
-path-hash promotion, held source/database checkpoints and an unchanged cycle
-without catalog reconciliation or duplicate files. Failure cases cover malformed
-queries, missing or mismatched frontier tokens, cancellation after the selected
-prefix, stale plans, local finalization and checkpoint/promotion write failures.
-An owned private selection with real retained deferred debt also keeps the path
-transition pending after a successful bounded query and file-backed reopen.
-Ordinary bounded refresh queries remain part of the unchanged cycle.
+The `smart_reconciliation` production-cycle tests use file-backed SQLite, pre-existing downloaded media and a changed smart-folder path template. Bounded cases change a lower date bound, preserve the excluded provider tail, reopen state each cycle and check retained old media, atomic path-hash promotion, held source/database checkpoints and an unchanged cycle without catalog reconciliation or duplicate files. Failure cases cover malformed queries, missing query tokens, cancellation after the selected prefix, stale plans, local finalization and checkpoint/promotion write failures. An owned private selection with real retained deferred debt also keeps the path transition pending after a successful bounded query and file-backed reopen. Ordinary bounded refresh queries remain part of the unchanged cycle.
 
 The `sync_loop::runner::tests::indexing` tests use file-backed SQLite reopened
 between cycles, pre-existing downloaded media, real local HTTP downloads, and
@@ -1020,18 +970,13 @@ opt-in (nightly + cargo-fuzz), excluded from `just gate`, and run via
    This prompts for a 2FA code and writes session tokens. Redo only when
    the session expires (typically months).
 
-3. Keep at least one eligible asset in the primary library. General live
-   tests use `tests/data/live-selection.toml`: albums `none`, unfiled enabled,
-   primary library, and the 10 most recent assets. Change the bound only there.
-   No named album, filename, date, or media format is required. A read-only
-   preflight reports the eligible filename count and fails if it is zero.
-   When the bound truncates the inventory, live tests require checkpoint
-   suppression and a no-download repeat full pass. Positive incremental live
-   checks apply only when this bounded selection proves EOF. Deterministic
-   production-path tests cover both cases and config reconciliation.
+3. Choose an explicit fixed lower capture date containing at least one eligible primary-library asset. Set `KEI_LIVE_SKIP_CREATED_BEFORE` to that `YYYY-MM-DD` before running an authorized general live sync route, for example `KEI_LIVE_SKIP_CREATED_BEFORE=2025-01-01 just test live`. Replace the example date with your own narrowly chosen bound; all selected dates at or after it can download, so this is not a ten-item cap. An unset, invalid or rolling value fails closed before provider preflight.
 
-Import runners also pass the shared count as `--recent`, because
-`import-existing` does not use the TOML recent count.
+General live tests read the selectors in `tests/data/live-selection.toml`: albums `none`, unfiled enabled and the primary library. Rust `tests/common/live_selection.rs` and shell `tests/shell/lib.sh` add `[filters].skip_created_before` from `KEI_LIVE_SKIP_CREATED_BEFORE` to each generated config. The Rust helper preserves an explicit valid fixed lower date already in a scenario's TOML; the environment bound is still required. No named album, filename or media format is required. A filename-only preflight reports the eligible count and fails on an empty selection without downloading media. It uses isolated config/state paths and can reuse or refresh cached authentication.
+
+A truncated fixed-date selection must preserve the checkpoint, report `date_bounded_full_enumeration` and repeat without new downloads. Positive incremental live checks apply only when the selected inventory proves EOF. Deterministic production-path tests cover both cases and config reconciliation. The Rust and shell live assertions use the fixed-date hold reason; live execution still requires explicit authorization.
+
+`tests/data/live-selection.toml` also holds `[import_sample].recent = 10`. That table is harness input, not a supported kei configuration table; it is not copied into generated configs. Import runners pass this separate positive count as `import-existing --recent N`, unless a scenario overrides it. Import does not use sync date bounds for matching.
 
 Exact content checks use the [bundled corpus](data/README.md). The
 [migration map](data/live-migration.md) names each deterministic replacement
@@ -1048,6 +993,7 @@ details are baked into test code.
 | `ICLOUD_USERNAME` | required | Apple ID email |
 | `ICLOUD_PASSWORD` | required | Apple ID password |
 | `ICLOUD_TEST_COOKIE_DIR` | `./.test-cookies` | Pre-authenticated session dir |
+| `KEI_LIVE_SKIP_CREATED_BEFORE` | required for live sync fixtures | Explicit fixed `YYYY-MM-DD` lower capture-date bound, written as `[filters].skip_created_before`; no rolling or count fallback |
 | `KEI_DOCKER_IMAGE` | `kei:latest` | Docker image under test |
 | `CARGO_TARGET_DIR` | `./target` | Cargo build directory. Full-test packaging, shell, live, service, and metrics phases use release artifacts from this directory. |
 | `KEI_FULL_TEST_TMPDIR` | `/tmp/codex/kei/full-test/tmp` | Temporary directory for full-test child processes and shell-suite scratch data. |

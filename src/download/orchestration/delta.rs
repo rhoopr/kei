@@ -443,6 +443,9 @@ impl<'a> IncrementalDeltaState<'a> {
 
     pub(super) fn record_completion(&mut self, token: Option<String>) {
         self.summary.sync_token = token;
+        if self.summary.sync_token.is_none() {
+            self.summary.raw_records_observed = None;
+        }
     }
 }
 
@@ -452,6 +455,7 @@ pub(super) struct IncrementalDeltaSummary {
     pub(super) sparse_identity_proofs: Vec<SparseIdentityProof>,
     pub(super) identity_incomplete: bool,
     pub(super) sync_token: Option<String>,
+    pub(super) raw_records_observed: Option<bool>,
     pub(super) token_unsafe_reason: Option<&'static str>,
     pub(super) created_count: u64,
     pub(super) soft_deleted_count: u64,

@@ -171,12 +171,14 @@ pub(super) async fn include_pending_provider_work(
             Arc::from(library.zone_name.as_str()),
         );
         let pending = match async {
-            if download::recent_selection_requires_recovery(
-                &library.plan.passes,
-                &config,
-                &library.sync_token_key,
-            )
-            .await?
+            if !library.plan.passes.is_empty()
+                && let Some(db) = &config.state_db
+                && db
+                    .get_metadata(&crate::sync_cycle::inventory_reconciliation_key(
+                        &library.zone_name,
+                    ))
+                    .await?
+                    .is_some()
             {
                 return Ok(true);
             }

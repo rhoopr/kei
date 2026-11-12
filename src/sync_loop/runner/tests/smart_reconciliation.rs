@@ -19,7 +19,6 @@ struct SmartReconciliationSession {
     zone: &'static str,
     records: Arc<Value>,
     extra_records: Arc<std::sync::Mutex<Vec<Value>>>,
-    frontier_only_tail: bool,
     lookups: Arc<AtomicUsize>,
     queries: Arc<AtomicUsize>,
     delta_calls: Arc<AtomicUsize>,
@@ -37,7 +36,6 @@ enum SmartReconciliationFault {
     Interrupted,
     LateInterrupted,
     CheckpointWrite,
-    FrontierTokenMismatch,
     PromotionWrite,
     DownloadWrite,
     IncompleteAlbumSnapshot,
@@ -93,14 +91,10 @@ impl PhotosSession for SmartReconciliationSession {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             }
             let mut response = self.records.as_ref().clone();
-            if !self.frontier_only_tail
-                || body.contains("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted")
-            {
-                response["records"]
-                    .as_array_mut()
-                    .unwrap()
-                    .extend(self.extra_records.lock().unwrap().clone());
-            }
+            response["records"]
+                .as_array_mut()
+                .unwrap()
+                .extend(self.extra_records.lock().unwrap().clone());
             match *self.fault.lock().unwrap() {
                 Some(SmartReconciliationFault::MalformedTail) => {
                     if response["records"].as_array().unwrap().len() > 2 {
@@ -109,11 +103,6 @@ impl PhotosSession for SmartReconciliationSession {
                 }
                 Some(SmartReconciliationFault::MalformedQuery) => {
                     response["records"][1]["fields"]["assetDate"]["value"] = Value::Null;
-                }
-                Some(SmartReconciliationFault::FrontierTokenMismatch)
-                    if body.contains("CPLAssetAndMasterByAssetDate") =>
-                {
-                    response["syncToken"] = json!("frontier-different");
                 }
                 Some(SmartReconciliationFault::MissingQueryToken) => {
                     response.as_object_mut().unwrap().remove("syncToken");
@@ -211,10 +200,8 @@ async fn smart_reconciliation_lifecycle(
 
 #[derive(Clone, Copy, Debug)]
 enum SmartBound {
-    Recent(crate::cli::RecentScope),
     Date,
     ExistingDate,
-    GlobalFrontierOnlyTail,
 }
 
 #[tokio::test]
@@ -233,12 +220,7 @@ async fn run_cycle_existing_date_bound_smart_path_drift_keeps_source_hold() {
 
 #[tokio::test]
 async fn run_cycle_bounded_smart_reconciliation_converges_without_advancing_source() {
-    for bound in [
-        SmartBound::Recent(crate::cli::RecentScope::Global),
-        SmartBound::Recent(crate::cli::RecentScope::PerFilter),
-        SmartBound::Date,
-        SmartBound::GlobalFrontierOnlyTail,
-    ] {
+    for bound in [SmartBound::Date] {
         Box::pin(smart_reconciliation_lifecycle_bounded(
             "Hidden",
             false,
@@ -262,7 +244,6 @@ async fn run_cycle_bounded_smart_reconciliation_failures_retain_then_recover() {
         SmartReconciliationFault::CheckpointWrite,
         SmartReconciliationFault::PromotionWrite,
         SmartReconciliationFault::DownloadWrite,
-        SmartReconciliationFault::FrontierTokenMismatch,
         SmartReconciliationFault::OtherLibraryFailure,
     ] {
         Box::pin(smart_reconciliation_lifecycle_bounded(
@@ -270,7 +251,7 @@ async fn run_cycle_bounded_smart_reconciliation_failures_retain_then_recover() {
             false,
             false,
             Some(failure),
-            Some(SmartBound::Recent(crate::cli::RecentScope::Global)),
+            Some(SmartBound::Date),
         ))
         .await;
     }
@@ -283,7 +264,7 @@ async fn run_cycle_bounded_smart_reconciliation_retained_selection_debt_holds_pr
         false,
         false,
         Some(SmartReconciliationFault::RetainedSelectionDebt),
-        Some(SmartBound::Recent(crate::cli::RecentScope::Global)),
+        Some(SmartBound::Date),
     ))
     .await;
 }
@@ -341,7 +322,6 @@ async fn smart_reconciliation_lifecycle_bounded(
         zone: "PrimarySync",
         records: records.clone(),
         extra_records: extra_records.clone(),
-        frontier_only_tail: matches!(bound, Some(SmartBound::GlobalFrontierOnlyTail)),
         lookups: lookups.clone(),
         queries: queries.clone(),
         delta_calls: delta_calls.clone(),
@@ -384,7 +364,6 @@ async fn smart_reconciliation_lifecycle_bounded(
                     zone: "SharedSync-TEST",
                     records: Arc::new(json!({"records": [], "syncToken": "smart-current"})),
                     extra_records: Arc::new(std::sync::Mutex::new(Vec::new())),
-                    frontier_only_tail: false,
                     lookups: Arc::new(AtomicUsize::new(0)),
                     queries: Arc::new(AtomicUsize::new(0)),
                     delta_calls: Arc::new(AtomicUsize::new(0)),
@@ -409,14 +388,6 @@ async fn smart_reconciliation_lifecycle_bounded(
             && let Some(bound) = bound
         {
             match bound {
-                SmartBound::GlobalFrontierOnlyTail => {
-                    config.filters.recent = Some(1);
-                    config.filters.recent_scope = crate::cli::RecentScope::Global;
-                }
-                SmartBound::Recent(scope) => {
-                    config.filters.recent = Some(1);
-                    config.filters.recent_scope = scope;
-                }
                 SmartBound::Date | SmartBound::ExistingDate => {
                     config.filters.skip_created_before =
                         Some(crate::config::CreatedDateFilter::CaptureDate(
@@ -576,8 +547,6 @@ async fn smart_reconciliation_lifecycle_bounded(
             }
             #[cfg(not(feature = "xmp"))]
             assert!(!sidecars);
-            result.recent = config.filters.recent;
-            result.recent_scope = config.filters.recent_scope;
             result.skip_created_before = config.filters.skip_created_before;
             Arc::new(result)
         };
@@ -747,7 +716,7 @@ async fn smart_reconciliation_lifecycle_bounded(
         if held && failure == Some(SmartReconciliationFault::RetainedSelectionDebt) {
             assert_eq!(
                 result.stats.sync_token_blocked_reason,
-                Some("recent_limited_full_enumeration")
+                Some("date_bounded_full_enumeration")
             );
             assert!(!result.can_advance_database_checkpoint());
             let (_, scope, _) = lib.plan.passes[0]

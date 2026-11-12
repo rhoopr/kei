@@ -10,8 +10,8 @@ pub fn live_recent() -> u32 {
     let table: toml::Table = SELECTION.parse().expect("shared live selection TOML");
     u32::try_from(
         table
-            .get("filters")
-            .expect("filters")
+            .get("import_sample")
+            .expect("import sample")
             .get("recent")
             .expect("recent")
             .as_integer()
@@ -21,6 +21,29 @@ pub fn live_recent() -> u32 {
 }
 
 pub fn live_config(body: &str) -> String {
+    live_config_with_bound(body, &require_fixed_date())
+}
+
+fn fixed_date(value: Option<&str>) -> Result<&str, &'static str> {
+    let value = value.ok_or(
+        "Set KEI_LIVE_SKIP_CREATED_BEFORE to an explicit fixed YYYY-MM-DD before live tests",
+    )?;
+    if value.len() != 10 || chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_err() {
+        return Err(
+            "KEI_LIVE_SKIP_CREATED_BEFORE must be a fixed YYYY-MM-DD, not a rolling window",
+        );
+    }
+    Ok(value)
+}
+
+pub fn require_fixed_date() -> String {
+    let value = std::env::var("KEI_LIVE_SKIP_CREATED_BEFORE").ok();
+    fixed_date(value.as_deref())
+        .expect("bounded live selection required")
+        .to_owned()
+}
+
+fn live_config_with_bound(body: &str, bound: &str) -> String {
     let mut config: toml::Table = body.parse().expect("live scenario TOML");
     let defaults: toml::Table = SELECTION.parse().expect("shared live selection TOML");
     let filters = config
@@ -36,6 +59,17 @@ pub fn live_config(body: &str) -> String {
     {
         filters.entry(key.clone()).or_insert_with(|| value.clone());
     }
+    assert!(
+        !filters.contains_key("recent") && !filters.contains_key("recent_scope"),
+        "retired sync count in live fixture"
+    );
+    let selected_bound = filters
+        .get("skip_created_before")
+        .map_or(bound, |value| value.as_str().expect("fixed live date"));
+    fixed_date(Some(selected_bound)).expect("fixed live date");
+    filters
+        .entry("skip_created_before")
+        .or_insert_with(|| toml::Value::String(bound.to_owned()));
     toml::to_string(&config).expect("serialize bounded live config")
 }
 
@@ -49,10 +83,7 @@ fn eligible_inventory(stdout: &[u8]) -> Result<usize, String> {
         .filter(|line| !line.trim().is_empty())
         .count();
     if count == 0 {
-        return Err(format!(
-            "Empty bounded live selection: primary library, recent={}; observed eligible filenames=0. Add at least one eligible asset before running live tests.",
-            live_recent()
-        ));
+        return Err("Empty bounded live selection: observed eligible filenames=0. Select a fixed capture-date range containing at least one eligible asset before running live tests.".to_owned());
     }
     Ok(count)
 }
@@ -75,14 +106,14 @@ pub(super) fn ensure_selection(username: &str, password: &str, cookies: &Path) {
                 .timeout(Duration::from_secs(180))
                 .assert().success().get_output().clone();
             let count = eligible_inventory(&output.stdout).expect("live selection preflight");
-            eprintln!("Live selection: primary library, albums=none, unfiled=true, recent={}, eligible filenames={count}", live_recent());
+            eprintln!("Live selection: primary library, albums=none, unfiled=true, fixed lower date={}, eligible filenames={count}", require_fixed_date());
         });
     });
 }
 
 #[test]
 fn shared_live_selection_is_bounded_and_preserves_scenario_options() {
-    let value: toml::Table = live_config("[download]\nthreads = 2\n[filters]\nrecent = 3\n")
+    let value: toml::Table = live_config_with_bound("[download]\nthreads = 2\n", "2025-01-02")
         .parse()
         .unwrap();
     assert_eq!(
@@ -118,10 +149,10 @@ fn shared_live_selection_is_bounded_and_preserves_scenario_options() {
         value
             .get("filters")
             .unwrap()
-            .get("recent")
+            .get("skip_created_before")
             .unwrap()
-            .as_integer(),
-        Some(3)
+            .as_str(),
+        Some("2025-01-02")
     );
     assert_eq!(
         value
@@ -133,6 +164,20 @@ fn shared_live_selection_is_bounded_and_preserves_scenario_options() {
         Some(2)
     );
     assert!(live_recent() > 0 && live_recent() <= 10);
+}
+
+#[test]
+fn live_sync_requires_an_explicit_fixed_date() {
+    for value in [
+        None,
+        Some(""),
+        Some("30d"),
+        Some("2025-02-30"),
+        Some("2025-1-2"),
+    ] {
+        assert!(fixed_date(value).is_err(), "{value:?}");
+    }
+    assert_eq!(fixed_date(Some("2025-01-02")), Ok("2025-01-02"));
 }
 
 #[test]

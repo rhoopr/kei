@@ -79,7 +79,6 @@ struct SetupAnswers {
     raw_policy: Option<RawPolicy>,
 
     // Date range
-    recent: Option<u32>,
     skip_created_before: Option<String>,
     skip_created_after: Option<String>,
 
@@ -135,7 +134,6 @@ impl Default for SetupAnswers {
             resolution: None,
             force_resolution: false,
             raw_policy: None,
-            recent: None,
             skip_created_before: None,
             skip_created_after: None,
             watch_interval: None,
@@ -959,7 +957,7 @@ fn ask_quality(answers: &mut SetupAnswers) -> anyhow::Result<()> {
 fn ask_date_range(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     println!();
     let limit = Confirm::new()
-        .with_prompt("Want to limit syncing to a specific date range or recent photos?")
+        .with_prompt("Want to limit syncing to a fixed capture-date range?")
         .default(false)
         .interact()?;
 
@@ -969,19 +967,6 @@ fn ask_date_range(answers: &mut SetupAnswers) -> anyhow::Result<()> {
 
     answers.skip_created_before = date_prompt("Only sync photos created after")?;
     answers.skip_created_after = date_prompt("Only sync photos created before")?;
-
-    let recent: String = Input::new()
-        .with_prompt(
-            "Only consider the N most-recent assets per selected library/album/smart-folder pass (blank = all)",
-        )
-        .default(String::new())
-        .show_default(false)
-        .allow_empty(true)
-        .validate_with(|s: &String| parse_positive_or_blank::<u32>(s).map(|_| ()))
-        .interact_text()?;
-    if let Ok(Some(n)) = parse_positive_or_blank::<u32>(&recent) {
-        answers.recent = Some(n);
-    }
 
     Ok(())
 }
@@ -1512,13 +1497,6 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             writeln!(out, "# media = [\"photos\", \"videos\", \"live-photos\"]")?;
         }
         // `live_photo_mode` is emitted in the [photos] section below.
-        match answers.recent {
-            Some(n) => writeln!(out, "recent = {n}")?,
-            None => writeln!(
-                out,
-                "# recent = 0  # 0 = all; cap applies per selected library/album/smart-folder pass"
-            )?,
-        };
         match &answers.skip_created_before {
             Some(d) => writeln!(out, "skip_created_before = \"{}\"", escape_toml_string(d))?,
             None => writeln!(out, "# skip_created_before = \"\"")?,
@@ -2120,7 +2098,6 @@ mod tests {
             resolution: Some(PhotoResolution::Medium),
             force_resolution: true,
             raw_policy: Some(RawPolicy::PreferRaw),
-            recent: Some(100),
             skip_created_before: Some("2024-01-01".to_string()),
             skip_created_after: Some("2025-01-01".to_string()),
             watch_interval: Some(1800),
@@ -2160,7 +2137,7 @@ mod tests {
         assert!(toml_str.contains("live_photo_mode = \"both\""));
         assert!(toml_str.contains("force_resolution = true"));
         assert!(toml_str.contains("raw_policy = \"prefer-raw\""));
-        assert!(toml_str.contains("recent = 100"));
+        assert!(!toml_str.contains("recent ="));
         assert!(toml_str.contains("interval = 1800"));
         assert!(toml_str.contains("notify_systemd = true"));
         assert!(toml_str.contains("reconcile_every_n_cycles = 24"));
@@ -2206,7 +2183,6 @@ mod tests {
             resolution: Some(PhotoResolution::Thumb),
             force_resolution: true,
             raw_policy: Some(RawPolicy::PreferJpeg),
-            recent: Some(50),
             skip_created_before: Some("2024-01-01".to_string()),
             skip_created_after: Some("2025-06-01".to_string()),
             watch_interval: Some(600),
@@ -2277,7 +2253,6 @@ mod tests {
             filters.libraries.is_none(),
             "empty libraries vec must produce a comment, not an array"
         );
-        assert_eq!(filters.recent, Some(crate::cli::RecentLimit::Count(50)));
         assert_eq!(filters.skip_created_before.as_deref(), Some("2024-01-01"));
         assert_eq!(filters.skip_created_after.as_deref(), Some("2025-06-01"));
 

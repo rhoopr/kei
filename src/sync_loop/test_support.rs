@@ -326,7 +326,6 @@ pub(super) async fn make_shared_session_for_run_cycle() -> (tempfile::TempDir, a
 pub(super) struct RunCycleDownloadConfigOptions {
     pub(super) media: config::MediaSelection,
     pub(super) per_pass_paths: bool,
-    pub(super) recent: Option<u32>,
     pub(super) skip_created_before: Option<config::CreatedDateFilter>,
     pub(super) skip_created_after: Option<config::CreatedDateFilter>,
     pub(super) file_match_policy: Option<crate::types::FileMatchPolicy>,
@@ -390,7 +389,6 @@ pub(super) fn make_run_cycle_download_config_builder_with_options(
         {
             config.metadata.xmp_sidecar = options.xmp_sidecar;
         }
-        config.recent = options.recent;
         config.skip_created_before = options.skip_created_before;
         config.skip_created_after = options.skip_created_after;
         if let Some(concurrent_downloads) = options.concurrent_downloads {

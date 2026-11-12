@@ -118,8 +118,6 @@ pub(crate) struct TomlFilters {
     pub unfiled: Option<bool>,
     pub media: Option<Vec<MediaKind>>,
     pub filename_exclude: Option<Vec<String>>,
-    pub recent: Option<crate::cli::RecentLimit>,
-    pub recent_scope: Option<crate::cli::RecentScope>,
     #[serde(default, deserialize_with = "deserialize_created_before")]
     pub skip_created_before: Option<String>,
     #[serde(default, deserialize_with = "deserialize_created_after")]
@@ -218,7 +216,11 @@ pub(crate) fn load_toml_config_with_source(
                 );
                 if parse_error.contains("unknown field") {
                     message.push_str("\n\n");
-                    message.push_str(&crate::upgrade_hints::toml_unknown_field_hint());
+                    if parse_error.contains("`recent`") || parse_error.contains("`recent_scope`") {
+                        message.push_str("Sync count selection is no longer supported. Remove recent and recent_scope from [filters]. To bound sync, set a fixed YYYY-MM-DD in [filters].skip_created_before or skip_created_after. Configuration was not changed.");
+                    } else {
+                        message.push_str(&crate::upgrade_hints::toml_unknown_field_hint());
+                    }
                 }
                 anyhow::anyhow!(message)
             })?;
@@ -293,8 +295,6 @@ mod tests {
             "filters.unfiled",
             "filters.media",
             "filters.filename_exclude",
-            "filters.recent",
-            "filters.recent_scope",
             "filters.skip_created_before",
             "filters.skip_created_after",
             "photos.resolution",
@@ -429,7 +429,6 @@ mod tests {
             libraries = ["PrimarySync"]
             albums = ["Favorites"]
             media = ["photos", "videos", "live-photos"]
-            recent = 500
             skip_created_before = "2024-01-01"
             skip_created_after = "2025-01-01"
 
@@ -460,7 +459,6 @@ mod tests {
 
         let filters = config.filters.unwrap();
         assert_eq!(filters.albums, Some(vec!["Favorites".to_string()]));
-        assert_eq!(filters.recent, Some(crate::cli::RecentLimit::Count(500)));
         let photos = config.photos.unwrap();
         assert_eq!(photos.resolution, Some(PhotoResolution::Original));
         assert_eq!(photos.raw_policy, Some(RawPolicy::AsIs));
@@ -720,7 +718,6 @@ mod tests {
             libraries = ["SharedSync-ABC"]
             albums = ["A", "B"]
             media = ["photos", "videos", "live-photos"]
-            recent = 100
             skip_created_before = "2024-01-01"
             skip_created_after = "2025-12-31"
         "#;
@@ -736,7 +733,6 @@ mod tests {
             Some(&[MediaKind::Photos, MediaKind::Videos, MediaKind::LivePhotos,][..])
         );
 
-        assert_eq!(f.recent, Some(crate::cli::RecentLimit::Count(100)));
         assert_eq!(f.skip_created_before.as_deref(), Some("2024-01-01"));
         assert_eq!(f.skip_created_after.as_deref(), Some("2025-12-31"));
     }

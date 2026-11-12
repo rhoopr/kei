@@ -746,6 +746,7 @@ fn finish_download_result(
 ) -> SyncResult {
     checkpoint.project(&mut stats);
     SyncResult {
+        deferred_album_snapshots: Vec::new(),
         outcome,
         sync_token: None,
         stats,

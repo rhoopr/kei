@@ -256,13 +256,7 @@ pub(crate) fn sync_coverage_fingerprint_json(
         .map(glob::Pattern::as_str)
         .collect();
     filename_exclude.sort_unstable();
-    let coverage = if let Some(count) = config.filters.recent {
-        serde_json::json!({
-            "kind": "bounded-recent-count",
-            "count": count,
-            "recent_scope": config.filters.recent_scope,
-        })
-    } else if skip_created_before.is_some() || skip_created_after.is_some() {
+    let coverage = if skip_created_before.is_some() || skip_created_after.is_some() {
         serde_json::json!({
             "kind": "bounded-date-window",
             "skip_created_before": skip_created_before,
@@ -294,8 +288,8 @@ pub(crate) fn sync_coverage_fingerprint_json(
             "filename_exclude": filename_exclude,
             "skip_created_before": skip_created_before,
             "skip_created_after": skip_created_after,
-            "recent": config.filters.recent,
-            "recent_scope": config.filters.recent_scope,
+            "recent": null,
+            "recent_scope": "global",
         },
         "coverage": coverage,
         "enum_config_hash": enum_config_hash,
@@ -374,8 +368,8 @@ pub(crate) fn inventory_scope(
                 "exclude_asset_ids": excludes,
                 "skip_created_before": config.skip_created_before.map(crate::config::CreatedDateFilter::fingerprint),
                 "skip_created_after": config.skip_created_after.map(crate::config::CreatedDateFilter::fingerprint),
-                "recent": config.recent,
-                "recent_scope": config.recent_scope,
+                "recent": null,
+                "recent_scope": "global",
                 "retry_only": config.retry_only,
             },
         })
@@ -437,16 +431,8 @@ fn hash_download_config_with_date_bounds(
             filename_exclude: &config.filename_exclude,
         },
     );
-    // `recent` affects which already-downloaded assets to trust/skip
-    hash_optional_u32(&mut hasher, config.recent);
-    if config.recent.is_some() {
-        hasher.update(b"recent_scope:");
-        hasher.update(match config.recent_scope {
-            crate::cli::RecentScope::Global => b"global".as_slice(),
-            crate::cli::RecentScope::PerFilter => b"per-filter".as_slice(),
-        });
-        hasher.update(b"\0");
-    }
+    // Preserve the historical uncapped encoding for retained path receipts.
+    hash_optional_u32(&mut hasher, None);
     if config.edited_naming == crate::types::EditedNaming::Primary {
         hasher.update(b"\0kei:edited-primary:v1\0");
     }
@@ -492,18 +478,8 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     for pattern in &sorted_excludes {
         hash_bytes(&mut hasher, pattern.as_bytes());
     }
-    // Recent eligibility drift must recover assets omitted before this owner
-    // persisted scoped recovery evidence. Version 3 also forces one conservative
-    // inventory/bridge on legacy cursors, including legacy cap removal.
-    hash_optional_u32(&mut hasher, config.filters.recent);
-    if config.filters.recent.is_some() {
-        hasher.update(b"recent_scope:");
-        hasher.update(match config.filters.recent_scope {
-            crate::cli::RecentScope::Global => b"global".as_slice(),
-            crate::cli::RecentScope::PerFilter => b"per-filter".as_slice(),
-        });
-        hasher.update(b"\0");
-    }
+    // Preserve the historical uncapped cursor-compatibility encoding.
+    hash_optional_u32(&mut hasher, None);
 
     // The unfiled selector is still unsafe to classify from the current state
     // alone: switching it on can make old, never-enumerated unfiled assets
@@ -517,6 +493,8 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
 /// Decoupled from CLI parsing so the engine can be tested independently.
 #[derive(Clone)]
 pub(crate) struct DownloadConfig {
+    /// One upgrade-requested inventory guarded by retained-cursor replay.
+    pub(crate) inventory_reconciliation: bool,
     pub(crate) sparse_targets: Arc<[crate::download::sparse_target::SelectedSparseTarget]>,
     /// Drain ordered queries to certify bounded local path work on config drift.
     /// Download eligibility and provider checkpoint bounds remain unchanged.
@@ -549,8 +527,6 @@ pub(crate) struct DownloadConfig {
     pub(crate) repair_truncated: bool,
     pub(crate) legacy_preservation_allow_hardlinks: bool,
     pub(crate) concurrent_downloads: usize,
-    pub(crate) recent: Option<u32>,
-    pub(crate) recent_scope: crate::cli::RecentScope,
     pub(crate) retry: RetryConfig,
     pub(crate) live_photo_mode: LivePhotoMode,
     pub(crate) live_resolution: AssetVersionSize,
@@ -696,16 +672,6 @@ impl DownloadConfig {
             ..self.clone()
         }
     }
-
-    pub(in crate::download) fn with_recent_scope(
-        &self,
-        recent_scope: crate::cli::RecentScope,
-    ) -> Self {
-        Self {
-            recent_scope,
-            ..self.clone()
-        }
-    }
 }
 
 impl std::fmt::Debug for DownloadConfig {
@@ -731,8 +697,6 @@ impl std::fmt::Debug for DownloadConfig {
                 &self.legacy_preservation_allow_hardlinks,
             )
             .field("concurrent_downloads", &self.concurrent_downloads)
-            .field("recent", &self.recent)
-            .field("recent_scope", &self.recent_scope)
             .field("retry", &self.retry)
             .field("live_photo_mode", &self.live_photo_mode)
             .field("live_resolution", &self.live_resolution)
@@ -766,6 +730,7 @@ impl DownloadConfig {
     pub(crate) fn test_default() -> Self {
         use rustc_hash::FxHashSet;
         Self {
+            inventory_reconciliation: false,
             directory: Arc::from(Path::new("/nonexistent/download_filter_tests")),
             folder_structure: "{:%Y/%m/%d}".to_string(),
             folder_structure_albums: Arc::from(crate::config::DEFAULT_FOLDER_STRUCTURE_ALBUMS),
@@ -782,8 +747,6 @@ impl DownloadConfig {
             repair_truncated: false,
             legacy_preservation_allow_hardlinks: false,
             concurrent_downloads: 1,
-            recent: None,
-            recent_scope: crate::cli::RecentScope::Global,
             retry: crate::retry::RetryConfig::default(),
             live_photo_mode: LivePhotoMode::Both,
             live_resolution: AssetVersionSize::LiveOriginal,

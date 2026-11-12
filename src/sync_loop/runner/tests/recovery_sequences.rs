@@ -171,7 +171,11 @@ async fn run_capture_history(seed: u64, trace: &[Event]) {
             db.clone(),
             RunCycleDownloadConfigOptions {
                 media: media_without_photo_downloads(),
-                recent: matches!(event, Event::FilteredInvalid).then_some(1),
+                skip_created_before: matches!(event, Event::FilteredInvalid).then_some(
+                    crate::config::CreatedDateFilter::CaptureDate(
+                        chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                    ),
+                ),
                 ..RunCycleDownloadConfigOptions::default()
             },
         );

@@ -62,8 +62,7 @@ async fn run_one_photo_full_cycle_with_controls(
 
 #[tokio::test]
 async fn run_cycle_recent_exact_multiple_libraries_advance_each_zone() {
-    let mut config = make_run_cycle_config();
-    config.filters.recent = Some(20);
+    let config = make_run_cycle_config();
     let db = make_state_db();
     let download_dir = tempfile::tempdir().expect("download tempdir");
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
@@ -92,7 +91,6 @@ async fn run_cycle_recent_exact_multiple_libraries_advance_each_zone() {
         Arc::clone(&db),
         RunCycleDownloadConfigOptions {
             media: media_without_photo_downloads(),
-            recent: Some(20),
             ..RunCycleDownloadConfigOptions::default()
         },
     );

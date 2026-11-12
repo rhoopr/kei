@@ -404,8 +404,7 @@ async fn shutdown_cancellation_exits_download_pass_promptly() {
         repair_truncated: false,
         legacy_preservation_allow_hardlinks: false,
         concurrent_downloads: 10,
-        recent: None,
-        recent_scope: crate::cli::RecentScope::Global,
+        inventory_reconciliation: false,
         retry: crate::retry::RetryConfig {
             max_retries: 0,
             base_delay_secs: 0,

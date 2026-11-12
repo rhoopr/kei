@@ -3,4 +3,7 @@
 albums = ["none"]
 unfiled = true
 libraries = ["primary"]
+
+# Import sampling is independent from sync's explicitly supplied fixed date.
+[import_sample]
 recent = 10

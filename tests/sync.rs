@@ -756,10 +756,7 @@ fn sync_bounded_second_run_preserves_checkpoint_and_skips_download() {
         if first_token.is_some() {
             assert!(stderr.contains("sync_mode=\"incremental\""), "{stderr}");
         } else {
-            assert!(
-                stderr.contains("recent_limited_full_enumeration"),
-                "{stderr}"
-            );
+            assert!(stderr.contains("date_bounded_full_enumeration"), "{stderr}");
             assert!(token().is_none(), "partial inventory must not checkpoint");
         }
         assert!(

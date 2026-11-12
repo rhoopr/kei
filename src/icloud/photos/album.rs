@@ -238,31 +238,6 @@ impl PhotoAlbum {
         self.container_id.is_some() && !self.cross_zone_sources.is_empty()
     }
 
-    pub(crate) fn clone_as_library_wide(&self) -> PhotoAlbum {
-        let mut album = PhotoAlbum::new(
-            PhotoAlbumConfig {
-                params: Arc::clone(&self.params),
-                service_endpoint: Arc::clone(&self.service_endpoint),
-                name: Arc::from(""),
-                list_type: Arc::from(QUERY_ALL_LIST),
-                obj_type: Arc::from(QUERY_ALL_OBJ),
-                query_filter: None,
-                page_size: self.page_size,
-                zone_id: Arc::clone(&self.zone_id),
-                retry_config: self.retry_config,
-                container_id: None,
-                cross_zone_sources: Vec::new(),
-            },
-            self.session.clone_box(),
-        );
-        album.shadow_capture = self.shadow_capture.clone();
-        album.rank_capture = self.rank_capture.clone().map(|mut capture| {
-            capture.pass_key = "global-frontier".to_owned();
-            capture
-        });
-        album
-    }
-
     /// Return total item count for this album via `HyperionIndexCountLookup`.
     pub async fn len(&self) -> anyhow::Result<u64> {
         self.fetch_len().await
@@ -564,10 +539,27 @@ impl PhotoAlbum {
     ///
     /// This method is inherently sequential -- each page's syncToken feeds the next request.
     /// No parallel fetchers.
+    #[allow(
+        dead_code,
+        reason = "preserve the public event-stream interface; checkpoint owners additionally require terminal raw-page evidence"
+    )]
     pub fn changes_stream(
         &self,
         sync_token: &str,
     ) -> (ChangeStream, tokio::sync::oneshot::Receiver<String>) {
+        let (stream, token, _completion) = self.stream_changes(sync_token);
+        (stream, token)
+    }
+
+    /// Raw observation is sent only at terminal EOF, never for receiver closure.
+    pub(crate) fn changes_stream_with_completion(
+        &self,
+        sync_token: &str,
+    ) -> (
+        ChangeStream,
+        tokio::sync::oneshot::Receiver<String>,
+        tokio::sync::oneshot::Receiver<bool>,
+    ) {
         self.stream_changes(sync_token)
     }
 }

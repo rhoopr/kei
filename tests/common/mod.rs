@@ -617,6 +617,7 @@ pub(crate) fn is_retryable_auth_failure(msg: &str) -> bool {
 /// Panics if credentials are not configured or session validation fails.
 #[allow(dead_code)]
 pub fn require_preauth() -> (String, String, PathBuf) {
+    live_selection::require_fixed_date();
     if RATE_LIMITED.load(Ordering::SeqCst) {
         eprintln!("\n*** ABORTING: Apple 503 rate limit detected in earlier test ***");
         std::process::exit(1);

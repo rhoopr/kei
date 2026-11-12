@@ -22,7 +22,7 @@ fn readiness(state: &'static str) -> IndexingOptions {
         cancel: CancellationToken::new(),
         interrupt: false,
         stale_plan: false,
-        recent: None,
+        date_bound: false,
         retry_only: false,
         token: Some("query-token"),
         queries: Arc::new(AtomicUsize::new(0)),
@@ -245,7 +245,7 @@ async fn indexing_managed_inventory_faults_never_publish_or_release_hold() {
         match fault {
             "regression" => finished.regress = true,
             "cancel" => finished.interrupt = true,
-            "bound" => finished.recent = Some(1),
+            "bound" => finished.date_bound = true,
             "stale" => finished.stale_plan = true,
             "identity" => current[1]["recordName"] = json!(""),
             "token" => finished.token = None,
@@ -327,7 +327,7 @@ async fn indexing_managed_materialization_failure_keeps_full_debt_and_cursor() {
                 rusqlite::Connection::open(root.path().join("state.db")).unwrap().execute_batch("CREATE TRIGGER fail_recovery_checkpoint BEFORE UPDATE OF value ON metadata WHEN NEW.key='sync_token:PrimarySync' BEGIN SELECT RAISE(FAIL,'injected recovery checkpoint failure'); END").unwrap();
             }
             "cancel" => interrupted.interrupt = true,
-            "bound" => interrupted.recent = Some(1),
+            "bound" => interrupted.date_bound = true,
             "regression" => interrupted.regress = true,
             _ => panic!("unknown fixture fault: {fault}"),
         }

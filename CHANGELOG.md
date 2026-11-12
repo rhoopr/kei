@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## Unreleased
+
+### Changed
+
+- Removed sync/service count selection (`--recent`, `--recent-scope` and `[filters].recent` / `recent_scope`). Retired settings fail before authentication or state/media changes with removal and fixed-date guidance. Relative `Nd` date bounds are also rejected. Import-only `import-existing --recent N` retains positive-count sampling.
+- Advanced SQLite state to schema 37. Old recent-selection receipt keys seed one-time current inventory requests without changing their original bytes. Guarded replay, current selected inventory and a raw-empty terminal replay qualify retirement; busy intervals and failed work retry in later cycles. This does not establish a provider snapshot or relax historical checkpoint holds.
+
 ## [0.26.0] - 2026-10-22
 
 ### Added

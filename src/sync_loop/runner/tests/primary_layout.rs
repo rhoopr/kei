@@ -31,7 +31,7 @@ struct IndexingOptions {
     cancel: CancellationToken,
     interrupt: bool,
     stale_plan: bool,
-    recent: Option<u32>,
+    date_bound: bool,
     retry_only: bool,
     token: Option<&'static str>,
     queries: Arc<AtomicUsize>,
@@ -324,10 +324,13 @@ async fn try_cycle_options(
         config.refresh_metadata = options.refresh_metadata;
         config.edited = true;
         config.edited_naming = naming;
-        config.recent = options
+        config.skip_created_after = options
             .indexing
             .as_ref()
-            .and_then(|indexing| indexing.recent);
+            .is_some_and(|indexing| indexing.date_bound)
+            .then_some(crate::config::CreatedDateFilter::CaptureDate(
+                chrono::NaiveDate::from_ymd_opt(2100, 1, 1).unwrap(),
+            ));
         config.retry_only = options
             .indexing
             .as_ref()

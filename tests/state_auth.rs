@@ -54,13 +54,7 @@ fn import_config(data_dir: &Path, dir: &Path, download_extra: &str) -> std::path
     common::live_selection::write_live_config(data_dir, "state-auth-import", &body)
 }
 
-fn sync_cmd(
-    username: &str,
-    password: &str,
-    cookie_dir: &Path,
-    dir: &Path,
-    recent: u32,
-) -> assert_cmd::Command {
+fn sync_cmd(username: &str, password: &str, cookie_dir: &Path, dir: &Path) -> assert_cmd::Command {
     // data/live-selection.toml selects one bounded primary-library pass
     // with albums = ["none"] and unfiled = true. These state tests do not
     // need album passes or shared-library fixtures.
@@ -70,8 +64,6 @@ fn sync_cmd(
         .env("KEI_DATA_DIR", cookie_dir);
     cmd.args([
         "sync",
-        "--recent",
-        &recent.to_string(),
         "--password",
         password,
         "--config",
@@ -178,7 +170,7 @@ fn status_after_sync_shows_counts() {
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -211,7 +203,7 @@ fn reset_state_deletes_db_after_sync() {
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -244,7 +236,7 @@ fn reset_state_without_yes_does_not_delete() {
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -286,7 +278,7 @@ fn verify_after_sync_reports_results() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
             .assert();
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -317,7 +309,7 @@ fn verify_checksums_after_sync() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
             .assert();
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -345,7 +337,7 @@ fn verify_detects_missing_files() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
             .assert();
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -385,7 +377,7 @@ fn verify_checksums_detects_corruption() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
             .assert();
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -447,7 +439,7 @@ fn import_existing_matches_synced_files() {
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -517,8 +509,6 @@ fn import_existing_custom_folder_structure() {
             .env("KEI_DATA_DIR", &cookie_dir)
             .args([
                 "sync",
-                "--recent",
-                "1",
                 "--password",
                 &password,
                 "--config",
@@ -574,7 +564,7 @@ fn retry_failed_after_successful_sync_is_noop() {
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -654,7 +644,6 @@ fn dry_run_does_not_create_state_db() {
             &password,
             isolated_cookies.path(),
             download_dir.path(),
-            2,
         )
         .args(["--dry-run"])
         .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
@@ -692,7 +681,7 @@ fn reset_sync_token_forces_full_enumeration() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
         // First sync to populate sync tokens
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -710,7 +699,7 @@ fn reset_sync_token_forces_full_enumeration() {
             .stdout(predicate::str::contains("Cleared sync tokens"));
 
         // Second sync should do full enumeration (no stored token)
-        let output = sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
+        let output = sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--log-level", "debug"])
             .timeout(Duration::from_secs(TIMEOUT_SYNC))
             .output()

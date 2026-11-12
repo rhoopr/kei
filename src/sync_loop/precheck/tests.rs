@@ -644,11 +644,17 @@ async fn check_changes_database_unselected_zone_token_persist_failure_still_skip
 }
 
 #[tokio::test]
-async fn pending_recent_selection_wakes_only_its_selected_zone_on_unchanged_precheck() {
+async fn pending_inventory_request_wakes_only_its_selected_zone_on_unchanged_precheck() {
     let db = make_state_db();
     db.set_metadata(
         "recent_selection_recovery:PrimarySync",
         "malformed legacy recovery receipt",
+    )
+    .await
+    .unwrap();
+    db.set_metadata(
+        &crate::sync_cycle::inventory_reconciliation_key("PrimarySync"),
+        "1",
     )
     .await
     .unwrap();

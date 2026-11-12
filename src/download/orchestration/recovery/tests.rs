@@ -1295,7 +1295,6 @@ async fn bounded_full_sync_revalidates_explicit_provider_deletion() {
     config.directory = Arc::from(dir.path());
     config.state_db = Some(db.clone());
     config.sync_mode = SyncMode::Full;
-    config.recent = Some(300);
 
     let result = download_photos_with_sync(
         &Client::new(),
@@ -1398,7 +1397,6 @@ async fn bounded_full_sync_hydrates_live_legacy_pending_master() {
         config.directory = Arc::from(dir.path());
         config.state_db = Some(db.clone());
         config.sync_mode = SyncMode::Full;
-        config.recent = Some(300);
 
         let result = download_photos_with_sync(
             &Client::new(),
@@ -2192,7 +2190,6 @@ async fn hidden_invalid_capture_date_preserves_pending_recovery() {
                 config.directory = Arc::from(media.as_path());
                 config.state_db = Some(db.clone());
                 config.sync_mode = SyncMode::Full;
-                config.recent = Some(300);
                 config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
                     Utc.timestamp_opt(if valid_epoch { 0 } else { 946_684_800 }, 0)
                         .unwrap(),

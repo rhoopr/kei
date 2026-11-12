@@ -109,8 +109,7 @@ fn make_one_photo_incremental_album_with_download(
 #[tokio::test]
 async fn run_cycle_recent_exact_inventory_stores_zone_token() {
     let (capture, _guard) = crate::test_helpers::TracingCapture::install();
-    let mut config = make_run_cycle_config();
-    config.filters.recent = Some(40);
+    let config = make_run_cycle_config();
     let db = make_state_db();
     let download_dir = tempfile::tempdir().expect("download tempdir");
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
@@ -126,7 +125,6 @@ async fn run_cycle_recent_exact_inventory_stores_zone_token() {
         Arc::clone(&db),
         RunCycleDownloadConfigOptions {
             media: media_without_photo_downloads(),
-            recent: Some(40),
             ..RunCycleDownloadConfigOptions::default()
         },
     );
@@ -255,8 +253,7 @@ async fn contract_malformed_required_asset_fields_block_checkpoint() {
 
 #[tokio::test]
 async fn watch_recent_exact_first_cycle_seeds_incremental_token() {
-    let mut config = make_run_cycle_config();
-    config.filters.recent = Some(20);
+    let config = make_run_cycle_config();
     let db = make_state_db();
     let download_dir = tempfile::tempdir().expect("download tempdir");
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
@@ -272,7 +269,6 @@ async fn watch_recent_exact_first_cycle_seeds_incremental_token() {
         Arc::clone(&db),
         RunCycleDownloadConfigOptions {
             media: media_without_photo_downloads(),
-            recent: Some(20),
             ..RunCycleDownloadConfigOptions::default()
         },
     );
@@ -1994,7 +1990,7 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
             let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
             let db: Arc<dyn download::DownloadStore> = inner.clone();
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let library = make_run_cycle_library_state_with_album(
+            let mut library = make_run_cycle_library_state_with_album(
                 "PrimarySync",
                 "sync_token:PrimarySync",
                 make_full_album_with_boxed_session(
@@ -2008,6 +2004,21 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
                     }),
                 ),
             );
+            if collecting {
+                // Multiple passes enter the production collecting strategy;
+                // the primary pass still selects every original input record.
+                let mut peer = library.plan.passes[0].clone();
+                peer.exclude_ids = Arc::new(
+                    [
+                        "asset-master-earlier".into(),
+                        "asset-master-debt".into(),
+                        "asset-master-rejected".into(),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+                library.plan.passes.push(peer);
+            }
             if phase == 1 {
                 let mut precheck = crate::sync_loop::precheck::WatchPrecheck::SkipAll;
                 crate::sync_loop::precheck::include_pending_local_work(
@@ -2022,10 +2033,7 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
             let builder = make_run_cycle_download_config_builder_with_options(
                 &media_dir,
                 db.clone(),
-                RunCycleDownloadConfigOptions {
-                    recent: collecting.then_some(10),
-                    ..RunCycleDownloadConfigOptions::default()
-                },
+                RunCycleDownloadConfigOptions::default(),
             );
             let result = run_cycle(
                 &[&library],

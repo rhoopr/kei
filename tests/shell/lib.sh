@@ -71,16 +71,33 @@ kei_db_path() {
 }
 
 kei_live_filters() {
-    cat "$PROJECT_DIR/tests/data/live-selection.toml"
+    local bound
+    bound=$(kei_live_fixed_date) || return 1
+    sed '/^\[import_sample\]/,$d' "$PROJECT_DIR/tests/data/live-selection.toml"
+    printf 'skip_created_before = "%s"\n' "$bound"
 }
 
-# import-existing reads its scan cap from --recent, not filters.recent.
+# Import-only sampling is separate from sync's mandatory fixed bound.
 kei_live_recent() {
     awk '$1 == "recent" && $2 == "=" { print $3 }' "$PROJECT_DIR/tests/data/live-selection.toml"
 }
 
+kei_live_fixed_date() {
+    python3 - "${KEI_LIVE_SKIP_CREATED_BEFORE:-}" <<'PY'
+import datetime
+import sys
+value = sys.argv[1]
+try:
+    assert len(value) == 10 and datetime.date.fromisoformat(value).isoformat() == value
+except (AssertionError, ValueError):
+    sys.exit("Set KEI_LIVE_SKIP_CREATED_BEFORE to an explicit fixed YYYY-MM-DD before live tests")
+print(value)
+PY
+}
+
 # No download or shared-state mutation. Fail before account-dependent suites.
 kei_preflight_selection() (
+    kei_live_fixed_date >/dev/null || exit 1
     local work config output count
     work=$(mktemp -d "${TMPDIR:-/tmp}/kei-live-selection-XXXXXX") || exit 1
     trap 'rm -rf "$work"' EXIT
@@ -93,7 +110,7 @@ kei_preflight_selection() (
     count=$(printf '%s\n' "$output" | awk 'NF { count++ } END { print count+0 }')
     echo "Live selection: primary library, albums=none, unfiled=true; eligible filenames=$count" >&2
     if [ "$count" -eq 0 ]; then
-        echo "ABORT: empty bounded live selection. Add at least one eligible recent asset. Selection:" >&2
+        echo "ABORT: empty bounded live selection. Select a fixed date range containing at least one eligible asset. Selection:" >&2
         kei_live_filters >&2
         exit 1
     fi
@@ -119,6 +136,7 @@ kei_append_toml_fragment() {
 }
 
 kei_write_sync_config() {
+    kei_live_fixed_date >/dev/null || return 1
     local data_dir="${1:?data dir required}"
     local download_dir="${2:?download dir required}"
     local download_extra="${KEI_SYNC_DOWNLOAD_TOML:-}"
@@ -196,6 +214,7 @@ kei_require_release_binary() {
 # success so callers don't reach into `_KEI_PASS`; exits the script on a
 # bad session so we don't cascade 12 subsequent sync failures.
 kei_preflight_session() {
+    kei_live_fixed_date >/dev/null || exit 1
     local bin cookies out
     bin="$(kei_release_bin)"
     cookies="$(kei_cookie_dir)"

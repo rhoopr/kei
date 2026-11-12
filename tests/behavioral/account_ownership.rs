@@ -1546,7 +1546,7 @@ impl Respond for RecentCliPhotos {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_other_account() {
+async fn inventory_upgrade_actual_cli_expands_fixed_dates_and_preserves_other_account() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let server = MockServer::start().await;
@@ -1591,7 +1591,9 @@ async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_othe
     }
     Connection::open(&account.path).unwrap().execute_batch(
         "UPDATE assets SET library='OldUnknownScope' WHERE id='retry';
-         UPDATE metadata SET key='sync_token:OldUnknownScope' WHERE key='pending_sync_token:old:PrimarySync';"
+         UPDATE metadata SET key='sync_token:OldUnknownScope' WHERE key='pending_sync_token:old:PrimarySync';
+         INSERT INTO metadata(key,value) VALUES('recent_selection_recovery:PrimarySync','unparsed old receipt');
+         PRAGMA user_version=36;"
     ).unwrap();
     let other_before = state(&other.path);
     let old_media = quiet_media_snapshot(account.media.parent().unwrap());
@@ -1599,18 +1601,14 @@ async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_othe
         let arguments = match cycle {
             0 => vec![
                 "sync",
-                "--recent",
-                "2",
-                "--recent-scope",
-                "global",
+                "--skip-created-before",
+                "2021-01-01",
                 "--no-progress-bar",
             ],
             1 => vec![
                 "sync",
-                "--recent",
-                "3",
-                "--recent-scope",
-                "global",
+                "--skip-created-before",
+                "2020-01-01",
                 "--no-progress-bar",
             ],
             _ => vec!["sync", "--no-progress-bar"],
@@ -1630,7 +1628,7 @@ async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_othe
         let conn = Connection::open(&account.path).unwrap();
         // name-id7's existing-file policy skips without inventing downloaded
         // state. Trace the actual selected byte paths; fresh publication and
-        // finalization are qualified by the dispatcher companion/overflow tests.
+        // finalization are qualified by the dispatcher companion/uncapped tests.
         let stderr = String::from_utf8_lossy(&output.stderr);
         let names: Vec<_> = (0..3)
             .map(|n| format!("recent-{n}_YXNzZXQ.JPG"))
@@ -1653,10 +1651,8 @@ async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_othe
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(
-                serde_json::from_str::<Value>(&raw).unwrap()["complete"],
-                false
-            );
+            assert_eq!(raw, "unparsed old receipt");
+            assert_eq!(conn.query_row::<i64,_,_>("SELECT COUNT(*) FROM metadata WHERE key='inventory_reconciliation_required:PrimarySync'",[],|row|row.get(0)).unwrap(),0);
             assert_eq!(
                 conn.query_row::<i64, _, _>(
                     "SELECT count(*) FROM provider_catalog_records WHERE record_type='CPLAsset'",

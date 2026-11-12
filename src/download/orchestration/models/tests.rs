@@ -543,7 +543,7 @@ async fn sparse_receipts_survive_report_changes_and_inventory_bridge_composition
         Some("after".into()),
         SyncStats::default(),
         vec![proof.clone()],
-        true,
+        Some((true, "after".into())),
     );
     // Reporting snapshots cannot erase or create durable checkpoint receipts.
     delta.stats = SyncStats::default();
@@ -558,6 +558,7 @@ async fn sparse_receipts_survive_report_changes_and_inventory_bridge_composition
             .is_none()
     );
     db.commit_checkpoint_transition(CheckpointTransition {
+        album_snapshots: Vec::new(),
         expected_metadata: Vec::new(),
         legacy_preservation_proofs: Vec::new(),
         legacy_config_hash: None,
@@ -604,7 +605,7 @@ fn mixed_delta_completion_provenance_preserves_vetoes_and_does_not_invent_succes
                 ..SyncStats::default()
             },
             Vec::new(),
-            complete,
+            complete.then_some((false, "delta-successor".into())),
         );
         let mut query = SyncResult::from_execution(
             DownloadOutcome::Success,

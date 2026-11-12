@@ -94,15 +94,6 @@ fn parse_2fa_code(s: &str) -> Result<String, String> {
     }
 }
 
-/// Limit on which assets a sync pass processes.
-///
-/// `--recent 100` is a count limit (top N most-recent assets).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecentLimit {
-    /// Take the N most-recent assets by creation date.
-    Count(u32),
-}
-
 /// Explicit legacy-state adoption. No automatic account inference or overwrite.
 #[derive(Debug, Clone, clap::Args)]
 pub struct MigrateStateArgs {
@@ -119,82 +110,11 @@ pub struct MigrateStateArgs {
     pub password: PasswordArgs,
 }
 
-/// Where a count-form `--recent N` limit is applied when filters create
-/// multiple CloudKit streams.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
-    clap::ValueEnum,
-    serde::Deserialize,
-    serde::Serialize,
-)]
-#[serde(rename_all = "kebab-case")]
-pub enum RecentScope {
-    /// Apply `recent` once to the selected library, then narrow with filters.
-    #[default]
-    Global,
-    /// Apply `recent` independently to each album, smart-folder, or unfiled pass.
-    PerFilter,
-}
-
-/// Parse a positive `--recent N` count. Clap `value_parser`.
-pub(crate) fn parse_recent_limit(s: &str) -> Result<RecentLimit, String> {
-    if s.is_empty() {
-        return Err("must not be empty; use a positive count such as 100, or remove recent to omit the count limit".to_string());
-    }
-    if s.ends_with('d') {
-        return Err("Relative date windows are no longer supported for recent. Remove recent from [filters] or omit --recent; for sync, use a fixed date range with skip_created_before/skip_created_after in [filters] or --skip-created-before/--skip-created-after (YYYY-MM-DD). For a count limit, use recent = 100 or --recent 100.".to_string());
-    }
-    let n: u32 = s
-        .parse()
-        .map_err(|_e| format!("expected a positive integer (got `{s}`); use a count such as 100, or remove recent to omit the count limit"))?;
-    if n == 0 {
-        return Err(format!(
-            "must be greater than zero (got `{s}`); use a count such as 100, or remove recent to omit the count limit"
-        ));
-    }
-    Ok(RecentLimit::Count(n))
-}
-
-impl std::fmt::Display for RecentLimit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Count(n) => write!(f, "{n}"),
-        }
-    }
-}
-
-impl serde::Serialize for RecentLimit {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            // Count serializes as a bare integer so TOML round-trips cleanly
-            // for the common case (`recent = 100`, not `recent = "100"`).
-            Self::Count(n) => s.serialize_u32(*n),
-        }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for RecentLimit {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        #[derive(serde::Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            Int(u32),
-            Str(String),
-        }
-        match Raw::deserialize(d)? {
-            Raw::Int(0) => Err(D::Error::custom(
-                "`recent` must be greater than zero; use recent = 100, or remove recent to omit the count limit",
-            )),
-            Raw::Int(n) => Ok(Self::Count(n)),
-            Raw::Str(s) => parse_recent_limit(&s).map_err(D::Error::custom),
-        }
-    }
+/// Import-only provider sampling. Sync has no count-selection policy.
+fn parse_import_sample_count(s: &str) -> Result<u32, String> {
+    s.parse::<u32>().ok().filter(|count| *count > 0).ok_or_else(|| {
+        "import-existing --recent requires a positive count, such as --recent 100. Date windows are not supported by import-existing; omit --recent to scan all selected existing files.".to_owned()
+    })
 }
 
 /// Password arguments shared across commands that authenticate.
@@ -230,19 +150,6 @@ fn parse_created_date_argument(s: &str) -> Result<String, String> {
 /// Arguments for the sync command.
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SyncArgs {
-    /// Limit to recent assets (e.g. `--recent 100`).
-    /// This is not a global exact file count - filters and live-photo parts
-    /// can change the final number of downloaded files.
-    #[arg(long, value_parser = parse_recent_limit)]
-    pub recent: Option<RecentLimit>,
-
-    /// Where count-form `--recent N` applies when filters create multiple streams.
-    ///
-    /// `global` means "take the library-wide recent N, then apply filters".
-    /// `per-filter` means "take up to N from each album/smart-folder/unfiled pass".
-    #[arg(long, value_enum)]
-    pub recent_scope: Option<RecentScope>,
-
     /// Do not modify local system or iCloud
     #[arg(long)]
     pub dry_run: bool,
@@ -279,7 +186,7 @@ pub struct SyncArgs {
     /// Use with sync, not service run. A configured watch interval is ignored.
     #[arg(
         long,
-        conflicts_with_all = ["dry_run", "retry_failed", "only_print_filenames", "recent"]
+        conflicts_with_all = ["dry_run", "retry_failed", "only_print_filenames"]
     )]
     pub refresh_metadata: bool,
 
@@ -410,8 +317,8 @@ pub struct ImportArgs {
     pub libraries: Vec<String>,
 
     /// Number of recent photos to check (`--recent 100`).
-    #[arg(long, value_parser = parse_recent_limit)]
-    pub recent: Option<RecentLimit>,
+    #[arg(long, value_parser = parse_import_sample_count)]
+    pub recent: Option<u32>,
 
     /// Scan and report matches without writing to the state DB. Useful for
     /// verifying that TOML path and filename settings match the tree you're
@@ -877,6 +784,11 @@ fn should_append_removed_sync_surface_hint(argv: &[OsString], err: &clap::Error)
 }
 
 fn with_removed_sync_surface_hint(message: String) -> String {
+    if message.contains("--recent") {
+        return format!(
+            "{message}\n\nnote: sync count selection is no longer supported. Remove --recent and --recent-scope, and remove recent/recent_scope from [filters]. To bound sync, set a fixed YYYY-MM-DD with --skip-created-before/--skip-created-after or [filters].skip_created_before/skip_created_after. Configuration was not changed."
+        );
+    }
     format!(
         "{message}\n\nnote: v0.20 removed durable sync CLI flags. Put persistent sync settings in config.toml instead.\n      See {}",
         crate::upgrade_hints::V020_MIGRATION_URL
@@ -1114,170 +1026,51 @@ mod tests {
         }
     }
 
-    // ── RecentLimit parser ──────────────────────────────────────────
-
     #[test]
-    fn parse_recent_limit_bare_count() {
-        assert_eq!(parse_recent_limit("100").unwrap(), RecentLimit::Count(100));
-        assert_eq!(parse_recent_limit("1").unwrap(), RecentLimit::Count(1));
-    }
-
-    #[test]
-    fn parse_recent_limit_rejects_days_with_resolution() {
-        for value in ["30d", "1d", "0d", "999999999999999999999d"] {
-            let err = parse_recent_limit(value).unwrap_err();
-            assert!(
-                err.contains("Relative date windows are no longer supported"),
-                "{err}"
-            );
-            assert!(
-                err.contains("Remove recent from [filters] or omit --recent"),
-                "{err}"
-            );
-            assert!(
-                err.contains("--skip-created-before/--skip-created-after (YYYY-MM-DD)"),
-                "{err}"
-            );
-            assert!(err.contains("recent = 100 or --recent 100"), "{err}");
-        }
-    }
-
-    #[test]
-    fn parse_recent_limit_rejects_zero() {
-        assert!(parse_recent_limit("0").unwrap_err().contains("zero"));
-    }
-
-    #[test]
-    fn parse_recent_limit_rejects_empty() {
-        assert!(parse_recent_limit("").is_err());
-    }
-
-    #[test]
-    fn parse_recent_limit_rejects_unknown_suffix() {
-        // Recent accepts counts only, not time units.
-        assert!(parse_recent_limit("3w").is_err());
-        assert!(parse_recent_limit("1y").is_err());
-        assert!(parse_recent_limit("2m").is_err());
-        assert!(parse_recent_limit("30days").is_err());
-    }
-
-    #[test]
-    fn parse_recent_limit_rejects_garbage() {
-        assert!(parse_recent_limit("abc").is_err());
-        assert!(parse_recent_limit("-5").is_err());
-        assert!(parse_recent_limit("10.5").is_err());
-        assert!(parse_recent_limit("10 d").is_err());
-    }
-
-    #[test]
-    fn recent_limit_toml_parses_integer() {
-        #[derive(serde::Deserialize)]
-        struct Wrap {
-            recent: RecentLimit,
-        }
-        let got: Wrap = toml::from_str("recent = 100").unwrap();
-        assert_eq!(got.recent, RecentLimit::Count(100));
-    }
-
-    #[test]
-    fn recent_limit_toml_rejects_days_string() {
-        #[derive(serde::Deserialize)]
-        struct Wrap {
-            #[serde(rename = "recent")]
-            _recent: RecentLimit,
-        }
-        let err = toml::from_str::<Wrap>(r#"recent = "30d""#)
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(
-            err.contains("Relative date windows are no longer supported for recent"),
-            "{err}"
-        );
-        assert!(err.contains("recent = 100"), "{err}");
-    }
-
-    #[test]
-    fn recent_limit_toml_rejects_zero_integer() {
-        #[derive(serde::Deserialize, Debug)]
-        struct Wrap {
-            #[allow(dead_code)]
-            recent: RecentLimit,
-        }
-        let err = toml::from_str::<Wrap>("recent = 0")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("zero"), "got: {err}");
-    }
-
-    #[test]
-    fn recent_limit_toml_rejects_garbage_string() {
-        #[derive(serde::Deserialize, Debug)]
-        struct Wrap {
-            #[allow(dead_code)]
-            recent: RecentLimit,
-        }
-        assert!(toml::from_str::<Wrap>(r#"recent = "abc""#).is_err());
-    }
-
-    #[test]
-    fn recent_limit_display_roundtrip() {
+    fn import_sample_count_is_positive_and_has_import_only_guidance() {
         for count in [1, 100, u32::MAX] {
-            let limit = RecentLimit::Count(count);
-            assert_eq!(limit.to_string(), count.to_string());
-            assert_eq!(parse_recent_limit(&limit.to_string()).unwrap(), limit);
+            assert_eq!(parse_import_sample_count(&count.to_string()), Ok(count));
+        }
+        for value in [
+            "",
+            "0",
+            "-5",
+            "10.5",
+            "30d",
+            "0d",
+            "3w",
+            "abc",
+            "4294967296",
+        ] {
+            let error = parse_import_sample_count(value).unwrap_err();
+            assert!(error.contains("import-existing --recent"));
+            assert!(error.contains("positive count"));
+            assert!(!error.contains("--skip-created"));
         }
     }
 
     #[test]
-    fn recent_scope_parses_global_and_per_filter() {
-        let cli = parse(&["kei", "sync", "--recent", "100", "--recent-scope", "global"]);
-        let Command::Sync { sync, .. } = cli.command else {
-            panic!("expected sync command");
-        };
-        assert_eq!(sync.recent_scope, Some(RecentScope::Global));
-
-        let cli = parse(&[
-            "kei",
-            "sync",
-            "--recent",
-            "100",
-            "--recent-scope",
-            "per-filter",
-        ]);
-        let Command::Sync { sync, .. } = cli.command else {
-            panic!("expected sync command");
-        };
-        assert_eq!(sync.recent_scope, Some(RecentScope::PerFilter));
-    }
-
-    #[test]
-    fn recent_scope_rejects_unknown_value() {
-        let err = Cli::try_parse_from(["kei", "sync", "--recent-scope", "per_album"])
-            .expect_err("invalid recent scope should fail");
-        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
-    }
-
-    #[test]
-    fn recent_limit_serializes_count_as_integer() {
-        let json = serde_json::to_string(&RecentLimit::Count(5)).unwrap();
-        assert_eq!(json, "5");
-    }
-
-    #[test]
-    fn recent_limit_toml_count_string_roundtrips_as_integer() {
-        #[derive(serde::Deserialize, serde::Serialize)]
-        struct Wrap {
-            recent: RecentLimit,
+    fn retired_sync_counts_fail_with_supported_fixed_date_guidance() {
+        for command in [vec!["sync"], vec!["service", "run"]] {
+            for (flag, value) in [
+                ("--recent", "100"),
+                ("--recent", "30d"),
+                ("--recent-scope", "global"),
+            ] {
+                let mut args = vec!["kei"];
+                args.extend(command.iter().copied());
+                args.extend([flag, value]);
+                let error = parse_cli_with_sources(args).unwrap_err();
+                assert_eq!(error.exit_code(), 2);
+                assert!(
+                    error
+                        .rendered()
+                        .contains("count selection is no longer supported")
+                );
+                assert!(error.rendered().contains("--skip-created-before"));
+                assert!(!error.rendered().contains("recent = 100"));
+            }
         }
-        let got: Wrap = toml::from_str(r#"recent = "100""#).unwrap();
-        assert_eq!(got.recent, RecentLimit::Count(100));
-        let serialized = toml::to_string(&got).unwrap();
-        assert_eq!(serialized, "recent = 100\n");
-        assert_eq!(
-            toml::from_str::<Wrap>(&serialized).unwrap().recent,
-            got.recent
-        );
     }
 
     fn base_args() -> Vec<&'static str> {
@@ -2662,8 +2455,6 @@ mod tests {
             "kei",
             "sync",
             "--friendly",
-            "--recent",
-            "100",
             "--skip-created-before",
             "2025-01-01",
         ])
@@ -2677,8 +2468,14 @@ mod tests {
     }
     #[test]
     fn retry_failed_with_sync_flag_parses_under_sync() {
-        Cli::try_parse_from(["kei", "sync", "--retry-failed", "--recent", "100"])
-            .expect("sync --retry-failed accepts kept per-run sync flags");
+        Cli::try_parse_from([
+            "kei",
+            "sync",
+            "--retry-failed",
+            "--skip-created-before",
+            "2025-01-01",
+        ])
+        .expect("sync --retry-failed accepts kept per-run sync flags");
     }
 
     #[test]
@@ -2693,8 +2490,15 @@ mod tests {
     }
     #[test]
     fn service_run_accepts_own_sync_flags() {
-        Cli::try_parse_from(["kei", "service", "run", "--recent", "100", "--dry-run"])
-            .expect("service run must accept its own sync flags");
+        Cli::try_parse_from([
+            "kei",
+            "service",
+            "run",
+            "--skip-created-before",
+            "2025-01-01",
+            "--dry-run",
+        ])
+        .expect("service run must accept its own sync flags");
     }
 
     #[test]

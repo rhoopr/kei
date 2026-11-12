@@ -16,7 +16,7 @@ impl Config {
     /// Convert the resolved config back to a [`TomlConfig`] for serialization.
     ///
     /// Only includes static fields suitable for persistence. Passwords are
-    /// never included. Per-run flags (`dry_run`, `recent`, etc.) are omitted.
+    /// never included. Per-run flags (`dry_run`, CLI date bounds, etc.) are omitted.
     pub(crate) fn to_toml(&self) -> TomlConfig {
         TomlConfig {
             data_dir: None,  // derived from config path, not serialized unless explicit
@@ -136,11 +136,6 @@ impl Config {
                             .collect(),
                     )
                 },
-                recent: self.filters.persistent_recent,
-                recent_scope: self
-                    .filters
-                    .persistent_recent_scope
-                    .and_then(|scope| (scope != crate::cli::RecentScope::Global).then_some(scope)),
                 skip_created_before: self.filters.persistent_skip_created_before.clone(),
                 skip_created_after: self.filters.persistent_skip_created_after.clone(),
             }),
@@ -608,22 +603,18 @@ mod tests {
     #[test]
     fn test_to_toml_per_run_fields_omitted() {
         let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Count(50));
         sync.skip_created_before = Some("2025-01-01".to_string());
         sync.skip_created_after = Some("2025-12-31".to_string());
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         let filters = toml.filters.as_ref().unwrap();
-        assert!(filters.recent.is_none());
         assert!(filters.skip_created_before.is_none());
         assert!(filters.skip_created_after.is_none());
     }
     #[test]
-    fn test_to_toml_persists_filter_recent_and_dates_from_toml() {
+    fn test_to_toml_persists_fixed_dates_from_toml() {
         let toml_str = r#"
             [filters]
-            recent = 100
-            recent_scope = "per-filter"
             skip_created_before = "2024-01-01"
             skip_created_after = "2025-06-01T14:30:00"
         "#;
@@ -637,11 +628,6 @@ mod tests {
         .unwrap();
         let serialized = cfg.to_toml();
         let filters = serialized.filters.as_ref().unwrap();
-        assert_eq!(filters.recent, Some(crate::cli::RecentLimit::Count(100)));
-        assert_eq!(
-            filters.recent_scope,
-            Some(crate::cli::RecentScope::PerFilter)
-        );
         assert_eq!(filters.skip_created_before.as_deref(), Some("2024-01-01"));
         assert_eq!(
             filters.skip_created_after.as_deref(),

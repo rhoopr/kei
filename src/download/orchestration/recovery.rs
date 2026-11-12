@@ -212,6 +212,7 @@ async fn run_targeted_recovery_pass(
     };
     checkpoint.project(&mut stats);
     Ok(SyncResult {
+        deferred_album_snapshots: Vec::new(),
         outcome,
         sync_token: None,
         stats,
@@ -247,6 +248,7 @@ fn pending_retry_no_download_result(
     };
     checkpoint.project(&mut stats);
     SyncResult {
+        deferred_album_snapshots: Vec::new(),
         outcome,
         sync_token: None,
         stats,

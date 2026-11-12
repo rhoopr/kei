@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 36;
+pub(crate) const SCHEMA_VERSION: i32 = 37;
 
 fn migrate_active_selection(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(r"CREATE TABLE IF NOT EXISTS provider_active_generations (
@@ -1420,6 +1420,16 @@ pub(crate) fn migrate_to_version(
         34 => migrate_active_selection(conn)?,
         35 => conn.execute_batch(super::db::primary_layout::DDL)?,
         36 => summary = Some(migrate_provider_transport_index(conn)?),
+        37 => {
+            // Receipt existence is the only upgrade input. Preserve every old
+            // key and value, including malformed/future bytes. The schema
+            // version prevents quiet reopens from reseeding completed work.
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO metadata(key,value) \
+                 SELECT 'inventory_reconciliation_required:' || substr(key,27), '1' \
+                 FROM metadata WHERE substr(key,1,26)='recent_selection_recovery:';",
+            )?;
+        }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1444,7 +1454,226 @@ pub(crate) fn migrate_genuine_v28(conn: &Connection) -> Result<(), StateError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inventory_upgrade_seeds_exact_receipt_keys_once_without_reading_their_values() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=36 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        let old = [
+            (
+                "recent_selection_recovery:PrimarySync",
+                b"\0\xffunparseable".as_slice(),
+            ),
+            (
+                "recent_selection_recovery:SharedSync-OTHER",
+                b"future receipt".as_slice(),
+            ),
+            (
+                "recent_selection_recovery:SharedSync-KEPT",
+                b"old receipt".as_slice(),
+            ),
+            (
+                "recent_selection_recoveryX:NOT-A-ZONE",
+                b"near prefix".as_slice(),
+            ),
+        ];
+        for (key, value) in old {
+            conn.execute(
+                "INSERT INTO metadata(key,value) VALUES(?1,?2)",
+                rusqlite::params![key, value],
+            )
+            .unwrap();
+        }
+        conn.execute("INSERT INTO metadata(key,value) VALUES('inventory_reconciliation_required:SharedSync-KEPT','existing obligation')",[]).unwrap();
+        migrate(&conn).unwrap();
+        let requests: Vec<(String,String)> = conn.prepare(
+            "SELECT key,value FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*' ORDER BY key"
+        ).unwrap().query_map([],|row|Ok((row.get(0)?,row.get(1)?))).unwrap()
+            .collect::<Result<_,_>>().unwrap();
+        assert_eq!(
+            requests,
+            vec![
+                (
+                    "inventory_reconciliation_required:PrimarySync".into(),
+                    "1".into()
+                ),
+                (
+                    "inventory_reconciliation_required:SharedSync-KEPT".into(),
+                    "existing obligation".into()
+                ),
+                (
+                    "inventory_reconciliation_required:SharedSync-OTHER".into(),
+                    "1".into()
+                ),
+            ]
+        );
+        conn.execute(
+            "DELETE FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*'",
+            [],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            migrate(&conn).unwrap();
+            assert_eq!(conn.query_row::<i64,_,_>("SELECT COUNT(*) FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*'",[],|row|row.get(0)).unwrap(),0);
+            for (key, value) in old {
+                assert_eq!(
+                    conn.query_row::<Vec<u8>, _, _>(
+                        "SELECT CAST(value AS BLOB) FROM metadata WHERE key=?1",
+                        [key],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    value
+                );
+            }
+        }
+    }
+
     use super::*;
+
+    #[tokio::test]
+    async fn inventory_upgrade_owned_v36_seed_failure_rolls_back_then_recovers_and_stays_quiet() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owned-v36.db");
+        let username = "seed-migration@example.invalid";
+        let data =
+            serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"seed-provider"}})).unwrap();
+        let owner =
+            crate::state::db::account::AccountOwner::authenticated(username, "com", &data).unwrap();
+        let receipts = [
+            (
+                "recent_selection_recovery:PrimarySync",
+                b"\0\xffunparseable".as_slice(),
+            ),
+            (
+                "recent_selection_recovery:SharedSync-OTHER",
+                b"{\"version\":99,\"opaque\":true}".as_slice(),
+            ),
+            (
+                "recent_selection_recovery:SharedSync-THIRD",
+                b"exact old receipt\0".as_slice(),
+            ),
+        ];
+        let assert_receipts = |conn: &Connection| {
+            for (key, bytes) in receipts {
+                assert_eq!(
+                    conn.query_row::<Vec<u8>, _, _>(
+                        "SELECT CAST(value AS BLOB) FROM metadata WHERE key=?1",
+                        [key],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    bytes
+                );
+            }
+            assert_eq!(
+                conn.query_row::<String, _, _>(
+                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                "saved-source-cursor"
+            );
+        };
+        {
+            let conn = Connection::open(&path).unwrap();
+            for version in 1..=36 {
+                migrate_to_version(&conn, 0, version).unwrap();
+            }
+            conn.execute_batch("CREATE TABLE account_owner(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL,account_key TEXT NOT NULL,provider_key TEXT NOT NULL);").unwrap();
+            conn.execute(
+                "INSERT INTO account_owner VALUES(1,1,?1,?2)",
+                rusqlite::params![
+                    crate::account::namespace(username, "com"),
+                    crate::account::provider_fingerprint("com", "seed-provider")
+                ],
+            )
+            .unwrap();
+            for (key, bytes) in receipts {
+                conn.execute(
+                    "INSERT INTO metadata(key,value) VALUES(?1,?2)",
+                    rusqlite::params![key, bytes],
+                )
+                .unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO metadata(key,value) VALUES('sync_token:PrimarySync','saved-source-cursor');
+                 CREATE TRIGGER fail_second_inventory_seed BEFORE INSERT ON metadata
+                 WHEN substr(NEW.key,1,34)='inventory_reconciliation_required:'
+                  AND (SELECT COUNT(*) FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*')=1
+                 BEGIN SELECT RAISE(FAIL,'schema37 seed after first request'); END;"
+            ).unwrap();
+            assert_eq!(get_schema_version(&conn).unwrap(), 36);
+        }
+        let error = crate::state::SqliteStateDb::open_owned(&path, &owner)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, StateError::BackedUpMigration { .. }),
+            "{error:?}"
+        );
+        assert!(
+            format!("{error:?}").contains("schema37 seed after first request"),
+            "failure must occur after the first seed insert, not before migration: {error:?}"
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(get_schema_version(&conn).unwrap(), 36);
+            assert_receipts(&conn);
+            assert_eq!(conn.query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*'", [], |row| row.get(0)
+            ).unwrap(), 0, "even RAISE(FAIL)'s earlier insert must roll back through the owned opener");
+            conn.execute_batch("DROP TRIGGER fail_second_inventory_seed")
+                .unwrap();
+        }
+        {
+            let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .unwrap();
+            let conn = db.acquire_lock("recovered inventory seeding").unwrap();
+            assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+            assert_receipts(&conn);
+            let requests: Vec<(String, String)> = conn.prepare(
+                "SELECT key,value FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*' ORDER BY key"
+            ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap()
+                .collect::<Result<_, _>>().unwrap();
+            assert_eq!(
+                requests,
+                vec![
+                    (
+                        "inventory_reconciliation_required:PrimarySync".into(),
+                        "1".into()
+                    ),
+                    (
+                        "inventory_reconciliation_required:SharedSync-OTHER".into(),
+                        "1".into()
+                    ),
+                    (
+                        "inventory_reconciliation_required:SharedSync-THIRD".into(),
+                        "1".into()
+                    ),
+                ]
+            );
+            conn.execute(
+                "DELETE FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*'",
+                [],
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .unwrap();
+            let conn = db.acquire_lock("quiet post-seed reopen").unwrap();
+            assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+            assert_receipts(&conn);
+            assert_eq!(conn.query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*'", [], |row| row.get(0)
+            ).unwrap(), 0, "completed requests must not be reseeded");
+        }
+    }
 
     #[tokio::test]
     async fn shadow_v29_migration_failure_rolls_back_then_reopens_without_losing_history() {

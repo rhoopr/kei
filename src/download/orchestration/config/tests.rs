@@ -214,26 +214,11 @@ fn test_legacy_download_config_hash_changes_on_skip_created_before() {
 }
 
 #[test]
-fn test_hash_download_config_changes_on_recent() {
-    let mut config1 = test_config();
-    config1.recent = None;
-    let mut config2 = test_config();
-    config2.recent = Some(100);
-    assert_ne!(
-        hash_download_config(&config1),
-        hash_download_config(&config2)
-    );
-}
-
-#[test]
-fn test_hash_download_config_changes_on_recent_scope_when_recent_is_set() {
-    let mut config1 = test_config();
-    config1.recent = Some(100);
-    config1.recent_scope = crate::cli::RecentScope::Global;
-    let mut config2 = test_config();
-    config2.recent = Some(100);
-    config2.recent_scope = crate::cli::RecentScope::PerFilter;
-    assert_ne!(
+fn inventory_request_does_not_change_historical_uncapped_hash() {
+    let config1 = test_config();
+    let mut config2 = config1.clone();
+    config2.inventory_reconciliation = true;
+    assert_eq!(
         hash_download_config(&config1),
         hash_download_config(&config2)
     );
@@ -305,7 +290,6 @@ fn test_compute_config_hash_matches_hash_download_config() {
         &globals,
         &crate::cli::PasswordArgs::default(),
         crate::cli::SyncArgs {
-            recent: dl_config.recent.map(crate::cli::RecentLimit::Count),
             config_overrides: crate::config::SyncConfigOverrides {
                 download_dir: Some(dl_config.directory.display().to_string()),
                 folder_structure: Some(dl_config.folder_structure.clone()),
@@ -520,16 +504,16 @@ fn test_compute_config_hash_path_only_changes_same_hash() {
 }
 
 #[test]
-fn test_compute_config_hash_different_recent_requires_inventory() {
+fn test_compute_config_hash_fixed_date_drift_requires_inventory() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos", |_| {});
     let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.recent = Some(crate::cli::RecentLimit::Count(100));
+        s.skip_created_before = Some("2025-01-01".into());
     });
     assert_ne!(
         compute_config_hash(&a),
         compute_config_hash(&b),
-        "recent changes require inventory and a preserved-cursor bridge"
+        "fixed-date changes require inventory and a preserved-cursor bridge"
     );
 }
 
@@ -869,7 +853,6 @@ fn golden_hash_download_config_non_defaults() {
             .unwrap()
             .with_timezone(&Utc),
     ));
-    config.recent = Some(500);
     config.force_resolution = true;
     config.media.videos = false;
     config.live_photo_mode = LivePhotoMode::ImageOnly;
@@ -879,12 +862,12 @@ fn golden_hash_download_config_non_defaults() {
     ]);
     let hash = hash_download_config(&config);
     assert_eq!(
-        hash, "4d5a9f1a5a0bf903",
+        hash, "c14d32eeb5d12af8",
         "hash_download_config golden hash changed -- this will trigger full re-syncs"
     );
     assert_eq!(
         hash_legacy_download_config(&config),
-        "d327fda31e8bec04",
+        "015b710d9e140e2f",
         "legacy hash changed -- matching stored hashes would no longer migrate safely"
     );
 }
@@ -946,33 +929,6 @@ fn golden_compute_config_hash_with_unfiled_false() {
     assert_eq!(
         hash, "08d06f84680c44b9",
         "compute_config_hash golden hash changed -- this will invalidate sync tokens"
-    );
-}
-
-#[test]
-fn enumeration_hash_binds_recent_scope_only_when_the_count_is_active() {
-    let tmp = TempDir::new().unwrap();
-    let global = build_config_with(tmp.path(), "/photos", |s| {
-        s.recent = Some(crate::cli::RecentLimit::Count(3));
-        s.recent_scope = Some(crate::cli::RecentScope::Global);
-    });
-    let per_filter = build_config_with(tmp.path(), "/photos", |s| {
-        s.recent = Some(crate::cli::RecentLimit::Count(3));
-        s.recent_scope = Some(crate::cli::RecentScope::PerFilter);
-    });
-    assert_ne!(
-        compute_config_hash(&global),
-        compute_config_hash(&per_filter)
-    );
-    // Public CLI rejects scope without a count; the resolved hash must still
-    // ignore its inactive stored/default value.
-    let mut disabled_global = build_config_with(tmp.path(), "/photos", |_| {});
-    disabled_global.filters.recent_scope = crate::cli::RecentScope::Global;
-    let mut disabled_per_filter = build_config_with(tmp.path(), "/photos", |_| {});
-    disabled_per_filter.filters.recent_scope = crate::cli::RecentScope::PerFilter;
-    assert_eq!(
-        compute_config_hash(&disabled_global),
-        compute_config_hash(&disabled_per_filter)
     );
 }
 

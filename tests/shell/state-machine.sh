@@ -47,7 +47,7 @@ get_effective_enum_hash() {
     kei_db_query "SELECT value FROM metadata WHERE key IN ('pending_enum_config_hash', 'enum_config_hash') ORDER BY key DESC LIMIT 1"
 }
 check_checkpoint() {
-    if grep -q 'recent_limited_full_enumeration' <<<"$OUTPUT"; then
+    if grep -q 'date_bounded_full_enumeration' <<<"$OUTPUT"; then
         [ -z "$(get_token)" ]
         kei_check "bounded incomplete inventory does not checkpoint"
     else

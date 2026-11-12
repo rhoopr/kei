@@ -611,7 +611,6 @@ async fn inventory_cycle(
     let mut config = make_run_cycle_config();
     config.runtime.dry_run = step.mode == download::DownloadRunMode::DryRun;
     config.runtime.refresh_metadata = step.full;
-    config.filters.recent = step.options.recent;
     config.filters.skip_created_before = step.options.skip_created_before;
     config.filters.skip_created_after = step.options.skip_created_after;
     if step.drift {
@@ -964,7 +963,8 @@ async fn comparable_inventory_four_percent_decline_does_not_warn() {
 #[tokio::test]
 async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
     use crate::config::CreatedDateFilter;
-    for case in 0..13 {
+    // Count-only vetoes were retired; the surviving date vetoes still run.
+    for case in [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12] {
         let root = inventory_root();
         inventory_cycle(root.path(), &InventoryStep::mixed(90, 10)).await;
         let before = inventory_anchors(root.path()).await;
@@ -975,7 +975,6 @@ async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
             2 => step.fault = Some(InventoryFault::MalformedAsset),
             3 => step.fault = Some(InventoryFault::Cancellation),
             4 => step.stale = true,
-            5 => step.options.recent = Some(1),
             6 => {
                 step.options.skip_created_before = Some(CreatedDateFilter::CaptureDate(
                     chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),

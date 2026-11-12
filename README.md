@@ -63,20 +63,20 @@ For a new installation on your computer, run:
 kei config setup
 ```
 
-Choose an empty destination such as `~/Photos/kei-first-backup`, your main library, and **Manually when needed**. Leave date and recent-item limits unset for now. Check the selected albums, file types and destination folders before saving. At **Want to kick off your first sync right now?**, answer **no** so you can try a small backup first. The default answer, **yes**, immediately runs one sync using your saved choices.
+Choose an empty destination such as `~/Photos/kei-first-backup`, your main library, and **Manually when needed**. Save a small fixed capture-date range containing photos you recognize. Check the selected albums, file types and destination folders before saving. At **Want to kick off your first sync right now?**, answer **no** so you can check the range before starting. The default answer, **yes**, immediately runs one sync using your saved choices.
 
 If you choose watch mode instead, the setup wizard still runs only once. Later `kei sync` commands can use the repeat interval you saved.
 
-The setup wizard saves your settings in `~/.config/kei/config.toml` and offers to save your login details. If it creates an environment file, follow the printed instructions to load it before the next command. Then try a small backup:
+The setup wizard saves your settings in `~/.config/kei/config.toml` and offers to save your login details. If it creates an environment file, follow the printed instructions to load it before the next command. Then try a small backup. Replace both example dates below with your own small range; the dates are inclusive and use each photo's capture-local calendar date:
 
 ```sh
-kei sync --recent 10
+kei sync --skip-created-before 2025-01-01 --skip-created-after 2025-01-07
 kei status
 ```
 
 Approve the sign-in prompt on your trusted Apple device and enter the six-digit code when asked.
 
-`--recent 10` considers up to ten recent photo or video items in each selected library before applying filters. The number of downloaded files can differ: album copies, Live Photo videos and additional versions can produce more files, while filters or failed downloads can leave fewer. This is only a sample of your library.
+The range limits capture dates, not file count. Album copies, Live Photo videos and additional versions can produce several files per item. A busy date range can still download many files. This is only a sample of your library.
 
 ### Check the result
 
@@ -92,7 +92,7 @@ By default, kei downloads originals and the videos that accompany Live Photos. S
 
 ## Run your normal backup
 
-Once the small backup looks right, run `kei sync` without `--recent` to use your saved choices. Check those settings first: any saved date or recent-item limits still apply, and the setup wizard can select all available libraries, including Shared Libraries. Check albums, smart folders, photos outside albums, edited versions and RAW options before treating the result as a full backup.
+Once the small backup looks right, review your saved choices before expanding them. Widen or remove the saved date bounds only when you want to include more dates. `kei sync` without date flags uses the saved bounds, so it can still repeat only the sample. The setup wizard can select all available libraries, including Shared Libraries. Check albums, smart folders, photos outside albums, edited versions and RAW options before treating the result as a full backup.
 
 As an alternative to the wizard, a minimal config is:
 
@@ -104,9 +104,9 @@ username = "you@example.com"
 directory = "~/Photos/iCloud"
 ```
 
-This uses your primary library, all its regular albums, and photos and videos outside those albums. Keep settings you want to reuse in the configuration file. To limit one run to a fixed capture-date range, use `kei sync --skip-created-before 2025-01-01 --skip-created-after 2025-01-31`. Both dates are inclusive.
+This has no date limit: it selects your primary library, all its regular albums, and photos and videos outside those albums. Save your chosen date bounds if you still want only a sample. To limit one run, use `kei sync --skip-created-before 2025-01-01 --skip-created-after 2025-01-07`, replacing both example dates with your own range. Both dates are inclusive.
 
-Relative date windows such as `30d` are no longer supported. Remove `recent`, `skip_created_before` or `skip_created_after` from `[filters]` to omit that limit, or replace relative date limits with fixed dates. For a count limit, `recent = 100` remains supported. Kei rejects retired relative settings even when a command-line value would override them; rejection leaves configuration, state and media unchanged.
+Sync and service mode no longer accept `--recent`, `--recent-scope`, or `[filters].recent` / `recent_scope`. Remove both saved keys and any old flags. To keep sync bounded, choose fixed `skip_created_before` / `skip_created_after` dates instead; relative values such as `30d` are also rejected. These errors explain the supported replacement and stop before authentication or state/media changes, even when a CLI value would override a retired saved setting. Kei does not rewrite your config or silently expand the selection. The separate `import-existing --recent 100` sampling option still accepts positive counts; import does not gain date filtering.
 
 For a daily unattended run, add this table to your existing config:
 

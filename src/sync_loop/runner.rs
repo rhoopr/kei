@@ -460,6 +460,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                                  library: Arc<str>|
      -> Arc<download::DownloadConfig> {
         Arc::new(download::DownloadConfig {
+            inventory_reconciliation: false,
             directory: Arc::clone(&cfg_directory),
             folder_structure: config.download.folder_structure.clone(),
             folder_structure_albums: Arc::clone(&cfg_folder_structure_albums),
@@ -477,8 +478,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 .download
                 .legacy_preservation_allow_hardlinks,
             concurrent_downloads: config.download.threads_num as usize,
-            recent: config.filters.recent,
-            recent_scope: config.filters.recent_scope,
             retry: retry_config,
             live_photo_mode: config.photos.live_photo_mode,
             live_resolution,

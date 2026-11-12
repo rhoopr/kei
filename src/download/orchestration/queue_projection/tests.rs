@@ -1256,7 +1256,6 @@ async fn queue_projection_lookup_failures_retain_fixed_debt_and_recover_current_
 #[tokio::test]
 async fn queue_projection_unsupported_selection_and_read_only_modes_do_not_publish() {
     for fault in [
-        "recent",
         "retry_only",
         "repair",
         "album",
@@ -1268,7 +1267,6 @@ async fn queue_projection_unsupported_selection_and_read_only_modes_do_not_publi
         f.capture(records("m", OLD, "source"), "old").await;
         let mut controls = controls();
         match fault {
-            "recent" => f.config.recent = Some(1),
             "retry_only" => f.config.retry_only = true,
             "repair" => f.config.refresh_metadata = true,
             "album" => f.pass.kind = PassKind::Album,

@@ -171,6 +171,42 @@ fn album_membership_record_from_row(
     })
 }
 
+pub(super) fn complete_album_membership_snapshot_tx(
+    tx: &Transaction<'_>,
+    library: &str,
+    container_id: &str,
+    generation: i64,
+) -> Result<(), StateError> {
+    let now = Utc::now().timestamp();
+    let updated = tx
+        .execute(
+            "UPDATE album_membership_snapshots SET status='complete', completed_at=?1 \
+         WHERE library=?2 AND container_id=?3 AND generation=?4 AND status='running' \
+         AND NOT EXISTS(SELECT 1 FROM album_membership_snapshots newer \
+             WHERE newer.library=?2 AND newer.container_id=?3 AND newer.generation>?4)",
+            rusqlite::params![now, library, container_id, generation],
+        )
+        .map_err(|error| {
+            StateError::query("complete_album_membership_snapshot::snapshot", error)
+        })?;
+    if updated == 0 {
+        return Err(StateError::Invariant {
+            operation: "complete_album_membership_snapshot",
+            detail: "running album snapshot changed before qualification".to_owned(),
+        });
+    }
+    tx.execute(
+        "UPDATE asset_album_memberships SET is_deleted=1, updated_at=?1 \
+         WHERE library=?2 AND container_id=?3 AND generation<>?4 AND is_deleted=0 \
+         AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p \
+             WHERE p.library=asset_album_memberships.library \
+             AND p.asset_id=asset_album_memberships.asset_record_name)",
+        rusqlite::params![now, library, container_id, generation],
+    )
+    .map_err(|error| StateError::query("complete_album_membership_snapshot::prune", error))?;
+    refresh_container_groupings_tx(tx, library, container_id, None, None)
+}
+
 impl SqliteStateDb {
     pub(crate) async fn add_asset_album(
         &self,
@@ -596,39 +632,10 @@ impl SqliteStateDb {
         let library = library.to_owned();
         let container_id = container_id.to_owned();
         self.with_conn_mut("complete_album_membership_snapshot", move |conn| {
-            let now = Utc::now().timestamp();
             let tx = conn
                 .transaction()
                 .map_err(|e| StateError::query("complete_album_membership_snapshot::begin", e))?;
-            let updated = tx
-                .execute(
-                    "UPDATE album_membership_snapshots \
-                     SET status = 'complete', completed_at = ?1 \
-                     WHERE library = ?2 AND container_id = ?3 \
-                       AND generation = ?4 AND status = 'running'",
-                    rusqlite::params![now, &library, &container_id, generation],
-                )
-                .map_err(|e| {
-                    StateError::query("complete_album_membership_snapshot::snapshot", e)
-                })?;
-            if updated == 0 {
-                return Err(StateError::Invariant {
-                    operation: "complete_album_membership_snapshot",
-                    detail: format!(
-                        "no running snapshot for library {library} container {container_id} generation {generation}"
-                    ),
-                });
-            }
-            tx.execute(
-                "UPDATE asset_album_memberships \
-                 SET is_deleted = 1, updated_at = ?1 \
-                 WHERE library = ?2 AND container_id = ?3 \
-                   AND generation <> ?4 AND is_deleted = 0 \
-                   AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=asset_album_memberships.library AND p.asset_id=asset_album_memberships.asset_record_name)",
-                rusqlite::params![now, &library, &container_id, generation],
-            )
-            .map_err(|e| StateError::query("complete_album_membership_snapshot::prune", e))?;
-            refresh_container_groupings_tx(&tx, &library, &container_id, None, None)?;
+            complete_album_membership_snapshot_tx(&tx, &library, &container_id, generation)?;
             tx.commit()
                 .map_err(|e| StateError::query("complete_album_membership_snapshot::commit", e))?;
             Ok(())

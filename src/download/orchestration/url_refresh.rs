@@ -432,7 +432,7 @@ pub(in crate::download) async fn build_retry_download_tasks(
             break;
         }
 
-        let assets = pass.album.photos(config.recent).await?;
+        let assets = pass.album.photos(None).await?;
         #[allow(
             clippy::indexing_slicing,
             reason = "pass_index comes from enumerate() over `passes`; pass_configs is \

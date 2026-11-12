@@ -1087,7 +1087,7 @@ pub(crate) async fn run_import_existing(
         }),
     );
 
-    let recent_count = args.recent.map(|crate::cli::RecentLimit::Count(n)| n);
+    let recent_count = args.recent;
 
     // Bail clearly on missing/non-dir; `dir_cache::read_dir_entries`
     // swallows read errors and would otherwise report "0 files matched".
@@ -1870,8 +1870,7 @@ mod wiremock_tests {
             repair_truncated: false,
             legacy_preservation_allow_hardlinks: false,
             concurrent_downloads: 1,
-            recent: None,
-            recent_scope: crate::cli::RecentScope::Global,
+            inventory_reconciliation: false,
             retry: RetryConfig::default(),
             live_photo_mode: LivePhotoMode::Both,
             live_resolution: AssetVersionSize::LiveOriginal,

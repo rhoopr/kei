@@ -907,6 +907,7 @@ const LABELS: &[&str] = &[
     "retry_passes",
     "revalidate_records",
     "selection_generation_deferred",
+    "inventory_reconciliation_required",
     "smart_folder_refresh_failed",
     "stop",
     "sync_token_missing",

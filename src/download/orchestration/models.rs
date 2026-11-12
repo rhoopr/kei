@@ -173,6 +173,8 @@ impl DownloadControls {
 /// Result of a sync cycle, including the optional new syncToken.
 #[derive(Debug)]
 pub struct SyncResult {
+    /// Exact running snapshots, completed only with guarded inventory retirement.
+    pub(crate) deferred_album_snapshots: Vec<(String, String, i64)>,
     /// The outcome of the download pass (success, session expired, partial failure).
     pub outcome: DownloadOutcome,
     /// The new zone-level syncToken, if one was captured during this sync.
@@ -205,7 +207,8 @@ pub(crate) struct InventoryMeasurement {
 #[derive(Debug, Default)]
 #[must_use]
 pub(crate) struct CheckpointEvidence {
-    /// Every fresh ordered path-selection query (including the global frontier)
+    pub(crate) inventory_reconciliation_complete: bool,
+    /// Every fresh ordered path-selection query
     /// reached proven EOF with usable unanimous tokens, but the selected work
     /// excluded a tail. This certifies local work only, never a source cursor.
     pub(crate) bounded_path_selection_complete: bool,
@@ -222,6 +225,10 @@ pub(crate) struct CheckpointEvidence {
     /// selection also ran or source progress remains held. Any offered successor
     /// belongs to that replay. A rank query never sets this evidence.
     pub(crate) completed_delta_replay: bool,
+    /// Raw records observed in the terminal replay, before pairing. Absence
+    /// means no completion proof, including a closed consumer's last-good token.
+    pub(crate) delta_raw_records_observed: Option<bool>,
+    pub(crate) delta_successor: Option<String>,
     /// The provider explicitly rejected the retained changes/zone cursor.
     /// Static decoding failures and rank-query tokens do not prove expiry.
     pub(crate) retained_token_rejected: bool,
@@ -258,6 +265,16 @@ impl CheckpointEvidence {
         self.identity_incomplete |= other.identity_incomplete;
         self.sync_token_blocked |= other.sync_token_blocked;
         self.completed_delta_replay |= other.completed_delta_replay;
+        if other.completed_delta_replay {
+            self.delta_successor.clone_from(&other.delta_successor);
+        }
+        self.delta_raw_records_observed = match (
+            self.delta_raw_records_observed,
+            other.delta_raw_records_observed,
+        ) {
+            (Some(left), Some(right)) => Some(left || right),
+            (left, right) => left.or(right),
+        };
         self.retained_token_rejected |= other.retained_token_rejected;
         self.retry_passes.extend(other.retry_passes.iter().cloned());
         self.revalidate_records
@@ -286,11 +303,15 @@ impl SyncResult {
         sync_token: Option<String>,
         stats: SyncStats,
         proofs: Vec<crate::state::SparseIdentityProof>,
-        completed_delta_replay: bool,
+        completion: Option<(bool, String)>,
     ) -> Self {
         let mut result = Self::from_execution(outcome, sync_token, stats);
         result.checkpoint.sparse_identity_proofs = proofs;
-        result.checkpoint.completed_delta_replay = completed_delta_replay;
+        result.checkpoint.completed_delta_replay = completion.is_some();
+        if let Some((raw_records_observed, successor)) = completion {
+            result.checkpoint.delta_raw_records_observed = Some(raw_records_observed);
+            result.checkpoint.delta_successor = Some(successor);
+        }
         result
     }
 
@@ -303,6 +324,7 @@ impl SyncResult {
     ) -> Self {
         let checkpoint = CheckpointEvidence::from_execution_stats(&stats);
         Self {
+            deferred_album_snapshots: Vec::new(),
             outcome,
             sync_token,
             stats,
@@ -319,6 +341,8 @@ impl SyncResult {
         self.checkpoint.accumulate(&other.checkpoint);
         self.checkpoint.project(&mut self.stats);
         self.full_enumeration_ran |= other.full_enumeration_ran;
+        self.deferred_album_snapshots
+            .extend(other.deferred_album_snapshots.iter().cloned());
         // Inventory belongs only to the original query invocation. Do not
         // import a later smart refresh, targeted retry, or bridge measurement.
     }
@@ -638,8 +662,6 @@ pub(super) const ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON: &str =
 
 pub(super) const DATE_BOUNDED_FULL_ENUMERATION_REASON: &str = "date_bounded_full_enumeration";
 
-pub(super) const RECENT_LIMITED_FULL_ENUMERATION_REASON: &str = "recent_limited_full_enumeration";
-
 pub(super) const UNPARSABLE_RELATION_DELTA_REASON: &str = "unparsable_relation_delta";
 
 pub(super) const UNKNOWN_ALBUM_RELATION_CONTAINER_REASON: &str = "unknown_album_relation_container";
@@ -693,7 +715,7 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
         | INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON
         | "kei_internal_token_receiver_dropped"
         | PRODUCER_ENUMERATION_INCOMPLETE_REASON
-        | RECENT_LIMITED_FULL_ENUMERATION_REASON
+        | "inventory_reconciliation_required"
         | SMART_FOLDER_REFRESH_FAILED_REASON
         | TARGETED_ALBUM_BACKFILL_FAILED_REASON
         | PENDING_RETRY_UNMATCHED_REASON
@@ -740,8 +762,8 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
         PRODUCER_ENUMERATION_INCOMPLETE_REASON => {
             "kei stopped before iCloud enumeration reached the natural end of the stream"
         }
-        RECENT_LIMITED_FULL_ENUMERATION_REASON => {
-            "a count-limited recent sync is a bounded enumeration, so kei intentionally did not persist a full-enumeration sync token"
+        "inventory_reconciliation_required" => {
+            "current inventory did not qualify with a terminal raw-empty replay; the next cycle will try once again"
         }
         DATE_BOUNDED_FULL_ENUMERATION_REASON => {
             "a lower-date-bounded sync is a bounded enumeration, so kei intentionally did not persist a full-enumeration sync token"

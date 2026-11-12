@@ -18,7 +18,7 @@ match their headings, so searching a label finds the section.
 - [Owners](#owners): find the decision owner and its boundary.
 - [Design rules](#design-rules) and [Wrong-layer traps](#wrong-layer-traps): check layer placement before editing.
 - [Command dispatch](#command-dispatch) and [Container startup](#container-startup): find entry points.
-- [Sync and provider checkpoints](#sync-and-provider-checkpoints) and [Full and incremental enumeration](#full-and-incremental-enumeration): trace source progress.
+- [Sync and provider checkpoints](#sync-and-provider-checkpoints), [Full and incremental enumeration](#full-and-incremental-enumeration), and [Guarded current inventory](#guarded-current-inventory-after-count-retirement): trace source progress.
 - [Download and publication](#download-and-publication), [Durable pending retry](#durable-pending-retry), and [Import-existing](#import-existing): trace local work.
 - [Account ownership and legacy adoption](#account-ownership-and-legacy-adoption), [Transactional source catalog and replay](#transactional-source-catalog-and-replay), and [Current provider work admission](#current-provider-work-admission): trace durable source ownership.
 - [Selection generation shadow](#selection-generation-shadow), [Private selection and destination replay](#private-selection-and-destination-replay), and [Observed incremental shadow capture](#observed-incremental-shadow-capture): trace selection and destination projections.
@@ -76,7 +76,7 @@ match their headings, so searching a label finds the section.
 | Local drift checks | `src/sync_loop/reconcile.rs` | Runs bounded local drift recovery and periodic read-only catalog diagnostics. |
 | Watch policy | `src/sync_loop/watch.rs` | Owns watch cadence, metadata follow-up timing, and one-shot recovery rules. |
 | Cycle ledger reporting | `src/sync_loop/reporting.rs` | Records cycle-run summaries and combines refresh-tail outcomes for reporting. |
-| One sync cycle | `src/sync_cycle.rs` | Chooses source enumeration, reconciles config drift, dispatches each library, and advances or preserves provider checkpoints. |
+| One sync cycle | `src/sync_cycle.rs` | Chooses source enumeration, reconciles config drift, dispatches each library, advances or preserves provider checkpoints, and fences retirement of current inventory requests. |
 | Library and pass planning | `src/commands/service.rs` | Resolves libraries, collection scope, album plans, smart folders, unfiled passes, and cross-zone hydration. |
 | iCloud Photos adapter | `src/icloud/photos/` | Owns CloudKit records, queries, change streams, provider identity, albums, smart folders, and metadata decoding. |
 | Album facade and counts | `src/icloud/photos/album.rs`, `src/icloud/photos/album/counts.rs` | Preserves album configuration and entry points; counts owns count queries and same-library batching. |
@@ -85,8 +85,8 @@ match their headings, so searching a label finds the section.
 | Provider page fetching | `src/icloud/photos/album/fetch.rs` | Owns query construction, empty-page probes, record pairing, deduplication, and asset emission. |
 | Enumeration completion | `src/icloud/photos/album/completion.rs` | Collects fetcher completion evidence and requires unanimous tokens before returning a checkpoint candidate. |
 | Album hydration | `src/icloud/photos/album/hydration.rs` | Matches named-album members across source zones and hydrates durable asset or master identities. |
-| Provider change streams | `src/icloud/photos/album/changes.rs` | Owns sequential change scans, delta buffering, and last-good-token delivery. |
-| Download facade and dispatch | `src/download/mod.rs`, `src/download/orchestration/dispatch.rs` | Preserves download entry points and composes full, incremental, targeted-backfill, and durable-retry work. |
+| Provider change streams | `src/icloud/photos/album/changes.rs` | Owns sequential change scans, delta buffering, terminal raw-record presence/completion evidence, and last-good-token delivery. |
+| Download facade and dispatch | `src/download/mod.rs`, `src/download/orchestration/dispatch.rs` | Preserves download entry points and composes full, incremental, targeted-backfill, durable-retry, and guarded inventory work. |
 | Download models and configuration | `src/download/orchestration/models.rs`, `src/download/orchestration/config.rs` | Owns controls, results, per-zone checkpoint evidence, reporting projections, checkpoint reasons, coverage fingerprints, and configuration hashes. |
 | Download context and selection | `src/download/orchestration/context.rs`, `src/download/orchestration/selection.rs` | Loads library-scoped state and identity evidence, derives pass configurations, and checks incremental routing eligibility. |
 | Full enumeration | `src/download/orchestration/full.rs` | Owns bounded enumeration, album snapshots, pass counts, and token evidence. |
@@ -153,7 +153,7 @@ match their headings, so searching a label finds the section.
 | Durable provider identity | `src/state/db/identity.rs` | Stores library-scoped asset/master mappings and legacy state ownership. Provider record parsing stays in the iCloud adapter. |
 | Durable membership | `src/state/db/membership.rs` | Stores album snapshots, provider relations, and grouping projections. |
 | Durable metadata work | `src/state/db/metadata.rs` | Stores capture revisions, path-specific rewrite work, and repair receipts. It does not write media files. |
-| Durable checkpoints | `src/state/db/checkpoints.rs` | Stores provider checkpoints, scoped database tokens, and enumeration progress. Sync policy decides when checkpoint proof permits a commit. |
+| Durable checkpoints | `src/state/db/checkpoints.rs` | Stores provider checkpoints, scoped database tokens, and enumeration progress. Its fenced transition also commits deferred album snapshots with inventory-request retirement; sync policy decides when proof permits either operation. |
 | Temporary-file ownership | `src/state/db/temp_files.rs` | Stores losslessly encoded paths and durable temporary-file ownership. Filesystem cleanup stays in download orchestration. |
 | Durable reconciliation | `src/state/db/reconciliation.rs` | Stores destination reservations and reads catalog evidence for reconciliation. |
 | Durable import adoption | `src/state/db/import.rs` | Atomically adopts imported files into state and reads imported records. Matching policy stays in the import command. |
@@ -519,27 +519,7 @@ are retained. Duplicate keys, duplicate or omitted records, provider errors,
 wrong owners, wrong zones and changed child/master relationships cannot confirm
 work. Provider confirmation is an observation, not an atomic provider snapshot.
 
-This slice supports one private library-wide pass with an explicit default
-owner, without recent caps, album exclusions, retry-only selection or metadata
-backfill-only execution. Default `PrimarySync` selection lazily discovers the
-private `/zones/list` response using the pinned authenticated session. Discovery
-requires bounded original JSON with unique keys, an explicit zones array, unique
-zone names, no zone errors and no unsupported continuation. Only a live exact
-`PrimarySync` entry with a nonblank string owner replaces the constructor's
-ownerless primary library after that exact selected scope returns a recognized
-indexing state. `RUNNING` retains provisional readiness and requires durable
-reconciliation; owner qualification alone never certifies a checkpoint.
-The complete discovered scope is preserved, including explicit owners
-other than `_defaultOwner`; lookup and inventory references must still match it.
-The complete validated private zone descriptors are cached separately from
-initialized libraries. Primary-only lookup initializes only the selected primary;
-unrelated private indexing failures do not block it. Private and shared library
-maps publish only after all requested library initialization succeeds. A failed
-full-map initialization preserves an already qualified primary and retries
-initialization using the validated private descriptors. Shared endpoint evidence cannot
-replace private primary ownership. Missing, deleted, blank or malformed primary
-owners preserve the ownerless constructor; no owner is inferred from a name.
-The current-work admission slice still requires `_defaultOwner` and is unchanged.
+This slice supports one private library-wide pass with an explicit default owner, without album exclusions, retry-only selection or metadata backfill-only execution. Default `PrimarySync` selection lazily discovers the private `/zones/list` response using the pinned authenticated session. Discovery requires bounded original JSON with unique keys, an explicit zones array, unique zone names, no zone errors and no unsupported continuation. Only a live exact `PrimarySync` entry with a nonblank string owner replaces the constructor's ownerless primary library after that exact selected scope returns a recognized indexing state. `RUNNING` retains provisional readiness and requires durable reconciliation; owner qualification alone never certifies a checkpoint. The complete discovered scope is preserved, including explicit owners other than `_defaultOwner`; lookup and inventory references must still match it. The complete validated private zone descriptors are cached separately from initialized libraries. Primary-only lookup initializes only the selected primary; unrelated private indexing failures do not block it. Private and shared library maps publish only after all requested library initialization succeeds. A failed full-map initialization preserves an already qualified primary and retries initialization using the validated private descriptors. Shared endpoint evidence cannot replace private primary ownership. Missing, deleted, blank or malformed primary owners preserve the ownerless constructor; no owner is inferred from a name. The current-work admission slice still requires `_defaultOwner` and is unchanged.
 Default selection needs only the cached private listing and selected primary's
 indexing success. Normal sync planning and import still request all libraries;
 their existing full-map initialization contract is unchanged.
@@ -641,16 +621,7 @@ numeric lexemes.
 Current confirmation is separate from the historical trigger observation;
 source order, page IDs and opaque cursors cannot establish a current version.
 
-Manifest format 1 explicitly records `confirmed_sources_only` coverage. It does
-not represent a complete library inventory, a global recent frontier, album
-membership coverage or absence. Selected, excluded and deferred decisions remain
-separate from admitted queue work and verified media. Destinations include the
-pass, child, logical rendition and path so one rendition can have distinct
-copies without changing the canonical asset identity. Native path encoding is
-lossless, including non-UTF-8 roots; relative task destinations are anchored
-without changing the task path. This stage captures only
-the existing admission profile. Multi-pass selection and activation require the
-next qualified stage.
+Manifest format 1 explicitly records `confirmed_sources_only` coverage. It does not represent a complete library inventory, album membership coverage or absence. Selected, excluded and deferred decisions remain separate from admitted queue work and verified media. Destinations include the pass, child, logical rendition and path so one rendition can have distinct copies without changing the canonical asset identity. Native path encoding is lossless, including non-UTF-8 roots; relative task destinations are anchored without changing the task path. This stage captures only the existing admission profile. Multi-pass selection and activation require the next qualified stage.
 
 Capture and replay independently check authenticated account ownership, complete
 private source scope, indexed original source bytes and identity, current paired
@@ -692,16 +663,7 @@ whole existing dispatcher. Retry-only, metadata backfill, read-only execution
 and capture-local timestamp replacement keep their existing owners. Ordinary
 explicit metadata refresh with preservation can use active destinations.
 
-A generation binds account and provider ownership, full zone identity, selected
-passes and queries, source dependencies and selection, rendition, path and
-metadata configuration. Lossless native destination paths are independently
-anchored. A rank page records its exact request and original response bytes,
-including unknown fields and tombstones. Rank pagination remains an observation
-window. EOF plus a delta bridge does not establish a snapshot or prove absence.
-Current paired confirmation determines resource identity; observed order and
-opaque rank or source tokens do not select versions. Ambiguous or incompatible
-facts remain deferred. Existing global/per-filter recent, ties, exclusions,
-RAW, companion and naming owners decide eligibility.
+A generation binds account and provider ownership, full zone identity, selected passes and queries, source dependencies and selection, rendition, path and metadata configuration. Lossless native destination paths are independently anchored. A rank page records its exact request and original response bytes, including unknown fields and tombstones. Rank pagination remains an observation window. EOF plus a delta bridge does not establish a snapshot or prove absence. Current paired confirmation determines resource identity; observed order and opaque rank or source tokens do not select versions. Ambiguous or incompatible facts remain deferred. Existing fixed-date, exclusion, RAW, companion and naming owners decide eligibility. Sync has no newest-N frontier or per-filter count cap.
 
 An immediate projection transaction commits the validated decision, source
 links, per-pass/rendition/path obligations, existing queue records, mappings and
@@ -1217,26 +1179,9 @@ the existing skip rules. New companions use a verified still filename. Existing
 companions with older numbered still stems remain usable after hash verification;
 Kei does not rename or delete them.
 
-Historical smart-folder membership cannot complete local path reconciliation. It reports separate conditional evidence when the fresh smart query
-is its only remaining dependency: album snapshots and catalog identity must be
-complete, with no deferred missing file or failed local work. The cycle owner
-can discharge that dependency only after successful current smart enumeration
-and durable work. During pending path drift, recent-count and lower-date-bounded
-selections drain ordered provider queries to EOF while forwarding only their
-configured selection to the existing download planner. The global recent
-frontier also drains to EOF and must report the same usable token as every
-selected pass. This costs a complete query on path drift, with bounded retained
-frontier IDs and streaming tail filtering. Cancellation stops the raw drain.
+Historical smart-folder membership cannot complete local path reconciliation. It reports separate conditional evidence when the fresh smart query is its only remaining dependency: album snapshots and catalog identity must be complete, with no deferred missing file or failed local work. The cycle owner can discharge that dependency only after successful current smart enumeration and durable work. During pending path drift, lower-date-bounded selections drain ordered provider queries to EOF while forwarding only their configured selection to the existing download planner. Every selected pass must report a usable, unanimous token. This costs a complete query on path drift, with streaming tail filtering. Cancellation stops the raw drain.
 
-Fresh query evidence certifies selected local work separately from source
-checkpoint coverage. Any excluded tail, including equal-date global-frontier
-IDs, still holds zone and database checkpoints. Stale plans, interruption,
-unresolved identity, failed enumeration, local work or state transactions retain
-the pending path hash. Every selected library must finish. Atomic promotion
-compares the active path hash and exact pending target before publishing the new
-hash and removing its marker. Eligibility inventory-and-bridge promotion remains
-separate. Unchanged cycles skip catalog reconciliation and the exhaustive path
-proof; ordinary bounded smart-folder refreshes may still query the provider.
+Fresh query evidence certifies selected local work separately from source checkpoint coverage. An excluded date tail still holds zone and database checkpoints. Stale plans, interruption, unresolved identity, failed enumeration, local work or state transactions retain the pending path hash. Every selected library must finish. Atomic promotion compares the active path hash and exact pending target before publishing the new hash and removing its marker. Eligibility inventory-and-bridge promotion remains separate. Unchanged cycles skip catalog reconciliation and the exhaustive path proof; ordinary bounded smart-folder refreshes may still query the provider.
 
 Local path reconciliation retains an unowned legacy master with multiple
 historical children as unresolved work, even when targeted lookup returns one
@@ -1453,40 +1398,25 @@ marks its zone token unsafe. Both routes preserve the prior checkpoint so an
 unchanged provider record remains retryable, and neither route counts the
 record as a policy, filename, or date skip.
 
-Recent and date-bounded runs may advance only when the producer proves the
-bound did not truncate the stream. Incremental count-form recent selection
-uses the full selection owner after complete strict delta replay. Global uses
-the library-wide ranked window before filters; per-filter uses each pass's
-window. Delta arrival order and asset/pass-pair counts never define that window.
+Date-bounded runs may advance only when the producer proves the lower bound did not truncate the stream. Sync count selection, global-frontier construction, per-filter caps and the recent-only recovery engine are retired. Import sampling remains separate. Enumeration, coverage and selection-generation encodings retain their historical uncapped count/scope slots so unchanged uncapped configurations and retained generations do not drift just because the input surface was removed.
 
-`orchestration/recent.rs` stores a fixed-size `recent_selection_recovery:<zone>`
-receipt in the account-owned database. It binds the resolved provider/pass
-scope, exclusions, selection and download configuration, and the source cursor
-hash. Missing, malformed, mismatched or pending receipts require current
-inventory even when the next delta has no changes. The pending receipt is
-written before selection. A completed receipt is usable only after its actual
-changes/zone successor becomes the requested cursor, so a failed checkpoint
-commit cannot skip recovery. Cap increases and removal consume this obligation
-without a manual token reset. Watch prechecks include this local recovery even
-when the provider reports no changed zones. Enumeration safety hash version 3
-includes count and recent scope, forcing one conservative inventory/bridge for
-legacy cursors, including prior cap removal, before trusting quiet streams.
+### Guarded current inventory after count retirement
 
-Selection rank tokens prove only the existing selection EOF contract. The
-combined result returns the delta successor and carries separate completed
-replay evidence for configuration bridges; a pure full fallback has no such
-evidence. Existing identity, state-write, interruption, sparse/legacy and
-bounded-inventory vetoes remain authoritative. Unresolved delta identity does
-not starve independently valid recent media selected by current inventory;
-its source veto, failed-write counters and pending recovery receipt remain in
-force. Current queue/publication guards remain authoritative for each job. A
-truncated count window keeps
-its recovery obligation and prior cursor; repeated bounded inventory remains a
-known cost until a larger catalog selection generation stage qualifies it.
-Typed provider session errors retain the existing bounded reauthentication
-route across current selection; other selection failures do not trigger fallback.
-This receipt neither claims an atomic rank snapshot nor proves absence or
-permits local deletion.
+Schema 37 seeds `inventory_reconciliation_required:<zone>` once from the existence of each exact `recent_selection_recovery:<zone>` key. It never parses or certifies the old value. Original keys and exact value bytes, including malformed, non-UTF-8 and future-version payloads, remain untouched. An existing inventory request is not replaced. The schema version prevents completed requests from being reseeded on quiet reopen. The new request is presence-only current work, not another historical receipt ledger.
+
+`sync_loop/precheck.rs` includes a selected zone with a nonempty pass plan whenever its request exists, even if changes/database reports no changed zones. `sync_cycle.rs` snapshots the request and current cursor/configuration fences, then passes the obligation to `download/orchestration/dispatch.rs`. With retained cursor P, `reconcile_inventory` performs one guarded attempt per zone per cycle:
+
+1. Replay strict changes/zone from P through terminal successor S. The provider adapter reports terminal completion separately from whether any raw records were observed. Qualification requires a completed replay; cancellation or an incomplete result returns a hold. Identity or state failures can still allow healthy inventory work but veto qualification.
+2. Run the ordinary current inventory and publication owner for the configured selection. Supported private selections use `generation::inventory`; other scopes use `full.rs`. Queries drain to natural EOF with usable token evidence, including a filtered tail when fixed dates limit selected work. Query tokens establish enumeration completion, never replace P or S, and never establish an atomic snapshot.
+3. Only after successful current work and complete selected coverage, replay changes/zone from S to a terminal successor. Every raw records array in this replay must be empty. An empty emitted-event stream is insufficient: unknown records, tombstones or rank displacement still make the interval nonquiet. A changed interval retains the request and trusted cursor for a later cycle; there is no same-cycle catch-up loop.
+
+Unresolved initial delta identity can still allow independently valid inventory jobs to finish, but vetoes qualification. Failed transfers, metadata, state writes, incomplete enumeration, cancellation, stale plans and readiness regression retain the request. The private generation delta path does not add an implicit inventory beside this attempt. Missing cursors use the ordinary first-run path and retain the request until a later guarded attempt is possible. Healthy completed files and all original historical evidence survive retries.
+
+An explicitly rejected cursor or supported static incremental fallback can still run the ordinary inventory, but cannot qualify the request without the guarded replay evidence. Completed inventory can feed the existing retained-checkpoint hold. A fallback error on the terminal replay does not start a second inventory or substitute a query token. Session, transient and durable-capture refusals keep their existing error routes.
+
+`sync_cycle.rs` retires qualified current work only after required enumeration/path configuration activation and a final FINISHED readiness check. `state/db/checkpoints.rs::commit_checkpoint_transition` compares the exact request value, accepted retained/offered cursor, active configuration hashes, absent pending hashes, and indexing/identity holds. The same transaction completes the inventory's deferred album-membership snapshots and removes the request. Failed comparison or transaction preserves both the request and prior membership; a rejected attempt cannot infer membership absence.
+
+Request retirement writes no source checkpoint. A fixed-date selection can complete this current obligation while its excluded tail still holds the zone/database checkpoint. Broader legacy certification, sparse identity, expired-cursor and retained-history gates remain unchanged; a qualified request can retire while an independent historical hold remains. This flow proves neither a provider snapshot nor complete historical deletion coverage, and never authorizes local media deletion.
 
 ### Download and publication
 
@@ -1517,7 +1447,7 @@ use a conservative UTC enumeration bound and then apply the exact resolved
 calendar-date filter, so enumeration safety does not depend on the backup host
 timezone.
 
-Selection date inputs are fixed: `YYYY-MM-DD` means a capture-local calendar date, and `YYYY-MM-DDTHH:MM:SS` means a host-local datetime. `config/runtime.rs::parse_created_date_filter` owns these semantics. Relative `Nd` inputs are rejected with instructions to remove the limit or use a fixed boundary. TOML relative-date rejection runs in `config/input.rs` before CLI precedence, so an override cannot hide a retired saved setting. `recent` retains count selection only; removing relative syntax changes neither date fingerprints nor checkpoint coverage rules.
+Selection date inputs are fixed: `YYYY-MM-DD` means a capture-local calendar date, and `YYYY-MM-DDTHH:MM:SS` means a host-local datetime. `config/runtime.rs::parse_created_date_filter` owns these semantics. Relative `Nd` inputs are rejected with instructions to remove the limit or use a fixed boundary. Sync/service `--recent` and `--recent-scope`, and TOML `[filters].recent` / `recent_scope`, also fail with removal and fixed-date guidance before authentication or state/media changes. TOML rejection runs in `config/input.rs` before CLI precedence, so an override cannot hide a retired saved setting. `import-existing --recent N` uses its own positive-count parser and does not acquire sync date filtering. Fixed-date fingerprints and uncapped compatibility encodings remain unchanged.
 
 Capture-local path rendering does not change the download config hash, so a
 sync that sees no other drift stays incremental and never re-enumerates an
@@ -2461,10 +2391,7 @@ cannot fail migration. Retained reasons and counters contain no source identity,
 URL or arbitrary error text, and remain subject to queue loss and bounded
 history retention. Unknown observations stay explicitly unavailable.
 
-History and export schema version 1 are separate from report version 3 and state
-schema 36. Raw reports and databases are never packaged. Interrupted writes
-preserve the previous history; read errors and limits appear as partial evidence.
-See [the operator guide](support-export.md) for limits and unavailable evidence.
+History and export schema version 1 are separate from report version 3 and state schema 37. Raw reports and databases are never packaged. Interrupted writes preserve the previous history; read errors and limits appear as partial evidence. See [the operator guide](support-export.md) for limits and unavailable evidence.
 
 ### Explicit missing-reference inventory diagnostic
 

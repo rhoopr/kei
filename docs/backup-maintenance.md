@@ -21,11 +21,7 @@ Automatic path reconciliation after configuration changes is separate from the
 
 ## Refresh catalogue and configured outputs
 
-Use a separate repair configuration that preserves your existing `data_dir`,
-credentials, and download directory. Remove the `albums` and `smart_folders`
-keys entirely, even when they contain `all` or `none`: explicit selectors reject
-this repair. Also remove date bounds and `recent`/`recent_scope`. This selection
-covers all visible libraries and enables the unfiled pass:
+Use a separate repair configuration that preserves your existing `data_dir`, credentials, and download directory. Remove the `albums` and `smart_folders` keys entirely, even when they contain `all` or `none`: explicit selectors reject this repair. Also remove date bounds. Retired `recent` / `recent_scope` keys must be removed from any config before it can load. This selection covers all visible libraries and enables the unfiled pass:
 
 ```toml
 [filters]
@@ -34,8 +30,7 @@ unfiled = true
 media = ["photos", "videos", "live-photos"]
 ```
 
-Choose the libraries you intend to repair. Do not add one-run date or recent
-filters. Then run:
+Choose the libraries you intend to repair. Do not add one-run date filters. Then run:
 
 ```sh
 kei sync --config /path/to/repair.toml --refresh-metadata
@@ -47,10 +42,7 @@ It does not download media again. Embedded and sidecar changes follow the
 configured metadata writers. Disable embedded outputs if media bytes must stay
 unchanged; disable sidecar output too if no local metadata should change.
 
-This is one-shot even when the TOML file sets a watch interval. It rejects
-`--dry-run`, `--retry-failed`, `--only-print-filenames`, `--recent`, narrowing
-selection, and `service run`. See [Metadata output](metadata.md) for automatic
-bounded capture repair, which is different from this explicit full sweep.
+This is one-shot even when the TOML file sets a watch interval. It rejects `--dry-run`, `--retry-failed`, `--only-print-filenames`, narrowing selection, and `service run`. See [Metadata output](metadata.md) for automatic bounded capture repair, which is different from this explicit full sweep.
 
 ### Replace capture timestamps
 
@@ -163,6 +155,14 @@ evidence limits; integrity commands cannot prove completeness against iCloud or
 restore damaged media. Never remove temporary files by suffix and age alone:
 cleanup requires durable ownership evidence.
 
+### Upgrade retired sync selection
+
+Sync and service mode reject `--recent` and `--recent-scope`. Remove those flags and `[filters].recent` / `recent_scope` before starting. If you still want a limited backup, choose fixed capture-date bounds, such as `skip_created_before = "2025-01-01"` and `skip_created_after = "2025-01-07"`; replace both dates with your own range. Relative `Nd` values are unsupported too. Startup errors give removal and replacement guidance without changing configuration, state or media. Import-only `import-existing --recent N` still accepts a positive sample count and does not apply sync date filters.
+
+Schema 37 preserves old recent-selection receipts and records a one-time inventory request for each zone with an old receipt key, regardless of its payload. A selected zone can therefore need a current inventory even when iCloud reports no changes. Each attempt replays the retained cursor, inventories the current selection, then requires a raw-empty terminal replay before retiring the request. A busy interval, interruption, failed write or incomplete current work keeps it pending for a later cycle; no same-cycle catch-up loop is added. Healthy media can still complete while other work remains held.
+
+This proves current selected coverage, not an atomic provider snapshot, complete historical deletions or permission to delete local files. Completing it can retire the inventory request while a separate legacy or expired-cursor checkpoint hold remains. Preserve the state and investigate that hold rather than resetting it.
+
 ## Unresolved provider identities
 
 If logs show `asset_delta_hydration_incomplete`, keep the state database and
@@ -185,7 +185,7 @@ or rendition evidence becomes eligible immediately. Status reports unresolved
 identities and deferred retries separately from failed repair attempts.
 Deferral keeps the capture revision and checkpoint pending; it is not recovery.
 
-Stable v0.26.0 uses schema 36. Even `kei status` can migrate an owned database. Stop all workers and take a matched cold backup of configuration/state, SQLite companions and media/sidecars before upgrading. Older binaries cannot open schema 36. Rollback requires the complete matched old set and retained old binary. Do not reset state or lower its schema version. See the [v0.26.0 upgrade guide](v0.26.0-upgrade.md).
+The current development branch uses schema 37; stable v0.26.0 uses schema 36. Even `kei status` can migrate an owned database. Stop all workers and take a matched cold backup of configuration/state, SQLite companions and media/sidecars before upgrading. Older binaries cannot open a newer schema. Rollback requires the complete matched old set and retained old binary. Do not reset state or lower its schema version. See the [v0.26.0 upgrade guide](v0.26.0-upgrade.md) for that release's backup and restoration procedure.
 
 Kei marks unresolved asset identity cycles incomplete. Status
 remains unsafe across restarts and successful syncs in other libraries until

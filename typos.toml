@@ -14,8 +14,7 @@ Caf = "Caf"
 Pn = "Pn"
 # THM = camera thumbnail file extension (e.g. Canon .THM files)
 THM = "THM"
-# `Nd` is the placeholder in `--recent Nd` (days form); a CLI-shape
-# template, not a typo for "And".
+# `Nd` names retired relative-date inputs in rejection and migration text.
 Nd = "Nd"
 # QuickTime/ISO BMFF track box FourCC.
 trak = "trak"

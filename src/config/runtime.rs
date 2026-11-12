@@ -94,10 +94,6 @@ pub struct FilterConfig {
     pub media: MediaSelection,
     pub skip_created_before: Option<CreatedDateFilter>,
     pub skip_created_after: Option<CreatedDateFilter>,
-    pub recent: Option<u32>,
-    pub recent_scope: crate::cli::RecentScope,
-    pub persistent_recent: Option<crate::cli::RecentLimit>,
-    pub persistent_recent_scope: Option<crate::cli::RecentScope>,
     pub persistent_skip_created_before: Option<String>,
     pub persistent_skip_created_after: Option<String>,
     pub skip_videos: bool,
@@ -218,8 +214,7 @@ impl FilterConfig {
     /// selected libraries, so a `--refresh-metadata` repair cannot revisit
     /// every downloaded asset in scope.
     pub(crate) fn narrows_enumeration(&self) -> bool {
-        self.recent.is_some()
-            || self.skip_created_before.is_some()
+        self.skip_created_before.is_some()
             || self.skip_created_after.is_some()
             || !self.media.is_all()
             || self.selection.albums_explicit
@@ -505,16 +500,8 @@ mod tests {
         assert!(!cfg.filters.narrows_enumeration());
     }
     #[test]
-    fn narrows_enumeration_true_for_recent() {
-        let toml: TomlConfig = toml::from_str("[filters]\nrecent = 500\n").unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert!(cfg.filters.narrows_enumeration());
+    fn retired_count_cannot_create_runtime_policy() {
+        assert!(toml::from_str::<TomlConfig>("[filters]\nrecent = 500\n").is_err());
     }
     #[test]
     fn narrows_enumeration_true_for_date_window() {

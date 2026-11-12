@@ -28,4 +28,5 @@ mod shared_keys;
 
 mod sparse_recovery;
 
+mod inventory_reconciliation;
 mod unprepared_recovery;

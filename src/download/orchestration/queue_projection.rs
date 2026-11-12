@@ -1,5 +1,8 @@
 //! Current-config admission from retained provider sources into existing queues.
 
+#[cfg(test)]
+mod generation_tests;
+
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -45,7 +48,6 @@ fn work_context(
     // Selection that needs rank or membership evidence remains with its existing
     // owner. These observations are retained without an admission receipt.
     if !controls.run_mode.downloads_files()
-        || config.recent.is_some()
         || config.retry_only
         || config.refresh_metadata
         || !config.exclude_asset_ids.is_empty()

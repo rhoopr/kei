@@ -306,8 +306,7 @@ async fn preload_asset_groupings_no_db_returns_empty() {
 
 #[tokio::test]
 async fn run_cycle_provider_metadata_write_failure_preserves_zone_checkpoint() {
-    let mut config = make_run_cycle_config();
-    config.filters.recent = Some(10);
+    let config = make_run_cycle_config();
     let inner = make_state_db();
     inner
         .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
@@ -335,15 +334,17 @@ async fn run_cycle_provider_metadata_write_failure_preserves_zone_checkpoint() {
             }]
         })).ok(serde_json::json!({"records":page["records"].clone(),"syncToken":"metadata-rank-token"})),
     );
-    let lib_state =
+    let mut lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+    // Multiple passes select the real collecting owner without count policy.
+    // The original unfiled pass and its metadata-write failure stay unchanged.
+    lib_state.plan.passes.push(lib_state.plan.passes[0].clone());
     let states = vec![&lib_state];
     let build_download_config = make_run_cycle_download_config_builder_with_options(
         download_dir.path(),
         Arc::clone(&db),
         RunCycleDownloadConfigOptions {
             media: media_without_photo_downloads(),
-            recent: Some(10),
             ..RunCycleDownloadConfigOptions::default()
         },
     );
@@ -603,18 +604,15 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
         files
     };
 
-    for (recent, evidence) in [Some(10), None].into_iter().flat_map(|recent| {
-        [
-            EvidenceCase::Ordinary,
-            EvidenceCase::Sparse,
-            EvidenceCase::DeletedDelta,
-            EvidenceCase::HardDeletedDelta,
-            EvidenceCase::Malformed,
-            EvidenceCase::Changed,
-            EvidenceCase::MarkerWriteFailure,
-        ]
-        .map(|evidence| (recent, evidence))
-    }) {
+    for evidence in [
+        EvidenceCase::Ordinary,
+        EvidenceCase::Sparse,
+        EvidenceCase::DeletedDelta,
+        EvidenceCase::HardDeletedDelta,
+        EvidenceCase::Malformed,
+        EvidenceCase::Changed,
+        EvidenceCase::MarkerWriteFailure,
+    ] {
         let server = crate::start_wiremock_or_skip!();
         // Valid JPEG framing; no optional metadata writer is needed.
         let bytes = vec![
@@ -681,8 +679,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
         }
         let before = snapshot_files(&media);
         let mut after_download = None;
-        let mut config = make_run_cycle_config();
-        config.filters.recent = recent;
+        let config = make_run_cycle_config();
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
         // Reopen SQLite each time. After marker failure, replay once to persist it
         // before selecting only the clean zone, recovering, and checking steady state.
@@ -773,10 +770,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             let builder = make_run_cycle_download_config_builder_with_options(
                 &media,
                 db.clone(),
-                RunCycleDownloadConfigOptions {
-                    recent,
-                    ..RunCycleDownloadConfigOptions::default()
-                },
+                RunCycleDownloadConfigOptions::default(),
             );
             let result = run_cycle(
                 &libraries,
@@ -793,7 +787,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             assert_eq!(
                 result.stats.identity_incomplete,
                 phase < recovery_phase,
-                "recent={recent:?} evidence={evidence:?} cycle={cycle}"
+                "evidence={evidence:?} cycle={cycle}"
             );
             assert_eq!(result.failed_count > 0, phase < recovery_phase);
             let deferred = phase == 2
@@ -807,7 +801,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             assert_eq!(
                 lookups.load(std::sync::atomic::Ordering::Relaxed),
                 usize::from(phase != 1 && !deferred && !(phase >= 3 && deletion_delta)),
-                "recent={recent:?} evidence={evidence:?} cycle={cycle} phase={phase}"
+                "evidence={evidence:?} cycle={cycle} phase={phase}"
             );
             let retained = inner.sparse_identities("PrimarySync").await.unwrap();
             let stable_link = matches!(
@@ -865,7 +859,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             assert_eq!(
                 crate::commands::backup_status_line(&summary).contains("unresolved asset identity"),
                 marker_expected,
-                "recent={recent:?} evidence={evidence:?} cycle={cycle}: {}",
+                "evidence={evidence:?} cycle={cycle}: {}",
                 crate::commands::backup_status_line(&summary)
             );
             assert_eq!(
@@ -888,22 +882,10 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                     .as_deref(),
                 Some("shared-after")
             );
-            if recent.is_some() && phase < recovery_phase {
-                let raw = inner
-                    .get_metadata("recent_selection_recovery:PrimarySync")
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(
-                    serde_json::from_str::<serde_json::Value>(&raw).unwrap()["complete"],
-                    false,
-                    "healthy materialization never clears unrelated source identity debt"
-                );
-            }
             assert_eq!(
                 result.stats.downloaded,
                 usize::from(cycle == 0),
-                "recent={recent:?} evidence={evidence:?} cycle={cycle}: {:?}",
+                "evidence={evidence:?} cycle={cycle}: {:?}",
                 result.stats
             );
             let files = snapshot_files(&media);
@@ -922,8 +904,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
 }
 /// #707: the paired single-pass streaming path must gate the zone
 /// checkpoint on provider-metadata durability exactly as the collecting
-/// path does. Identical to the collecting regression above but without
-/// `recent`, which is what routes the cycle through the streaming
+/// path does. The single unfiled pass routes the cycle through the streaming
 /// producer rather than collecting incremental planning.
 #[tokio::test]
 async fn run_cycle_single_pass_metadata_refresh_failure_preserves_zone_checkpoint() {
@@ -2441,13 +2422,8 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
         Stage::AssetIdentity,
     ] {
         for status in [401, 403, 421] {
-            for recent in [None, Some(10)] {
-                // A bounded full inventory deliberately cannot advance its checkpoint.
-                if matches!(stage, Stage::Full | Stage::FullPerPass) && recent.is_some() {
-                    continue;
-                }
-                let mut config = make_run_cycle_config();
-                config.filters.recent = recent;
+            {
+                let config = make_run_cycle_config();
                 let dir = tempfile::tempdir().unwrap();
                 let inner = Arc::new(
                     state::SqliteStateDb::open(&dir.path().join("state.db"))
@@ -2522,7 +2498,6 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
                     RunCycleDownloadConfigOptions {
                         media: media_without_photo_downloads(),
                         per_pass_paths: stage == Stage::FullPerPass,
-                        recent,
                         ..RunCycleDownloadConfigOptions::default()
                     },
                 );
@@ -2546,7 +2521,7 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
                     assert_eq!(
                         result.session_expired,
                         cycle == 0,
-                        "{stage:?} HTTP {status} recent={recent:?} cycle={cycle}"
+                        "{stage:?} HTTP {status} cycle={cycle}"
                     );
                     assert_eq!(
                         inner
@@ -2566,12 +2541,10 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
                         "provider recovery must not change local media"
                     );
                     assert_eq!(result.stats.downloaded, 0);
-                    if recent.is_none()
-                        && matches!(
-                            stage,
-                            Stage::Incremental | Stage::AssetPair | Stage::AssetIdentity
-                        )
-                    {
+                    if matches!(
+                        stage,
+                        Stage::Incremental | Stage::AssetPair | Stage::AssetIdentity
+                    ) {
                         let summary = inner.get_summary().await.unwrap();
                         let status = crate::commands::backup_status_line(&summary);
                         assert_eq!(summary.last_sync_interrupted, cycle == 0);
@@ -2707,7 +2680,7 @@ async fn sparse_deletion_batches_survive_restart_and_preserve_failed_state() {
             Box::new(self.clone())
         }
     }
-    for recent in [None, Some(10)] {
+    {
         for replay in [false, true] {
             for changing_snapshot in [false, true] {
                 let count = 101;
@@ -2757,8 +2730,7 @@ async fn sparse_deletion_batches_survive_restart_and_preserve_failed_state() {
                 }
                 let sentinel = media.join("keep.bin");
                 std::fs::write(&sentinel, b"unchanged private media").unwrap();
-                let mut config = make_run_cycle_config();
-                config.filters.recent = recent;
+                let config = make_run_cycle_config();
                 let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
                 let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let snapshot = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2792,10 +2764,7 @@ async fn sparse_deletion_batches_survive_restart_and_preserve_failed_state() {
                     let builder = make_run_cycle_download_config_builder_with_options(
                         &media,
                         db.clone(),
-                        RunCycleDownloadConfigOptions {
-                            recent,
-                            ..RunCycleDownloadConfigOptions::default()
-                        },
+                        RunCycleDownloadConfigOptions::default(),
                     );
                     let result = run_cycle(
                         &[&library],
@@ -2824,7 +2793,7 @@ async fn sparse_deletion_batches_survive_restart_and_preserve_failed_state() {
                             .unwrap()
                             .as_deref(),
                         Some(expected_token),
-                        "recent={recent:?} replay={replay} changing_snapshot={changing_snapshot} cycle={cycle}"
+                        "replay={replay} changing_snapshot={changing_snapshot} cycle={cycle}"
                     );
                     assert_eq!(
                         inner.sparse_identities("PrimarySync").await.unwrap().len(),
@@ -2929,7 +2898,7 @@ async fn sparse_deletion_validation_preserves_restored_or_unproven_sources() {
             Box::new(self.clone())
         }
     }
-    for recent in [None, Some(10)] {
+    {
         for change in [
             ValidationChange::Restored,
             ValidationChange::Incomplete,
@@ -2973,8 +2942,7 @@ async fn sparse_deletion_validation_preserves_restored_or_unproven_sources() {
             }
             let sentinel = media.join("keep.bin");
             std::fs::write(&sentinel, b"unchanged media").unwrap();
-            let mut config = make_run_cycle_config();
-            config.filters.recent = recent;
+            let config = make_run_cycle_config();
             let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
             let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let validations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3004,10 +2972,7 @@ async fn sparse_deletion_validation_preserves_restored_or_unproven_sources() {
                 let builder = make_run_cycle_download_config_builder_with_options(
                     &media,
                     db.clone(),
-                    RunCycleDownloadConfigOptions {
-                        recent,
-                        ..RunCycleDownloadConfigOptions::default()
-                    },
+                    RunCycleDownloadConfigOptions::default(),
                 );
                 let result = run_cycle(
                     &[&library],
@@ -3027,7 +2992,7 @@ async fn sparse_deletion_validation_preserves_restored_or_unproven_sources() {
                         .unwrap()
                         .as_deref(),
                     Some(if cycle < 2 { "before" } else { "after-2" }),
-                    "{recent:?} {change:?} cycle {cycle}"
+                    "{change:?} cycle {cycle}"
                 );
                 let retained = db.sparse_identities("PrimarySync").await.unwrap();
                 assert_eq!(retained.len(), if cycle < 2 { 101 } else { 0 });
@@ -3127,7 +3092,7 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
         }
     }
 
-    for recent in [None, Some(10)] {
+    {
         for interrupted in [false, true] {
             let server = crate::start_wiremock_or_skip!();
             let bytes =
@@ -3193,8 +3158,7 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
             }
             let sentinel = media.join("keep-private.bin");
             std::fs::write(&sentinel, b"keep these bytes").unwrap();
-            let mut config = make_run_cycle_config();
-            config.filters.recent = recent;
+            let config = make_run_cycle_config();
             let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
             let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut completed_requests = 0;
@@ -3228,10 +3192,7 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
                 let builder = make_run_cycle_download_config_builder_with_options(
                     &media,
                     db.clone(),
-                    RunCycleDownloadConfigOptions {
-                        recent,
-                        ..RunCycleDownloadConfigOptions::default()
-                    },
+                    RunCycleDownloadConfigOptions::default(),
                 );
                 let result = run_cycle(
                     &[&primary],
@@ -3253,7 +3214,7 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
                         .unwrap()
                         .as_deref(),
                     Some(if cycle == 0 { "before" } else { "after" }),
-                    "recent={recent:?} interrupted={interrupted} cycle={cycle}"
+                    "interrupted={interrupted} cycle={cycle}"
                 );
                 assert_eq!(
                     inner.sparse_identities("PrimarySync").await.unwrap().len(),

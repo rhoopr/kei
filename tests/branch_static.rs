@@ -52,7 +52,7 @@ fn state_machine_quiet_greps_do_not_sigpipe() {
     assert_eq!(predicates.len(), 8, "quiet search lines: {predicates:#?}");
 
     let matching = concat!(
-        "recent_limited_full_enumeration Fetching full enumeration fallback ",
+        "date_bounded_full_enumeration Fetching full enumeration fallback ",
         "No new photos Completed Existing session token is valid ",
         "accountLogin succeeded Session validated recently, skipping /validate call ",
         "Authenticating SRP",
@@ -2197,7 +2197,7 @@ fn live_import_rehearsal_uses_shared_bounded_selection() {
         let selection: toml::Table = repo_file("tests/data/live-selection.toml").parse().unwrap();
         assert_eq!(
             String::from_utf8(output.stdout).unwrap().trim(),
-            selection["filters"]["recent"]
+            selection["import_sample"]["recent"]
                 .as_integer()
                 .unwrap()
                 .to_string()
@@ -2256,6 +2256,152 @@ fn full_test_cross_zone_album_phase_is_opt_in_and_checks_source_zone() {
     assert!(
         readme.contains("KEI_FULL_TEST_CROSS_ZONE_ALBUM"),
         "tests README must document the opt-in cross-zone fixture"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_test_cross_zone_album_requires_fixed_date_before_auth_and_preserves_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let bin = root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir_all(root.join("tests/shell")).unwrap();
+    let library = format!(
+        "{}\n{}",
+        repo_file("tests/shell/lib.sh"),
+        r#"
+kei_require_env() { printf 'auth\n' >> "$CALLS"; }
+kei_require_release_binary() { printf 'build\n' >> "$CALLS"; }
+kei_release_bin() { printf '%s/kei' "$FIXTURE_BIN"; }
+kei_copy_session_without_state() { printf 'session\n' >> "$CALLS"; }
+"#
+    );
+    std::fs::write(root.join("tests/shell/lib.sh"), library).unwrap();
+    write_executable(
+        &bin.join("git"),
+        "#!/bin/sh\nprintf '%s' \"$FIXTURE_ROOT\"\n",
+    );
+    write_executable(&bin.join("sqlite3"), "#!/bin/sh\nexit 99\n");
+    // Stop at the would-be binary boundary. No real binary, credentials,
+    // provider calls or host services are used by this harness proof.
+    write_executable(
+        &bin.join("kei"),
+        "#!/bin/bash\n[[ $1 == sync && $2 == --no-progress-bar && $3 == --config ]] || exit 98\ncp \"$4\" \"$CAPTURED_CONFIG\"\nexit 77\n",
+    );
+    let calls = root.join("calls");
+    let captured = root.join("captured.toml");
+    for value in [
+        None,
+        Some(""),
+        Some("30d"),
+        Some("2025-02-30"),
+        Some("2025-01-02"),
+    ] {
+        std::fs::write(&calls, "").unwrap();
+        let mut command = Command::new("bash");
+        command
+            .arg(repo_path(
+                "scripts/full-test/run_cross_zone_album_hydration.sh",
+            ))
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("FIXTURE_ROOT", root)
+            .env("FIXTURE_BIN", &bin)
+            .env("CALLS", &calls)
+            .env("CAPTURED_CONFIG", &captured)
+            .env("TMPDIR", root)
+            .env("ICLOUD_USERNAME", "synthetic@example.invalid")
+            .env("KEI_FULL_TEST_CROSS_ZONE_ALBUM", "Cross-zone fixture")
+            .env_remove("KEI_LIVE_SKIP_CREATED_BEFORE");
+        if let Some(value) = value {
+            command.env("KEI_LIVE_SKIP_CREATED_BEFORE", value);
+        }
+        let output = command.output().unwrap();
+        if value == Some("2025-01-02") {
+            assert_eq!(output.status.code(), Some(77), "{output:?}");
+            assert_eq!(
+                std::fs::read_to_string(&calls).unwrap(),
+                "auth\nbuild\nsession\n"
+            );
+            let config: toml::Table = std::fs::read_to_string(&captured).unwrap().parse().unwrap();
+            assert_eq!(
+                config["filters"]["skip_created_before"].as_str(),
+                Some("2025-01-02")
+            );
+            assert_eq!(
+                config["filters"]["albums"].as_array().unwrap(),
+                &[toml::Value::String("Cross-zone fixture".into())]
+            );
+            assert_eq!(
+                config["filters"]["libraries"].as_array().unwrap(),
+                &[toml::Value::String("all".into())]
+            );
+            assert_eq!(config["filters"]["unfiled"].as_bool(), Some(false));
+        } else {
+            assert_eq!(output.status.code(), Some(64), "{value:?}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("explicit fixed YYYY-MM-DD"));
+            assert!(
+                std::fs::read_to_string(&calls).unwrap().is_empty(),
+                "invalid bound reached auth/build/session"
+            );
+            assert!(!captured.exists());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_checkpoint_oracles_require_fixed_date_hold_or_complete_inventory() {
+    let script = repo_file("tests/shell/state-machine.sh");
+    let helper = script
+        .split_once("check_checkpoint() {")
+        .unwrap()
+        .1
+        .split_once("\n}")
+        .unwrap()
+        .0;
+    for (reason, token, success) in [
+        ("date_bounded_full_enumeration", "", true),
+        (
+            "date_bounded_full_enumeration",
+            "incorrect-new-token",
+            false,
+        ),
+        ("complete inventory", "saved-token", true),
+        ("complete inventory", "", false),
+        ("recent_limited_full_enumeration", "", false),
+    ] {
+        let command = format!(
+            "get_token() {{ printf '%s' \"$TOKEN\"; }}\nkei_check() {{ return $?; }}\ncheck_checkpoint() {{{helper}\n}}\ncheck_checkpoint"
+        );
+        let output = Command::new("bash")
+            .args(["-c", &command])
+            .env("OUTPUT", reason)
+            .env("TOKEN", token)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{reason}/{token}: {output:?}"
+        );
+    }
+    let sync = repo_file("tests/sync.rs");
+    let scenario = sync
+        .split_once("fn sync_bounded_second_run_preserves_checkpoint_and_skips_download()")
+        .unwrap()
+        .1
+        .split_once("\n#[test]")
+        .unwrap()
+        .0;
+    assert!(scenario.contains("date_bounded_full_enumeration"));
+    assert!(!scenario.contains("recent_limited_full_enumeration"));
+    assert!(
+        scenario.contains("token().is_none()")
+            && scenario.contains("second run must report no new downloads")
     );
 }
 
@@ -2673,6 +2819,7 @@ fn live_shell_preflight_rejects_empty_selection() {
             .args(["-c", r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_release_bin() { printf '%s' "$BINARY"; }; kei_copy_session_without_state() { mkdir -p "$1"; }; kei_preflight_selection"#])
             .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
             .env("BINARY", &binary)
+            .env("KEI_LIVE_SKIP_CREATED_BEFORE", "2025-01-02")
             .output().unwrap();
         assert_eq!(
             result.status.success(),
@@ -2684,6 +2831,25 @@ fn live_shell_preflight_rejects_empty_selection() {
             assert!(
                 String::from_utf8_lossy(&result.stderr).contains("empty bounded live selection")
             );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_shell_preflight_requires_fixed_date_before_provider_or_session_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("unexpected-provider-work");
+    for value in ["", "30d", "2025-02-30"] {
+        for preflight in ["kei_preflight_selection", "kei_preflight_session"] {
+            let result = Command::new("bash")
+                .args(["-c",r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_copy_session_without_state() { touch "$MARKER"; }; kei_release_bin() { touch "$MARKER"; }; "$PREFLIGHT""#])
+                .env("PROJECT_DIR",env!("CARGO_MANIFEST_DIR"))
+                .env("KEI_LIVE_SKIP_CREATED_BEFORE",value).env("MARKER",&marker)
+                .env("PREFLIGHT",preflight).output().unwrap();
+            assert!(!result.status.success());
+            assert!(String::from_utf8_lossy(&result.stderr).contains("explicit fixed YYYY-MM-DD"));
+            assert!(!marker.exists());
         }
     }
 }

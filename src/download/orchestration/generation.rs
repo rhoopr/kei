@@ -209,7 +209,7 @@ pub(crate) async fn context(
     let mut excludes: Vec<_> = config.exclude_asset_ids.iter().collect();
     excludes.sort_unstable();
     let profile = json!({"format":1,"coverage":"observed_selection_window","passes":profile,
-        "recent":config.recent,"recent_scope":format!("{:?}",config.recent_scope),"excludes":excludes});
+        "recent":null,"recent_scope":"Global","excludes":excludes});
     let config_hash=digest(serde_json::to_vec(&json!({"format":1,"profile":profile,"scope":scope,"zone":zone,
         "paths":hash_download_config(config),"anchored_root":SelectionPath::from_path(&std::path::absolute(&config.directory)?),
         "before":config.skip_created_before.map(crate::config::CreatedDateFilter::fingerprint),"after":config.skip_created_after.map(crate::config::CreatedDateFilter::fingerprint),
@@ -1306,9 +1306,6 @@ async fn replay(
         .await?;
     if !root.checkpoint_ready || run.held.load(Ordering::Relaxed) {
         result.block_incremental_token(match root.checkpoint_veto.as_deref() {
-            Some(super::models::RECENT_LIMITED_FULL_ENUMERATION_REASON) => {
-                super::models::RECENT_LIMITED_FULL_ENUMERATION_REASON
-            }
             Some(super::models::DATE_BOUNDED_FULL_ENUMERATION_REASON) => {
                 super::models::DATE_BOUNDED_FULL_ENUMERATION_REASON
             }
@@ -1335,50 +1332,11 @@ pub(super) async fn after_delta(
     controls: DownloadControls,
     cancel: CancellationToken,
     delta: IncrementalDeltaSummary,
-    prior_cursor: &str,
 ) -> Result<SyncResult> {
     let context = config
         .selection_context
         .as_ref()
         .context("Missing selection context")?;
-    let recent = super::recent::active(config)
-        .await
-        .map_err(super::recent::RecentSelectionError)?;
-    let repeat_inventory = recent
-        && super::recent::needs_inventory(passes, config, prior_cursor, false)
-            .await
-            .map_err(super::recent::RecentSelectionError)?;
-    if recent {
-        super::recent::record(passes, config, prior_cursor, false)
-            .await
-            .map_err(super::recent::RecentSelectionError)?;
-    }
-    let root = context.current().await?;
-    let selection = match root {
-        Some(root)
-            if !repeat_inventory
-                && (root.sealed
-                    || context
-                        .capture
-                        .db
-                        .selection_waiting_for_retry(context.capture.owner.clone(), root.id.clone())
-                        .await?) =>
-        {
-            replay(client, passes, config, controls, cancel.clone(), root).await
-        }
-        _ => inventory(client, passes, config, controls, cancel.clone()).await,
-    };
-    let mut selected = if recent {
-        selection.map_err(|error| {
-            if crate::icloud::photos::session::is_session_error(&error) {
-                error
-            } else {
-                super::recent::RecentSelectionError(error).into()
-            }
-        })?
-    } else {
-        selection?
-    };
     let mut stats = SyncStats {
         state_write_failures: delta.state_transition_failures,
         identity_incomplete: delta.identity_incomplete,
@@ -1388,8 +1346,8 @@ pub(super) async fn after_delta(
     if let Some(reason) = delta.token_unsafe_reason {
         block_sync_token_for_incremental_delta(&mut stats, reason)
     }
-    let completed_delta_replay = delta.sync_token.is_some();
-    let delta_result = SyncResult::from_incremental_execution(
+    let completed_delta_replay = delta.raw_records_observed.zip(delta.sync_token.clone());
+    let mut delta_result = SyncResult::from_incremental_execution(
         if delta.state_transition_failures > 0 {
             DownloadOutcome::PartialFailure {
                 failed_count: delta.state_transition_failures,
@@ -1402,6 +1360,35 @@ pub(super) async fn after_delta(
         delta.sparse_identity_proofs,
         completed_delta_replay,
     );
+    if config.inventory_reconciliation {
+        // The dispatcher already owns exactly one current inventory between
+        // these two delta passes. Do not start another implicit generation scan
+        // or replay here. Its durable request and retained source cursor remain
+        // until full selected coverage plus a raw-empty replay qualify; a
+        // changed replay cannot advance past newly observed unadmitted work.
+        if !delta_result.checkpoint.sync_token_blocked
+            && !delta_result.checkpoint.identity_incomplete
+            && !delta_result.checkpoint.interrupted
+            && delta_result.checkpoint.state_write_failures == 0
+        {
+            delta_result.sync_token = delta.sync_token;
+        }
+        return Ok(delta_result);
+    }
+    let root = context.current().await?;
+    let mut selected = match root {
+        Some(root)
+            if root.sealed
+                || context
+                    .capture
+                    .db
+                    .selection_waiting_for_retry(context.capture.owner.clone(), root.id.clone())
+                    .await? =>
+        {
+            replay(client, passes, config, controls, cancel.clone(), root).await?
+        }
+        _ => inventory(client, passes, config, controls, cancel.clone()).await?,
+    };
     selected.outcome = merge_download_outcomes(&selected.outcome, &delta_result.outcome);
     selected.accumulate(&delta_result);
     if let Some(reason) = delta.token_unsafe_reason {
@@ -1417,16 +1404,6 @@ pub(super) async fn after_delta(
         && selected.checkpoint.state_write_failures == 0
     {
         selected.sync_token = delta.sync_token;
-        if recent && let Some(successor) = selected.sync_token.as_deref() {
-            super::recent::record(
-                passes,
-                config,
-                successor,
-                matches!(selected.outcome, DownloadOutcome::Success),
-            )
-            .await
-            .map_err(super::recent::RecentSelectionError)?;
-        }
     }
     Ok(selected)
 }

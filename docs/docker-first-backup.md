@@ -14,7 +14,7 @@ In a new working directory, create `config` and `photos` directories:
 mkdir config photos
 ```
 
-Create `config/config.toml`, replacing the account value:
+Create `config/config.toml`, replacing the account value and both example dates with a small range containing photos you recognize. Both dates are inclusive and use the photo's capture-local calendar date:
 
 ```toml
 [auth]
@@ -22,6 +22,10 @@ username = "you@example.com"
 
 [download]
 directory = "/photos"
+
+[filters]
+skip_created_before = "2025-01-01"
+skip_created_after = "2025-01-07"
 ```
 
 Create `compose.yaml` beside those directories:
@@ -59,13 +63,13 @@ archive for this trial.
 
 ## Log in and try a small sync
 
-Run these in order, before starting a background service:
+Run these in order, before starting a background service. Replace the dates in the sync command with the same range you chose in the config:
 
 ```sh
 docker compose pull
 docker compose run --rm -it kei password set --config /config/config.toml
 docker compose run --rm -it kei login --config /config/config.toml
-docker compose run --rm -it kei sync --config /config/config.toml --recent 10
+docker compose run --rm -it kei sync --config /config/config.toml --skip-created-before 2025-01-01 --skip-created-after 2025-01-07
 docker compose run --rm kei status --config /config/config.toml
 ```
 
@@ -74,16 +78,13 @@ The password command stores an encrypted credential under `/config`; protect
 that mount as sensitive data. [Credentials](https://github.com/rhoopr/kei/wiki/Credentials)
 describes password files and external secret managers as alternatives.
 
-The sync overrides the image's default service command and runs once because
-this config has no watch interval. `--recent 10` limits asset candidates, not
-output files. Open expected media under the host's `photos` directory and follow
-[Check the result](../README.md#check-the-result). Inspect warnings and recorded
-pending/failed work before expanding the selection. Preserve both mounts.
+The sync overrides the image's default service command and runs once because this config has no watch interval. A fixed date range limits capture dates, not output files; a busy range can still download many files. Open expected media under the host's `photos` directory and follow [Check the result](../README.md#check-the-result). Inspect warnings and recorded pending/failed work before expanding the selection. Preserve both mounts.
+
+Sync no longer accepts `--recent`, `--recent-scope`, or the TOML keys `recent` / `recent_scope` in `[filters]`. Old settings fail early with removal and fixed-date guidance, rather than silently selecting more media. See [the configuration upgrade note](../README.md#run-your-normal-backup).
 
 ## Run unattended
 
-After verifying the trial, review the saved selection and add this to
-`config/config.toml`:
+After verifying the trial, review the saved selection. Widen or remove its two date bounds only when you intend to expand the backup; leaving them in place keeps unattended runs limited to the sample. Then add this to `config/config.toml`:
 
 ```toml
 [watch]
@@ -98,10 +99,7 @@ docker compose up -d
 docker compose logs -f kei
 ```
 
-The image's default command is `kei service run --config /config/config.toml`.
-It syncs the saved selection, without the trial's one-run recent limit, and
-repeats daily. `service run` also uses a daily fallback if no interval is saved.
-Apple may require 2FA again. For this Compose service, request and submit a code:
+The image's default command is `kei service run --config /config/config.toml`. It syncs the saved selection, including any saved date bounds, and repeats daily. `service run` also uses a daily fallback if no interval is saved. Apple may require 2FA again. For this Compose service, request and submit a code:
 
 ```sh
 docker compose exec --user UID:GID kei kei login get-code --config /config/config.toml

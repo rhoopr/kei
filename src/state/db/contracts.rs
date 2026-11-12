@@ -388,6 +388,8 @@ pub(crate) struct ScopedDbSyncToken {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckpointTransition {
+    /// Qualified running album snapshots, completed under the metadata fences.
+    pub(crate) album_snapshots: Vec<(String, String, i64)>,
     /// Rechecked in the same transaction before proof activation or any write.
     pub(crate) expected_metadata: Vec<(String, Option<String>)>,
     pub(crate) legacy_preservation_proofs: Vec<super::LegacyActivationProof>,

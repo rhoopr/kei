@@ -153,18 +153,6 @@ media = ["photos", "videos", "live-photos"]
 # Description: Skips candidate files whose derived filename matches any pattern.
 filename_exclude = []
 
-# Option: filters.recent
-# Default value: unset
-# Valid values: positive integer count such as 100
-# Description: Permanently limits sync to recent assets with a candidate cap. Remove this setting for no count limit; use fixed date bounds below for a date range.
-# recent = 100
-
-# Option: filters.recent_scope
-# Default value: global
-# Valid values: global, per-filter
-# Description: Controls where count-form recent applies. Only valid when recent is set to a count.
-# recent_scope = "global"
-
 # Option: filters.skip_created_before
 # Default value: unset
 # Valid values: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS

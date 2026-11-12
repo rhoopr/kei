@@ -62,7 +62,7 @@ pub(super) fn refresh_metadata_forces_one_shot(
     );
     anyhow::ensure!(
         !narrows_enumeration,
-        "--refresh-metadata repairs every downloaded asset in the selected libraries and requires a complete library sweep. Enable the unfiled pass and remove album, smart-folder, media, or date/recent filters before retrying."
+        "--refresh-metadata repairs every downloaded asset in the selected libraries and requires a complete library sweep. Enable the unfiled pass and remove album, smart-folder, media, or date filters before retrying."
     );
     Ok(true)
 }

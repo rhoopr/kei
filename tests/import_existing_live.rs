@@ -133,8 +133,8 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
         let data_dir = prepare_fixture_data_dir(&download_dir, &cookie_dir);
 
         eprintln!(
-            "Building import-existing fixture: --recent {} into {}",
-            common::live_selection::live_recent(),
+            "Building import-existing fixture with fixed lower date {} into {}",
+            common::live_selection::require_fixed_date(),
             download_dir.display()
         );
         // Keep the reusable fixture to one library-wide pass. The default
@@ -151,8 +151,6 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
                 &password,
                 "--config",
                 config_path.to_str().unwrap(),
-                "--recent",
-                &common::live_selection::live_recent().to_string(),
                 "--no-progress-bar",
             ])
             .timeout(Duration::from_secs(FIXTURE_TIMEOUT_SECS))
@@ -261,7 +259,7 @@ fn import_cmd(
 #[test]
 fn import_command_uses_shared_bound_unless_scenario_overrides_it() {
     let dir = tempdir().unwrap();
-    for (extra, expected) in [
+    for (mut extra, expected) in [
         (
             Vec::new(),
             common::live_selection::live_recent().to_string(),
@@ -269,6 +267,7 @@ fn import_command_uses_shared_bound_unless_scenario_overrides_it() {
         (vec!["--recent", "3"], "3".to_owned()),
         (vec!["--recent", "30d"], "30d".to_owned()),
     ] {
+        extra.extend(["--config", "unused-construction-only.toml"]);
         let command = import_cmd(
             "test@example.invalid",
             "test",
@@ -566,7 +565,7 @@ fn import_recent_days_form_is_rejected() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains(
-            "Relative date windows are no longer supported for recent",
+            "import-existing --recent requires a positive count",
         ))
         .stderr(predicate::str::contains("omit --recent"))
         .stderr(predicate::str::contains("--recent 100"));
@@ -828,7 +827,7 @@ fn kei_std_command() -> std::process::Command {
     std::process::Command::new(env!("CARGO_BIN_EXE_kei"))
 }
 
-/// Run `kei sync --recent N` reusing the post-import data_dir, capture
+/// Run fixed-date `kei sync` reusing the post-import data_dir, capture
 /// stderr, and parse downloaded/skipped counts. Returns
 /// `(downloaded, skipped_or_zero)`. Sync logs go to stderr via
 /// `tracing::info!`. Two patterns to match:
@@ -854,8 +853,6 @@ fn run_sync_against_fixture(
         password,
         "--config",
         config_path.to_str().unwrap(),
-        "--recent",
-        &common::live_selection::live_recent().to_string(),
         "--no-progress-bar",
     ]);
     let output = cmd

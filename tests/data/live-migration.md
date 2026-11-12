@@ -34,17 +34,13 @@ the exact exit-code-2 assertion for the removed shell partial-failure case.
 
 ## Bounded checkpoint coverage
 
-A recent-limited pass cannot checkpoint an incomplete library inventory. Live
-checks require either a stored token after proven EOF or the explicit
-`recent_limited_full_enumeration` hold with no token. The second run must do no
-new downloads in either mode. Config changes inspect pending reconciliation
-as well as the committed hash. Positive incremental and corrupt-token live
-checks run only when the bounded selection proves EOF; large libraries retain
-the checkpoint-hold, reset, config-drift, and file-recovery checks instead.
+Current live sync fixtures use a fixed lower capture-date bound supplied through `KEI_LIVE_SKIP_CREATED_BEFORE`, not a recent-item cap. Rust and shell helpers write it as `[filters].skip_created_before`; missing, invalid or rolling values fail before provider preflight. Choose a narrow bound containing at least one eligible asset; every selected item at or after that date is in scope. The separate `[import_sample].recent` value in `live-selection.toml` is harness-only input for import's positive-count CLI option.
+
+A date-limited pass cannot checkpoint a truncated library inventory. The required result is either a stored token after proven EOF or the explicit `date_bounded_full_enumeration` hold with no token. The second run must do no new downloads in either mode. Config changes inspect pending reconciliation as well as the committed hash. Positive incremental and corrupt-token live checks run only when the bounded selection proves EOF; truncated selections retain the checkpoint-hold, reset, config-drift and file-recovery checks instead. The Rust and shell live assertions use the fixed-date hold reason. This source reconciliation does not replace an authorized live run.
 
 | Adapted live assertion | Unconditional deterministic proof |
 | --- | --- |
-| `sync_incremental_second_run_skips_download` becomes `sync_bounded_second_run_preserves_checkpoint_and_skips_download`; shell token creation and second cycle | `run_cycle_recent_exact_inventory_stores_zone_token`, `watch_recent_exact_first_cycle_seeds_incremental_token`, `full_sync_recent_download_saves_token_when_cap_does_not_bind` |
+| `sync_incremental_second_run_skips_download` becomes `sync_bounded_second_run_preserves_checkpoint_and_skips_download`; shell token creation and second cycle | `full_sync_skip_created_before_stops_at_date_boundary`, `full_sync_skip_created_before_saves_token_when_boundary_does_not_truncate`, `run_cycle_bounded_smart_reconciliation_converges_without_advancing_source` |
 | Shell config hash promotion after resolution/media changes | `run_cycle_enum_config_drift_atomically_promotes_bridged_checkpoint`, `enum_config_hash_drift_stages_reconciliation_and_preserves_tokens`, `enum_config_revert_clears_pending_reconciliation` |
 | Shell corrupt-token fallback when a live token exists | `run_cycle_provider_session_failures_preserve_and_recover_checkpoints` (invalid-token full fallback, failed recovery, successful retry and steady state); `run_cycle_failed_token_repair_preserves_prior_sqlite_checkpoint` |
 | Shell missing-file discovery after forced full enumeration | `bundled_invalid_download_retains_retry_evidence_then_recovers_after_restart`, retained live deleted/truncated-file recovery |
@@ -61,12 +57,7 @@ and Docker/release/import/service smokes. File recovery must accept any media
 format. Keep the generated nonexistent-selector cases. Keep the separate
 opt-in cross-zone fixture unchanged.
 
-All general live paths use `live-selection.toml`. Explicit negative selector
-cases may override selectors; scan-limit tests may lower the shared bound.
-Preflight reports the bounded selection and observed eligible filename count,
-without exposing filenames or requiring specific formats. Empty selection is
-a failure, not a passing skip. Test state and download directories stay isolated. Live import seeds use fresh
-per-run trees, so previous cached media cannot change collision naming.
+All general live paths use `live-selection.toml` plus the required fixed-date environment value. Explicit negative selector cases may override selectors; import scan-limit tests may lower the separate import sample count. Preflight reports the bounded selection and observed eligible filename count, without exposing filenames or requiring specific formats. Empty selection is a failure, not a passing skip. Test state and download directories stay isolated. Live import seeds use fresh per-run trees, so previous cached media cannot change collision naming.
 
 ## Safety and validation
 

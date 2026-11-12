@@ -2486,7 +2486,7 @@ async fn unresolved_identity_inventory_requires_a_delta_bridge() {
 }
 
 #[tokio::test]
-async fn recent_exact_eof_bridge_receipt_survives_failed_cursor_commit_and_quiet_reopen() {
+async fn inventory_coverage_survives_failed_cursor_commit_and_quiet_reopen() {
     use crate::icloud::photos::PhotosSession;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2514,8 +2514,7 @@ async fn recent_exact_eof_bridge_receipt_survives_failed_cursor_commit_and_quiet
     }
 
     for drift in [false, true] {
-        let mut config = make_run_cycle_config();
-        config.filters.recent = Some(2);
+        let config = make_run_cycle_config();
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("state.db");
         let media = directory.path().join("media");
@@ -2559,6 +2558,15 @@ async fn recent_exact_eof_bridge_receipt_survives_failed_cursor_commit_and_quiet
             db.set_metadata("sync_token:PrimarySync", "preserved-prior")
                 .await
                 .unwrap();
+            db.set_metadata(
+                "recent_selection_recovery:PrimarySync",
+                "unparsed completed receipt",
+            )
+            .await
+            .unwrap();
+            db.set_metadata("inventory_reconciliation_required:PrimarySync", "1")
+                .await
+                .unwrap();
         }
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
         for cycle in 0..3 {
@@ -2594,7 +2602,6 @@ async fn recent_exact_eof_bridge_receipt_survives_failed_cursor_commit_and_quiet
                 &media,
                 db.clone(),
                 RunCycleDownloadConfigOptions {
-                    recent: Some(2),
                     ..RunCycleDownloadConfigOptions::default()
                 },
             );
@@ -2633,10 +2640,14 @@ async fn recent_exact_eof_bridge_receipt_survives_failed_cursor_commit_and_quiet
                     .await
                     .unwrap()
                     .unwrap();
+                assert_eq!(raw, "unparsed completed receipt");
                 assert_eq!(
-                    serde_json::from_str::<serde_json::Value>(&raw).unwrap()["complete"],
-                    true,
-                    "an early completed receipt still cannot match the uncommitted prior cursor"
+                    db.get_metadata("inventory_reconciliation_required:PrimarySync")
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    drift,
+                    "a staged configuration must activate before consuming its inventory request"
                 );
             } else {
                 let result = result.unwrap();
@@ -2655,10 +2666,11 @@ async fn recent_exact_eof_bridge_receipt_survives_failed_cursor_commit_and_quiet
                         .as_deref(),
                     Some(download::compute_config_hash(&config).as_str())
                 );
-                if cycle == 1 && !drift {
-                    assert!(
+                if cycle == 1 {
+                    assert_eq!(
                         queries.load(Ordering::SeqCst) > 0,
-                        "uncommitted receipt must retry inventory"
+                        drift,
+                        "only unactivated configuration repeats its guarded inventory"
                     );
                 }
                 if cycle == 2 {

@@ -1133,15 +1133,11 @@ fn config_show_emits_libraries_when_repeatable_named_zone() {
 }
 
 #[test]
-fn config_show_round_trips_persistent_recent_and_dates() {
+fn config_show_round_trips_persistent_fixed_dates() {
     let (stdout, _) = run_config_show(
-        "\n[filters]\nrecent = 100\nrecent_scope = \"per-filter\"\nskip_created_before = \"2024-01-01\"\nskip_created_after = \"2025-06-01T14:30:00\"\n",
+        "\n[filters]\nskip_created_before = \"2024-01-01\"\nskip_created_after = \"2025-06-01T14:30:00\"\n",
     );
-    assert!(stdout.contains("recent = 100"), "stdout: {stdout}");
-    assert!(
-        stdout.contains("recent_scope = \"per-filter\""),
-        "stdout: {stdout}"
-    );
+    assert!(!stdout.contains("recent"), "stdout: {stdout}");
     assert!(
         stdout.contains("skip_created_before = \"2024-01-01\""),
         "stdout: {stdout}"
@@ -1158,7 +1154,12 @@ enum RelativeInput {
     OverriddenToml,
 }
 
-fn assert_relative_refusal_preserves_archive(command: &[&str], key: &str, input: RelativeInput) {
+fn assert_relative_refusal_preserves_archive(
+    command: &[&str],
+    key: &str,
+    input: RelativeInput,
+    value: &str,
+) {
     let saved = !matches!(input, RelativeInput::Cli);
     let overrides = matches!(input, RelativeInput::OverriddenToml);
     let dir = tempfile::tempdir().unwrap();
@@ -1197,7 +1198,14 @@ fn assert_relative_refusal_preserves_archive(command: &[&str], key: &str, input:
         let config = std::fs::read_to_string(&config_path).unwrap();
         std::fs::write(
             &config_path,
-            format!("{config}\n[filters]\n{key} = \"30d\"\n"),
+            format!(
+                "{config}\n[filters]\n{key} = {}\n",
+                if value.parse::<u32>().is_ok() {
+                    value.to_owned()
+                } else {
+                    format!("\"{value}\"")
+                }
+            ),
         )
         .unwrap();
     }
@@ -1235,12 +1243,10 @@ fn assert_relative_refusal_preserves_archive(command: &[&str], key: &str, input:
         .arg(&config_path);
     let flag = format!("--{}", key.replace('_', "-"));
     if !saved {
-        cmd.args([flag.as_str(), "30d"]);
+        cmd.args([flag.as_str(), value]);
     }
     if overrides {
         cmd.args([
-            "--recent",
-            "100",
             "--skip-created-before",
             "2024-01-01",
             "--skip-created-after",
@@ -1250,18 +1256,23 @@ fn assert_relative_refusal_preserves_archive(command: &[&str], key: &str, input:
     let code = if saved { 1 } else { 2 };
     let output = cmd.assert().code(code).get_output().clone();
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected = if matches!(key, "recent" | "recent_scope") {
+        "count selection is no longer supported"
+    } else {
+        "Relative date windows are no longer supported"
+    };
     assert!(
-        stderr.contains("Relative date windows are no longer supported"),
+        stderr.contains(expected),
         "{command:?} {key} saved={saved} overrides={overrides}: {stderr}"
     );
     assert!(stderr.contains(key) || stderr.contains(&flag), "{stderr}");
     assert!(stderr.contains("YYYY-MM-DD"), "{stderr}");
-    if key == "recent" {
+    if matches!(key, "recent" | "recent_scope") {
         assert!(
-            stderr.contains("Remove recent from [filters] or omit --recent"),
+            stderr.contains("Remove recent") || stderr.contains("Remove --recent"),
             "{stderr}"
         );
-        assert!(stderr.contains("recent = 100 or --recent 100"), "{stderr}");
+        assert!(!stderr.contains("recent = 100 or --recent 100"), "{stderr}");
     } else {
         assert!(
             stderr.contains("Remove this date limit from [filters] or omit its CLI flag"),
@@ -1303,9 +1314,7 @@ fn assert_relative_refusal_preserves_archive(command: &[&str], key: &str, input:
         cmd.env("KEI_DATA_DIR", &absent_data_dir)
             .assert()
             .code(2)
-            .stderr(predicate::str::contains(
-                "Relative date windows are no longer supported",
-            ));
+            .stderr(predicate::str::contains(expected));
         assert!(
             !absent_data_dir.exists(),
             "CLI refusal must precede data/support initialization"
@@ -1319,7 +1328,7 @@ fn assert_relative_refusal_preserves_archive(command: &[&str], key: &str, input:
 fn relative_cli_refusal_preserves_config_state_and_media_before_auth() {
     for command in [&["sync"][..], &["service", "run"][..]] {
         for key in ["recent", "skip_created_before", "skip_created_after"] {
-            assert_relative_refusal_preserves_archive(command, key, RelativeInput::Cli);
+            assert_relative_refusal_preserves_archive(command, key, RelativeInput::Cli, "30d");
         }
     }
 }
@@ -1332,7 +1341,7 @@ fn relative_toml_refusal_preserves_config_state_and_media_before_auth() {
         &["config", "show"][..],
     ] {
         for key in ["recent", "skip_created_before", "skip_created_after"] {
-            assert_relative_refusal_preserves_archive(command, key, RelativeInput::Toml);
+            assert_relative_refusal_preserves_archive(command, key, RelativeInput::Toml, "30d");
         }
     }
 }
@@ -1341,8 +1350,40 @@ fn relative_toml_refusal_preserves_config_state_and_media_before_auth() {
 fn relative_toml_refusal_cannot_be_masked_by_fixed_cli_overrides() {
     for command in [&["sync"][..], &["service", "run"][..]] {
         for key in ["recent", "skip_created_before", "skip_created_after"] {
-            assert_relative_refusal_preserves_archive(command, key, RelativeInput::OverriddenToml);
+            assert_relative_refusal_preserves_archive(
+                command,
+                key,
+                RelativeInput::OverriddenToml,
+                "30d",
+            );
         }
+    }
+}
+
+#[test]
+fn retired_sync_count_inputs_preserve_archive_before_auth_or_startup_writes() {
+    for (key, value) in [
+        ("recent", "10"),
+        ("recent", "0"),
+        ("recent_scope", "global"),
+        ("recent_scope", "per-filter"),
+    ] {
+        for command in [&["sync"][..], &["service", "run"][..]] {
+            assert_relative_refusal_preserves_archive(command, key, RelativeInput::Cli, value);
+            assert_relative_refusal_preserves_archive(command, key, RelativeInput::Toml, value);
+            assert_relative_refusal_preserves_archive(
+                command,
+                key,
+                RelativeInput::OverriddenToml,
+                value,
+            );
+        }
+        assert_relative_refusal_preserves_archive(
+            &["config", "show"],
+            key,
+            RelativeInput::Toml,
+            value,
+        );
     }
 }
 
@@ -1357,8 +1398,6 @@ fn fixed_date_sync_control_reaches_offline_auth_boundary() {
         .args(["sync", "--config"])
         .arg(config_path)
         .args([
-            "--recent",
-            "100",
             "--skip-created-before",
             "2024-01-01",
             "--skip-created-after",

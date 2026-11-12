@@ -23,10 +23,9 @@ use super::config::{DownloadConfig, inventory_scope};
 use super::context::{DownloadContext, preload_download_context};
 use super::models::{
     DATE_BOUNDED_FULL_ENUMERATION_REASON, DownloadControls, DownloadStore, FullEnumerationReason,
-    ICLOUD_ALBUM_COUNT_ERROR_REASON, InventoryMeasurement, PassKey,
-    RECENT_LIMITED_FULL_ENUMERATION_REASON, RecoveryAction, SyncResult, merge_streaming_result,
-    merge_token_recovery_result, set_full_enumeration_reason, sync_token_blocked_explanation,
-    sync_token_blocked_source,
+    ICLOUD_ALBUM_COUNT_ERROR_REASON, InventoryMeasurement, PassKey, RecoveryAction, SyncResult,
+    merge_streaming_result, merge_token_recovery_result, set_full_enumeration_reason,
+    sync_token_blocked_explanation, sync_token_blocked_source,
 };
 use super::selection::{
     build_pass_configs_resolving_deferred_excludes, build_pass_configs_with_download_concurrency,
@@ -91,6 +90,7 @@ where
 
 #[derive(Debug)]
 struct PerPassStreamingResult {
+    deferred_album_snapshot: Option<(String, String, i64)>,
     pass_index: usize,
     kind: crate::commands::PassKind,
     label: String,
@@ -380,13 +380,6 @@ async fn receive_pass_token(
     }
 }
 
-struct RecentFrontier {
-    asset_ids: Arc<FxHashSet<String>>,
-    oldest_created: Option<DateTime<Utc>>,
-    query_token: Option<String>,
-    truncated: bool,
-}
-
 struct FullPassStreamOptions {
     pass_index: usize,
     controls: DownloadControls,
@@ -525,101 +518,6 @@ impl AlbumSnapshotRecorder {
     }
 }
 
-fn should_use_scope_recent_frontier(passes: &[crate::commands::AlbumPass]) -> bool {
-    passes
-        .iter()
-        .any(|pass| pass.kind != crate::commands::PassKind::Unfiled || !pass.exclude_ids.is_empty())
-}
-
-fn should_use_global_recent_frontier(
-    passes: &[crate::commands::AlbumPass],
-    config: &DownloadConfig,
-) -> bool {
-    config.recent.is_some()
-        && config.recent_scope == crate::cli::RecentScope::Global
-        && should_use_scope_recent_frontier(passes)
-}
-
-async fn build_recent_frontier(
-    passes: &[crate::commands::AlbumPass],
-    config: &DownloadConfig,
-    controls: DownloadControls,
-    shutdown_token: CancellationToken,
-) -> Result<Option<RecentFrontier>> {
-    let Some(recent) = config.recent else {
-        return Ok(None);
-    };
-    if !should_use_global_recent_frontier(passes, config) {
-        return Ok(None);
-    }
-
-    let Some(frontier_source) = passes
-        .iter()
-        .find(|pass| pass.kind == crate::commands::PassKind::Unfiled)
-        .map(|pass| pass.album.clone_as_library_wide())
-        .or_else(|| {
-            passes
-                .first()
-                .map(|pass| pass.album.clone_as_library_wide())
-        })
-    else {
-        return Ok(None);
-    };
-
-    let (stream, token_rx) = open_photo_stream_for_controls(
-        &frontier_source,
-        (!config.complete_path_selection).then_some(recent),
-        None,
-        config.concurrent_downloads,
-        config.concurrent_downloads,
-        controls,
-        false,
-    );
-    let mut stream = Box::pin(stream.take_until(shutdown_token.clone().cancelled_owned()));
-
-    let mut asset_ids = FxHashSet::default();
-    let mut oldest_created: Option<DateTime<Utc>> = None;
-    let mut prefix_ended = false;
-    let mut selected = 0u32;
-    while let Some(item) = stream.next().await {
-        if shutdown_token.is_cancelled() {
-            break;
-        }
-        let asset = item?;
-        let created = asset.created();
-        prefix_ended |= selected >= recent
-            || enumeration_created_lower_bound(config)
-                .map(|boundary| created < boundary)
-                .unwrap_or(false);
-        if prefix_ended {
-            if config.complete_path_selection {
-                continue;
-            }
-            break;
-        }
-        selected += 1;
-        oldest_created = Some(oldest_created.map_or(created, |oldest| oldest.min(created)));
-        asset_ids.insert(asset.asset_record_name().to_string());
-    }
-    drop(stream);
-    let query_token = if !shutdown_token.is_cancelled() {
-        receive_pass_token(token_rx, &shutdown_token)
-            .await
-            .ok()
-            .flatten()
-            .map(|token| token.trim().to_owned())
-            .filter(|token| !token.is_empty())
-    } else {
-        None
-    };
-    Ok(Some(RecentFrontier {
-        asset_ids: Arc::new(asset_ids),
-        oldest_created,
-        truncated: prefix_ended || query_token.is_none(),
-        query_token,
-    }))
-}
-
 /// Convert a capture-local date lower bound into a conservative UTC
 /// enumeration bound.  Capture offsets can move the local midnight by almost
 /// a day, so stopping at the unadjusted UTC midnight could omit valid assets.
@@ -629,43 +527,22 @@ fn enumeration_created_lower_bound(config: &DownloadConfig) -> Option<DateTime<U
         .map(crate::config::CreatedDateFilter::conservative_utc_lower_bound)
 }
 
-fn stream_created_lower_bound(
-    config: &DownloadConfig,
-    frontier: Option<&RecentFrontier>,
-) -> Option<DateTime<Utc>> {
-    frontier
-        .and_then(|frontier| frontier.oldest_created)
-        .into_iter()
-        .chain(enumeration_created_lower_bound(config))
-        .max()
-}
-
 fn filter_stream_to_enumeration_bounds(
     stream: DownloadPhotoStream,
     config: &DownloadConfig,
-    frontier: Option<&RecentFrontier>,
     bounds_truncated: Arc<AtomicBool>,
     shutdown_token: CancellationToken,
 ) -> DownloadPhotoStream {
-    let asset_ids = frontier.map(|frontier| Arc::clone(&frontier.asset_ids));
-    let lower_created_bound = stream_created_lower_bound(config, frontier);
+    let lower_created_bound = enumeration_created_lower_bound(config);
     if config.complete_path_selection {
-        let limit = frontier.is_none().then_some(config.recent).flatten();
-        let mut seen = 0u64;
         let mut prefix_ended = false;
         let stream = stream.take_until(shutdown_token.cancelled_owned());
         return Box::pin(stream.filter_map(move |item| {
             std::future::ready(match item {
                 Ok(asset) => {
-                    prefix_ended |= lower_created_bound
-                        .is_some_and(|bound| asset.created() < bound)
-                        || limit.is_some_and(|limit| seen >= u64::from(limit));
-                    seen = seen.saturating_add(1);
-                    let selected = !prefix_ended
-                        && asset_ids
-                            .as_ref()
-                            .is_none_or(|ids| ids.contains(asset.asset_record_name()));
-                    if selected {
+                    prefix_ended |=
+                        lower_created_bound.is_some_and(|bound| asset.created() < bound);
+                    if !prefix_ended {
                         Some(Ok(asset))
                     } else {
                         bounds_truncated.store(true, Ordering::Relaxed);
@@ -676,52 +553,20 @@ fn filter_stream_to_enumeration_bounds(
             })
         }));
     }
-    let id_filter_truncated = Arc::clone(&bounds_truncated);
-    Box::pin(
-        stream
-            .take_while(move |item| {
-                std::future::ready(match item {
-                    Ok(asset) => {
-                        let in_bounds = lower_created_bound
-                            .map(|boundary| asset.created() >= boundary)
-                            .unwrap_or(true);
-                        if !in_bounds {
-                            bounds_truncated.store(true, Ordering::Relaxed);
-                        }
-                        in_bounds
-                    }
-                    Err(_) => true,
-                })
-            })
-            .filter_map(move |item| {
-                std::future::ready(match item {
-                    Ok(asset)
-                        if asset_ids
-                            .as_ref()
-                            .map(|ids| ids.contains(asset.asset_record_name()))
-                            .unwrap_or(true) =>
-                    {
-                        Some(Ok(asset))
-                    }
-                    Ok(_) => {
-                        id_filter_truncated.store(true, Ordering::Relaxed);
-                        None
-                    }
-                    Err(e) => Some(Err(e)),
-                })
-            }),
-    )
-}
-
-fn scope_frontier_limit(
-    config: &DownloadConfig,
-    recent_frontier: Option<&RecentFrontier>,
-) -> Option<u32> {
-    if config.complete_path_selection {
-        None
-    } else {
-        recent_frontier.map_or(config.recent, |_| None)
-    }
+    Box::pin(stream.take_while(move |item| {
+        std::future::ready(match item {
+            Ok(asset) => {
+                let in_bounds = lower_created_bound
+                    .map(|boundary| asset.created() >= boundary)
+                    .unwrap_or(true);
+                if !in_bounds {
+                    bounds_truncated.store(true, Ordering::Relaxed);
+                }
+                in_bounds
+            }
+            Err(_) => true,
+        })
+    }))
 }
 
 async fn run_full_pass_stream<S>(
@@ -778,13 +623,39 @@ where
         .deferring_metadata_drain(),
     )
     .await?;
-    if let Some(snapshot) = &options.album_snapshot {
+    if let Some(snapshot) = &options.album_snapshot
+        && !pass_config.inventory_reconciliation
+    {
         snapshot.complete_if_clean(&mut result).await;
     }
+    if pass_config.inventory_reconciliation
+        && options
+            .album_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.write_failed.load(Ordering::Relaxed))
+    {
+        result.state_write_failures += 1;
+    }
+    let deferred_album_snapshot = options
+        .album_snapshot
+        .filter(|snapshot| {
+            pass_config.inventory_reconciliation
+                && !snapshot.write_failed.load(Ordering::Relaxed)
+                && result.enumeration_errors == 0
+                && result.enumeration_complete
+        })
+        .map(|snapshot| {
+            (
+                snapshot.library.to_string(),
+                snapshot.container_id.to_string(),
+                snapshot.generation,
+            )
+        });
 
     let elapsed = pass_start.elapsed();
     pass_pb.finish_and_clear();
     Ok(PerPassStreamingResult {
+        deferred_album_snapshot,
         pass_index: options.pass_index,
         kind: options.kind,
         label: pass_config.pass_label().to_string(),
@@ -848,18 +719,6 @@ struct PassCountPlan {
     len_errors: usize,
 }
 
-fn capped_exact_total(counts: &[u64], recent: Option<u32>) -> u64 {
-    let total = counts.iter().sum::<u64>();
-    total.min(recent.map(u64::from).unwrap_or(u64::MAX))
-}
-
-fn display_total_for_recent_scope(counts: &[u64], config: &DownloadConfig) -> u64 {
-    match (config.recent, config.recent_scope) {
-        (Some(recent), crate::cli::RecentScope::Global) => capped_exact_total(counts, Some(recent)),
-        _ => counts.iter().sum(),
-    }
-}
-
 fn should_skip_pass_count_fetch(config: &DownloadConfig) -> bool {
     // Recent-limited and lower-date-bounded runs deliberately enumerate only a
     // prefix of each newest-first pass. The Hyperion count endpoint reports the
@@ -867,7 +726,7 @@ fn should_skip_pass_count_fetch(config: &DownloadConfig) -> bool {
     // bounded prefix, so using it as an exact undercount bound false-fires on
     // live accounts with sparse windows. These bounded full syncs suppress the
     // sync token below because they are not complete zone enumerations.
-    config.recent.is_some() || config.skip_created_before.is_some()
+    config.skip_created_before.is_some()
 }
 
 async fn build_pass_count_plan(
@@ -876,9 +735,8 @@ async fn build_pass_count_plan(
     _controls: DownloadControls,
 ) -> PassCountPlan {
     if should_skip_pass_count_fetch(config) {
-        let display_count = config.recent.map(u64::from).unwrap_or(0);
         return PassCountPlan {
-            display_counts: vec![display_count; passes.len()],
+            display_counts: vec![0; passes.len()],
             stream_total_counts: vec![None; passes.len()],
             exact_total: None,
             len_errors: 0,
@@ -903,7 +761,7 @@ async fn build_pass_count_plan(
     } else {
         display_counts.iter().copied().map(Some).collect()
     };
-    let exact_total = (len_errors == 0).then(|| capped_exact_total(&display_counts, config.recent));
+    let exact_total = (len_errors == 0).then(|| display_counts.iter().sum());
 
     PassCountPlan {
         display_counts,
@@ -930,7 +788,7 @@ enum PaginationShortfall {
 }
 
 /// Pure classifier for the pagination-undercount gate. `total` is the
-/// pre-enumeration API count (post `--recent` cap and known filters);
+/// pre-enumeration API count for the selected passes and known filters;
 /// `unique_seen` is the producer's `assets_seen` count after duplicate asset
 /// IDs have been suppressed. Caller is responsible for the `total > 0` guard
 /// and any dry-run / print-only suppression.
@@ -990,6 +848,7 @@ pub(super) async fn download_photos_full_with_token_policy(
     repair_token_gaps: bool,
 ) -> Result<SyncResult> {
     let started = Instant::now();
+    let mut deferred_album_snapshots = Vec::new();
     let record_album_snapshots = should_record_album_snapshots(passes, config, controls);
     let needs_per_pass = config.requires_per_pass_paths() || record_album_snapshots;
 
@@ -1017,17 +876,11 @@ pub(super) async fn download_photos_full_with_token_policy(
     let mut exact_total = pass_count_plan.exact_total;
     let mut pagination_count_deduction = 0u64;
     let len_errors = pass_count_plan.len_errors;
-    let display_total = display_total_for_recent_scope(&pass_counts, config);
+    let display_total = pass_counts.iter().sum();
     let deferred_unfiled = deferred_unfiled_index(passes);
-    let recent_frontier =
-        build_recent_frontier(passes, config, controls, shutdown_token.clone()).await?;
-    let bounds_truncated = Arc::new(AtomicBool::new(
-        recent_frontier
-            .as_ref()
-            .is_some_and(|frontier| frontier.truncated),
-    ));
+    let bounds_truncated = Arc::new(AtomicBool::new(false));
     let strict_empty_tail_errors = (config.complete_path_selection
-        || (config.recent.is_none() && config.skip_created_before.is_none()))
+        || config.skip_created_before.is_none())
         && !controls.run_mode.only_print_filenames()
         && !controls.run_mode.is_dry_run();
 
@@ -1101,7 +954,6 @@ pub(super) async fn download_photos_full_with_token_policy(
                 let shutdown_token = shutdown_token.clone();
                 let download_client = download_client.clone();
                 let deferred_ids = deferred_ids.clone();
-                let recent_frontier = recent_frontier.as_ref();
                 let download_ctx = shared_download_ctx.clone();
                 let bounds_truncated = Arc::clone(&bounds_truncated);
                 let initial_order = initial_order.clone();
@@ -1118,7 +970,7 @@ pub(super) async fn download_photos_full_with_token_policy(
                     };
                     let (stream, token_rx) = open_photo_stream_for_controls(
                         &pass.album,
-                        scope_frontier_limit(config, recent_frontier),
+                        None,
                         *total_count,
                         config.concurrent_downloads,
                         pass_config.concurrent_downloads,
@@ -1128,7 +980,6 @@ pub(super) async fn download_photos_full_with_token_policy(
                     let stream = filter_stream_to_enumeration_bounds(
                         stream,
                         config,
-                        recent_frontier,
                         Arc::clone(&bounds_truncated),
                         shutdown_token.clone(),
                     );
@@ -1191,6 +1042,7 @@ pub(super) async fn download_photos_full_with_token_policy(
         let mut deferred_exclusions_complete = true;
         for pass_result in pass_results {
             let PerPassStreamingResult {
+                deferred_album_snapshot,
                 pass_index,
                 kind,
                 label,
@@ -1199,6 +1051,7 @@ pub(super) async fn download_photos_full_with_token_policy(
                 token_rx,
                 result,
             } = pass_result?;
+            deferred_album_snapshots.extend(deferred_album_snapshot);
 
             if deferred_unfiled.is_some()
                 && kind == crate::commands::PassKind::Album
@@ -1249,7 +1102,7 @@ pub(super) async fn download_photos_full_with_token_policy(
                     let stream_total_count = pass_stream_counts.get(index).copied().flatten();
                     let (stream, token_rx) = open_photo_stream_for_controls(
                         &pass.album,
-                        scope_frontier_limit(config, recent_frontier.as_ref()),
+                        None,
                         stream_total_count,
                         config.concurrent_downloads,
                         pass_config.concurrent_downloads,
@@ -1260,7 +1113,6 @@ pub(super) async fn download_photos_full_with_token_policy(
                     let stream = filter_stream_to_enumeration_bounds(
                         stream,
                         config,
-                        recent_frontier.as_ref(),
                         Arc::clone(&bounds_truncated),
                         shutdown_token.clone(),
                     );
@@ -1338,7 +1190,7 @@ pub(super) async fn download_photos_full_with_token_policy(
             .map(|((pass_index, pass), total_count)| {
                 let (stream, token_rx) = open_photo_stream_for_controls(
                     &pass.album,
-                    scope_frontier_limit(config, recent_frontier.as_ref()),
+                    None,
                     *total_count,
                     config.concurrent_downloads,
                     config.concurrent_downloads,
@@ -1363,7 +1215,6 @@ pub(super) async fn download_photos_full_with_token_policy(
                     filter_stream_to_enumeration_bounds(
                         stream,
                         config,
-                        recent_frontier.as_ref(),
                         Arc::clone(&bounds_truncated),
                         shutdown_token.clone(),
                     ),
@@ -1396,12 +1247,13 @@ pub(super) async fn download_photos_full_with_token_policy(
     // delivered a naturally drained stream and a usable token.
     if exact_total.is_some() {
         exact_total = Some(
-            capped_exact_total(&pagination_counts, config.recent)
+            pagination_counts
+                .iter()
+                .sum::<u64>()
                 .saturating_sub(pagination_count_deduction),
         );
     }
     let api_total_at_start = if len_errors == 0
-        && config.recent.is_none()
         && config.skip_created_before.is_none()
         && !controls.run_mode.only_print_filenames()
         && !controls.run_mode.is_dry_run()
@@ -1529,24 +1381,15 @@ pub(super) async fn download_photos_full_with_token_policy(
         path_selection_queries_complete = config.complete_path_selection
             && streaming_result.enumeration_complete
             && streaming_result.enumeration_errors == 0
-            && match classify_zone_token_evidence(&observations) {
-                ZoneTokenEvidence::Complete { token } => recent_frontier
-                    .as_ref()
-                    .is_none_or(|frontier| frontier.query_token.as_deref() == Some(token.as_str())),
-                _ => false,
-            };
+            && matches!(
+                classify_zone_token_evidence(&observations),
+                ZoneTokenEvidence::Complete { .. }
+            );
         let bounded_stream_truncated = bounds_truncated.load(Ordering::Relaxed);
         let repair_entire_enumeration = (!streaming_result.enumeration_complete
             || streaming_result.enumeration_errors > 0)
             && !bounded_stream_truncated;
-        let frontier_proof_incomplete = config.complete_path_selection
-            && recent_frontier.is_some()
-            && !path_selection_queries_complete;
-        let initial_evidence = if frontier_proof_incomplete {
-            ZoneTokenEvidence::Incomplete {
-                reason: TokenGap::Mismatch,
-            }
-        } else if bounded_stream_truncated {
+        let initial_evidence = if bounded_stream_truncated {
             ZoneTokenEvidence::Incomplete {
                 reason: TokenGap::EnumerationIncomplete,
             }
@@ -1626,7 +1469,7 @@ pub(super) async fn download_photos_full_with_token_policy(
                     let total_count = pass_stream_counts.get(pass_key.index).copied().flatten();
                     let (stream, token_rx) = open_photo_stream_for_controls(
                         &pass.album,
-                        scope_frontier_limit(config, recent_frontier.as_ref()),
+                        None,
                         total_count,
                         config.concurrent_downloads,
                         pass_config.concurrent_downloads,
@@ -1636,7 +1479,6 @@ pub(super) async fn download_photos_full_with_token_policy(
                     let stream = filter_stream_to_enumeration_bounds(
                         stream,
                         config,
-                        recent_frontier.as_ref(),
                         Arc::clone(&bounds_truncated),
                         shutdown_token.clone(),
                     );
@@ -1837,7 +1679,7 @@ pub(super) async fn download_photos_full_with_token_policy(
     // whose enumeration phase finished still clears the marker.
     let enumeration_complete = streaming_result.enumeration_complete;
     let enumeration_errors = streaming_result.enumeration_errors;
-    let tail_probes = if config.recent.is_none() && config.skip_created_before.is_none() {
+    let tail_probes = if config.skip_created_before.is_none() {
         pass_stream_counts
             .iter()
             .filter(|count| count.is_some())
@@ -1901,7 +1743,7 @@ pub(super) async fn download_photos_full_with_token_policy(
         stats.sync_token_receivers_dropped = token_receivers_dropped;
         stats.sync_token_unique_values = token_unique_values;
     }
-    let bounded_run = config.recent.is_some() || config.skip_created_before.is_some();
+    let bounded_run = config.skip_created_before.is_some();
     let bounded_limit_truncated = bounded_run
         && (bounds_truncated.load(Ordering::Relaxed)
             || (token_eligible
@@ -1926,11 +1768,7 @@ pub(super) async fn download_photos_full_with_token_policy(
         && !controls.run_mode.is_dry_run()
         && enumeration_errors == 0
     {
-        let bounded_reason = if config.recent.is_some() {
-            RECENT_LIMITED_FULL_ENUMERATION_REASON
-        } else {
-            DATE_BOUNDED_FULL_ENUMERATION_REASON
-        };
+        let bounded_reason = DATE_BOUNDED_FULL_ENUMERATION_REASON;
         checkpoint.bounded_path_selection_complete =
             path_selection_queries_complete && !checkpoint.sync_token_blocked;
         checkpoint.sync_token_blocked = true;
@@ -1978,6 +1816,7 @@ pub(super) async fn download_photos_full_with_token_policy(
     checkpoint.project(stats);
     result.sync_token = sync_token;
     result.full_enumeration_ran = true;
+    result.deferred_album_snapshots = deferred_album_snapshots;
     // Counts are diagnostic only. Natural completion and the actual queried
     // passes, not a full-query flag or the composed activity total, establish
     // coverage. Configured bounds never seed a complete inventory baseline.
@@ -1991,7 +1830,6 @@ pub(super) async fn download_photos_full_with_token_policy(
         && matches!(result.outcome, super::models::DownloadOutcome::Success)
         && controls.run_mode.downloads_files()
         && !config.retry_only
-        && config.recent.is_none()
         && config.skip_created_before.is_none()
         && config.skip_created_after.is_none()
         && !bounds_truncated.load(Ordering::Relaxed)

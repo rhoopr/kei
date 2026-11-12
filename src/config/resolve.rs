@@ -712,14 +712,6 @@ impl Config {
                     .map_err(|e| anyhow::anyhow!("Invalid --filename-exclude pattern '{p}': {e}"))
             })
             .collect::<anyhow::Result<_>>()?;
-        let persistent_recent = toml_filters.and_then(|f| f.recent);
-        let recent_raw = sync.recent.or(persistent_recent);
-        let persistent_recent_scope = toml_filters.and_then(|f| f.recent_scope);
-        let recent_scope = sync
-            .recent_scope
-            .or(persistent_recent_scope)
-            .unwrap_or_default();
-        let recent_scope_was_set = sync.recent_scope.is_some() || persistent_recent_scope.is_some();
         let persistent_skip_created_before =
             toml_filters.and_then(|f| f.skip_created_before.clone());
         let persistent_skip_created_after = toml_filters.and_then(|f| f.skip_created_after.clone());
@@ -727,11 +719,6 @@ impl Config {
             .skip_created_before
             .or_else(|| persistent_skip_created_before.clone());
 
-        let recent = recent_raw.map(|crate::cli::RecentLimit::Count(n)| n);
-        anyhow::ensure!(
-            recent_raw.is_some() || !recent_scope_was_set,
-            "`recent_scope` only applies when `recent` is set. Set a count with recent = 100 or --recent 100, or remove recent_scope / --recent-scope."
-        );
         let skip_created_after_str = sync
             .skip_created_after
             .or_else(|| persistent_skip_created_after.clone());
@@ -864,10 +851,6 @@ impl Config {
                 media,
                 skip_created_before,
                 skip_created_after,
-                recent,
-                recent_scope,
-                persistent_recent,
-                persistent_recent_scope,
                 persistent_skip_created_before,
                 persistent_skip_created_after,
                 skip_videos,
@@ -2169,7 +2152,6 @@ mod tests {
         assert!(!cfg.filters.skip_videos);
         assert!(!cfg.filters.skip_photos);
         assert_eq!(cfg.photos.live_photo_mode, LivePhotoMode::Both);
-        assert!(cfg.filters.recent.is_none());
         assert!(cfg.filters.skip_created_before.is_none());
         assert!(cfg.filters.skip_created_after.is_none());
         // Photos
@@ -2928,68 +2910,22 @@ mod tests {
         assert!(cfg.report.json.is_none());
     }
     #[test]
-    fn test_build_recent_cli_overrides_toml() {
-        let toml_str = r#"
-            [filters]
-            recent = 500
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Count(100));
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.filters.recent, Some(100));
-    }
-    #[test]
-    fn test_build_recent_from_toml() {
-        let toml_str = r#"
-            [filters]
-            recent = 500
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.filters.recent, Some(500));
-        assert_eq!(cfg.filters.recent_scope, crate::cli::RecentScope::Global);
-    }
-    #[test]
-    fn test_build_recent_scope_cli_overrides_toml() {
-        let toml_str = r#"
-            [filters]
-            recent = 500
-            recent_scope = "per-filter"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Count(100));
-        sync.recent_scope = Some(crate::cli::RecentScope::Global);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.filters.recent, Some(100));
-        assert_eq!(cfg.filters.recent_scope, crate::cli::RecentScope::Global);
-    }
-    #[test]
-    fn test_build_recent_scope_from_toml() {
-        let toml_str = r#"
-            [filters]
-            recent = 500
-            recent_scope = "per-filter"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.filters.recent, Some(500));
-        assert_eq!(cfg.filters.recent_scope, crate::cli::RecentScope::PerFilter);
+    fn retired_count_inputs_fail_before_resolution() {
+        for setting in [
+            "recent = 500",
+            "recent = \"100\"",
+            "recent = \"14d\"",
+            "recent_scope = \"global\"",
+            "recent_scope = \"per-filter\"",
+        ] {
+            let body = format!("[filters]\n{setting}\nskip_created_before = \"2025-01-01\"\n");
+            assert!(
+                toml::from_str::<TomlConfig>(&body)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown field `recent")
+            );
+        }
     }
     #[test]
     fn test_build_skip_dates_cli_overrides_toml() {
@@ -3074,7 +3010,6 @@ mod tests {
             libraries = ["SharedSync-FULL"]
             albums = ["Album1"]
             media = ["photos", "live-photos"]
-            recent = 50
 
             [photos]
             resolution = "medium"
@@ -3115,7 +3050,6 @@ mod tests {
         );
         assert_album_raw(&cfg, &["Album1"]);
         assert!(cfg.filters.skip_videos);
-        assert_eq!(cfg.filters.recent, Some(50));
         assert!(matches!(cfg.photos.resolution, PhotoResolution::Medium));
         assert!(matches!(
             cfg.photos.live_resolution,
@@ -4122,17 +4056,6 @@ mod tests {
         assert_eq!(cfg.download.threads_num, 16);
     }
     #[test]
-    fn test_build_recent_count_populates_recent_field() {
-        let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Count(100));
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.filters.recent, Some(100));
-        assert!(
-            cfg.filters.skip_created_before.is_none(),
-            "Count form must not touch skip_created_before"
-        );
-    }
-    #[test]
     fn test_build_relative_skip_created_before_rejected() {
         let mut sync = default_sync();
         sync.skip_created_before = Some("30d".to_string());
@@ -4168,14 +4091,10 @@ mod tests {
         assert!(err.contains("YYYY-MM-DD"), "{err}");
     }
     #[test]
-    fn test_build_recent_count_orthogonal_with_skip_created_before() {
-        // Count and skip_created_before are orthogonal - take the N most
-        // recent assets, filtered to those after the cutoff.
+    fn test_build_fixed_skip_created_before() {
         let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Count(100));
         sync.skip_created_before = Some("2024-01-01".to_string());
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.filters.recent, Some(100));
         assert!(cfg.filters.skip_created_before.is_some());
     }
     #[test]
@@ -4188,30 +4107,20 @@ mod tests {
         let err = toml::from_str::<TomlConfig>(toml_str)
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("Relative date windows are no longer supported for recent"),
-            "{err}"
-        );
-        assert!(
-            err.contains("Remove recent from [filters] or omit --recent"),
-            "{err}"
-        );
+        assert!(err.contains("unknown field `recent`"), "{err}");
     }
     #[test]
-    fn test_build_recent_count_from_toml_integer() {
+    fn test_retired_count_from_toml_integer() {
         let toml_str = r#"
             [filters]
             recent = 250
         "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.filters.recent, Some(250));
+        assert!(
+            toml::from_str::<TomlConfig>(toml_str)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field `recent`")
+        );
     }
     #[test]
     fn test_build_recent_scope_without_recent_rejected() {
@@ -4219,15 +4128,9 @@ mod tests {
             [filters]
             recent_scope = "per-filter"
         "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let err = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap_err()
-        .to_string();
+        let err = toml::from_str::<TomlConfig>(toml_str)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("recent_scope"), "{err}");
         assert!(err.contains("recent"), "{err}");
     }
@@ -4241,24 +4144,18 @@ mod tests {
         let err = toml::from_str::<TomlConfig>(toml_str)
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("Relative date windows are no longer supported for recent"),
-            "{err}"
-        );
-        assert!(err.contains("recent = 100"), "{err}");
+        assert!(err.contains("unknown field `recent`"), "{err}");
     }
     #[test]
-    fn test_build_recent_count_combines_with_toml_skip_created_before() {
+    fn test_build_toml_fixed_skip_created_before() {
         let toml_str = r#"
             [filters]
             skip_created_before = "2024-01-01"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Count(7));
+        let sync = default_sync();
         let cfg =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.filters.recent, Some(7));
         assert_eq!(
             cfg.filters.skip_created_before,
             Some(CreatedDateFilter::CaptureDate(

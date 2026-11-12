@@ -157,6 +157,14 @@ impl SqliteStateDb {
                     )?;
                 }
             }
+            for (library, container, generation) in &transition.album_snapshots {
+                super::membership::complete_album_membership_snapshot_tx(
+                    &tx,
+                    library,
+                    container,
+                    *generation,
+                )?;
+            }
             for (key, value) in transition.metadata_updates {
                 tx.execute(
                     "INSERT INTO metadata (key, value) VALUES (?1, ?2) \

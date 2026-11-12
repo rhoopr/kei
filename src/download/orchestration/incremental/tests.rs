@@ -42,7 +42,39 @@ use super::super::test_support::{
     incremental_test_config, mock_album, relation_delete_record, seed_complete_album_snapshot,
     seed_downloaded_metadata_asset, test_config, unused_unfiled_changes_pass,
 };
-use super::{download_photos_incremental, download_photos_incremental_collecting_inner};
+use super::{
+    download_photos_incremental, download_photos_incremental_collecting,
+    download_photos_incremental_collecting_inner,
+};
+
+async fn run_incremental_strategy(
+    collecting: bool,
+    passes: &[AlbumPass],
+    config: &Arc<DownloadConfig>,
+    cursor: &str,
+) -> anyhow::Result<super::super::models::SyncResult> {
+    if collecting {
+        download_photos_incremental_collecting(
+            &Client::new(),
+            passes,
+            config,
+            cursor,
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+    } else {
+        download_photos_incremental(
+            &Client::new(),
+            passes,
+            config,
+            cursor,
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+    }
+}
 
 async fn relation_removed_metadata_edit_fixture(
     db: &Arc<SqliteStateDb>,
@@ -480,7 +512,6 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
         drop(db);
         let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
         config.state_db = Some(db.clone());
-        config.recent = Some(10);
         let pass = AlbumPass {
             kind: PassKind::Unfiled,
             album: changes_album(
@@ -498,7 +529,7 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
         tokio::fs::write(&sidecars[0], b"not parseable XMP")
             .await
             .unwrap();
-        let failed = download_photos_incremental(
+        let failed = download_photos_incremental_collecting(
             &Client::new(),
             std::slice::from_ref(&pass),
             &Arc::new(config.clone()),
@@ -527,7 +558,7 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
         tokio::fs::write(&sidecars[0], original_sidecar)
             .await
             .unwrap();
-        let repaired = download_photos_incremental(
+        let repaired = download_photos_incremental_collecting(
             &Client::new(),
             std::slice::from_ref(&pass),
             &Arc::new(config.clone()),
@@ -578,7 +609,7 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
                 .unwrap()
                 .is_empty()
         );
-        let steady = download_photos_incremental(
+        let steady = download_photos_incremental_collecting(
             &Client::new(),
             &[pass],
             &Arc::new(config),
@@ -722,7 +753,6 @@ async fn album_membership_first_xmp_and_tracked_path_removal() {
     );
 
     config.album_name = None;
-    config.recent = Some(10);
     let pass = AlbumPass {
         kind: PassKind::Unfiled,
         album: changes_album(
@@ -735,7 +765,7 @@ async fn album_membership_first_xmp_and_tracked_path_removal() {
         exclude_ids: Arc::new(FxHashSet::default()),
     };
     for _ in 0..2 {
-        let removed = download_photos_incremental(
+        let removed = download_photos_incremental_collecting(
             &Client::new(),
             std::slice::from_ref(&pass),
             &Arc::new(config.clone()),
@@ -792,7 +822,6 @@ async fn collecting_album_membership_failure_replays_without_redownloading() {
     };
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
-    config.recent = Some(10);
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
     let media_path = seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &asset).await;
     let config = Arc::new(config);
@@ -801,7 +830,7 @@ async fn collecting_album_membership_failure_replays_without_redownloading() {
         .expect("read seeded media");
 
     db.fail_asset_album_writes_for_test();
-    let failed = download_photos_incremental(
+    let failed = download_photos_incremental_collecting(
         &Client::new(),
         std::slice::from_ref(&pass),
         &config,
@@ -828,7 +857,7 @@ async fn collecting_album_membership_failure_replays_without_redownloading() {
 
     db.allow_asset_album_writes_for_test();
     for cycle in 2..=3 {
-        let recovered = download_photos_incremental(
+        let recovered = download_photos_incremental_collecting(
             &Client::new(),
             std::slice::from_ref(&pass),
             &config,
@@ -870,7 +899,7 @@ async fn filtered_original_replacement_refreshes_metadata_and_advances_checkpoin
         ("com.apple.quicktime-movie", false),
         ("public.jpeg", true),
     ] {
-        for recent in [None, Some(10)] {
+        for collecting in [false, true] {
             let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
             let dir = TempDir::new().unwrap();
             let mut records = incremental_photo_records_with_favorite("REPLACED", false);
@@ -901,7 +930,6 @@ async fn filtered_original_replacement_refreshes_metadata_and_advances_checkpoin
             };
             let mut config = test_config();
             config.directory = Arc::from(dir.path());
-            config.recent = recent;
             config.file_match_policy = FileMatchPolicy::NameId7;
             config.state_db = Some(db.clone());
             config.raw_policy = RawPolicy::PreferRaw;
@@ -956,19 +984,17 @@ async fn filtered_original_replacement_refreshes_metadata_and_advances_checkpoin
                     ),
                     exclude_ids: Arc::new(FxHashSet::default()),
                 };
-                let result = download_photos_incremental(
-                    &Client::new(),
+                let result = run_incremental_strategy(
+                    collecting,
                     &[pass],
                     &Arc::new(config.clone()),
                     &token,
-                    DownloadControls::download_hidden(),
-                    CancellationToken::new(),
                 )
                 .await
                 .unwrap();
                 assert!(
                     matches!(result.outcome, DownloadOutcome::Success),
-                    "{item_type}, swapped={swapped_original_only}, recent={recent:?}, cycle={cycle}: {result:?}"
+                    "{item_type}, swapped={swapped_original_only}, collecting={collecting}, cycle={cycle}: {result:?}"
                 );
                 assert_eq!(result.stats.downloaded, 0);
                 assert_eq!(result.stats.state_write_failures, 0);
@@ -1047,7 +1073,6 @@ async fn raw_policy_incremental_metadata_refresh_captures_unknown_bytes_without_
         config.directory = Arc::from(dir.path());
         config.raw_policy = policy;
         config.alternative = true;
-        config.recent = Some(10);
         config.state_db = Some(db.clone());
         seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored).await;
         let before = db.get_downloaded_page(0, 10).await.unwrap();
@@ -1086,7 +1111,7 @@ async fn raw_policy_incremental_metadata_refresh_captures_unknown_bytes_without_
                 ),
                 exclude_ids: Arc::new(FxHashSet::default()),
             };
-            let result = download_photos_incremental(
+            let result = download_photos_incremental_collecting(
                 &Client::new(),
                 &[pass],
                 &Arc::new(config.clone()),
@@ -1207,7 +1232,6 @@ async fn collecting_metadata_edit_refreshes_catalogue_without_duplicate_for_both
         let mut config = test_config();
         config.directory = Arc::from(dir.path());
         config.file_match_policy = policy;
-        config.recent = Some(10);
         config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         let media_path =
             seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored_asset).await;
@@ -1215,7 +1239,7 @@ async fn collecting_metadata_edit_refreshes_catalogue_without_duplicate_for_both
         assert_eq!(initial.len(), 2);
         let config = Arc::new(config);
         db.fail_provider_metadata_refresh_for_test();
-        let failed = download_photos_incremental(
+        let failed = download_photos_incremental_collecting(
             &Client::new(),
             std::slice::from_ref(&pass),
             &config,
@@ -1271,7 +1295,7 @@ async fn collecting_metadata_edit_refreshes_catalogue_without_duplicate_for_both
             if cycle == 1 {
                 db.fail_provider_metadata_refresh_for_test();
             }
-            let result = download_photos_incremental(
+            let result = download_photos_incremental_collecting(
                 &Client::new(),
                 std::slice::from_ref(&pass),
                 &config,
@@ -1477,13 +1501,12 @@ async fn collecting_unchanged_metadata_is_a_production_path_noop() {
     };
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
-    config.recent = Some(10);
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
     let media_path =
         seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored_asset).await;
     db.fail_provider_metadata_refresh_for_test();
 
-    let result = download_photos_incremental(
+    let result = download_photos_incremental_collecting(
         &Client::new(),
         std::slice::from_ref(&pass),
         &Arc::new(config),
@@ -1546,11 +1569,10 @@ async fn collecting_zero_download_cycle_drains_metadata_rewrite_batch() {
     };
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
-    config.recent = Some(10);
     config.metadata.xmp_sidecar = true;
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
 
-    let result = download_photos_incremental(
+    let result = download_photos_incremental_collecting(
         &Client::new(),
         std::slice::from_ref(&pass),
         &Arc::new(config),
@@ -1653,17 +1675,10 @@ async fn rejected_capture_upserts_never_dispatch_streaming_or_collecting_tasks()
         };
         let mut config = incremental_test_config(&dir);
         config.state_db = Some(db.clone());
-        config.recent = collecting.then_some(10);
-        let result = download_photos_incremental(
-            &Client::new(),
-            &[pass],
-            &Arc::new(config),
-            "zone-token-prev",
-            DownloadControls::download_hidden(),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+        let result =
+            run_incremental_strategy(collecting, &[pass], &Arc::new(config), "zone-token-prev")
+                .await
+                .unwrap();
         assert_eq!(
             server.received_requests().await.unwrap().len(),
             0,
@@ -1974,10 +1989,9 @@ async fn collecting_rewrite_failure_retains_marker_and_advances_durable_checkpoi
             };
             let mut config = test_config();
             config.directory = Arc::from(media.clone());
-            config.recent = Some(10);
             config.metadata.xmp_sidecar = true;
             config.state_db = Some(db.clone());
-            let result = download_photos_incremental(
+            let result = download_photos_incremental_collecting(
                 &Client::new(),
                 std::slice::from_ref(&pass),
                 &Arc::new(config),
@@ -2455,15 +2469,15 @@ async fn incremental_collecting_paired_asset_preserves_child_state_identity() {
         ),
         exclude_ids: Arc::new(FxHashSet::default()),
     }];
-    config.recent = Some(10);
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-full".to_string(),
     };
 
-    let incremental = download_photos_with_sync(
+    let incremental = download_photos_incremental_collecting(
         &Client::new(),
         &incremental_passes,
-        Arc::new(config),
+        &Arc::new(config),
+        "zone-token-full",
         DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
@@ -2690,16 +2704,8 @@ async fn malformed_delta_page_rejected_by_streaming_and_collecting_consumers() {
         };
         let mut config = incremental_test_config(&dir);
         config.state_db = Some(db.clone());
-        config.recent = collecting.then_some(10);
-        let result = download_photos_incremental(
-            &Client::new(),
-            &[pass],
-            &Arc::new(config),
-            "saved",
-            DownloadControls::download_hidden(),
-            CancellationToken::new(),
-        )
-        .await;
+        let result =
+            run_incremental_strategy(collecting, &[pass], &Arc::new(config), "saved").await;
         assert!(
             result.is_err(),
             "collecting={collecting}: malformed page completed"
@@ -2728,7 +2734,7 @@ async fn malformed_delta_page_rejected_by_streaming_and_collecting_consumers() {
 }
 
 #[tokio::test]
-async fn recent_overflow_uses_current_inventory_and_preserves_checkpoint() {
+async fn uncapped_delta_processes_every_asset_independent_of_arrival_order() {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -2765,7 +2771,6 @@ async fn recent_overflow_uses_current_inventory_and_preserves_checkpoint() {
     let database = dir.path().join("state.db");
     let mut config = test_config();
     config.directory = Arc::from(dir.path().join("media"));
-    config.recent = Some(1);
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "saved-cursor".to_string(),
     };
@@ -2816,14 +2821,15 @@ async fn recent_overflow_uses_current_inventory_and_preserves_checkpoint() {
     names.sort_unstable();
     assert_eq!(
         names,
-        ["changed.JPG", "newest.JPG"],
-        "production recent selection must use current descending inventory, not shuffled delta arrival: {result:?}"
+        ["changed.JPG", "middle.JPG", "newest.JPG", "oldest.JPG"],
+        "uncapped selection must retain every observed current asset: {result:?}"
     );
     assert_eq!(
-        result.sync_token, None,
-        "bounded current inventory cannot accept a successor: {result:?}"
+        result.sync_token.as_deref(),
+        Some("delta-terminal"),
+        "the complete ordinary delta supplies its actual successor: {result:?}"
     );
-    assert!(result.checkpoint.sync_token_blocked);
+    assert!(!result.checkpoint.sync_token_blocked);
     assert_eq!(
         tokio::fs::read(&previous_path).await.unwrap(),
         previous_bytes

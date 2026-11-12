@@ -1784,6 +1784,7 @@ mod tests {
     }
     fn transition(proofs: Vec<LegacyActivationProof>) -> CheckpointTransition {
         CheckpointTransition {
+            album_snapshots: Vec::new(),
             expected_metadata: Vec::new(),
             legacy_preservation_proofs: proofs,
             legacy_config_hash: Some("config".into()),
