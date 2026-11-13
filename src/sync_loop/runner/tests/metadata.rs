@@ -4460,7 +4460,12 @@ async fn exercise_legacy_child_cycles_with_provenance(
                 if cycle >= 2
                     && hardlink_fault.is_some_and(|fault| fault != LegacyHardlinkFault::Quiet)
                 {
-                    if matches!(hardlink_fault, Some(LegacyHardlinkFault::OriginalJournal)) {
+                    let original_journal = match hardlink_fault {
+                        #[cfg(target_os = "linux")]
+                        Some(LegacyHardlinkFault::OriginalJournal) => true,
+                        _ => false,
+                    };
+                    if original_journal {
                         assert!(
                             result
                                 .as_ref()
@@ -4508,14 +4513,7 @@ async fn exercise_legacy_child_cycles_with_provenance(
                             .await
                             .unwrap()
                             .as_deref(),
-                        Some(
-                            if matches!(hardlink_fault, Some(LegacyHardlinkFault::OriginalJournal))
-                            {
-                                "after"
-                            } else {
-                                "later"
-                            }
-                        )
+                        Some(if original_journal { "after" } else { "later" })
                     );
                     assert_eq!(rows(&database, receipt_sql), receipt);
                     assert_eq!(rows(&database, retry_sql), retry);
