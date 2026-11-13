@@ -417,8 +417,6 @@ async fn private_master_metadata_and_relationship_only_invalidation_reseeds_curr
         db.commit_checkpoint_transition(crate::state::CheckpointTransition {
             album_snapshots: Vec::new(),
             expected_metadata: Vec::new(),
-            legacy_preservation_proofs: Vec::new(),
-            legacy_config_hash: None,
             sparse_identity_proofs: Vec::new(),
             metadata_updates: vec![("sync_token:PrimarySync".into(), successor)],
             metadata_deletes: Vec::new(),
@@ -565,8 +563,6 @@ async fn private_filter_expansion_reopens_retained_coverage_and_converges_withou
         db.commit_checkpoint_transition(crate::state::CheckpointTransition {
             album_snapshots: Vec::new(),
             expected_metadata: Vec::new(),
-            legacy_preservation_proofs: Vec::new(),
-            legacy_config_hash: None,
             sparse_identity_proofs: Vec::new(),
             metadata_updates: vec![("sync_token:PrimarySync".into(), successor)],
             metadata_deletes: Vec::new(),

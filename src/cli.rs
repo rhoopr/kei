@@ -2673,7 +2673,7 @@ mod read_only_entrypoint_tests {
     }
 }
 
-/// Bounded offline local-byte acceptance; source verification is unchanged.
+/// Retired legacy file trust command. Existing trust records are retained.
 #[derive(Debug, Clone, clap::Args)]
 pub struct TrustedLegacyArgs {
     #[command(subcommand)]
@@ -2681,14 +2681,14 @@ pub struct TrustedLegacyArgs {
 }
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum TrustedLegacyAction {
-    /// Write a new reviewable JSON plan for one library (maximum 128 renditions)
+    /// Retired: run kei sync instead; no plan will be written
     Plan {
         #[arg(long)]
         library: String,
         #[arg(long)]
         output: std::path::PathBuf,
     },
-    /// Accept exactly the unchanged files and catalogue bindings in a reviewed plan
+    /// Retired: run kei sync instead; trust records and media will not be changed
     Apply {
         #[arg(long)]
         plan: std::path::PathBuf,
@@ -2697,7 +2697,7 @@ pub enum TrustedLegacyAction {
 
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum ReconcileAction {
-    /// Explicitly trust selected local files for preserved legacy migration (offline)
+    /// Retired legacy file trust command; normal sync no longer requires coverage certificates
     #[command(
         after_help = "Documentation: https://github.com/rhoopr/kei/blob/main/docs/trusted-legacy-files.md"
     )]

@@ -399,6 +399,7 @@ pub struct SyncStats {
     pub metadata_capture_unresolved: u64,
     pub metadata_capture_deferred: u64,
     pub unattributed_legacy_assets: u64,
+    /// Historical rows lacking a stored certificate, not pending sync work.
     pub unattributed_legacy_pending: u64,
     /// True when this cycle durably reduced metadata-capture work.
     #[serde(skip)]

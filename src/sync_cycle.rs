@@ -231,8 +231,6 @@ async fn persist_retained_checkpoint_hold(
     db.commit_checkpoint_transition(state::CheckpointTransition {
         album_snapshots: Vec::new(),
         expected_metadata,
-        legacy_preservation_proofs: Vec::new(),
-        legacy_config_hash: None,
         sparse_identity_proofs: Vec::new(),
         metadata_updates: vec![
             (key, serde_json::to_string(hold)?),
@@ -362,7 +360,6 @@ pub(crate) enum CheckpointHoldReason {
     EnumerationIncomplete,
     StateNotDurable,
     TokenProofIncomplete,
-    LegacyPreservationIncomplete,
 }
 
 impl CheckpointHoldReason {
@@ -375,7 +372,6 @@ impl CheckpointHoldReason {
             Self::EnumerationIncomplete => "enumeration_incomplete",
             Self::StateNotDurable => "state_not_durable",
             Self::TokenProofIncomplete => "token_proof_incomplete",
-            Self::LegacyPreservationIncomplete => "legacy_preservation_incomplete",
         }
     }
 }
@@ -870,8 +866,6 @@ where
                 .commit_checkpoint_transition(state::CheckpointTransition {
                     album_snapshots: Vec::new(),
                     expected_metadata: Vec::new(),
-                    legacy_preservation_proofs: Vec::new(),
-                    legacy_config_hash: None,
                     sparse_identity_proofs: Vec::new(),
                     metadata_updates: vec![(
                         download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
@@ -1266,7 +1260,6 @@ pub(crate) async fn run_cycle(
             }
         }
 
-        let mut legacy_cycle = download::legacy_preservation::LegacyCycle::default();
         if indexing_finished
             && !indexing_reconciliation
             && download_controls.run_mode.downloads_files()
@@ -1278,8 +1271,7 @@ pub(crate) async fn run_cycle(
                 .metadata_capture
                 .iter()
                 .any(|capture| {
-                    capture.library == lib_state.zone_name
-                        && (capture.unresolved_assets > 0 || capture.unattributed_legacy_assets > 0)
+                    capture.library == lib_state.zone_name && capture.unresolved_assets > 0
                 })
         {
             let legacy_probe = build_download_config(
@@ -1288,7 +1280,7 @@ pub(crate) async fn run_cycle(
                 Arc::new(download::AssetGroupings::default()),
                 Arc::from(lib_state.zone_name.as_str()),
             );
-            legacy_cycle = download::legacy_preservation::LegacyCycle::begin(
+            download::legacy_preservation::prepare(
                 db,
                 &legacy_probe,
                 &lib_state.library.all(),
@@ -1338,11 +1330,6 @@ pub(crate) async fn run_cycle(
             metadata_refresh_mode_decision(config.runtime.refresh_metadata)
         {
             refresh_decision
-        } else if legacy_cycle.requires_inventory() {
-            SyncModeDecision {
-                mode: download::SyncMode::Full,
-                full_enumeration_reason: Some(download::FullEnumerationReason::MetadataBackfill),
-            }
         } else if let Some(zone_sync_token) = pending_zone_token {
             tracing::debug!(
                 zone = %lib_state.zone_name,
@@ -1551,39 +1538,6 @@ pub(crate) async fn run_cycle(
             lib_state.plan.passes.len(),
         );
 
-        if indexing_finished
-            && legacy_cycle.requires_inventory()
-            && sync_result.full_enumeration_ran
-            && matches!(
-                source_checkpoint_decision(
-                    &sync_result,
-                    config.runtime.dry_run,
-                    lib_state.plan_is_stale,
-                    CheckpointBasis::CompleteInventory
-                ),
-                SourceCheckpointDecision::Advance { .. }
-            )
-            && let Some(db) = state_db
-        {
-            let prior = db
-                .get_metadata(&lib_state.sync_token_key)
-                .await?
-                .unwrap_or_default();
-            if let Err(error) = legacy_cycle
-                .certify(
-                    db,
-                    &download_config,
-                    &lib_state.library.all(),
-                    preservation_config_hash.as_deref().unwrap_or(""),
-                    &prior,
-                    shutdown_token,
-                )
-                .await
-            {
-                download::legacy_preservation::log_preservation_hold("certification", &error);
-            }
-        }
-
         // Guarded inventory may finish healthy current work after either source
         // boundary was rejected. Dispatch sets this evidence only after complete
         // inventory; reuse the existing fenced hold without adopting its token.
@@ -1624,7 +1578,6 @@ pub(crate) async fn run_cycle(
         };
         if (matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed)
             || unresolved_identity
-            || legacy_cycle.requires_inventory()
             || ((indexing_replay_pending || indexing_materialization_pending)
                 && !is_retry_failed
                 && !download_config.retry_only))
@@ -2010,8 +1963,6 @@ pub(crate) async fn run_cycle(
                     .commit_checkpoint_transition(state::CheckpointTransition {
                         album_snapshots: Vec::new(),
                         expected_metadata: zone_metadata_fence.clone(),
-                        legacy_preservation_proofs: Vec::new(),
-                        legacy_config_hash: None,
                         sparse_identity_proofs: Vec::new(),
                         metadata_updates: obligations,
                         metadata_deletes: vec![indexing_key.clone()],
@@ -2057,40 +2008,6 @@ pub(crate) async fn run_cycle(
             path_reconciliation_cycle_safe = false;
         }
 
-        let mut legacy_proofs = Vec::new();
-        if let SourceCheckpointDecision::Advance { token, .. } = &checkpoint_decision
-            && let Some(db) = state_db
-        {
-            let qualified = if legacy_cycle.requires_inventory()
-                && (!matches!(sync_result.outcome, download::DownloadOutcome::Success)
-                    || sync_result.stats.failed > 0
-                    || sync_result.stats.exif_failures > 0)
-            {
-                Err(anyhow::anyhow!("Legacy current work is incomplete"))
-            } else {
-                legacy_cycle
-                    .finish(db, &download_config, token, shutdown_token)
-                    .await
-            };
-            match qualified {
-                Ok(proofs) => legacy_proofs = proofs,
-                Err(error) => {
-                    download::legacy_preservation::log_preservation_hold("checkpoint", &error);
-                    checkpoint_decision = SourceCheckpointDecision::Preserve {
-                        reason: CheckpointHoldReason::LegacyPreservationIncomplete,
-                        recovery: RecoveryAction::ReplayFromPriorToken,
-                    };
-                    sync_result.stats.sync_token_blocked = true;
-                    sync_result.stats.sync_token_blocked_reason =
-                        Some("legacy_preservation_incomplete");
-                    sync_result.stats.sync_token_blocked_source = Some("kei");
-                    sync_result.stats.sync_token_blocked_explanation = Some(
-                        "legacy evidence is protected, but independent current coverage is incomplete",
-                    );
-                }
-            }
-        }
-
         path_reconciliation_cycle_safe &= library_completed_without_errors
             && checkpoint_transition_state_safe
             && !retained_checkpoint_expired
@@ -2105,8 +2022,7 @@ pub(crate) async fn run_cycle(
                 }
             ) && sync_result.checkpoint.bounded_path_selection_complete
                 && !sync_result.checkpoint.enumeration_incomplete
-                && sync_result.checkpoint.state_write_failures == 0
-                && !legacy_cycle.requires_inventory()));
+                && sync_result.checkpoint.state_write_failures == 0));
 
         let mut checkpoint_evidence = checkpoint_support_fields(&checkpoint_decision);
         let mut checkpoint_persistence = "no_state_db";
@@ -2135,8 +2051,6 @@ pub(crate) async fn run_cycle(
                             .commit_checkpoint_transition(state::CheckpointTransition {
                                 album_snapshots: Vec::new(),
                                 expected_metadata: zone_metadata_fence.clone(),
-                                legacy_preservation_proofs: legacy_proofs,
-                                legacy_config_hash: preservation_config_hash.clone(),
                                 sparse_identity_proofs: Vec::new(),
                                 metadata_updates: vec![(candidate_key, token)],
                                 metadata_deletes: vec![retained_checkpoint_hold_key(
@@ -2181,8 +2095,6 @@ pub(crate) async fn run_cycle(
                             .commit_checkpoint_transition(state::CheckpointTransition {
                                 album_snapshots: Vec::new(),
                                 expected_metadata: zone_metadata_fence.clone(),
-                                legacy_preservation_proofs: legacy_proofs,
-                                legacy_config_hash: preservation_config_hash.clone(),
                                 sparse_identity_proofs: sync_result
                                     .checkpoint
                                     .sparse_identity_proofs
@@ -2243,8 +2155,6 @@ pub(crate) async fn run_cycle(
                         .commit_checkpoint_transition(state::CheckpointTransition {
                             album_snapshots: Vec::new(),
                             expected_metadata: Vec::new(),
-                            legacy_preservation_proofs: Vec::new(),
-                            legacy_config_hash: None,
                             sparse_identity_proofs: Vec::new(),
                             metadata_updates: vec![
                                 (
@@ -2339,19 +2249,6 @@ pub(crate) async fn run_cycle(
             cycle_failed_count += 1;
         }
 
-        if sync_result.stats.unattributed_legacy_assets > 0
-            && let Some(db) = state_db
-            && let Some(capture) = db
-                .get_summary()
-                .await?
-                .metadata_capture
-                .into_iter()
-                .find(|capture| capture.library == lib_state.zone_name)
-        {
-            sync_result.stats.unattributed_legacy_assets = capture.unattributed_legacy_assets;
-            sync_result.stats.unattributed_legacy_pending = capture.unattributed_legacy_pending;
-        }
-
         // Accumulate stats across libraries.
         cycle_stats.accumulate(&sync_result.stats);
 
@@ -2425,8 +2322,6 @@ pub(crate) async fn run_cycle(
                         .cloned()
                         .chain(active_cursor_fences)
                         .collect(),
-                    legacy_preservation_proofs: Vec::new(),
-                    legacy_config_hash: preservation_config_hash.clone(),
                     sparse_identity_proofs,
                     metadata_updates,
                     metadata_deletes,
@@ -2450,8 +2345,6 @@ pub(crate) async fn run_cycle(
             .commit_checkpoint_transition(state::CheckpointTransition {
                 album_snapshots: Vec::new(),
                 expected_metadata: path_metadata_at_start,
-                legacy_preservation_proofs: Vec::new(),
-                legacy_config_hash: None,
                 sparse_identity_proofs: Vec::new(),
                 metadata_updates: vec![(
                     download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
@@ -2495,8 +2388,6 @@ pub(crate) async fn run_cycle(
                     (indexing_reconciliation_key(&zone), None),
                     (state::unresolved_identity_key(&zone), None),
                 ],
-                legacy_preservation_proofs: Vec::new(),
-                legacy_config_hash: None,
                 sparse_identity_proofs: Vec::new(),
                 metadata_updates: Vec::new(),
                 metadata_deletes: vec![key],
@@ -2514,16 +2405,6 @@ pub(crate) async fn run_cycle(
         let summary = db.get_summary().await?;
         if summary.unresolved_identity_zones > 0 {
             download::block_sync_token_for_unresolved_identity(&mut cycle_stats);
-            cycle_failed_count = cycle_failed_count.max(1);
-            db_sync_token_advance_safe = false;
-        }
-        if summary
-            .metadata_capture
-            .iter()
-            .any(|capture| capture.unattributed_legacy_pending > 0)
-        {
-            // Protected history no longer appears in the capture retry count,
-            // but pending current-work proof is still incomplete cycle work.
             cycle_failed_count = cycle_failed_count.max(1);
             db_sync_token_advance_safe = false;
         }

@@ -273,6 +273,41 @@ impl MetadataCapture {
 }
 
 impl AssetMetadata {
+    /// Exact comparison for transient duplicate admission, not the rounded
+    /// persisted metadata hash. Non-finite floats are never duplicate evidence.
+    pub(crate) fn same_observation(&self, other: &Self) -> bool {
+        fn same_float(a: Option<f64>, b: Option<f64>) -> bool {
+            match (a, b) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits(),
+                _ => false,
+            }
+        }
+        self.source == other.source
+            && self.is_favorite == other.is_favorite
+            && self.rating == other.rating
+            && same_float(self.latitude, other.latitude)
+            && same_float(self.longitude, other.longitude)
+            && same_float(self.altitude, other.altitude)
+            && self.orientation == other.orientation
+            && same_float(self.duration_secs, other.duration_secs)
+            && self.timezone_offset == other.timezone_offset
+            && self.width == other.width
+            && self.height == other.height
+            && self.title == other.title
+            && self.keywords == other.keywords
+            && self.description == other.description
+            && self.media_subtype == other.media_subtype
+            && self.burst_id == other.burst_id
+            && self.is_hidden == other.is_hidden
+            && self.is_archived == other.is_archived
+            && self.modified_at == other.modified_at
+            && self.is_deleted == other.is_deleted
+            && self.deleted_at == other.deleted_at
+            && self.provider_data == other.provider_data
+            && self.metadata_hash == other.metadata_hash
+    }
+
     /// Compute a stable SHA-256 hash of metadata fields for change detection.
     ///
     /// Does not include `source` (immutable per record) or `metadata_hash`
@@ -585,7 +620,8 @@ pub(crate) struct MetadataCaptureCandidate {
 pub struct MetadataCaptureStatus {
     /// Preserved original identities whose historical owner remains unknown.
     pub unattributed_legacy_assets: u64,
-    /// Originals without a currently valid preservation coverage receipt.
+    /// Historical rows without a stored certificate at their recorded generation.
+    /// Certification is retired; this is not pending sync work.
     pub unattributed_legacy_pending: u64,
     pub library: String,
     pub active_revision: i64,
@@ -911,6 +947,25 @@ mod tests {
             "AssetRecord size {} exceeds 736 bytes",
             size_of::<AssetRecord>()
         );
+    }
+
+    #[test]
+    fn duplicate_observation_compares_metadata_beyond_rounded_hash() {
+        let mut a = AssetMetadata {
+            latitude: Some(1.000_000_000_1),
+            ..AssetMetadata::default()
+        };
+        let mut b = AssetMetadata {
+            latitude: Some(1.000_000_000_2),
+            ..AssetMetadata::default()
+        };
+        a.refresh_hash();
+        b.refresh_hash();
+        assert_eq!(a.metadata_hash, b.metadata_hash);
+        assert!(!a.same_observation(&b));
+        assert!(a.same_observation(&a));
+        a.latitude = Some(f64::NAN);
+        assert!(!a.same_observation(&a));
     }
 
     #[test]

@@ -390,10 +390,8 @@ pub(crate) struct ScopedDbSyncToken {
 pub(crate) struct CheckpointTransition {
     /// Qualified running album snapshots, completed under the metadata fences.
     pub(crate) album_snapshots: Vec<(String, String, i64)>,
-    /// Rechecked in the same transaction before proof activation or any write.
+    /// Rechecked in the same transaction before current-proof retirement or any write.
     pub(crate) expected_metadata: Vec<(String, Option<String>)>,
-    pub(crate) legacy_preservation_proofs: Vec<super::LegacyActivationProof>,
-    pub(crate) legacy_config_hash: Option<String>,
     pub(crate) sparse_identity_proofs: Vec<SparseIdentityProof>,
     pub(crate) metadata_updates: Vec<(String, String)>,
     pub(crate) metadata_deletes: Vec<String>,
@@ -1009,17 +1007,6 @@ pub trait MetadataRewriteStore: Send + Sync {
             detail: "legacy preservation is unsupported by this store".into(),
         })
     }
-    /// Diagnostic-only explanation after a selected receipt was refused. This
-    /// cannot supply a receipt or authorize progress; unsupported stores retain
-    /// the ordinary refusal without requiring a new implementation.
-    async fn legacy_child_receipt_refusal(
-        &self,
-        _library: &str,
-        _id: &str,
-        _version_size: &str,
-    ) -> Result<super::LegacyChildReceiptRefusal, StateError> {
-        Ok(super::LegacyChildReceiptRefusal::Unavailable)
-    }
     async fn legacy_preparation_snapshots(
         &self,
         _library: &str,
@@ -1050,36 +1037,6 @@ pub trait MetadataRewriteStore: Send + Sync {
         Err(StateError::Invariant {
             operation: "prepare_legacy_preservation_validated",
             detail: "state store does not support validated historical claims".into(),
-        })
-    }
-    async fn legacy_preservations(
-        &self,
-        _library: &str,
-    ) -> Result<Vec<super::LegacyPreservation>, StateError> {
-        Err(StateError::Invariant {
-            operation: "legacy_preservations",
-            detail: "legacy preservation is unsupported by this store".into(),
-        })
-    }
-    async fn legacy_dependency_evidence(
-        &self,
-        _library: &str,
-        _id: &str,
-    ) -> Result<String, StateError> {
-        Err(StateError::Invariant {
-            operation: "legacy_dependency_evidence",
-            detail: "legacy preservation is unsupported by this store".into(),
-        })
-    }
-    async fn reactivate_legacy_preservation(
-        &self,
-        _library: &str,
-        _id: &str,
-        _expected_generation: Option<i64>,
-    ) -> Result<(), StateError> {
-        Err(StateError::Invariant {
-            operation: "reactivate_legacy_preservation",
-            detail: "legacy preservation is unsupported by this store".into(),
         })
     }
 

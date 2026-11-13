@@ -38,8 +38,6 @@ async fn guarded_inventory_retirement_rejects_a_newer_album_snapshot_atomically(
     let retirement = |generation| CheckpointTransition {
         album_snapshots: vec![("PrimarySync".into(), "trip".into(), generation)],
         expected_metadata: vec![(key.into(), Some("1".into()))],
-        legacy_preservation_proofs: Vec::new(),
-        legacy_config_hash: None,
         sparse_identity_proofs: Vec::new(),
         metadata_updates: Vec::new(),
         metadata_deletes: vec![key.into()],
@@ -220,8 +218,6 @@ async fn checkpoint_transition_is_atomic() {
         .commit_checkpoint_transition(CheckpointTransition {
             album_snapshots: Vec::new(),
             expected_metadata: Vec::new(),
-            legacy_preservation_proofs: Vec::new(),
-            legacy_config_hash: None,
             sparse_identity_proofs: Vec::new(),
             metadata_updates: vec![
                 ("sync_token:zone".into(), "new-token".into()),
@@ -393,8 +389,6 @@ async fn retained_checkpoint_metadata_fence_rolls_back_stale_plans() {
             .commit_checkpoint_transition(CheckpointTransition {
                 album_snapshots: Vec::new(),
                 expected_metadata: vec![("sync_token:zone".into(), Some("planned-cursor".into()))],
-                legacy_preservation_proofs: Vec::new(),
-                legacy_config_hash: None,
                 sparse_identity_proofs: Vec::new(),
                 metadata_updates: vec![
                     ("sync_token:zone".into(), "new-cursor".into()),

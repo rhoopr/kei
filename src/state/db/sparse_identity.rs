@@ -564,8 +564,6 @@ mod tests {
         let transition = || CheckpointTransition {
             album_snapshots: Vec::new(),
             expected_metadata: Vec::new(),
-            legacy_preservation_proofs: Vec::new(),
-            legacy_config_hash: None,
             sparse_identity_proofs: vec![proof.clone()],
             metadata_updates: vec![
                 ("sync_token:PrimarySync".into(), "after".into()),
@@ -910,8 +908,6 @@ mod tests {
         let transition = |proofs| CheckpointTransition {
             album_snapshots: Vec::new(),
             expected_metadata: Vec::new(),
-            legacy_preservation_proofs: Vec::new(),
-            legacy_config_hash: None,
             sparse_identity_proofs: proofs,
             metadata_updates: vec![
                 ("sync_token:PrimarySync".into(), "after".into()),

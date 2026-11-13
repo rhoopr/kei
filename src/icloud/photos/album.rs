@@ -21,7 +21,7 @@ pub(crate) mod selection_capture;
 pub(crate) mod work;
 
 mod preservation_proof;
-pub(crate) use preservation_proof::{CompleteLegacyInventory, classify_legacy_inventory_error};
+pub(crate) use preservation_proof::classify_legacy_inventory_error;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]

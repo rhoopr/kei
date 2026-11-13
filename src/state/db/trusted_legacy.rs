@@ -1,4 +1,4 @@
-//! Explicit local-byte acceptance for preserved legacy migrations. Never source verification.
+//! Read-only historical local-trust declarations. Never source verification.
 use std::path::PathBuf;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -9,7 +9,6 @@ use super::{SqliteStateDb, legacy_preservation};
 use crate::state::error::StateError;
 
 const PREFIX: &str = "trusted_legacy_file:v1:";
-pub(crate) const MAX_TARGETS: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,7 +35,7 @@ pub(crate) enum LegacyReceiptProvenance {
 fn invalid() -> StateError {
     StateError::Invariant {
         operation: "trusted_legacy_file",
-        detail: "trusted legacy file plan is invalid, stale or cancelled".into(),
+        detail: "stored legacy local-trust declaration is invalid".into(),
     }
 }
 fn digest(value: &str) -> String {
@@ -181,6 +180,29 @@ pub(super) fn provenance(
 }
 
 impl SqliteStateDb {
+    #[cfg(test)]
+    pub(crate) async fn historical_trust_targets_for_test(
+        &self,
+        library: &str,
+    ) -> Vec<TrustedLegacyFile> {
+        let library = library.to_owned();
+        self.with_conn("historical_trust_fixture", move |conn| {
+            let ids = conn
+                .prepare(
+                    "SELECT id,version_size FROM assets WHERE library=?1 ORDER BY id,version_size",
+                )?
+                .query_map([&library], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            ids.into_iter()
+                .filter_map(|(id, rendition)| target(conn, &library, &id, &rendition).transpose())
+                .collect()
+        })
+        .await
+        .unwrap()
+    }
+
     pub(crate) async fn stored_trusted_legacy_file_count(&self) -> Result<u64, StateError> {
         self.with_conn("stored_trusted_legacy_file_count", |conn| {
             let count: i64 = conn.query_row(
@@ -189,71 +211,6 @@ impl SqliteStateDb {
                 |r| r.get(0),
             )?;
             u64::try_from(count).map_err(|_private_error| invalid())
-        })
-        .await
-    }
-    pub(crate) async fn trusted_legacy_candidates(
-        &self,
-        library: &str,
-    ) -> Result<Vec<TrustedLegacyFile>, StateError> {
-        let library = library.to_owned();
-        self.with_conn("trusted_legacy_candidates",move |conn| {
-            let ids=conn.prepare("SELECT a.id,a.version_size FROM assets a JOIN asset_master_mappings m ON m.library=a.library AND m.asset_record_name=a.id JOIN unattributed_legacy u ON u.library=m.library AND u.asset_id=m.master_record_name WHERE a.library=?1 ORDER BY a.id,a.version_size LIMIT ?2")?
-                .query_map(params![library,(MAX_TARGETS+1) as i64],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?;
-            if ids.len()>MAX_TARGETS {return Err(invalid())}
-            let mut targets=Vec::new();
-            for (child,rendition) in ids {if let Some(t)=target(conn,&library,&child,&rendition)? {targets.push(t)}}
-            Ok(targets)
-        }).await
-    }
-    pub(crate) async fn apply_trusted_legacy_files<F>(
-        &self,
-        targets: Vec<TrustedLegacyFile>,
-        validate_files: F,
-    ) -> Result<(), StateError>
-    where
-        F: FnOnce() -> Result<(), StateError> + Send + 'static,
-    {
-        self.with_conn_mut("apply_trusted_legacy_files", move |conn| {
-            if targets.is_empty() || targets.len() > MAX_TARGETS {
-                return Err(invalid());
-            }
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            // Append-only acceptances, including through generic metadata APIs.
-            // Created only by explicit apply, in this same atomic transaction.
-            tx.execute_batch("CREATE TRIGGER IF NOT EXISTS trusted_legacy_file_no_update BEFORE UPDATE ON metadata WHEN substr(OLD.key,1,length('trusted_legacy_file:v1:'))='trusted_legacy_file:v1:' OR substr(NEW.key,1,length('trusted_legacy_file:v1:'))='trusted_legacy_file:v1:' BEGIN SELECT RAISE(ABORT,'trusted legacy file acceptance is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS trusted_legacy_file_no_delete BEFORE DELETE ON metadata WHEN substr(OLD.key,1,length('trusted_legacy_file:v1:'))='trusted_legacy_file:v1:' BEGIN SELECT RAISE(ABORT,'trusted legacy file acceptance is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS trusted_legacy_file_no_replace BEFORE INSERT ON metadata WHEN substr(NEW.key,1,length('trusted_legacy_file:v1:'))='trusted_legacy_file:v1:' AND EXISTS(SELECT 1 FROM metadata WHERE key=NEW.key AND value!=NEW.value) BEGIN SELECT RAISE(ABORT,'trusted legacy file acceptance is immutable'); END;")?;
-            let mut seen = std::collections::HashSet::new();
-            for expected in &targets {
-                let Some(mut current) =
-                    target(&tx, &expected.library, &expected.child, &expected.rendition)?
-                else {
-                    return Err(invalid());
-                };
-                current.local_size = expected.local_size;
-                if &current != expected || !seen.insert(key(expected)) {
-                    return Err(invalid());
-                }
-                let value = serde_json::to_string(expected).map_err(|_private_error| invalid())?;
-                tx.execute(
-                    "INSERT OR IGNORE INTO metadata(key,value) VALUES(?1,?2)",
-                    params![key(expected), value],
-                )?;
-                let stored: String = tx.query_row(
-                    "SELECT value FROM metadata WHERE key=?1",
-                    [key(expected)],
-                    |r| r.get(0),
-                )?;
-                if stored != value {
-                    return Err(invalid());
-                }
-            }
-            // Held confined handles and cancellation are checked after all SQL,
-            // immediately before commit. Any error rolls back the entire plan.
-            validate_files()?;
-            tx.commit()?;
-            Ok(())
         })
         .await
     }

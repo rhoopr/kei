@@ -1307,7 +1307,7 @@ fn preserved_legacy_status_and_reconcile_keep_attribution_separate_from_failure(
     let output = String::from_utf8(out).unwrap();
     assert!(
         output.contains(
-            "1 legacy records need attribution; 1 awaiting current-work preservation proof"
+            "preserved legacy records with unknown attribution: 1; legacy records without a stored coverage certificate: 1. Certification is retired; this is not pending sync work."
         ),
         "{output}"
     );
@@ -1349,4 +1349,80 @@ fn preserved_legacy_status_and_reconcile_keep_attribution_separate_from_failure(
         ("downloaded".into(), None, "original-checksum".into())
     );
     assert!(!missing.exists());
+}
+
+#[test]
+fn retired_legacy_trust_plan_and_apply_refuse_before_archive_or_auth_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    let media = root.path().join("photos");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&media).unwrap();
+    let username = "retired-trust@example.invalid";
+    let conn = create_state_db(&data, username);
+    let photo = media.join("existing.jpg");
+    std::fs::write(&photo, b"retained synthetic media").unwrap();
+    std::fs::write(media.join("existing.jpg.xmp"), b"retained custom metadata").unwrap();
+    insert_asset(
+        &conn,
+        "existing",
+        "downloaded",
+        "existing.jpg",
+        Some(photo.to_str().unwrap()),
+        None,
+        Some("old-local-proof"),
+    );
+    conn.execute("INSERT INTO metadata VALUES('trusted_legacy_file:v1:historical:receipt','immutable historical declaration')",[]).unwrap();
+    conn.execute(
+        "INSERT INTO metadata VALUES('sync_token:PrimarySync','old-cursor')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let config = root.path().join("config.toml");
+    std::fs::write(&config,format!("[auth]\nusername = {username:?}\npassword = 'synthetic-not-a-real-password'\n[download]\ndirectory = {:?}\n",media.to_str().unwrap())).unwrap();
+    let plan = root.path().join("plan.json");
+    let snapshot = || {
+        crate::common::walkdir(root.path())
+            .into_iter()
+            .map(|path| {
+                let bytes = std::fs::read(&path).unwrap();
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                (path, bytes, modified)
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = snapshot();
+    for args in [
+        vec![
+            "plan",
+            "--library",
+            "PrimarySync",
+            "--output",
+            plan.to_str().unwrap(),
+        ],
+        vec!["apply", "--plan", plan.to_str().unwrap()],
+    ] {
+        let output = clean_cmd()
+            .env("KEI_DATA_DIR", &data)
+            .env("KEI_UNSTABLE_FAKE_TWO_FACTOR_REQUIRED_FOR_TESTS", "1")
+            .arg("--config")
+            .arg(&config)
+            .args(["reconcile", "trust-legacy-files"])
+            .args(args)
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("Legacy file trust is no longer supported. Run kei sync. Existing trust records and media were not changed."),"{error}");
+        assert!(!error.contains("Authenticating"), "{error}");
+        assert!(
+            !error.contains("Offline 2FA-required test seam enabled"),
+            "{error}"
+        );
+        assert!(output.stdout.is_empty());
+        assert_eq!(snapshot(), before);
+        assert!(!plan.exists());
+    }
 }

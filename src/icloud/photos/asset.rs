@@ -535,6 +535,59 @@ fn is_test_loopback_host(host: &str) -> bool {
 }
 
 impl PhotoAsset {
+    /// Compare parsed planning evidence while allowing signed URL renewal.
+    /// URL aliasing between versions remains significant to rendition selection.
+    pub(crate) fn same_download_observation(&self, other: &Self) -> bool {
+        let same_float = |a: Option<f64>, b: Option<f64>| match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits(),
+            _ => false,
+        };
+        self.record_name == other.record_name
+            && self.asset_record_name == other.asset_record_name
+            && self.state_record_name == other.state_record_name
+            && self.source_zone == other.source_zone
+            && self.filename == other.filename
+            && self.item_type_val == other.item_type_val
+            && same_float(self.asset_date_ms, other.asset_date_ms)
+            && same_float(self.added_date_ms, other.added_date_ms)
+            && self.asset_metadata.same_observation(&other.asset_metadata)
+            && self.malformed_resources == other.malformed_resources
+            && self.rendition_facts.len() == other.rendition_facts.len()
+            && self
+                .rendition_facts
+                .iter()
+                .zip(other.rendition_facts.iter())
+                .all(|((ak, a), (bk, b))| {
+                    ak == bk
+                        && a.checksum == b.checksum
+                        && a.width == b.width
+                        && a.height == b.height
+                        && same_float(a.duration_secs, b.duration_secs)
+                })
+            && self.versions.len() == other.versions.len()
+            && self
+                .versions
+                .iter()
+                .zip(other.versions.iter())
+                .all(|((ak, a), (bk, b))| {
+                    ak == bk
+                        && a.size == b.size
+                        && a.checksum == b.checksum
+                        && a.asset_type == b.asset_type
+                })
+            && self
+                .versions
+                .iter()
+                .zip(other.versions.iter())
+                .all(|((_, a), (_, b))| {
+                    self.versions
+                        .iter()
+                        .zip(other.versions.iter())
+                        .all(|((_, ax), (_, bx))| (a.url == ax.url) == (b.url == bx.url))
+                })
+    }
+
     /// Construct from raw JSON values (used by tests).
     #[cfg(test)]
     pub fn new(master_record: Value, asset_record: Value) -> Self {

@@ -161,7 +161,22 @@ Sync and service mode reject `--recent` and `--recent-scope`. Remove those flags
 
 Schema 37 preserves old recent-selection receipts and records a one-time inventory request for each zone with an old receipt key, regardless of its payload. A selected zone can therefore need a current inventory even when iCloud reports no changes. Each attempt replays the retained cursor, inventories the current selection, then requires a raw-empty terminal replay before retiring the request. A busy interval, interruption, failed write or incomplete current work keeps it pending for a later cycle; no same-cycle catch-up loop is added. Healthy media can still complete while other work remains held.
 
-This proves current selected coverage, not an atomic provider snapshot, complete historical deletions or permission to delete local files. Completing it can retire the inventory request while a separate legacy or expired-cursor checkpoint hold remains. Preserve the state and investigate that hold rather than resetting it.
+This proves current selected coverage, not an atomic provider snapshot, complete historical deletions or permission to delete local files. Completing it can retire the inventory request while a separate sparse-identity, expired-cursor or retained provider-work hold remains. Historical legacy certification is no longer a checkpoint requirement. Preserve the state and investigate any remaining hold rather than resetting it.
+
+### Historical legacy evidence
+
+Run normal `kei sync`; there is no certificate repair step. Preserved legacy records and old coverage certificates remain in the database, but sync no longer revalidates or writes those certificates. For already prepared records, a missing certificate or changed historical file alone does not force another inventory, fail the current cycle or make the process unhealthy. This retirement adds no schema migration and rewrites no files.
+
+Status, sync reports and health JSON retain their existing field names:
+
+- `unattributed_legacy_assets` counts preserved legacy records with unknown attribution, not paths or renditions.
+- `unattributed_legacy_pending` counts those records without a stored coverage certificate at their recorded generation. The historical name is retained for compatibility; this is not pending sync work. The count does not revalidate configuration, file contents or certificate dependencies.
+
+Unresolved historical attribution still makes `kei status` say `Backup status: unsafe`. That means historical completeness is unproven; it does not by itself fail a current sync, increment health failures or prevent a successful health update. Current transfer, metadata, identity, enumeration and state-write failures keep their existing retry and checkpoint effects. A healthy process is not proof of a complete backup.
+
+The old [`reconcile trust-legacy-files plan/apply` commands](trusted-legacy-files.md) now refuse early and direct you to `kei sync`. They create no plan or trust declaration. Existing declarations remain stored history, not provider verification or new ownership permission.
+
+Original-file protection remains in force before and after preservation preparation. The separate preparation scan, unresolved source identity, raw-inbox capacity, unfinished provider-selection work across generations and expired-cursor recovery retain their existing limits. Certification retirement does not resolve every historical-state or Shared Library problem reported in [#1044](https://github.com/rhoopr/kei/issues/1044), and it never permits deletion or overwrite of uncertain files.
 
 ## Unresolved provider identities
 

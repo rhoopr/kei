@@ -293,17 +293,11 @@ state, abrupt process death, or power-loss durability.
 
 ### Legacy current-content provenance
 
-`run_cycle_legacy_opaque_mmcs_qualifies_after_reopen` uses opaque 21-byte and
-32-byte provider generation signatures unrelated to downloaded SHA-256. Actual
-ordinary and Hidden-only cycles qualify independently downloaded current work,
-then reopen SQLite twice without repeating downloads or altering retained
-legacy evidence. Unknown source provenance and failed checkpoint transactions
-have separate held-cycle controls. State receipt tests refuse unknown historical
-hashes, generation/path/local-byte mismatches, metadata debt and unverified
-replacement bytes after reopen. Exact-byte relocation retains only unambiguous,
-scope-matched source lineage. A publication state-write failure remains held
-after on-disk adoption; its recovery fixture retains that copy and performs
-a fresh verified download before certification and a quiet reopened cycle.
+`run_cycle_legacy_opaque_mmcs_qualifies_after_reopen` uses opaque 21-byte and 32-byte provider generation signatures unrelated to downloaded SHA-256. Ordinary and Hidden-only production cycles download independent current copies, preserve historical rows and originals, and check two reopened cycles without repeat transfers. The old test name does not imply certificate activation: `active_generation` stays unset and the uncertified historical count stays visible.
+
+`run_cycle_legacy_opaque_mmcs_checkpoint_failure_stays_atomic` injects a current cursor-write failure, retains the prior cursor, then removes the failure and checks reopened recovery. `run_cycle_legacy_opaque_mmcs_unknown_source_stays_unverified` exercises sync with the unverified-source store variant; unknown historical provenance no longer creates a certification hold. The state-owner `legacy_current_receipts_require_exact_verified_source_after_reopen` matrix separately rejects historical hashes, generation/path/local-byte mismatches, metadata debt and unverified replacements. `legacy_relocated_receipts_reuse_only_exact_unambiguous_source` checks scope-matched source lineage.
+
+`run_cycle_single_survivor_current_write_failure_recovers` retains bytes from a failed publication finalization. Its later recovery moves those unverified copies aside, invokes the production drift probe, requires a fresh download and checks stable follow-up cycles. No recovery step writes a legacy coverage certificate.
 
 `private_destination_opaque_mmcs_proofs_survive_reopen` covers native destination
 proof creation and validation through normal downloads, compatible destination
@@ -320,27 +314,11 @@ The current-child seed records verified source explicitly; historical legacy and
 other generic receipts keep unknown source. The fixture asserts these initial
 source facts before running its unchanged progress and preservation oracles.
 
-`mixed_library_provider_shapes` composes long-lived synthetic families in two
-zones with reused raw IDs, distinct dates and checksums, independent current
-children, unattributed legacy files, and numbered Live Photo publications in
-two zone-local albums. Two fixed histories each run six production cycles through
-`run_cycle`, reopening real SQLite after every cycle. One withholds the final
-inventory while another zone progresses; the other changes still-only selection
-to both renditions and changes album selection and order during identity debt.
-Both retain complete-evidence recovery and two quiet cycles. The recovery
-cycle makes any synthetic discovery retry eligible by changing only its due
-timestamp; it retains the retry signature, identity debt and all receipts.
-This models elapsed scheduling time without sleeping or bypassing proof gates.
+`mixed_library_provider_shapes` composes long-lived synthetic families in two zones with reused raw IDs, distinct dates and checksums, independent current children, unattributed legacy files, and numbered Live Photo publications in two zone-local albums. Two fixed histories each run six production cycles through `run_cycle`, reopening real SQLite after every cycle. One withholds the final inventory while another zone progresses; the other changes still-only selection to both renditions and changes album selection and order during identity debt. Both explicitly seed current selection drift to reach inventory discovery without a historical-certification trigger. A healthy zone can finish local work and stage its successor while another zone holds atomic configuration activation. Both histories retain complete-evidence recovery and two quiet cycles. The recovery cycle makes any synthetic discovery retry eligible by changing only its due timestamp; it retains the retry signature, identity debt and all receipts. This models elapsed scheduling time without sleeping or bypassing proof gates.
 
-Each history runs through baseline responses, independent-family reordering and
-alternate page cuts, then those same cuts with exact duplicate observations and
-an empty continuation page. These are equivalent snapshots, not reordered causal
-updates or tombstones. Normalized state comparisons include identity, ownership,
-publication receipts, membership, retry and deletion state, and active and staged
-zone checkpoints. Independent oracles check legacy bytes, existing numbered paths,
-new-child ownership and subsequent stability, request bounds, and quiet hydration,
-download, metadata-repair and file counts. New collision suffix spelling is not
-part of response equivalence. Mock-server bind failures fail the test.
+Each history runs through baseline inventory responses, independent-family reordering and alternate page cuts, then those same inventory cuts with exact duplicate observations and an empty continuation page. These are equivalent snapshots, not reordered causal updates, tombstones or duplicate-delta scheduling tests. Normalized state comparisons include identity, ownership, publication receipts, membership, retry and deletion state, and active and staged zone checkpoints. Independent oracles check legacy bytes, existing numbered paths, new-child ownership and subsequent stability, request bounds, and quiet hydration, download, metadata-repair and file counts. New collision suffix spelling is not part of response equivalence. Mock-server bind failures fail the test.
+
+`duplicate_created_prepared_archive_replay` covers the separate unchanged-config collecting route with a retained cursor, prepared uncertified historical files and one repeated Created child. It requires one transfer, file and receipt, unchanged historical bytes and retry evidence, cursor progress, and two quiet reopened cycles. The historical transfer and finalization failure fixtures also use duplicate Created input through collecting before checking retry and quiet recovery.
 
 The cap is 36 production cycles per feature configuration. Replay JSON selects
 one complete six-cycle history and encoding; a non-baseline encoding also runs its
@@ -721,9 +699,29 @@ These tests qualify bounded supported-path admission and targeted queue recovery
 
 The shared/private histories require replay from P to S, one current inventory, and a terminal raw-empty replay from S. Query tokens differ from source successors. A multi-page rank displacement and an unknown raw record that emits no asset event must retain the request and trusted cursor. Later quiet evidence recovers the omitted asset exactly once. Healthy media still publishes when initial delta identity, transfer or state work fails; those failures cannot qualify the inventory. The private-generation case bounds the attempt without implicit extra generation scans.
 
-Request-clear transaction failure, cancellation, changed configuration and changed request values preserve the request and prior album membership across SQLite reopen. Successful retirement completes deferred membership in the same fenced transaction. Two quiet reopened cycles check exact downloaded bytes, receipt preservation, no repeated guarded replay and no duplicate transfers. Missing-cursor coverage retains the request through the ordinary first run. Fixed-date coverage can retire the current request while source/database checkpoints remain bounded; unrelated historical validation can also remain held after retirement. These are current-work proofs, not provider snapshot, complete deletion-history, power-loss or live-account qualification.
+Request-clear transaction failure, cancellation, changed configuration and changed request values preserve the request and prior album membership across SQLite reopen. Successful retirement completes deferred membership in the same fenced transaction. Two quiet reopened cycles check exact downloaded bytes, receipt preservation, no repeated guarded replay and no duplicate transfers. Missing-cursor coverage retains the request through the ordinary first run. Fixed-date coverage can retire the current request while source/database checkpoints remain bounded; independent recovery holds can also remain. Historical legacy certification is no longer a checkpoint requirement. These are current-work proofs, not provider snapshot, complete deletion-history, power-loss or live-account qualification.
 
 `cargo test --test behavioral retired_sync_count_inputs_preserve_archive_before_auth_or_startup_writes` checks sync/service flags and saved `recent` / `recent_scope` against a populated archive. Rejection must precede authentication and startup writes, preserve config/state/media, and give fixed-date guidance. CLI and config tests keep positive import-only sampling separate from the retired sync settings. Generated config and the example must omit both retired keys.
+
+## Historical evidence and current work
+
+Legacy coverage certificates are retained history, not current completion or checkpoint authority. When adapting fixtures, keep their original discovery, ownership, path, media, metadata and failure stimuli. Replace certification-only assertions; do not remove a current observation just because the retired route used to discover it. A current write failure must remain reachable through a production owner rather than an inactive proof writer.
+
+Require current-item progress with preserved historical rows, protected originals, missing certificates and changed historical evidence. Historical counters alone must not fail a cycle, prevent a health success or cause repeated inventories. `unattributed_legacy_pending` now inventories missing stored certificates at the recorded generation without dependency revalidation. Preserve the separate `Backup status: unsafe` historical-completeness warning and all current retry, unresolved-identity, metadata and checkpoint failure oracles.
+
+Retired `reconcile trust-legacy-files plan/apply` cases must prove early actionable refusal with existing declarations, configuration, state and media unchanged. Historical declarations are setup evidence, not a successful new trust operation or verified source provenance. Preserve real current discovery, healthy-peer progress and current-failure recovery in former trust fixtures. Use reopened state and quiet follow-up cycles where applicable; record actual test entry points and results only after the adapted production paths have run.
+
+These requirements do not retire raw-inbox limits, all-generation provider-work debt, unprepared attribution or expired-cursor holds. They add no schema migration or media rewrite and do not establish recovery of a reporter's complete account.
+
+### Production-cycle regression entry points
+
+`cargo test --lib sync_loop::runner::tests::historical_preservation::` selects account-owned, file-backed production-cycle fixtures with nonempty historical originals and sidecars, a selected Live Photo and a healthy peer. `historical_certificates_missing_stale_and_future_do_not_gate_current_live_photos` asserts current completion with absent, stale or unsupported stored certificates. `historical_changed_or_missing_originals_do_not_recertify_or_release_reserved_names` checks that historical drift neither creates current retries nor releases protected paths. `historical_records_allow_current_config_activation_in_same_and_second_zone` checks current configuration and cursor activation without altering retained history.
+
+`historical_records_do_not_hide_explicit_child_or_master_family_deletion` applies explicit deletion observations to both current Live Photo renditions while retaining local media. `historical_records_retain_current_transfer_finalization_and_missing_file_failures` injects failed transfers, downloaded-state finalization failure and production-detected missing current media; it requires retained failed work, healthy-peer progress and later recovery. With `xmp`, `historical_records_retain_selected_metadata_failure_until_quiet_retry` checks a conflicting sidecar, retained media and failure markers, then successful queued retry.
+
+`historical_records_do_not_relax_current_identity_enumeration_cancellation_or_stale_plan` retains current refusals and the original cursor. `historical_records_preserve_checkpoint_and_configuration_transaction_atomicity` injects cursor and active-configuration writes that fail, then checks recovery after removing the faults. These fixtures compare historical rows after each cycle, reopen owned state and require two successful unchanged tail cycles with stable files, receipts and checkpoints, no new media GETs and no rank inventory. They use synthetic responses and local HTTP downloads; SQLite reopen is not process-death or power-loss qualification.
+
+`historical_legacy_counters_do_not_fail_completed_reporting` asserts successful JSON reporting and health updates with nonzero historical counts. `historical_legacy_counters_do_not_fail_idle_health` checks all-catalogue counts during skipped watch cycles without failing health, including a stored certificate with stale dependencies. The behavioral `preserved_legacy_status_and_reconcile_keep_attribution_separate_from_failure` checks the separate unsafe historical-backup status and protects original receipts from integrity-retry conversion. These are test entry points and assertion contracts, not a record of the latest qualification results.
 
 ## State-transition proof
 
@@ -1513,23 +1511,13 @@ retained-history recovery proof. Permanently expired boundaries with
 unproven history retain a finite actionable hold. Successful replay does not
 resolve the distinct reporter limitations tracked in #765, #853 or #845.
 
-## Legacy current-work certification regression
+<a id="legacy-current-work-certification-regression"></a>
 
-`run_cycle_legacy_smart_only_bridge_qualifies_after_reopen` uses the Hidden query
-with real SQLite, independently named current outputs and retained originals.
-`run_cycle_legacy_smart_only_bridge_preserves_failure_guards` exercises cancellation, current receipt write failure and proof transaction
-failure before reopened recovery. The same helper checks unchanged historical
-rows, dates, owners, original files, sidecars and mapping history.
-`run_cycle_ambiguous_children_unselected_hidden` retains missing-current-receipt
-holds and verifies a redacted fixed-label refusal. Cycle reporting distinguishes
-pending certification from certified history still needing attribution.
+## Preserved history and current checkpoint regression
 
-`run_cycle_legacy_smart_only_query_cannot_replace_missing_delta_successor` keeps
-healthy query tokens separate from missing/blank source successors and retains
-original cursors without proof publication. The positive cycle fixture uses a
-distinct delta successor. `smart_only_delta_replays_source_without_admitting_unselected_media`
-adds a delta-only child while the smart query is empty; source replay supplies the
-token but no off-selection download. Existing bridge-debt controls remain active.
+`run_cycle_legacy_smart_only_bridge_qualifies_after_reopen` uses the Hidden query with real SQLite, independently named current outputs and retained originals. Current selection drift supplies its inventory-and-bridge requirement; historical certification does not. `run_cycle_legacy_smart_only_bridge_preserves_failure_guards` retains cancellation, current receipt-write failure and current cursor-transaction failure before reopened recovery. The shared helper checks historical rows, dates, owners, originals, sidecars and mappings, an unset certificate generation and the visible historical counter.
+
+`run_cycle_ambiguous_children_unselected_hidden` preserves the historical family and downloads selected children without requiring a receipt for the unselected hidden child. It does not infer ownership or download that child. `run_cycle_legacy_smart_only_query_cannot_replace_missing_delta_successor` keeps healthy query tokens separate from missing or blank source successors and retains the original cursor without certificate writes. The positive fixture uses a distinct delta successor. `smart_only_delta_replays_source_without_admitting_unselected_media` adds a delta-only child while the smart query is empty; source replay supplies the token but no off-selection download. Existing current bridge-debt controls remain active.
 
 The smart-only replay controls also cover a date bound already active before a
 path-template change. A real initial source cursor and subsequent zone request
@@ -1539,21 +1527,13 @@ tokens retain the pending config until healthy query recovery. The query owns
 its local selection proof and inventory; delta evidence adds vetoes and supplies
 only the source successor.
 
-### Legacy receipt prerequisite diagnostics
+<a id="legacy-receipt-prerequisite-diagnostics"></a>
 
-`legacy_receipt_prerequisites_are_read_only_after_reopen` uses verified file-backed
-SQLite receipts and 23 synthetic conditions, then reopens each database and runs
-the explanation twice on a query-only connection. It distinguishes readiness,
-missing rendition/path receipt, wrong scoped binding, unknown/invalid source and
-a now-eligible snapshot; qualification, SQLite change count and media stay intact.
-The existing historical-source and exact-binding matrices retain their acceptance
-oracles. Ordinary and Hidden production-cycle unknown-source controls retain the
-original checkpoint/proof/row/file checks and require the fixed prerequisite label.
-A production-cycle fallback control injects read failure, unavailable inspection
-and a changed snapshot while retaining unknown provenance and every checkpoint hold.
-Support-history round-trip coverage permits only the eight fixed labels and drops
-identifiers, paths, hashes, errors and unknown future labels. No reporter data,
-authenticated run, recovery action, migration or new acceptance rule is exercised.
+### Read-only receipts and historical diagnostic decoding
+
+`legacy_receipt_prerequisites_are_read_only_after_reopen` retains its original test name but now checks the surviving receipt reader rather than a certification explanation. Its file-backed matrix varies readiness, rendition/path receipts, scoped bindings and source provenance, reopens SQLite, then compares receipt eligibility before and after enabling query-only mode. It asserts unchanged SQLite change counts and media bytes. The ready control remains eligible; invalid or missing evidence does not become a usable receipt.
+
+`historical_legacy_receipt_prerequisites_roundtrip_only_fixed_labels` retains decoding of previously stored `legacy_receipt_prerequisite_v1` support history. It accepts the eight known labels and drops identifiers, paths, hashes, errors and unknown labels. Normal sync no longer emits this retired certification diagnostic. Neither test grants ownership, source verification or checkpoint permission.
 
 ## Token-equivalence diagnostics
 
@@ -1654,14 +1634,15 @@ ordinary fail-closed acceptance controls. No live account is used. Hard process
 supervision remains an external operational requirement, as documented in
 `docs/missing-reference-inventory.md`.
 
-`cargo test --lib trusted_legacy_files` exercises explicit local-byte acceptance
-through the real cycle owner using six synthetic historical renditions, four
-ready children and two mixed-owner families. It checks zero media GETs, unchanged
-source receipts and legacy rows/aliases, restart/idempotency, two quiet followups,
-atomic stale/cancelled/SQL-failed plans, and readiness/Primary bridge holds.
-Run it with default and `--no-default-features` profiles when changing trusted
-legacy receipts. Existing `legacy_preservation` tests retain the no-acceptance
-verified-source controls.
+## Historical trust declarations and retired commands
+
+`cargo test --lib sync_loop::runner::tests::trusted_legacy::` selects the historical-trust fixtures, including mixed current work. Declarations are seeded initial history with the released key, payload and immutability triggers; no test performs a successful new plan or apply operation. `trusted_legacy_files_zero_get_reopen_and_quiet_followups` checks six local-only historical declarations, unchanged originals and source provenance, zero media GETs and no certificate writes. `trusted_legacy_files_unaccepted_rendition_is_not_checkpoint_debt` leaves one rendition without a declaration and still requires current checkpoint progress. `trusted_legacy_files_historical_receipt_immutability` checks refusal of declaration mutation, deletion, renaming and conflicting replacement.
+
+`trusted_legacy_mixed_local_only_cohort_downloads_ready_child_without_historical_hold` and `trusted_legacy_mixed_ready_control_completes_and_reopens_quietly` introduce current observations through ordinary discovery, require one independent source-verified download and check two quiet reopened cycles. Historical declarations never supply a source receipt or guessed owner. `trusted_legacy_mixed_six_acceptance_survives_readiness_failure_and_reopens` retains existing metadata-failure markers and an ineligible current receipt while independent work progresses. Its metadata writers are disabled; configured metadata retry is covered separately by the `xmp` historical-preservation fixture above.
+
+`trusted_legacy_mixed_six_acceptance_with_primary_hold_downloads_and_reopens` keeps the primary cursor and aggregate checkpoint held while the independent shared-library child completes. `trusted_legacy_mixed_missing_parent_holds_and_preserves_acceptances` checks pre-cancellation, then current missing-parent discovery, healthy-child progress and a durable `asset_delta_hydration_incomplete` hold across reopen. Both preserve historical declarations, original bytes and ownership without inventing source provenance.
+
+`trusted_legacy_files_retired_commands_refuse_before_state_or_plan_access` checks both retained CLI spellings and the command-owner refusal before database or plan access. The behavioral `retired_legacy_trust_plan_and_apply_refuse_before_archive_or_auth_writes` invokes both real binary routes against populated state and media with a forced-authentication test seam. It requires the actionable retirement error, no authentication, no plan, empty stdout and unchanged archive bytes, paths and modification times. Run the library module and behavioral entry point under the applicable default and `--no-default-features` profiles; these descriptions make no claim about the latest run results.
 
 ## Recovery evidence regressions
 

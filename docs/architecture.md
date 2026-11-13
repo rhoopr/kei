@@ -92,6 +92,7 @@ match their headings, so searching a label finds the section.
 | Full enumeration | `src/download/orchestration/full.rs` | Owns bounded enumeration, album snapshots, pass counts, and token evidence. |
 | Incremental enumeration | `src/download/orchestration/incremental.rs`, `src/download/orchestration/delta.rs` | Runs separate streaming and collecting strategies with one shared delta-state owner for provider-event bookkeeping and routing facts. |
 | Download recovery | `src/download/orchestration/recovery.rs`, `src/download/orchestration/url_refresh.rs` | Runs durable pending recovery and refreshes exact download tasks with current provider URLs. |
+| Legacy preservation preparation | `src/download/legacy_preservation.rs` | Validates unprepared historical families and files before storing protection evidence. It no longer certifies prepared history or supplies checkpoint permission. |
 | Local catalog maintenance | `src/download/orchestration/reconciliation.rs`, `src/download/orchestration/cleanup.rs`, `src/download/orchestration/maintenance.rs` | Reconciles catalog paths, removes durably owned stale temporary files, and repairs metadata-capture revisions. |
 | Asset planning | `src/download/planner.rs` | Applies filters, derives tasks, records dispatched pending work, and persists membership and identity mappings. |
 | Filter facade and configuration | `src/download/filter.rs`, `src/download/filter/config.rs` | Preserves filter entry points and shares path and filter settings between sync and import. |
@@ -159,7 +160,7 @@ match their headings, so searching a label finds the section.
 | Durable import adoption | `src/state/db/import.rs` | Atomically adopts imported files into state and reads imported records. Matching policy stays in the import command. |
 | Durable layout journals | `src/state/db/primary_layout.rs` | Stores preservation-backed layout bindings, operations, members, path claims, and immutable historical receipts. |
 | Prior publication recovery | `src/state/db/pending_publication.rs` | Recovers a rendition's unchanged prior current publication and retains conditional recovery evidence. |
-| Legacy preservation evidence | `src/state/db/legacy_preservation.rs` | Stores immutable legacy evidence and generation-fenced current-coverage receipts. It never assigns identity, writes files, or infers provider completion. |
+| Legacy preservation evidence | `src/state/db/legacy_preservation.rs` | Stores immutable originals and protected paths, retains historical coverage certificates without new certificate writes, and reads historical counters. It never assigns identity, writes files, or infers provider completion. |
 | State reports | `src/state/db/reports.rs` | Reads status, verification and manifest data, and records sync-run history. |
 | Import-existing | `src/commands/import.rs` | Matches existing files to expected iCloud paths and adopts verified files into state. |
 | Service integration | `src/service/` | Owns install, uninstall, status, service execution, and platform renderers. |
@@ -444,7 +445,7 @@ returns the canonical ID; it creates no new alias.
 
 A shadow receipt is only the last observed page, and replay can move it back. It
 is not a coverage frontier, materialization receipt or verified filesystem
-progress. Existing `CheckpointEvidence`, sparse and legacy generation proofs,
+progress. Existing `CheckpointEvidence`, sparse generation proofs,
 recovery debt and filesystem guards retain checkpoint authority. Capturing a
 tombstone cannot authorize local media deletion. Existing download and metadata
 queues still consume the current stream. Capture alone cannot admit queue work;
@@ -601,7 +602,7 @@ Current versions under current configuration are the approved materialization
 scope. Historical observations and all unfinished debt remain retained. Admission
 of a current version does not prove historical completeness, acknowledge old
 unrecoverable debt, authorize local tombstone deletion or select a historical
-retention policy. Existing CheckpointEvidence, sparse/legacy proofs, opt-in
+retention policy. Existing CheckpointEvidence, sparse proofs, opt-in
 metadata writes, publication guards and WAL NORMAL qualification remain in force.
 
 ### Selection generation shadow
@@ -731,7 +732,7 @@ latency or constant total decode-work guarantee is advertised.
 Captured observations, admitted decisions, verified media and verified metadata
 are separate durable facts. CLI download counts retain the existing task
 semantics and do not claim unique-file counts or full-zone completion. Active
-progress cannot replace `CheckpointEvidence`, legacy/sparse generation proofs,
+progress cannot replace `CheckpointEvidence`, sparse generation proofs,
 filesystem guards or source checkpoint policy. Unfinished old selection debt
 vetoes the source successor, including when later configuration uses the legacy
 dispatcher. Local wake-up cannot invent a provider cursor. Tombstones do not
@@ -1065,7 +1066,7 @@ of the retained boundary removes the hold in the same transaction that stages
 or activates its successor. Transaction-time metadata comparisons fence both
 hold staging and checkpoint promotion against changes to the planned cursor
 and enumeration configuration, including the exact staged candidate read during
-aggregate promotion. Existing legacy/sparse generation validation
+aggregate promotion. Existing sparse generation validation
 still applies. Global configuration activation remains atomic across selected
 zones. Zone-local hold aggregation keeps status and backup safety truthful even
 when another zone succeeds.
@@ -1384,6 +1385,12 @@ event counts, and completion tokens. The streaming strategy emits created
 assets through a bounded channel and defers album, relation, and unpaired-asset
 work. The collecting strategy observes all events before state writes, hydrates
 missing identities, and applies relations before routing created assets.
+Before reserving paths, collecting coalesces equivalent consecutive observations
+for each library, source identity and selected pass, using the later signed URL.
+It compares parsed dates, metadata, resources and URL alias relationships; a
+different observation remains admitted. Raw event and checkpoint evidence is
+never coalesced. Distinct metadata revisions in one batch still follow the
+existing first-observation metadata refresh behavior.
 These orders preserve each strategy's token-safety and selected-album behavior.
 Shutdown races provider-event and successor waits in both strategies; the owned
 receiver is dropped before the successor wait to release provider backpressure.
@@ -1416,7 +1423,7 @@ An explicitly rejected cursor or supported static incremental fallback can still
 
 `sync_cycle.rs` retires qualified current work only after required enumeration/path configuration activation and a final FINISHED readiness check. `state/db/checkpoints.rs::commit_checkpoint_transition` compares the exact request value, accepted retained/offered cursor, active configuration hashes, absent pending hashes, and indexing/identity holds. The same transaction completes the inventory's deferred album-membership snapshots and removes the request. Failed comparison or transaction preserves both the request and prior membership; a rejected attempt cannot infer membership absence.
 
-Request retirement writes no source checkpoint. A fixed-date selection can complete this current obligation while its excluded tail still holds the zone/database checkpoint. Broader legacy certification, sparse identity, expired-cursor and retained-history gates remain unchanged; a qualified request can retire while an independent historical hold remains. This flow proves neither a provider snapshot nor complete historical deletion coverage, and never authorizes local media deletion.
+Request retirement writes no source checkpoint. A fixed-date selection can complete this current obligation while its excluded tail still holds the zone/database checkpoint. Sparse identity, expired-cursor and retained provider-work gates remain independent; a qualified request can retire while another hold remains. Legacy coverage certification is retired and cannot supply or veto checkpoint permission. This flow proves neither a provider snapshot nor complete historical deletion coverage, and never authorizes local media deletion.
 
 ### Download and publication
 
@@ -1839,18 +1846,7 @@ matching child, and full-evidence matching child counts. It contains no IDs,
 paths, checksums, or provider metadata. These counts do not authorize identity
 selection, even when only one child matches every stored rendition.
 
-Schema v28 can preserve an unclaimed legacy master receipt with at least two
-historical child mappings without assigning it to a child. A complete current
-inventory must contain at least one live child. A sole survivor must satisfy the
-same independent current-child receipt and file checks as a multi-child family;
-historical siblings missing from that inventory do not establish ownership or
-authorize source deletion. Zero-current-child families and saved legacy owners
-remain excluded. `download/legacy_preservation.rs` owns eligibility and
-file validation; `state/db/legacy_preservation.rs` owns immutable evidence and
-generation-fenced receipts. Migration creates empty tables and protection
-triggers only. It does not classify or rewrite existing records. Schema-27
-binaries reject a migrated database; read-only reports require the current
-schema and never migrate it.
+Schema v28 can preserve an unclaimed legacy master receipt with at least two historical child mappings without assigning it to a child. Preparation requires a complete current inventory with at least one live child; a sole survivor is not inferred to own the historical original. Historical siblings missing from that inventory do not establish ownership or authorize source deletion. Zero-current-child families and saved legacy owners remain excluded. Independently identified current children use the normal download and publication checks, without a legacy coverage certificate. `download/legacy_preservation.rs` owns preparation eligibility and file validation; `state/db/legacy_preservation.rs` owns immutable originals, protected paths and retained historical certificates. The original schema-28 migration created empty tables and protection triggers without classifying existing records. Retiring certification adds no schema migration, rewrites no files and leaves the current state schema at 37. Older schema binaries still cannot open newer state; this change is not a downgrade guarantee.
 
 Preparation protects the original catalogue rows, capture revisions, retry
 receipts, relationship history, media paths and sidecar presence. It preserves
@@ -1878,7 +1874,7 @@ Cumulative transferred bytes are counted separately and do not consume the
 retained-evidence budget. These counts are representation bounds, not process RSS;
 one response is decoded before its page-size guard. A cycle considers at most 64
 new candidates. Exhausting a limit retains the hold. Sparse, malformed,
-cross-library or incomplete evidence cannot activate preservation. No diagnostic
+cross-library or incomplete evidence cannot establish preservation evidence. No diagnostic
 count is ownership proof.
 
 Failed preparation discovery records a versioned, library-scoped
@@ -1888,48 +1884,15 @@ for at most one hour across restart. Retry scheduling, capture cycle counters an
 unchanged relation refresh timestamps do not reset that delay. Changed
 configuration or original-family evidence permits
 a new attempt; malformed, unsupported or out-of-range retry receipts never defer
-work. Deferral supplies no provider evidence or checkpoint permission. Prepared
-records still require fresh certification, and metadata-capture retry scheduling
-remains independent. Successful discovery clears its failure delay.
+work. Deferral supplies no provider evidence or checkpoint permission. Preparation and metadata-capture retry scheduling remain independent. Successful discovery clears its failure delay. Prepared records no longer require certification; unprepared discovery and attribution limits remain outside that retirement.
 
-Preparation and certification use separate complete scans; a preparation result
-cannot certify work performed later. Failure warnings expose only a fixed stage
-and category plus aggregate page, record, transferred-byte and retained-byte
-counts. Provider error text, record identities, paths and URLs remain private.
+Preparation still requires its complete scan. It establishes protected historical evidence, not current work completion or checkpoint permission. Failure warnings expose only a fixed stage and category plus aggregate page, record, transferred-byte and retained-byte counts. Provider error text, record identities, paths and URLs remain private.
 
-Activation requires a normal completed current inventory and, when a retained
-cursor exists, a successful delta bridge. Independently identified current
-children need separate, finalized receipts and verified files for every selected
-rendition. Qualification requires independently verified per-path source
-provenance for the exact child, rendition, provider generation and catalogue
-path, with a freshly verified current local SHA-256. Provider MMCS signatures
-are generation identities and are never compared to local content hashes.
-Historical download hashes and publication without durable source provenance
-remain insufficient. A new unverified publication that changes local bytes
-clears prior source provenance; verified metadata rewrites retain their source
-receipt. Exact-byte relocation can reuse an unambiguous source receipt bound
-to the same library, child, rendition and provider generation. Pending
-rewrite, capture-repair or path-reconciliation debt keeps this conservative
-qualification blocked. Retained reconciliation destination choices are naming
-evidence, not pending work, and remain part of the dependency comparison. No metadata writer is enabled automatically. A replay
-that creates debt holds the cursor; a later cycle may qualify after configured
-current-child work completes.
+Prepared history is no longer revalidated or activated during normal sync. Missing certificates, changed historical dependencies or changed historical files alone do not force a full inventory, delta bridge, checkpoint hold or cycle failure. Existing `unattributed_legacy_proofs` rows and `active_generation` pointers remain unchanged history; normal sync no longer appends certificates or reactivates their old holds. Independently identified current work still uses its normal provider discovery, finalization, retry and checkpoint owners.
 
-Original media and sidecars are fingerprinted through confined paths. Symlinks,
-pending temporary writes, replacement journals, shared paths and changed bytes
-reject qualification. Multiple hard links also reject qualification by default. Preparation warnings retain the aggregate
-`invalid_original_files` candidate count and expose `shared_file_links` as a subset,
-counting each candidate once at its first rejected media or sidecar. Typed shared-link
-errors also expose only the fixed reason `shared_file_links` at certification and
-checkpoint stages. The TOML-only `[download].legacy_preservation_allow_hardlinks`
-flag defaults to false. True waives only the hard-link-count check for original
-and current-child media and sidecars during legacy qualification and revalidation.
-Actual use emits one redacted aggregate warning per library cycle, deduplicated
-by evidence path; enabling the flag without linked evidence emits no warning.
-Other confined-path, byte, receipt, debt and checkpoint validation stays intact.
-Preparation, certification and checkpoint validation consume the same flag.
-Its value is bound into the separate legacy policy hash; ordinary download and
-enumeration hashes remain unchanged. False retains the previous legacy hash.
+Current source provenance remains separate from historical certificates. Provider MMCS signatures identify generations and are never compared to local SHA-256. Historical download hashes, local-trust declarations and publication without durable source provenance do not establish verified source bytes. Current transfer, metadata, source-identity and state-write failures retain their existing obligations; retiring certification neither clears them nor enables a metadata writer.
+
+Preparation fingerprints original media and sidecars through confined paths. Symlinks, pending temporary writes, replacement journals, shared paths and changed bytes reject preparation. Multiple hard links also reject it by default. Preparation warnings retain the aggregate `invalid_original_files` candidate count and expose `shared_file_links` as a subset, counting each candidate once at its first rejected media or sidecar. The TOML-only `[download].legacy_preservation_allow_hardlinks` flag defaults to false. True waives only the hard-link-count check for qualifying evidence paths. Actual use emits one redacted aggregate warning per library cycle, deduplicated by evidence path; enabling the flag without linked evidence emits no warning. Other confined-path, byte, receipt and current-work guards stay intact. The separate legacy policy hash retains its existing encoding for retained-checkpoint policy comparisons; certification retirement does not change the ordinary download or enumeration hashes.
 
 The opt-in assumes external tools are coordinated so they do not change linked
 contents, metadata, or kei-managed names during the operation. It does not prove
@@ -1945,8 +1908,7 @@ all libraries before opening a journal, including unselected libraries. Missing
 protected parents retain their path reservation through the nearest existing
 ancestor; they do not abort unrelated recovery or clear preservation/checkpoint
 holds. Other filesystem errors and existing protected journals still block
-recovery. Current child files and sidecar presence are also bound
-into the receipt. The preservation owner never moves, rewrites, adopts or deletes
+recovery. The preservation owner never moves, rewrites, adopts or deletes
 original paths. With the hardlink opt-in, that path protection cannot prevent
 changes made through another alias by an unchanged write path.
 Normal downloads, metadata repair, local path reconciliation, imports and source
@@ -1964,40 +1926,11 @@ Source metadata recovery distinguishes protected legacy originals from healthy
 managed primary-layout sources. Managed sources continue through their layout
 owner; pending media or sidecar replacement journals still hold reconciliation.
 
-The final SQLite transaction compares the original snapshot, current child and
-family evidence, receipt generation, configuration metadata and prior cursor.
-It appends the proof and commits the cursor together. Staged config-reconciliation
-cursors use the same transaction. Invalid or stale proof, incomplete current work,
-interruption and write failure retain the prior cursor. Existing current-provider
-identity and checkpoint guards remain independent and are never cleared to permit
-preservation. An unchanged activated receipt can support ordinary incremental
-cycles without another full inventory. Changed family, configuration, file or
-receipt evidence reactivates the hold while retaining every original snapshot and
-prior proof. Reactivation does not authorize historical attribution or rewriting.
+Current checkpoint transactions retain their source cursor, configuration, sparse-identity and stale-plan fences. Failed enumeration, cancellation, unfinished current work without sufficient durable recovery proof, or a failed state transaction retain the affected checkpoint. Historical certificates are neither an extra prerequisite nor a substitute for these checks. The raw inbox, unprepared attribution, all-generation provider-work debt and expired-cursor recovery retain their existing policies and limits; certification retirement does not resolve every historical-state hold or establish recovery of the reports collected in #1044.
 
-`status`, cycle reports and health JSON expose `unattributed_legacy_assets` and
-`unattributed_legacy_pending` separately from download failures. Pending current
-proof makes one-shot exit status, cycle reports and health incomplete, including
-idle health for unselected libraries. Certified but unattributed history alone
-does not fail current sync. Certification refusals include the fixed-label
-`legacy_certification_refusal_v1` diagnostic and a bounded `subreason`; unknown
-errors use `unclassified`, without logging their private source text. The first counts
-legacy records still needing attribution; the second counts records awaiting
-valid current-work preservation proof. Original capture revision and retry history
-remain stored. Advancing current sync does not claim a complete historical backup;
-backup safety remains false while attribution is unresolved.
+`status`, cycle reports and health JSON retain `unattributed_legacy_assets` and `unattributed_legacy_pending` with their existing names, types and scopes. The first counts preserved records with unknown attribution, not paths or renditions. The second counts records without a stored certificate at their recorded `active_generation`, including absent pointers. This is a presence lookup: it does not validate certificate versions, payloads, dependencies, configuration or files. Despite its historical name, it is not pending sync work. Status is per library, completed cycles total selected libraries, and skipped watch cycles report all-catalogue historical totals. Current capture `remaining`, `unresolved` and `deferred` counts, revision `processed` and `failed` tallies, and cycle metadata-capture observations keep their existing meanings.
 
-A missing selected receipt also emits `legacy_receipt_prerequisite_v1` with
-one fixed `prerequisite`: child readiness, absent rendition or scoped path receipt,
-binding mismatch, or missing/invalid verified source. This is a read-only snapshot
-after refusal, not acceptance evidence. A newly eligible snapshot reports
-`receipt_state_changed`; failed or unsupported inspection reports
-`diagnostic_unavailable`. Both retain the original `child_receipt_missing` hold.
-The lookup cannot grant qualification, retry work, write state or inspect media.
-It emits no child/library identifiers, paths, hashes or private database errors;
-support history retains only the enumerated prerequisite. One refusal does not
-establish how many families lack proof. Primary sparse-identity recovery remains
-independent.
+Historical attribution still makes status report `Backup status: unsafe`, because current sync success does not establish historical completeness. Historical counters alone no longer fail one-shot sync, increment cycle or health failures, prevent health's `last_success_at` update, or wake an otherwise idle watch cycle. Current identity and selected-work failures keep their ordinary effects. Primary sparse-identity recovery still requires verified source provenance; stored local trust cannot replace it.
 
 Automatic repair processes at most 500 stale assets per library in one sync
 cycle. When a clean batch makes progress and work remains, watch and service
@@ -2018,7 +1951,7 @@ corrected catalogue metadata, the current revision, and any configured rewrite
 marker before the library revision can become active. Lookup or state failures
 leave the row stale, report the remaining work, and preserve the affected
 provider checkpoint. A library promotes its active revision only when every
-live downloaded row is current. Persisted rewrite markers may drain later
+live downloaded row is current, excluding prepared historical originals without requiring a coverage certificate. Persisted rewrite markers may drain later
 because they are durable recovery evidence.
 
 Metadata failure markers must survive so a later run can retry metadata
@@ -2408,24 +2341,10 @@ or CompleteLegacyInventory proof. At most one later lookup is observational.
 Ordinary preservation retains its candidate, scope, date and completeness gates.
 See `docs/missing-reference-inventory.md` for bounds and supervision requirements.
 
-### Explicit trusted local bytes for legacy migration
+<a id="explicit-trusted-local-bytes-for-legacy-migration"></a>
 
-`commands/trusted_legacy.rs` owns the offline `reconcile trust-legacy-files plan/apply`
-interface and account lock. `download/trusted_legacy.rs` owns bounded plans,
-confined retained file handles and final byte validation.
-`state/db/trusted_legacy.rs` owns typed `TrustedLegacyFile` acceptances in
-versioned, content-addressed `metadata` keys. Apply installs prefix-scoped
-immutability guards in the acceptance transaction; no-acceptance catalogues are
-unchanged. Their account/provider identity,
-current-child generation, metadata/path and protected-family snapshots are
-rebuilt from current state at apply and receipt lookup. Apply commits all entries
-atomically after final file and cancellation checks. No source checksum is
-inferred or written.
+### Retired legacy local-trust commands
 
-Only legacy current-child coverage consumes this alternate provenance. Its fresh
-inventory, readiness, ownership, file and checkpoint guards still run.
-Nonempty library-scoped acceptance rows extend the legacy dependency fence;
-provider evidence records `verified_source` or `trusted_legacy_file` explicitly.
-No-acceptance dependency serialization is unchanged. Native source verification,
-GPS and ordinary adoption retain their verified-source requirements. See
-[Trusted Legacy Files](trusted-legacy-files.md) for the command boundary.
+`reconcile trust-legacy-files plan/apply` remains parseable and documented in CLI help only to refuse early with guidance to run `kei sync`. `commands/reconcile.rs::run_reconcile` refuses the nested action before resolving the database path; no authentication, state opening, plan creation or media work follows. It adds no declaration and leaves existing trust records, plans and media unchanged. No useful sync consumer of new local-trust declarations remains after coverage certification retires.
+
+Existing `trusted_legacy_file:v1:` metadata records and their immutability guards remain historical evidence. Status counts stored declarations, including obsolete bindings, rather than currently verified files. They do not establish source provenance, ownership, adoption permission or checkpoint authority. Native source verification, sparse recovery, GPS and ordinary adoption retain their source and ownership requirements. See [Trusted Legacy Files](trusted-legacy-files.md) for operator guidance.

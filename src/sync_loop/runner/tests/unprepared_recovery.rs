@@ -505,9 +505,8 @@ async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_
             assert_eq!(presences.len(), 1, "cycle {cycle}: one family original");
             assert_eq!(presences[0].asset_id, "legacy-master");
             assert_eq!(
-                presences[0].active_generation,
-                Some(1),
-                "cycle {cycle}: the family proof is active"
+                presences[0].active_generation, None,
+                "cycle {cycle}: preparation does not write a certificate"
             );
             assert_eq!(
                 presences[0].files.len(),
@@ -597,10 +596,10 @@ async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_
 
     assert!(
         inventory.load(Ordering::SeqCst) > 0,
-        "certification reads the complete provider inventory"
+        "preparation reads the complete provider inventory"
     );
 
-    // Quiet reopen: an empty after-cursor delta keeps the active proof, the
+    // Quiet reopen: an empty after-cursor delta keeps the prepared history, the
     // refusal evidence, the owners and the advanced checkpoint unchanged.
     let (inner, result) = run_cycle(cycle_count).await;
     assert_eq!(result.stats.downloaded, 0, "{result:?}");
@@ -616,10 +615,10 @@ async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_
     assert_eq!(
         presences.len(),
         1,
-        "the family proof survives the quiet reopen"
+        "the family preservation survives the quiet reopen"
     );
     assert_eq!(presences[0].asset_id, "legacy-master");
-    assert_eq!(presences[0].active_generation, Some(1));
+    assert_eq!(presences[0].active_generation, None);
     assert_eq!(
         inner
             .get_metadata("sync_token:PrimarySync")
@@ -627,7 +626,7 @@ async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_
             .unwrap()
             .as_deref(),
         Some("after"),
-        "the certified checkpoint stays advanced"
+        "the current checkpoint stays advanced"
     );
     server.verify().await;
 }

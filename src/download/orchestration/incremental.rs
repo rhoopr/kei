@@ -508,6 +508,34 @@ async fn run_collecting_metadata_rewrite_batch(
     .failed
 }
 
+/// Keep later equivalent URLs without suppressing intervening distinct observations.
+fn coalesce_collecting_assets<'a>(
+    assets: &'a [(PhotoAsset, usize)],
+    library: &'a str,
+) -> Vec<(&'a PhotoAsset, usize)> {
+    let mut admitted: Vec<(&PhotoAsset, usize)> = Vec::with_capacity(assets.len());
+    let mut latest: FxHashMap<(&str, &str, usize), usize> = FxHashMap::default();
+    for (asset, pass_index) in assets {
+        // Master and state identities are observation evidence, not stream keys:
+        // a change and return must both reach the planner's mapping writer.
+        let key = (
+            asset.source_zone().unwrap_or(library),
+            asset.asset_record_name(),
+            *pass_index,
+        );
+        if let Some(index) = latest.get(&key).copied()
+            && let Some((previous, _)) = admitted.get_mut(index)
+            && previous.same_download_observation(asset)
+        {
+            *previous = asset;
+            continue;
+        }
+        latest.insert(key, admitted.len());
+        admitted.push((asset, *pass_index));
+    }
+    admitted
+}
+
 pub(super) async fn download_photos_incremental_collecting_inner(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
@@ -855,13 +883,13 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     let phase_started = Instant::now();
     let mut retry_sources: FxHashMap<RetryTaskKey, UrlRetrySource> = FxHashMap::default();
 
-    for (asset, pass_index) in &downloadable_assets {
+    for (asset, pass_index) in coalesce_collecting_assets(&downloadable_assets, &config.library) {
         #[allow(
             clippy::indexing_slicing,
             reason = "pass_index was assigned by the producer from the same `passes` slice \
                       that pass_configs was built from; indices are valid"
         )]
-        let effective_config = &pass_configs[*pass_index];
+        let effective_config = &pass_configs[pass_index];
 
         if controls.run_mode.downloads_files()
             && let Some(db) = &config.state_db
@@ -1052,7 +1080,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                         effective_config.as_ref(),
                         task.version_size,
                     ),
-                    pass_index: *pass_index,
+                    pass_index,
                 },
             );
         }

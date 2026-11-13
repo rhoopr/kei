@@ -470,6 +470,7 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "interrupted",
         ]),
         "recovery_decision_v1" => Some(&["mechanism", "decision", "reason"]),
+        // Read-only compatibility for support history from older binaries.
         "legacy_receipt_prerequisite_v1" => Some(&["prerequisite"]),
         "legacy_preservation_hardlink_trust" => Some(&["stage", "reason", "affected_paths"]),
         "expired_url_refresh_failed" => Some(&[

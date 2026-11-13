@@ -47,7 +47,7 @@ pub(crate) async fn run_status(
     let trusted = db.stored_trusted_legacy_file_count().await?;
     if trusted > 0 {
         println!(
-            "  Stored Trusted Legacy File acceptances: {trusted} (provider verification unknown)"
+            "  Stored historical local-trust declarations: {trusted} (not provider verification)"
         );
     }
 
@@ -98,7 +98,7 @@ pub(crate) async fn run_status(
         for capture in &summary.metadata_capture {
             if capture.unattributed_legacy_assets > 0 {
                 println!(
-                    "  {}: {} legacy records need attribution; {} awaiting current-work preservation proof",
+                    "  {}: preserved legacy records with unknown attribution: {}; legacy records without a stored coverage certificate: {}. Certification is retired; this is not pending sync work.",
                     capture.library,
                     capture.unattributed_legacy_assets,
                     capture.unattributed_legacy_pending

@@ -153,7 +153,6 @@ fn owning_checkpoint_decisions_survive_support_allowlist_without_tokens() {
         CheckpointHoldReason::EnumerationIncomplete,
         CheckpointHoldReason::StateNotDurable,
         CheckpointHoldReason::TokenProofIncomplete,
-        CheckpointHoldReason::LegacyPreservationIncomplete,
     ] {
         let decision = SourceCheckpointDecision::Preserve {
             reason,

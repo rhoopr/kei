@@ -19,7 +19,9 @@ use crate::types::ChangeReason;
 
 #[derive(Debug)]
 pub(crate) struct CompleteLegacyInventory {
+    #[cfg(test)]
     pub(crate) library: String,
+    #[cfg(test)]
     pub(crate) cursor: String,
     pub(crate) children: Vec<PhotoAsset>,
 }
@@ -344,7 +346,10 @@ impl PhotoAlbum {
             !masters.is_empty(),
             InventoryFailureKind::Evidence("missing_candidate_scope")
         );
-        let RetainedLegacyInventory { cursor, latest } = self
+        let RetainedLegacyInventory {
+            cursor: _cursor,
+            latest,
+        } = self
             .scan_legacy_preservation_records(masters, cancel, budget, progress)
             .await?;
         let mut expected = FxHashSet::default();
@@ -475,8 +480,10 @@ impl PhotoAlbum {
         );
         children.sort_by(|a, b| a.asset_record_name().cmp(b.asset_record_name()));
         Ok(CompleteLegacyInventory {
+            #[cfg(test)]
             library: self.zone_name().to_owned(),
-            cursor,
+            #[cfg(test)]
+            cursor: _cursor,
             children,
         })
     }

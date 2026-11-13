@@ -43,9 +43,303 @@ use super::super::test_support::{
     seed_downloaded_metadata_asset, test_config, unused_unfiled_changes_pass,
 };
 use super::{
-    download_photos_incremental, download_photos_incremental_collecting,
-    download_photos_incremental_collecting_inner,
+    coalesce_collecting_assets, download_photos_incremental,
+    download_photos_incremental_collecting, download_photos_incremental_collecting_inner,
 };
+
+#[test]
+fn collecting_duplicate_admission_preserves_distinct_observations() {
+    let records = incremental_photo_records("duplicate");
+    let make =
+        |records: &[serde_json::Value]| PhotoAsset::new(records[0].clone(), records[1].clone());
+    let base = make(&records);
+    let mut renewal = records.clone();
+    renewal[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+        json!("https://p01.icloud-content.com/renewed.jpg");
+    let renewed = make(&renewal);
+    let inputs = vec![(base.clone(), 0), (renewed.clone(), 0)];
+    let admitted = coalesce_collecting_assets(&inputs, "PrimarySync");
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(
+        admitted[0].0.versions()[0].1.url.as_ref(),
+        "https://p01.icloud-content.com/renewed.jpg"
+    );
+
+    for (label, index, pointer, value) in [
+        (
+            "checksum",
+            0,
+            "/fields/resOriginalRes/value/fileChecksum",
+            json!("different"),
+        ),
+        ("size", 0, "/fields/resOriginalRes/value/size", json!(1025)),
+        (
+            "resource type",
+            0,
+            "/fields/resOriginalFileType/value",
+            json!("public.png"),
+        ),
+        (
+            "filename",
+            0,
+            "/fields/filenameEnc/value",
+            json!("other.jpg"),
+        ),
+        ("master", 0, "/recordName", json!("other-master")),
+        ("child", 1, "/recordName", json!("other-child")),
+        (
+            "capture date",
+            1,
+            "/fields/assetDate/value",
+            json!(1700000000001i64),
+        ),
+        (
+            "added date",
+            1,
+            "/fields/addedDate/value",
+            json!(1700000000001i64),
+        ),
+        (
+            "rendition width",
+            0,
+            "/fields/resOriginalWidth/value",
+            json!(101),
+        ),
+        (
+            "malformed resource",
+            0,
+            "/fields/resOriginalRes/value/downloadURL",
+            json!("not-a-url"),
+        ),
+    ] {
+        let mut changed = records.clone();
+        *changed[index].pointer_mut(pointer).unwrap() = value;
+        let inputs = vec![(base.clone(), 0), (make(&changed), 0)];
+        assert_eq!(
+            coalesce_collecting_assets(&inputs, "PrimarySync").len(),
+            2,
+            "{label}"
+        );
+    }
+    let mut changed = records.clone();
+    changed[1]["fields"]["isFavorite"] = json!({"value": 1});
+    let changed = make(&changed);
+    let inputs = vec![(base.clone(), 0), (changed, 0), (base.clone(), 0)];
+    assert_eq!(
+        coalesce_collecting_assets(&inputs, "PrimarySync").len(),
+        3,
+        "A/B/A is not globally deduplicated"
+    );
+    let inputs = vec![
+        (base.clone(), 0),
+        (base.clone(), 1),
+        (base.clone().with_source_zone(Arc::from("SharedSync")), 0),
+        (
+            base.clone()
+                .with_state_record_name(Arc::from("legacy-state")),
+            0,
+        ),
+    ];
+    assert_eq!(
+        coalesce_collecting_assets(&inputs, "PrimarySync").len(),
+        4,
+        "passes, libraries and state identities remain distinct"
+    );
+}
+
+#[test]
+fn collecting_duplicate_admission_preserves_companions_and_url_aliases() {
+    let mut records = incremental_photo_records("live");
+    records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {"downloadURL":"https://p01.icloud-content.com/motion", "size": 50, "fileChecksum":"motion"}});
+    records[0]["fields"]["resOriginalVidComplFileType"] =
+        json!({"value":"com.apple.quicktime-movie"});
+    let make =
+        |records: &[serde_json::Value]| PhotoAsset::new(records[0].clone(), records[1].clone());
+    let original = make(&records);
+    assert!(original.is_live_photo());
+    let mut renewed = records.clone();
+    renewed[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+        json!("https://p01.icloud-content.com/new-still");
+    renewed[0]["fields"]["resOriginalVidComplRes"]["value"]["downloadURL"] =
+        json!("https://p01.icloud-content.com/new-motion");
+    let renewed = make(&renewed);
+    let inputs = vec![(original.clone(), 0), (renewed, 0)];
+    let admitted = coalesce_collecting_assets(&inputs, "PrimarySync");
+    assert_eq!(admitted.len(), 1);
+    assert!(admitted[0].0.is_live_photo());
+    assert_eq!(admitted[0].0.versions().len(), 2);
+    let mut aliased = records.clone();
+    aliased[0]["fields"]["resOriginalVidComplRes"]["value"]["downloadURL"] =
+        records[0]["fields"]["resOriginalRes"]["value"]["downloadURL"].clone();
+    let inputs = vec![(original.clone(), 0), (make(&aliased), 0)];
+    assert_eq!(
+        coalesce_collecting_assets(&inputs, "PrimarySync").len(),
+        2,
+        "URL alias changes selection"
+    );
+    records[0]["fields"]["resOriginalVidComplRes"]["value"]["fileChecksum"] = json!("new-motion");
+    let inputs = vec![(original, 0), (make(&records), 0)];
+    assert_eq!(
+        coalesce_collecting_assets(&inputs, "PrimarySync").len(),
+        2,
+        "changed companion is new evidence"
+    );
+}
+
+#[test]
+fn collecting_duplicate_admission_tracks_master_and_state_transitions_per_child() {
+    let a_records = incremental_photo_records("master-a");
+    let mut b_records = incremental_photo_records("master-b");
+    b_records[1]["recordName"] = a_records[1]["recordName"].clone();
+    let a = PhotoAsset::new(a_records[0].clone(), a_records[1].clone());
+    let b = PhotoAsset::new(b_records[0].clone(), b_records[1].clone());
+    let other_state = a.clone().with_state_record_name(Arc::from("legacy-state"));
+    for (label, middle) in [
+        ("master", b),
+        ("state", other_state),
+        (
+            "source-zone-evidence",
+            a.clone().with_source_zone(Arc::from("PrimarySync")),
+        ),
+    ] {
+        let inputs = vec![(a.clone(), 0), (middle, 0), (a.clone(), 0)];
+        let admitted = coalesce_collecting_assets(&inputs, "PrimarySync");
+        assert_eq!(admitted.len(), 3, "{label} A/B/A must stay in order");
+        assert!(std::ptr::eq(admitted[0].0, &inputs[0].0));
+        assert!(std::ptr::eq(admitted[1].0, &inputs[1].0));
+        assert!(std::ptr::eq(admitted[2].0, &inputs[2].0));
+    }
+
+    let other_child = PhotoAsset::new(
+        a_records[0].clone(),
+        incremental_photo_records("other")[1].clone(),
+    );
+    for (label, other, pass) in [
+        ("child", other_child, 0),
+        (
+            "zone",
+            a.clone().with_source_zone(Arc::from("SharedSync")),
+            0,
+        ),
+        ("pass", a.clone(), 1),
+    ] {
+        let inputs = vec![(a.clone(), 0), (other, pass), (a.clone(), 0)];
+        let admitted = coalesce_collecting_assets(&inputs, "PrimarySync");
+        assert_eq!(
+            admitted.len(),
+            2,
+            "{label} does not split an independent stream"
+        );
+        assert!(
+            std::ptr::eq(admitted[0].0, &inputs[2].0),
+            "later equivalent URL is retained"
+        );
+        assert!(std::ptr::eq(admitted[1].0, &inputs[1].0));
+    }
+}
+
+#[tokio::test]
+async fn collecting_master_aba_preserves_final_durable_mapping() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = crate::start_wiremock_or_skip!();
+    let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, 0x4A, 0x46];
+    Mock::given(method("GET"))
+        .and(path("/aba.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&server)
+        .await;
+    let url = format!("{}/aba.jpg", server.uri());
+    let mut a = incremental_photo_records_with_url("master-a", "aba.jpg", &url, body.len() as u64);
+    let mut b = incremental_photo_records_with_url("master-b", "aba.jpg", &url, body.len() as u64);
+    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+    a[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+    b[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+    b[1]["recordName"] = a[1]["recordName"].clone();
+    let records = vec![
+        a[0].clone(),
+        a[1].clone(),
+        b[0].clone(),
+        b[1].clone(),
+        a[1].clone(),
+    ];
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: changes_album(
+            "",
+            changes_zone_session(Arc::new(AtomicUsize::new(0)), records),
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let root = TempDir::new().unwrap();
+    let database = root.path().join("state.db");
+    let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+    db.acquire_lock("mapping transitions").unwrap().execute_batch(
+        "CREATE TABLE mapping_observations(master TEXT NOT NULL);\
+         CREATE TRIGGER track_mapping_insert AFTER INSERT ON asset_master_mappings BEGIN INSERT INTO mapping_observations VALUES(NEW.master_record_name); END;\
+         CREATE TRIGGER track_mapping_update AFTER UPDATE ON asset_master_mappings BEGIN INSERT INTO mapping_observations VALUES(NEW.master_record_name); END;"
+    ).unwrap();
+    let mut config = test_config();
+    config.directory = Arc::from(root.path().join("media"));
+    config.concurrent_downloads = 1;
+    config.state_db = Some(db.clone());
+    let result = download_photos_incremental_collecting(
+        &Client::new(),
+        &[pass],
+        &Arc::new(config),
+        "before",
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result.outcome, DownloadOutcome::Success),
+        "{result:?}"
+    );
+    assert_eq!(
+        result.stats.downloaded, 3,
+        "all three distinct observations reach execution"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    assert_eq!(
+        db.get_master_record_name_for_asset("PrimarySync", "asset-master-a")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("master-a")
+    );
+    let observations = {
+        let conn = db.acquire_lock("inspect mapping transitions").unwrap();
+        let mut query = conn
+            .prepare("SELECT master FROM mapping_observations ORDER BY rowid")
+            .unwrap();
+        query
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        observations,
+        [
+            "master-a", "master-b", "master-a", "master-a", "master-b", "master-a"
+        ]
+    );
+    drop(db);
+    let reopened = SqliteStateDb::open(&database).await.unwrap();
+    assert_eq!(
+        reopened
+            .get_master_record_name_for_asset("PrimarySync", "asset-master-a")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("master-a")
+    );
+}
 
 async fn run_incremental_strategy(
     collecting: bool,

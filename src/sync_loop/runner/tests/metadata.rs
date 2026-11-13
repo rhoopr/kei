@@ -3665,25 +3665,6 @@ async fn exercise_legacy_child_cycles_with_provenance(
     smart_only: bool,
     signature_bytes: Option<usize>,
 ) {
-    Box::pin(exercise_legacy_child_cycles_with_receipt_diagnostic(
-        fault,
-        child_counts,
-        hardlink_fault,
-        smart_only,
-        signature_bytes,
-        None,
-    ))
-    .await;
-}
-
-async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
-    fault: AmbiguousChildFault,
-    child_counts: &[usize],
-    hardlink_fault: Option<LegacyHardlinkFault>,
-    smart_only: bool,
-    signature_bytes: Option<usize>,
-    diagnostic: Option<Result<state::db::LegacyChildReceiptRefusal, &'static str>>,
-) {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -3742,7 +3723,15 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                 return Ok(response);
             }
             if url.contains("/changes/zone?") {
-                let mut response = serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"after","moreComing":false,"records":self.records}]});
+                let records: Vec<_> = self
+                    .records
+                    .iter()
+                    .filter(|record| {
+                        !self.omit_hidden
+                            || record["fields"]["isHidden"]["value"] != serde_json::json!(1)
+                    })
+                    .collect();
+                let mut response = serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"after","moreComing":false,"records":records}]});
                 if self.incomplete_inventory {
                     response["zones"][0]
                         .as_object_mut()
@@ -4003,6 +3992,17 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     .set_metadata("sync_token:PrimarySync", "before")
                     .await
                     .unwrap();
+                if preserving {
+                    // Current selection drift, not historical certificates,
+                    // requires the initial selected inventory and delta bridge.
+                    inner
+                        .set_metadata(
+                            crate::sync_cycle::ENUM_CONFIG_HASH_KEY,
+                            "previous-selection",
+                        )
+                        .await
+                        .unwrap();
+                }
                 inner
                     .begin_metadata_capture_revision(
                         "PrimarySync",
@@ -4092,7 +4092,7 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
             );
             if matches!(fault, AmbiguousChildFault::PreserveCheckpointFailure) {
                 rusqlite::Connection::open(&database).unwrap().execute_batch(
-                    "CREATE TRIGGER fail_single_survivor_proof BEFORE INSERT ON unattributed_legacy_proofs BEGIN SELECT RAISE(ABORT,'injected checkpoint receipt failure'); END;"
+                    "CREATE TRIGGER fail_single_survivor_cursor BEFORE UPDATE ON metadata WHEN OLD.key='sync_token:PrimarySync' BEGIN SELECT RAISE(ABORT,'injected checkpoint cursor failure'); END;"
                 ).unwrap();
             }
             let receipt_sql = "SELECT * FROM assets WHERE id='legacy-master'";
@@ -4122,13 +4122,14 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
             );
             let fresh_source_recovery = matches!(fault, AmbiguousChildFault::PreserveStateWrite);
             let mut retained_unverified_outputs = Vec::new();
+            let mut missing_current_path = None;
             for cycle in 0..if relocating
                 || fresh_source_recovery
                 || matches!(fault, AmbiguousChildFault::PreserveHistoricalReplacement)
             {
-                4
+                5
             } else {
-                3
+                4
             } {
                 let mut config = make_run_cycle_config();
                 let allow_hardlinks = hardlink_fault.is_some()
@@ -4141,7 +4142,12 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                             )
                         ));
                 config.download.legacy_preservation_allow_hardlinks = allow_hardlinks;
-                let mut missing_current = None;
+                if relocating && cycle >= 2 {
+                    config.download.folder_structure = "relocated".into();
+                    config.download.folder_structure_albums = "relocated".into();
+                    config.download.folder_structure_smart_folders = "relocated".into();
+                }
+                let mut missing_current = missing_current_path.clone();
                 let mut current_aliases = std::collections::HashMap::new();
                 if cycle == 2
                     && let Some(hardlink_fault) = hardlink_fault
@@ -4198,9 +4204,9 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                             std::fs::remove_file(current).unwrap();
                             assert!(!current.exists(), "current receipt path must be absent");
                             missing_current = Some(current.clone());
-                            // A normal Full pass can repair missing Current evidence
-                            // before recertification. Refuse that repair here so the
-                            // actual checkpoint boundary must retain the missing-file hold.
+                            missing_current_path = missing_current.clone();
+                            // Use production drift detection below to wake ordinary
+                            // recovery. The HTTP refusal must retain actual retry work.
                             server.reset().await;
                             Mock::given(method("GET"))
                                 .and(path("/child.jpg"))
@@ -4231,17 +4237,25 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                 });
                 let requests_before = server.received_requests().await.unwrap().len();
                 let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                if cycle == 2 && (missing_current.is_some() || fresh_source_recovery) {
+                    let drift = crate::sync_loop::reconcile::run_bounded_local_drift_probe(
+                        inner.as_ref(),
+                        cycle,
+                    )
+                    .await;
+                    assert!(
+                        drift.marked_failed > 0,
+                        "missing current files must wake normal recovery"
+                    );
+                }
                 let cancel = CancellationToken::new();
                 let db: Arc<dyn download::DownloadStore> =
                     if matches!(fault, AmbiguousChildFault::PreserveUnknownSource) {
-                        let mut unknown = FailingMetadataSetDb::without_set_failure(
+                        let unknown = FailingMetadataSetDb::without_set_failure(
                             inner.clone(),
                             "unknown source fixture",
                         )
                         .with_unknown_download_source();
-                        if let Some(result) = diagnostic {
-                            unknown = unknown.with_receipt_diagnostic(result);
-                        }
                         Arc::new(unknown)
                     } else if cycle == 0
                         && matches!(fault, AmbiguousChildFault::PreserveHistoricalReplacement)
@@ -4357,51 +4371,6 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     }
                     built
                 };
-                if hardlink_fault.is_some() {
-                    let probe = builder(
-                        download::SyncMode::Full,
-                        Arc::new(rustc_hash::FxHashSet::default()),
-                        Arc::new(download::AssetGroupings::default()),
-                        Arc::from("PrimarySync"),
-                    );
-                    let policy = serde_json::json!([
-                        1,
-                        state::METADATA_CAPTURE_REVISION,
-                        download::sync_coverage_fingerprint_json(
-                            &config,
-                            "icloud",
-                            1,
-                            &["PrimarySync".to_owned()],
-                            &download::compute_config_hash(&config),
-                            &download::hash_download_config(&probe)
-                        )
-                        .unwrap(),
-                        format!("{:?}", probe.metadata),
-                        config.runtime.refresh_metadata,
-                        config.runtime.repair_capture_timestamps,
-                        config.runtime.repair_truncated
-                    ]);
-                    let trusted_hash =
-                        crate::sync_cycle::hash_legacy_preservation_policy(&policy, true);
-                    let strict_hash =
-                        crate::sync_cycle::hash_legacy_preservation_policy(&policy, false);
-                    assert_ne!(
-                        trusted_hash, strict_hash,
-                        "trust flag must qualify a separate legacy proof policy"
-                    );
-                    if cycle == 2 {
-                        let hashes = rows(
-                            &database,
-                            "SELECT config_hash FROM unattributed_legacy_proofs",
-                        );
-                        if !hashes.is_empty() {
-                            assert!(
-                                hashes.iter().all(|row| row[0]
-                                    == rusqlite::types::Value::Text(trusted_hash.clone()))
-                            );
-                        }
-                    }
-                }
                 let warning_path = dir.path().join(format!("cycle-{cycle}.log"));
                 let subscriber = tracing_subscriber::fmt()
                     .with_ansi(false)
@@ -4491,16 +4460,35 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                 if cycle >= 2
                     && hardlink_fault.is_some_and(|fault| fault != LegacyHardlinkFault::Quiet)
                 {
-                    if let Ok(result) = &result {
+                    if matches!(hardlink_fault, Some(LegacyHardlinkFault::OriginalJournal)) {
                         assert!(
-                            result.stats.sync_token_blocked,
-                            "trust fault must retain the checkpoint: {hardlink_fault:?}"
-                        );
-                        assert_eq!(
-                            result.stats.downloaded, 0,
-                            "held qualification must not publish new outputs"
+                            result
+                                .as_ref()
+                                .unwrap_err()
+                                .to_string()
+                                .contains("protected legacy evidence")
                         );
                     }
+                    let result = result.as_ref().ok();
+                    if missing_current.is_some() {
+                        let result = result.unwrap();
+                        assert!(
+                            result.failed_count > 0,
+                            "failed current repair remains unfinished"
+                        );
+                        assert!(inner.get_summary().await.unwrap().failed > 0);
+                    } else if let Some(result) = result {
+                        assert_eq!(
+                            result.failed_count, 0,
+                            "historical change is not current work"
+                        );
+                        assert!(!result.stats.sync_token_blocked);
+                    }
+                    assert_eq!(
+                        result.map_or(0, |result| result.stats.downloaded),
+                        0,
+                        "historical changes must not publish new outputs"
+                    );
                     if matches!(
                         hardlink_fault,
                         Some(
@@ -4511,7 +4499,7 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                             inner.legacy_preservations("PrimarySync").await.unwrap()[0]
                                 .active_generation,
                             None,
-                            "disabling trust must deactivate the formerly trusted proof"
+                            "retired certification never changes its generation"
                         );
                     }
                     assert_eq!(
@@ -4520,7 +4508,14 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                             .await
                             .unwrap()
                             .as_deref(),
-                        Some("after")
+                        Some(
+                            if matches!(hardlink_fault, Some(LegacyHardlinkFault::OriginalJournal))
+                            {
+                                "after"
+                            } else {
+                                "later"
+                            }
+                        )
                     );
                     assert_eq!(rows(&database, receipt_sql), receipt);
                     assert_eq!(rows(&database, retry_sql), retry);
@@ -4548,9 +4543,9 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                         &database,
                         "SELECT * FROM unattributed_legacy_proofs ORDER BY generation",
                     );
-                    assert!(
-                        retained_proofs.iter().all(|proof| proofs.contains(proof)),
-                        "old proof history must survive failed active revalidation"
+                    assert_eq!(
+                        retained_proofs, proofs,
+                        "historical proof bytes are unchanged"
                     );
                     let (original, sidecar) = original_before.unwrap();
                     assert_eq!(std::fs::read(&legacy_path).unwrap(), original);
@@ -4572,7 +4567,7 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                             inner.legacy_preservations("PrimarySync").await.unwrap()[0]
                                 .active_generation,
                             None,
-                            "missing Current evidence must invalidate the old active proof"
+                            "current failure never writes historical certificates"
                         );
                     } else {
                         assert_eq!(
@@ -4738,12 +4733,10 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     AmbiguousChildFault::PreserveMissingDelta
                     | AmbiguousChildFault::PreserveBlankDelta => false,
                     AmbiguousChildFault::PreserveFreshRetry => cycle > 0,
-                    AmbiguousChildFault::PreserveInventoryRecovery
-                    | AmbiguousChildFault::PreserveStateWrite => cycle >= 2,
+                    AmbiguousChildFault::PreserveInventoryRecovery => cycle >= 2,
                     _ => true,
                 };
                 let activated = preserving
-                    && !matches!(fault, AmbiguousChildFault::PreserveUnknownSource)
                     && source_evidence_ready
                     && children > 0
                     && !matches!(
@@ -4753,9 +4746,6 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     )
                     && !(cycle == 0
                         && matches!(fault, AmbiguousChildFault::PreserveCheckpointFailure))
-                    && !matches!(fault, AmbiguousChildFault::PreserveHiddenUnselected)
-                    && (!matches!(fault, AmbiguousChildFault::PreserveBridgeDebt)
-                        || (cfg!(feature = "xmp") && sidecars && cycle > 0))
                     && !(cycle == 0
                         && matches!(
                             fault,
@@ -4804,44 +4794,6 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                         "missing successor is not evidence of an expired cursor"
                     );
                 }
-                if preserving && result.stats.unattributed_legacy_pending > 0 {
-                    assert!(
-                        result.failed_count > 0,
-                        "pending certification must fail the cycle {label}"
-                    );
-                    assert!(!result.can_advance_database_checkpoint());
-                    // Cancellation/session expiration retain their higher-priority
-                    // status, but pending proof can never report success.
-                    assert_ne!(
-                        crate::cycle_reporter::classify_cycle(
-                            &result.stats,
-                            result.failed_count,
-                            result.session_expired
-                        ),
-                        crate::cycle_reporter::CycleStatus::Success
-                    );
-                }
-                if matches!(
-                    fault,
-                    AmbiguousChildFault::PreserveHiddenUnselected
-                        | AmbiguousChildFault::PreserveUnknownSource
-                ) {
-                    let warning = std::fs::read_to_string(&warning_path).unwrap();
-                    assert!(warning.contains("legacy_certification_refusal_v1"));
-                    assert!(warning.contains("child_receipt_missing"));
-                    assert!(warning.contains("legacy_receipt_prerequisite_v1"));
-                    let expected = if matches!(fault, AmbiguousChildFault::PreserveUnknownSource) {
-                        diagnostic
-                            .unwrap_or(Ok(state::db::LegacyChildReceiptRefusal::SourceMissing))
-                            .unwrap_or(state::db::LegacyChildReceiptRefusal::Unavailable)
-                            .label()
-                    } else {
-                        "child_not_ready"
-                    };
-                    assert!(warning.contains(&format!("prerequisite=\"{expected}\"")));
-                    assert!(!warning.contains("private receipt database failure"));
-                    assert!(!warning.contains("child-0-unique"));
-                }
                 if activated {
                     assert!(
                         !result.stats.identity_incomplete,
@@ -4850,15 +4802,7 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     assert_eq!(
                         inner.legacy_preservations("PrimarySync").await.unwrap()[0]
                             .active_generation,
-                        Some(
-                            if matches!(fault, AmbiguousChildFault::PreserveConfigChange)
-                                && cycle >= 2
-                            {
-                                2
-                            } else {
-                                1
-                            }
-                        ),
+                        None,
                         "active generation {label}"
                     );
                     if cycle >= 2 && !((relocating || fresh_source_recovery) && cycle == 2) {
@@ -4872,8 +4816,8 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                         "attribution count {label}"
                     );
                     assert_eq!(
-                        result.stats.unattributed_legacy_pending, 0,
-                        "current proof count {label}"
+                        result.stats.unattributed_legacy_pending, 1,
+                        "historical uncertified row count {label}"
                     );
                 } else if preserving
                     && (children == 0
@@ -4931,8 +4875,22 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
                     || (cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveFreshRetry))
                 {
-                    assert_eq!(result.stats.downloaded, 0, "incomplete inventory {label}");
-                    assert_eq!(inner.get_downloaded_page(0, 20).await.unwrap().len(), 1);
+                    if cycle == 0 {
+                        assert_eq!(
+                            result.stats.downloaded,
+                            names.len(),
+                            "healthy current work progresses despite unprepared history {label}"
+                        );
+                    } else {
+                        assert_eq!(
+                            result.stats.downloaded, 0,
+                            "completed current work stays complete {label}"
+                        );
+                    }
+                    assert_eq!(
+                        inner.get_downloaded_page(0, 20).await.unwrap().len(),
+                        1 + names.len()
+                    );
                     assert!(result.stats.sync_token_blocked, "incomplete hold {label}");
                 } else {
                     let downloaded = inner.get_downloaded_page(0, 20).await.unwrap();
@@ -5007,8 +4965,12 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                                 outputs
                                     .keys()
                                     .all(|path| path.starts_with(media.join("relocated"))),
-                                "new current paths {label}"
+                                "new current paths {label}: {:?}; {:?}",
+                                result.stats,
+                                outputs.keys().collect::<Vec<_>>()
                             );
+                            completed_outputs = outputs;
+                        } else if cycle == 2 && fresh_source_recovery {
                             completed_outputs = outputs;
                         } else {
                             assert_eq!(outputs, completed_outputs, "steady files {label}");
@@ -5022,7 +4984,7 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     );
                     rusqlite::Connection::open(&database)
                         .unwrap()
-                        .execute_batch("DROP TRIGGER fail_single_survivor_proof;")
+                        .execute_batch("DROP TRIGGER fail_single_survivor_cursor;")
                         .unwrap();
                 }
                 if matches!(fault, AmbiguousChildFault::PreserveIncompleteInventory) {
@@ -5034,8 +4996,8 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                 } else if matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery) {
                     assert_eq!(
                         inventory_requests.load(std::sync::atomic::Ordering::SeqCst),
-                        if cycle < 2 { 1 } else { 3 },
-                        "changed configuration permits fresh preparation and certification {label}"
+                        if cycle < 2 { 1 } else { 2 },
+                        "changed configuration permits fresh preparation only {label}"
                     );
                 }
                 if cycle == 0
@@ -5056,14 +5018,7 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                         .unwrap();
                 }
                 let requests = server.received_requests().await.unwrap().len();
-                if cycle == 1
-                    && !matches!(
-                        fault,
-                        AmbiguousChildFault::PreserveIncompleteInventory
-                            | AmbiguousChildFault::PreserveInventoryRecovery
-                            | AmbiguousChildFault::PreserveSharedOriginal
-                    )
-                {
+                if cycle == 1 {
                     assert!(
                         requests
                             >= names.len()
@@ -5329,7 +5284,7 @@ async fn run_cycle_legacy_hardlink_opt_in_original_and_current_qualify_after_reo
 }
 
 #[tokio::test]
-async fn run_cycle_legacy_hardlink_opt_in_disable_revalidates_original_and_current_only() {
+async fn run_cycle_legacy_hardlink_opt_in_disable_preserves_prepared_history_and_current_copies() {
     for fault in [
         LegacyHardlinkFault::Disable,
         LegacyHardlinkFault::DisableCurrentOnly,
@@ -5445,7 +5400,7 @@ async fn run_cycle_legacy_opaque_mmcs_checkpoint_failure_stays_atomic() {
 }
 
 #[tokio::test]
-async fn run_cycle_legacy_opaque_mmcs_unknown_source_stays_held() {
+async fn run_cycle_legacy_opaque_mmcs_unknown_source_stays_unverified() {
     for smart_only in [false, true] {
         Box::pin(exercise_legacy_child_cycles_with_provenance(
             AmbiguousChildFault::PreserveUnknownSource,
@@ -5453,25 +5408,6 @@ async fn run_cycle_legacy_opaque_mmcs_unknown_source_stays_held() {
             None,
             smart_only,
             Some(21),
-        ))
-        .await;
-    }
-}
-
-#[tokio::test]
-async fn run_cycle_legacy_receipt_diagnostic_never_grants_progress() {
-    for diagnostic in [
-        Err("private receipt database failure"),
-        Ok(state::db::LegacyChildReceiptRefusal::Unavailable),
-        Ok(state::db::LegacyChildReceiptRefusal::StateChanged),
-    ] {
-        Box::pin(exercise_legacy_child_cycles_with_receipt_diagnostic(
-            AmbiguousChildFault::PreserveUnknownSource,
-            &[1],
-            None,
-            true,
-            Some(21),
-            Some(diagnostic),
         ))
         .await;
     }

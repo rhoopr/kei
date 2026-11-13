@@ -74,11 +74,6 @@ impl SqliteStateDb {
         let key = key.to_owned();
         let value = value.to_owned();
         self.with_conn("set_metadata", move |conn| {
-            if let Some(library) = super::legacy_preservation::checkpoint_library(&key) {
-                let protected: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM unattributed_legacy WHERE library=?1)", [library], |row| row.get(0))?;
-                if protected { return Err(super::legacy_preservation::invalid_checkpoint()); }
-            }
-
             conn.execute(
                 "INSERT INTO metadata (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 rusqlite::params![key, value],
@@ -124,26 +119,6 @@ impl SqliteStateDb {
                         operation: "commit_checkpoint_transition",
                         detail: "checkpoint planning facts changed".to_owned(),
                     });
-                }
-            }
-            for proof in &transition.legacy_preservation_proofs {
-                let binds_cursor = transition.metadata_updates.iter().any(|(key, value)| {
-                    super::legacy_preservation::checkpoint_library(key)
-                        == Some(proof.library.as_str())
-                        && value == &proof.next_cursor
-                });
-                if !binds_cursor {
-                    return Err(super::legacy_preservation::invalid_checkpoint());
-                }
-                super::legacy_preservation::activate(&tx, proof)?;
-            }
-            for (key, _) in &transition.metadata_updates {
-                if let Some(library) = super::legacy_preservation::checkpoint_library(key) {
-                    super::legacy_preservation::validate_checkpoint(
-                        &tx,
-                        library,
-                        transition.legacy_config_hash.as_deref(),
-                    )?;
                 }
             }
             // Validate against the planning generation before this transaction promotes it.

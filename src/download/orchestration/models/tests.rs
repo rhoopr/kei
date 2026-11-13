@@ -560,8 +560,6 @@ async fn sparse_receipts_survive_report_changes_and_inventory_bridge_composition
     db.commit_checkpoint_transition(CheckpointTransition {
         album_snapshots: Vec::new(),
         expected_metadata: Vec::new(),
-        legacy_preservation_proofs: Vec::new(),
-        legacy_config_hash: None,
         sparse_identity_proofs: inventory.checkpoint.sparse_identity_proofs,
         metadata_updates: vec![("sync_token:PrimarySync".into(), "after".into())],
         metadata_deletes: vec![unresolved_identity_key("PrimarySync")],

@@ -582,7 +582,7 @@ fn missing_reference_history_survives_restart_and_revalidates_export() {
 }
 
 #[test]
-fn legacy_receipt_prerequisites_roundtrip_only_fixed_labels() {
+fn historical_legacy_receipt_prerequisites_roundtrip_only_fixed_labels() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("support.json");
     let mut history = History {

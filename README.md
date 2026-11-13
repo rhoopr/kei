@@ -127,6 +127,8 @@ For a bug or confusing result, open an [issue](https://github.com/rhoopr/kei/iss
 
 Some repair commands change kei's saved state or replace files. Read [Backup maintenance](docs/backup-maintenance.md) first. Don't delete state or conflicting files just to clear a warning. When preserving older files, kei normally refuses files with hardlinks, where several paths refer to the same file. The [hardlink waiver](docs/backup-maintenance.md#legacy-preservation-and-hardlinks) allows this case, but a change through one path can affect the others. It does not prevent kei from writing to files.
 
+Historical legacy coverage certificates are no longer required for current sync or process health. Their stored counters remain visible, and unresolved historical attribution can still mean `Backup status: unsafe` without failing an otherwise successful current sync. The old `reconcile trust-legacy-files plan/apply` commands refuse without changing state or media; use `kei sync` instead. Ownership, protected files and current retry work remain guarded. See [historical legacy evidence](docs/backup-maintenance.md#historical-legacy-evidence) for the distinction and remaining limits.
+
 ## What kei gives you
 
 - Downloads several files at once, resumes interrupted transfers, and checks downloaded data before marking a file complete.

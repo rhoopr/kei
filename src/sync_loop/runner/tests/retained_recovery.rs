@@ -371,7 +371,10 @@ impl Fixture {
             db.acquire_lock("seed retained transfer error history").unwrap().execute(
                 "UPDATE assets SET last_error='historical transfer failure' WHERE library='PrimarySync' AND id='transfer-history'", []
             ).unwrap();
-            let hash = if trigger == Trigger::Eligibility {
+            // Certification is retired. This legacy-preservation variant still
+            // exercises expired retained replay under an actual current
+            // configuration reconciliation, not a historical-proof veto.
+            let hash = if matches!(trigger, Trigger::Eligibility | Trigger::Legacy) {
                 "old-enumeration-generation".to_owned()
             } else {
                 download::compute_config_hash(&make_run_cycle_config())

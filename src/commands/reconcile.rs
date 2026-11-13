@@ -208,12 +208,10 @@ pub(crate) async fn run_reconcile(
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
 ) -> anyhow::Result<()> {
-    if let Some(cli::ReconcileAction::TrustLegacyFiles(trust)) = args.action {
-        anyhow::ensure!(
-            !args.dry_run,
-            "Use the trust-legacy-files plan action to review acceptance; --dry-run applies to ordinary reconcile"
+    if args.action.is_some() {
+        anyhow::bail!(
+            "Legacy file trust is no longer supported. Run kei sync. Existing trust records and media were not changed."
         );
-        return super::trusted_legacy::run(trust, globals, toml).await;
     }
     let db_path = super::super::get_db_path(globals, toml).await?;
 

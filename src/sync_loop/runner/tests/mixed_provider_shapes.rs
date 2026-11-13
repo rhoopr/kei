@@ -53,6 +53,7 @@ struct Provider {
     query_records: Vec<Value>,
     encoding: Encoding,
     incomplete: bool,
+    emit_before: bool,
     quiet: bool,
     requests: Arc<AtomicUsize>,
     hydrations: Arc<AtomicUsize>,
@@ -92,7 +93,9 @@ impl PhotosSession for Provider {
         if url.contains("/changes/zone?") {
             assert_eq!(request["zones"][0]["zoneID"]["zoneName"], self.zone);
             let cursor = request["zones"][0]["syncToken"].as_str();
-            let inventory = cursor.is_none() || cursor.is_some_and(|s| s.starts_with("page-"));
+            let inventory = cursor.is_none()
+                || cursor.is_some_and(|s| s.starts_with("page-"))
+                || (self.emit_before && cursor == Some("before") && !self.incomplete);
             let pages = self.pages();
             let index = cursor
                 .and_then(|s| s.strip_prefix("page-"))
@@ -480,6 +483,15 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
             records_by_zone.push(records);
             bytes_by_zone.push((bytes, motion));
         }
+        // A real current-selection change discovers unchanged current work.
+        // The equivalent unfiltered pages still exercise preparation, including
+        // its incomplete terminal page and duplicate/empty-page encodings.
+        db.set_metadata(
+            crate::sync_cycle::ENUM_CONFIG_HASH_KEY,
+            "previous-selection",
+        )
+        .await
+        .unwrap();
         seeded_paths.extend(files(&media));
     }
     let legacy_rows = rows(
@@ -519,7 +531,7 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
                     .unwrap();
             }
         }
-        let result = {
+        let (result, enum_hash) = {
             let db: Arc<dyn download::DownloadStore> =
                 Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
             let mut libraries = Vec::new();
@@ -539,6 +551,7 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
                     incomplete: zone == 0
                         && cycle < 2
                         && matches!(replay.history, History::IncompleteInventory),
+                    emit_before: false,
                     quiet: cycle >= 4,
                     requests: requests[zone].clone(),
                     hydrations: hydrations[zone].clone(),
@@ -616,7 +629,8 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
                 Arc::make_mut(&mut built).live_photo_mode = config.photos.live_photo_mode;
                 built
             };
-            crate::sync_cycle::run_cycle(
+            let enum_hash = download::compute_config_hash(&config);
+            let result = crate::sync_cycle::run_cycle(
                 &libraries.iter().collect::<Vec<_>>(),
                 &config,
                 Some(db.as_ref()),
@@ -627,7 +641,8 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
                 &CancellationToken::new(),
             )
             .await
-            .unwrap()
+            .unwrap();
+            (result, enum_hash)
         };
         // All production handles are gone. Reopen independently after EVERY
         // cycle, including both quiet tail cycles and the final comparison.
@@ -667,17 +682,31 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
                     .await
                     .unwrap()
                     .as_deref(),
-                Some(if eligible { "after" } else { "before" }),
+                Some(if cycle >= 2 { "after" } else { "before" }),
                 "first eligible progress {replay:?} cycle={cycle} zone={name}: {:?}",
                 result.stats
             );
+            if eligible && cycle < 2 {
+                assert_eq!(
+                    reopened
+                        .get_metadata(&crate::sync_cycle::pending_zone_token_key(&enum_hash, name))
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("after"),
+                    "healthy zone retains its completed current checkpoint while another zone holds configuration activation"
+                );
+            }
             let downloaded = reopened.get_downloaded_page(0, 100).await.unwrap();
             let mut paths = HashSet::new();
             for child in ["current-a", "current-b"] {
                 let found = downloaded
                     .iter()
                     .find(|r| r.library.as_ref() == *name && r.id.as_ref() == child);
-                if eligible || child == "current-a" {
+                if eligible
+                    || child == "current-a"
+                    || matches!(replay.history, History::IncompleteInventory)
+                {
                     let row =
                         found.expect("each current sibling has an independent durable receipt");
                     assert_eq!(row.created_at, date(zone));
@@ -743,7 +772,12 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
         }
         assert_eq!(
             files(&media).len(),
-            seeded_paths.len() + if cycle >= 2 { 2 } else { 1 },
+            seeded_paths.len()
+                + if cycle >= 2 || matches!(replay.history, History::IncompleteInventory) {
+                    2
+                } else {
+                    1
+                },
             "exact owned files; no new duplicate copies or stale temporary media"
         );
         let state = snapshot(&database);
@@ -785,6 +819,327 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
         "bounded media work"
     );
     outputs
+}
+
+#[tokio::test]
+async fn duplicate_created_prepared_archive_replay() {
+    let server = wiremock::MockServer::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let database = root.path().join("state.db");
+    let media = root.path().join("media");
+    let zone = ZONES[0];
+    let mut bytes = STILL.to_vec();
+    bytes.push(0);
+    Mock::given(method("GET"))
+        .and(path("/0.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+        .mount(&server)
+        .await;
+    let mut page = full_album_page_with_download(
+        zone,
+        "legacy-master",
+        "after",
+        &format!("{}/0.jpg", server.uri()),
+        bytes.len() as u64,
+        &checksum(&bytes),
+    );
+    page["records"][0]["fields"]["filenameEnc"] = json!({"value":"photo.JPG","type":"STRING"});
+    page["records"][1]["recordName"] = json!("current-a");
+    let mut child = page["records"][1].clone();
+    child["recordName"] = json!("current-b");
+    let unique = vec![
+        page["records"][0].clone(),
+        page["records"][1].clone(),
+        child.clone(),
+    ];
+    let observations = vec![unique[0].clone(), unique[1].clone(), child.clone(), child];
+    let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+    let legacy = media.join(date_dir(0)).join("photo.JPG");
+    seed_file(
+        &db,
+        0,
+        "legacy-master",
+        state::VersionSizeKey::Original,
+        &legacy,
+        &bytes,
+        SeedSource::Unknown,
+    )
+    .await;
+    let sidecar = legacy.with_extension("JPG.xmp");
+    std::fs::write(&sidecar, b"unattributed private sidecar").unwrap();
+    for id in ["current-a", "current-b"] {
+        db.upsert_asset_master_mapping(zone, id, "legacy-master")
+            .await
+            .unwrap();
+    }
+    db.set_metadata_capture_revision_for_test(zone, "legacy-master", 0);
+    db.begin_metadata_capture_revision(zone, state::METADATA_CAPTURE_REVISION)
+        .await
+        .unwrap();
+    let candidate = db
+        .get_metadata_capture_candidates(zone, 1, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(
+        db.defer_metadata_capture_ambiguity(&candidate, 1)
+            .await
+            .unwrap()
+    );
+    let current = media.join(date_dir(0)).join("photo-current-a-9.JPG");
+    seed_file(
+        &db,
+        0,
+        "current-a",
+        state::VersionSizeKey::Original,
+        &current,
+        &bytes,
+        SeedSource::Verified,
+    )
+    .await;
+    db.upsert_album_container(zone, "B", "PrimarySync-B", "album")
+        .await
+        .unwrap();
+    let membership = db
+        .start_album_membership_snapshot(zone, "B", None)
+        .await
+        .unwrap();
+    db.complete_album_membership_snapshot(zone, "B", membership)
+        .await
+        .unwrap();
+    let mut config = make_run_cycle_config();
+    config.filters.selection.albums = crate::selection::AlbumSelector::Named {
+        included: ["PrimarySync-B".to_owned()].into_iter().collect(),
+        excluded: Default::default(),
+    };
+    config.filters.selection.albums_explicit = true;
+    let enum_hash = download::compute_config_hash(&config);
+    db.set_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY, &enum_hash)
+        .await
+        .unwrap();
+    db.set_metadata("sync_token:PrimarySync", "before")
+        .await
+        .unwrap();
+    let builder = make_run_cycle_download_config_builder_with_options(
+        &media,
+        db.clone(),
+        RunCycleDownloadConfigOptions {
+            per_pass_paths: true,
+            concurrent_downloads: Some(1),
+            ..Default::default()
+        },
+    );
+    let probe = builder(
+        download::SyncMode::Full,
+        Arc::new(rustc_hash::FxHashSet::default()),
+        Arc::new(download::AssetGroupings::default()),
+        Arc::from(zone),
+    );
+    let path_hash = download::hash_download_config(&probe);
+    db.set_metadata("config_hash", &path_hash).await.unwrap();
+    let prepared = db
+        .legacy_preparation_snapshots(zone, 64)
+        .await
+        .unwrap()
+        .remove(0);
+    let evidence: Vec<_> = [&legacy, &sidecar]
+        .into_iter()
+        .map(|p| state::LegacyFileEvidence {
+            root: media.clone(),
+            path: p.clone(),
+            sha256: Some(local_hash(&std::fs::read(p).unwrap())),
+            size: Some(std::fs::metadata(p).unwrap().len()),
+        })
+        .collect();
+    assert!(
+        db.prepare_legacy_preservation(&prepared, &evidence)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        rows(
+            &database,
+            "SELECT active_generation FROM unattributed_legacy"
+        ),
+        vec![vec![rusqlite::types::Value::Null]]
+    );
+    assert!(rows(&database, "SELECT * FROM unattributed_legacy_proofs").is_empty());
+    let history = rows(
+        &database,
+        "SELECT original_evidence,files FROM unattributed_legacy",
+    );
+    let originals = files(&media);
+    let retry = rows(
+        &database,
+        "SELECT library,asset_id FROM metadata_capture_retries ORDER BY 1,2",
+    );
+    assert_eq!(retry.len(), 1);
+    drop(probe);
+    drop(builder);
+    drop(db);
+    let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+    let mut first_gets = 0;
+    let mut first_files = None;
+    let mut exact_copy_counts = Vec::new();
+    for cycle in 0..3 {
+        let result = {
+            let db: Arc<dyn download::DownloadStore> =
+                Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+            let provider = Provider {
+                zone,
+                records: observations.clone(),
+                query_records: unique.clone(),
+                encoding: Encoding::Baseline,
+                incomplete: false,
+                emit_before: true,
+                quiet: cycle > 0,
+                requests: Arc::new(AtomicUsize::new(0)),
+                hydrations: Arc::new(AtomicUsize::new(0)),
+            };
+            let mut named = provider.clone();
+            named.query_records = Vec::new();
+            let passes = vec![
+                AlbumPass {
+                    kind: PassKind::Album,
+                    album: album(named, "PrimarySync-B", Some("B")),
+                    exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+                },
+                AlbumPass {
+                    kind: PassKind::Unfiled,
+                    album: album(provider.clone(), "", None),
+                    exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+                },
+            ];
+            let mut library =
+                make_run_cycle_library_state_with_passes(zone, "sync_token:PrimarySync", passes);
+            library.library =
+                crate::icloud::photos::PhotoLibrary::new_stub_with_zone(Box::new(provider), zone);
+            let builder = make_run_cycle_download_config_builder_with_options(
+                &media,
+                db.clone(),
+                RunCycleDownloadConfigOptions {
+                    per_pass_paths: true,
+                    concurrent_downloads: Some(1),
+                    ..Default::default()
+                },
+            );
+            Box::pin(crate::sync_cycle::run_cycle(
+                &[&library],
+                &config,
+                Some(db.as_ref()),
+                false,
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &session,
+                &CancellationToken::new(),
+            ))
+            .await
+            .unwrap()
+        };
+        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        let receipts = rows(
+            &database,
+            "SELECT id,version_size,local_path,source_checksum FROM asset_metadata_paths ORDER BY id,local_path",
+        );
+        let count = rows(
+            &database,
+            "SELECT local_path FROM asset_metadata_paths WHERE id='current-b'",
+        )
+        .len();
+        exact_copy_counts.push(count);
+        let gets: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.url.path().to_owned())
+            .collect();
+        eprintln!(
+            "DUPCHECK cycle={cycle} downloaded={} failed={} blocked={} full={:?} cursor={:?} gets={gets:?} files={:?} receipts={receipts:?} assets={:?} retry={:?}",
+            result.stats.downloaded,
+            result.failed_count,
+            result.stats.sync_token_blocked,
+            result.stats.full_enumeration_reason,
+            db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+            files(&media).keys().collect::<Vec<_>>(),
+            rows(
+                &database,
+                "SELECT id,version_size,status,local_path,download_attempts,last_error FROM assets ORDER BY id"
+            ),
+            rows(
+                &database,
+                "SELECT library,asset_id FROM metadata_capture_retries ORDER BY 1,2"
+            )
+        );
+        assert_eq!(
+            rows(
+                &database,
+                "SELECT original_evidence,files FROM unattributed_legacy"
+            ),
+            history
+        );
+        assert_eq!(
+            rows(
+                &database,
+                "SELECT library,asset_id FROM metadata_capture_retries ORDER BY 1,2"
+            ),
+            retry
+        );
+        assert_eq!(result.failed_count, 0);
+        assert!(!result.stats.sync_token_blocked);
+        assert!(result.stats.full_enumeration_reason.is_none());
+        for (path, content) in &originals {
+            assert_eq!(std::fs::read(media.join(path)).unwrap(), *content);
+        }
+        assert_eq!(
+            db.get_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(enum_hash.as_str())
+        );
+        assert_eq!(
+            db.get_metadata("config_hash").await.unwrap().as_deref(),
+            Some(path_hash.as_str())
+        );
+        assert!(
+            db.get_metadata("pending_enum_config_hash")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("after")
+        );
+        if cycle == 0 {
+            assert_eq!(result.stats.downloaded, 1);
+            let current_files = files(&media);
+            assert_eq!(current_files.len(), originals.len() + 1);
+            assert_eq!(
+                current_files.get(&PathBuf::from(date_dir(0)).join("photo-current-b.JPG")),
+                Some(&bytes)
+            );
+            first_gets = gets.len();
+            first_files = Some(current_files);
+        } else {
+            assert_eq!(result.stats.downloaded, 0);
+            assert_eq!(gets.len(), first_gets);
+            assert_eq!(files(&media), *first_files.as_ref().unwrap());
+        }
+    }
+    assert_eq!(
+        exact_copy_counts,
+        vec![1, 1, 1],
+        "exactly one new current rendition receipt across two quiet reopens"
+    );
+    assert_eq!(
+        first_gets, 1,
+        "exactly one transfer for the duplicated current rendition"
+    );
 }
 
 #[tokio::test]
@@ -912,6 +1267,7 @@ async fn mixed_numbered_album_mode_transition_repro() {
                 query_records: records.clone(),
                 encoding: Encoding::Baseline,
                 incomplete: false,
+                emit_before: false,
                 quiet: false,
                 requests: Arc::new(AtomicUsize::new(0)),
                 hydrations: Arc::new(AtomicUsize::new(0)),
@@ -1091,6 +1447,7 @@ async fn mixed_legacy_reservation_blocks_preparation_repro() {
         query_records: vec![],
         encoding: Encoding::Baseline,
         incomplete: false,
+        emit_before: false,
         quiet: false,
         requests: Arc::new(AtomicUsize::new(0)),
         hydrations: Arc::new(AtomicUsize::new(0)),

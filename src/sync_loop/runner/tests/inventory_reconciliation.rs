@@ -843,14 +843,14 @@ async fn inventory_private_generation_uses_one_guarded_inventory_not_implicit_de
 }
 
 #[tokio::test]
-async fn inventory_qualified_fact_can_retire_while_historical_checkpoint_validation_is_held() {
+async fn inventory_qualified_fact_retires_without_historical_checkpoint_certification() {
     let fixture = Fixture::new(b"historical receipt", Some("matching"), false, false).await;
     fixture.open().await.acquire_lock("retained unrelated historical evidence").unwrap().execute(
         "INSERT INTO unattributed_legacy(library,asset_id,evidence_version,original_evidence,files,prepared_at) \
          VALUES(?1,'unrelated-history',1,'unparsed original history','[]',1)", [ZONE],
     ).unwrap();
     let result = fixture.cycle(false, CancellationToken::new()).await;
-    assert!(!result.db_sync_token_advance_safe, "{result:?}");
+    assert!(result.db_sync_token_advance_safe, "{result:?}");
     fixture.preserved(false).await;
     assert_eq!(
         fixture
@@ -860,7 +860,7 @@ async fn inventory_qualified_fact_can_retire_while_historical_checkpoint_validat
             .await
             .unwrap()
             .as_deref(),
-        Some("P")
+        Some("E")
     );
     let guarded_replays = fixture
         .session
@@ -874,9 +874,9 @@ async fn inventory_qualified_fact_can_retire_while_historical_checkpoint_validat
         fixture.cycle(false, CancellationToken::new()).await;
         fixture.preserved(false).await;
     }
-    // LegacyCycle's own inventory/certification holds are outside this slice.
-    // They may still query ranks, but the retired request cannot run its second
-    // replay again or redownload successfully finalized current media.
+    // Current identity and retained-cursor holds remain independent of this
+    // request. Retirement cannot repeat its guarded replay or redownload
+    // successfully finalized current media.
     assert_eq!(
         fixture
             .session
