@@ -2457,6 +2457,11 @@ set -euo pipefail
 call=$(printf '%s' "$1"; shift; printf '\t%s' "$@")
 printf '%s\n' "$call" >> "$CALL_LOG"
 [[ "$call" != "${FAIL_CALL:-}" ]] || exit 23
+if [[ "${EXPECT_OFFLINE_ENV_ISOLATION:-0}" == 1 ]]; then
+    for key in ICLOUD_USERNAME ICLOUD_PASSWORD KEI_DATA_DIR KEI_CONFIG KEI_PASSWORD_FILE KEI_PASSWORD_COMMAND; do
+        [[ ! -v "$key" ]] || exit 24
+    done
+fi
 if [[ "$call" == *--list ]]; then
     [[ "${EMPTY_CATALOG:-0}" != 1 ]] || exit 0
     cat "$CATALOG"
@@ -2478,6 +2483,20 @@ fi
             .env("CATALOG", root.join("catalog"))
             .env("FAIL_CALL", fail)
             .env("EMPTY_CATALOG", if empty { "1" } else { "0" })
+            .env("ICLOUD_USERNAME", "fixture-bootstrap@example.invalid")
+            .env("ICLOUD_PASSWORD", "fixture-password")
+            .env("KEI_DATA_DIR", root.join("unselected-data"))
+            .env("KEI_CONFIG", "unselected-config.toml")
+            .env("KEI_PASSWORD_FILE", "unselected-password-file")
+            .env("KEI_PASSWORD_COMMAND", "DO_NOT_EXECUTE")
+            .env(
+                "EXPECT_OFFLINE_ENV_ISOLATION",
+                if args == ["test", "offline"] {
+                    "1"
+                } else {
+                    "0"
+                },
+            )
             .output()
             .unwrap();
         let calls: Vec<String> = std::fs::read_to_string(&log)
@@ -2875,6 +2894,7 @@ fn live_shell_preflight_rejects_empty_selection() {
         let result = Command::new("bash")
             .args(["-c", r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_release_bin() { printf '%s' "$BINARY"; }; kei_copy_session_without_state() { mkdir -p "$1"; }; kei_preflight_selection"#])
             .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
+            .env("ICLOUD_USERNAME", "fixture@example.invalid")
             .env("BINARY", &binary)
             .env("KEI_LIVE_SKIP_CREATED_BEFORE", "2025-01-02")
             .env("KEI_LIVE_SKIP_CREATED_AFTER", "2025-01-03")
@@ -2913,6 +2933,7 @@ fn live_shell_preflight_requires_fixed_date_before_provider_or_session_work() {
             let result = Command::new("bash")
                 .args(["-c",r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_copy_session_without_state() { touch "$MARKER"; }; kei_release_bin() { touch "$MARKER"; }; "$PREFLIGHT""#])
                 .env("PROJECT_DIR",env!("CARGO_MANIFEST_DIR"))
+                .env("ICLOUD_USERNAME", "fixture@example.invalid")
                 .env("KEI_LIVE_SKIP_CREATED_BEFORE",value).env("MARKER",&marker)
                 .env("PREFLIGHT",preflight).output().unwrap();
             assert!(!result.status.success());

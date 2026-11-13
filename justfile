@@ -241,6 +241,8 @@ test MODE="" *ARGS="":
             cargo test --test cli --test behavioral --test service_cli --test service_linux --test service_macos --test service_windows --test service_status
             ;;
         offline)
+            # Offline fixtures own their account/config inputs, including under full-test's .env.
+            unset ICLOUD_USERNAME ICLOUD_PASSWORD KEI_DATA_DIR KEI_CONFIG KEI_PASSWORD_FILE KEI_PASSWORD_COMMAND
             cargo test --all-features
             cargo test --no-default-features
             scripts/test-scenarios/check.sh

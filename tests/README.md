@@ -837,6 +837,7 @@ Choose the route by purpose:
 | Optional combined local battery | `just full-test` | The offline gate's checks plus nightly tools, package, Docker, live provider, release-binary, and service phases |
 
 `just test offline` runs the behavior and catalog portion of `just gate`.
+It clears inherited account, credential and config-path inputs in its child process so offline fixtures cannot consume the live account loaded by `just full-test`. The parent keeps those inputs for the later live phases.
 `just test` runs only the all-feature suite. Existing focused, packaging,
 Docker, service, and live commands remain available individually.
 
