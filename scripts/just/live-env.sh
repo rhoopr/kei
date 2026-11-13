@@ -13,3 +13,9 @@ if [ -z "${ICLOUD_USERNAME:-}" ] && [ -f .env ]; then
 fi
 
 : "${ICLOUD_USERNAME:?ICLOUD_USERNAME must be set (via .env or environment)}"
+
+# Reject invalid live bounds before Cargo builds or the first lookup authenticates.
+PROJECT_DIR="${PROJECT_DIR:-$PWD}"
+# shellcheck disable=SC1091
+source "$PROJECT_DIR/tests/shell/lib.sh"
+kei_live_fixed_date >/dev/null || return 1

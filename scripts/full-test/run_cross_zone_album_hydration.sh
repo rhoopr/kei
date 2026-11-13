@@ -34,7 +34,7 @@ if ! [[ "$min_files" =~ ^[0-9]+$ ]] || [[ "$min_files" -lt 1 ]]; then
     exit 64
 fi
 
-bound=$(kei_live_fixed_date) || exit 64
+date_filters=$(kei_live_date_filters) || exit 64
 kei_require_env
 kei_require_release_binary
 command -v sqlite3 >/dev/null 2>&1 || {
@@ -65,7 +65,7 @@ config="$work/cross-zone.toml"
     printf 'albums = [%s]\n' "$(kei_toml_string "$album")"
     echo "unfiled = false"
     echo 'libraries = ["all"]'
-    printf 'skip_created_before = "%s"\n' "$bound"
+    printf '%s\n' "$date_filters"
 } >"$config"
 
 echo "--- cross-zone album sync ($album, libraries=all) ---"

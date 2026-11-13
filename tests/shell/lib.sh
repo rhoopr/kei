@@ -23,6 +23,7 @@ if [ -z "${ICLOUD_USERNAME:-}" ] && [ -f "$PROJECT_DIR/.env" ]; then
 fi
 
 kei_require_env() {
+    kei_live_fixed_date >/dev/null || exit 1
     if [ -z "${ICLOUD_USERNAME:-}" ] || [ -z "${ICLOUD_PASSWORD:-}" ]; then
         echo "ABORT: ICLOUD_USERNAME and ICLOUD_PASSWORD must be set (via .env or environment)."
         exit 1
@@ -71,10 +72,19 @@ kei_db_path() {
 }
 
 kei_live_filters() {
+    local bounds
+    bounds=$(kei_live_date_filters) || return 1
+    sed '/^\[import_sample\]/,$d' "$PROJECT_DIR/tests/data/live-selection.toml"
+    printf '%s\n' "$bounds"
+}
+
+kei_live_date_filters() {
     local bound
     bound=$(kei_live_fixed_date) || return 1
-    sed '/^\[import_sample\]/,$d' "$PROJECT_DIR/tests/data/live-selection.toml"
     printf 'skip_created_before = "%s"\n' "$bound"
+    if [[ ${KEI_LIVE_SKIP_CREATED_AFTER+x} ]]; then
+        printf 'skip_created_after = "%s"\n' "$KEI_LIVE_SKIP_CREATED_AFTER"
+    fi
 }
 
 # Import-only sampling is separate from sync's mandatory fixed bound.
@@ -83,15 +93,18 @@ kei_live_recent() {
 }
 
 kei_live_fixed_date() {
-    python3 - "${KEI_LIVE_SKIP_CREATED_BEFORE:-}" <<'PY'
+    python3 - "${KEI_LIVE_SKIP_CREATED_BEFORE:-}" "${KEI_LIVE_SKIP_CREATED_AFTER-}" "${KEI_LIVE_SKIP_CREATED_AFTER+x}" <<'PY'
 import datetime
 import sys
-value = sys.argv[1]
-try:
-    assert len(value) == 10 and datetime.date.fromisoformat(value).isoformat() == value
-except (AssertionError, ValueError):
-    sys.exit("Set KEI_LIVE_SKIP_CREATED_BEFORE to an explicit fixed YYYY-MM-DD before live tests")
-print(value)
+before, after, has_after = sys.argv[1:]
+for key, value in [("BEFORE", before)] + ([("AFTER", after)] if has_after else []):
+    try:
+        assert len(value) == 10 and datetime.date.fromisoformat(value).isoformat() == value
+    except (AssertionError, ValueError):
+        sys.exit(f"Set KEI_LIVE_SKIP_CREATED_{key} to an explicit fixed YYYY-MM-DD before live tests")
+if has_after and before > after:
+    sys.exit("live fixed lower date must not be after the upper date")
+print(before)
 PY
 }
 
@@ -193,6 +206,7 @@ kei_release_bin() {
 # circuit skips cargo's own freshness check (a warm but noop cargo call
 # is ~300-500ms) on the common up-to-date path.
 kei_require_release_binary() {
+    kei_live_fixed_date >/dev/null || return 1
     local bin
     bin="$(kei_release_bin)"
     local needs_build=0

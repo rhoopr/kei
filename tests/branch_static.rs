@@ -2291,14 +2291,22 @@ kei_copy_session_without_state() { printf 'session\n' >> "$CALLS"; }
     );
     let calls = root.join("calls");
     let captured = root.join("captured.toml");
-    for value in [
-        None,
-        Some(""),
-        Some("30d"),
-        Some("2025-02-30"),
-        Some("2025-01-02"),
+    for (value, upper) in [
+        (None, None),
+        (Some(""), None),
+        (Some("30d"), None),
+        (Some("2025-02-30"), None),
+        (Some("2025-01-02"), Some("")),
+        (Some("2025-01-02"), Some("3d")),
+        (Some("2025-01-02"), Some("2025-02-30")),
+        (Some("2025-01-02"), Some("2025-01-01")),
+        (Some("2025-01-02"), None),
+        (Some("2025-01-02"), Some("2025-01-03")),
     ] {
         std::fs::write(&calls, "").unwrap();
+        if captured.exists() {
+            std::fs::remove_file(&captured).unwrap();
+        }
         let mut command = Command::new("bash");
         command
             .arg(repo_path(
@@ -2315,12 +2323,16 @@ kei_copy_session_without_state() { printf 'session\n' >> "$CALLS"; }
             .env("TMPDIR", root)
             .env("ICLOUD_USERNAME", "synthetic@example.invalid")
             .env("KEI_FULL_TEST_CROSS_ZONE_ALBUM", "Cross-zone fixture")
-            .env_remove("KEI_LIVE_SKIP_CREATED_BEFORE");
+            .env_remove("KEI_LIVE_SKIP_CREATED_BEFORE")
+            .env_remove("KEI_LIVE_SKIP_CREATED_AFTER");
         if let Some(value) = value {
             command.env("KEI_LIVE_SKIP_CREATED_BEFORE", value);
         }
+        if let Some(upper) = upper {
+            command.env("KEI_LIVE_SKIP_CREATED_AFTER", upper);
+        }
         let output = command.output().unwrap();
-        if value == Some("2025-01-02") {
+        if value == Some("2025-01-02") && [None, Some("2025-01-03")].contains(&upper) {
             assert_eq!(output.status.code(), Some(77), "{output:?}");
             assert_eq!(
                 std::fs::read_to_string(&calls).unwrap(),
@@ -2340,9 +2352,19 @@ kei_copy_session_without_state() { printf 'session\n' >> "$CALLS"; }
                 &[toml::Value::String("all".into())]
             );
             assert_eq!(config["filters"]["unfiled"].as_bool(), Some(false));
+            assert_eq!(
+                config["filters"]
+                    .get("skip_created_after")
+                    .and_then(toml::Value::as_str),
+                upper
+            );
         } else {
             assert_eq!(output.status.code(), Some(64), "{value:?}: {output:?}");
-            assert!(String::from_utf8_lossy(&output.stderr).contains("explicit fixed YYYY-MM-DD"));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("explicit fixed YYYY-MM-DD")
+                    || stderr.contains("lower date must not be after")
+            );
             assert!(
                 std::fs::read_to_string(&calls).unwrap().is_empty(),
                 "invalid bound reached auth/build/session"
@@ -2543,6 +2565,12 @@ fn full_test_live_dispatch_reaches_lookup_only_and_propagates_failure() {
     let bin = root.join("bin");
     std::fs::create_dir_all(&scripts).unwrap();
     std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir_all(root.join("tests/shell")).unwrap();
+    std::fs::write(
+        root.join("tests/shell/lib.sh"),
+        repo_file("tests/shell/lib.sh"),
+    )
+    .unwrap();
     std::fs::write(root.join("justfile"), repo_file("justfile")).unwrap();
     std::fs::write(
         scripts.join("live-env.sh"),
@@ -2575,6 +2603,9 @@ printf '%s\n' "$call" >> "$CALL_LOG"
                 format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
             )
             .env("ICLOUD_USERNAME", "fixture@example.invalid")
+            .env("PROJECT_DIR", root)
+            .env("KEI_LIVE_SKIP_CREATED_BEFORE", "2025-01-02")
+            .env("KEI_LIVE_SKIP_CREATED_AFTER", "2025-01-03")
             .env_remove("ICLOUD_PASSWORD")
             .env("CALL_LOG", &log)
             .env("FAIL_CALL", fail)
@@ -2596,6 +2627,28 @@ printf '%s\n' "$call" >> "$CALL_LOG"
             assert!(!output.status.success(), "must propagate {fail}");
             assert_eq!(calls.last().unwrap(), fail, "must stop after child failure");
         }
+    }
+    for upper in ["", "3d", "2025-02-30", "2025-01-01"] {
+        std::fs::write(&log, "").unwrap();
+        let output = Command::new("just")
+            .args(["test", "live"])
+            .current_dir(root)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("PROJECT_DIR", root)
+            .env("ICLOUD_USERNAME", "fixture@example.invalid")
+            .env("KEI_LIVE_SKIP_CREATED_BEFORE", "2025-01-02")
+            .env("KEI_LIVE_SKIP_CREATED_AFTER", upper)
+            .env("CALL_LOG", &log)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            std::fs::read_to_string(&log).unwrap().is_empty(),
+            "invalid upper bound reached Cargo"
+        );
     }
 }
 
@@ -2813,19 +2866,34 @@ fn live_selection_guard_rejects_retired_album_consumers() {
 fn live_shell_preflight_rejects_empty_selection() {
     let dir = tempfile::tempdir().unwrap();
     let binary = dir.path().join("kei");
+    let captured = dir.path().join("config.toml");
     for (output, success) in [("", false), ("controlled.JPG", true)] {
-        write_executable(&binary, &format!("#!/bin/sh\nprintf '%s\\n' '{output}'\n"));
+        write_executable(
+            &binary,
+            &format!("#!/bin/sh\ncp \"$3\" \"$CAPTURED_CONFIG\"\nprintf '%s\\n' '{output}'\n"),
+        );
         let result = Command::new("bash")
             .args(["-c", r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_release_bin() { printf '%s' "$BINARY"; }; kei_copy_session_without_state() { mkdir -p "$1"; }; kei_preflight_selection"#])
             .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
             .env("BINARY", &binary)
             .env("KEI_LIVE_SKIP_CREATED_BEFORE", "2025-01-02")
+            .env("KEI_LIVE_SKIP_CREATED_AFTER", "2025-01-03")
+            .env("CAPTURED_CONFIG", &captured)
             .output().unwrap();
         assert_eq!(
             result.status.success(),
             success,
             "{}",
             String::from_utf8_lossy(&result.stderr)
+        );
+        let config: toml::Table = std::fs::read_to_string(&captured).unwrap().parse().unwrap();
+        assert_eq!(
+            config["filters"]["skip_created_before"].as_str(),
+            Some("2025-01-02")
+        );
+        assert_eq!(
+            config["filters"]["skip_created_after"].as_str(),
+            Some("2025-01-03")
         );
         if !success {
             assert!(
