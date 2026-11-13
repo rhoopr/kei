@@ -365,17 +365,129 @@ fn selected_fixture_files(data_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn fixture_asset_count(data_dir: &Path) -> u64 {
+    let db_path = std::fs::read_dir(data_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "db"))
+        .unwrap();
+    rusqlite::Connection::open(db_path).unwrap().query_row(
+        "SELECT COUNT(*) FROM (SELECT DISTINCT library, id FROM assets WHERE status = 'downloaded')",
+        [], |row| row.get::<_, i64>(0),
+    ).map(|count| u64::try_from(count).expect("fixture count is nonnegative")).unwrap()
+}
+
+fn assert_fixture_matches(summary: &ImportSummary, assets: u64, versions: u64) {
+    assert!(
+        assets > 0 && versions > 0,
+        "fixture must contain source-backed media"
+    );
+    if assets <= u64::from(common::live_selection::live_recent()) {
+        assert_eq!(
+            summary.matched, versions,
+            "every known fixture version must match"
+        );
+    } else {
+        // A count sample may select only part of a larger date-bounded tree.
+        let eligible = summary.total.saturating_sub(summary.filtered);
+        assert!(
+            eligible > 0 && summary.matched as f64 / eligible as f64 >= 0.90,
+            "sample match ratio too low: {summary:?}"
+        );
+    }
+}
+
+fn import_fixture_summary(
+    username: &str,
+    password: &str,
+    cookies: &Path,
+    media: &Path,
+    data: &Path,
+) -> ImportSummary {
+    let output = import_cmd(username, password, cookies, media, data, &[])
+        .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    parse_summary(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn assert_one_version_lost(before: &ImportSummary, after: &ImportSummary) {
+    assert!(
+        before.matched > 0,
+        "healthy import must match the mutation target"
+    );
+    assert_eq!(
+        after.total, before.total,
+        "provider sample changed during mutation test"
+    );
+    assert_eq!(after.filtered, before.filtered);
+    assert_eq!(
+        after.matched + 1,
+        before.matched,
+        "exactly one known match must be lost"
+    );
+    assert_eq!(
+        after.unmatched,
+        before.unmatched + 1,
+        "only the mutated version may add an unmatched result"
+    );
+}
+
+#[test]
+fn bounded_fixture_oracles_preserve_count_sampling_and_exact_mutation_loss() {
+    let healthy = ImportSummary {
+        total: 10,
+        matched: 1,
+        unmatched: 9,
+        filtered: 0,
+    };
+    assert_fixture_matches(&healthy, 1, 1);
+    let paired = ImportSummary {
+        total: 10,
+        matched: 2,
+        unmatched: 9,
+        filtered: 0,
+    };
+    assert_fixture_matches(&paired, 1, 2);
+    let missing = ImportSummary {
+        total: 10,
+        matched: 0,
+        unmatched: 10,
+        filtered: 0,
+    };
+    assert_one_version_lost(&healthy, &missing);
+    let complete = ImportSummary {
+        total: 10,
+        matched: 10,
+        unmatched: 0,
+        filtered: 0,
+    };
+    let one_lost = ImportSummary {
+        total: 10,
+        matched: 9,
+        unmatched: 1,
+        filtered: 0,
+    };
+    assert_one_version_lost(&complete, &one_lost);
+    assert!(std::panic::catch_unwind(|| assert_fixture_matches(&healthy, 1, 2)).is_err());
+    assert!(std::panic::catch_unwind(|| assert_fixture_matches(&healthy, 11, 11)).is_err());
+    assert!(std::panic::catch_unwind(|| assert_one_version_lost(&healthy, &healthy)).is_err());
+    assert!(std::panic::catch_unwind(|| assert_one_version_lost(&complete, &missing)).is_err());
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 /// Smoke test: import media written by the fixture sync with the same
-/// bounded primary-library selection. The recent window can change between
-/// scans, so the match ratio and row-count bounds are broad smoke checks.
+/// bounded primary-library selection. Import sampling remains count-based;
+/// versions outside the date-bounded local tree may legitimately be unmatched.
 /// This fixture does not exercise album overlap or shared libraries.
 #[test]
 #[ignore]
 fn import_matches_default_layout_after_sync() {
     let (username, password, cookie_dir) = common::require_preauth();
-    let (download_dir, _sync_data_dir) = fixture();
+    let (download_dir, sync_data_dir) = fixture();
 
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
@@ -397,18 +509,10 @@ fn import_matches_default_layout_after_sync() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let summary = parse_summary(&stdout);
         assert!(summary.total > 0, "expected some assets, got {summary:?}");
-        // CloudKit's recent window can change while the live suite runs.
-        // Keep this as a broad smoke threshold. Offline import tests in
-        // src/commands/import.rs cover controlled matching cases.
-        let eligible = summary.total.saturating_sub(summary.filtered);
-        let match_ratio = if eligible > 0 {
-            (summary.matched as f64) / (eligible as f64)
-        } else {
-            1.0
-        };
-        assert!(
-            match_ratio >= 0.90,
-            "match ratio too low: {match_ratio:.2} ({summary:?}) eligible={eligible}\n{stdout}"
+        assert_fixture_matches(
+            &summary,
+            fixture_asset_count(sync_data_dir),
+            selected_fixture_files(sync_data_dir).len() as u64,
         );
 
         let rows = count_downloaded_rows(test_data.path());
@@ -604,36 +708,48 @@ fn import_unmatches_truncated_file() {
             std::fs::copy(src, &dst).unwrap();
         }
 
-        // Truncate the first file by 1 byte.
-        let first_rel = files[0].strip_prefix(download_dir).unwrap();
-        let truncated = test_dl.join(first_rel);
+        // Prove a healthy match in this exact count sample before changing it.
+        let healthy_data = tempdir().unwrap();
+        let before = import_fixture_summary(
+            &username,
+            &password,
+            &cookie_dir,
+            &test_dl,
+            healthy_data.path(),
+        );
+        let matched = selected_fixture_files(healthy_data.path());
+        assert!(
+            !matched.is_empty(),
+            "healthy import must have a source-backed target"
+        );
+        let truncated = &matched[0];
+        let relative = truncated.strip_prefix(&test_dl).unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|path| path.strip_prefix(download_dir).unwrap() == relative)
+        );
+        assert!(
+            std::fs::read(truncated).unwrap()
+                == std::fs::read(download_dir.join(relative)).unwrap(),
+            "mutation target must retain the source-backed fixture bytes"
+        );
         let f = std::fs::OpenOptions::new()
             .write(true)
-            .open(&truncated)
+            .open(truncated)
             .unwrap();
         let len = f.metadata().unwrap().len();
         f.set_len(len.saturating_sub(1)).unwrap();
 
         let test_data = tempdir().unwrap();
-        let output = import_cmd(
+        let after = import_fixture_summary(
             &username,
             &password,
             &cookie_dir,
             &test_dl,
             test_data.path(),
-            &[],
-        )
-        .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let summary = parse_summary(&stdout);
-        assert_eq!(
-            summary.unmatched, 1,
-            "only the truncated version should be unmatched: {summary:?}\n{stdout}"
         );
+        assert_one_version_lost(&before, &after);
     });
 }
 
@@ -650,8 +766,7 @@ fn import_unmatches_missing_file() {
         std::fs::create_dir_all(&test_dl).unwrap();
         let files = selected_fixture_files(sync_data_dir);
         assert!(!files.is_empty(), "bounded fixture contains no media");
-        // Omit one known file, even when the library contains only one asset.
-        for src in &files[..files.len() - 1] {
+        for src in &files {
             let rel = src.strip_prefix(download_dir).unwrap();
             let dst = test_dl.join(rel);
             if let Some(parent) = dst.parent() {
@@ -660,26 +775,41 @@ fn import_unmatches_missing_file() {
             std::fs::copy(src, &dst).unwrap();
         }
 
+        let healthy_data = tempdir().unwrap();
+        let before = import_fixture_summary(
+            &username,
+            &password,
+            &cookie_dir,
+            &test_dl,
+            healthy_data.path(),
+        );
+        let matched = selected_fixture_files(healthy_data.path());
+        assert!(
+            !matched.is_empty(),
+            "healthy import must have a source-backed target"
+        );
+        let missing = &matched[0];
+        let relative = missing.strip_prefix(&test_dl).unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|path| path.strip_prefix(download_dir).unwrap() == relative)
+        );
+        assert!(
+            std::fs::read(missing).unwrap() == std::fs::read(download_dir.join(relative)).unwrap(),
+            "mutation target must retain the source-backed fixture bytes"
+        );
+        std::fs::remove_file(missing).unwrap();
+
         let test_data = tempdir().unwrap();
-        let output = import_cmd(
+        let after = import_fixture_summary(
             &username,
             &password,
             &cookie_dir,
             &test_dl,
             test_data.path(),
-            &[],
-        )
-        .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let summary = parse_summary(&stdout);
-        assert_eq!(
-            summary.unmatched, 1,
-            "only the missing version should be unmatched: {summary:?}\n{stdout}"
         );
+        assert_one_version_lost(&before, &after);
     });
 }
 
