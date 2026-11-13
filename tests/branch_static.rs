@@ -2225,6 +2225,136 @@ fn live_import_rehearsal_uses_shared_bounded_selection() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn live_import_rehearsal_validates_known_receipts_and_repeat_counts() {
+    let script = repo_file("scripts/full-test/run_live_import_rehearsal.sh");
+    let validator = script
+        .split_once("<<'PY'\n")
+        .unwrap()
+        .1
+        .split_once("\nPY")
+        .unwrap()
+        .0;
+    for (case, seed_count, matched, unmatched, hash_errors, error) in [
+        ("healthy", 1, 1, 9, 0, ""),
+        ("complete", 10, 10, 0, 0, ""),
+        ("capacity", 11, 10, 0, 0, "seed fixture exceeds"),
+        ("no_match", 1, 0, 10, 0, "import must match"),
+        ("identity", 1, 1, 9, 0, "independent seed receipts"),
+        ("checksum", 1, 1, 9, 0, "independent seed receipts"),
+        ("path", 1, 1, 9, 0, "independent seed receipts"),
+        ("duplicate", 1, 1, 9, 0, "duplicate asset receipt identity"),
+        (
+            "hash_error",
+            1,
+            1,
+            9,
+            1,
+            "import must match without hash errors",
+        ),
+        ("repeat_counts", 1, 1, 9, 0, "summaries differ"),
+        ("known_missing", 2, 1, 9, 0, "known seed receipt missing"),
+        ("dry_write", 1, 1, 9, 0, "dry-run wrote asset rows"),
+        (
+            "repeat_rows",
+            1,
+            1,
+            9,
+            0,
+            "repeat dry-run changed asset receipts",
+        ),
+        ("over_cap", 1, 1, 9, 0, "scan exceeded"),
+        ("zero_cap", 1, 1, 9, 0, "sample cap must be positive"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let seed = root.path().join("seed");
+        let import = root.path().join("import");
+        let mut import_rows = Vec::new();
+        for (directory, count) in [(&seed, seed_count), (&import, matched)] {
+            std::fs::create_dir(directory).unwrap();
+            let connection = rusqlite::Connection::open(directory.join("fixture.db")).unwrap();
+            connection.execute_batch("CREATE TABLE assets(library TEXT,id TEXT,version_size TEXT,checksum TEXT,local_path TEXT,status TEXT)").unwrap();
+            for index in 0..count {
+                let mut row = vec![
+                    "PrimarySync".to_owned(),
+                    format!("fixture-{index}"),
+                    "original".to_owned(),
+                    "checksum".to_owned(),
+                    format!("/fixture/{index}.jpg"),
+                    "downloaded".to_owned(),
+                ];
+                if directory == &import {
+                    match case {
+                        "identity" => row[1] = "foreign-fixture".to_owned(),
+                        "checksum" => row[3] = "wrong-checksum".to_owned(),
+                        "path" => row[4] = "/fixture/wrong.jpg".to_owned(),
+                        _ => {}
+                    }
+                    import_rows.push(row.clone());
+                }
+                connection
+                    .execute(
+                        "INSERT INTO assets VALUES (?1,?2,?3,?4,?5,?6)",
+                        rusqlite::params_from_iter(&row),
+                    )
+                    .unwrap();
+            }
+            if directory == &import && case == "duplicate" {
+                connection
+                    .execute("INSERT INTO assets SELECT * FROM assets", [])
+                    .unwrap();
+                import_rows.extend(import_rows.clone());
+            }
+        }
+        let dry_snapshot = root.path().join("dry.json");
+        std::fs::write(
+            &dry_snapshot,
+            if case == "dry_write" {
+                serde_json::to_vec(&import_rows).unwrap()
+            } else {
+                b"[]".to_vec()
+            },
+        )
+        .unwrap();
+        if case == "repeat_rows" {
+            import_rows[0][3] = "before-checksum".to_owned();
+        }
+        let real_snapshot = root.path().join("real.json");
+        std::fs::write(&real_snapshot, serde_json::to_vec(&import_rows).unwrap()).unwrap();
+        let reports: Vec<_> = (0..3).map(|index| {
+            let path = root.path().join(format!("{index}.out"));
+            let count = if index == 2 && case == "repeat_counts" { matched + 1 } else { matched };
+            let total = if case == "over_cap" { 11 } else { 10 };
+            std::fs::write(&path, format!("Total assets scanned: {total}\nFiles matched: {count}\nUnmatched versions: {unmatched}\nHash errors: {hash_errors}\n")).unwrap();
+            path
+        }).collect();
+        let output = Command::new("python3")
+            .args(["-c", validator])
+            .arg(&seed)
+            .arg(&import)
+            .arg(if case == "zero_cap" { "0" } else { "10" })
+            .arg(dry_snapshot)
+            .arg(real_snapshot)
+            .args(reports)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            error.is_empty(),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !error.is_empty() {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(error),
+                "{case}: wrong refusal: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
 #[test]
 fn full_test_cross_zone_album_phase_is_opt_in_and_checks_source_zone() {
     let run_all = repo_file("scripts/full-test/run_all.sh");

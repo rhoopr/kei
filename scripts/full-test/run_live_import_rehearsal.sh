@@ -82,47 +82,114 @@ if [[ "$file_count" -lt 1 ]]; then
     exit 1
 fi
 
+media_fingerprint() {
+    python3 - "$photos" <<'PY_MEDIA'
+import hashlib
+import json
+import os
+import pathlib
+import sys
+root = pathlib.Path(sys.argv[1])
+rows = []
+for path in sorted(root.rglob("*")):
+    if path.is_file():
+        stat = path.stat()
+        with path.open("rb") as stream:
+            checksum = hashlib.file_digest(stream, "sha256").hexdigest()
+        rows.append((os.fsencode(path.relative_to(root)).hex(), stat.st_ino, stat.st_size,
+                     stat.st_mtime_ns, stat.st_mode, stat.st_nlink, checksum))
+print(hashlib.sha256(json.dumps(rows).encode()).hexdigest())
+PY_MEDIA
+}
+
+snapshot_assets() {
+    python3 - "$import_data" "$1" <<'PY_ASSETS'
+import json
+import pathlib
+import sqlite3
+import sys
+directory, output = map(pathlib.Path, sys.argv[1:])
+databases = list(directory.glob("*.db"))
+assert len(databases) <= 1, "ambiguous isolated state DB"
+rows = []
+if databases:
+    with sqlite3.connect(databases[0].resolve().as_uri() + "?mode=ro", uri=True) as connection:
+        rows = connection.execute("SELECT library,id,version_size,checksum,local_path,status FROM assets ORDER BY library,id,version_size").fetchall()
+output.write_text(json.dumps(rows))
+PY_ASSETS
+}
+
+original_media=$(media_fingerprint)
 echo "--- import dry-run into fresh DB ---"
 run_and_show import-dry-run \
     "$binary" import-existing --dry-run --force-empty --recent "$recent" --no-progress-bar --config "$import_config"
+snapshot_assets "$work/after-dry-run.json"
+[[ "$(media_fingerprint)" == "$original_media" ]] || { echo "import dry-run changed seed media" >&2; exit 1; }
 
 echo "--- import real into fresh DB ---"
 run_and_show import-real \
     "$binary" import-existing --force-empty --recent "$recent" --no-progress-bar --config "$import_config"
+snapshot_assets "$work/after-real.json"
 
 echo "--- import repeat dry-run ---"
 run_and_show import-repeat-dry-run \
     "$binary" import-existing --dry-run --force-empty --recent "$recent" --no-progress-bar --config "$import_config"
+[[ "$(media_fingerprint)" == "$original_media" ]] || { echo "import changed seed media" >&2; exit 1; }
+echo "seed_media_unchanged=1"
 
-matched=$(awk -F: '/Files matched/ { gsub(/[[:space:]]/, "", $2); print $2 }' "$work/import-real.out" | tail -1)
-unmatched=$(awk -F: '/Unmatched versions/ { gsub(/[[:space:]]/, "", $2); print $2 }' "$work/import-real.out" | tail -1)
-hash_errors=$(awk -F: '/Hash errors/ { gsub(/[[:space:]]/, "", $2); print $2 }' "$work/import-real.out" | tail -1)
+# The count sample can include records outside the date-bounded local tree.
+# Keep the sample unchanged and require exact known receipts and quiet repetition.
+python3 - "$sync_data" "$import_data" "$recent" "$work/after-dry-run.json" "$work/after-real.json" "$work/import-dry-run.out" "$work/import-real.out" "$work/import-repeat-dry-run.out" <<'PY'
+import json
+import pathlib
+import sqlite3
+import sys
 
-if [[ -z "$matched" || "$matched" -lt 1 ]]; then
-    echo "run_live_import_rehearsal: import matched no files" >&2
-    exit 1
-fi
-if [[ "${unmatched:-999}" != "0" ]]; then
-    echo "run_live_import_rehearsal: import left unmatched versions: $unmatched" >&2
-    exit 1
-fi
-if [[ "${hash_errors:-999}" != "0" ]]; then
-    echo "run_live_import_rehearsal: import had hash errors: $hash_errors" >&2
-    exit 1
-fi
+seed_dir, import_dir, recent, dry_snapshot, real_snapshot, *reports = sys.argv[1:]
+recent = int(recent)
+assert recent > 0, "import sample cap must be positive"
+keys = ("Total assets scanned", "Files matched", "Unmatched versions", "Hash errors")
+summaries = []
+for report in reports:
+    values = {}
+    for line in pathlib.Path(report).read_text().splitlines():
+        key, separator, value = line.strip().partition(":")
+        if separator and key in keys:
+            assert key not in values, "duplicate import summary field"
+            values[key] = int(value.strip())
+    assert all(key in values and values[key] >= 0 for key in keys), "missing import summary"
+    assert 0 < values["Total assets scanned"] <= recent, "scan exceeded the positive import sample cap"
+    summaries.append(values)
+assert len(summaries) == 3 and all(value == summaries[0] for value in summaries), "dry-run, real and repeat summaries differ"
+summary = summaries[0]
+matched = summary["Files matched"]
+assert matched > 0 and summary["Hash errors"] == 0, "import must match without hash errors"
 
-db=$(find "$import_data" -maxdepth 1 -name '*.db' | head -1)
-if [[ -z "$db" ]]; then
-    echo "run_live_import_rehearsal: import DB was not created" >&2
-    exit 1
-fi
+def asset_rows(directory):
+    databases = list(pathlib.Path(directory).glob("*.db"))
+    assert len(databases) == 1, "expected one isolated state DB"
+    with sqlite3.connect(databases[0].resolve().as_uri() + "?mode=ro", uri=True) as connection:
+        rows = connection.execute("SELECT library,id,version_size,checksum,local_path,status FROM assets ORDER BY library,id,version_size").fetchall()
+    assert len(rows) == len({row[:3] for row in rows}), "duplicate asset receipt identity"
+    return rows
 
-downloaded=$(sqlite3 "$db" "SELECT COUNT(*) FROM assets WHERE status='downloaded'" 2>/dev/null || echo 0)
-echo "import_matched=$matched"
-echo "db_downloaded=$downloaded"
-if [[ "$downloaded" -lt "$matched" ]]; then
-    echo "run_live_import_rehearsal: DB downloaded count $downloaded is less than matched $matched" >&2
-    exit 1
-fi
+seed_rows = asset_rows(seed_dir)
+import_rows = asset_rows(import_dir)
+seed = {row[:5] for row in seed_rows if row[5] == "downloaded"}
+imported = {row[:5] for row in import_rows if row[5] == "downloaded"}
+assert json.loads(pathlib.Path(dry_snapshot).read_text()) == [], "dry-run wrote asset rows"
+assert json.loads(pathlib.Path(real_snapshot).read_text()) == [list(row) for row in import_rows], "repeat dry-run changed asset receipts"
+assert seed and imported and imported <= seed, "import receipts must match independent seed receipts"
+assert len(imported) == matched, "matched count must equal durable imported versions"
+assert len({row[:2] for row in seed}) <= recent, "seed fixture exceeds import sample capacity; refusing incomplete coverage"
+# Cardinality is only a capacity check. Exact observed receipt equality proves
+# overlap for this fixture; date/album gaps must refuse, not infer eligibility.
+assert imported == seed, "fixture/sample overlap incomplete: known seed receipt missing"
+print(f"import_matched={matched}")
+print(f"db_downloaded={len(imported)}")
+print("seed_sample_receipts_equal=1")
+print("dry_run_asset_rows=0")
+print("repeat_asset_receipts_unchanged=1")
+PY
 
 echo "live import rehearsal passed"
