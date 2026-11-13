@@ -124,7 +124,10 @@ echo "--- import dry-run into fresh DB ---"
 run_and_show import-dry-run \
     "$binary" import-existing --dry-run --force-empty --recent "$recent" --no-progress-bar --config "$import_config"
 snapshot_assets "$work/after-dry-run.json"
-[[ "$(media_fingerprint)" == "$original_media" ]] || { echo "import dry-run changed seed media" >&2; exit 1; }
+[[ "$(media_fingerprint)" == "$original_media" ]] || {
+    echo "import dry-run changed seed media" >&2
+    exit 1
+}
 
 echo "--- import real into fresh DB ---"
 run_and_show import-real \
@@ -134,7 +137,10 @@ snapshot_assets "$work/after-real.json"
 echo "--- import repeat dry-run ---"
 run_and_show import-repeat-dry-run \
     "$binary" import-existing --dry-run --force-empty --recent "$recent" --no-progress-bar --config "$import_config"
-[[ "$(media_fingerprint)" == "$original_media" ]] || { echo "import changed seed media" >&2; exit 1; }
+[[ "$(media_fingerprint)" == "$original_media" ]] || {
+    echo "import changed seed media" >&2
+    exit 1
+}
 echo "seed_media_unchanged=1"
 
 # The count sample can include records outside the date-bounded local tree.
