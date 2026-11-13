@@ -180,7 +180,7 @@ pub(super) fn provenance(
 }
 
 impl SqliteStateDb {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) async fn historical_trust_targets_for_test(
         &self,
         library: &str,
