@@ -423,31 +423,9 @@ an invalid private page or a mismatched index entry fails validation. A replay
 always reprojects the durable source, so an interruption after capture but before
 projection recovers on the next equivalent observation.
 
-The same schema step compacts finite legacy duplicates before ordinary admission.
-It streams one body at a time inside the migration savepoint and requires a
-validated raw hash, provider-owned evidence, exact account/provider/scope/cursor/
-successor/`moreComing` binding, complete masked-byte equality, and a fresh pure
-projection that equals every stored record, reference, debt and charge. Only then
-may an old body become empty. The old row keeps its original ID, ordinal source
-identities, historical observation hash and catalogue/work/selection references;
-a typed alias stores the canonical page, classifier version, masked digest,
-canonical certificate and an immutable provenance binding over the original ID
-and hash, canonical ID and hash, class key, version and ordinal identities.
-Known work receipts, work retries/scans and selection sources must still match
-that old identity, source hash and independent confirmation bytes before the
-body may be dropped; an unsupported or mismatched dependency pins the page as
-raw. Loads expose `Raw` versus `LegacyAlias` provenance and verify the
-representative hash, certificate, provenance binding and index on every access.
-Alias chains and cycles are refused. The historical hash is never presented as a hash
-of representative bytes, and no original hash is fabricated. Unknown formats,
-unsupported projector versions or failed projection proof stay raw; inability to
-prove the optional projection (including its byte budget) makes a page
-ineligible for compaction rather than failing migration, while SQLite and
-storage errors still abort. Migration
-charges retained provenance plus alias and index overhead, does not raise budgets
-or prune catalogue rows, and rolls every alias and body drop back with the schema
-version on any failure. Replaying a discarded URL variant validates the alias and
-returns the canonical ID; it creates no new alias.
+The transport-index schema step creates and validates its tables without compacting historical bodies. Schema 38 retires historical pages before that step; the legacy compaction algorithm and its dependency-validation checks have been removed. The existing migration diagnostic shape remains, with zero compaction counts and unknown byte-reclaim totals. Current capture still uses the canonical index to avoid repeated equivalent observations.
+
+The checked page loader retains support for previously encoded `LegacyAlias` provenance. It verifies the representative hash, certificate, provenance binding and index on every access and refuses alias chains and cycles. A historical observation hash is never presented as a hash of representative bytes. Alias fixtures exercise this read boundary directly; no production writer creates new legacy aliases.
 
 A shadow receipt is only the last observed page, and replay can move it back. It
 is not a coverage frontier, materialization receipt or verified filesystem

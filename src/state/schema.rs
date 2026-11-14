@@ -331,7 +331,7 @@ CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
 ///
 /// `provider_shadow_pages.body_hash` remains the historical observation hash.
 /// For a legacy alias it is the original transport hash of bytes removed by
-/// this migration, never a digest of the representative body.
+/// older versions of this migration, never a digest of the representative body.
 fn migrate_provider_transport_index(
     conn: &Connection,
 ) -> Result<crate::support::CompactionSummary, StateError> {
@@ -374,9 +374,9 @@ CREATE INDEX IF NOT EXISTS idx_transport_alias_canonical
     if actual != ["page_id"] {
         return Err(StateError::ProviderInboxInvalid);
     }
-    // Automatic legacy compaction is part of the same savepoint as DDL. Any
-    // failure rolls back all aliases and dropped bodies with this version step.
-    crate::state::db::provider_inbox::compact_legacy_aliases(conn)
+    // Historical pages have already been retired by the upgrade boundary.
+    // Keep the existing migration diagnostic shape with no compaction work.
+    Ok(crate::support::CompactionSummary::default())
 }
 
 /// Scheduling evidence neither completes work nor changes checkpoint authority.
