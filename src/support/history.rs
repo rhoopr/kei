@@ -130,6 +130,7 @@ impl StorageReuse {
         let counters = match component {
             StorageComponent::Inbox => &mut self.inbox,
             StorageComponent::Catalogue => &mut self.catalogue,
+            #[cfg(test)]
             StorageComponent::Selection => &mut self.selection,
             StorageComponent::Work => &mut self.work,
         };
@@ -166,6 +167,8 @@ impl ReuseCounters {
 pub(crate) enum StorageComponent {
     Inbox,
     Catalogue,
+    // Historical diagnostic compatibility; current admission has no shadow writer.
+    #[cfg(test)]
     Selection,
     Work,
 }

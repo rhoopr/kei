@@ -9,7 +9,7 @@ use crate::icloud::photos::inbox::ShadowCapture;
 use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
 use crate::state::SqliteStateDb;
 use crate::state::db::account::AccountOwner;
-use crate::state::db::provider_selection::{MAX_SELECTION_BYTES, SelectionOutcome, SelectionPath};
+use crate::state::db::provider_selection::{SelectionOutcome, SelectionPath};
 use crate::state::db::provider_work::{WorkAdmission, WorkPlan};
 use rustc_hash::FxHashSet;
 use serde_json::{Value, json};
@@ -572,7 +572,7 @@ async fn queue_projection_equivalent_confirmation_requires_exact_non_url_bytes()
 }
 
 #[tokio::test]
-async fn queue_projection_selection_equivalent_url_retries_stay_bounded_across_reopen() {
+async fn queue_projection_work_equivalent_url_retries_stay_bounded_across_reopen() {
     let mut f = Fixture::new().await;
     f.capture(
         eligible_records(
@@ -586,7 +586,7 @@ async fn queue_projection_selection_equivalent_url_retries_stay_bounded_across_r
         .await
         .unwrap();
     // Explicit fixture scheduling only: the production retry clock stays
-    // unchanged, and catalogue/selection preparation is never manual.
+    // unchanged, and catalogue/work preparation is never manual.
     let make_due = |f: &Fixture| {
         f.db.acquire_lock("fixture retry schedule")
             .unwrap()
@@ -596,7 +596,7 @@ async fn queue_projection_selection_equivalent_url_retries_stay_bounded_across_r
             )
             .unwrap();
     };
-    let mut baseline: Option<(Vec<i64>, i64, i64)> = None;
+    let mut baseline: Option<(Vec<i64>, i64)> = None;
     let mut first_url = String::new();
     let mut last_url = String::new();
     for reopen in 0..2 {
@@ -649,15 +649,6 @@ async fn queue_projection_selection_equivalent_url_retries_stay_bounded_across_r
             ]
             .map(|table| f.count(table))
             .to_vec();
-            let selection_charge: i64 =
-                f.db.acquire_lock("selection charge oracle")
-                    .unwrap()
-                    .query_row(
-                        "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_selection_generations",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .unwrap();
             let work_charge: i64 =
                 f.db.acquire_lock("work charge oracle")
                     .unwrap()
@@ -667,25 +658,31 @@ async fn queue_projection_selection_equivalent_url_retries_stay_bounded_across_r
                         |r| r.get(0),
                     )
                     .unwrap();
-            if let Some((expected_counts, expected_selection, expected_work)) = &baseline {
+            if let Some((expected_counts, expected_work)) = &baseline {
                 assert_eq!(&counts, expected_counts, "count growth at {rotation}");
-                assert_eq!(selection_charge, *expected_selection, "selection charge");
                 assert_eq!(work_charge, *expected_work, "work charge");
             } else {
-                baseline = Some((counts, selection_charge, work_charge));
+                baseline = Some((counts, work_charge));
             }
             f.preserved().await;
         }
     }
-    let (_, manifest) = selection_manifest(&f).await;
-    let retained = manifest.decisions[0].confirmation.as_deref().unwrap();
+    let retained: Vec<u8> =
+        f.db.acquire_lock("retained work confirmation")
+            .unwrap()
+            .query_row(
+                "SELECT confirmation FROM provider_work_receipts LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
     assert!(
-        String::from_utf8_lossy(retained).contains(&first_url),
-        "the retained selection representative must keep its original bytes"
+        String::from_utf8_lossy(&retained).contains(&first_url),
+        "the retained work representative must keep its original bytes"
     );
     assert!(
-        !String::from_utf8_lossy(retained).contains(&last_url),
-        "a fresh URL must not replace retained selection bytes"
+        !String::from_utf8_lossy(&retained).contains(&last_url),
+        "a fresh URL must not replace retained work bytes"
     );
     // A genuine non-URL confirmation change remains a distinct decision.
     let mut changed = eligible_records(
@@ -696,13 +693,13 @@ async fn queue_projection_selection_equivalent_url_retries_stay_bounded_across_r
     *f.session.records.lock().unwrap() = changed;
     make_due(&f);
     f.cycle().await.unwrap();
-    assert_eq!(f.count("provider_selection_generations"), 2);
+    assert_eq!(f.count("provider_selection_generations"), 0);
     assert_eq!(f.count("provider_work_receipts"), 2);
     f.preserved().await;
 }
 
 #[tokio::test]
-async fn queue_projection_selection_equivalent_url_reuses_class_beyond_lexical_prefix() {
+async fn queue_projection_work_equivalent_url_reuses_class_beyond_lexical_prefix() {
     let f = Fixture::new().await;
     f.capture(
         eligible_records(
@@ -739,15 +736,18 @@ async fn queue_projection_selection_equivalent_url_reuses_class_beyond_lexical_p
         *f.session.records.lock().unwrap() = records;
         make_due(&f);
         f.cycle().await.unwrap();
-        let ids: Vec<String> =
-            f.db.acquire_lock("selection class identities")
-                .unwrap()
-                .prepare("SELECT id FROM provider_selection_generations ORDER BY id")
-                .unwrap()
-                .query_map([], |r| r.get(0))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap();
+        let ids: Vec<String> = f
+            .db
+            .acquire_lock("selection class identities")
+            .unwrap()
+            .prepare(
+                "SELECT confirmation_hash FROM provider_work_receipts ORDER BY confirmation_hash",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
         let inserted: Vec<String> = ids
             .iter()
             .filter(|id| !previous.contains(id))
@@ -755,10 +755,7 @@ async fn queue_projection_selection_equivalent_url_reuses_class_beyond_lexical_p
             .collect();
         assert_eq!(inserted.len(), 1, "class {index} generation growth");
         previous = ids;
-        assert_eq!(
-            f.count("provider_selection_generations"),
-            i64::from(index) + 1
-        );
+        assert_eq!(f.count("provider_work_receipts"), i64::from(index) + 1);
         classes.push((tag, original_url, inserted[0].clone()));
     }
     classes.sort_by(|left, right| left.2.cmp(&right.2));
@@ -773,19 +770,13 @@ async fn queue_projection_selection_equivalent_url_reuses_class_beyond_lexical_p
         TARGET,
         "target representative must sort beyond the first 64 candidate IDs"
     );
-    let counts = [
-        "provider_selection_generations",
-        "provider_selection_sources",
-        "provider_selection_decisions",
-        "provider_selection_destinations",
-    ]
-    .map(|table| f.count(table));
-    assert_eq!(counts, [66; 4]);
+    let count = f.count("provider_work_receipts");
+    assert_eq!(count, 66);
     let charge: i64 =
-        f.db.acquire_lock("selection class charge")
+        f.db.acquire_lock("work class charge")
             .unwrap()
             .query_row(
-                "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_selection_generations",
+                "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_work_receipts",
                 [],
                 |r| r.get(0),
             )
@@ -801,48 +792,46 @@ async fn queue_projection_selection_equivalent_url_reuses_class_beyond_lexical_p
         make_due(&f);
         f.cycle().await.unwrap();
         assert_eq!(
-            [
-                "provider_selection_generations",
-                "provider_selection_sources",
-                "provider_selection_decisions",
-                "provider_selection_destinations",
-            ]
-            .map(|table| f.count(table)),
-            counts,
-            "selection count growth at rotation {rotation}"
+            f.count("provider_work_receipts"),
+            count,
+            "work count growth at rotation {rotation}"
         );
         let current_charge: i64 =
-            f.db.acquire_lock("selection class charge after rotation")
+            f.db.acquire_lock("work class charge after rotation")
                 .unwrap()
                 .query_row(
-                    "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_selection_generations",
+                    "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_work_receipts",
                     [],
                     |r| r.get(0),
                 )
                 .unwrap();
-        assert_eq!(current_charge, charge, "selection charge at {rotation}");
+        assert_eq!(current_charge, charge, "work charge at {rotation}");
         assert_eq!(
             f.db.acquire_lock("target class generation oracle")
                 .unwrap()
                 .query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_selection_generations WHERE id=?1",
+                    "SELECT count(*) FROM provider_work_receipts WHERE confirmation_hash=?1",
                     [&target_id],
                     |r| r.get(0),
                 )
                 .unwrap(),
             1
         );
-        let retained =
-            f.db.replay_selection_shadow(owner(), target_id.clone())
-                .await
+        let body: Vec<u8> =
+            f.db.acquire_lock("retained work class")
+                .unwrap()
+                .query_row(
+                    "SELECT confirmation FROM provider_work_receipts WHERE confirmation_hash=?1",
+                    [&target_id],
+                    |row| row.get(0),
+                )
                 .unwrap();
-        let body = retained.decisions[0].confirmation.as_deref().unwrap();
         assert!(
-            String::from_utf8_lossy(body).contains(&target_url),
+            String::from_utf8_lossy(&body).contains(&target_url),
             "the beyond-prefix representative must keep its original bytes at {rotation}"
         );
         assert!(
-            !String::from_utf8_lossy(body).contains(&rotated_url),
+            !String::from_utf8_lossy(&body).contains(&rotated_url),
             "a fresh URL must not replace retained class bytes at {rotation}"
         );
     }
@@ -2474,324 +2463,64 @@ async fn queue_projection_admitted_before_dispatch_reopens_materializes_and_stay
     }
 }
 
-async fn selection_manifest(
-    fixture: &Fixture,
-) -> (
-    String,
-    crate::state::db::provider_selection::SelectionManifest,
-) {
-    let id: String = fixture
-        .db
-        .acquire_lock("shadow generation identity")
-        .unwrap()
-        .query_row(
-            "SELECT id FROM provider_selection_generations ORDER BY id LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let manifest = fixture
-        .db
-        .replay_selection_shadow(owner(), id.clone())
-        .await
-        .unwrap();
-    (id, manifest)
-}
-
 #[tokio::test]
-async fn selection_shadow_current_authority_original_bytes_and_two_reopens_preserve_progress() {
-    let fixture = Fixture::new().await;
-    fixture
-        .capture(records("m", OLD, "historical"), "old-page")
-        .await;
-    fixture.cycle().await.unwrap();
-    let (id, manifest) = selection_manifest(&fixture).await;
-    assert_eq!(manifest.profile["coverage"], "confirmed_sources_only");
-    assert_eq!(manifest.decisions.len(), 1);
-    let decision = &manifest.decisions[0];
-    assert_eq!(decision.outcome, SelectionOutcome::Selected);
-    assert_eq!(decision.child, "asset-m");
-    assert_eq!(decision.master.as_deref(), Some("m"));
-    let body = decision.confirmation.as_ref().unwrap();
-    assert!(
-        std::str::from_utf8(body)
-            .unwrap()
-            .contains("\"futureExact\":1.2300e+30")
-    );
-    assert_eq!(decision.destinations.len(), 1);
-    assert_eq!(decision.destinations[0].checksum, CURRENT);
-    assert!(
-        decision.destinations[0]
-            .path
-            .to_path()
-            .starts_with(&fixture.config.directory)
-    );
-    assert_eq!(fixture.count("provider_selection_sources"), 1);
-    assert_eq!(fixture.count("provider_selection_destinations"), 1);
-    let pending: String = fixture
-        .db
-        .acquire_lock("selection is not byte completion")
-        .unwrap()
-        .query_row("SELECT status FROM assets WHERE id='asset-m'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(pending, "pending");
-    fixture.preserved().await;
-    let calls = fixture.session.calls.load(Ordering::SeqCst);
-    fixture.cycle().await.unwrap();
-    assert_eq!(fixture.session.calls.load(Ordering::SeqCst), calls);
-    assert_eq!(fixture.count("provider_selection_generations"), 1);
-    let database = fixture.dir.path().join("state.db");
-    let media = fixture.config.directory.to_path_buf();
-    let Fixture {
-        dir,
-        db,
-        capture,
-        session,
-        pass,
-        config,
-    } = fixture;
-    drop(config);
-    drop(pass);
-    drop(capture);
-    drop(db);
-    drop(session);
-    for _ in 0..2 {
-        let reopened = SqliteStateDb::open_owned(&database, &owner())
-            .await
-            .unwrap();
-        assert_eq!(
-            reopened
-                .replay_selection_shadow(owner(), id.clone())
-                .await
-                .unwrap(),
-            manifest
-        );
-        assert_eq!(
-            reopened
-                .get_metadata("sync_token:PrimarySync")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("old-cursor")
-        );
-        assert_eq!(
-            std::fs::read(media.join("existing.jpg")).unwrap(),
-            b"existing-media"
-        );
-        drop(reopened);
-    }
-    drop(dir);
-}
-
-#[tokio::test]
-async fn selection_shadow_multiple_destinations_capacity_and_atomic_failure_do_not_admit_work() {
-    let fixture = Fixture::new().await;
-    fixture
-        .capture(records("m", OLD, "historical"), "source")
-        .await;
-    fixture.cycle().await.unwrap();
-    let (id, mut manifest) = selection_manifest(&fixture).await;
-    let original_queue = fixture.queue();
-    assert_eq!(
-        fixture
-            .db
-            .capture_selection_shadow(owner(), manifest.clone(), 0)
-            .await
-            .unwrap(),
-        id
-    );
-    let mut second = manifest.decisions[0].clone();
-    manifest.decisions[0].pass_key = "album-A".to_owned();
-    second.pass_key = "album-B".to_owned();
-    second.destinations[0].path =
-        SelectionPath::from_path(&fixture.config.directory.join("B/photo.jpg"));
-    manifest.decisions.push(second);
-    assert!(matches!(
-        fixture
-            .db
-            .capture_selection_shadow(owner(), manifest.clone(), 0)
-            .await,
-        Err(crate::state::error::StateError::ProviderSelectionFull)
-    ));
-    assert_eq!(fixture.count("provider_selection_generations"), 1);
-    fixture.db.acquire_lock("fault second destination").unwrap().execute_batch(
-        "CREATE TRIGGER selection_fault BEFORE INSERT ON provider_selection_destinations WHEN NEW.pass_key='album-B' BEGIN SELECT RAISE(ABORT,'synthetic destination failure'); END;"
-    ).unwrap();
-    assert!(
-        fixture
-            .db
-            .capture_selection_shadow(owner(), manifest.clone(), MAX_SELECTION_BYTES)
-            .await
-            .is_err()
-    );
-    for (table, count) in [
-        ("provider_selection_generations", 1),
-        ("provider_selection_sources", 1),
-        ("provider_selection_decisions", 1),
-        ("provider_selection_destinations", 1),
-    ] {
-        assert_eq!(
-            fixture.count(table),
-            count,
-            "partial shadow insert into {table}"
-        );
-    }
-    fixture
-        .db
-        .acquire_lock("restore destination writes")
-        .unwrap()
-        .execute_batch("DROP TRIGGER selection_fault;")
-        .unwrap();
-    let generation = fixture
-        .db
-        .capture_selection_shadow(owner(), manifest.clone(), MAX_SELECTION_BYTES)
-        .await
-        .unwrap();
-    assert_eq!(
-        fixture
-            .db
-            .replay_selection_shadow(owner(), generation)
-            .await
-            .unwrap(),
-        manifest
-    );
-    assert_eq!(fixture.count("provider_selection_destinations"), 3);
-    assert_eq!(fixture.queue(), original_queue);
-    assert_eq!(fixture.count("provider_work_receipts"), 1);
-    fixture.preserved().await;
-}
-
-#[tokio::test]
-async fn selection_shadow_replay_rejects_corrupt_rows_sources_confirmations_and_foreign_owner() {
-    let fixture = Fixture::new().await;
-    fixture
-        .capture(records("m", OLD, "historical"), "source")
-        .await;
-    fixture.cycle().await.unwrap();
-    let (id, manifest) = selection_manifest(&fixture).await;
-    let original_queue = fixture.queue();
-    let wrong = AccountOwner::authenticated(
-        "other@example.invalid",
-        "com",
-        &serde_json::from_value(json!({"dsInfo":{"dsid":"queue-provider"}})).unwrap(),
-    )
-    .unwrap();
-    assert!(matches!(
-        fixture.db.replay_selection_shadow(wrong, id.clone()).await,
-        Err(crate::state::error::StateError::AccountOwnerMismatch)
-    ));
-    for mutation in [
-        "UPDATE provider_selection_destinations SET checksum='wrong'",
-        "DELETE FROM provider_selection_destinations",
-        "UPDATE provider_selection_sources SET body_hash='wrong'",
-        "UPDATE provider_selection_generations SET config_hash='wrong'",
-        "UPDATE provider_shadow_pages SET body=X'7B7D'",
-    ] {
-        let probe = Fixture::new().await;
-        probe
-            .capture(records("m", OLD, "historical"), "corruption-source")
-            .await;
-        probe.cycle().await.unwrap();
-        let (probe_id, healthy) = selection_manifest(&probe).await;
-        assert_eq!(
-            probe
-                .db
-                .replay_selection_shadow(owner(), probe_id.clone())
-                .await
-                .unwrap(),
-            healthy
-        );
-        let queue = probe.queue();
-        probe
-            .db
-            .acquire_lock("committed shadow corruption probe")
-            .unwrap()
-            .execute_batch(mutation)
-            .unwrap();
-        let error = probe
-            .db
-            .replay_selection_shadow(owner(), probe_id)
-            .await
-            .expect_err("corrupted evidence cannot replay");
-        if mutation.contains("provider_shadow_pages") {
-            assert!(
-                matches!(
-                    error,
-                    crate::state::error::StateError::ProviderCatalogInvalid
-                ),
-                "wrong validation error: {error:?}"
-            );
-        } else {
-            assert!(
-                matches!(
-                    error,
-                    crate::state::error::StateError::ProviderSelectionInvalid
-                ),
-                "wrong validation error: {error:?}"
-            );
-        }
-        assert_eq!(probe.queue(), queue);
-        probe.preserved().await;
-    }
-    assert_eq!(
-        fixture
-            .db
-            .replay_selection_shadow(owner(), id)
-            .await
-            .unwrap(),
-        manifest
-    );
-    let mut wrong = manifest.clone();
-    wrong.decisions[0].confirmation = Some(b"{\"records\":[]}".to_vec());
-    assert!(matches!(
-        fixture
-            .db
-            .capture_selection_shadow(owner(), wrong, MAX_SELECTION_BYTES)
-            .await,
-        Err(crate::state::error::StateError::ProviderSelectionInvalid)
-    ));
-    let mut wrong = manifest;
-    wrong.scope = wrong.scope.replace("PrimarySync", "OtherZone");
-    assert!(matches!(
-        fixture
-            .db
-            .capture_selection_shadow(owner(), wrong, MAX_SELECTION_BYTES)
-            .await,
-        Err(crate::state::error::StateError::ProviderSelectionInvalid)
-    ));
-    assert_eq!(fixture.queue(), original_queue);
-    fixture.preserved().await;
-}
-
-#[tokio::test]
-async fn selection_shadow_failure_precedes_queue_admission_then_recovers_quietly() {
-    let fixture = Fixture::new().await;
+async fn queue_projection_obsolete_selection_shadow_cannot_block_current_work() {
+    let mut fixture = Fixture::new().await;
     fixture
         .capture(records("m", OLD, "historical"), "source")
         .await;
     fixture.db.acquire_lock("shadow manifest fault").unwrap().execute_batch(
-        "CREATE TRIGGER selection_manifest_fault BEFORE INSERT ON provider_selection_generations BEGIN SELECT RAISE(ABORT,'synthetic selection failure'); END;"
+        "INSERT INTO provider_selection_generations VALUES ('opaque-history','unknown','unknown',1,'unknown','unknown',X'00FF09',9223372036854775807);
+         CREATE TRIGGER selection_manifest_fault BEFORE INSERT ON provider_selection_generations BEGIN SELECT RAISE(ABORT,'synthetic selection failure'); END;
+         CREATE TRIGGER current_work_fault BEFORE INSERT ON provider_work_receipts BEGIN SELECT RAISE(ABORT,'synthetic current work failure'); END;"
     ).unwrap();
-    assert!(fixture.cycle().await.is_err());
-    assert_eq!(fixture.count("provider_selection_generations"), 0);
+    let error = fixture.cycle().await.unwrap_err();
+    assert!(format!("{error:#}").contains("synthetic current work failure"));
     assert_eq!(fixture.count("assets"), 0);
     assert_eq!(fixture.count("provider_work_receipts"), 0);
-    assert_eq!(fixture.count("provider_catalog_records"), 2);
     fixture.preserved().await;
     fixture
         .db
-        .acquire_lock("remove shadow fault")
+        .acquire_lock("restore current admission")
         .unwrap()
-        .execute_batch("DROP TRIGGER selection_manifest_fault;")
+        .execute_batch("DROP TRIGGER current_work_fault;")
         .unwrap();
     fixture.cycle().await.unwrap();
+    assert_eq!(fixture.count("provider_selection_generations"), 1);
     assert_eq!(fixture.count("assets"), 1);
     assert_eq!(fixture.count("provider_work_receipts"), 1);
+    assert_eq!(fixture.count("provider_catalog_records"), 2);
+    fixture.preserved().await;
     let calls = fixture.session.calls.load(Ordering::SeqCst);
-    fixture.cycle().await.unwrap();
-    fixture.cycle().await.unwrap();
+    for _ in 0..2 {
+        fixture.db = Arc::new(
+            SqliteStateDb::open_owned(&fixture.dir.path().join("state.db"), &owner())
+                .await
+                .unwrap(),
+        );
+        fixture.capture = ShadowCapture::new(Arc::clone(&fixture.db), owner(), "com");
+        fixture
+            .pass
+            .album
+            .set_shadow_capture(fixture.capture.clone(), Arc::from("private"));
+        fixture.config.state_db = Some(Arc::clone(&fixture.db) as Arc<dyn DownloadStore>);
+        fixture.cycle().await.unwrap();
+        assert_eq!(
+            fixture
+                .db
+                .acquire_lock("opaque selection bytes")
+                .unwrap()
+                .query_row::<Vec<u8>, _, _>(
+                    "SELECT manifest FROM provider_selection_generations",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            [0, 255, 9]
+        );
+        assert_eq!(fixture.count("provider_work_receipts"), 1);
+        fixture.preserved().await;
+    }
     assert_eq!(fixture.session.calls.load(Ordering::SeqCst), calls);
     assert_eq!(fixture.count("provider_selection_generations"), 1);
     fixture.preserved().await;
@@ -2888,7 +2617,7 @@ async fn selection_shadow_schema32_migration_preserves_live_wal_work_and_unknown
 }
 
 #[tokio::test]
-async fn selection_shadow_relative_download_root_keeps_existing_admission_contract() {
+async fn queue_projection_relative_download_root_keeps_existing_admission_contract() {
     let mut fixture = Fixture::new().await;
     let current = std::env::current_dir().unwrap();
     let relative = tempfile::tempdir_in(&current).unwrap();
@@ -2903,11 +2632,24 @@ async fn selection_shadow_relative_download_root_keeps_existing_admission_contra
         .capture(records("m", OLD, "historical"), "relative-source")
         .await;
     fixture.cycle().await.unwrap();
-    let (_, manifest) = selection_manifest(&fixture).await;
+    assert_eq!(fixture.count("assets"), 1);
+    let current = fixture
+        .pass
+        .album
+        .confirm_catalog_asset("asset-m")
+        .await
+        .unwrap();
+    let mut planner = TaskPlanner::for_download(fixture.config.state_db.as_deref())
+        .await
+        .unwrap();
+    let plan = planner
+        .plan_download_asset(&current.asset, &fixture.config)
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1);
     assert!(
-        manifest.decisions[0].destinations[0]
-            .path
-            .to_path()
+        std::path::absolute(&plan.tasks[0].download_path)
+            .unwrap()
             .starts_with(&absolute)
     );
     fixture.preserved().await;
@@ -2915,7 +2657,7 @@ async fn selection_shadow_relative_download_root_keeps_existing_admission_contra
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn selection_shadow_non_utf8_download_root_preserves_native_path() {
+async fn queue_projection_non_utf8_download_root_preserves_native_path() {
     use std::os::unix::ffi::OsStringExt;
     let mut fixture = Fixture::new().await;
     let root = fixture
@@ -2931,33 +2673,30 @@ async fn selection_shadow_non_utf8_download_root_preserves_native_path() {
         .capture(records("m", OLD, "historical"), "native-source")
         .await;
     fixture.cycle().await.unwrap();
-    let (generation, manifest) = selection_manifest(&fixture).await;
-    let path = manifest.decisions[0].destinations[0].path.to_path();
-    assert!(path.starts_with(&root));
-    assert!(path.to_str().is_none());
-    let reopened = SqliteStateDb::open_owned(&fixture.dir.path().join("state.db"), &owner())
+    let current = fixture
+        .pass
+        .album
+        .confirm_catalog_asset("asset-m")
         .await
         .unwrap();
-    assert_eq!(
-        reopened
-            .replay_selection_shadow(owner(), generation)
-            .await
-            .unwrap(),
-        manifest
-    );
+    let mut planner = TaskPlanner::for_download(fixture.config.state_db.as_deref())
+        .await
+        .unwrap();
+    let plan = planner
+        .plan_download_asset(&current.asset, &fixture.config)
+        .await
+        .unwrap();
+    let path = &plan.tasks[0].download_path;
+    assert!(path.starts_with(&root));
+    assert!(path.to_str().is_none());
     assert_eq!(fixture.count("assets"), 1);
     fixture.preserved().await;
 }
 
 #[cfg(any(unix, windows))]
 #[tokio::test]
-async fn selection_shadow_native_path_storage_reopens_without_filesystem_creation() {
-    let fixture = Fixture::new().await;
-    fixture
-        .capture(records("m", OLD, "historical"), "native-storage-source")
-        .await;
-    fixture.cycle().await.unwrap();
-    let (_, mut manifest) = selection_manifest(&fixture).await;
+async fn selection_native_path_encoding_round_trips_without_filesystem_creation() {
+    let directory = tempfile::tempdir().unwrap();
     let component = {
         #[cfg(unix)]
         {
@@ -2972,56 +2711,12 @@ async fn selection_shadow_native_path_storage_reopens_without_filesystem_creatio
     };
     // Native encoding is a storage contract even when the current filesystem
     // cannot create this name. This fixture deliberately never creates it.
-    let destination = fixture.dir.path().join(component).join("selected.jpg");
+    let destination = directory.path().join(component).join("selected.jpg");
     assert!(destination.is_absolute());
     assert!(destination.to_str().is_none());
-    manifest.decisions[0].destinations[0].path = SelectionPath::from_path(&destination);
-    let queue = fixture.queue();
-    let generation = fixture
-        .db
-        .capture_selection_shadow(owner(), manifest.clone(), MAX_SELECTION_BYTES)
-        .await
-        .unwrap();
-    assert_eq!(fixture.queue(), queue);
-    fixture.preserved().await;
-    let database = fixture.dir.path().join("state.db");
-    let Fixture {
-        dir,
-        db,
-        capture,
-        session,
-        pass,
-        config,
-    } = fixture;
-    drop(config);
-    drop(pass);
-    drop(capture);
-    drop(db);
-    drop(session);
-    for _ in 0..2 {
-        let reopened = SqliteStateDb::open_owned(&database, &owner())
-            .await
-            .unwrap();
-        let replay = reopened
-            .replay_selection_shadow(owner(), generation.clone())
-            .await
-            .unwrap();
-        assert_eq!(replay, manifest);
-        assert_eq!(
-            replay.decisions[0].destinations[0].path.to_path(),
-            destination
-        );
-        assert_eq!(
-            reopened
-                .get_metadata("sync_token:PrimarySync")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("old-cursor")
-        );
-        drop(reopened);
-    }
-    drop(dir);
+    let encoded = SelectionPath::from_path(&destination).key().unwrap();
+    let decoded: SelectionPath = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded.to_path(), destination);
 }
 
 #[derive(Clone)]
@@ -6704,35 +6399,15 @@ async fn queue_projection_actual_diagnostics_child() {
     f.capture(records("m", OLD, "source"), "old").await;
     f.cycle().await.unwrap();
     let queue = f.queue();
-    assert_eq!(f.count("provider_selection_generations"), 1);
+    assert_eq!(f.count("provider_selection_generations"), 0);
     assert_eq!(f.count("provider_work_receipts"), 1);
 
-    let (id, manifest) = selection_manifest(&f).await;
-    assert_eq!(
-        f.db.capture_selection_shadow(owner(), manifest.clone(), 0)
-            .await
-            .unwrap(),
-        id
-    );
     let plan = f.plan().await;
     assert_eq!(
         f.db.project_provider_work(owner(), plan, 0).await.unwrap(),
         WorkAdmission::Admitted
     );
 
-    let mut equivalent = manifest.clone();
-    let body = equivalent.decisions[0].confirmation.take().unwrap();
-    let body = String::from_utf8(body)
-        .unwrap()
-        .replace(INITIAL_URL, ROTATED_URL)
-        .into_bytes();
-    equivalent.decisions[0].confirmation = Some(body);
-    assert_eq!(
-        f.db.capture_selection_shadow(owner(), equivalent, MAX_SELECTION_BYTES)
-            .await
-            .unwrap(),
-        id
-    );
     *f.session.records.lock().unwrap() = eligible_records("m", ROTATED_URL);
     let plan = f.plan().await;
     assert_eq!(
@@ -6741,7 +6416,7 @@ async fn queue_projection_actual_diagnostics_child() {
             .unwrap(),
         WorkAdmission::Admitted
     );
-    assert_eq!(f.count("provider_selection_generations"), 1);
+    assert_eq!(f.count("provider_selection_generations"), 0);
     assert_eq!(f.count("provider_work_receipts"), 1);
     assert_eq!(f.queue(), queue);
 
@@ -6757,24 +6432,10 @@ async fn queue_projection_actual_diagnostics_child() {
             .await,
         Err(crate::state::error::StateError::ProviderWorkFull)
     ));
-    let (_, mut manifest) = selection_manifest(&f).await;
-    manifest.decisions[0].reason = "x".repeat(16 * 1024 * 1024);
-    assert!(matches!(
-        f.db.capture_selection_shadow(owner(), manifest, MAX_SELECTION_BYTES)
-            .await,
-        Err(crate::state::error::StateError::ProviderSelectionFull)
-    ));
     let plan = f.plan().await;
     assert_eq!(
         f.db.project_provider_work(owner(), plan, 0).await.unwrap(),
         WorkAdmission::Admitted
-    );
-    let (_, manifest) = selection_manifest(&f).await;
-    assert_eq!(
-        f.db.capture_selection_shadow(owner(), manifest, 0)
-            .await
-            .unwrap(),
-        id
     );
 
     crate::support::begin(json!({"scenario": "capacity"}));
@@ -6784,22 +6445,12 @@ async fn queue_projection_actual_diagnostics_child() {
         f.db.project_provider_work(owner(), plan, 0).await,
         Err(crate::state::error::StateError::ProviderWorkFull)
     ));
-    let (_, mut manifest) = selection_manifest(&f).await;
-    let mut second = manifest.decisions[0].clone();
-    manifest.decisions[0].pass_key = "album-A".to_owned();
-    second.pass_key = "album-B".to_owned();
-    second.destinations[0].path = SelectionPath::from_path(&f.config.directory.join("B/photo.jpg"));
-    manifest.decisions.push(second);
-    assert!(matches!(
-        f.db.capture_selection_shadow(owner(), manifest, 0).await,
-        Err(crate::state::error::StateError::ProviderSelectionFull)
-    ));
 
     guard.finish().await;
 }
 
 #[tokio::test]
-async fn queue_projection_actual_diagnostics_record_selection_and_work_limits() {
+async fn queue_projection_actual_diagnostics_record_work_limits() {
     if std::env::var_os("KEI_TEST_QUEUE_DIAGNOSTICS_CHILD").is_some() {
         queue_projection_actual_diagnostics_child().await;
         return;
@@ -6809,7 +6460,7 @@ async fn queue_projection_actual_diagnostics_record_selection_and_work_limits() 
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "download::orchestration::queue_projection::tests::queue_projection_actual_diagnostics_record_selection_and_work_limits",
+            "download::orchestration::queue_projection::tests::queue_projection_actual_diagnostics_record_work_limits",
             "--nocapture",
         ])
         .env("TMPDIR", root.path())
@@ -6828,23 +6479,17 @@ async fn queue_projection_actual_diagnostics_record_selection_and_work_limits() 
     let snapshot = crate::support::history::test_retained_snapshot(&history);
     let cycles = snapshot["cycles"].as_array().unwrap();
     let first = &cycles[0]["storage_reuse"];
-    assert_eq!(first["selection"]["new"], 1);
-    assert_eq!(first["selection"]["exact"], 1);
-    assert_eq!(first["selection"]["equivalent"], 1);
+    assert_eq!(first["selection"]["observed"], false);
     assert_eq!(first["work"]["new"], 1);
     assert_eq!(first["work"]["exact"], 1);
     assert_eq!(first["work"]["equivalent"], 1);
     let single = &cycles[1]["storage_reuse"];
-    assert_eq!(single["selection"]["single_item_limit"], 1);
-    assert_eq!(single["selection"]["last_reason"], "single_item_limit");
-    assert!(single["selection"]["last_observed_used"].is_null());
+    assert_eq!(single["selection"]["observed"], false);
     assert_eq!(single["work"]["single_item_limit"], 1);
     assert_eq!(single["work"]["last_reason"], "single_item_limit");
     assert!(single["work"]["last_observed_used"].is_null());
     let capacity = &cycles[2]["storage_reuse"];
-    assert_eq!(capacity["selection"]["capacity_rejected"], 1);
-    assert_eq!(capacity["selection"]["last_reason"], "capacity");
-    assert_eq!(capacity["selection"]["last_observed_limit"], 0);
+    assert_eq!(capacity["selection"]["observed"], false);
     assert_eq!(capacity["work"]["capacity_rejected"], 1);
     assert_eq!(capacity["work"]["last_reason"], "capacity");
     assert_eq!(capacity["work"]["last_observed_limit"], 0);

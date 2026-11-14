@@ -1204,35 +1204,9 @@ completion-evidence roundtrip tests prevent reuse of invalid deletion evidence.
 
 ## Selection generation shadow
 
-`selection_shadow` tests enter the real retained-work admission owner against
-account-owned file-backed SQLite, historical source records, existing media and
-sidecars, a retained cursor, sparse debt and an unknown BLOB table. Current lookup
-confirmation differs from the historical trigger. Replay must preserve the
-original confirmation numeric lexeme and the current resource checksum. Two
-released-handle reopens retain pending queue status, source cursor and original
-media; repeat admission performs no current lookup or duplicate shadow insert.
+`queue_projection_obsolete_selection_shadow_cannot_block_current_work` enters retained-work admission with opaque shadow bytes, an exhausted historical charge and a shadow-write fault. A current work-receipt fault must still roll back admission. Removing that current fault allows admission while preserving the shadow bytes and existing media, sidecars and checkpoint evidence through two reopened cycles. The schema-32 live WAL test retains migration collision and evidence-preservation coverage.
 
-The bounded storage tests represent the same child/rendition in two pass paths,
-refuse new evidence at capacity, replay exact evidence at capacity, and roll back
-all manifest, source, decision and destination rows on a second-destination SQL
-failure. Corrupted rows, source bytes, confirmation identity and foreign owners
-cannot replay. A capture failure precedes queue admission; valid recovery and two
-quiet admission cycles retain all source and unrelated work. Relative download
-roots retain the existing admission contract; shadow destinations are anchored
-without changing the task path. Linux non-UTF-8 roots preserve actual filesystem
-admission. A separate native Unix/Windows path fixture round-trips manifest and
-normalized destination bytes through two released-handle SQLite reopens without
-creating a filesystem name; macOS filesystems can reject invalid UTF-8 names
-before admission. Corruption probes commit their mutations before
-replay, include a healthy replay control, and assert the specific validation
-error rather than a transaction-entry failure. The schema-32 live
-WAL test preserves queue work, original confirmation and unknown tables across a
-refused conflicting migration and a subsequent successful migration.
-
-These tests prove shadow representation and parity for the existing sole Unfiled
-profile. They do not qualify album selection, multi-destination publication,
-late filesystem faults, catalog selection activation or cursor ownership. Those
-are acceptance requirements for the next PR in the same phase.
+The shadow writer and its exclusive replay tests are retired. Current work tests retain owner, source, resource, metadata, retry and transaction guards. URL-rotation tests check bounded work-receipt reuse across reopen and beyond 64 confirmation classes. Relative and Linux non-UTF-8 roots enter real planning and admission; a separate Unix/Windows encoding fixture checks the shared native-path serialization without requiring filesystem support. Active destination publication and reopen coverage remains in the private-selection tests below. Diagnostics exercise real work capacity and single-item limits while the historical selection field stays unobserved.
 
 
 ## Private selection activation and destination recovery
