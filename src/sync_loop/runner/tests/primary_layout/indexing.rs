@@ -175,22 +175,9 @@ async fn indexing_managed_reopen_qualifies_then_materializes_omissions_with_quie
         assert!(metadata(root.path(), &indexing_replay_key(ZONE)).is_none());
         let target = root.path().join("media");
         assert_bytes(&target.join("IMG_0502.JPG"), ORIGINAL);
-        assert_bytes(
-            &target.join(if naming == EditedNaming::Primary {
-                "IMG_0501.JPG"
-            } else {
-                "IMG_0501_edited.JPG"
-            }),
-            EDIT_ONE,
-        );
-        assert_bytes(
-            &target.join(if naming == EditedNaming::Primary {
-                "IMG_0501_original.JPG"
-            } else {
-                "IMG_0501.JPG"
-            }),
-            ORIGINAL,
-        );
+        assert_bytes(&target.join("IMG_0501.JPG"), EDIT_ONE);
+        assert_bytes(&target.join("IMG_0501_original.JPG"), ORIGINAL);
+        assert!(!target.join("IMG_0501_edited.JPG").exists());
         let gets = server.received_requests().await.unwrap().len();
         for _ in 0..2 {
             let steady = readiness("FINISHED");
@@ -473,8 +460,9 @@ async fn indexing_managed_pending_journal_is_held_even_under_suffix_then_recover
         ),
         0
     );
-    assert_bytes(&root.path().join("media/IMG_0501.JPG"), ORIGINAL);
-    assert_bytes(&root.path().join("media/IMG_0501_edited.JPG"), EDIT_ONE);
+    assert_bytes(&root.path().join("media/IMG_0501.JPG"), EDIT_ONE);
+    assert_bytes(&root.path().join("media/IMG_0501_original.JPG"), ORIGINAL);
+    assert!(!root.path().join("media/IMG_0501_edited.JPG").exists());
 }
 
 #[tokio::test]

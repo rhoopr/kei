@@ -688,7 +688,7 @@ async fn primary_layout_heic_jpeg_extension_changes_retire_only_preserved_owned_
 }
 
 #[tokio::test]
-async fn primary_layout_migrates_suffix_and_disables_without_redownload() {
+async fn primary_layout_retains_recorded_paths_after_public_naming_retirement() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
@@ -717,16 +717,84 @@ async fn primary_layout_migrates_suffix_and_disables_without_redownload() {
             .await
             .unwrap()
             .is_empty(),
-        "unfiled path label became real membership and would suppress reversal"
+        "unfiled path label became real membership"
     );
     drop(db);
-    let (disabled, _) = cycle(root.path(), edited.clone(), true, EditedNaming::Suffix).await;
-    assert_eq!(disabled.failed_count, 0, "{:?}", disabled.stats);
-    assert!(disabled.db_sync_token_advance_safe);
-    assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
-    assert_bytes(&media.join("IMG_0501_edited.JPG"), EDIT_ONE);
-    assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
-    assert_eq!(server.received_requests().await.unwrap().len(), downloads);
+    for mode in [
+        download::DownloadRunMode::DryRun,
+        download::DownloadRunMode::PrintFilenames,
+    ] {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+        let operations = db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_operations",
+        );
+        let (preview, _) = cycle_options(
+            root.path(),
+            edited.clone(),
+            false,
+            EditedNaming::Suffix,
+            CycleOptions {
+                controls: download::DownloadControls::new(
+                    mode,
+                    download::DownloadReporting::hidden(),
+                ),
+                ..CycleOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(preview.failed_count, 0);
+        assert!(
+            capture.contains_event(|event| {
+                event.message() == Some("[PLAN] Current selected rendition destination")
+                    && event.field("version") == Some("adjusted")
+                    && event.field("path") == media.join("IMG_0501.JPG").to_str()
+            }),
+            "{:?}",
+            capture.events()
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations"
+            ),
+            operations
+        );
+        assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
+        assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+    }
+    for _ in 0..2 {
+        let (retained, _) = cycle(root.path(), edited.clone(), true, EditedNaming::Suffix).await;
+        assert_eq!(retained.failed_count, 0, "{:?}", retained.stats);
+        assert!(retained.db_sync_token_advance_safe);
+        assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
+        assert!(!media.join("IMG_0501_edited.JPG").exists());
+        assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+        assert_eq!(server.received_requests().await.unwrap().len(), downloads);
+    }
+    let changed = records(&server, Some(("edit-two", EDIT_TWO)));
+    for cycle_number in 0..3 {
+        let (retained, _) = cycle(
+            root.path(),
+            changed.clone(),
+            cycle_number > 0,
+            EditedNaming::Suffix,
+        )
+        .await;
+        assert_eq!(
+            retained.failed_count, 0,
+            "cycle {cycle_number}: {:?}",
+            retained.stats
+        );
+        assert!(retained.db_sync_token_advance_safe);
+        assert_bytes(&media.join("IMG_0501.JPG"), EDIT_TWO);
+        assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+        assert!(!media.join("IMG_0501_edited.JPG").exists());
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            downloads + 1
+        );
+    }
 }
 
 #[tokio::test]
@@ -892,7 +960,7 @@ async fn primary_layout_after_database_failure(upgrade: bool) {
             .pragma_update(None, "user_version", 37)
             .unwrap();
     }
-    let (recovered, _) = cycle(root.path(), edited, true, EditedNaming::Primary).await;
+    let (recovered, _) = cycle(root.path(), edited.clone(), true, EditedNaming::Suffix).await;
     assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
     assert!(recovered.db_sync_token_advance_safe);
     assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
@@ -909,6 +977,15 @@ async fn primary_layout_after_database_failure(upgrade: bool) {
         ),
         0
     );
+    for _ in 0..2 {
+        let (quiet, _) = cycle(root.path(), edited.clone(), true, EditedNaming::Suffix).await;
+        assert_eq!(quiet.failed_count, 0);
+        assert!(quiet.db_sync_token_advance_safe);
+        assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
+        assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+        assert!(!media.join("IMG_0501_edited.JPG").exists());
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    }
 }
 
 #[tokio::test]
@@ -2781,13 +2858,13 @@ async fn review501_suffix_album_collecting_delta_uses_managed_metadata_owner() {
         assert_eq!(result.failed_count, 0, "{:?}", result.stats);
         assert!(result.db_sync_token_advance_safe);
     }
-    let old_xmp = std::fs::read(media.join("IMG_0501_edited.JPG.xmp")).unwrap();
+    let old_xmp = std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap();
     let archive_xmp = std::fs::read(media.join("IMG_0501_original.JPG.xmp")).unwrap();
     let requests = server.received_requests().await.unwrap().len();
     let mut changed = current;
     changed[1]["recordChangeTag"] = json!("ct-asset-caption");
     changed[1]["fields"]["captionEnc"] =
-        json!({"type":"STRING","value":"caption changed after suffix reversal"});
+        json!({"type":"STRING","value":"caption changed after naming retirement"});
     let (result, _) = cycle_options(
         root.path(),
         changed.clone(),
@@ -2799,17 +2876,25 @@ async fn review501_suffix_album_collecting_delta_uses_managed_metadata_owner() {
     assert_eq!(result.failed_count, 0, "{:?}", result.stats);
     assert!(result.db_sync_token_advance_safe);
     assert_eq!(result.stats.downloaded, 0);
-    assert_bytes(&media.join("IMG_0501.JPG"), VALID_ORIGINAL);
-    assert_bytes(&media.join("IMG_0501_edited.JPG"), VALID_EDIT);
-    let xmp = std::fs::read_to_string(media.join("IMG_0501_edited.JPG.xmp")).unwrap();
+    assert_bytes(&media.join("IMG_0501_original.JPG"), VALID_ORIGINAL);
+    assert_bytes(&media.join("IMG_0501.JPG"), VALID_EDIT);
+    assert!(!media.join("IMG_0501_edited.JPG").exists());
+    let xmp = std::fs::read_to_string(media.join("IMG_0501.JPG.xmp")).unwrap();
     assert!(
-        xmp.contains("caption changed after suffix reversal"),
+        xmp.contains("caption changed after naming retirement"),
         "stats {:?}, lookups/events {:?}: {xmp}",
         result.stats,
         capture.events()
     );
     assert_ne!(xmp.as_bytes(), old_xmp);
-    assert_bytes(&media.join("IMG_0501_original.JPG.xmp"), &archive_xmp);
+    // The original remains selected in the retained primary layout, so its
+    // configured sidecar receives current metadata too. Its previous bytes
+    // must remain independently preserved, unlike an unselected archive.
+    let current_original_xmp = std::fs::read(media.join("IMG_0501_original.JPG.xmp")).unwrap();
+    assert!(
+        String::from_utf8_lossy(&current_original_xmp)
+            .contains("caption changed after naming retirement")
+    );
     let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
         .await
         .unwrap();
@@ -2833,10 +2918,22 @@ async fn review501_suffix_album_collecting_delta_uses_managed_metadata_owner() {
         retained,
         "prior adjusted sidecar was not independently preserved"
     );
+    assert!(
+        manifest
+            .iter()
+            .flat_map(|row| &row.preserved_files)
+            .any(|file| {
+                let mut path = file.native_path.to_path().as_os_str().to_os_string();
+                path.push(".xmp");
+                std::fs::read(std::path::PathBuf::from(path))
+                    .is_ok_and(|bytes| bytes == archive_xmp)
+            }),
+        "prior selected original sidecar was not independently preserved"
+    );
     drop(db);
     let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
     let title: String = conn.query_row("SELECT title FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted'", [], |row| row.get(0)).unwrap();
-    assert_eq!(title, "caption changed after suffix reversal");
+    assert_eq!(title, "caption changed after naming retirement");
     drop(conn);
     for _ in 0..2 {
         let (quiet, lookups) = cycle_options(
@@ -2851,8 +2948,11 @@ async fn review501_suffix_album_collecting_delta_uses_managed_metadata_owner() {
         assert!(quiet.db_sync_token_advance_safe);
         assert_eq!(quiet.stats.downloaded, 0);
         assert_eq!(lookups, 0);
-        assert_bytes(&media.join("IMG_0501_edited.JPG.xmp"), xmp.as_bytes());
-        assert_bytes(&media.join("IMG_0501_original.JPG.xmp"), &archive_xmp);
+        assert_bytes(&media.join("IMG_0501.JPG.xmp"), xmp.as_bytes());
+        assert_bytes(
+            &media.join("IMG_0501_original.JPG.xmp"),
+            &current_original_xmp,
+        );
     }
     assert_eq!(server.received_requests().await.unwrap().len(), requests);
 }
@@ -3026,8 +3126,8 @@ async fn review501_suffix_album_collecting_edit_recovers_without_redownload() {
     .await;
     assert!(held.failed_count > 0);
     assert!(!held.db_sync_token_advance_safe);
-    assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
-    assert_bytes(&media.join("IMG_0501_edited.JPG"), EDIT_TWO);
+    assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+    assert_bytes(&media.join("IMG_0501.JPG"), EDIT_TWO);
     assert_eq!(
         db_count(
             root.path(),
@@ -3061,8 +3161,8 @@ async fn review501_suffix_album_collecting_edit_recovers_without_redownload() {
         }
         assert_eq!(result.failed_count, 0, "{:?}", result.stats);
         assert!(result.db_sync_token_advance_safe);
-        assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
-        assert_bytes(&media.join("IMG_0501_edited.JPG"), EDIT_TWO);
+        assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+        assert_bytes(&media.join("IMG_0501.JPG"), EDIT_TWO);
         assert_eq!(
             server.received_requests().await.unwrap().len(),
             requests.len()
@@ -3091,10 +3191,7 @@ async fn review501_suffix_album_collecting_edit_recovers_without_redownload() {
         local,
         data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_TWO))
     );
-    assert_eq!(
-        std::path::PathBuf::from(path),
-        media.join("IMG_0501_edited.JPG")
-    );
+    assert_eq!(std::path::PathBuf::from(path), media.join("IMG_0501.JPG"));
     assert_eq!(
         db_count(
             root.path(),

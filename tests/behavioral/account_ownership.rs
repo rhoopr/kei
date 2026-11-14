@@ -130,7 +130,7 @@ fn rows(path: &Path, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
 }
 
 #[tokio::test]
-async fn retired_filename_selection_refuses_before_provider_or_state_writes() {
+async fn retired_selection_settings_refuse_before_provider_or_state_writes() {
     let server = MockServer::start().await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -138,14 +138,20 @@ async fn retired_filename_selection_refuses_before_provider_or_state_writes() {
     let original_config = std::fs::read_to_string(&account.config).unwrap();
     let state_bytes = std::fs::read(&account.path).unwrap();
     let media_bytes = std::fs::read(&account.media).unwrap();
-    for patterns in ["[]", "[\"*.AAE\"]", "[\"[invalid\"]"] {
-        let config = format!("{original_config}[filters]\nfilename_exclude={patterns}\n");
+    for (section, key, value) in [
+        ("filters", "filename_exclude", "[]"),
+        ("filters", "filename_exclude", "[\"*.AAE\"]"),
+        ("filters", "filename_exclude", "[\"[invalid\"]"),
+        ("photos", "edited_naming", "'primary'"),
+        ("photos", "edited_naming", "'suffix'"),
+    ] {
+        let config = format!("{original_config}[{section}]\n{key}={value}\n");
         std::fs::write(&account.config, &config).unwrap();
         let output = command(root, &account, &["sync", "--no-progress-bar"]);
         assert!(!output.status.success());
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(
-            error.contains("Remove filename_exclude from [filters]"),
+            error.contains(&format!("Remove {key} from [{section}]")),
             "{error}"
         );
         assert_eq!(std::fs::read(&account.config).unwrap(), config.as_bytes());

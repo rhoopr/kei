@@ -361,6 +361,9 @@ async fn narrowed_command_process_deadline_emits_incomplete_without_writes_or_du
                     "inventory_diagnostic::tests::narrowed_command_worker",
                     "--exact",
                     "--nocapture",
+                    // Keep libtest's single-threaded test-name prefix off the
+                    // diagnostic JSON line, including under RUST_TEST_THREADS=1.
+                    "--quiet",
                 ])
                 .env("KEI_SYNTHETIC_INVENTORY_CONFIG", &config)
                 .env(

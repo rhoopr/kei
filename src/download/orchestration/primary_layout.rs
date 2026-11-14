@@ -1,4 +1,4 @@
-//! Owns opt-in current-primary layout transitions across selected renditions.
+//! Owns recorded current-primary layout transitions across selected renditions.
 
 use crate::download::{DownloadConfig, DownloadStore, file, filter, planner};
 use crate::icloud::photos::PhotoAsset;
@@ -89,6 +89,33 @@ fn policy(config: &DownloadConfig) -> &'static str {
     } else {
         "suffix"
     }
+}
+
+// Established layout and unfinished publication are durable facts, not a
+// request to move files when the default naming policy changes. A pending
+// operation takes precedence because it may already have published members.
+fn recorded_layout_config(
+    config: &DownloadConfig,
+    binding: Option<&LayoutBinding>,
+    operation: Option<&LayoutOperation>,
+) -> Result<Option<Box<DownloadConfig>>> {
+    let recorded = operation
+        .map(|operation| operation.policy.as_str())
+        .or_else(|| binding.map(|binding| binding.policy.as_str()));
+    let naming = match recorded {
+        None => return Ok(None),
+        Some("primary") => EditedNaming::Primary,
+        Some("suffix") => EditedNaming::Suffix,
+        Some(_) => {
+            anyhow::bail!("Unrecognized recorded layout policy; preserving its files and journal")
+        }
+    };
+    if naming == config.edited_naming {
+        return Ok(None);
+    }
+    let mut recorded_config = config.clone();
+    recorded_config.edited_naming = naming;
+    Ok(Some(Box::new(recorded_config)))
 }
 
 fn family(asset: &PhotoAsset, config: &DownloadConfig) -> Result<String> {
@@ -292,6 +319,15 @@ async fn process_asset_inner(
         .context("Primary naming requires an owned state database")?;
     let family = family(&observed, config)?;
     let binding = db.primary_layout_binding(family.clone()).await?;
+    let pending = db
+        .primary_layout_operations(config.library.to_string())
+        .await?;
+    let recorded_config = recorded_layout_config(
+        config,
+        binding.as_ref(),
+        pending.iter().find(|op| op.family == family),
+    )?;
+    let config = recorded_config.as_deref().unwrap_or(config);
     if config.edited_naming == EditedNaming::Suffix
         && binding.is_none()
         && !db
@@ -312,9 +348,6 @@ async fn process_asset_inner(
     if cancel.is_cancelled() {
         anyhow::bail!("Primary layout interrupted")
     }
-    let pending = db
-        .primary_layout_operations(config.library.to_string())
-        .await?;
     let has_pending = pending.iter().any(|op| op.family == family);
     if !has_pending
         && !config.refresh_metadata
@@ -1307,6 +1340,18 @@ pub(in crate::download) async fn preview_asset(
     } else {
         None
     };
+    let pending = if let Some(db) = config.state_db.as_deref() {
+        db.primary_layout_operations(config.library.to_string())
+            .await?
+    } else {
+        Vec::new()
+    };
+    let recorded_config = recorded_layout_config(
+        config,
+        binding.as_ref(),
+        pending.iter().find(|op| op.family == key),
+    )?;
+    let config = recorded_config.as_deref().unwrap_or(config);
     if config.edited_naming == EditedNaming::Suffix && binding.is_none() {
         let managed = if let Some(db) = config.state_db.as_deref() {
             db.primary_layout_owns_asset(
@@ -1337,13 +1382,7 @@ pub(in crate::download) async fn preview_asset(
         "Primary layout preview waits for usable adjusted resources"
     );
     let desired = decision(&current, config)?;
-    if let Some(db) = config.state_db.as_deref()
-        && db
-            .primary_layout_operations(config.library.to_string())
-            .await?
-            .iter()
-            .any(|op| op.family == key)
-    {
+    if pending.iter().any(|op| op.family == key) {
         tracing::info!(family=%key,"[PLAN] Recorded primary layout recovery must finish before applying this plan");
     }
     let unchanged = binding
@@ -1409,6 +1448,13 @@ pub(in crate::download) async fn plan_asset(
         .context("Primary naming requires an owned state database")?;
     let key = family(asset, config)?;
     let binding = db.primary_layout_binding(key.clone()).await?;
+    let op = db
+        .primary_layout_operations(config.library.to_string())
+        .await?
+        .into_iter()
+        .find(|op| op.family == key);
+    let recorded_config = recorded_layout_config(config, binding.as_ref(), op.as_ref())?;
+    let config = recorded_config.as_deref().unwrap_or(config);
     if binding.is_none()
         && config.edited_naming == EditedNaming::Primary
         && filter::derive_expected_paths(asset, config).is_empty()
@@ -1451,11 +1497,6 @@ pub(in crate::download) async fn plan_asset(
         "Primary layout waits for usable adjusted resources"
     );
     let desired = decision(&current, config)?;
-    let op = db
-        .primary_layout_operations(config.library.to_string())
-        .await?
-        .into_iter()
-        .find(|o| o.family == key);
     let op = if let Some(mut op) = op {
         if op.decision == desired {
             Some(op)

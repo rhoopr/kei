@@ -158,7 +158,6 @@ pub(crate) struct TomlPhotos {
     pub live_photo_mode: Option<LivePhotoMode>,
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
     pub edited: Option<bool>,
-    pub edited_naming: Option<crate::types::EditedNaming>,
     pub alternative: Option<bool>,
     pub raw_policy: Option<RawPolicy>,
     pub file_match_policy: Option<FileMatchPolicy>,
@@ -215,7 +214,9 @@ pub(crate) fn load_toml_config_with_source(
                 );
                 if parse_error.contains("unknown field") {
                     message.push_str("\n\n");
-                    if parse_error.contains("`filename_exclude`") {
+                    if parse_error.contains("`edited_naming`") {
+                        message.push_str("The edited_naming option is retired. Remove edited_naming from [photos]. New edited files use an edited suffix; recorded managed layouts and interrupted publications retain their existing layout. Configuration was not changed.");
+                    } else if parse_error.contains("`filename_exclude`") {
                         message.push_str("Filename-based selection is no longer supported. Remove filename_exclude from [filters] after reviewing the expanded selection. Use album/library selection or fixed capture-date bounds where appropriate. Configuration was not changed.");
                     } else if parse_error.contains("`recent`") || parse_error.contains("`recent_scope`") {
                         message.push_str("Sync count selection is no longer supported. Remove recent and recent_scope from [filters]. To bound sync, set a fixed YYYY-MM-DD in [filters].skip_created_before or skip_created_after. Configuration was not changed.");
@@ -302,7 +303,6 @@ mod tests {
             "photos.live_photo_mode",
             "photos.live_photo_mov_filename_policy",
             "photos.edited",
-            "photos.edited_naming",
             "photos.alternative",
             "photos.raw_policy",
             "photos.file_match_policy",

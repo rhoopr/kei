@@ -36,7 +36,7 @@ tests/
 
 ## Test catalog
 
-`retired_filename_selection_refuses_before_provider_or_state_writes` runs the real CLI with empty, nonempty and malformed retired filename restrictions. It checks actionable refusal, unchanged config/database/media bytes and zero provider requests. Filtered-work recovery fixtures use fixed-date bounds; bounded inventory retains its cursor until the expanded selection completes.
+`retired_selection_settings_refuse_before_provider_or_state_writes` runs the real CLI with empty, nonempty and malformed retired filename restrictions and both retired edited-naming values. It checks actionable refusal, unchanged config/database/media bytes and zero provider requests. Filtered-work recovery fixtures use fixed-date bounds; bounded inventory retains its cursor until the expanded selection completes. Managed-layout tests retain established paths under the new suffix default, including read-only previews, edits, metadata updates, interrupted publication, indexing recovery and quiet reopens.
 
 | Target | Network | Runs via |
 |--------|:-------:|----------|

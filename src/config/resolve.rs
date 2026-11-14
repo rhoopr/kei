@@ -291,13 +291,7 @@ pub(crate) fn resolve_path_derivation_fields(
         LivePhotoMovFilenamePolicy::Suffix,
     );
     let edited = resolve_flag(cli.edited, toml_photos.and_then(|p| p.edited));
-    let edited_naming = toml_photos
-        .and_then(|p| p.edited_naming)
-        .unwrap_or_default();
-    anyhow::ensure!(
-        edited_naming != crate::types::EditedNaming::Primary || edited,
-        "[photos].edited_naming = \"primary\" requires [photos].edited = true."
-    );
+    let edited_naming = crate::types::EditedNaming::Suffix;
     let alternative = resolve_flag(cli.alternative, toml_photos.and_then(|p| p.alternative));
     anyhow::ensure!(
         resolution != PhotoResolution::None || edited || alternative,
@@ -930,53 +924,29 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn edited_naming_is_opt_in_and_requires_edited_selection() {
-        for (text, expected) in [
-            ("", crate::types::EditedNaming::Suffix),
-            (
-                "[photos]\nedited=true\nedited_naming='primary'",
-                crate::types::EditedNaming::Primary,
-            ),
-            (
-                "[photos]\nedited=true\nedited_naming='suffix'",
-                crate::types::EditedNaming::Suffix,
-            ),
-        ] {
-            let parsed: TomlConfig = toml::from_str(text).unwrap();
-            let config = Config::build(
-                &default_globals(),
-                &default_password(),
-                default_sync(),
-                Some(&parsed),
-            )
-            .unwrap();
-            assert_eq!(config.photos.edited_naming, expected);
-            let serialized = config
-                .to_toml()
-                .photos
-                .and_then(|photos| photos.edited_naming);
-            assert_eq!(
-                serialized,
-                (expected == crate::types::EditedNaming::Primary).then_some(expected)
-            );
-        }
-        let parsed: TomlConfig = toml::from_str("[photos]\nedited_naming='primary'").unwrap();
-        let error = Config::build(
+    fn new_config_uses_suffix_and_rejects_retired_naming() {
+        let config = Config::build(
             &default_globals(),
             &default_password(),
             default_sync(),
-            Some(&parsed),
+            None,
         )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("requires [photos].edited = true")
+        .unwrap();
+        assert_eq!(
+            config.photos.edited_naming,
+            crate::types::EditedNaming::Suffix
         );
         assert!(
-            toml::from_str::<TomlConfig>("[photos]\nedited=true\nedited_naming='anything'")
-                .is_err()
+            !toml::to_string(&config.to_toml())
+                .unwrap()
+                .contains("edited_naming")
         );
+        for naming in ["primary", "suffix", "anything"] {
+            assert!(
+                toml::from_str::<TomlConfig>(&format!("[photos]\nedited_naming='{naming}'"))
+                    .is_err()
+            );
+        }
     }
 
     #[test]
