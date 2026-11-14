@@ -1887,7 +1887,6 @@ mod wiremock_tests {
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_resolution: false,
             keep_unicode_in_filenames: false,
-            filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
             temp_suffix: Arc::from(".kei-tmp"),
             state_db: None,
             retry_only: false,
@@ -3844,7 +3843,7 @@ mod wiremock_tests {
     // `is_asset_filtered_blocks_excluded_asset_id` already pin the gate
     // for two filter sources. The branch's commit "honor is_asset_filtered"
     // (05356d2) ties the import path to ALL filter sources, not just two.
-    // These pin media / date / filename-exclude so a future change
+    // These pin media and date eligibility so a future change
     // that loses one of them surfaces here.
     //
     // Each test stages the file the matcher would land on without the
@@ -3908,7 +3907,7 @@ mod wiremock_tests {
     }
 
     #[tokio::test]
-    async fn filename_exclude_glob_drops_matching_assets() {
+    async fn fixed_date_filter_drops_matching_assets_before_hash() {
         let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("BLOCK1", "IMG_BLOCK.JPG", "public.jpeg").orig(
             1000,
@@ -3919,8 +3918,8 @@ mod wiremock_tests {
         let dl = tmp.path().join("photos");
         std::fs::create_dir_all(&dl).unwrap();
         let mut config = base_config(&dl);
-        let pattern = glob::Pattern::new("IMG_BLOCK.*").expect("compile glob");
-        config.filename_exclude = Arc::from(vec![pattern]);
+        config.skip_created_before =
+            Some(crate::config::parse_created_date_filter("2099-01-01").unwrap());
         stage_expected(&asset.to_photo_asset(), &base_config(&dl));
 
         let db = open_db(&tmp).await;
@@ -3928,7 +3927,7 @@ mod wiremock_tests {
         assert_eq!(stats.total, 1);
         assert_eq!(
             stats.matched, 0,
-            "filename_exclude must drop the asset before hash"
+            "fixed date filter must drop the asset before hash"
         );
         assert_eq!(stats.unmatched, 0);
         assert_eq!(stats.filtered, 1);

@@ -63,8 +63,6 @@ struct SetupAnswers {
     /// picks specific albums and doesn't also want every other photo).
     /// `None` keeps the v0.13 default (`true`).
     unfiled: Option<bool>,
-    /// v0.13 `[filters].filename_exclude` patterns; empty = don't emit.
-    filename_exclude: Vec<String>,
 
     // Media types
     skip_videos: bool,
@@ -127,7 +125,6 @@ impl Default for SetupAnswers {
             smart_folders: Vec::new(),
             folder_structure_smart_folders: None,
             unfiled: None,
-            filename_exclude: Vec::new(),
             skip_videos: false,
             live_photo_mode: None,
             live_photo_mov_filename_policy: None,
@@ -1211,29 +1208,6 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         }
     }
 
-    // Exclusions: filename glob patterns applied across every pass.
-    println!();
-    let exclude = Confirm::new()
-        .with_prompt("Exclude files matching glob patterns (e.g. IMG_screenshot*.png)?")
-        .default(false)
-        .interact()?;
-    if exclude {
-        println!("  Enter one pattern per line. Press Enter on a blank line to finish.");
-        loop {
-            let pat: String = Input::new()
-                .with_prompt("Pattern (blank to finish)")
-                .default(String::new())
-                .show_default(false)
-                .allow_empty(true)
-                .interact_text()?;
-            let trimmed = pat.trim();
-            if trimmed.is_empty() {
-                break;
-            }
-            answers.filename_exclude.push(trimmed.to_string());
-        }
-    }
-
     // Filenames
     println!();
     answers.keep_unicode_in_filenames = Confirm::new()
@@ -1481,16 +1455,6 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             Some(true) => writeln!(out, "unfiled = true")?,
             None => writeln!(out, "# unfiled = true")?,
         };
-        if answers.filename_exclude.is_empty() {
-            writeln!(out, "# filename_exclude = []")?;
-        } else {
-            let pat_strs: Vec<String> = answers
-                .filename_exclude
-                .iter()
-                .map(|p| format!("\"{}\"", escape_toml_string(p)))
-                .collect();
-            writeln!(out, "filename_exclude = [{}]", pat_strs.join(", "))?;
-        }
         if answers.skip_videos {
             writeln!(out, "media = [\"photos\", \"live-photos\"]")?;
         } else {
@@ -2091,7 +2055,6 @@ mod tests {
             smart_folders: vec!["all".to_string()],
             folder_structure_smart_folders: None,
             unfiled: Some(false),
-            filename_exclude: vec!["IMG_screenshot*.png".to_string()],
             skip_videos: true,
             live_photo_mode: Some(LivePhotoMode::Both),
             live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
@@ -2129,7 +2092,7 @@ mod tests {
         assert!(toml_str.contains("libraries = [\"all\"]"));
         assert!(toml_str.contains("smart_folders = [\"all\"]"));
         assert!(toml_str.contains("unfiled = false"));
-        assert!(toml_str.contains("filename_exclude = [\"IMG_screenshot*.png\"]"));
+        assert!(!toml_str.contains("filename_exclude"));
         assert!(toml_str.contains("media = [\"photos\", \"live-photos\"]"));
         assert!(toml_str.contains("resolution = \"medium\""));
         // live_photo_mode = "both" is the default; emitting it explicitly is
@@ -2176,7 +2139,6 @@ mod tests {
             smart_folders: vec!["Favorites".to_string()],
             folder_structure_smart_folders: None,
             unfiled: Some(false),
-            filename_exclude: vec!["*.tmp".to_string()],
             skip_videos: true,
             live_photo_mode: Some(LivePhotoMode::Skip),
             live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
@@ -2236,10 +2198,6 @@ mod tests {
             Some(&["Favorites".to_string()][..])
         );
         assert_eq!(filters.unfiled, Some(false));
-        assert_eq!(
-            filters.filename_exclude.as_deref(),
-            Some(&["*.tmp".to_string()][..])
-        );
         assert_eq!(
             filters.media.as_deref(),
             Some(
@@ -2322,7 +2280,6 @@ mod tests {
                 smart_folders: vec!["all".to_string()],
                 folder_structure_smart_folders: None,
                 unfiled: Some(false),
-                filename_exclude: vec!["*.tmp".to_string()],
                 skip_videos: true,
                 live_photo_mode: Some(LivePhotoMode::Skip),
                 live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),

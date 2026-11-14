@@ -425,7 +425,6 @@ async fn shutdown_cancellation_exits_download_pass_promptly() {
         file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
         force_resolution: false,
         keep_unicode_in_filenames: false,
-        filename_exclude: std::sync::Arc::from(Vec::<glob::Pattern>::new()),
         temp_suffix: std::sync::Arc::from(".kei-tmp"),
         state_db: None,
         sparse_targets: Arc::from([]),

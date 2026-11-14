@@ -147,12 +147,6 @@ unfiled = true
 # Description: Selects media categories before download planning.
 media = ["photos", "videos", "live-photos"]
 
-# Option: filters.filename_exclude
-# Default value: []
-# Valid values: array of glob patterns, for example ["*.AAE", "Screenshot*"]
-# Description: Skips candidate files whose derived filename matches any pattern.
-filename_exclude = []
-
 # Option: filters.skip_created_before
 # Default value: unset
 # Valid values: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS

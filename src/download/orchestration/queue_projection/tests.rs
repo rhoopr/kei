@@ -1381,7 +1381,8 @@ async fn queue_projection_cancelled_attempt_leaves_source_and_no_admission() {
 async fn queue_projection_current_filters_retain_source_then_replan_changed_configuration() {
     let mut f = Fixture::new().await;
     f.capture(records("m", OLD, "source"), "old").await;
-    f.config.filename_exclude = Arc::from([glob::Pattern::new("changed.jpg").unwrap()]);
+    f.config.skip_created_before =
+        Some(crate::config::parse_created_date_filter("2099-01-01").unwrap());
     f.cycle().await.unwrap();
     assert_eq!(f.count("assets"), 0);
     assert_eq!(
@@ -1392,7 +1393,7 @@ async fn queue_projection_current_filters_retain_source_then_replan_changed_conf
             .unwrap(),
         "currently_filtered"
     );
-    f.config.filename_exclude = Arc::from([]);
+    f.config.skip_created_before = None;
     f.cycle().await.unwrap();
     assert_eq!(f.count("assets"), 1);
     assert_eq!(f.count("provider_shadow_pages"), 1);
@@ -2235,7 +2236,8 @@ async fn queue_projection_wake_requires_current_scope_config_and_unfinished_gene
             .await
             .is_err()
     );
-    f.config.filename_exclude = Arc::from([glob::Pattern::new("changed.jpg").unwrap()]);
+    f.config.skip_created_before =
+        Some(crate::config::parse_created_date_filter("2099-01-01").unwrap());
     assert!(
         has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
             .await

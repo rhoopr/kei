@@ -125,17 +125,6 @@ impl Config {
                 } else {
                     Some(self.filters.media.to_kinds())
                 },
-                filename_exclude: if self.download.filename_exclude.is_empty() {
-                    None
-                } else {
-                    Some(
-                        self.download
-                            .filename_exclude
-                            .iter()
-                            .map(|p| p.as_str().to_string())
-                            .collect(),
-                    )
-                },
                 skip_created_before: self.filters.persistent_skip_created_before.clone(),
                 skip_created_after: self.filters.persistent_skip_created_after.clone(),
             }),
@@ -685,24 +674,18 @@ mod tests {
         );
     }
     #[test]
-    fn test_to_toml_roundtrip_filename_exclude() {
-        let mut sync = default_sync();
-        sync.config_overrides.filename_exclude =
-            vec!["*.AAE".to_string(), "Screenshot*".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+    fn test_to_toml_omits_retired_filename_exclude() {
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         let toml = cfg.to_toml();
-        let filters = toml.filters.as_ref().unwrap();
-        assert_eq!(
-            filters.filename_exclude.as_deref(),
-            Some(&["*.AAE".to_string(), "Screenshot*".to_string()][..])
-        );
-        // Round-trip: serialize then deserialize
         let serialized = ::toml::to_string_pretty(&toml).unwrap();
-        let parsed: TomlConfig = ::toml::from_str(&serialized).unwrap();
-        assert_eq!(
-            parsed.filters.as_ref().unwrap().filename_exclude.as_deref(),
-            Some(&["*.AAE".to_string(), "Screenshot*".to_string()][..])
-        );
+        assert!(!serialized.contains("filename_exclude"));
+        let _: TomlConfig = ::toml::from_str(&serialized).unwrap();
     }
     #[test]
     fn test_to_toml_roundtrip_live_photo_mode() {

@@ -15,7 +15,7 @@ use super::collisions::{
     CollisionStrategy, NormalizedPath, PathPlanningMode, ResolveContext,
     identity_collision_filename, resolve_download_path, size_or_identity_collision_filename,
 };
-use super::eligibility::{GLOB_CASE_INSENSITIVE, determine_media_type};
+use super::eligibility::determine_media_type;
 use super::expected_paths::{DerivedPath, raw_filename};
 use super::metadata::{MetadataPayload, build_payload};
 use super::{
@@ -133,10 +133,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
         return Ok(Vec::new());
     }
 
-    // Sync-only fingerprint-fallback exclusion: when `asset.filename()` is
-    // None, log the synthesized name and apply `filename_exclude` patterns
-    // to it (`is_asset_filtered` only sees real filenames). Import never
-    // populates `filename_exclude`.
+    // Missing provider filenames use the same stable fallback in sync and import.
     if asset.filename().is_none() {
         let fp = raw_filename(asset);
         tracing::info!(target: "kei::download::filter",
@@ -144,18 +141,6 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
             filename = %fp,
             "Using fingerprint fallback filename"
         );
-        if config
-            .filename_exclude
-            .iter()
-            .any(|p| p.matches_with(&fp, GLOB_CASE_INSENSITIVE))
-        {
-            tracing::debug!(target: "kei::download::filter",
-                asset_id = %asset.id(),
-                filename = %fp,
-                "Skipping (filename_exclude match on fallback)"
-            );
-            return Ok(Vec::new());
-        }
     }
 
     if config.edited_naming == crate::types::EditedNaming::Primary {

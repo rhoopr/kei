@@ -129,6 +129,32 @@ fn rows(path: &Path, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
         .collect()
 }
 
+#[tokio::test]
+async fn retired_filename_selection_refuses_before_provider_or_state_writes() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = seed(root, ACCOUNTS[0], "A", &server.uri());
+    let original_config = std::fs::read_to_string(&account.config).unwrap();
+    let state_bytes = std::fs::read(&account.path).unwrap();
+    let media_bytes = std::fs::read(&account.media).unwrap();
+    for patterns in ["[]", "[\"*.AAE\"]", "[\"[invalid\"]"] {
+        let config = format!("{original_config}[filters]\nfilename_exclude={patterns}\n");
+        std::fs::write(&account.config, &config).unwrap();
+        let output = command(root, &account, &["sync", "--no-progress-bar"]);
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("Remove filename_exclude from [filters]"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&account.config).unwrap(), config.as_bytes());
+        assert_eq!(std::fs::read(&account.path).unwrap(), state_bytes);
+        assert_eq!(std::fs::read(&account.media).unwrap(), media_bytes);
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
 fn state(path: &Path) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
     ["SELECT * FROM account_owner",
      "SELECT key,value FROM metadata WHERE key LIKE 'sync_token:%' OR key LIKE 'pending_sync_token:%' ORDER BY key",
@@ -1208,10 +1234,10 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let account = seed(root, ACCOUNTS[0], "A", &server.uri());
-    // Current filename selection is intentionally filtered; its source work
+    // Current fixed-date selection is intentionally filtered; its source work
     // must still be durably classified without being discarded or downloaded.
     let config = format!(
-        "{}[filters]\nfilename_exclude=[\"quiet-*\"]\n",
+        "{}[filters]\nskip_created_before=\"2099-01-01\"\n",
         std::fs::read_to_string(&account.config).unwrap()
     );
     std::fs::write(&account.config, &config).unwrap();

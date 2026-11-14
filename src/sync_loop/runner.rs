@@ -442,11 +442,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // Promote the String / Vec / PathBuf config fields to their Arc
     // counterparts once, outside the per-library closure. Otherwise the
     // Arc-sharing win is half-defeated: each build_download_config
-    // call would re-allocate directory / filename_exclude / temp_suffix
+    // call would re-allocate directory / temp_suffix
     // from scratch instead of refcount-bumping.
     let cfg_directory: Arc<std::path::Path> = Arc::from(config.download.directory.as_path());
-    let cfg_filename_exclude: Arc<[glob::Pattern]> =
-        Arc::from(config.download.filename_exclude.clone());
     let cfg_temp_suffix: Arc<str> = Arc::from(config.download.temp_suffix.as_str());
     let cfg_folder_structure_albums: Arc<str> =
         Arc::from(config.download.folder_structure_albums.as_str());
@@ -494,7 +492,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             file_match_policy: config.photos.file_match_policy,
             force_resolution: config.photos.force_resolution,
             keep_unicode_in_filenames: config.photos.keep_unicode_in_filenames,
-            filename_exclude: Arc::clone(&cfg_filename_exclude),
             temp_suffix: Arc::clone(&cfg_temp_suffix),
             state_db: state_db.clone(),
             sparse_targets: Arc::from([]),

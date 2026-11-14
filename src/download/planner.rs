@@ -1437,12 +1437,13 @@ mod tests {
             .find(|path| path.version_size.is_live_photo_motion())
             .unwrap();
         std::fs::remove_file(&motion.path).unwrap();
-        config.filename_exclude = vec![glob::Pattern::new("*").unwrap()].into();
+        config.skip_created_before =
+            Some(crate::config::parse_created_date_filter("2099-01-01").unwrap());
         let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
         let filtered = planner.plan_download_asset(&asset, &config).await.unwrap();
         assert!(matches!(
             filtered.filter_reason,
-            Some(FilterReason::Filename)
+            Some(FilterReason::DateRange)
         ));
         assert_eq!(
             planner
@@ -1451,7 +1452,7 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
-        config.filename_exclude = Arc::from([]);
+        config.skip_created_before = None;
         let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
         assert_eq!(
             planner
@@ -1523,17 +1524,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planner_applies_filename_date_media_and_unfiled_exclusions() {
+    async fn planner_applies_date_media_and_unfiled_exclusions() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(tmp.path());
-        config.filename_exclude = Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
-        let asset = TestPhotoAsset::new("FILTERED_NAME")
-            .filename("IMG_0001.AAE")
-            .build();
-        let mut planner = TaskPlanner::new();
-        let plan = planner.plan_asset(&asset, &config).await;
-        assert_eq!(plan.filter_reason, Some(FilterReason::Filename));
-
         let mut config = test_config(tmp.path());
         config.media.photos = false;
         let asset = TestPhotoAsset::new("FILTERED_MEDIA").build();

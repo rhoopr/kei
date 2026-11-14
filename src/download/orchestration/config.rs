@@ -103,7 +103,6 @@ struct SharedHashFields<'a> {
     force_resolution: bool,
     media: crate::config::MediaSelection,
     live_photo_mode: LivePhotoMode,
-    filename_exclude: &'a [glob::Pattern],
 }
 
 /// Hash the shared config fields into the hasher. All enum values use
@@ -139,16 +138,6 @@ fn hash_shared_fields(hasher: &mut sha2::Sha256, version: u8, f: &SharedHashFiel
     hasher.update([u8::from(f.media.videos)]);
     hasher.update([u8::from(f.media.live_photos)]);
     hasher.update([f.live_photo_mode as u8]);
-    // filename_exclude patterns affect which assets are eligible
-    let mut sorted_excludes: Vec<&str> = f
-        .filename_exclude
-        .iter()
-        .map(glob::Pattern::as_str)
-        .collect();
-    sorted_excludes.sort_unstable();
-    for pattern in &sorted_excludes {
-        hash_bytes(hasher, pattern.as_bytes());
-    }
 }
 
 fn hash_optional_created_date_filter(
@@ -249,13 +238,6 @@ pub(crate) fn sync_coverage_fingerprint_json(
         .filters
         .skip_created_after
         .map(crate::config::CreatedDateFilter::fingerprint);
-    let mut filename_exclude: Vec<&str> = config
-        .download
-        .filename_exclude
-        .iter()
-        .map(glob::Pattern::as_str)
-        .collect();
-    filename_exclude.sort_unstable();
     let coverage = if skip_created_before.is_some() || skip_created_after.is_some() {
         serde_json::json!({
             "kind": "bounded-date-window",
@@ -285,7 +267,7 @@ pub(crate) fn sync_coverage_fingerprint_json(
                 "videos": config.filters.media.videos,
                 "live_photos": config.filters.media.live_photos,
             },
-            "filename_exclude": filename_exclude,
+            "filename_exclude": [],
             "skip_created_before": skip_created_before,
             "skip_created_after": skip_created_after,
             "recent": null,
@@ -346,12 +328,6 @@ pub(crate) fn inventory_scope(
         .map(String::as_str)
         .collect();
     excludes.sort_unstable();
-    let mut filenames: Vec<&str> = config
-        .filename_exclude
-        .iter()
-        .map(glob::Pattern::as_str)
-        .collect();
-    filenames.sort_unstable();
     InventoryScope(
         serde_json::json!({
             "passes": resolved,
@@ -364,7 +340,7 @@ pub(crate) fn inventory_scope(
                 "alternative": config.alternative,
                 "raw_policy": config.raw_policy as u8,
                 "force_resolution": config.force_resolution,
-                "filename_exclude": filenames,
+                "filename_exclude": [],
                 "exclude_asset_ids": excludes,
                 "skip_created_before": config.skip_created_before.map(crate::config::CreatedDateFilter::fingerprint),
                 "skip_created_after": config.skip_created_after.map(crate::config::CreatedDateFilter::fingerprint),
@@ -428,7 +404,6 @@ fn hash_download_config_with_date_bounds(
             force_resolution: config.force_resolution,
             media: config.media,
             live_photo_mode: config.live_photo_mode,
-            filename_exclude: &config.filename_exclude,
         },
     );
     // Preserve the historical uncapped encoding for retained path receipts.
@@ -468,16 +443,6 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     hasher.update([u8::from(config.filters.media.videos)]);
     hasher.update([u8::from(config.filters.media.live_photos)]);
     hasher.update([config.photos.live_photo_mode as u8]);
-    let mut sorted_excludes: Vec<&str> = config
-        .download
-        .filename_exclude
-        .iter()
-        .map(glob::Pattern::as_str)
-        .collect();
-    sorted_excludes.sort_unstable();
-    for pattern in &sorted_excludes {
-        hash_bytes(&mut hasher, pattern.as_bytes());
-    }
     // Preserve the historical uncapped cursor-compatibility encoding.
     hash_optional_u32(&mut hasher, None);
 
@@ -543,11 +508,6 @@ pub(crate) struct DownloadConfig {
     pub(crate) file_match_policy: FileMatchPolicy,
     pub(crate) force_resolution: bool,
     pub(crate) keep_unicode_in_filenames: bool,
-    /// Compiled glob patterns for filename exclusion.
-    ///
-    /// Behind `Arc<[_]>` so per-pass clones share one allocation
-    /// (significant with `-a all` over 100+ albums).
-    pub(crate) filename_exclude: Arc<[glob::Pattern]>,
     /// Temp file suffix for partial downloads (e.g. `.kei-tmp`).
     pub(crate) temp_suffix: Arc<str>,
     /// State database for tracking download progress.
@@ -710,7 +670,6 @@ impl std::fmt::Debug for DownloadConfig {
             .field("file_match_policy", &self.file_match_policy)
             .field("force_resolution", &self.force_resolution)
             .field("keep_unicode_in_filenames", &self.keep_unicode_in_filenames)
-            .field("filename_exclude", &self.filename_exclude)
             .field("temp_suffix", &self.temp_suffix)
             .field("state_db", &self.state_db.is_some())
             .field("retry_only", &self.retry_only)
@@ -763,7 +722,6 @@ impl DownloadConfig {
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_resolution: false,
             keep_unicode_in_filenames: false,
-            filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
             temp_suffix: Arc::from(".kei-tmp"),
             state_db: None,
             sparse_targets: Arc::from([]),

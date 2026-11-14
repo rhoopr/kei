@@ -374,14 +374,13 @@ fn producer_skip_summary_records_every_filter_reason() {
     skips.record_filter_reason(crate::download::filter::FilterReason::MediaType);
     skips.record_filter_reason(crate::download::filter::FilterReason::LivePhoto);
     skips.record_filter_reason(crate::download::filter::FilterReason::DateRange);
-    skips.record_filter_reason(crate::download::filter::FilterReason::Filename);
 
-    assert_eq!(skips.by_filename, 2);
+    assert_eq!(skips.by_filename, 1);
     assert_eq!(skips.by_excluded_album, 1);
     assert_eq!(skips.by_media_type, 1);
     assert_eq!(skips.by_live_photo, 1);
     assert_eq!(skips.by_date_range, 1);
-    assert_eq!(skips.total(), 6);
+    assert_eq!(skips.total(), 5);
 }
 
 #[test]
@@ -622,9 +621,9 @@ async fn producer_plans_distinct_same_path_same_size_assets() {
 }
 
 /// Explicit metadata refresh updates historical versions before current
-/// resolution and filename filters are applied.
+/// resolution and fixed date filters are applied.
 #[tokio::test]
-async fn refresh_metadata_updates_historical_version_before_filename_filter() {
+async fn refresh_metadata_updates_historical_version_before_date_filter() {
     use crate::download::DownloadConfig;
     use crate::icloud::photos::PhotoAsset;
     use crate::state::SqliteStateDb;
@@ -653,8 +652,8 @@ async fn refresh_metadata_updates_historical_version_before_filename_filter() {
     config.capture_timestamp_repair =
         crate::download::CaptureTimestampRepair::ReplaceWithCaptureLocal;
     config.metadata.set_exif_datetime = true;
-    config.filename_exclude =
-        Arc::from(vec![glob::Pattern::new("*.jpg").expect("filename pattern")]);
+    config.skip_created_before =
+        Some(crate::config::parse_created_date_filter("2099-01-01").unwrap());
     let config = Arc::new(config);
 
     let historical_path = dir.path().join("historical-medium.jpg");
@@ -703,7 +702,7 @@ async fn refresh_metadata_updates_historical_version_before_filename_filter() {
 
     assert_eq!(
         result.downloaded, 0,
-        "filename-filtered asset should not be downloaded"
+        "date-filtered asset should not be downloaded"
     );
     let rewrites = db.get_pending_metadata_rewrites(10).await.unwrap();
     assert_eq!(rewrites.len(), 1);
@@ -753,8 +752,8 @@ async fn filtered_embed_rewrite_keeps_stored_checksums_current() {
     config.directory = Arc::from(dir.path());
     config.state_db = Some(db.clone());
     config.metadata.set_exif_rating = true;
-    config.filename_exclude =
-        Arc::from(vec![glob::Pattern::new("*.jpg").expect("filename pattern")]);
+    config.skip_created_before =
+        Some(crate::config::parse_created_date_filter("2099-01-01").unwrap());
     let config = Arc::new(config);
 
     let media_path = dir.path().join("filtered-embed.jpg");

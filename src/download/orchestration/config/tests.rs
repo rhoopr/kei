@@ -533,7 +533,7 @@ fn test_compute_config_hash_different_dry_run_same_hash() {
 
 // ── filter_asset_to_tasks edge-case tests ──────────────────────
 
-// ── LivePhotoMode + filename_exclude filter tests ─────────────
+// ── LivePhotoMode filter tests ─────────────
 
 // ── exclude_asset_ids filter tests ─────────────────────────────
 
@@ -542,17 +542,6 @@ fn test_hash_changes_on_live_photo_mode() {
     let config1 = test_config();
     let mut config2 = test_config();
     config2.live_photo_mode = LivePhotoMode::Skip;
-    assert_ne!(
-        hash_download_config(&config1),
-        hash_download_config(&config2)
-    );
-}
-
-#[test]
-fn test_hash_changes_on_filename_exclude() {
-    let config1 = test_config();
-    let mut config2 = test_config();
-    config2.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
     assert_ne!(
         hash_download_config(&config1),
         hash_download_config(&config2)
@@ -751,7 +740,6 @@ fn test_with_pass_preserves_all_fields() {
     config.force_resolution = true;
     config.keep_unicode_in_filenames = true;
     config.metadata.set_exif_datetime = true;
-    config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
     config.temp_suffix = std::sync::Arc::from(".custom-tmp");
     let derived = config.with_pass(&make_pass(PassKind::Album, "Test"));
     assert!(!derived.media.photos);
@@ -760,27 +748,8 @@ fn test_with_pass_preserves_all_fields() {
     assert!(derived.force_resolution);
     assert!(derived.keep_unicode_in_filenames);
     assert!(derived.metadata.set_exif_datetime);
-    assert_eq!(derived.filename_exclude.len(), 1);
     assert_eq!(&*derived.temp_suffix, ".custom-tmp");
     assert_eq!(derived.directory, config.directory);
-}
-
-// ── extract_skip_candidates: filename_exclude ─────────────────
-
-// ── compute_config_hash: filename_exclude ─────────────────────
-
-#[test]
-fn test_compute_config_hash_different_filename_exclude() {
-    let tmp = TempDir::new().unwrap();
-    let a = build_config_with(tmp.path(), "/photos", |_| {});
-    let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.config_overrides.filename_exclude = vec!["*.AAE".to_string()];
-    });
-    assert_ne!(
-        compute_config_hash(&a),
-        compute_config_hash(&b),
-        "changing filename_exclude should change the config hash"
-    );
 }
 
 #[test]
@@ -834,6 +803,8 @@ fn golden_hash_download_config_defaults() {
 
 #[test]
 fn golden_hash_download_config_non_defaults() {
+    // Retired filename restrictions are absent. Default-policy goldens above
+    // retain their released values; this fixture now hashes an empty exclusion set.
     let mut config = test_config();
     config.directory = std::sync::Arc::from(std::path::Path::new("/my/photos"));
     config.folder_structure = "{:%Y/%m}".to_string();
@@ -856,18 +827,14 @@ fn golden_hash_download_config_non_defaults() {
     config.force_resolution = true;
     config.media.videos = false;
     config.live_photo_mode = LivePhotoMode::ImageOnly;
-    config.filename_exclude = std::sync::Arc::from(vec![
-        glob::Pattern::new("*.AAE").unwrap(),
-        glob::Pattern::new("*.THM").unwrap(),
-    ]);
     let hash = hash_download_config(&config);
     assert_eq!(
-        hash, "c14d32eeb5d12af8",
+        hash, "238f3f4ded9518f7",
         "hash_download_config golden hash changed -- this will trigger full re-syncs"
     );
     assert_eq!(
         hash_legacy_download_config(&config),
-        "015b710d9e140e2f",
+        "9057fc0901697949",
         "legacy hash changed -- matching stored hashes would no longer migrate safely"
     );
 }
@@ -1010,7 +977,8 @@ fn inventory_scope_round_trip_preserves_resolved_queries_and_filters() {
         "multiplicity changes the observation sum",
     );
     let mut filtered = config.clone();
-    filtered.filename_exclude = Arc::from(vec![glob::Pattern::new("private*").unwrap()]);
+    filtered.skip_created_before =
+        Some(crate::config::parse_created_date_filter("2099-01-01").unwrap());
     assert_ne!(
         super::inventory_scope(&[hidden.clone(), favorite.clone()], &filtered),
         scope

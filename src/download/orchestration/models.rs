@@ -885,7 +885,6 @@ impl SkipBreakdown {
             filter::FilterReason::MediaType => self.by_media_type += 1,
             filter::FilterReason::LivePhoto => self.by_live_photo += 1,
             filter::FilterReason::DateRange => self.by_date_range += 1,
-            filter::FilterReason::Filename => self.by_filename += 1,
         }
     }
 }

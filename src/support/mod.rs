@@ -69,10 +69,7 @@ pub(crate) fn runtime_configuration(config: &crate::config::Config) -> Value {
                 crate::types::LivePhotoMode::Skip => "skip",
             }),
         );
-        map.insert(
-            "filename_exclusions".into(),
-            json!(config.download.filename_exclude.len()),
-        );
+        map.insert("filename_exclusions".into(), json!(0));
         map.insert("watch_interval_secs".into(), json!(config.watch.interval));
         map.insert("per_transfer".into(), json!(config.retry.max_retries));
         map.insert(
@@ -162,7 +159,7 @@ fn configuration(toml: Option<&crate::config::TomlConfig>, explicit: bool) -> Va
         "album_selectors": filters.and_then(|f| f.albums.as_ref()).map_or(0, Vec::len),
         "smart_folder_selectors": filters.and_then(|f| f.smart_folders.as_ref()).map_or(0, Vec::len),
         "library_selectors": filters.and_then(|f| f.libraries.as_ref()).map_or(0, Vec::len),
-        "filename_exclusions": filters.and_then(|f| f.filename_exclude.as_ref()).map_or(0, Vec::len),
+        "filename_exclusions": 0,
         "unfiled": filters.and_then(|f| f.unfiled).unwrap_or(true),
         "date_filter_present": filters.is_some_and(|f| f.skip_created_before.is_some() || f.skip_created_after.is_some()),
         "recent_limit_present": false,

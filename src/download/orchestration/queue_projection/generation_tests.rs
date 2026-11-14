@@ -452,7 +452,10 @@ async fn private_filter_expansion_reopens_retained_coverage_and_converges_withou
     config.directory = Arc::from(directory.path().join("media"));
     config.folder_structure = String::new();
     config.folder_structure_albums = Arc::from("{album}");
-    config.filename_exclude = Arc::from([glob::Pattern::new("epsilon.*").unwrap()]);
+    // Epsilon is the only observation older than this fixed capture instant.
+    config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
+        chrono::DateTime::from_timestamp_millis(1_699_996_500_000).unwrap(),
+    ));
     let existing;
     {
         let db = Arc::new(
@@ -488,7 +491,7 @@ async fn private_filter_expansion_reopens_retained_coverage_and_converges_withou
         );
         config.state_db = Some(db.clone());
         if cycle > 0 {
-            config.filename_exclude = Arc::from([]);
+            config.skip_created_before = None;
             config.sync_mode = SyncMode::Incremental {
                 zone_sync_token: db
                     .get_metadata("sync_token:PrimarySync")
@@ -548,16 +551,25 @@ async fn private_filter_expansion_reopens_retained_coverage_and_converges_withou
                 "unchanged complete coverage must not reselect inventory"
             );
         }
+        if cycle == 0 {
+            // Unlike the retired filename filter, a lower date bound truncates
+            // inventory coverage. It must retain the existing source cursor.
+            assert!(result.sync_token.is_none());
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("saved-cursor")
+            );
+            config.state_db = None;
+            continue;
+        }
         let successor = result
             .sync_token
             .expect("complete unbounded selection retains the existing source bridge");
         assert_eq!(
-            successor,
-            if cycle == 0 {
-                "rank-query-token"
-            } else {
-                "delta-successor"
-            },
+            successor, "delta-successor",
             "retain the existing full-query and incremental source checkpoint owners"
         );
         db.commit_checkpoint_transition(crate::state::CheckpointTransition {

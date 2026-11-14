@@ -13,15 +13,7 @@ pub(crate) enum FilterReason {
     MediaType,
     LivePhoto,
     DateRange,
-    Filename,
 }
-
-/// Case-insensitive glob matching options for filename exclusion patterns.
-pub(super) const GLOB_CASE_INSENSITIVE: glob::MatchOptions = glob::MatchOptions {
-    case_sensitive: false,
-    require_literal_separator: false,
-    require_literal_leading_dot: false,
-};
 
 /// Determine the media type for an asset based on version size and item type.
 pub(crate) fn determine_media_type(
@@ -109,18 +101,6 @@ pub(crate) fn is_asset_filtered(
         tracing::debug!(target: "kei::download::filter", asset_id = %asset.id(), date = %created_local, "Skipping (after date range)");
         return Some(FilterReason::DateRange);
     }
-    // Only check filename exclusion when the asset has a real filename.
-    // filter_asset_to_tasks separately handles fallback fingerprint filenames.
-    if !config.filename_exclude().is_empty()
-        && let Some(filename) = asset.filename()
-        && config
-            .filename_exclude()
-            .iter()
-            .any(|p| p.matches_with(filename, GLOB_CASE_INSENSITIVE))
-    {
-        tracing::debug!(target: "kei::download::filter", asset_id = %asset.id(), filename, "Skipping (filename_exclude match)");
-        return Some(FilterReason::Filename);
-    }
     None
 }
 
@@ -139,8 +119,8 @@ mod tests {
 
     use super::super::expected_paths::expected_paths_for;
     use super::super::test_support::{
-        exclude_aae_filenames, filter_asset_fresh, plain_photo_asset, skip_live_photos,
-        test_config, test_live_photo_asset, video_asset,
+        filter_asset_fresh, plain_photo_asset, skip_live_photos, test_config,
+        test_live_photo_asset, video_asset,
     };
     use super::super::versions::extract_skip_candidates;
     use super::{FilterReason, determine_media_type, is_asset_filtered};
@@ -532,21 +512,21 @@ mod tests {
                 expected: Some(FilterReason::DateRange),
             },
             FilterDecisionCase {
-                name: "filename exclude matches uppercase AAE",
+                name: "uppercase AAE filename does not restrict selection",
                 asset: aae_asset,
-                configure: exclude_aae_filenames,
-                expected: Some(FilterReason::Filename),
+                configure: |_| {},
+                expected: None,
             },
             FilterDecisionCase {
-                name: "filename exclude is case insensitive",
+                name: "lowercase AAE filename does not restrict selection",
                 asset: lowercase_aae_asset,
-                configure: exclude_aae_filenames,
-                expected: Some(FilterReason::Filename),
+                configure: |_| {},
+                expected: None,
             },
             FilterDecisionCase {
-                name: "filename exclude no-match passes",
+                name: "ordinary filename passes",
                 asset: keep_asset,
-                configure: exclude_aae_filenames,
+                configure: |_| {},
                 expected: None,
             },
             FilterDecisionCase {

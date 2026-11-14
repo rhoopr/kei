@@ -117,7 +117,6 @@ pub(crate) struct TomlFilters {
     /// Unfiled-pass toggle. Default: `true`.
     pub unfiled: Option<bool>,
     pub media: Option<Vec<MediaKind>>,
-    pub filename_exclude: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_created_before")]
     pub skip_created_before: Option<String>,
     #[serde(default, deserialize_with = "deserialize_created_after")]
@@ -216,7 +215,9 @@ pub(crate) fn load_toml_config_with_source(
                 );
                 if parse_error.contains("unknown field") {
                     message.push_str("\n\n");
-                    if parse_error.contains("`recent`") || parse_error.contains("`recent_scope`") {
+                    if parse_error.contains("`filename_exclude`") {
+                        message.push_str("Filename-based selection is no longer supported. Remove filename_exclude from [filters] after reviewing the expanded selection. Use album/library selection or fixed capture-date bounds where appropriate. Configuration was not changed.");
+                    } else if parse_error.contains("`recent`") || parse_error.contains("`recent_scope`") {
                         message.push_str("Sync count selection is no longer supported. Remove recent and recent_scope from [filters]. To bound sync, set a fixed YYYY-MM-DD in [filters].skip_created_before or skip_created_after. Configuration was not changed.");
                     } else {
                         message.push_str(&crate::upgrade_hints::toml_unknown_field_hint());
@@ -294,7 +295,6 @@ mod tests {
             "filters.smart_folders",
             "filters.unfiled",
             "filters.media",
-            "filters.filename_exclude",
             "filters.skip_created_before",
             "filters.skip_created_after",
             "photos.resolution",

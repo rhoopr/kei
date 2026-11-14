@@ -33,7 +33,6 @@ pub(crate) struct SyncConfigOverrides {
     pub albums: Vec<String>,
     pub smart_folders: Vec<String>,
     pub unfiled: Option<bool>,
-    pub filename_exclude: Vec<String>,
     pub libraries: Vec<String>,
     pub resolution: Option<PhotoResolution>,
     pub live_resolution: Option<LivePhotoResolution>,
@@ -700,18 +699,6 @@ impl Config {
             libraries: library_selector.clone(),
             unfiled: unfiled_override.unwrap_or_else(unfiled_default),
         };
-        let filename_exclude_strs = resolve_vec(
-            overrides.filename_exclude,
-            toml_filters.and_then(|f| f.filename_exclude.clone()),
-        );
-        // Compile glob patterns once during build
-        let filename_exclude: Vec<glob::Pattern> = filename_exclude_strs
-            .iter()
-            .map(|p| {
-                glob::Pattern::new(p)
-                    .map_err(|e| anyhow::anyhow!("Invalid --filename-exclude pattern '{p}': {e}"))
-            })
-            .collect::<anyhow::Result<_>>()?;
         let persistent_skip_created_before =
             toml_filters.and_then(|f| f.skip_created_before.clone());
         let persistent_skip_created_after = toml_filters.and_then(|f| f.skip_created_after.clone());
@@ -837,7 +824,6 @@ impl Config {
                 folder_structure,
                 folder_structure_albums,
                 folder_structure_smart_folders,
-                filename_exclude,
                 temp_suffix,
                 legacy_preservation_allow_hardlinks: toml_dl
                     .and_then(|download| download.legacy_preservation_allow_hardlinks)
@@ -3569,30 +3555,12 @@ mod tests {
     #[test]
     fn test_filename_exclude_from_toml() {
         let toml_str = "[filters]\nfilename_exclude = [\"*.AAE\", \"*.TMP\"]\n";
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        let patterns: Vec<&str> = cfg
-            .download
-            .filename_exclude
-            .iter()
-            .map(|p| p.as_str())
-            .collect();
-        assert_eq!(patterns, vec!["*.AAE", "*.TMP"]);
+        assert!(toml::from_str::<TomlConfig>(toml_str).is_err());
     }
     #[test]
     fn test_filename_exclude_invalid_glob_rejected() {
-        let mut sync = default_sync();
-        sync.config_overrides.filename_exclude = vec!["[invalid".to_string()];
-        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("Invalid --filename-exclude pattern")
+            toml::from_str::<TomlConfig>("[filters]\nfilename_exclude = ['[invalid']").is_err()
         );
     }
     fn assert_sf_named(
@@ -3860,41 +3828,6 @@ mod tests {
                 .unwrap()
                 .is_strictly_after(cfg.filters.skip_created_after.unwrap())
         );
-    }
-    #[test]
-    fn test_filename_exclude_cli_overrides_toml() {
-        let mut sync = default_sync();
-        sync.config_overrides.filename_exclude = vec!["*.AAE".to_string()];
-        let toml_str = "[filters]\nfilename_exclude = [\"*.TMP\"]\n";
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        let patterns: Vec<&str> = cfg
-            .download
-            .filename_exclude
-            .iter()
-            .map(|p| p.as_str())
-            .collect();
-        assert_eq!(patterns, vec!["*.AAE"]);
-    }
-    #[test]
-    fn test_filename_exclude_falls_back_to_toml() {
-        let toml_str = "[filters]\nfilename_exclude = [\"*.TMP\"]\n";
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        let patterns: Vec<&str> = cfg
-            .download
-            .filename_exclude
-            .iter()
-            .map(|p| p.as_str())
-            .collect();
-        assert_eq!(patterns, vec!["*.TMP"]);
     }
     #[test]
     fn resolve_library_defaults_to_primary_only() {

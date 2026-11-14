@@ -330,8 +330,8 @@ mod tests {
     use crate::types::{AssetVersionSize, LivePhotoMode, RawPolicy};
 
     use super::super::test_support::{
-        exclude_aae_filenames, photo_asset_with_original_and_alternative, plain_photo_asset,
-        skip_live_photos, test_config, test_live_photo_asset,
+        photo_asset_with_original_and_alternative, plain_photo_asset, skip_live_photos,
+        test_config, test_live_photo_asset,
     };
     use super::{VersionsView, apply_raw_policy, extract_skip_candidates, metadata_capture};
 
@@ -653,9 +653,9 @@ mod tests {
                 expected: &[],
             },
             SkipCandidateCase {
-                name: "filename exclude no-match still emits original",
+                name: "ordinary filename emits original",
                 asset: plain_photo_asset,
-                configure: exclude_aae_filenames,
+                configure: |_| {},
                 expected: &[(VersionSizeKey::Original, "abc123")],
             },
             SkipCandidateCase {

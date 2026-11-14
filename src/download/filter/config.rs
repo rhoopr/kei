@@ -27,7 +27,6 @@ pub(crate) trait PathDerivationSource {
     fn file_match_policy(&self) -> FileMatchPolicy;
     fn force_resolution(&self) -> bool;
     fn keep_unicode_in_filenames(&self) -> bool;
-    fn filename_exclude(&self) -> &[glob::Pattern];
     fn album_name(&self) -> Option<&str>;
     fn exclude_asset_ids(&self) -> &FxHashSet<String>;
 }
@@ -58,7 +57,6 @@ pub(crate) struct PathDerivationConfig {
     pub(crate) file_match_policy: FileMatchPolicy,
     pub(crate) force_resolution: bool,
     pub(crate) keep_unicode_in_filenames: bool,
-    pub(crate) filename_exclude: Arc<[glob::Pattern]>,
     pub(crate) album_name: Option<Arc<str>>,
     pub(crate) library: Arc<str>,
     pub(crate) exclude_asset_ids: Arc<FxHashSet<String>>,
@@ -91,7 +89,6 @@ impl PathDerivationConfig {
             file_match_policy: fields.file_match_policy,
             force_resolution: fields.force_resolution,
             keep_unicode_in_filenames: fields.keep_unicode_in_filenames,
-            filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
             album_name: None,
             library: Arc::from(crate::icloud::photos::PRIMARY_ZONE_NAME),
             exclude_asset_ids: Arc::new(FxHashSet::default()),
@@ -221,10 +218,6 @@ impl PathDerivationSource for PathDerivationConfig {
         self.keep_unicode_in_filenames
     }
 
-    fn filename_exclude(&self) -> &[glob::Pattern] {
-        &self.filename_exclude
-    }
-
     fn album_name(&self) -> Option<&str> {
         self.album_name.as_deref()
     }
@@ -297,10 +290,6 @@ impl PathDerivationSource for DownloadConfig {
 
     fn keep_unicode_in_filenames(&self) -> bool {
         self.keep_unicode_in_filenames
-    }
-
-    fn filename_exclude(&self) -> &[glob::Pattern] {
-        &self.filename_exclude
     }
 
     fn album_name(&self) -> Option<&str> {

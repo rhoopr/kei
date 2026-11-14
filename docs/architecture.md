@@ -96,7 +96,7 @@ match their headings, so searching a label finds the section.
 | Local catalog maintenance | `src/download/orchestration/reconciliation.rs`, `src/download/orchestration/cleanup.rs`, `src/download/orchestration/maintenance.rs` | Reconciles catalog paths, removes durably owned stale temporary files, and repairs metadata-capture revisions. |
 | Asset planning | `src/download/planner.rs` | Applies filters, derives tasks, records dispatched pending work, and persists membership and identity mappings. |
 | Filter facade and configuration | `src/download/filter.rs`, `src/download/filter/config.rs` | Preserves filter entry points and shares path and filter settings between sync and import. |
-| Asset eligibility | `src/download/filter/eligibility.rs` | Owns content, date, and filename filters and media classification, without path or filesystem decisions. |
+| Asset eligibility | `src/download/filter/eligibility.rs` | Owns content and date filters and media classification, without path or filesystem decisions. |
 | Rendition selection | `src/download/filter/versions.rs` | Owns RAW alignment, primary and companion selection, and selected-rendition metadata keys. |
 | Task metadata | `src/download/filter/metadata.rs` | Builds metadata payloads with preloaded album and people groupings. |
 | Expected asset paths | `src/download/filter/expected_paths.rs` | Derives paths shared by sync and import before collision resolution; uses the rendition-selection owner. |

@@ -253,6 +253,8 @@ the same way.
 
 ## Useful kei-only options
 
+Filename-based selection is no longer supported. Remove `[filters].filename_exclude` from an existing config after reviewing the expanded selection. Use libraries, albums, smart folders or fixed capture-date bounds to restrict sync. A config containing the retired key is rejected before sync writes state or media.
+
 | Option or command | What it does |
 |---|---|
 | `kei config setup` | Interactive config wizard. |
@@ -265,7 +267,6 @@ the same way.
 | `[filters].libraries` | Select primary, shared, all, named, or excluded iCloud libraries. |
 | `[filters].smart_folders` | Sync Favorites, Screenshots, Hidden, Recently Deleted, and other Apple smart folders across visible libraries when explicitly set. |
 | `[filters].unfiled = false` | Skip photos and videos outside user albums. |
-| `[filters].filename_exclude` | Skip files by glob, such as `*.AAE` or `Screenshot*`. |
 | `[download].bandwidth_limit` | Limit total download speed, for example `10M` or `1.5Mi`. |
 | `[metadata].set_exif_rating`, `.set_exif_gps`, `.set_exif_description` | Write more iCloud metadata into downloaded media. |
 | `[metadata].embed_xmp`, `[metadata].xmp_sidecar` | Embed XMP or write `.xmp` sidecars. |
