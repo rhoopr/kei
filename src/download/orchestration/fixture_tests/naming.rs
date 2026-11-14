@@ -82,17 +82,10 @@ async fn bundled_raw_and_companion_naming() {
             .await;
         records[0]["fields"]["resOriginalAltRes"] = h.resource("raw", "media/pattern.dng", 1).await;
         records[0]["fields"]["resOriginalAltFileType"] = json!({"value": "com.adobe.raw-image"});
-        let expected = if policy == RawPolicy::PreferRaw {
-            vec![
-                ("Pair.DNG", "media/pattern.dng"),
-                ("Pair_alt.JPG", "media/pattern.jpg"),
-            ]
-        } else {
-            vec![
-                ("Pair.JPG", "media/pattern.jpg"),
-                ("Pair_RAW.DNG", "media/pattern.dng"),
-            ]
-        };
+        let expected = vec![
+            ("Pair.JPG", "media/pattern.jpg"),
+            ("Pair_RAW.DNG", "media/pattern.dng"),
+        ];
         h.stable(records, &expected).await;
     }
     for policy in [

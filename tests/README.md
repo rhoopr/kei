@@ -38,6 +38,14 @@ tests/
 
 `retired_selection_settings_refuse_before_provider_or_state_writes` runs the real CLI with empty, nonempty and malformed retired filename restrictions and both retired edited-naming values. It checks actionable refusal, unchanged config/database/media bytes and zero provider requests. Filtered-work recovery fixtures use fixed-date bounds; bounded inventory retains its cursor until the expanded selection completes. Managed-layout tests retain established paths under the new suffix default, including read-only previews, edits, metadata updates, interrupted publication, indexing recovery and quiet reopens.
 
+`rendition_migration_refuses_before_provider_or_state_writes` runs sync,
+import-existing and config-show against unversioned configs, an unsupported
+version and every retired rendition restriction. It checks unchanged config,
+database and media bytes and zero provider requests. Component-exclusion tests
+resolve real TOML and compare sync tasks with import paths, including original,
+edited, RAW and both Live Photo video renditions. Persistence tests cover all 16
+exclusion combinations, including refusal when all components are excluded.
+
 | Target | Network | Runs via |
 |--------|:-------:|----------|
 | `cargo test --lib` | no | `just test fast` |

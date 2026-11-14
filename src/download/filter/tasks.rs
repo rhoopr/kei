@@ -584,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_live_photo_medium_size() {
+    fn test_filter_live_photo_preview_is_not_a_full_resolution_companion() {
         let asset = PhotoAsset::new(
             json!({"recordName": "LIVE_MED", "fields": {
                 "filenameEnc": {"value": "IMG_0002.HEIC", "type": "STRING"},
@@ -607,8 +607,9 @@ mod tests {
         let mut config = test_config();
         config.live_resolution = AssetVersionSize::LiveMedium;
         let tasks = filter_asset_fresh(&asset, &config);
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/live_med");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].version_size, VersionSizeKey::Original);
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/heic_orig");
     }
 
     #[test]
@@ -629,15 +630,16 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_asset_uses_raw_policy_swap() {
+    fn retired_raw_preference_preserves_provider_resource_identity() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
         let mut config = test_config();
         config.raw_policy = RawPolicy::PreferRaw;
-        // With AsOriginal and RAW alternative, the swap makes Original point to alt URL
+        // Retained config values cannot relabel new downloads.
         let tasks = filter_asset_fresh(&asset, &config);
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/alt");
-        assert_eq!(&*tasks[0].checksum, "alt_ck");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
+        assert_eq!(&*tasks[0].checksum, "orig_ck");
+        assert_eq!(&*tasks[1].checksum, "alt_ck");
     }
 
     #[test]
@@ -745,6 +747,110 @@ mod tests {
     }
 
     #[test]
+    fn live_component_exclusions_keep_all_selected_renditions_and_resource_identity() {
+        let asset = TestPhotoAsset::new("LIVE_ALL_RENDITIONS")
+            .filename("IMG.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .adjusted_version(
+                "https://p01.icloud-content.com/edit",
+                "edit_ck",
+                900,
+                "public.heic",
+            )
+            .alt_version(
+                "https://p01.icloud-content.com/raw",
+                "raw_ck",
+                2000,
+                "com.adobe.raw-image",
+            )
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .live_adjusted(
+                "https://p01.icloud-content.com/edit_mov",
+                "edit_mov_ck",
+                2500,
+            )
+            .build();
+        for (exclude, expected) in [
+            (
+                "[]",
+                vec![
+                    VersionSizeKey::Original,
+                    VersionSizeKey::Adjusted,
+                    VersionSizeKey::Alternative,
+                    VersionSizeKey::LiveAdjusted,
+                    VersionSizeKey::LiveOriginal,
+                ],
+            ),
+            (
+                "['live-photo-videos']",
+                vec![
+                    VersionSizeKey::Original,
+                    VersionSizeKey::Adjusted,
+                    VersionSizeKey::Alternative,
+                ],
+            ),
+            (
+                "['live-photo-stills']",
+                vec![VersionSizeKey::LiveAdjusted, VersionSizeKey::LiveOriginal],
+            ),
+            ("['live-photo-stills','live-photo-videos']", vec![]),
+            (
+                "['photos','videos']",
+                vec![
+                    VersionSizeKey::Original,
+                    VersionSizeKey::Adjusted,
+                    VersionSizeKey::Alternative,
+                    VersionSizeKey::LiveAdjusted,
+                    VersionSizeKey::LiveOriginal,
+                ],
+            ),
+        ] {
+            let input: crate::config::TomlConfig =
+                toml::from_str(&format!("config_version=1\n[filters]\nexclude={exclude}")).unwrap();
+            let resolved = crate::config::Config::build(
+                &crate::config::GlobalArgs {
+                    config_source: Default::default(),
+                    username: Some("fixture@example.com".to_owned()),
+                    domain: None,
+                    data_dir: None,
+                },
+                &crate::cli::PasswordArgs::default(),
+                crate::cli::SyncArgs::default(),
+                Some(&input),
+            )
+            .unwrap();
+            let mut config = test_config();
+            config.media = resolved.filters.media;
+            config.live_photo_mode = resolved.photos.live_photo_mode;
+            let tasks = filter_asset_fresh(&asset, &config);
+            let paths = expected_paths_for(&asset, &config);
+            assert_eq!(
+                tasks
+                    .iter()
+                    .map(|task| task.version_size)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{exclude}"
+            );
+            assert_eq!(
+                paths
+                    .iter()
+                    .map(|path| path.version_size)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{exclude}"
+            );
+            for (path, task) in paths.iter().zip(&tasks) {
+                assert_eq!(path.path, task.download_path);
+                assert_eq!(path.checksum, task.checksum);
+                assert_eq!(path.size, task.size);
+                assert_eq!(path.url, task.url);
+            }
+        }
+    }
+
+    #[test]
     fn video_only_live_photo_uses_fingerprint_mov_when_unicode_strip_empties_stem() {
         let asset = TestPhotoAsset::new("UNI_LIVE_MOV")
             .filename("日本語.HEIC")
@@ -767,19 +873,40 @@ mod tests {
     }
 
     #[test]
-    fn resolution_none_with_alternative_emits_only_alternative() {
+    fn default_policy_emits_original_edit_and_alternative() {
         let asset = original_adjusted_alternative_asset();
-        let mut config = test_config();
-        config.resolution = crate::types::PhotoResolution::None;
-        config.alternative = true;
+        let config = test_config();
 
         let paths = expected_paths_for(&asset, &config);
-        assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0].version_size, VersionSizeKey::Alternative);
+        let tasks = filter_asset_fresh(&asset, &config);
+        let expected = [
+            VersionSizeKey::Original,
+            VersionSizeKey::Adjusted,
+            VersionSizeKey::Alternative,
+        ];
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| path.version_size)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.version_size)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for (path, task) in paths.iter().zip(&tasks) {
+            assert_eq!(path.path, task.download_path);
+            assert_eq!(path.checksum, task.checksum);
+            assert_eq!(path.size, task.size);
+        }
     }
 
     #[test]
-    fn raw_policy_prefer_raw_makes_raw_primary_and_jpeg_extra() {
+    fn retired_raw_preference_keeps_jpeg_original_and_raw_alternative() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
         let mut config = test_config();
         config.raw_policy = RawPolicy::PreferRaw;
@@ -787,14 +914,14 @@ mod tests {
 
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
-        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/alt");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
         assert_eq!(tasks[0].version_size, VersionSizeKey::Original);
-        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/orig");
+        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/alt");
         assert_eq!(tasks[1].version_size, VersionSizeKey::Alternative);
     }
 
     #[test]
-    fn raw_policy_prefer_jpeg_makes_jpeg_primary_and_raw_extra() {
+    fn retired_jpeg_preference_keeps_raw_original_and_jpeg_alternative() {
         let asset = photo_asset_with_original_and_alternative("com.adobe.raw-image", "public.jpeg");
         let mut config = test_config();
         config.raw_policy = RawPolicy::PreferJpeg;
@@ -802,31 +929,35 @@ mod tests {
 
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
-        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/alt");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
         assert_eq!(tasks[0].version_size, VersionSizeKey::Original);
-        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/orig");
+        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/alt");
         assert_eq!(tasks[1].version_size, VersionSizeKey::Alternative);
-        let raw_extra = tasks[1]
+        let jpeg_extra = tasks[1]
             .download_path
             .file_name()
             .unwrap()
             .to_string_lossy()
             .into_owned();
         assert!(
-            raw_extra.contains("_RAW."),
-            "raw alternative extra should use _RAW suffix, got {raw_extra}"
+            jpeg_extra.contains("_alt."),
+            "JPEG alternative should use _alt suffix, got {jpeg_extra}"
         );
     }
 
     #[test]
-    fn resolution_none_with_missing_edited_extra_skips_asset() {
+    fn missing_edit_does_not_suppress_original() {
         let asset = TestPhotoAsset::new("PR4_NONE_NO_EDITED").build();
         let mut config = test_config();
         config.resolution = crate::types::PhotoResolution::None;
         config.edited = true;
 
-        assert!(expected_paths_for(&asset, &config).is_empty());
-        assert!(filter_asset_fresh(&asset, &config).is_empty());
+        let paths = expected_paths_for(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].version_size, VersionSizeKey::Original);
+        assert_eq!(paths[0].path, tasks[0].download_path);
     }
 
     #[test]
@@ -843,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn live_resolution_medium_with_edited_emits_live_medium_and_live_adjusted() {
+    fn live_preview_does_not_replace_original_or_current_edit() {
         let asset = PhotoAsset::new(
             json!({"recordName": "PR4_LIVE_MEDIUM_EDITED", "fields": {
                 "filenameEnc": {"value": "IMG_LIVE_MEDIUM.HEIC", "type": "STRING"},
@@ -886,11 +1017,11 @@ mod tests {
             vec![
                 VersionSizeKey::Original,
                 VersionSizeKey::LiveAdjusted,
-                VersionSizeKey::LiveMedium,
+                VersionSizeKey::LiveOriginal,
             ]
         );
         assert_eq!(&*paths[1].checksum, "live_adjusted_ck");
-        assert_eq!(&*paths[2].checksum, "live_med_ck");
+        assert_eq!(&*paths[2].checksum, "live_orig_ck");
     }
 
     #[test]
@@ -1011,13 +1142,15 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_asset_as_is_downloads_original() {
+    fn test_filter_asset_as_is_downloads_original_and_raw() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
         let config = test_config(); // raw_policy defaults to AsIs
         let tasks = filter_asset_fresh(&asset, &config);
-        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks.len(), 2);
         assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
         assert_eq!(&*tasks[0].checksum, "orig_ck");
+        assert_eq!(tasks[1].version_size, VersionSizeKey::Alternative);
+        assert_eq!(&*tasks[1].checksum, "alt_ck");
     }
 
     #[test]
@@ -1046,14 +1179,14 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_live_adjusted_force_resolution_no_fallback() {
+    fn test_filter_missing_live_edit_keeps_original_companion() {
         let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
         let mut config = test_config();
         config.live_resolution = AssetVersionSize::LiveAdjusted;
         config.force_resolution = true;
         let tasks = filter_asset_fresh(&asset, &config);
-        // force_resolution prevents fallback — only primary, no live companion
-        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].version_size, VersionSizeKey::LiveOriginal);
     }
 
     // ── NameId7 filter tests ────────────────────────────────────────────
@@ -1175,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn test_medium_size_adds_suffix() {
+    fn test_available_medium_does_not_change_original_filename() {
         let asset = multi_size_photo_asset();
         let mut config = test_config();
         config.resolution = crate::types::PhotoResolution::Medium;
@@ -1187,14 +1320,12 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(
-            filename.contains("-medium"),
-            "Medium size should add '-medium' suffix, got: {filename}"
-        );
+        assert_eq!(filename, "photo.JPG");
+        assert_eq!(tasks[0].version_size, VersionSizeKey::Original);
     }
 
     #[test]
-    fn test_thumb_size_adds_suffix() {
+    fn test_available_thumbnail_does_not_change_original_filename() {
         let asset = multi_size_photo_asset();
         let mut config = test_config();
         config.resolution = crate::types::PhotoResolution::Thumb;
@@ -1206,10 +1337,8 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(
-            filename.contains("-thumb"),
-            "Thumb size should add '-thumb' suffix, got: {filename}"
-        );
+        assert_eq!(filename, "photo.JPG");
+        assert_eq!(tasks[0].version_size, VersionSizeKey::Original);
     }
 
     // ── Gap coverage: empty versions, path traversal, empty filename ───
@@ -1529,16 +1658,14 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_force_resolution_missing_version_no_fallback() {
-        // Asset only has Original; request Medium with force_resolution=true
+    fn test_filter_original_without_previews_is_selected() {
         let asset = TestPhotoAsset::new("FORCE_1").build();
         let mut config = test_config();
         config.resolution = crate::types::PhotoResolution::Medium;
         config.force_resolution = true;
-        assert!(
-            filter_asset_fresh(&asset, &config).is_empty(),
-            "force_resolution=true with missing Medium version should not fall back to Original"
-        );
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].version_size, VersionSizeKey::Original);
     }
 
     // ── LivePhotoMode task shaping ─────────────────────────────────

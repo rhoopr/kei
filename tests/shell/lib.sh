@@ -158,6 +158,7 @@ kei_write_sync_config() {
     local config="$data_dir/.kei-shell-sync-$$.toml"
     mkdir -p "$data_dir"
     {
+        echo "config_version = 1"
         echo "[download]"
         printf 'directory = %s\n' "$(kei_toml_string "$download_dir")"
         kei_append_toml_fragment "$download_extra"

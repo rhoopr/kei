@@ -358,7 +358,7 @@ mod tests {
             ..crate::cli::SyncArgs::default()
         };
         let toml: crate::config::TomlConfig =
-            toml::from_str("[filters]\nmedia = [\"photos\", \"videos\"]\n")
+            toml::from_str("[filters]\nexclude = ['live-photo-stills', 'live-photo-videos']\n")
                 .expect("parse media config");
         let config = crate::config::Config::build(
             &globals,

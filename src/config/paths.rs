@@ -178,6 +178,7 @@ mod tests {
     #[test]
     fn test_resolve_data_dir_toml_data_dir() {
         let toml = TomlConfig {
+            config_version: Some(1),
             data_dir: Some("/toml/data".to_string()),
             log_level: None,
             auth: None,
@@ -203,6 +204,7 @@ mod tests {
     #[test]
     fn test_resolve_data_dir_cli_takes_precedence_over_toml() {
         let toml = TomlConfig {
+            config_version: Some(1),
             data_dir: Some("/toml/data".to_string()),
             log_level: None,
             auth: None,

@@ -7,10 +7,10 @@ use crate::download::orchestration::test_support::incremental_photo_records;
 use crate::download::planner::{TaskPlanner, pending_record_for_task};
 use crate::icloud::photos::inbox::ShadowCapture;
 use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
-use crate::state::SqliteStateDb;
 use crate::state::db::account::AccountOwner;
 use crate::state::db::provider_selection::{SelectionOutcome, SelectionPath};
 use crate::state::db::provider_work::{WorkAdmission, WorkPlan};
+use crate::state::{SqliteStateDb, VersionSizeKey};
 use rustc_hash::FxHashSet;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1738,7 +1738,7 @@ async fn queue_projection_companion_obligations_commit_all_or_defer_all() {
 }
 
 #[tokio::test]
-async fn queue_projection_raw_alignment_preserves_current_provider_metadata_binding() {
+async fn queue_projection_retired_raw_preference_preserves_provider_metadata_binding() {
     let mut f = Fixture::new().await;
     f.capture(records("m", OLD, "source"), "old").await;
     {
@@ -1753,10 +1753,10 @@ async fn queue_projection_raw_alignment_preserves_current_provider_metadata_bind
     f.config.raw_policy = crate::types::RawPolicy::PreferJpeg;
     f.cycle().await.unwrap();
     assert_eq!(
-        f.db.acquire_lock("logical original uses confirmed JPEG facts")
+        f.db.acquire_lock("provider alternative uses confirmed JPEG facts")
             .unwrap()
             .query_row::<(String, i64, i64), _, _>(
-                "SELECT checksum,width,height FROM assets WHERE version_size='original'",
+                "SELECT checksum,width,height FROM assets WHERE version_size='alternative'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             )
@@ -4128,10 +4128,23 @@ async fn active_pending_fixture() -> (
     crate::state::db::provider_generations::ActiveDecision,
     Vec<crate::state::AssetRecord>,
 ) {
+    admit_pending_fixture(Fixture::new().await, &[]).await
+}
+
+// Explicit logical/provider key pairs model a frozen historical declaration,
+// without asking the current selector to reproduce a retired RAW preference.
+async fn admit_pending_fixture(
+    mut f: Fixture,
+    historical_keys: &[(VersionSizeKey, VersionSizeKey)],
+) -> (
+    Fixture,
+    crate::state::db::provider_generations::ActiveGeneration,
+    crate::state::db::provider_generations::ActiveDecision,
+    Vec<crate::state::AssetRecord>,
+) {
     use crate::state::db::provider_generations::{
         ActiveDecision, GenerationSpec, MAX_GENERATION_BYTES,
     };
-    let mut f = Fixture::new().await;
     f.capture(records("m", OLD, "retained"), "active-proofs")
         .await;
     f.pass = destination_pass_with(&f.session, &f.capture, "A");
@@ -4154,12 +4167,12 @@ async fn active_pending_fixture() -> (
         .plan_download_asset(&current.asset, &effective)
         .await
         .unwrap();
-    let records = plan
+    let mut records = plan
         .tasks
         .iter()
         .map(|task| pending_record_for_task(&effective, &current.asset, task))
         .collect::<Vec<_>>();
-    let manifest = ActiveDecision {
+    let mut manifest = ActiveDecision {
         decision: crate::state::db::provider_selection::SelectionDecision {
             pass_key: key.clone(),
             child: "asset-m".into(),
@@ -4197,6 +4210,22 @@ async fn active_pending_fixture() -> (
             .unwrap(),
         state_id: "asset-m".into(),
     };
+    for record in &mut records {
+        if let Some((logical, _)) = historical_keys
+            .iter()
+            .find(|(_, provider)| *provider == record.version_size)
+        {
+            record.version_size = *logical;
+        }
+    }
+    for destination in &mut manifest.decision.destinations {
+        if let Some((logical, _)) = historical_keys
+            .iter()
+            .find(|(_, provider)| provider.as_str() == destination.version_size)
+        {
+            destination.version_size = logical.as_str().into();
+        }
+    }
     assert!(
         f.db.project_selection_decision(
             owner(),
@@ -4210,6 +4239,63 @@ async fn active_pending_fixture() -> (
         .admitted
     );
     (f, root, manifest, records)
+}
+
+#[tokio::test]
+async fn frozen_raw_generation_preserves_swapped_keys_and_resource_evidence_on_reopen() {
+    let f = Fixture::new().await;
+    {
+        let mut records = f.session.records.lock().unwrap();
+        records[0]["fields"]["resOriginalAltRes"] = json!({"value": {
+            "downloadURL": "https://p01.icloud-content.com/frozen-raw",
+            "size": 2000, "fileChecksum": "frozen-raw-checksum"
+        }});
+        records[0]["fields"]["resOriginalAltFileType"] = json!({"value":"com.adobe.raw-image"});
+    }
+    let (f, root, manifest, records) = admit_pending_fixture(
+        f,
+        &[
+            (VersionSizeKey::Original, VersionSizeKey::Alternative),
+            (VersionSizeKey::Alternative, VersionSizeKey::Original),
+        ],
+    )
+    .await;
+    assert_eq!(records.len(), 2);
+    let f = reopen_destination_fixture(f).await;
+    let retained =
+        f.db.selection_decision(
+            owner(),
+            root.id,
+            manifest.decision.pass_key.clone(),
+            "asset-m".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained, manifest);
+    let current = f.pass.album.confirm_catalog_asset("asset-m").await.unwrap();
+    for destination in &retained.decision.destinations {
+        let logical = records
+            .iter()
+            .find(|record| record.version_size.as_str() == destination.version_size)
+            .unwrap()
+            .version_size;
+        let expected = match logical {
+            VersionSizeKey::Original => VersionSizeKey::Alternative,
+            VersionSizeKey::Alternative => VersionSizeKey::Original,
+            _ => panic!("fixture contains only RAW/JPEG siblings"),
+        };
+        assert_eq!(
+            crate::download::filter::provider_version_for_frozen_resource(
+                &current.asset,
+                logical,
+                &destination.checksum,
+                destination.size,
+            ),
+            Some(expected)
+        );
+    }
+    assert_eq!(f.db.get_pending().await.unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -5408,11 +5494,7 @@ async fn private_multi_destination_raw_edited_alternative_and_companion_failure_
         .await
         .unwrap();
         assert_eq!(recovered.stats.downloaded, 2, "{policy:?}: {recovered:?}");
-        let names = if policy == crate::types::RawPolicy::PreferRaw {
-            vec![("r.DNG", raw.as_slice()), ("r_alt.JPG", jpeg.as_slice())]
-        } else {
-            vec![("r.JPG", jpeg.as_slice()), ("r_RAW.DNG", raw.as_slice())]
-        };
+        let names = [("r.JPG", jpeg.as_slice()), ("r_RAW.DNG", raw.as_slice())];
         for album in ["A", "B"] {
             for (name, bytes) in names.iter().copied().chain([
                 ("r_edited.JPG", edited.as_slice()),
@@ -5615,6 +5697,7 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
 
 #[tokio::test]
 async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_resource() {
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5623,7 +5706,6 @@ async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_reso
     let jpeg = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
     let mut f = Fixture::new().await;
     f.config.folder_structure_albums = Arc::from("copies");
-    f.config.raw_policy = crate::types::RawPolicy::PreferRaw;
     f.config.retry.max_retries = 0;
     {
         let mut records = f.session.records.lock().unwrap();
@@ -5656,10 +5738,99 @@ async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_reso
         .await;
     Mock::given(method("GET"))
         .and(path("/unused-jpeg"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(0)
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(jpeg))
+        .expect(1)
         .mount(&server)
         .await;
+    let passes = [destination_pass(&f, "A"), destination_pass(&f, "B")];
+    f.capture(
+        vec![json!({"recordName":"frozen-source","recordType":"FutureOpaque"})],
+        "frozen-source",
+    )
+    .await;
+    let root = crate::download::orchestration::generation::begin_frozen_fixture(
+        &passes,
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    for pass in &passes {
+        let key = crate::download::orchestration::generation::pass_key(pass);
+        assert_eq!(
+            pass.album
+                .clone()
+                .with_rank_capture(&root.id, &key)
+                .photos(None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let current = pass.album.confirm_catalog_asset("asset-m").await.unwrap();
+        let effective = f.config.with_pass(pass);
+        let mut planner = TaskPlanner::for_download(effective.state_db.as_deref())
+            .await
+            .unwrap();
+        let plan = planner
+            .plan_download_asset(&current.asset, &effective)
+            .await
+            .unwrap();
+        let mut frozen_records = Vec::new();
+        let mut destinations = Vec::new();
+        for mut task in plan.tasks {
+            let (logical, filename) = match task.version_size {
+                VersionSizeKey::Original => (VersionSizeKey::Alternative, "changed_alt.JPG"),
+                VersionSizeKey::Alternative => (VersionSizeKey::Original, "changed.DNG"),
+                _ => panic!("historical fixture contains only RAW/JPEG siblings"),
+            };
+            task.download_path = f.config.directory.join("copies").join(filename);
+            let mut record = pending_record_for_task(&effective, &current.asset, &task);
+            record.version_size = logical;
+            destinations.push(crate::state::db::provider_selection::SelectionDestination {
+                version_size: logical.as_str().into(),
+                path: SelectionPath::from_path(&task.download_path),
+                checksum: task.checksum.to_string(),
+                size: task.size,
+                metadata_hash: record.metadata.metadata_hash.clone().unwrap(),
+            });
+            frozen_records.push(record);
+        }
+        assert_eq!(frozen_records.len(), 2);
+        let decision = crate::state::db::provider_generations::ActiveDecision {
+            sources: f
+                .db
+                .selection_rank_sources(owner(), root.id.clone(), key.clone(), "asset-m".into())
+                .await
+                .unwrap(),
+            state_id: "asset-m".into(),
+            decision: crate::state::db::provider_selection::SelectionDecision {
+                pass_key: key,
+                child: "asset-m".into(),
+                master: Some("m".into()),
+                confirmation: Some(current.body),
+                outcome: SelectionOutcome::Selected,
+                reason: String::new(),
+                destinations,
+            },
+        };
+        assert!(
+            f.db.project_selection_decision(
+                owner(),
+                root.id.clone(),
+                decision,
+                frozen_records,
+                crate::state::db::provider_generations::MAX_GENERATION_BYTES
+            )
+            .await
+            .unwrap()
+            .admitted
+        );
+    }
+    f.db.seal_selection_generation(owner(), root.id, false, Some("bounded_fixture".into()))
+        .await
+        .unwrap();
+    f = reopen_destination_fixture(f).await;
     let first = crate::download::download_photos_with_sync(
         &reqwest::Client::new(),
         &[destination_pass(&f, "A"), destination_pass(&f, "B")],
@@ -5669,7 +5840,12 @@ async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_reso
     )
     .await
     .unwrap();
-    assert_eq!(first.stats.downloaded, 0, "{first:?}");
+    assert_eq!(
+        first.stats.downloaded,
+        1,
+        "{first:?}\n{:?}",
+        capture.events()
+    );
     assert!(first.sync_token.is_none());
     let roots = f.count("provider_active_generations");
     assert_eq!(roots, 1);

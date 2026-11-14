@@ -106,7 +106,7 @@ fn seed(root: &Path, username: &'static str, label: &'static str, server: &str) 
     let password = root.join(format!("{label}-empty-password"));
     std::fs::write(&password, "").unwrap();
     let config = root.join(format!("{label}.toml"));
-    std::fs::write(&config,format!("[auth]\nusername={}\npassword_file={}\n[download]\ndirectory={}\n[ui]\nfriendly=false\nprogress_bar=false\n",
+    std::fs::write(&config,format!("config_version=1\n[auth]\nusername={}\npassword_file={}\n[download]\ndirectory={}\n[ui]\nfriendly=false\nprogress_bar=false\n",
         crate::common::toml_string(username),crate::common::toml_string(password.to_str().unwrap()),crate::common::toml_string(media_dir.to_str().unwrap()))).unwrap();
     Account {
         username,
@@ -157,6 +157,59 @@ async fn retired_selection_settings_refuse_before_provider_or_state_writes() {
         assert_eq!(std::fs::read(&account.config).unwrap(), config.as_bytes());
         assert_eq!(std::fs::read(&account.path).unwrap(), state_bytes);
         assert_eq!(std::fs::read(&account.media).unwrap(), media_bytes);
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rendition_migration_refuses_before_provider_or_state_writes() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = seed(root, ACCOUNTS[0], "A", &server.uri());
+    let original_config = std::fs::read_to_string(&account.config).unwrap();
+    let unversioned = original_config
+        .lines()
+        .filter(|line| !line.starts_with("config_version"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let state_bytes = std::fs::read(&account.path).unwrap();
+    let media_bytes = std::fs::read(&account.media).unwrap();
+    let mut configs = vec![
+        unversioned.clone(),
+        format!("config_version=0\n{unversioned}"),
+    ];
+    for (section, key, value) in [
+        ("photos", "resolution", "'original'"),
+        ("photos", "resolution", "'none'"),
+        ("photos", "live_resolution", "'medium'"),
+        ("photos", "live_photo_mode", "'image-only'"),
+        ("photos", "edited", "false"),
+        ("photos", "alternative", "false"),
+        ("photos", "raw_policy", "'prefer-raw'"),
+        ("photos", "force_resolution", "true"),
+        ("filters", "media", "['photos']"),
+    ] {
+        configs.push(format!(
+            "config_version=1\n{unversioned}\n[{section}]\n{key}={value}\n"
+        ));
+    }
+    for config in configs {
+        std::fs::write(&account.config, &config).unwrap();
+        for args in [
+            vec!["sync", "--no-progress-bar"],
+            vec!["import-existing", "--force-empty"],
+            vec!["config", "show"],
+        ] {
+            let output = command(root, &account, &args);
+            assert!(!output.status.success(), "{args:?}");
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains("config_version = 1"), "{args:?}: {error}");
+            assert!(error.contains("full-resolution"), "{args:?}: {error}");
+            assert_eq!(std::fs::read(&account.config).unwrap(), config.as_bytes());
+            assert_eq!(std::fs::read(&account.path).unwrap(), state_bytes);
+            assert_eq!(std::fs::read(&account.media).unwrap(), media_bytes);
+        }
     }
     assert!(server.received_requests().await.unwrap().is_empty());
 }

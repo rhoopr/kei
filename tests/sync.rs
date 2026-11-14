@@ -283,15 +283,14 @@ fn sync_skip_all_media_rejected_at_startup() {
         &cookie_dir,
         download_dir.path(),
         SyncToml {
-            filters: "media = [\"live-photos\"]\n",
-            photos: "live_photo_mode = \"skip\"\n",
+            filters: "exclude = ['photos', 'videos', 'live-photo-stills', 'live-photo-videos']\n",
             ..SyncToml::default()
         },
     )
     .timeout(Duration::from_secs(TIMEOUT_META))
     .assert()
     .failure()
-    .stderr(predicate::str::contains("would download nothing"));
+    .stderr(predicate::str::contains("at least one media component"));
 }
 
 // ── Misc flags ──────────────────────────────────────────────────────────

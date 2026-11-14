@@ -140,20 +140,22 @@ Always check the preview: collisions and existing ownership records can still pr
 
 ### Live photos, RAW, and sizes
 
-Match the file versions your Python setup downloaded. For example:
+Kei selects available full-resolution originals, current edits and RAW/JPEG
+renditions for each included component. Both Live Photo components are included
+by default. For example, to omit Live Photo videos:
 
 ```toml
-[photos]
-resolution = "original"
-live_photo_mode = "both"
-live_resolution = "original"
-live_photo_mov_filename_policy = "suffix"
-raw_policy = "as-is"
+[filters]
+exclude = ["live-photo-videos"]
 ```
 
-Edited and alternative versions, including RAW, need the corresponding settings. See [example.config.toml](../example.config.toml) for the available choices.
+Medium and thumbnail previews are not imported as originals. Missing selected
+renditions can be downloaded by a later sync. Existing kei configurations need
+the [rendition-policy migration](rendition-policy-migration.md), including the
+top-level `config_version = 1` marker. See
+[example.config.toml](../example.config.toml) for supported settings.
 
-You can try a smaller import with `--recent 100`. Import accepts a count, not a date window: `--recent 30d` works only with sync.
+You can try a smaller import with `--recent 100`. Import accepts a count, not a date window. Sync uses fixed capture-date bounds; rolling windows such as `--recent 30d` are no longer supported.
 
 ### Libraries and albums
 
@@ -216,17 +218,17 @@ For all settings, see [example.config.toml](../example.config.toml) and [Configu
 | `--list-libraries` | `kei list libraries` | The old flag was removed in v0.20. |
 | `--cookie-directory` | `data_dir` | The old flag was removed in v0.20. New default is `~/.config/kei`; `KEI_DATA_DIR` still works for automation. |
 | `--folder-structure "{:%Y/%m/%d}"` | `[download].folder_structure = "%Y/%m/%d"` | Python wrapper syntax is still accepted. Use `folder_structure_albums` and `folder_structure_smart_folders` for albums and smart folders. |
-| `--size original` | `[photos].resolution = "original"` | Values: `original`, `medium`, `thumb`, `none`. Use `edited = true` for edited versions and `alternative = true` for other versions, including RAW. |
+| `--size original` | Full-resolution selection is fixed | Included components select originals, current edits and available RAW/JPEG renditions. Medium and thumbnail restrictions are retired. |
 | `--threads-num` | `[download].threads` | Default is 10. With `[download].bandwidth_limit` and no explicit thread count, default drops to 1. |
-| `--skip-videos`, `--skip-photos` | `[filters].media` | Use `media = ["photos", "live-photos"]` to skip videos, or `media = ["videos", "live-photos"]` to skip normal photos. |
-| `--skip-live-photos` | `[photos].live_photo_mode = "skip"` | The old flag was removed in v0.20. |
-| `--recent 100` | `--recent 100` | Count form works for sync and import. |
-| `--recent 30d` | `--recent 30d` for sync | Import rejects the days form. |
+| `--skip-videos`, `--skip-photos` | `[filters].exclude` | Use `exclude = ["videos"]` to skip ordinary videos, or `exclude = ["photos"]` to skip ordinary photos. |
+| `--skip-live-photos` | `[filters].exclude = ["live-photo-stills", "live-photo-videos"]` | Both components are excluded independently of ordinary photos and videos. |
+| `--recent 100` | `kei import-existing --recent 100` | Import-only sampling. Sync count limits are retired. |
+| `--recent 30d` | Fixed sync date bounds | Choose explicit `skip_created_before` and `skip_created_after` dates. Rolling windows are retired. |
 | `--set-exif-datetime` | `[metadata].set_exif_datetime = true` | kei also has EXIF rating, GPS, and description settings. |
 | `--keep-unicode-in-filenames` | `[photos].keep_unicode_in_filenames = true` | Set this before import. |
 | `--live-photo-mov-filename-policy` | `[photos].live_photo_mov_filename_policy` | `suffix` or `original`. |
 | `--file-match-policy` | `[photos].file_match_policy` | `name-size-dedup-with-suffix` or `name-id7`. |
-| `--align-raw` | `[photos].raw_policy` | `as-is`, `prefer-raw`, or `prefer-jpeg`. |
+| `--align-raw` | Provider rendition identities are retained | RAW/JPEG alignment preferences are retired. Available full-resolution siblings are selected together. |
 | `--domain` | `[auth].domain` | `com` or `cn`. |
 | `--watch-with-interval` | `[watch].interval`; Docker uses `kei service run` | Save the repeat interval in the configuration and use the service commands. |
 | `--log-level` | `--log-level` or `log_level` | `debug`, `info`, `warn`, `error`. |

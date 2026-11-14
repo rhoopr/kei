@@ -221,7 +221,7 @@ fn doctor_json_uses_local_config_paths_and_redacts() {
     std::fs::create_dir_all(&data).unwrap();
     let report = dir.path().join("report-doctor-secret@example.com.json");
     let config = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config,
         format!(
             "data_dir = {:?}\n\
@@ -1152,7 +1152,7 @@ fn exit_code_0_on_version() {
 fn exit_code_1_on_missing_username() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config,
         format!(
             "[download]\ndirectory = {:?}\n",
@@ -1180,7 +1180,7 @@ fn exit_code_1_on_missing_username() {
 fn exit_code_3_on_empty_password_file() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config,
         format!(
             "[download]\ndirectory = {:?}\n",
@@ -1215,7 +1215,7 @@ fn exit_code_3_on_empty_password_file() {
 fn exit_code_3_on_newline_only_password_file() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config,
         format!(
             "[download]\ndirectory = {:?}\n",

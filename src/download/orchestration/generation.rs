@@ -81,6 +81,20 @@ pub(crate) struct SelectionContext {
     retry_sources: Arc<std::sync::Mutex<SelectionRetrySources>>,
 }
 
+/// Begin a synthetic historical generation through the normal admission owner.
+/// Tests supply frozen decisions separately, rather than enabling retired policy.
+#[cfg(test)]
+pub(super) async fn begin_frozen_fixture(
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+) -> Result<ActiveGeneration> {
+    let context = context(passes, config, controls)
+        .await?
+        .context("fixture selection context")?;
+    Ok(context.start(passes, config).await?.root.clone())
+}
+
 /// Preserve already admitted writer dependencies before the next sync can
 /// apply source relations or ordinary metadata changes. This does not create
 /// or seal a generation and applies even when current selection is unsupported.
@@ -340,7 +354,6 @@ impl SelectionRun {
         &self,
         tasks: &[filter::DownloadTask],
         passes: &[AlbumPass],
-        config: &DownloadConfig,
     ) -> Result<()> {
         let mut sources = Vec::new();
         for task in tasks {
@@ -376,16 +389,20 @@ impl SelectionRun {
                 };
                 let asset =
                     current_asset(body, &manifest.decision.child, master, &self.root.spec.zone)?;
+                let Some(provider_version) = filter::provider_version_for_frozen_resource(
+                    &asset,
+                    task.version_size,
+                    &task.checksum,
+                    task.size,
+                ) else {
+                    continue;
+                };
                 sources.push((
                     super::url_refresh::RetryTaskKey::from(task),
                     super::url_refresh::UrlRetrySource {
                         asset_record_name: asset.asset_record_name_arc(),
                         master_record_name: Arc::from(master.as_str()),
-                        provider_version: filter::provider_version_for_selected(
-                            &asset,
-                            &config.with_pass(pass),
-                            task.version_size,
-                        ),
+                        provider_version,
                         pass_index,
                     },
                 ));
@@ -599,8 +616,45 @@ impl SelectionRun {
             .await?;
         let mut destinations = Vec::new();
         let mut records = Vec::new();
+        // A frozen historical RAW pair may use the opposite logical keys.
+        // Recover that mapping from exact resource evidence, never current policy.
+        let frozen_key = |provider, checksum: &str, size| -> Result<crate::state::VersionSizeKey> {
+            use crate::state::VersionSizeKey;
+            let Some(previous) = previous
+                .as_ref()
+                .filter(|p| p.decision.confirmation.is_some())
+            else {
+                return Ok(provider);
+            };
+            if !matches!(
+                provider,
+                VersionSizeKey::Original | VersionSizeKey::Alternative
+            ) {
+                return Ok(provider);
+            }
+            let mut candidates = previous.decision.destinations.iter().filter(|d| {
+                matches!(d.version_size.as_str(), "original" | "alternative")
+                    && d.checksum == checksum
+                    && d.size == size
+            });
+            let destination = candidates
+                .next()
+                .context("Frozen RAW resource is missing")?;
+            anyhow::ensure!(
+                candidates.next().is_none(),
+                "Frozen RAW resource is ambiguous"
+            );
+            VersionSizeKey::from_str(&destination.version_size).context("Invalid frozen RAW key")
+        };
+        for task in &mut plan.tasks {
+            task.version_size = frozen_key(task.version_size, &task.checksum, task.size)?;
+        }
         if reason.is_empty() {
-            let derived_paths = filter::derive_expected_paths(asset, config);
+            let mut derived_paths = filter::derive_expected_paths(asset, config);
+            for derived in &mut derived_paths {
+                derived.version_size =
+                    frozen_key(derived.version_size, &derived.checksum, derived.size)?;
+            }
             for derived in &derived_paths {
                 let mut retained = None;
                 let candidates = self
@@ -683,8 +737,21 @@ impl SelectionRun {
                 } else {
                     derived.path.clone()
                 };
-                let metadata =
-                    filter::metadata_for_selected_version(asset, config, derived.version_size);
+                let metadata = if previous
+                    .as_ref()
+                    .is_some_and(|p| p.decision.confirmation.is_some())
+                {
+                    let provider = filter::provider_version_for_frozen_resource(
+                        asset,
+                        derived.version_size,
+                        &derived.checksum,
+                        derived.size,
+                    )
+                    .context("Frozen rendition resource is unresolved")?;
+                    asset.metadata_arc(provider)
+                } else {
+                    filter::metadata_for_selected_version(asset, config, derived.version_size)
+                };
                 let metadata_hash = metadata
                     .metadata_hash
                     .clone()
@@ -1201,8 +1268,7 @@ async fn recover_retained(
             crate::download::pipeline::StreamRuntime::new(None, None).deferring_metadata_drain(),
         )
         .await?;
-        run.remember_retry_sources(&result.failed, passes, config)
-            .await?;
+        run.remember_retry_sources(&result.failed, passes).await?;
         super::models::merge_streaming_result(&mut combined, result);
     }
     context
@@ -1289,8 +1355,7 @@ async fn replay(
                     .deferring_metadata_drain(),
             )
             .await?;
-            run.remember_retry_sources(&result.failed, passes, config)
-                .await?;
+            run.remember_retry_sources(&result.failed, passes).await?;
             super::models::merge_streaming_result(&mut combined, result);
         }
     }

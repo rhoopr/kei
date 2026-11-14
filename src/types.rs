@@ -78,17 +78,6 @@ pub enum PhotoResolution {
     Thumb = 3,
 }
 
-impl PhotoResolution {
-    pub const fn to_asset_version_size(self) -> Option<AssetVersionSize> {
-        match self {
-            Self::None => None,
-            Self::Original => Some(AssetVersionSize::Original),
-            Self::Medium => Some(AssetVersionSize::Medium),
-            Self::Thumb => Some(AssetVersionSize::Thumb),
-        }
-    }
-}
-
 impl From<VersionSize> for PhotoResolution {
     fn from(value: VersionSize) -> Self {
         match value {

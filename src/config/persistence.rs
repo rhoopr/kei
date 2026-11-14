@@ -6,10 +6,7 @@ use super::input::{
 };
 use super::runtime::Config;
 use super::templates::{DEFAULT_FOLDER_STRUCTURE_ALBUMS, DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS};
-use crate::types::{
-    Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoResolution,
-    PhotoResolution, RawPolicy,
-};
+use crate::types::{Domain, FileMatchPolicy, LivePhotoMovFilenamePolicy};
 use std::path::Path;
 
 impl Config {
@@ -19,7 +16,8 @@ impl Config {
     /// never included. Per-run flags (`dry_run`, CLI date bounds, etc.) are omitted.
     pub(crate) fn to_toml(&self) -> TomlConfig {
         TomlConfig {
-            data_dir: None,  // derived from config path, not serialized unless explicit
+            config_version: Some(1),
+            data_dir: None, // derived from config path, not serialized unless explicit
             log_level: None, // only written if user explicitly set it
             auth: Some(TomlAuth {
                 username: if self.auth.username.is_empty() {
@@ -120,30 +118,14 @@ impl Config {
                 } else {
                     Some(false)
                 },
-                media: if self.filters.media.is_all() {
-                    None
-                } else {
-                    Some(self.filters.media.to_kinds())
-                },
+                exclude: Some(super::runtime::MediaExclusion::from_selection(
+                    self.filters.media,
+                    self.photos.live_photo_mode,
+                )),
                 skip_created_before: self.filters.persistent_skip_created_before.clone(),
                 skip_created_after: self.filters.persistent_skip_created_after.clone(),
             }),
             photos: Some(TomlPhotos {
-                resolution: if self.photos.resolution == PhotoResolution::Original {
-                    None
-                } else {
-                    Some(self.photos.resolution)
-                },
-                live_resolution: if self.photos.live_resolution == LivePhotoResolution::Original {
-                    None
-                } else {
-                    Some(self.photos.live_resolution)
-                },
-                live_photo_mode: if self.photos.live_photo_mode == LivePhotoMode::Both {
-                    None
-                } else {
-                    Some(self.photos.live_photo_mode)
-                },
                 live_photo_mov_filename_policy: if self.photos.live_photo_mov_filename_policy
                     == LivePhotoMovFilenamePolicy::Suffix
                 {
@@ -151,28 +133,12 @@ impl Config {
                 } else {
                     Some(self.photos.live_photo_mov_filename_policy)
                 },
-                edited: if self.photos.edited { Some(true) } else { None },
-                alternative: if self.photos.alternative {
-                    Some(true)
-                } else {
-                    None
-                },
-                raw_policy: if self.photos.raw_policy == RawPolicy::AsIs {
-                    None
-                } else {
-                    Some(self.photos.raw_policy)
-                },
                 file_match_policy: if self.photos.file_match_policy
                     == FileMatchPolicy::NameSizeDedupWithSuffix
                 {
                     None
                 } else {
                     Some(self.photos.file_match_policy)
-                },
-                force_resolution: if self.photos.force_resolution {
-                    Some(true)
-                } else {
-                    None
                 },
                 keep_unicode_in_filenames: if self.photos.keep_unicode_in_filenames {
                     Some(true)
@@ -342,6 +308,7 @@ pub(crate) fn persist_first_run_config(
     let data_dir = data_dir_cli.map(String::from);
 
     let minimal = TomlConfig {
+        config_version: Some(1),
         data_dir,
         log_level: None,
         auth: full.auth.map(|a| TomlAuth {
@@ -412,7 +379,7 @@ pub(crate) fn persist_first_run_config(
 mod tests {
     use super::persist_first_run_config;
     use crate::config::input::TomlConfig;
-    use crate::config::runtime::{Config, MediaKind};
+    use crate::config::runtime::Config;
     use crate::config::test_support::{default_globals, default_password, default_sync};
     use std::path::PathBuf;
 
@@ -529,8 +496,7 @@ mod tests {
         let toml = cfg.to_toml();
         // Default domain (com) should be omitted
         assert!(toml.auth.as_ref().unwrap().domain.is_none());
-        // Default resolution (original) should be omitted
-        assert!(toml.photos.as_ref().unwrap().resolution.is_none());
+        assert_eq!(toml.config_version, Some(1));
         // Default temp_suffix should be omitted
         assert!(toml.download.as_ref().unwrap().temp_suffix.is_none());
     }
@@ -561,7 +527,7 @@ mod tests {
         let pw = default_password();
         globals.domain = Some(crate::types::Domain::Cn);
         let mut sync = default_sync();
-        sync.config_overrides.resolution = Some(crate::types::PhotoResolution::Medium);
+        sync.config_overrides.file_match_policy = Some(crate::types::FileMatchPolicy::NameId7);
         let cfg = Config::build(&globals, &pw, sync, None).unwrap();
         let toml = cfg.to_toml();
         assert_eq!(
@@ -569,8 +535,8 @@ mod tests {
             Some(crate::types::Domain::Cn)
         );
         assert_eq!(
-            toml.photos.as_ref().unwrap().resolution,
-            Some(crate::types::PhotoResolution::Medium)
+            toml.photos.as_ref().unwrap().file_match_policy,
+            Some(crate::types::FileMatchPolicy::NameId7)
         );
     }
     #[test]
@@ -636,7 +602,7 @@ mod tests {
     fn test_to_toml_roundtrip_media() {
         let toml_str = r#"
             [filters]
-            media = ["photos", "live-photos"]
+            exclude = ["videos"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
@@ -649,8 +615,8 @@ mod tests {
         let serialized = cfg.to_toml();
         let filters = serialized.filters.as_ref().unwrap();
         assert_eq!(
-            filters.media.as_deref(),
-            Some(&[MediaKind::Photos, MediaKind::LivePhotos][..])
+            filters.exclude.as_deref(),
+            Some(&[crate::config::MediaExclusion::Videos][..])
         );
     }
     #[test]
@@ -686,22 +652,60 @@ mod tests {
         let _: TomlConfig = ::toml::from_str(&serialized).unwrap();
     }
     #[test]
-    fn test_to_toml_roundtrip_live_photo_mode() {
-        let mut sync = default_sync();
-        sync.config_overrides.live_photo_mode = Some(crate::types::LivePhotoMode::ImageOnly);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        let toml = cfg.to_toml();
-        assert_eq!(
-            toml.photos.as_ref().unwrap().live_photo_mode,
-            Some(crate::types::LivePhotoMode::ImageOnly)
-        );
-        // Round-trip
-        let serialized = ::toml::to_string_pretty(&toml).unwrap();
-        let parsed: TomlConfig = ::toml::from_str(&serialized).unwrap();
-        assert_eq!(
-            parsed.photos.as_ref().unwrap().live_photo_mode,
-            Some(crate::types::LivePhotoMode::ImageOnly)
-        );
+    fn test_to_toml_roundtrip_component_exclusions() {
+        use crate::config::MediaExclusion;
+        let components = [
+            MediaExclusion::Photos,
+            MediaExclusion::Videos,
+            MediaExclusion::LivePhotoStills,
+            MediaExclusion::LivePhotoVideos,
+        ];
+        for mask in 0..16 {
+            let exclusions: Vec<_> = components
+                .iter()
+                .enumerate()
+                .filter_map(|(index, component)| (mask & (1 << index) != 0).then_some(*component))
+                .collect();
+            let mut input: TomlConfig =
+                ::toml::from_str("config_version=1\n[filters]\nexclude=[]").unwrap();
+            input.filters.as_mut().unwrap().exclude = Some(exclusions.clone());
+            let result = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&input),
+            );
+            if mask == 15 {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("at least one media component")
+                );
+                continue;
+            }
+            let config = result.unwrap();
+            let serialized = ::toml::to_string_pretty(&config.to_toml()).unwrap();
+            let parsed: TomlConfig = ::toml::from_str(&serialized).unwrap();
+            assert_eq!(parsed.config_version, Some(1));
+            assert_eq!(
+                parsed.filters.as_ref().unwrap().exclude.as_ref(),
+                Some(&exclusions)
+            );
+            let reopened = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&parsed),
+            )
+            .unwrap();
+            assert_eq!(reopened.filters.media, config.filters.media);
+            assert_eq!(
+                reopened.photos.live_photo_mode,
+                config.photos.live_photo_mode
+            );
+            assert!(reopened.photos.edited && reopened.photos.alternative);
+        }
     }
     #[test]
     fn test_to_toml_default_live_photo_mode_omitted() {
@@ -713,7 +717,10 @@ mod tests {
         )
         .unwrap();
         let toml = cfg.to_toml();
-        assert!(toml.photos.as_ref().unwrap().live_photo_mode.is_none());
+        assert_eq!(
+            toml.filters.as_ref().unwrap().exclude.as_deref(),
+            Some([].as_slice())
+        );
     }
     #[test]
     fn test_to_toml_roundtrip_bandwidth_limit() {

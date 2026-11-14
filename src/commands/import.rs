@@ -942,7 +942,6 @@ where
             tracing::warn!(
                 id = %asset.id(),
                 live_photo_mode = ?path_config.live_photo_mode(),
-                force_resolution = path_config.force_resolution(),
                 "Skipping asset with no expected paths from path-derivation",
             );
             stats.filtered += 1;
@@ -1369,24 +1368,8 @@ fn build_import_path_config(
     config::validate_download_dir(&directory_path)?;
     let directory: Arc<Path> = Arc::from(directory_path.as_path());
 
-    let path_fields = config::resolve_path_derivation_fields(
-        config::PathDerivationCliArgs {
-            folder_structure: None,
-            folder_structure_albums: None,
-            folder_structure_smart_folders: None,
-            resolution: None,
-            live_photo_mode: None,
-            live_resolution: None,
-            live_photo_mov_filename_policy: None,
-            edited: None,
-            alternative: None,
-            raw_policy: None,
-            file_match_policy: None,
-            force_resolution: None,
-            keep_unicode_in_filenames: None,
-        },
-        toml,
-    )?;
+    let path_fields =
+        config::resolve_path_derivation_fields(config::PathDerivationCliArgs::default(), toml)?;
     let media = config::resolve_media_selection(toml.and_then(|t| t.filters.as_ref()), None, None)?;
 
     let config = PathDerivationConfig::from_path_fields(directory, path_fields, media);
@@ -3347,7 +3330,7 @@ mod wiremock_tests {
     }
 
     #[tokio::test]
-    async fn force_resolution_strict_skips_when_size_missing() {
+    async fn missing_local_original_is_unmatched_not_filtered() {
         let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("FS2", "IMG_0002.JPG", "public.jpeg").orig(
             1000,
@@ -3364,12 +3347,10 @@ mod wiremock_tests {
         let db = open_db(&tmp).await;
         let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
         assert_eq!(stats.total, 1);
-        assert_eq!(stats.matched, 0, "force_resolution strict must skip");
-        assert_eq!(stats.unmatched, 0);
-        assert_eq!(
-            stats.filtered, 1,
-            "force_resolution + missing size produces empty expected paths -> filtered",
-        );
+        assert_eq!(stats.matched, 0);
+        assert_eq!(stats.unmatched, 1);
+        assert_eq!(stats.filtered, 0);
+        assert!(all_downloaded(db.as_ref()).await.is_empty());
     }
 
     // ── Tests: pagination + EOF ───────────────────────────────────────
@@ -3480,9 +3461,9 @@ mod wiremock_tests {
                 for row in &rows {
                     let (width, height, checksum) = if row.version_size == VersionSizeKey::Original
                     {
-                        (6000, 4500, "alternative")
-                    } else {
                         (4000, 3000, "original")
+                    } else {
+                        (6000, 4500, "alternative")
                     };
                     assert_eq!(
                         (row.metadata.width, row.metadata.height),
@@ -4963,9 +4944,7 @@ mod build_config_tests {
     use super::build_import_path_config;
     use crate::cli::{Cli, Command};
     use crate::config::{Config, GlobalArgs, TomlConfig};
-    use crate::types::{
-        AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
-    };
+    use crate::types::{FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy};
     use clap::Parser;
 
     fn parse_import_args(extra: &[&str]) -> crate::cli::ImportArgs {
@@ -4999,33 +4978,25 @@ mod build_config_tests {
             folder_structure = "%Y/%m"
 
             [photos]
-            resolution = "medium"
             file_match_policy = "name-id7"
-            live_photo_mode = "video-only"
-            live_resolution = "thumb"
             live_photo_mov_filename_policy = "original"
-            raw_policy = "prefer-raw"
-            force_resolution = true
             keep_unicode_in_filenames = true
 
             [filters]
-            media = ["photos", "live-photos"]
+            exclude = ["videos", "live-photo-stills"]
             "#,
         );
 
         let cfg = build_import_path_config(Some(&toml)).unwrap();
 
         assert_eq!(cfg.folder_structure, "%Y/%m");
-        assert_eq!(cfg.resolution, crate::types::PhotoResolution::Medium);
         assert_eq!(cfg.file_match_policy, FileMatchPolicy::NameId7);
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::VideoOnly);
-        assert_eq!(cfg.live_resolution, AssetVersionSize::LiveThumb);
         assert_eq!(
             cfg.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Original
         );
-        assert_eq!(cfg.raw_policy, RawPolicy::PreferRaw);
-        assert!(cfg.force_resolution);
+        assert_eq!(cfg.raw_policy, RawPolicy::AsIs);
         assert!(cfg.keep_unicode_in_filenames);
         assert!(cfg.media.photos);
         assert!(!cfg.media.videos);
@@ -5038,19 +5009,16 @@ mod build_config_tests {
     fn build_import_path_config_falls_through_to_default() {
         let toml = toml_with_download("");
         let cfg = build_import_path_config(Some(&toml)).unwrap();
-        assert_eq!(cfg.resolution, crate::types::PhotoResolution::Original);
         assert_eq!(
             cfg.file_match_policy,
             FileMatchPolicy::NameSizeDedupWithSuffix
         );
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::Both);
-        assert_eq!(cfg.live_resolution, AssetVersionSize::LiveOriginal);
         assert_eq!(
             cfg.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Suffix
         );
         assert_eq!(cfg.raw_policy, RawPolicy::AsIs);
-        assert!(!cfg.force_resolution);
         assert!(!cfg.keep_unicode_in_filenames);
         assert_eq!(cfg.folder_structure, "%Y/%m/%d");
     }
@@ -5078,12 +5046,8 @@ mod build_config_tests {
             folder_structure = "%Y/%m"
 
             [photos]
-            resolution = "original"
-            edited = true
             file_match_policy = "name-id7"
             live_photo_mov_filename_policy = "original"
-            raw_policy = "prefer-raw"
-            force_resolution = true
             keep_unicode_in_filenames = true
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
@@ -5109,12 +5073,7 @@ mod build_config_tests {
             import_cfg.folder_structure,
             sync_cfg.download.folder_structure
         );
-        assert_eq!(import_cfg.resolution, sync_cfg.photos.resolution);
         assert_eq!(import_cfg.live_photo_mode, sync_cfg.photos.live_photo_mode);
-        assert_eq!(
-            import_cfg.live_resolution,
-            sync_cfg.photos.live_resolution.to_asset_version_size()
-        );
         assert_eq!(
             import_cfg.live_photo_mov_filename_policy,
             sync_cfg.photos.live_photo_mov_filename_policy
@@ -5123,10 +5082,6 @@ mod build_config_tests {
         assert_eq!(
             import_cfg.file_match_policy,
             sync_cfg.photos.file_match_policy
-        );
-        assert_eq!(
-            import_cfg.force_resolution,
-            sync_cfg.photos.force_resolution
         );
         assert_eq!(
             import_cfg.keep_unicode_in_filenames,

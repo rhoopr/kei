@@ -568,8 +568,7 @@ pub(in crate::download) async fn build_download_result(
     };
     let retry_plan = if let Some(context) = &config.selection_context {
         if let Some(run) = &config.selection_run {
-            run.remember_retry_sources(&failed_tasks, passes, config)
-                .await?;
+            run.remember_retry_sources(&failed_tasks, passes).await?;
         }
         let sources = context.exact_retry_sources()?;
         crate::download::orchestration::url_refresh::build_incremental_expired_url_retry_tasks(

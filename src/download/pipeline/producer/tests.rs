@@ -1049,9 +1049,9 @@ async fn raw_policy_rendition_metadata_tracks_bytes_across_refresh_and_config_dr
                         .await
                         .unwrap();
                     let body = if task.version_size == VersionSizeKey::Original {
-                        alternative.0
-                    } else {
                         original.0
+                    } else {
+                        alternative.0
                     };
                     fs::create_dir_all(task.download_path.parent().unwrap()).unwrap();
                     fs::write(&task.download_path, body).unwrap();
@@ -1105,7 +1105,7 @@ async fn raw_policy_rendition_metadata_tracks_bytes_across_refresh_and_config_dr
                 assert_eq!(rows.len(), 2);
                 for row in &rows {
                     let (provider_key, body, width, height) =
-                        if row.version_size == VersionSizeKey::Original {
+                        if row.version_size == VersionSizeKey::Alternative {
                             (
                                 VersionSizeKey::Alternative,
                                 alternative.0,
@@ -1177,7 +1177,7 @@ async fn raw_policy_rendition_metadata_tracks_bytes_across_refresh_and_config_dr
             assert_eq!(result.state_write_failures, 0);
             let rows = db.get_downloaded_page(0, 10).await.unwrap();
             for row in rows {
-                if row.version_size == VersionSizeKey::Original {
+                if row.version_size == VersionSizeKey::Alternative {
                     assert_eq!(row.metadata.width, Some(9999));
                 } else {
                     assert_eq!(
@@ -1243,31 +1243,31 @@ async fn filtered_replacement_renditions_capture_shared_metadata_without_guessin
         let mut config = DownloadConfig::test_default();
         config.directory = Arc::from(dir.path());
         config.state_db = Some(db.clone());
-        if key == VersionSizeKey::Medium {
-            config.resolution = crate::types::PhotoResolution::Medium;
-        }
-        if key == VersionSizeKey::LiveMedium {
-            config.live_resolution = crate::types::AssetVersionSize::LiveMedium;
-        }
-        let derived = derive_expected_paths(&stored, &config)
-            .into_iter()
-            .find(|path| path.version_size == key)
-            .unwrap();
-        fs::create_dir_all(derived.path.parent().unwrap()).unwrap();
+        // Historical preview rows must remain recoverable even though current
+        // selection cannot create them. Seed their recorded resource directly.
+        let historical_path = dir
+            .path()
+            .join(format!("historical-{}.media", key.as_str()));
         let bytes = vec![0u8; 1000];
-        fs::write(&derived.path, &bytes).unwrap();
-        let local_checksum = crate::download::file::compute_sha256(&derived.path)
+        fs::write(&historical_path, &bytes).unwrap();
+        let local_checksum = crate::download::file::compute_sha256(&historical_path)
             .await
             .unwrap();
-        let record =
-            asset_record_for_derived_path(Arc::from("PrimarySync"), &stored, &derived, &config);
+        let record = crate::test_helpers::TestAssetRecord::new(stored.state_id())
+            .library("PrimarySync")
+            .filename(historical_path.file_name().unwrap().to_str().unwrap())
+            .checksum("previous")
+            .size(1000)
+            .version_size(key)
+            .metadata((*stored.metadata_arc(key)).clone())
+            .build();
         assert_eq!(record.metadata.width, Some(1920));
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded(
             "PrimarySync",
             stored.state_id(),
             key.as_str(),
-            &derived.path,
+            &historical_path,
             &local_checksum,
             None,
         )
@@ -1322,9 +1322,9 @@ async fn filtered_replacement_renditions_capture_shared_metadata_without_guessin
             assert_eq!(row.local_checksum, before.local_checksum);
             assert_eq!(row.download_checksum, before.download_checksum);
             assert_eq!(row.downloaded_at, before.downloaded_at);
-            assert_eq!(fs::read(&derived.path).unwrap(), bytes);
+            assert_eq!(fs::read(&historical_path).unwrap(), bytes);
             assert_eq!(
-                fs::read_dir(derived.path.parent().unwrap())
+                fs::read_dir(historical_path.parent().unwrap())
                     .unwrap()
                     .count(),
                 1
@@ -1388,9 +1388,9 @@ async fn forced_metadata_refresh_resolves_completed_sibling_with_stale_preload()
             .await
             .unwrap();
         let body = if task.version_size == VersionSizeKey::Original {
-            raw
-        } else {
             jpeg
+        } else {
+            raw
         };
         fs::create_dir_all(task.download_path.parent().unwrap()).unwrap();
         fs::write(&task.download_path, body).unwrap();
@@ -1414,12 +1414,12 @@ async fn forced_metadata_refresh_resolves_completed_sibling_with_stale_preload()
     assert_eq!(db.get_pending().await.unwrap().len(), 1);
     // Reject even an intermediate refresh that uses provider keys instead of
     // the current downloaded checksums. Final-state assertions alone miss it.
-    db.acquire_lock("guard swapped metadata")
+    db.acquire_lock("guard resource metadata")
         .unwrap()
         .execute_batch(
-            "CREATE TRIGGER guard_swapped_metadata BEFORE UPDATE OF width ON assets
-         WHEN (NEW.version_size = 'original' AND NEW.width IS NOT 6000)
-           OR (NEW.version_size = 'alternative' AND NEW.width IS NOT 4000)
+            "CREATE TRIGGER guard_resource_metadata BEFORE UPDATE OF width ON assets
+         WHEN (NEW.version_size = 'original' AND NEW.width IS NOT 4000)
+           OR (NEW.version_size = 'alternative' AND NEW.width IS NOT 6000)
          BEGIN SELECT RAISE(ABORT, 'wrong rendition metadata'); END;",
         )
         .unwrap();
@@ -1456,9 +1456,9 @@ async fn forced_metadata_refresh_resolves_completed_sibling_with_stale_preload()
                 .find(|task| task.version_size == row.version_size)
                 .unwrap();
             let (width, body) = if row.version_size == VersionSizeKey::Original {
-                (6000, raw)
-            } else {
                 (4000, jpeg)
+            } else {
+                (6000, raw)
             };
             assert_eq!(row.metadata.width, Some(width));
             assert_eq!(row.metadata.is_favorite, cycle > 0);

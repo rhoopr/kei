@@ -105,7 +105,7 @@ fn config(root: &Path) -> ConfigSource {
     let path = root.join("custom.toml");
     std::fs::write(
         &path,
-        b"# retain exact comments and CRLF\r\n[filters]\r\nskip_created_before = '2020-01-01'\r\n",
+        b"# retain exact comments and CRLF\r\nconfig_version = 1\r\n[filters]\r\nskip_created_before = '2020-01-01'\r\n",
     )
     .unwrap();
     load_toml_config_with_source(&path, true).unwrap().1

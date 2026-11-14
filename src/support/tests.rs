@@ -300,8 +300,16 @@ fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
             super::runtime_configuration(&config)["live_photo_mode"],
             label
         );
+        let exclusions = crate::config::MediaExclusion::from_selection(
+            crate::config::MediaSelection::all(),
+            variant,
+        );
+        let names: Vec<_> = exclusions
+            .iter()
+            .map(|kind| format!("{:?}", kind.as_str()))
+            .collect();
         let input: crate::config::TomlConfig =
-            toml::from_str(&format!("[photos]\nlive_photo_mode={label:?}")).unwrap();
+            toml::from_str(&format!("[filters]\nexclude=[{}]", names.join(","))).unwrap();
         assert_eq!(
             super::configuration(Some(&input), true)["live_photo_mode"],
             label

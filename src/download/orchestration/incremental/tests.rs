@@ -1212,7 +1212,21 @@ async fn filtered_original_replacement_refreshes_metadata_and_advances_checkpoin
                 records[0]["fields"]["resOriginalAltWidth"] = json!({"value": 6000});
                 records[0]["fields"]["resOriginalAltHeight"] = json!({"value": 4500});
             }
-            let stored = PhotoAsset::new(records[0].clone(), records[1].clone())
+            // Seed the historical RAW-only original binding directly. Current
+            // selection includes both siblings, so it cannot recreate this old
+            // restrictive policy through the live selector.
+            let mut stored_master = records[0].clone();
+            if swapped_original_only {
+                for suffix in ["Res", "FileType", "Width", "Height"] {
+                    let value = stored_master["fields"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(&format!("resOriginalAlt{suffix}"))
+                        .unwrap();
+                    stored_master["fields"][format!("resOriginal{suffix}")] = value;
+                }
+            }
+            let stored = PhotoAsset::new(stored_master, records[1].clone())
                 .with_state_record_name(Arc::from("asset-REPLACED"));
             let pass = AlbumPass {
                 kind: PassKind::Unfiled,
@@ -1428,7 +1442,7 @@ async fn raw_policy_incremental_metadata_refresh_captures_unknown_bytes_without_
                     .iter()
                     .find(|initial| initial.version_size == row.version_size)
                     .unwrap();
-                let expected = if row.version_size == VersionSizeKey::Original {
+                let expected = if row.version_size == VersionSizeKey::Alternative {
                     if cycle < 2 {
                         (Some(6200), Some(4500))
                     } else {
@@ -1439,7 +1453,7 @@ async fn raw_policy_incremental_metadata_refresh_captures_unknown_bytes_without_
                 };
                 assert_eq!((row.metadata.width, row.metadata.height), expected);
                 assert_eq!(row.metadata.is_favorite, cycle >= 2);
-                if cycle >= 2 && row.version_size == VersionSizeKey::Original {
+                if cycle >= 2 && row.version_size == VersionSizeKey::Alternative {
                     assert_eq!(row.metadata.duration_secs, None);
                 }
                 assert_eq!(

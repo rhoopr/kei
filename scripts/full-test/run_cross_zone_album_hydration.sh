@@ -55,6 +55,7 @@ config="$work/cross-zone.toml"
 {
     printf 'data_dir = %s\n' "$(kei_toml_string "$data_dir")"
     echo
+    echo "config_version = 1"
     echo "[auth]"
     printf 'username = %s\n' "$(kei_toml_string "$ICLOUD_USERNAME")"
     echo

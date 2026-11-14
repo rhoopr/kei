@@ -1980,7 +1980,7 @@ async fn path_reconciliation_live_resolution_change_preserves_rendition_ownershi
     let mut records = mock_photo_records_for_zone_with_filename("LIVE", "PrimarySync", "live.jpg");
     for (key, size, url) in [
         ("resOriginalVidCompl", 1024, "original"),
-        ("resVidMed", 512, "medium"),
+        ("resVidCompl", 512, "edited"),
     ] {
         records[0]["fields"][format!("{key}Res")] = json!({"value": {
             "downloadURL": format!("https://p01.icloud-content.com/{url}.mov"),
@@ -1995,8 +1995,13 @@ async fn path_reconciliation_live_resolution_change_preserves_rendition_ownershi
     std::fs::create_dir_all(&config.directory).unwrap();
     config.state_db = Some(db.clone());
     let expected = filter::expected_paths_for(&asset, &config);
-    assert_eq!(expected.len(), 2);
-    for item in expected {
+    assert_eq!(expected.len(), 3);
+    // Model an archive made before edited companions were selected. The new
+    // edit must get independent ownership without displacing the original.
+    for item in expected
+        .into_iter()
+        .filter(|item| item.version_size != VersionSizeKey::LiveAdjusted)
+    {
         let source = root.path().join("old").join(item.path.file_name().unwrap());
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         std::fs::write(&source, vec![1u8; 1024]).unwrap();
@@ -2055,7 +2060,7 @@ async fn path_reconciliation_live_resolution_change_preserves_rendition_ownershi
             .unwrap();
     assert!(
         changed.complete,
-        "changing live resolution must leave the newly selected rendition to normal download: {changed:?}"
+        "the new edited companion remains for normal download: {changed:?}"
     );
     assert_eq!(changed.stats.downloaded, 0);
     assert_eq!(changed.stats.state_write_failures, 0);

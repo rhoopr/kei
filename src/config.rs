@@ -55,7 +55,7 @@ pub use runtime::{
     MetadataConfig, NotificationConfig, PhotoConfig, ReportConfig, ResolvedRetryConfig,
     RuntimeConfig, ServerConfig, UiConfig, WatchConfig,
 };
-pub(crate) use runtime::{MediaKind, MediaSelection, parse_created_date_filter};
+pub(crate) use runtime::{MediaExclusion, MediaKind, MediaSelection, parse_created_date_filter};
 #[cfg_attr(
     not(test),
     expect(

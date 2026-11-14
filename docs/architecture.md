@@ -97,7 +97,7 @@ match their headings, so searching a label finds the section.
 | Asset planning | `src/download/planner.rs` | Applies filters, derives tasks, records dispatched pending work, and persists membership and identity mappings. |
 | Filter facade and configuration | `src/download/filter.rs`, `src/download/filter/config.rs` | Preserves filter entry points and shares path and filter settings between sync and import. |
 | Asset eligibility | `src/download/filter/eligibility.rs` | Owns content and date filters and media classification, without path or filesystem decisions. |
-| Rendition selection | `src/download/filter/versions.rs` | Owns RAW alignment, primary and companion selection, and selected-rendition metadata keys. |
+| Rendition selection | `src/download/filter/versions.rs` | Owns full-resolution original, current-edit and alternative selection for included components, provider rendition keys, and checksum-based historical resource recovery. |
 | Task metadata | `src/download/filter/metadata.rs` | Builds metadata payloads with preloaded album and people groupings. |
 | Expected asset paths | `src/download/filter/expected_paths.rs` | Derives paths shared by sync and import before collision resolution; uses the rendition-selection owner. |
 | Collision planning | `src/download/filter/collisions.rs` | Owns normalized path claims and existing-file collision resolution. |
@@ -670,7 +670,13 @@ the selected run and preserve the existing bounded reauthentication route.
 Non-authentication proof failures retain their own deferred debt. Active cleanup
 reconstructs original failed tasks' child/master and provider-rendition binding
 from their validated declarations, then uses the existing exact URL-refresh
-owner. A refreshed URL cannot replace frozen selection, metadata, path or
+owner. Historical RAW original/alternative relabeling is resolved by a unique
+checksum-and-size match in the frozen provider response, independently of the
+current configuration. Generation replay restores historical logical RAW keys
+from the frozen destinations before projecting records or dispatching tasks.
+Pending-record metadata follows the resource's provider key. New selection
+never swaps original and alternative keys. Ambiguous siblings remain unresolved; other rendition
+keys require an exact key match. A refreshed URL cannot replace frozen selection, metadata, path or
 publication authorization. A transient per-invocation registry composes failed
 historical and current runs; it is not durable identity or a separate memory quota.
 
@@ -2192,6 +2198,25 @@ Keep the guide focused on stable ownership and safety. Source code remains the
 final authority. Do not cite build output, local session files, retained
 investigation notes, or release history as an ownership claim. Describe the
 current owner instead.
+
+## Rendition policy and configuration migration
+
+`config/input.rs` requires top-level `config_version = 1` in existing files and
+rejects retired rendition restrictions before startup can persist configuration
+or open provider work. `config/resolve.rs` maps `[filters].exclude` to four
+independent components: ordinary photos, ordinary videos, Live Photo stills and
+Live Photo videos. Excluding all four is invalid. Persistence and setup emit the
+same marker and exclusions.
+
+`download/filter/versions.rs` selects available full-resolution originals,
+current edits and alternatives for included components. Medium and thumbnail
+resources do not replace a missing original. Live Photo still exclusion covers
+original, edited and alternative stills; video exclusion covers original and
+edited companions. URL deduplication prevents duplicate transfers. Shared
+expected paths keep import and sync resource identities and filenames aligned.
+Historical rendition keys remain readable for state and metadata recovery.
+Expanded defaults intentionally change the enumeration safety hash; its old
+policy encoding remains pinned for historical evidence.
 
 ## Managed edited-primary layouts
 

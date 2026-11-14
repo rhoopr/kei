@@ -17,6 +17,57 @@ pub(crate) enum MediaKind {
     LivePhotos,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum MediaExclusion {
+    Photos,
+    Videos,
+    LivePhotoStills,
+    LivePhotoVideos,
+}
+
+impl MediaExclusion {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Photos => "photos",
+            Self::Videos => "videos",
+            Self::LivePhotoStills => "live-photo-stills",
+            Self::LivePhotoVideos => "live-photo-videos",
+        }
+    }
+    pub(crate) fn live_mode(exclusions: &[Self]) -> LivePhotoMode {
+        match (
+            exclusions.contains(&Self::LivePhotoStills),
+            exclusions.contains(&Self::LivePhotoVideos),
+        ) {
+            (false, false) => LivePhotoMode::Both,
+            (false, true) => LivePhotoMode::ImageOnly,
+            (true, false) => LivePhotoMode::VideoOnly,
+            (true, true) => LivePhotoMode::Skip,
+        }
+    }
+
+    pub(crate) fn from_selection(media: MediaSelection, live: LivePhotoMode) -> Vec<Self> {
+        [
+            (!media.photos, Self::Photos),
+            (!media.videos, Self::Videos),
+            (
+                !media.live_photos
+                    || matches!(live, LivePhotoMode::Skip | LivePhotoMode::VideoOnly),
+                Self::LivePhotoStills,
+            ),
+            (
+                !media.live_photos
+                    || matches!(live, LivePhotoMode::Skip | LivePhotoMode::ImageOnly),
+                Self::LivePhotoVideos,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(excluded, kind)| excluded.then_some(kind))
+        .collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MediaSelection {
     pub photos: bool,
@@ -517,7 +568,10 @@ mod tests {
     }
     #[test]
     fn narrows_enumeration_true_for_media_subset() {
-        let toml: TomlConfig = toml::from_str("[filters]\nmedia = [\"photos\"]\n").unwrap();
+        let toml: TomlConfig = toml::from_str(
+            "[filters]\nexclude = ['videos', 'live-photo-stills', 'live-photo-videos']\n",
+        )
+        .unwrap();
         let cfg = Config::build(
             &default_globals(),
             &default_password(),

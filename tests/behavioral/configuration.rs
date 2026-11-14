@@ -37,7 +37,7 @@ fn config_show_contains_username() {
 fn config_show_reflects_directory_from_toml() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/my/photos\"\n",
     )
@@ -57,7 +57,7 @@ fn config_show_rejects_toml_with_password() {
     // the migration message rather than silently dropping the field.
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"x@x.com\"\npassword = \"super_secret_value\"\n",
     )
@@ -80,7 +80,7 @@ fn config_show_rejects_toml_with_password() {
 fn config_show_reflects_toml_values() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         r#"
 [auth]
@@ -114,7 +114,7 @@ fn config_show_preserves_top_level_toml_values() {
     let config_path = dir.path().join("config.toml");
     let data_dir = dir.path().join("data");
     let data_dir_string = data_dir.to_string_lossy();
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         format!(
             r#"
@@ -157,7 +157,7 @@ fn config_show_omits_derived_top_level_values_when_unset() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     let download_dir = dir.path().join("photos");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         format!(
             r#"
@@ -201,7 +201,7 @@ fn config_show_emits_unfiled_false_when_explicit() {
     // we can observe directly in `kei config show` output.
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         r#"
 [auth]
@@ -236,7 +236,7 @@ unfiled = false
 fn config_show_cli_overrides_toml() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         r#"
 [auth]
@@ -307,7 +307,7 @@ fn first_run_auto_config_creates_file() {
 fn first_run_auto_config_does_not_overwrite() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(&config_path, "# existing config\n").unwrap();
+    common::write_versioned_config(&config_path, "# existing config\n").unwrap();
 
     clean_cmd()
         .args(["config", "show", "--config", config_path.to_str().unwrap()])
@@ -316,7 +316,7 @@ fn first_run_auto_config_does_not_overwrite() {
 
     let content = std::fs::read_to_string(&config_path).unwrap();
     assert_eq!(
-        content, "# existing config\n",
+        content, "config_version = 1\n# existing config\n",
         "auto-config must not overwrite existing file"
     );
 }
@@ -332,7 +332,7 @@ fn legacy_icloudpd_rs_paths_are_not_auto_copied_on_startup() {
     std::fs::create_dir_all(&old_cookie_dir).unwrap();
     std::fs::write(&old_config, "[auth]\nusername = \"legacy@example.com\"\n").unwrap();
     std::fs::write(old_cookie_dir.join("session.json"), "{}").unwrap();
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"current@example.com\"\n[download]\ndirectory = \"/tmp/codex/kei/photos\"\n",
     )
@@ -389,7 +389,7 @@ fn config_unknown_toml_field() {
 fn config_empty_username_in_toml() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"\"\n\n[download]\ndirectory = \"/photos\"\n",
     )
@@ -410,7 +410,7 @@ fn config_toml_password_field_rejected() {
     // `[auth] password` is not accepted, empty or otherwise.
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"x@x.com\"\npassword = \"\"\n\n[download]\ndirectory = \"/photos\"\n",
     )
@@ -434,7 +434,7 @@ fn config_multiple_password_sources_in_toml() {
     // still rejected with "pick one".
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"x@x.com\"\npassword_file = \"/tmp/pw\"\npassword_command = \"echo hi\"\n\n[download]\ndirectory = \"/photos\"\n",
     )
@@ -453,7 +453,7 @@ fn config_strftime_folder_structure_accepted() {
     // The process may fail auth, but it should NOT fail config validation.
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\nfolder_structure = \"%Y/%B/%d\"\n",
     )
@@ -471,7 +471,7 @@ fn config_strftime_folder_structure_accepted() {
 fn config_valid_folder_structure_ymd() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\nfolder_structure = \"%Y/%m/%d\"\n",
     )
@@ -488,7 +488,7 @@ fn config_valid_folder_structure_ymd() {
 fn config_valid_folder_structure_ym() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\nfolder_structure = \"%Y-%m\"\n",
     )
@@ -505,7 +505,7 @@ fn config_valid_folder_structure_ym() {
 fn config_valid_folder_structure_ymdh() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\nfolder_structure = \"%Y/%m/%d/%H\"\n",
     )
@@ -522,7 +522,7 @@ fn config_valid_folder_structure_ymdh() {
 fn config_folder_structure_none() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\nfolder_structure = \"none\"\n",
     )
@@ -540,7 +540,7 @@ fn config_folder_structure_none() {
 fn config_watch_interval_below_60_in_toml() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\n\n[watch]\ninterval = 30\n",
     )
@@ -559,7 +559,7 @@ fn config_watch_interval_below_60_in_toml() {
 fn config_retry_delay_toml_key_is_removed() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\n\n[download.retry]\ndelay = 5\n",
     )
@@ -576,7 +576,7 @@ fn config_retry_delay_toml_key_is_removed() {
 fn config_threads_num_toml_key_is_removed() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\nthreads_num = 4\n",
     )
@@ -593,7 +593,7 @@ fn config_threads_num_toml_key_is_removed() {
 fn config_resolution_toml_only() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"tomluser@example.com\"\n\n[download]\ndirectory = \"/toml/dir\"\n",
     )
@@ -614,7 +614,8 @@ fn config_resolution_toml_only() {
 fn config_resolution_toml_username_used() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(&config_path, "[auth]\nusername = \"toml@example.com\"\n").unwrap();
+    common::write_versioned_config(&config_path, "[auth]\nusername = \"toml@example.com\"\n")
+        .unwrap();
 
     clean_cmd()
         .env_remove("ICLOUD_USERNAME")
@@ -628,7 +629,8 @@ fn config_resolution_toml_username_used() {
 fn config_resolution_env_overrides_toml() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(&config_path, "[auth]\nusername = \"toml@example.com\"\n").unwrap();
+    common::write_versioned_config(&config_path, "[auth]\nusername = \"toml@example.com\"\n")
+        .unwrap();
 
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", "env@example.com")
@@ -695,7 +697,7 @@ fn config_show_does_not_read_password_file_contents() {
     let config_path = dir.path().join("config.toml");
     // Use TOML literal strings (single quotes) for the path so Windows
     // paths like `C:\Users\...` don't get interpreted as `\U...` escapes.
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         format!(
             "[auth]\nusername = \"x@x.com\"\npassword_file = '{}'\n",
@@ -910,7 +912,7 @@ fn config_setup_requires_interactive_terminal() {
 fn toml_domain_cn() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"x@x.com\"\ndomain = \"cn\"\n",
     )
@@ -927,7 +929,7 @@ fn toml_domain_cn() {
 fn config_show_reflects_threads_from_toml() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         "[auth]\nusername = \"x@x.com\"\n\n[download]\nthreads = 4\n",
     )
@@ -947,7 +949,8 @@ fn config_show_reflects_threads_from_toml() {
 fn kei_config_env_var_loads_toml() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("env-config.toml");
-    std::fs::write(&config_path, "[auth]\nusername = \"fromenv@example.com\"\n").unwrap();
+    common::write_versioned_config(&config_path, "[auth]\nusername = \"fromenv@example.com\"\n")
+        .unwrap();
 
     clean_cmd()
         .env("KEI_CONFIG", config_path.to_str().unwrap())
@@ -973,7 +976,7 @@ fn kei_config_env_var_loads_toml() {
 fn run_config_show(body: &str) -> (String, String) {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         format!("[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\n{body}"),
     )
@@ -993,7 +996,7 @@ fn run_config_show(body: &str) -> (String, String) {
 fn run_config_show_error(body: &str) -> String {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         format!("[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\n{body}"),
     )
@@ -1421,10 +1424,13 @@ fn fixed_date_sync_control_reaches_offline_auth_boundary() {
 
 #[test]
 fn config_show_round_trips_media_filter() {
-    let (stdout, _) = run_config_show("\n[filters]\nmedia = [\"photos\", \"live-photos\"]\n");
-    assert!(stdout.contains("media"), "stdout: {stdout}");
-    assert!(stdout.contains("photos"), "stdout: {stdout}");
-    assert!(stdout.contains("live-photos"), "stdout: {stdout}");
+    let (stdout, _) = run_config_show("\n[filters]\nexclude = [\"videos\"]\n");
+    let parsed: toml::Value = toml::from_str(&stdout).unwrap();
+    assert_eq!(parsed["config_version"].as_integer(), Some(1));
+    assert_eq!(
+        parsed["filters"]["exclude"].as_array().unwrap(),
+        &[toml::Value::String("videos".into())]
+    );
 }
 
 #[test]

@@ -38,7 +38,7 @@ fn maintenance_refresh_example_accepts_complete_sweep() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let report_path = dir.path().join("report.json");
-        std::fs::write(
+        common::write_versioned_config(
             &config_path,
             format!(
                 "[auth]\nusername = \"offline-refresh@example.com\"\n[download]\ndirectory = {}\n{}\n[report]\njson = {}\n",
@@ -175,7 +175,7 @@ fn import_existing_requires_directory() {
 fn import_existing_rejects_nonexistent_directory() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config,
         "[download]\ndirectory = \"/does/not/exist/anywhere\"\n",
     )

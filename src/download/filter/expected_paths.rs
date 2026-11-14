@@ -525,27 +525,6 @@ fn malformed_for_keys(
     })
 }
 
-fn primary_candidate_keys(config: &(impl PathDerivationSource + ?Sized)) -> Vec<AssetVersionSize> {
-    let mut keys = Vec::with_capacity(2);
-    let Some(requested) = config.resolution().to_asset_version_size() else {
-        return keys;
-    };
-    keys.push(requested);
-    if !config.force_resolution() && requested != AssetVersionSize::Original {
-        keys.push(AssetVersionSize::Original);
-    }
-    keys
-}
-
-fn live_candidate_keys(config: &(impl PathDerivationSource + ?Sized)) -> Vec<AssetVersionSize> {
-    let mut keys = Vec::with_capacity(2);
-    keys.push(config.live_resolution());
-    if !config.force_resolution() && config.live_resolution() != AssetVersionSize::LiveOriginal {
-        keys.push(AssetVersionSize::LiveOriginal);
-    }
-    keys
-}
-
 /// Return the malformed resource that explains a post-filter asset producing
 /// no downloadable tasks, if CloudKit advertised a selected resource but made
 /// it unusable.
@@ -561,7 +540,14 @@ pub(in crate::download) fn malformed_no_task_resource(
         config.live_photo_mode(),
         LivePhotoMode::Skip | LivePhotoMode::VideoOnly
     ) || !asset.is_live_photo())
-        && let Some(resource) = malformed_for_keys(asset, primary_candidate_keys(config))
+        && let Some(resource) = malformed_for_keys(
+            asset,
+            [
+                AssetVersionSize::Original,
+                AssetVersionSize::Adjusted,
+                AssetVersionSize::Alternative,
+            ],
+        )
     {
         return Some(resource);
     }
@@ -569,8 +555,15 @@ pub(in crate::download) fn malformed_no_task_resource(
     if matches!(
         config.live_photo_mode(),
         LivePhotoMode::Both | LivePhotoMode::VideoOnly
-    ) && asset.item_type() == Some(AssetItemType::Image)
-        && let Some(resource) = malformed_for_keys(asset, live_candidate_keys(config))
+    ) && asset.is_live_photo()
+        && asset.item_type() == Some(AssetItemType::Image)
+        && let Some(resource) = malformed_for_keys(
+            asset,
+            [
+                AssetVersionSize::LiveOriginal,
+                AssetVersionSize::LiveAdjusted,
+            ],
+        )
     {
         return Some(resource);
     }
@@ -664,7 +657,7 @@ pub(in crate::download) fn derive_edited_extra(
     ctx: &DerivationContext<'_>,
     seen_urls: &[Box<str>],
 ) -> Option<DerivedPath> {
-    let (version, key) = select_edited_extra(config, &ctx.versions, &[])?;
+    let (version, key) = select_edited_extra(asset, config, &ctx.versions, &[])?;
     if boxed_url_seen(version, seen_urls) {
         return None;
     }
@@ -1330,23 +1323,24 @@ mod tests {
         which: VersionSizeKey,
         label: &str,
     ) {
-        let want_live = matches!(which, VersionSizeKey::LiveOriginal);
         let expected = expected_paths_for(asset, config);
         let tasks = filter_asset_fresh(asset, config);
         let exp = expected
             .iter()
-            .find(|p| matches!(p.version_size, VersionSizeKey::LiveOriginal) == want_live)
-            .map(|p| p.path.clone())
-            .unwrap_or_default();
+            .find(|p| p.version_size == which)
+            .expect("expected rendition must exist in import paths");
         let got = tasks
             .iter()
-            .find(|t| matches!(t.version_size, VersionSizeKey::LiveOriginal) == want_live)
-            .map(|t| t.download_path.to_path_buf())
-            .unwrap_or_default();
+            .find(|t| t.version_size == which)
+            .expect("expected rendition must exist in sync tasks");
         assert_eq!(
-            exp, got,
+            exp.path,
+            got.download_path.to_path_buf(),
             "{label}: expected_paths_for path drifted from filter_asset_to_tasks"
         );
+        assert_eq!(exp.size, got.size, "{label}");
+        assert_eq!(exp.checksum, got.checksum, "{label}");
+        assert_eq!(exp.url, got.url, "{label}");
     }
 
     // ── expected_paths_for tests ────────────────────────────────────────
@@ -1481,18 +1475,26 @@ mod tests {
     }
 
     #[test]
-    fn expected_paths_force_resolution_missing_returns_empty() {
-        let asset = TestPhotoAsset::new("TEST_1")
-            .filename("IMG_0001.JPG")
-            .build();
-        let mut config = test_config();
-        config.resolution = crate::types::PhotoResolution::Medium;
-        config.force_resolution = true;
+    fn expected_paths_missing_original_does_not_use_preview() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "PREVIEW_ONLY", "fields": {
+                "filenameEnc": {"value": "IMG.JPG", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resJPEGMedRes": {"value": {
+                    "size": 2000, "downloadURL": "https://p01.icloud-content.com/med",
+                    "fileChecksum": "med_ck"
+                }},
+                "resJPEGMedFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1_736_899_200_000.0_f64}}}),
+        );
+        let config = test_config();
         let paths = expected_paths_for(&asset, &config);
         assert!(
             paths.is_empty(),
-            "force_resolution + missing size should yield no paths, got {paths:?}"
+            "missing original must not select a preview, got {paths:?}"
         );
+        assert!(filter_asset_fresh(&asset, &config).is_empty());
     }
 
     #[test]
@@ -1722,12 +1724,8 @@ mod tests {
             .build();
         let mut config = test_config();
         config.live_photo_mode = LivePhotoMode::VideoOnly;
-        assert_path_parity(
-            &asset,
-            &config,
-            VersionSizeKey::Original,
-            "video-only primary (absent)",
-        );
+        assert_eq!(expected_paths_for(&asset, &config).len(), 1);
+        assert_eq!(filter_asset_fresh(&asset, &config).len(), 1);
         assert_path_parity(
             &asset,
             &config,
@@ -1780,24 +1778,17 @@ mod tests {
         );
     }
 
-    /// CG-2: regression-guards `resolution = "medium"` actually-published path.
-    /// A bug in the size-suffix branch of `expected_paths_for` would emit
-    /// an unsuffixed path; sync would write `IMG-medium.JPG` while
-    /// import-existing scans for `IMG.JPG` (silent miss).
     #[test]
-    fn expected_paths_size_medium_present_emits_medium_suffix() {
+    fn expected_paths_original_wins_over_available_medium() {
         let asset = primary_multi_size_asset("MED_PRESENT", "IMG_6001.JPG");
         let mut config = test_config();
         config.resolution = crate::types::PhotoResolution::Medium;
         let paths = expected_paths_for(&asset, &config);
         assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0].version_size, VersionSizeKey::Medium);
-        assert_eq!(paths[0].size, 2000);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        assert_eq!(paths[0].size, 5000);
         let name = paths[0].path.file_name().unwrap().to_string_lossy();
-        assert!(
-            name.contains("-medium"),
-            "size=Medium present should carry '-medium' suffix, got {name}"
-        );
+        assert_eq!(name, "IMG_6001.JPG");
     }
 
     /// CG-2 parity: when Medium is published and `resolution = "medium"` is set,
@@ -1807,24 +1798,21 @@ mod tests {
         let asset = primary_multi_size_asset("PAR_MED", "IMG_6002.JPG");
         let mut config = test_config();
         config.resolution = crate::types::PhotoResolution::Medium;
-        assert_path_parity(&asset, &config, VersionSizeKey::Medium, "Medium present");
+        assert_path_parity(&asset, &config, VersionSizeKey::Original, "Medium present");
     }
 
     /// CG-3: regression-guards `resolution = "thumb"` actually-published path.
     #[test]
-    fn expected_paths_size_thumb_present_emits_thumb_suffix() {
+    fn expected_paths_original_wins_over_available_thumbnail() {
         let asset = primary_multi_size_asset("THUMB_PRESENT", "IMG_6003.JPG");
         let mut config = test_config();
         config.resolution = crate::types::PhotoResolution::Thumb;
         let paths = expected_paths_for(&asset, &config);
         assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0].version_size, VersionSizeKey::Thumb);
-        assert_eq!(paths[0].size, 500);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        assert_eq!(paths[0].size, 5000);
         let name = paths[0].path.file_name().unwrap().to_string_lossy();
-        assert!(
-            name.contains("-thumb"),
-            "size=Thumb present should carry '-thumb' suffix, got {name}"
-        );
+        assert_eq!(name, "IMG_6003.JPG");
     }
 
     /// CG-3 parity.
@@ -1833,15 +1821,11 @@ mod tests {
         let asset = primary_multi_size_asset("PAR_THUMB", "IMG_6004.JPG");
         let mut config = test_config();
         config.resolution = crate::types::PhotoResolution::Thumb;
-        assert_path_parity(&asset, &config, VersionSizeKey::Thumb, "Thumb present");
+        assert_path_parity(&asset, &config, VersionSizeKey::Original, "Thumb present");
     }
 
-    /// CG-4: regression-guards `live_resolution = "medium"`. A bug in the
-    /// `version_with_fallback` call inside the live branch would silently
-    /// land the LiveOriginal MOV at the LiveMedium config, producing the
-    /// wrong path.
     #[test]
-    fn expected_paths_live_resolution_medium_emits_live_medium_path() {
+    fn expected_paths_live_original_wins_over_available_medium() {
         let asset = live_photo_multi_size_asset("LIVE_MED_1");
         let mut config = test_config();
         config.live_resolution = AssetVersionSize::LiveMedium;
@@ -1849,10 +1833,10 @@ mod tests {
         assert_eq!(paths.len(), 2, "expected primary + MOV companion");
         let mov = paths
             .iter()
-            .find(|p| matches!(p.version_size, VersionSizeKey::LiveMedium))
-            .expect("LiveMedium MOV path missing");
-        assert_eq!(mov.size, 1500);
-        assert_eq!(&*mov.checksum, "live_med_ck");
+            .find(|p| matches!(p.version_size, VersionSizeKey::LiveOriginal))
+            .expect("LiveOriginal MOV path missing");
+        assert_eq!(mov.size, 3000);
+        assert_eq!(&*mov.checksum, "live_orig_ck");
         // The primary stays at Original and unaffected by live_resolution.
         let primary = paths
             .iter()
@@ -1862,17 +1846,8 @@ mod tests {
         assert_eq!(primary.size, 4000);
     }
 
-    /// CG-5: `resolution` and `live_resolution` are independent. A
-    /// regression that couples them (e.g. live branch reading
-    /// `config.resolution` instead of `config.live_resolution`) lands silently
-    /// without this assertion.
     #[test]
-    fn expected_paths_size_medium_with_live_resolution_thumb_independent() {
-        // Build a HEIC primary with original + medium res, and a live MOV
-        // companion at LiveOriginal + LiveMedium. We don't have a
-        // LiveThumb resolution to point to, so we use LiveMedium for the
-        // live resolution and Medium for the primary -- different
-        // non-default values across the two settings.
+    fn expected_paths_both_components_use_full_resolution() {
         let asset = PhotoAsset::new(
             json!({"recordName": "INDEP_1", "fields": {
                 "filenameEnc": {"value": "IMG_INDEP.HEIC", "type": "STRING"},
@@ -1912,19 +1887,18 @@ mod tests {
         assert_eq!(paths.len(), 2);
         let primary = paths
             .iter()
-            .find(|p| matches!(p.version_size, VersionSizeKey::Medium))
-            .expect("primary at Medium missing");
-        assert_eq!(primary.size, 1800);
+            .find(|p| matches!(p.version_size, VersionSizeKey::Original))
+            .expect("primary at Original missing");
+        assert_eq!(primary.size, 4000);
+        assert_eq!(primary.checksum.as_ref(), "heic_ck");
         let mov = paths
             .iter()
-            .find(|p| matches!(p.version_size, VersionSizeKey::LiveMedium))
-            .expect("MOV at LiveMedium missing");
-        assert_eq!(mov.size, 1500);
-        // Crucially: primary did not key off live_resolution, MOV did
-        // not key off primary resolution. (If the two settings were coupled, both would
-        // share one variant.)
-        assert_ne!(primary.version_size, VersionSizeKey::LiveMedium);
-        assert_ne!(mov.version_size, VersionSizeKey::Medium);
+            .find(|p| matches!(p.version_size, VersionSizeKey::LiveOriginal))
+            .expect("MOV at LiveOriginal missing");
+        assert_eq!(mov.size, 3000);
+        assert_eq!(mov.checksum.as_ref(), "live_orig_ck");
+        assert_path_parity(&asset, &config, VersionSizeKey::Original, "still");
+        assert_path_parity(&asset, &config, VersionSizeKey::LiveOriginal, "video");
     }
 
     /// CG-6: `raw_policy = "prefer-raw"` + `resolution = "medium"`. apply_raw_policy
@@ -1967,12 +1941,8 @@ mod tests {
         );
     }
 
-    /// CG-7: `force_resolution = true` applied to the live-photo companion. With
-    /// force_resolution=true and live_resolution=LiveMedium but only LiveOriginal
-    /// published, the MOV companion should drop entirely (not silently
-    /// land at LiveOriginal).
     #[test]
-    fn expected_paths_force_resolution_drops_live_companion_when_live_size_missing() {
+    fn expected_paths_original_companion_needs_no_preview() {
         let asset = TestPhotoAsset::new("FORCE_LIVE")
             .filename("IMG_FL.HEIC")
             .item_type("public.heic")
@@ -1983,24 +1953,18 @@ mod tests {
         config.live_resolution = AssetVersionSize::LiveMedium;
         config.force_resolution = true;
         let paths = expected_paths_for(&asset, &config);
-        // Primary HEIC is still Original and kept (force_resolution applies to
-        // the requested primary resolution and to the requested
-        // `live_resolution`; primary resolution is Original which is
-        // present).
+        assert_eq!(paths.len(), 2);
         assert!(
             paths
                 .iter()
                 .any(|p| matches!(p.version_size, VersionSizeKey::Original)),
             "primary should remain present when its requested size is published"
         );
-        // The MOV companion should drop because LiveMedium is missing
-        // and force_resolution=true forbids fallback.
-        assert!(
-            !paths.iter().any(|p| matches!(
-                p.version_size,
-                VersionSizeKey::LiveOriginal | VersionSizeKey::LiveMedium
-            )),
-            "force_resolution + missing LiveMedium should drop the MOV companion entirely, got {paths:?}"
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::LiveOriginal,
+            "original companion",
         );
     }
 

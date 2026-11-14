@@ -13,7 +13,7 @@ fn sync_report_json_offline_binary_boundary_writes_current_schema() {
     let report_path = dir.path().join("sync_report.json");
     let config_path = dir.path().join("config.toml");
     let username = "offline-report@example.com";
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         format!(
             "\
@@ -26,7 +26,7 @@ folder_structure = \"%Y/%m/%d\"
 threads = 3
 
 [filters]
-media = [\"photos\", \"videos\"]
+exclude = [\"live-photo-stills\", \"live-photo-videos\"]
 
 [report]
 json = {report_path}

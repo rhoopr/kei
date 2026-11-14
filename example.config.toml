@@ -12,6 +12,12 @@
 # Options whose default value is unset stay commented so copying this file does
 # not accidentally enable a feature, write to a path, or use a secret source.
 
+# Option: config_version
+# Default value: required in existing config files
+# Valid values: 1
+# Description: Accepts full-resolution rendition selection. Review exclusions and remove retired restrictions before upgrading an existing config.
+config_version = 1
+
 # Option: data_dir
 # Default value: parent directory of the resolved config file; Docker sets KEI_DATA_DIR=/config
 # Valid values: filesystem path; ~ expands to your home directory
@@ -141,11 +147,11 @@ smart_folders = ["none"]
 # Description: When true, also syncs photos that are not in a user album.
 unfiled = true
 
-# Option: filters.media
-# Default value: ["photos", "videos", "live-photos"]
-# Valid values: non-empty array containing photos, videos, live-photos
-# Description: Selects media categories before download planning.
-media = ["photos", "videos", "live-photos"]
+# Option: filters.exclude
+# Default value: []
+# Valid values: array containing photos, videos, live-photo-stills, live-photo-videos; leave at least one component selected
+# Description: Excludes components. Selected components include available full-resolution originals, current edits and RAW/JPEG renditions.
+exclude = []
 
 # Option: filters.skip_created_before
 # Default value: unset
@@ -160,59 +166,17 @@ media = ["photos", "videos", "live-photos"]
 # skip_created_after = "2024-12-31"
 
 [photos]
-# Option: photos.resolution
-# Default value: original
-# Valid values: original, medium, thumb, none
-# Description: Primary still/video rendition to download. none requires edited or alternative to be true.
-resolution = "original"
-
-# Option: photos.live_resolution
-# Default value: original
-# Valid values: original, medium, thumb
-# Description: Live Photo MOV rendition to download when live-photo video is included.
-live_resolution = "original"
-
-# Option: photos.live_photo_mode
-# Default value: both
-# Valid values: both, image-only, video-only, skip
-# Description: Controls whether Live Photos download the still image, MOV, both, or neither.
-live_photo_mode = "both"
-
 # Option: photos.live_photo_mov_filename_policy
 # Default value: suffix
 # Valid values: suffix, original
 # Description: Names Live Photo MOV files with kei's paired suffix or Apple's original MOV name.
 live_photo_mov_filename_policy = "suffix"
 
-# Option: photos.edited
-# Default value: false
-# Valid values: true, false
-# Description: Also downloads adjusted or edited stills and videos when Apple provides them.
-edited = false
-
-# Option: photos.alternative
-# Default value: false
-# Valid values: true, false
-# Description: Also downloads alternative or RAW sibling resources when Apple provides them.
-alternative = false
-
-# Option: photos.raw_policy
-# Default value: as-is
-# Valid values: as-is, prefer-raw, prefer-jpeg
-# Description: Chooses how RAW+JPEG pairs are aligned when both forms are available.
-raw_policy = "as-is"
-
 # Option: photos.file_match_policy
 # Default value: name-size-dedup-with-suffix
 # Valid values: name-size-dedup-with-suffix, name-id7
 # Description: Controls path matching for import-existing and skip-existing decisions.
 file_match_policy = "name-size-dedup-with-suffix"
-
-# Option: photos.force_resolution
-# Default value: false
-# Valid values: true, false
-# Description: When true, skips assets missing the selected primary resolution instead of falling back.
-force_resolution = false
 
 # Option: photos.keep_unicode_in_filenames
 # Default value: false

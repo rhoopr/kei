@@ -2096,7 +2096,15 @@ async fn review501_legacy_original_survives_adjusted_only_migration_as_archive()
         assert_bytes(&media.join("IMG_0501.JPG"), VALID_ORIGINAL);
         let original_sidecar =
             sidecar.then(|| std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap());
-        let edited = records_with_original(&server, VALID_ORIGINAL, Some(("edit-one", VALID_EDIT)));
+        let mut edited =
+            records_with_original(&server, VALID_ORIGINAL, Some(("edit-one", VALID_EDIT)));
+        // Current policy always includes available originals. Exercise a
+        // genuinely edit-only provider response while retaining the historical
+        // original and its sidecar as preservation evidence.
+        edited[0]["fields"]
+            .as_object_mut()
+            .unwrap()
+            .remove("resOriginalRes");
         let (migrated, _) = cycle_options(
             root.path(),
             edited.clone(),

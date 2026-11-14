@@ -86,13 +86,13 @@ The range limits capture dates, not file count. Album copies, Live Photo videos 
 
 Photos are saved in the folder set by `[download].directory`. Settings, saved logins and kei's record of your backup normally live under `~/.config/kei`. If you use a custom configuration file, kei normally keeps its state beside that file; `data_dir` or `KEI_DATA_DIR` can change this location. Keep the state as well as your photos and videos.
 
-By default, kei downloads originals and the videos that accompany Live Photos. Select edited versions and other versions, including RAW, explicitly if you want them. See [example.config.toml](example.config.toml).
+By default, kei downloads available full-resolution originals, current edits and RAW/JPEG renditions, including both Live Photo components. Use `[filters].exclude` to omit ordinary photos, ordinary videos, Live Photo stills or Live Photo videos. Existing configurations need an [explicit rendition-policy migration](docs/rendition-policy-migration.md). See [example.config.toml](example.config.toml).
 
 <a id="expand-the-backup"></a>
 
 ## Run your normal backup
 
-Once the small backup looks right, review your saved choices before expanding them. Widen or remove the saved date bounds only when you want to include more dates. `kei sync` without date flags uses the saved bounds, so it can still repeat only the sample. The setup wizard can select all available libraries, including Shared Libraries. Check albums, smart folders, photos outside albums, edited versions and RAW options before treating the result as a full backup.
+Once the small backup looks right, review your saved choices before expanding them. Widen or remove the saved date bounds only when you want to include more dates. `kei sync` without date flags uses the saved bounds, so it can still repeat only the sample. The setup wizard can select all available libraries, including Shared Libraries. Check albums, smart folders, photos outside albums and component exclusions before treating the result as a full backup.
 
 As an alternative to the wizard, a minimal config is:
 
@@ -133,7 +133,7 @@ Historical legacy coverage certificates are no longer required for current sync 
 
 - Downloads several files at once, resumes interrupted transfers, and checks downloaded data before marking a file complete.
 - Saves ordinary photo and video files without needing an Apple Photos library, arranged by album and date as you choose.
-- Supports Shared Libraries, Live Photos, and optional edited and other versions, including RAW.
+- Supports Shared Libraries, Live Photos, current edits and available RAW/JPEG renditions.
 - Runs once or on a schedule, in Docker or as a background service on Linux, macOS or Windows.
 - Provides progress reports, troubleshooting tools, file lists, backup checks, repair commands and import of existing files.
 

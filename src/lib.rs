@@ -1183,7 +1183,11 @@ mod tests {
     fn startup_config_loads_explicit_file_before_output_resolution() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "log_level = 'warn'\n[ui]\nfriendly = false\n").unwrap();
+        std::fs::write(
+            &path,
+            "config_version = 1\nlog_level = 'warn'\n[ui]\nfriendly = false\n",
+        )
+        .unwrap();
         let cli = cli::Cli {
             config: path.to_string_lossy().into_owned(),
             ..startup_cli()

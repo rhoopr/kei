@@ -1247,11 +1247,18 @@ pub(super) fn pending_record_for_task(
         task.size,
         media_type,
     )
-    .with_metadata_arc(super::filter::metadata_for_selected_version(
-        asset,
-        config,
-        task.version_size,
-    ))
+    .with_metadata_arc(
+        super::filter::provider_version_for_frozen_resource(
+            asset,
+            task.version_size,
+            &task.checksum,
+            task.size,
+        )
+        .map_or_else(
+            || super::filter::metadata_for_selected_version(asset, config, task.version_size),
+            |provider| asset.metadata_arc(provider),
+        ),
+    )
 }
 
 /// Persist the durable CloudKit identifier bridge used to resolve future

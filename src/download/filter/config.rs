@@ -6,26 +6,19 @@ use std::sync::Arc;
 use rustc_hash::FxHashSet;
 
 use crate::download::{DownloadConfig, paths};
-use crate::types::{
-    AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
-};
+use crate::types::{FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy};
 
 pub(crate) trait PathDerivationSource {
     fn directory(&self) -> &Path;
     fn folder_structure(&self) -> &str;
-    fn resolution(&self) -> crate::types::PhotoResolution;
     fn media(&self) -> &crate::config::MediaSelection;
     fn skip_created_before(&self) -> Option<crate::config::CreatedDateFilter>;
     fn skip_created_after(&self) -> Option<crate::config::CreatedDateFilter>;
     fn live_photo_mode(&self) -> LivePhotoMode;
-    fn live_resolution(&self) -> AssetVersionSize;
     fn live_photo_mov_filename_policy(&self) -> LivePhotoMovFilenamePolicy;
-    fn edited(&self) -> bool;
     fn edited_naming(&self) -> crate::types::EditedNaming;
-    fn alternative(&self) -> bool;
     fn raw_policy(&self) -> RawPolicy;
     fn file_match_policy(&self) -> FileMatchPolicy;
-    fn force_resolution(&self) -> bool;
     fn keep_unicode_in_filenames(&self) -> bool;
     fn album_name(&self) -> Option<&str>;
     fn exclude_asset_ids(&self) -> &FxHashSet<String>;
@@ -43,19 +36,14 @@ pub(crate) struct PathDerivationConfig {
     pub(crate) folder_structure: String,
     pub(crate) folder_structure_albums: Arc<str>,
     pub(crate) folder_structure_smart_folders: Arc<str>,
-    pub(crate) resolution: crate::types::PhotoResolution,
     pub(crate) media: crate::config::MediaSelection,
     pub(crate) skip_created_before: Option<crate::config::CreatedDateFilter>,
     pub(crate) skip_created_after: Option<crate::config::CreatedDateFilter>,
     pub(crate) live_photo_mode: LivePhotoMode,
-    pub(crate) live_resolution: AssetVersionSize,
     pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
-    pub(crate) edited: bool,
     pub(crate) edited_naming: crate::types::EditedNaming,
-    pub(crate) alternative: bool,
     pub(crate) raw_policy: RawPolicy,
     pub(crate) file_match_policy: FileMatchPolicy,
-    pub(crate) force_resolution: bool,
     pub(crate) keep_unicode_in_filenames: bool,
     pub(crate) album_name: Option<Arc<str>>,
     pub(crate) library: Arc<str>,
@@ -75,19 +63,14 @@ impl PathDerivationConfig {
             folder_structure_smart_folders: Arc::from(
                 fields.folder_structure_smart_folders.as_str(),
             ),
-            resolution: fields.resolution,
             media,
             skip_created_before: None,
             skip_created_after: None,
             live_photo_mode: fields.live_photo_mode,
-            live_resolution: fields.live_resolution.to_asset_version_size(),
             live_photo_mov_filename_policy: fields.live_photo_mov_filename_policy,
-            edited: fields.edited,
             edited_naming: fields.edited_naming,
-            alternative: fields.alternative,
             raw_policy: fields.raw_policy,
             file_match_policy: fields.file_match_policy,
-            force_resolution: fields.force_resolution,
             keep_unicode_in_filenames: fields.keep_unicode_in_filenames,
             album_name: None,
             library: Arc::from(crate::icloud::photos::PRIMARY_ZONE_NAME),
@@ -162,10 +145,6 @@ impl PathDerivationSource for PathDerivationConfig {
         &self.folder_structure
     }
 
-    fn resolution(&self) -> crate::types::PhotoResolution {
-        self.resolution
-    }
-
     fn media(&self) -> &crate::config::MediaSelection {
         &self.media
     }
@@ -182,10 +161,6 @@ impl PathDerivationSource for PathDerivationConfig {
         self.live_photo_mode
     }
 
-    fn live_resolution(&self) -> AssetVersionSize {
-        self.live_resolution
-    }
-
     fn live_photo_mov_filename_policy(&self) -> LivePhotoMovFilenamePolicy {
         self.live_photo_mov_filename_policy
     }
@@ -194,24 +169,12 @@ impl PathDerivationSource for PathDerivationConfig {
         self.edited_naming
     }
 
-    fn edited(&self) -> bool {
-        self.edited
-    }
-
-    fn alternative(&self) -> bool {
-        self.alternative
-    }
-
     fn raw_policy(&self) -> RawPolicy {
         self.raw_policy
     }
 
     fn file_match_policy(&self) -> FileMatchPolicy {
         self.file_match_policy
-    }
-
-    fn force_resolution(&self) -> bool {
-        self.force_resolution
     }
 
     fn keep_unicode_in_filenames(&self) -> bool {
@@ -236,10 +199,6 @@ impl PathDerivationSource for DownloadConfig {
         &self.folder_structure
     }
 
-    fn resolution(&self) -> crate::types::PhotoResolution {
-        self.resolution
-    }
-
     fn media(&self) -> &crate::config::MediaSelection {
         &self.media
     }
@@ -256,10 +215,6 @@ impl PathDerivationSource for DownloadConfig {
         self.live_photo_mode
     }
 
-    fn live_resolution(&self) -> AssetVersionSize {
-        self.live_resolution
-    }
-
     fn live_photo_mov_filename_policy(&self) -> LivePhotoMovFilenamePolicy {
         self.live_photo_mov_filename_policy
     }
@@ -268,24 +223,12 @@ impl PathDerivationSource for DownloadConfig {
         self.edited_naming
     }
 
-    fn edited(&self) -> bool {
-        self.edited
-    }
-
-    fn alternative(&self) -> bool {
-        self.alternative
-    }
-
     fn raw_policy(&self) -> RawPolicy {
         self.raw_policy
     }
 
     fn file_match_policy(&self) -> FileMatchPolicy {
         self.file_match_policy
-    }
-
-    fn force_resolution(&self) -> bool {
-        self.force_resolution
     }
 
     fn keep_unicode_in_filenames(&self) -> bool {

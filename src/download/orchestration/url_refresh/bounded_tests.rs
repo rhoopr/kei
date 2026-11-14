@@ -1017,7 +1017,7 @@ async fn incremental_refresh_preserves_frozen_raw_jpeg_provider_renditions() {
                 for row in rows {
                     let bytes = std::fs::read(row.local_path.unwrap()).unwrap();
                     match row.version_size {
-                        VersionSizeKey::Original => {
+                        VersionSizeKey::Alternative => {
                             assert_eq!(
                                 &*row.checksum,
                                 "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
@@ -1025,7 +1025,7 @@ async fn incremental_refresh_preserves_frozen_raw_jpeg_provider_renditions() {
                             assert_eq!(bytes, alternative_bytes);
                         }
                         _ => {
-                            assert_eq!(row.version_size, VersionSizeKey::Alternative);
+                            assert_eq!(row.version_size, VersionSizeKey::Original);
                             assert_eq!(
                                 &*row.checksum,
                                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="

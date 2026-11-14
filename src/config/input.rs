@@ -1,10 +1,7 @@
 //! TOML input schema and file loading.
 
-use super::runtime::MediaKind;
-use crate::types::{
-    Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoResolution,
-    LogLevel, PhotoResolution, RawPolicy,
-};
+use super::runtime::MediaExclusion;
+use crate::types::{Domain, FileMatchPolicy, LivePhotoMovFilenamePolicy, LogLevel};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -13,6 +10,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlConfig {
+    pub config_version: Option<u32>,
     pub data_dir: Option<String>,
     pub log_level: Option<LogLevel>,
     pub auth: Option<TomlAuth>,
@@ -116,7 +114,7 @@ pub(crate) struct TomlFilters {
     pub smart_folders: Option<Vec<String>>,
     /// Unfiled-pass toggle. Default: `true`.
     pub unfiled: Option<bool>,
-    pub media: Option<Vec<MediaKind>>,
+    pub exclude: Option<Vec<MediaExclusion>>,
     #[serde(default, deserialize_with = "deserialize_created_before")]
     pub skip_created_before: Option<String>,
     #[serde(default, deserialize_with = "deserialize_created_after")]
@@ -153,15 +151,8 @@ fn deserialize_fixed_date<'de, D: serde::Deserializer<'de>>(
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlPhotos {
-    pub resolution: Option<PhotoResolution>,
-    pub live_resolution: Option<LivePhotoResolution>,
-    pub live_photo_mode: Option<LivePhotoMode>,
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
-    pub edited: Option<bool>,
-    pub alternative: Option<bool>,
-    pub raw_policy: Option<RawPolicy>,
     pub file_match_policy: Option<FileMatchPolicy>,
-    pub force_resolution: Option<bool>,
     pub keep_unicode_in_filenames: Option<bool>,
 }
 
@@ -218,6 +209,8 @@ pub(crate) fn load_toml_config_with_source(
                         message.push_str("The edited_naming option is retired. Remove edited_naming from [photos]. New edited files use an edited suffix; recorded managed layouts and interrupted publications retain their existing layout. Configuration was not changed.");
                     } else if parse_error.contains("`filename_exclude`") {
                         message.push_str("Filename-based selection is no longer supported. Remove filename_exclude from [filters] after reviewing the expanded selection. Use album/library selection or fixed capture-date bounds where appropriate. Configuration was not changed.");
+                    } else if ["resolution", "live_resolution", "live_photo_mode", "edited", "alternative", "raw_policy", "force_resolution", "media"].iter().any(|key| parse_error.contains(&format!("`{key}`"))) {
+                        message.push_str("Rendition restrictions are retired. Remove resolution, live_resolution, live_photo_mode, edited, alternative, raw_policy and force_resolution from [photos], and media from [filters]. Selected components now include all available full-resolution originals, current edits and RAW/JPEG renditions. Review [filters].exclude (photos, videos, live-photo-stills, live-photo-videos), then set config_version = 1 at the top of the file to accept this migration. Configuration was not changed.");
                     } else if parse_error.contains("`recent`") || parse_error.contains("`recent_scope`") {
                         message.push_str("Sync count selection is no longer supported. Remove recent and recent_scope from [filters]. To bound sync, set a fixed YYYY-MM-DD in [filters].skip_created_before or skip_created_after. Configuration was not changed.");
                     } else {
@@ -226,6 +219,11 @@ pub(crate) fn load_toml_config_with_source(
                 }
                 anyhow::anyhow!(message)
             })?;
+            anyhow::ensure!(
+                config.config_version == Some(1),
+                "Configuration migration required: selected components now include all available full-resolution originals, current edits and RAW/JPEG renditions. Review [filters].exclude (photos, videos, live-photo-stills, live-photo-videos), remove retired rendition restrictions, then set config_version = 1 at the top of {}. Configuration was not changed.",
+                path.display()
+            );
             // Warn if config contains a password and file permissions are too open
             #[cfg(unix)]
             if config.auth.as_ref().is_some_and(|a| a.password.is_some()) {
@@ -265,16 +263,14 @@ pub(crate) fn load_toml_config_with_source(
 #[cfg(test)]
 mod tests {
     use super::{TomlConfig, load_toml_config};
-    use crate::config::runtime::MediaKind;
-    use crate::types::{
-        Domain, FileMatchPolicy, LivePhotoMovFilenamePolicy, LivePhotoResolution, LogLevel,
-        PhotoResolution, RawPolicy,
-    };
+    use crate::config::runtime::MediaExclusion;
+    use crate::types::{Domain, FileMatchPolicy, LivePhotoMovFilenamePolicy, LogLevel};
     use std::collections::BTreeSet;
     use std::path::Path;
 
     fn documented_config_options() -> BTreeSet<&'static str> {
         [
+            "config_version",
             "data_dir",
             "log_level",
             "auth.username",
@@ -295,18 +291,11 @@ mod tests {
             "filters.albums",
             "filters.smart_folders",
             "filters.unfiled",
-            "filters.media",
+            "filters.exclude",
             "filters.skip_created_before",
             "filters.skip_created_after",
-            "photos.resolution",
-            "photos.live_resolution",
-            "photos.live_photo_mode",
             "photos.live_photo_mov_filename_policy",
-            "photos.edited",
-            "photos.alternative",
-            "photos.raw_policy",
             "photos.file_match_policy",
-            "photos.force_resolution",
             "photos.keep_unicode_in_filenames",
             "metadata.set_exif_datetime",
             "metadata.set_exif_rating",
@@ -428,17 +417,13 @@ mod tests {
             [filters]
             libraries = ["PrimarySync"]
             albums = ["Favorites"]
-            media = ["photos", "videos", "live-photos"]
+            exclude = []
             skip_created_before = "2024-01-01"
             skip_created_after = "2025-01-01"
 
             [photos]
-            resolution = "original"
-            live_resolution = "original"
             live_photo_mov_filename_policy = "suffix"
-            raw_policy = "as-is"
             file_match_policy = "name-size-dedup-with-suffix"
-            force_resolution = false
             keep_unicode_in_filenames = false
 
             [watch]
@@ -460,8 +445,6 @@ mod tests {
         let filters = config.filters.unwrap();
         assert_eq!(filters.albums, Some(vec!["Favorites".to_string()]));
         let photos = config.photos.unwrap();
-        assert_eq!(photos.resolution, Some(PhotoResolution::Original));
-        assert_eq!(photos.raw_policy, Some(RawPolicy::AsIs));
         assert_eq!(
             photos.file_match_policy,
             Some(FileMatchPolicy::NameSizeDedupWithSuffix)
@@ -482,14 +465,10 @@ mod tests {
     fn test_toml_parse_enum_values() {
         let toml_str = r#"
             [photos]
-            resolution = "medium"
-            raw_policy = "prefer-jpeg"
             file_match_policy = "name-id7"
         "#;
         let config: TomlConfig = toml::from_str(toml_str).unwrap();
         let photos = config.photos.unwrap();
-        assert_eq!(photos.resolution, Some(PhotoResolution::Medium));
-        assert_eq!(photos.raw_policy, Some(RawPolicy::PreferJpeg));
         assert_eq!(photos.file_match_policy, Some(FileMatchPolicy::NameId7));
     }
     #[test]
@@ -518,36 +497,17 @@ mod tests {
         );
     }
     #[test]
-    fn test_toml_parse_all_resolution_variants() {
-        for (input, expected) in [
-            ("original", PhotoResolution::Original),
-            ("medium", PhotoResolution::Medium),
-            ("thumb", PhotoResolution::Thumb),
-            ("none", PhotoResolution::None),
-        ] {
+    fn test_toml_reject_all_retired_resolution_variants() {
+        for input in ["original", "medium", "thumb", "none"] {
             let toml_str = format!("[photos]\nresolution = \"{input}\"\nedited = true");
-            let config: TomlConfig = toml::from_str(&toml_str).unwrap();
-            assert_eq!(
-                config.photos.unwrap().resolution,
-                Some(expected),
-                "resolution variant: {input}"
-            );
+            assert!(toml::from_str::<TomlConfig>(&toml_str).is_err());
         }
     }
     #[test]
-    fn test_toml_parse_all_live_resolution_variants() {
-        for (input, expected) in [
-            ("original", LivePhotoResolution::Original),
-            ("medium", LivePhotoResolution::Medium),
-            ("thumb", LivePhotoResolution::Thumb),
-        ] {
+    fn test_toml_reject_all_retired_live_resolution_variants() {
+        for input in ["original", "medium", "thumb"] {
             let toml_str = format!("[photos]\nlive_resolution = \"{input}\"");
-            let config: TomlConfig = toml::from_str(&toml_str).unwrap();
-            assert_eq!(
-                config.photos.unwrap().live_resolution,
-                Some(expected),
-                "live_resolution variant: {input}"
-            );
+            assert!(toml::from_str::<TomlConfig>(&toml_str).is_err());
         }
     }
     #[test]
@@ -595,19 +555,10 @@ mod tests {
         }
     }
     #[test]
-    fn test_toml_parse_all_raw_policy_variants() {
-        for (input, expected) in [
-            ("as-is", RawPolicy::AsIs),
-            ("prefer-raw", RawPolicy::PreferRaw),
-            ("prefer-jpeg", RawPolicy::PreferJpeg),
-        ] {
+    fn test_toml_reject_all_retired_raw_policy_variants() {
+        for input in ["as-is", "prefer-raw", "prefer-jpeg"] {
             let toml_str = format!("[photos]\nraw_policy = \"{input}\"");
-            let config: TomlConfig = toml::from_str(&toml_str).unwrap();
-            assert_eq!(
-                config.photos.unwrap().raw_policy,
-                Some(expected),
-                "raw_policy variant: {input}"
-            );
+            assert!(toml::from_str::<TomlConfig>(&toml_str).is_err());
         }
     }
     #[test]
@@ -683,7 +634,7 @@ mod tests {
         assert!(config.auth.unwrap().username.is_none());
         assert!(config.download.unwrap().threads.is_none());
         assert!(config.filters.unwrap().libraries.is_none());
-        assert!(config.photos.unwrap().resolution.is_none());
+        assert!(config.photos.unwrap().file_match_policy.is_none());
         assert!(config.watch.unwrap().interval.is_none());
         assert!(config.notifications.unwrap().script.is_none());
     }
@@ -717,7 +668,7 @@ mod tests {
             [filters]
             libraries = ["SharedSync-ABC"]
             albums = ["A", "B"]
-            media = ["photos", "videos", "live-photos"]
+            exclude = ["videos", "live-photo-videos"]
             skip_created_before = "2024-01-01"
             skip_created_after = "2025-12-31"
         "#;
@@ -729,8 +680,8 @@ mod tests {
         );
         assert_eq!(f.albums, Some(vec!["A".to_string(), "B".to_string()]));
         assert_eq!(
-            f.media.as_deref(),
-            Some(&[MediaKind::Photos, MediaKind::Videos, MediaKind::LivePhotos,][..])
+            f.exclude.as_deref(),
+            Some(&[MediaExclusion::Videos, MediaExclusion::LivePhotoVideos][..])
         );
 
         assert_eq!(f.skip_created_before.as_deref(), Some("2024-01-01"));
@@ -740,25 +691,17 @@ mod tests {
     fn test_toml_photos_all_fields() {
         let toml_str = r#"
             [photos]
-            resolution = "thumb"
-            live_resolution = "medium"
             live_photo_mov_filename_policy = "original"
-            raw_policy = "prefer-raw"
             file_match_policy = "name-id7"
-            force_resolution = true
             keep_unicode_in_filenames = true
         "#;
         let config: TomlConfig = toml::from_str(toml_str).unwrap();
         let p = config.photos.unwrap();
-        assert_eq!(p.resolution, Some(PhotoResolution::Thumb));
-        assert_eq!(p.live_resolution, Some(LivePhotoResolution::Medium));
         assert_eq!(
             p.live_photo_mov_filename_policy,
             Some(LivePhotoMovFilenamePolicy::Original)
         );
-        assert_eq!(p.raw_policy, Some(RawPolicy::PreferRaw));
         assert_eq!(p.file_match_policy, Some(FileMatchPolicy::NameId7));
-        assert_eq!(p.force_resolution, Some(true));
         assert_eq!(p.keep_unicode_in_filenames, Some(true));
     }
     #[test]
@@ -814,6 +757,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"
+            config_version = 1
             [auth]
             username = "disk@example.com"
             "#,
@@ -830,7 +774,7 @@ mod tests {
     fn test_load_toml_config_valid_file_required() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test-required.toml");
-        std::fs::write(&path, "log_level = \"warn\"").unwrap();
+        std::fs::write(&path, "config_version = 1\nlog_level = \"warn\"").unwrap();
         let result = load_toml_config(&path, true).unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().log_level, Some(LogLevel::Warn));
@@ -846,14 +790,33 @@ mod tests {
         assert!(err.contains("Failed to parse config file"), "got: {err}");
     }
     #[test]
-    fn test_load_toml_config_empty_file() {
+    fn existing_configs_require_explicit_rendition_migration_without_rewrite() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.toml");
-        std::fs::write(&path, "").unwrap();
-        let result = load_toml_config(&path, false).unwrap();
-        let config = result.unwrap();
-        assert!(config.auth.is_none());
-        assert!(config.download.is_none());
+        for text in [
+            "",
+            "[photos]",
+            "config_version=0",
+            "config_version=2",
+            "[download]\ndirectory='/photos'",
+            "[photos]\nedited=false\nalternative=false",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let error = load_toml_config(&path, false).unwrap_err().to_string();
+            assert!(error.contains("config_version = 1"), "{error}");
+            assert!(error.contains("full-resolution"), "{error}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+        std::fs::write(
+            &path,
+            "config_version=1\n[filters]\nexclude=['live-photo-videos']",
+        )
+        .unwrap();
+        let config = load_toml_config(&path, true).unwrap().unwrap();
+        assert_eq!(
+            config.filters.unwrap().exclude,
+            Some(vec![MediaExclusion::LivePhotoVideos])
+        );
     }
     #[test]
     fn old_photo_toml_names_are_rejected() {

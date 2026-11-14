@@ -34,7 +34,7 @@ pub(super) fn write_sync_config(config_path: &std::path::Path, download_dir: &st
     std::fs::write(
         config_path,
         format!(
-            "[download]\ndirectory = {}\n",
+            "config_version = 1\n[download]\ndirectory = {}\n",
             common::toml_string(download_dir)
         ),
     )
@@ -767,7 +767,7 @@ pub(super) fn write_fake_two_factor_config(
     std::fs::write(
         &config_path,
         format!(
-            "[auth]\nusername = {}\npassword_file = {}\n\n[download]\ndirectory = {}\n",
+            "config_version = 1\n[auth]\nusername = {}\npassword_file = {}\n\n[download]\ndirectory = {}\n",
             common::toml_string(username),
             common::toml_string(&password_file.to_string_lossy()),
             common::toml_string(&download_dir.to_string_lossy()),
@@ -793,7 +793,7 @@ pub(super) fn sync_cmd_for_config_body(body: &str) -> assert_cmd::Command {
     std::fs::write(
         &config_path,
         format!(
-            "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = {}\n{body}",
+            "config_version = 1\n[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = {}\n{body}",
             common::toml_string(dl_dir.path().to_str().unwrap())
         ),
     )

@@ -1380,7 +1380,7 @@ fn retired_legacy_trust_plan_and_apply_refuse_before_archive_or_auth_writes() {
     .unwrap();
     drop(conn);
     let config = root.path().join("config.toml");
-    std::fs::write(&config,format!("[auth]\nusername = {username:?}\npassword = 'synthetic-not-a-real-password'\n[download]\ndirectory = {:?}\n",media.to_str().unwrap())).unwrap();
+    crate::common::write_versioned_config(&config,format!("[auth]\nusername = {username:?}\npassword = 'synthetic-not-a-real-password'\n[download]\ndirectory = {:?}\n",media.to_str().unwrap())).unwrap();
     let plan = root.path().join("plan.json");
     let snapshot = || {
         crate::common::walkdir(root.path())

@@ -8,15 +8,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use console::Style;
-use dialoguer::{Confirm, Input, Password, Select};
+use dialoguer::{Confirm, Input, MultiSelect, Password, Select};
 use indicatif::ProgressBar;
 use secrecy::ExposeSecret;
 
+use crate::config::MediaExclusion;
 use crate::credential::{CredentialBackend, CredentialStore};
-use crate::types::{
-    Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LogLevel, PhotoResolution,
-    RawPolicy,
-};
+use crate::types::{Domain, FileMatchPolicy, LivePhotoMovFilenamePolicy, LogLevel};
 
 /// Result of the setup wizard — either the user wants to sync now or just exit.
 #[derive(Debug)]
@@ -65,16 +63,8 @@ struct SetupAnswers {
     unfiled: Option<bool>,
 
     // Media types
-    skip_videos: bool,
-    /// `Some(_)` emits `[photos].live_photo_mode = "..."`; `None` keeps the
-    /// `Both` default. Replaces the wizard's old binary skip prompt.
-    live_photo_mode: Option<LivePhotoMode>,
+    exclude: Vec<MediaExclusion>,
     live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
-
-    // Quality
-    resolution: Option<PhotoResolution>,
-    force_resolution: bool,
-    raw_policy: Option<RawPolicy>,
 
     // Date range
     skip_created_before: Option<String>,
@@ -125,12 +115,8 @@ impl Default for SetupAnswers {
             smart_folders: Vec::new(),
             folder_structure_smart_folders: None,
             unfiled: None,
-            skip_videos: false,
-            live_photo_mode: None,
+            exclude: Vec::new(),
             live_photo_mov_filename_policy: None,
-            resolution: None,
-            force_resolution: false,
-            raw_policy: None,
             skip_created_before: None,
             skip_created_after: None,
             watch_interval: None,
@@ -278,7 +264,6 @@ pub(crate) fn run_setup(
 
     // Step 6: Photo quality & RAW
     section_header("Quality");
-    ask_quality(&mut answers)?;
 
     // Step 7: Date range
     section_header("Date range");
@@ -844,39 +829,38 @@ fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
 
 fn ask_media_types(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     println!();
-    let include_videos = Confirm::new()
-        .with_prompt("Include videos along with photos?")
-        .default(true)
-        .interact()?;
-    answers.skip_videos = !include_videos;
-
-    // Four-way choice (matches the runtime `LivePhotoMode` enum). The old
-    // wizard only exposed Both vs Skip, hiding the image-only / video-only
-    // modes that the CLI surface and TOML accept.
-    let live_items = [
-        "Both: image + video (default)",
-        "Image only: skip the .mov video file",
-        "Video only: skip the still image",
-        "Skip live photos entirely",
+    println!(
+        "Selected media includes full-resolution originals, current edits and available RAW/JPEG renditions."
+    );
+    let components = [
+        MediaExclusion::Photos,
+        MediaExclusion::Videos,
+        MediaExclusion::LivePhotoStills,
+        MediaExclusion::LivePhotoVideos,
     ];
-    let live_choice = Select::new()
-        .with_prompt("How should live photos be downloaded?")
-        .items(live_items)
-        .default(0)
+    let excluded = MultiSelect::new()
+        .with_prompt("Exclude components (leave unchecked to include)")
+        .items([
+            "Ordinary photos",
+            "Ordinary videos",
+            "Live Photo stills",
+            "Live Photo videos",
+        ])
         .interact()?;
-    answers.live_photo_mode = match live_choice {
-        1 => Some(LivePhotoMode::ImageOnly),
-        2 => Some(LivePhotoMode::VideoOnly),
-        3 => Some(LivePhotoMode::Skip),
-        // `Both` is the default; leave as None so the emitted TOML keeps the
-        // commented hint instead of an explicit assignment.
-        _ => None,
-    };
+    anyhow::ensure!(
+        excluded.len() < components.len(),
+        "Leave at least one media component selected."
+    );
+    answers.exclude = excluded
+        .into_iter()
+        .filter_map(|index| components.get(index).copied())
+        .collect();
 
     // The .mov filename policy only matters when both image and video land
     // on disk together. Image-only / video-only / skip leave the .mov on its
     // own (or absent), so the suffix-vs-original choice is moot.
-    let download_both_parts = matches!(live_choice, 0);
+    let download_both_parts = !answers.exclude.contains(&MediaExclusion::LivePhotoStills)
+        && !answers.exclude.contains(&MediaExclusion::LivePhotoVideos);
     if download_both_parts {
         let mov_items = [
             "Add -live suffix (IMG_1234-live.mov)",
@@ -890,59 +874,6 @@ fn ask_media_types(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         answers.live_photo_mov_filename_policy = match mov_policy {
             1 => Some(LivePhotoMovFilenamePolicy::Original),
             _ => None, // suffix is the default
-        };
-    }
-
-    Ok(())
-}
-
-// ── Step 5: Photo quality & RAW ────────────────────────────────────
-
-fn ask_quality(answers: &mut SetupAnswers) -> anyhow::Result<()> {
-    println!();
-    let size_items = ["Original (full resolution)", "Medium", "Thumbnail"];
-    let size = Select::new()
-        .with_prompt("What size should photos be downloaded at?")
-        .items(size_items)
-        .default(0)
-        .interact()?;
-
-    answers.resolution = match size {
-        1 => Some(PhotoResolution::Medium),
-        2 => Some(PhotoResolution::Thumb),
-        _ => None, // original is the default
-    };
-
-    // If not original, ask about fallback
-    if answers.resolution.is_some() {
-        let fallback = Confirm::new()
-            .with_prompt("If that size isn't available, fall back to original?")
-            .default(true)
-            .interact()?;
-        answers.force_resolution = !fallback;
-    }
-
-    println!();
-    let shoots_raw = Confirm::new()
-        .with_prompt("Do you shoot RAW?")
-        .default(false)
-        .interact()?;
-
-    if shoots_raw {
-        let raw_items = [
-            "Download both as-is",
-            "Prefer the RAW original",
-            "Prefer the processed JPEG",
-        ];
-        let raw_policy = Select::new()
-            .with_prompt("When both RAW and JPEG versions exist:")
-            .items(raw_items)
-            .default(0)
-            .interact()?;
-        answers.raw_policy = match raw_policy {
-            1 => Some(RawPolicy::PreferRaw),
-            2 => Some(RawPolicy::PreferJpeg),
-            _ => None, // as-is is the default
         };
     }
 
@@ -1294,6 +1225,8 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             None => writeln!(out, "# log_level = \"warn\"")?,
         };
 
+        writeln!(out, "config_version = 1")?;
+
         // [auth]
         writeln!(out)?;
         writeln!(out, "[auth]")?;
@@ -1455,12 +1388,12 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             Some(true) => writeln!(out, "unfiled = true")?,
             None => writeln!(out, "# unfiled = true")?,
         };
-        if answers.skip_videos {
-            writeln!(out, "media = [\"photos\", \"live-photos\"]")?;
-        } else {
-            writeln!(out, "# media = [\"photos\", \"videos\", \"live-photos\"]")?;
-        }
-        // `live_photo_mode` is emitted in the [photos] section below.
+        let exclusions: Vec<String> = answers
+            .exclude
+            .iter()
+            .map(|kind| format!("\"{}\"", kind.as_str()))
+            .collect();
+        writeln!(out, "exclude = [{}]", exclusions.join(", "))?;
         match &answers.skip_created_before {
             Some(d) => writeln!(out, "skip_created_before = \"{}\"", escape_toml_string(d))?,
             None => writeln!(out, "# skip_created_before = \"\"")?,
@@ -1473,17 +1406,6 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         // [photos]
         writeln!(out)?;
         writeln!(out, "[photos]")?;
-        match answers.resolution {
-            Some(size) => writeln!(out, "resolution = \"{}\"", version_size_str(size))?,
-            None => writeln!(out, "# resolution = \"original\"")?,
-        };
-        writeln!(out, "# edited = false")?;
-        writeln!(out, "# alternative = false")?;
-        writeln!(out, "# live_resolution = \"original\"")?;
-        match answers.live_photo_mode {
-            Some(mode) => writeln!(out, "live_photo_mode = \"{}\"", live_photo_mode_str(mode))?,
-            None => writeln!(out, "# live_photo_mode = \"both\"")?,
-        };
         match answers.live_photo_mov_filename_policy {
             Some(p) => writeln!(
                 out,
@@ -1492,19 +1414,10 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             )?,
             None => writeln!(out, "# live_photo_mov_filename_policy = \"suffix\"")?,
         };
-        match answers.raw_policy {
-            Some(p) => writeln!(out, "raw_policy = \"{}\"", raw_policy_str(p))?,
-            None => writeln!(out, "# raw_policy = \"as-is\"")?,
-        };
         match answers.file_match_policy {
             Some(p) => writeln!(out, "file_match_policy = \"{}\"", file_match_str(p))?,
             None => writeln!(out, "# file_match_policy = \"name-size-dedup-with-suffix\"")?,
         };
-        if answers.force_resolution {
-            writeln!(out, "force_resolution = true")?;
-        } else {
-            writeln!(out, "# force_resolution = false")?;
-        }
         if answers.keep_unicode_in_filenames {
             writeln!(out, "keep_unicode_in_filenames = true")?;
         } else {
@@ -1581,38 +1494,10 @@ fn log_level_str(level: LogLevel) -> &'static str {
     }
 }
 
-fn version_size_str(size: PhotoResolution) -> &'static str {
-    match size {
-        PhotoResolution::None => "none",
-        PhotoResolution::Original => "original",
-        PhotoResolution::Medium => "medium",
-        PhotoResolution::Thumb => "thumb",
-    }
-}
-
 fn mov_policy_str(policy: LivePhotoMovFilenamePolicy) -> &'static str {
     match policy {
         LivePhotoMovFilenamePolicy::Suffix => "suffix",
         LivePhotoMovFilenamePolicy::Original => "original",
-    }
-}
-
-fn live_photo_mode_str(mode: LivePhotoMode) -> &'static str {
-    // Must match the kebab-case rename in `LivePhotoMode`'s `Deserialize`
-    // (`#[serde(rename_all = "kebab-case")]`).
-    match mode {
-        LivePhotoMode::Both => "both",
-        LivePhotoMode::ImageOnly => "image-only",
-        LivePhotoMode::VideoOnly => "video-only",
-        LivePhotoMode::Skip => "skip",
-    }
-}
-
-fn raw_policy_str(policy: RawPolicy) -> &'static str {
-    match policy {
-        RawPolicy::AsIs => "as-is",
-        RawPolicy::PreferRaw => "prefer-raw",
-        RawPolicy::PreferJpeg => "prefer-jpeg",
     }
 }
 
@@ -1627,7 +1512,6 @@ fn file_match_str(policy: FileMatchPolicy) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::TomlConfig;
-    use crate::types::LivePhotoMode;
 
     #[test]
     fn dim_comments_preserves_toml_text_while_styling_comments_and_sections() {
@@ -1750,7 +1634,8 @@ mod tests {
         // Password should NOT be in the TOML
         assert!(!toml.contains("secret"));
         // Defaults should be commented out
-        assert!(toml.contains("# resolution = \"original\""));
+        assert!(toml.contains("config_version = 1"));
+        assert!(toml.contains("exclude = []"));
         assert!(toml.contains("# threads = 10"));
         assert!(toml.contains("# log_level = \"warn\""));
         assert!(toml.contains("# data_dir = \"~/.config/kei\""));
@@ -2055,12 +1940,8 @@ mod tests {
             smart_folders: vec!["all".to_string()],
             folder_structure_smart_folders: None,
             unfiled: Some(false),
-            skip_videos: true,
-            live_photo_mode: Some(LivePhotoMode::Both),
+            exclude: vec![MediaExclusion::Videos],
             live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
-            resolution: Some(PhotoResolution::Medium),
-            force_resolution: true,
-            raw_policy: Some(RawPolicy::PreferRaw),
             skip_created_before: Some("2024-01-01".to_string()),
             skip_created_after: Some("2025-01-01".to_string()),
             watch_interval: Some(1800),
@@ -2093,13 +1974,8 @@ mod tests {
         assert!(toml_str.contains("smart_folders = [\"all\"]"));
         assert!(toml_str.contains("unfiled = false"));
         assert!(!toml_str.contains("filename_exclude"));
-        assert!(toml_str.contains("media = [\"photos\", \"live-photos\"]"));
-        assert!(toml_str.contains("resolution = \"medium\""));
-        // live_photo_mode = "both" is the default; emitting it explicitly is
-        // also fine, but the test above sets `Some(Both)` so we expect it.
-        assert!(toml_str.contains("live_photo_mode = \"both\""));
-        assert!(toml_str.contains("force_resolution = true"));
-        assert!(toml_str.contains("raw_policy = \"prefer-raw\""));
+        assert!(toml_str.contains("exclude = [\"videos\"]"));
+        assert!(toml_str.contains("config_version = 1"));
         assert!(!toml_str.contains("recent ="));
         assert!(toml_str.contains("interval = 1800"));
         assert!(toml_str.contains("notify_systemd = true"));
@@ -2139,12 +2015,12 @@ mod tests {
             smart_folders: vec!["Favorites".to_string()],
             folder_structure_smart_folders: None,
             unfiled: Some(false),
-            skip_videos: true,
-            live_photo_mode: Some(LivePhotoMode::Skip),
+            exclude: vec![
+                MediaExclusion::Videos,
+                MediaExclusion::LivePhotoStills,
+                MediaExclusion::LivePhotoVideos,
+            ],
             live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
-            resolution: Some(PhotoResolution::Thumb),
-            force_resolution: true,
-            raw_policy: Some(RawPolicy::PreferJpeg),
             skip_created_before: Some("2024-01-01".to_string()),
             skip_created_after: Some("2025-06-01".to_string()),
             watch_interval: Some(600),
@@ -2198,15 +2074,7 @@ mod tests {
             Some(&["Favorites".to_string()][..])
         );
         assert_eq!(filters.unfiled, Some(false));
-        assert_eq!(
-            filters.media.as_deref(),
-            Some(
-                &[
-                    crate::config::MediaKind::Photos,
-                    crate::config::MediaKind::LivePhotos,
-                ][..]
-            )
-        );
+        assert_eq!(filters.exclude.as_deref(), Some(answers.exclude.as_slice()));
         assert!(
             filters.libraries.is_none(),
             "empty libraries vec must produce a comment, not an array"
@@ -2215,14 +2083,10 @@ mod tests {
         assert_eq!(filters.skip_created_after.as_deref(), Some("2025-06-01"));
 
         let photos = parsed.photos.unwrap();
-        assert_eq!(photos.resolution, Some(PhotoResolution::Thumb));
-        assert_eq!(photos.force_resolution, Some(true));
-        assert_eq!(photos.raw_policy, Some(RawPolicy::PreferJpeg));
         assert_eq!(
             photos.live_photo_mov_filename_policy,
             Some(LivePhotoMovFilenamePolicy::Original)
         );
-        assert_eq!(photos.live_photo_mode, Some(LivePhotoMode::Skip));
         assert_eq!(photos.file_match_policy, Some(FileMatchPolicy::NameId7));
         assert_eq!(photos.keep_unicode_in_filenames, Some(true));
 
@@ -2280,12 +2144,12 @@ mod tests {
                 smart_folders: vec!["all".to_string()],
                 folder_structure_smart_folders: None,
                 unfiled: Some(false),
-                skip_videos: true,
-                live_photo_mode: Some(LivePhotoMode::Skip),
+                exclude: vec![
+                    MediaExclusion::Videos,
+                    MediaExclusion::LivePhotoStills,
+                    MediaExclusion::LivePhotoVideos,
+                ],
                 live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
-                resolution: Some(PhotoResolution::Thumb),
-                force_resolution: true,
-                raw_policy: Some(RawPolicy::PreferJpeg),
                 bandwidth_limit: Some("10MB".to_string()),
                 reconcile_every_n_cycles: Some(24),
                 set_exif_datetime: true,
@@ -2304,6 +2168,15 @@ mod tests {
         // `key = ` (with the equals sign) so we don't false-positive on
         // comment hints or substring matches inside another key.
         const REMOVED_KEYS: &[(&str, &str)] = &[
+            ("resolution =", "full-resolution renditions are fixed"),
+            ("edited =", "current edits are included"),
+            (
+                "alternative =",
+                "available RAW/JPEG renditions are included",
+            ),
+            ("raw_policy =", "provider rendition identities are fixed"),
+            ("live_photo_mode =", "use filters.exclude"),
+            ("media =", "use filters.exclude"),
             (
                 "cookie_directory =",
                 "[auth].cookie_directory -> top-level data_dir",
@@ -2448,31 +2321,25 @@ mod tests {
         assert!(toml_str.contains("# folder_structure_albums = \"{album}\""));
     }
 
-    /// The wizard must be able to emit every `LivePhotoMode` value the
-    /// runtime accepts. The pre-fix wizard only exposed Both vs Skip, hiding
-    /// `image-only` and `video-only` from interactive setup.
     #[test]
-    fn test_live_photo_mode_emits_every_runtime_variant() {
-        for (mode, expected) in [
-            (LivePhotoMode::Both, "live_photo_mode = \"both\""),
-            (LivePhotoMode::ImageOnly, "live_photo_mode = \"image-only\""),
-            (LivePhotoMode::VideoOnly, "live_photo_mode = \"video-only\""),
-            (LivePhotoMode::Skip, "live_photo_mode = \"skip\""),
+    fn test_component_exclusions_emit_every_choice() {
+        for component in [
+            MediaExclusion::Photos,
+            MediaExclusion::Videos,
+            MediaExclusion::LivePhotoStills,
+            MediaExclusion::LivePhotoVideos,
         ] {
             let answers = SetupAnswers {
                 username: "u@e.com".to_string(),
                 password: secrecy::SecretString::from("p"),
                 directory: "/d".to_string(),
-                live_photo_mode: Some(mode),
+                exclude: vec![component],
                 ..Default::default()
             };
             let toml_str = generate_toml(&answers);
-            assert!(
-                toml_str.contains(expected),
-                "expected `{expected}` for mode {mode:?}; got:\n{toml_str}"
-            );
             let parsed: TomlConfig = toml::from_str(&toml_str).expect("must parse");
-            assert_eq!(parsed.photos.unwrap().live_photo_mode, Some(mode));
+            assert_eq!(parsed.filters.unwrap().exclude, Some(vec![component]));
+            assert_eq!(parsed.config_version, Some(1));
         }
     }
 
@@ -2521,13 +2388,6 @@ mod tests {
     fn test_generate_toml_enum_values() {
         // Verify each enum serializes to the correct TOML string that
         // the config parser expects.
-        assert_eq!(version_size_str(PhotoResolution::Original), "original");
-        assert_eq!(version_size_str(PhotoResolution::Medium), "medium");
-        assert_eq!(version_size_str(PhotoResolution::Thumb), "thumb");
-
-        assert_eq!(raw_policy_str(RawPolicy::AsIs), "as-is");
-        assert_eq!(raw_policy_str(RawPolicy::PreferRaw), "prefer-raw");
-        assert_eq!(raw_policy_str(RawPolicy::PreferJpeg), "prefer-jpeg");
 
         assert_eq!(
             file_match_str(FileMatchPolicy::NameSizeDedupWithSuffix),
@@ -2540,11 +2400,6 @@ mod tests {
             mov_policy_str(LivePhotoMovFilenamePolicy::Original),
             "original"
         );
-
-        assert_eq!(live_photo_mode_str(LivePhotoMode::Both), "both");
-        assert_eq!(live_photo_mode_str(LivePhotoMode::ImageOnly), "image-only");
-        assert_eq!(live_photo_mode_str(LivePhotoMode::VideoOnly), "video-only");
-        assert_eq!(live_photo_mode_str(LivePhotoMode::Skip), "skip");
 
         assert_eq!(log_level_str(LogLevel::Debug), "debug");
         assert_eq!(log_level_str(LogLevel::Info), "info");

@@ -293,7 +293,6 @@ fn test_compute_config_hash_matches_hash_download_config() {
             config_overrides: crate::config::SyncConfigOverrides {
                 download_dir: Some(dl_config.directory.display().to_string()),
                 folder_structure: Some(dl_config.folder_structure.clone()),
-                resolution: Some(crate::types::PhotoResolution::Original),
                 ..Default::default()
             },
             no_progress_bar: true,
@@ -385,9 +384,9 @@ fn test_compute_config_hash_different_directory() {
 fn test_compute_config_hash_different_size() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos", |_| {});
-    let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.config_overrides.resolution = Some(crate::types::PhotoResolution::Medium);
-    });
+    // Retained historical rendition decisions still have distinct hashes.
+    let mut b = build_config_with(tmp.path(), "/photos", |_| {});
+    b.photos.resolution = crate::types::PhotoResolution::Medium;
     assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
 }
 
@@ -433,9 +432,8 @@ fn test_compute_config_hash_different_inline_album_excludes() {
 fn test_compute_config_hash_different_live_photo_mode() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos", |_| {});
-    let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.config_overrides.live_photo_mode = Some(LivePhotoMode::Skip);
-    });
+    let mut b = build_config_with(tmp.path(), "/photos", |_| {});
+    b.photos.live_photo_mode = LivePhotoMode::Skip;
     assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
 }
 
@@ -842,12 +840,18 @@ fn golden_hash_download_config_non_defaults() {
 #[test]
 fn golden_compute_config_hash_defaults() {
     let tmp = TempDir::new().unwrap();
-    let config = build_config_with(tmp.path(), "/photos", |_| {});
+    let mut config = build_config_with(tmp.path(), "/photos", |_| {});
     let hash = compute_config_hash(&config);
     assert_eq!(
-        hash, "ad7d38163f7d7bad",
+        hash, "ec9963c3fdf2a5a2",
         "compute_config_hash golden hash changed -- this will invalidate sync tokens"
     );
+    // Migration expands selected renditions, while the released encoding
+    // remains recognizable for the old policy.
+    config.photos.edited = false;
+    config.photos.alternative = false;
+    config.photos.force_resolution = false;
+    assert_eq!(compute_config_hash(&config), "ad7d38163f7d7bad");
 }
 
 #[test]
@@ -862,7 +866,7 @@ fn golden_compute_config_hash_with_albums() {
     });
     let hash = compute_config_hash(&config);
     assert_eq!(
-        hash, "ad7d38163f7d7bad",
+        hash, "ec9963c3fdf2a5a2",
         "album selection should not change the CloudKit zone-token hash"
     );
 }
@@ -877,7 +881,7 @@ fn golden_compute_config_hash_with_smart_folders() {
     });
     let hash = compute_config_hash(&config);
     assert_eq!(
-        hash, "ad7d38163f7d7bad",
+        hash, "ec9963c3fdf2a5a2",
         "smart-folder selection should not change the CloudKit zone-token hash"
     );
 }
@@ -894,7 +898,7 @@ fn golden_compute_config_hash_with_unfiled_false() {
     });
     let hash = compute_config_hash(&config);
     assert_eq!(
-        hash, "08d06f84680c44b9",
+        hash, "1f3d64d238010c41",
         "compute_config_hash golden hash changed -- this will invalidate sync tokens"
     );
 }
