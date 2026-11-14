@@ -2405,8 +2405,8 @@ async fn run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_res
         let db: Arc<dyn download::DownloadStore> = inner.clone();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         if phase == 0 {
-            inner.acquire_lock("inject shadow receipt failure").unwrap().execute_batch(
-                "CREATE TRIGGER shadow_cycle_fault BEFORE INSERT ON provider_shadow_receipts BEGIN SELECT RAISE(ABORT,'synthetic capture fault'); END").unwrap();
+            inner.acquire_lock("inject shadow page failure").unwrap().execute_batch(
+                "CREATE TRIGGER shadow_cycle_fault AFTER INSERT ON provider_shadow_pages BEGIN SELECT RAISE(ABORT,'synthetic capture fault'); END").unwrap();
         } else if phase == 1 {
             inner
                 .acquire_lock("remove injected capture fault")
@@ -2529,7 +2529,13 @@ async fn run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_res
             let conn = inner
                 .acquire_lock("capture does not clear historical debt")
                 .unwrap();
-            let receipt: String = conn.query_row("SELECT p.successor FROM provider_shadow_receipts r JOIN provider_shadow_pages p ON p.id=r.page_id",[],|r|r.get(0)).unwrap();
+            let receipt: String = conn
+                .query_row(
+                    "SELECT successor FROM provider_shadow_pages WHERE request_cursor='recovered'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
             assert_eq!(receipt, "recovered");
             assert_eq!(
                 conn.query_row::<i64, _, _>(

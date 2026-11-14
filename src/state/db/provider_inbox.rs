@@ -269,12 +269,6 @@ impl SqliteStateDb {
                     id
                 }
             };
-            // Last observed receipt only. Replaying an older legacy cursor may
-            // replace this pointer; it is neither materialization nor coverage.
-            tx.execute(
-                "INSERT INTO provider_shadow_receipts(scope,page_id) VALUES (?1,?2) ON CONFLICT(scope) DO UPDATE SET page_id=excluded.page_id",
-                params![page.scope, page_id],
-            )?;
             tx.commit()?;
             crate::support::record_storage(StorageComponent::Inbox, storage.0, storage.1);
             Ok(CapturedPageId(page_id))

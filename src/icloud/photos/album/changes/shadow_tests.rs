@@ -156,7 +156,7 @@ async fn shadow_source_payload_roundtrip_preserves_history_and_current_replay_pa
     );
     let bound = album(body.clone(), capture(&db));
     assert_eq!(collect(&bound.clone()).await, baseline);
-    assert_eq!(counts(&db), (1, 5, 1));
+    assert_eq!(counts(&db), (1, 5, 0));
     // Synthetic version rewind exercises migration re-entry with observations
     // already present, as the established earlier-version controls do.
     db.acquire_lock("synthetic migration re-entry")
@@ -226,7 +226,7 @@ async fn shadow_source_payload_roundtrip_preserves_history_and_current_replay_pa
         assert_eq!(collect(&bound).await, baseline);
         assert_eq!(
             counts(&db),
-            (1, 5, 1),
+            (1, 5, 0),
             "exact observed-page replay must be idempotent"
         );
         let conn = db.acquire_lock("retired checkpoint bytes").unwrap();
@@ -246,7 +246,7 @@ async fn shadow_transaction_failure_and_capacity_hold_then_recover_after_reopen(
     let path = directory.path().join("owned.db");
     let db = open(&path).await;
     db.acquire_lock("capture fault").unwrap().execute_batch(
-        "CREATE TRIGGER shadow_receipt_fault BEFORE INSERT ON provider_shadow_receipts BEGIN SELECT RAISE(ABORT,'synthetic receipt failure'); END").unwrap();
+        "CREATE TRIGGER shadow_receipt_fault AFTER INSERT ON provider_shadow_records BEGIN SELECT RAISE(ABORT,'synthetic identity write failure'); END").unwrap();
     let bound = album(unknown_page(), capture(&db));
     let (events, errors, token) = collect(&bound).await;
     assert!(events.is_empty());
@@ -263,7 +263,8 @@ async fn shadow_transaction_failure_and_capacity_hold_then_recover_after_reopen(
     assert_eq!(counts(&db), (0, 0, 0));
     db.acquire_lock("remove only injected fault")
         .unwrap()
-        .execute_batch("DROP TRIGGER shadow_receipt_fault")
+        .execute_batch("DROP TRIGGER shadow_receipt_fault;
+            CREATE TRIGGER obsolete_receipt_fault BEFORE INSERT ON provider_shadow_receipts BEGIN SELECT RAISE(ABORT,'obsolete pointer must not be written'); END;")
         .unwrap();
     let mut full = capture(&db);
     full.capacity = 0;
@@ -280,7 +281,7 @@ async fn shadow_transaction_failure_and_capacity_hold_then_recover_after_reopen(
         collect(&recovered).await,
         (Vec::new(), Vec::new(), "successor".into())
     );
-    assert_eq!(counts(&db), (1, 1, 1));
+    assert_eq!(counts(&db), (1, 1, 0));
     drop(recovered);
     // Existing exact observations do not need another byte allocation, even
     // when capacity is exhausted. A changed revision must hold, not overwrite.
@@ -295,7 +296,7 @@ async fn shadow_transaction_failure_and_capacity_hold_then_recover_after_reopen(
         .replace("v1", "v2")
         .into_bytes();
     assert_eq!(collect(&album(changed, full)).await.2, "saved");
-    assert_eq!(counts(&db), (1, 1, 1));
+    assert_eq!(counts(&db), (1, 1, 0));
 }
 
 #[tokio::test]
@@ -356,7 +357,7 @@ async fn shadow_scopes_and_revisions_remain_distinct_and_owner_is_rechecked() {
             .1
             .is_empty()
     );
-    assert_eq!(counts(&db), (3, 3, 2));
+    assert_eq!(counts(&db), (3, 3, 0));
     {
         let conn = db
             .acquire_lock("independent stable scope and version facts")
@@ -401,7 +402,7 @@ async fn shadow_scopes_and_revisions_remain_distinct_and_owner_is_rechecked() {
     );
     assert_eq!(
         counts(&db),
-        (3, 3, 2),
+        (3, 3, 0),
         "wrong owner cannot even acknowledge an existing page"
     );
 }
@@ -497,7 +498,7 @@ async fn shadow_cancelled_receiver_before_capture_preserves_page_and_legacy_curs
             .1
             .is_empty()
     );
-    assert_eq!(counts(&db), (1, 1, 1));
+    assert_eq!(counts(&db), (1, 1, 0));
     assert_eq!(
         db.get_metadata("sync_token:PrimarySync")
             .await

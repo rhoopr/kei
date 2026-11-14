@@ -730,7 +730,7 @@ async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quie
             // cannot mask an otherwise eligible rank checkpoint.
             conn.execute_batch("DELETE FROM assets WHERE id='retry'; DELETE FROM metadata WHERE key LIKE 'pending_sync_token:%';").unwrap();
             if kind == "write" {
-                conn.execute_batch("CREATE TRIGGER shadow_cli_fault BEFORE INSERT ON provider_shadow_receipts BEGIN SELECT RAISE(ABORT,'synthetic CLI receipt failure'); END;").unwrap();
+                conn.execute_batch("CREATE TRIGGER shadow_cli_fault AFTER INSERT ON provider_shadow_pages BEGIN SELECT RAISE(ABORT,'synthetic CLI receipt failure'); END;").unwrap();
             }
         }
         let original_charge = if kind == "capacity" {

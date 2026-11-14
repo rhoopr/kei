@@ -1147,14 +1147,16 @@ async fn full_budget_accepts_equivalent_repeat_and_refuses_distinct_change() {
     let error = capture.capture(changed).await.expect_err("full inbox");
     assert!(format!("{error:#}").contains("inbox is full"));
     assert_eq!(transport_counts(&db), (1, 1, 1));
-    let receipt: i64 = db
-        .acquire_lock("refused change keeps receipt")
+    let retained_pages: i64 = db
+        .acquire_lock("refused change keeps original page")
         .unwrap()
-        .query_row("SELECT page_id FROM provider_shadow_receipts", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT count(*) FROM provider_shadow_pages WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
-    assert_eq!(receipt, 1);
+    assert_eq!(retained_pages, 1);
 }
 
 #[tokio::test]

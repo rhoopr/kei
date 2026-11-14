@@ -373,10 +373,7 @@ unresolved relationships, including numeric lexemes that a typed JSON re-encode
 could alter. Cookies and authentication headers are not captured; resource URLs
 remain transient payload, never durable identity.
 
-Schema 29 adds `provider_shadow_pages`, ordinal source identities in
-`provider_shadow_records`, and a per-scope last-observed pointer in
-`provider_shadow_receipts`. An immediate SQLite transaction rechecks the
-independent account owner and commits all three together. Provenance includes the
+Schema 29 adds `provider_shadow_pages` and ordinal source identities in `provider_shadow_records`. An immediate SQLite transaction rechecks the independent account owner and commits both together. The former per-scope pointer in `provider_shadow_receipts` has no runtime reader or writer; its schema and historical bytes remain preserved. Provenance includes the
 account namespace and authenticated provider fingerprint, versioned realm,
 CloudKit container and environment, private/shared database, validated zone and
 returned owner when present, request cursor and successor. Unknown zone metadata
