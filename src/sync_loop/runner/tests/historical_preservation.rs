@@ -103,6 +103,180 @@ impl PhotosSession for Session {
 }
 static EMPTY: Vec<Value> = Vec::new();
 
+#[tokio::test]
+async fn fresh_start_current_sync_survives_invalid_historical_plans() {
+    let mut fixture = Fixture::new("missing").await;
+    fixture.native_scope = true;
+    fixture.responses(true).await;
+    let first = fixture.cycle(CancellationToken::new(), false, false).await;
+    assert!(first.failed_count > 0, "{first:?}");
+    let before = files(&fixture.media);
+    {
+        let conn = rusqlite::Connection::open(&fixture.database).unwrap();
+        // These are real plans from the interrupted production cycle. Damage
+        // their historical payloads, keeping the current provider fixture intact.
+        assert!(
+            conn.execute(
+                "UPDATE provider_active_generations SET specification=X'00ff'",
+                []
+            )
+            .unwrap()
+                > 0
+        );
+        conn.execute("UPDATE provider_shadow_pages SET body=X'00ff'", [])
+            .unwrap();
+        conn.execute_batch("INSERT INTO unresolved_sparse_identities
+            (library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at)
+            VALUES ('PrimarySync','historical-sparse','invalid-old-key','invalid-old-key',1,1);
+            INSERT INTO metadata VALUES ('unresolved_asset_identity:PrimarySync','1');
+            INSERT INTO metadata VALUES ('sparse_identity_generation',X'00ff');").unwrap();
+    }
+    fixture.responses(false).await;
+    assert!(
+        fixture
+            .try_cycle(CancellationToken::new(), false, false)
+            .await
+            .is_err(),
+        "the same historical inconsistency must fail before the transition"
+    );
+    rusqlite::Connection::open(&fixture.database)
+        .unwrap()
+        .pragma_update(None, "user_version", 37)
+        .unwrap();
+    fixture.responses(true).await;
+    fixture.session.trace.lock().unwrap().clear();
+    let current_failure = fixture.cycle(CancellationToken::new(), false, false).await;
+    assert!(current_failure.failed_count > 0, "{current_failure:?}");
+    assert!(
+        !current_failure.can_advance_database_checkpoint(),
+        "{current_failure:?}"
+    );
+    assert!(
+        fixture
+            .session
+            .trace
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "rank")
+    );
+    fixture.responses(false).await;
+    fixture.session.trace.lock().unwrap().clear();
+    let recovered = fixture.cycle(CancellationToken::new(), false, false).await;
+    assert_eq!(recovered.failed_count, 0, "{recovered:?}");
+    assert!(recovered.can_advance_database_checkpoint(), "{recovered:?}");
+    assert_eq!(
+        recovered.stats.downloaded, 1,
+        "completed peers must be reused"
+    );
+    for (path, evidence) in before {
+        assert_eq!(files(&fixture.media).get(&path), Some(&evidence));
+    }
+    assert!(
+        !rows(
+            &fixture.database,
+            "SELECT * FROM historical_v030_provider_active_destinations"
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        rows(
+            &fixture.database,
+            "SELECT original_evidence FROM historical_v030_unresolved_sparse_identities"
+        ),
+        vec![vec![rusqlite::types::Value::Text("invalid-old-key".into())]]
+    );
+    assert!(
+        rows(
+            &fixture.database,
+            "SELECT * FROM unresolved_sparse_identities"
+        )
+        .is_empty()
+    );
+    assert!(
+        rows(
+            &fixture.database,
+            "SELECT specification FROM historical_v030_provider_active_generations"
+        )
+        .iter()
+        .all(|row| row == &vec![rusqlite::types::Value::Blob(vec![0, 255])])
+    );
+    // Every cycle opens and drops the owned database. Let the first incremental
+    // response establish its successor before checking two unchanged cycles.
+    fixture.healthy().await;
+    let root = fixture.database.parent().unwrap();
+    std::fs::write(
+        root.join("restart-records.json"),
+        serde_json::to_vec(&fixture.session.records).unwrap(),
+    )
+    .unwrap();
+    let requests = fixture.server.received_requests().await.unwrap().len();
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sync_loop::runner::tests::historical_preservation::fresh_start_restart_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KEI_TEST_FRESH_START_ROOT", root)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fixture.server.received_requests().await.unwrap().len(),
+        requests
+    );
+    fixture.assert_history();
+}
+
+#[tokio::test]
+#[ignore = "invoked by the fresh-start parent against its persisted synthetic fixture"]
+async fn fresh_start_restart_worker() {
+    let root = PathBuf::from(std::env::var_os("KEI_TEST_FRESH_START_ROOT").unwrap());
+    let database = root.join("owned.db");
+    let media = root.join("media");
+    let history = HISTORY.iter().map(|sql| rows(&database, sql)).collect();
+    let fixture = Fixture {
+        _root: tempfile::tempdir().unwrap(),
+        database,
+        original: media.join("photo.jpg"),
+        sidecar: media.join("photo.jpg.xmp"),
+        media,
+        owner: AccountOwner::authenticated(
+            "history@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-history"}})).unwrap(),
+        )
+        .unwrap(),
+        config: make_run_cycle_config(),
+        session: Session {
+            zone: ZONE.into(),
+            records: serde_json::from_slice(
+                &std::fs::read(root.join("restart-records.json")).unwrap(),
+            )
+            .unwrap(),
+            ..Default::default()
+        },
+        server: MockServer::start().await,
+        second_zone: false,
+        collecting: false,
+        native_scope: true,
+        history,
+    };
+    fixture.quiet_twice().await;
+}
+
 fn rows(database: &Path, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
     let conn = rusqlite::Connection::open(database).unwrap();
     let mut statement = conn.prepare(sql).unwrap();
@@ -146,6 +320,7 @@ struct Fixture {
     server: MockServer,
     second_zone: bool,
     collecting: bool,
+    native_scope: bool,
     history: Vec<Vec<Vec<rusqlite::types::Value>>>,
 }
 
@@ -301,6 +476,7 @@ impl Fixture {
             server,
             second_zone: false,
             collecting: false,
+            native_scope: false,
             history,
         };
         fixture.responses(false).await;
@@ -365,6 +541,24 @@ impl Fixture {
         let db = self.open().await;
         let capture = ShadowCapture::new(db.clone(), self.owner.clone(), "com");
         let mut album = make_full_album_with_boxed_session(ZONE, Box::new(self.session.clone()));
+        if self.native_scope {
+            album = crate::icloud::photos::PhotoAlbum::new(
+                crate::icloud::photos::PhotoAlbumConfig {
+                    params: Arc::new(std::collections::HashMap::new()),
+                    service_endpoint: Arc::from("https://example.invalid"),
+                    name: Arc::from("All Photos"),
+                    list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                    obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                    query_filter: None,
+                    page_size: 100,
+                    zone_id: Arc::new(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})),
+                    retry_config: crate::retry::RetryConfig::default(),
+                    container_id: None,
+                    cross_zone_sources: Vec::new(),
+                },
+                Box::new(self.session.clone()),
+            );
+        }
         album.set_shadow_capture(capture.clone(), Arc::from("private"));
         let mut selected = make_run_cycle_library_state_with_album(ZONE, CURSOR, album);
         if self.collecting {

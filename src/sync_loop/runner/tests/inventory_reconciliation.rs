@@ -202,6 +202,10 @@ impl Fixture {
             )
             .unwrap();
             conn.pragma_update(None, "user_version", 36).unwrap();
+            // These scenarios exercise an outstanding inventory request with a
+            // retained cursor. Build that historical post-migration state
+            // explicitly; schema-38 upgrades instead retire the old cursor.
+            crate::state::schema::migrate_historical_fixture(&conn).unwrap();
         }
         drop(db);
         let server = MockServer::start().await;

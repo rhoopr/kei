@@ -1129,7 +1129,7 @@ mod tests {
         };
         {
             let conn = Connection::open(&path).unwrap();
-            crate::state::schema::migrate(&conn).unwrap();
+            crate::state::schema::migrate_historical_fixture(&conn).unwrap();
             assert_eq!(
                 crate::state::schema::get_schema_version(&conn).unwrap(),
                 crate::state::schema::SCHEMA_VERSION
@@ -1312,6 +1312,8 @@ mod tests {
             );
             id
         };
+        crate::state::schema::migrate_historical_fixture(&Connection::open(&path).unwrap())
+            .unwrap();
         let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
             .await
             .unwrap();
@@ -1395,7 +1397,7 @@ mod tests {
             let conn = Connection::open(&path).unwrap();
             let before = charged_sum(&conn);
             TEST_ABORT_AFTER_ALIASES.with(|count| count.set(1));
-            assert!(crate::state::schema::migrate(&conn).is_err());
+            assert!(crate::state::schema::migrate_historical_fixture(&conn).is_err());
             TEST_ABORT_AFTER_ALIASES.with(|count| count.set(0));
             assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 35);
             assert_eq!(charged_sum(&conn), before);
@@ -1412,7 +1414,7 @@ mod tests {
         }
         {
             let conn = Connection::open(&path).unwrap();
-            crate::state::schema::migrate(&conn).unwrap();
+            crate::state::schema::migrate_historical_fixture(&conn).unwrap();
         }
         let conn = Connection::open(&path).unwrap();
         assert_eq!(
@@ -1448,7 +1450,7 @@ mod tests {
     fn migrated_legacy(path: &std::path::Path) -> AccountOwner {
         let (owner, _, _) = legacy_v35(path);
         let conn = Connection::open(path).unwrap();
-        crate::state::schema::migrate(&conn).unwrap();
+        crate::state::schema::migrate_historical_fixture(&conn).unwrap();
         owner
     }
 
@@ -1487,7 +1489,7 @@ mod tests {
             let (_owner, _budget) = full_legacy_v35(&path);
             {
                 let conn = Connection::open(&path).unwrap();
-                crate::state::schema::migrate(&conn).unwrap();
+                crate::state::schema::migrate_historical_fixture(&conn).unwrap();
             }
             let conn = Connection::open(&path).unwrap();
             conn.execute(
@@ -1533,7 +1535,7 @@ mod tests {
             {
                 let conn = Connection::open(&path).unwrap();
                 conn.execute_batch(sql).unwrap();
-                crate::state::schema::migrate(&conn).unwrap();
+                crate::state::schema::migrate_historical_fixture(&conn).unwrap();
                 assert!(
                     !conn
                         .query_row::<bool, _, _>(
@@ -1580,8 +1582,10 @@ mod tests {
         assert_eq!(before.0, 35);
         assert_eq!(u64::try_from(before.1).unwrap(), budget);
 
-        // Opening the database performs the complete migration, including
-        // compaction. No schema action or manual charge discount is applied.
+        // Exercise the historical compaction step explicitly. Current upgrades
+        // retire these pages before that step instead of compacting them.
+        crate::state::schema::migrate_historical_fixture(&Connection::open(&path).unwrap())
+            .unwrap();
         let db = std::sync::Arc::new(
             crate::state::SqliteStateDb::open_owned(&path, &owner)
                 .await
@@ -1761,7 +1765,7 @@ mod tests {
         };
         {
             let conn = Connection::open(&commit_path).unwrap();
-            crate::state::schema::migrate(&conn).unwrap();
+            crate::state::schema::migrate_historical_fixture(&conn).unwrap();
         }
         let after_charge = {
             let conn = Connection::open(&commit_path).unwrap();
@@ -1813,14 +1817,14 @@ mod tests {
         {
             let conn = Connection::open(&failed_path).unwrap();
             TEST_ABORT_AFTER_ALIASES.with(|count| count.set(1));
-            assert!(crate::state::schema::migrate(&conn).is_err());
+            assert!(crate::state::schema::migrate_historical_fixture(&conn).is_err());
             TEST_ABORT_AFTER_ALIASES.with(|count| count.set(0));
         }
 
         crate::support::begin(serde_json::json!({"scenario": "reopen-commit"}));
         {
             let conn = Connection::open(&failed_path).unwrap();
-            crate::state::schema::migrate(&conn).unwrap();
+            crate::state::schema::migrate_historical_fixture(&conn).unwrap();
         }
 
         crate::support::begin(serde_json::json!({"scenario": "unprojectable"}));
@@ -1829,7 +1833,7 @@ mod tests {
         {
             let conn = Connection::open(&unprojectable_path).unwrap();
             insert_legacy(&conn, &oversized_unprojected_observed(), 200_000);
-            crate::state::schema::migrate(&conn).unwrap();
+            crate::state::schema::migrate_historical_fixture(&conn).unwrap();
         }
 
         crate::support::begin(serde_json::json!({"scenario": "inbox-catalogue-single-item-limit"}));

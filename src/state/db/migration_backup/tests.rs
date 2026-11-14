@@ -63,15 +63,7 @@ fn assert_history(conn: &Connection) {
         ("sync_token:PrimarySync", "original-cursor"),
         ("pending_sync_token:old:PrimarySync", "historical-debt"),
     ] {
-        assert_eq!(
-            conn.query_row::<String, _, _>(
-                "SELECT value FROM metadata WHERE key=?1",
-                [key],
-                |row| row.get(0)
-            )
-            .unwrap(),
-            expected
-        );
+        crate::test_helpers::assert_checkpoint_evidence(conn, key, expected);
     }
     assert_eq!(
         conn.query_row::<Vec<u8>, _, _>("SELECT payload FROM future_unknown", [], |row| row.get(0))

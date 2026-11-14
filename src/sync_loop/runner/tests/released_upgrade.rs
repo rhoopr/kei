@@ -2,6 +2,7 @@
 use std::sync::Arc;
 
 use base64::Engine as _;
+use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
@@ -28,6 +29,23 @@ impl crate::icloud::photos::PhotosSession for UpgradeSession {
         body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<serde_json::Value> {
+        if url.contains("/records/query/batch?") {
+            return Ok(crate::sync_loop::test_support::album_count_response(1));
+        }
+        if url.contains("/records/query?") {
+            let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .unwrap()["fieldValue"]["value"]
+                .as_u64()
+                .unwrap();
+            return Ok(
+                serde_json::json!({"records": if offset == 0 { self.records.clone() } else { serde_json::json!([]) }, "syncToken":"after"}),
+            );
+        }
         if url.contains("/changes/zone?") {
             let records = if self.quiet {
                 serde_json::json!([])
@@ -199,17 +217,27 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
             if cycle == 0 { "pending" } else { "downloaded" },
             "cycle {cycle}"
         );
-        let token: String = conn
+        let token: Option<String> = conn
             .query_row(
                 "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
                 [],
                 |r| r.get(0),
             )
+            .optional()
             .unwrap();
         assert_eq!(
-            token,
-            if cycle == 0 { "before" } else { "after" },
+            token.as_deref(),
+            if cycle == 0 { None } else { Some("after") },
             "cycle {cycle}"
+        );
+        assert_eq!(
+            conn.query_row::<String, _, _>(
+                "SELECT value FROM historical_v030_checkpoints WHERE key='sync_token:PrimarySync'",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            "before"
         );
         assert_eq!(conn.query_row("SELECT master_record_name FROM asset_master_mappings WHERE library='PrimarySync' AND asset_record_name='asset-recovered'", [], |r| r.get::<_, String>(0)).unwrap(), "recovered");
         // Retry routing resets failed to pending before attempting the write.
@@ -411,14 +439,10 @@ async fn released_v0240_metadata_policy_selection_restart_preserves_siblings() {
             ("PrimarySync", "primary-before"),
             ("SharedSync-synthetic", "shared-before"),
         ] {
-            assert_eq!(
-                conn.query_row(
-                    "SELECT value FROM metadata WHERE key=?1",
-                    [format!("sync_token:{library}")],
-                    |row| row.get::<_, String>(0)
-                )
-                .unwrap(),
-                token
+            crate::test_helpers::assert_checkpoint_evidence(
+                &conn,
+                &format!("sync_token:{library}"),
+                token,
             );
         }
         assert_eq!(

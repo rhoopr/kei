@@ -1,5 +1,20 @@
 # v0.30 sync simplification implementation plan
 
+## Guiding decision: v0.30.0 is a fresh start
+
+User decision, 2026-11-14. This governs every slice and supersedes conflicting historical requirements, designs and delivery dependencies below. It records the required behavior, not completed implementation.
+
+- On transition to v0.30.0, run a full sync and build clean current state from canonical current iCloud observations under the user's supported selection. Establish a valid current provider boundary, then proceed with ordinary incremental sync.
+- Historical state issues and mismatches are informational only. They must not make sync unrecoverable, prevent current state from being saved, veto baseline activation or checkpoints, or keep obsolete work executable.
+- Resolve history when a clean sync pass can do so simply. Otherwise preserve the evidence and proceed. Do not add historical repair protocols, replay branches or edge-case machinery to make old planning records consistent or satisfiable.
+- Preserve existing media and metadata, confidently reusable ownership and path evidence, and evidence needed to settle interrupted publication safely. Uncertain historical associations do not authorize overwrites or deletion; preserve those files and let independently identified current work progress.
+- Genuine current provider, transfer, storage and publication failures retain their safety checks and durable retry behavior. Unknown current identity remains unresolved work; historical inconsistency alone is not a current failure.
+- For every slice, name the authority being removed and its surviving current owner. Reject an approach that requires repairing historical planning state before current sync can proceed. Prove the fresh-start flow through production startup/sync, an actual restart and quiet incremental progress before expanding the test matrix.
+
+Current redesign work is isolated on `work/v030-slice1-bounded` at `/home/robhooper/dev/kei-slice1-bounded`, based on `76eaab8d`. Both earlier dirty checkouts remain preserved reference material. The next implementation boundary must follow this decision; the filename-exclusion proposal is not the agreed next slice.
+
+The approved in-place transition is implemented as a local schema-38 candidate. Historical provider planning, raw inbox/catalog, active selection, sparse identity and checkpoint authority move into inactive snapshots in the same database. The existing full-sync and current-work owners rebuild authority from current observations. This is a transition-only prerequisite: it adds the one-time retirement boundary rather than removing the live inbox subsystem. Raw capture and replay deletion remains the later provider-to-work simplification boundary. Local validation passed the library suite (4,135 passed, eight ignored), the added unversioned-state regression, and focused reruns of all failures found by the behavioral suite. Formatting and all-target/all-feature Clippy passed. This candidate has no full available-suite, live or platform qualification claim.
+
 ## Current accepted boundary and next approval
 
 The user subsequently authorized live testing using the supplied `.test-cookies` and required each slice to run the full available test suite. Hosted offline qualification alone is no longer the final acceptance boundary. Run the full-test phases against an immutable slice commit in an isolated checkout, preserve the supplied authentication and all existing media/state, and use explicit fixed-date fixture selection. Missing fixture bounds, unavailable tools, rate limits and skipped phases must be reported rather than counted as passes. Real host-service testing requires an unused isolated slot; never replace an existing service. Slice 1b's live/full-suite qualification is assigned separately from ongoing next-slice source edits. This supersedes earlier no-live restrictions for the authorized test scope, not restrictions on publishing, releases or unrelated provider operations.

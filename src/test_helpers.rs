@@ -15,6 +15,39 @@ use crate::icloud::photos::PhotoAsset;
 use crate::icloud::photos::session::PhotosSession;
 use crate::state::types::{AssetMetadata, AssetRecord, MediaType, VersionSizeKey};
 
+/// Check exact saved cursor bytes before and after fresh-start retirement.
+/// A retired cursor must be preserved as evidence and absent from live state.
+pub(crate) fn assert_checkpoint_evidence(conn: &rusqlite::Connection, key: &str, expected: &str) {
+    let retired: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='historical_v030_checkpoints')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let table = if retired {
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM metadata WHERE key=?1", [key], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        "historical_v030_checkpoints"
+    } else {
+        "metadata"
+    };
+    assert_eq!(
+        conn.query_row(
+            &format!("SELECT value FROM {table} WHERE key=?1"),
+            [key],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        expected
+    );
+}
+
 /// Synthetic QuickTime track metadata without an ISO FullBox prefix.
 #[cfg(feature = "xmp")]
 pub(crate) fn bare_track_meta_movie() -> Vec<u8> {

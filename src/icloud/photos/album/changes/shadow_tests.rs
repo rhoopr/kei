@@ -112,7 +112,7 @@ pub(super) async fn collect(
 }
 
 #[tokio::test]
-async fn shadow_source_payload_roundtrip_reopens_losslessly_and_replays_legacy_parity() {
+async fn shadow_source_payload_roundtrip_preserves_history_and_current_replay_parity() {
     use crate::icloud::photos::album::test_support::{changes_asset, changes_master};
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("owned.db");
@@ -170,16 +170,18 @@ async fn shadow_source_payload_roundtrip_reopens_losslessly_and_replays_legacy_p
         let stored: Vec<u8> = db
             .acquire_lock("independent raw replay")
             .unwrap()
-            .query_row("SELECT body FROM provider_shadow_pages", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT body FROM historical_v030_provider_shadow_pages",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(stored, body);
         assert!(String::from_utf8_lossy(&stored).contains("9007199254740993.0"));
         {
             let conn = db.acquire_lock("scope and ordinal facts").unwrap();
             let (scope, request, successor, account, provider): (String,String,String,String,String) = conn.query_row(
-                "SELECT scope,request_cursor,successor,account_key,provider_key FROM provider_shadow_pages", [],
+                "SELECT scope,request_cursor,successor,account_key,provider_key FROM historical_v030_provider_shadow_pages", [],
                 |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
             let scope: Value = serde_json::from_str(&scope).unwrap();
             assert_eq!(scope["realm"], "com");
@@ -193,7 +195,7 @@ async fn shadow_source_payload_roundtrip_reopens_losslessly_and_replays_legacy_p
             );
             assert!(account.starts_with("account-v1-"));
             assert_eq!(provider.len(), 64);
-            let mut query = conn.prepare("SELECT ordinal,record_name,record_type,deleted FROM provider_shadow_records ORDER BY ordinal").unwrap();
+            let mut query = conn.prepare("SELECT ordinal,record_name,record_type,deleted FROM historical_v030_provider_shadow_records ORDER BY ordinal").unwrap();
             let identities: Vec<(i64, String, Option<String>, bool)> = query
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                 .unwrap()
@@ -227,19 +229,12 @@ async fn shadow_source_payload_roundtrip_reopens_losslessly_and_replays_legacy_p
             (1, 5, 1),
             "exact observed-page replay must be idempotent"
         );
-        assert_eq!(
-            db.get_metadata("sync_token:PrimarySync")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("saved")
-        );
-        assert_eq!(
-            db.get_metadata("pending_sync_token:old-epoch:PrimarySync")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("retained-debt")
+        let conn = db.acquire_lock("retired checkpoint bytes").unwrap();
+        crate::test_helpers::assert_checkpoint_evidence(&conn, "sync_token:PrimarySync", "saved");
+        crate::test_helpers::assert_checkpoint_evidence(
+            &conn,
+            "pending_sync_token:old-epoch:PrimarySync",
+            "retained-debt",
         );
         assert_eq!(std::fs::read(&media).unwrap(), b"preexisting-media");
     }

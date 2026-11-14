@@ -320,22 +320,19 @@ impl Fixture {
             std::fs::read(self.config.directory.join("existing.xmp")).unwrap(),
             b"retained-sidecar"
         );
-        assert_eq!(
-            self.db
-                .get_metadata("sync_token:PrimarySync")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("old-cursor")
-        );
-        assert_eq!(
-            self.db
-                .get_metadata("pending_sync_token:sparse:OtherZone")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("retained-debt")
-        );
+        {
+            let conn = self.db.acquire_lock("checkpoint evidence").unwrap();
+            crate::test_helpers::assert_checkpoint_evidence(
+                &conn,
+                "sync_token:PrimarySync",
+                "old-cursor",
+            );
+            crate::test_helpers::assert_checkpoint_evidence(
+                &conn,
+                "pending_sync_token:sparse:OtherZone",
+                "retained-debt",
+            );
+        }
         assert_eq!(
             self.db
                 .acquire_lock("future bytes oracle")
@@ -2339,7 +2336,7 @@ async fn queue_projection_schema31_retry_migration_preserves_receipts_and_confli
                 let opened = opened.unwrap();
                 let (_, scope, zone) = f.pass.album.catalog_work_scope().unwrap().unwrap();
                 assert!(
-                    opened
+                    !opened
                         .has_due_provider_work(
                             owner(),
                             scope,
@@ -2347,10 +2344,20 @@ async fn queue_projection_schema31_retry_migration_preserves_receipts_and_confli
                         )
                         .await
                         .unwrap(),
-                    "legacy deferred receipt is not silently acknowledged"
+                    "retired deferred receipts must not schedule current work"
                 );
             }
-            assert_eq!(f.count("provider_work_receipts"), 1);
+            assert_eq!(
+                f.count(if conflict {
+                    "provider_work_receipts"
+                } else {
+                    "historical_v030_provider_work_receipts"
+                }),
+                1
+            );
+            if !conflict {
+                assert_eq!(f.count("provider_work_receipts"), 0);
+            }
             assert_eq!(f.count("assets"), 0);
             f.preserved().await;
         }
@@ -2852,7 +2859,7 @@ async fn selection_shadow_schema32_migration_preserves_live_wal_work_and_unknown
             .acquire_lock("work preserved after migration")
             .unwrap()
             .query_row(
-                "SELECT confirmation FROM provider_work_receipts LIMIT 1",
+                "SELECT confirmation FROM historical_v030_provider_work_receipts LIMIT 1",
                 [],
                 |r| r.get::<_, Vec<u8>>(0)
             )
@@ -4390,7 +4397,7 @@ async fn private_selection_schema33_migration_preserves_live_wal_work_and_unknow
             .acquire_lock("work preserved after migration")
             .unwrap()
             .query_row(
-                "SELECT confirmation FROM provider_work_receipts LIMIT 1",
+                "SELECT confirmation FROM historical_v030_provider_work_receipts LIMIT 1",
                 [],
                 |r| r.get::<_, Vec<u8>>(0)
             )

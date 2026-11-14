@@ -865,7 +865,7 @@ async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quie
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn catalog_projection_actual_cli_replays_schema29_backlog_after_fault_and_stays_quiet() {
+async fn catalog_projection_actual_cli_replays_current_backlog_after_fault_and_stays_quiet() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(OfflinePhotos)
@@ -928,7 +928,8 @@ async fn catalog_projection_actual_cli_replays_schema29_backlog_after_fault_and_
             params![scope, id],
         )
         .unwrap();
-        conn.execute_batch("DROP TABLE provider_catalog_pages; DROP TABLE provider_catalog_debt; DROP TABLE provider_catalog_references; DROP TABLE provider_catalog_records; PRAGMA user_version=29;").unwrap();
+        // Current captured observations remain executable and checkpoint-blocking.
+        // Schema-38 retirement of historical observations is covered separately.
     }
     success(&command(root, &account, &["status"]));
     {
@@ -1638,12 +1639,21 @@ async fn inventory_upgrade_actual_cli_expands_fixed_dates_and_preserves_other_ac
             assert_eq!(names, ["recent-1_YXNzZXQ.JPG", "recent-2_YXNzZXQ.JPG"]);
             let cursor: String = conn
                 .query_row(
-                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                    "SELECT value FROM historical_v030_checkpoints WHERE key='sync_token:PrimarySync'",
                     [],
                     |r| r.get(0),
                 )
                 .unwrap();
             assert_eq!(cursor, "A-cursor");
+            assert_eq!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM metadata WHERE key='sync_token:PrimarySync'",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                0
+            );
             let raw: String = conn
                 .query_row(
                     "SELECT value FROM metadata WHERE key='recent_selection_recovery:PrimarySync'",
@@ -1660,7 +1670,8 @@ async fn inventory_upgrade_actual_cli_expands_fixed_dates_and_preserves_other_ac
                     |r| r.get(0)
                 )
                 .unwrap(),
-                3
+                0,
+                "fresh-start rank enumeration must not replay the retired delta cursor"
             );
         } else {
             if cycle <= 2 {
@@ -1679,12 +1690,17 @@ async fn inventory_upgrade_actual_cli_expands_fixed_dates_and_preserves_other_ac
                 .query_row(
                     "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
                     [],
-                    |r| r.get(0),
+                    |row| row.get(0),
                 )
                 .unwrap();
             assert_eq!(
-                cursor, "recent-delta-successor",
-                "rank token cannot replace the source delta"
+                cursor,
+                if cycle == 1 {
+                    "recent-rank-token"
+                } else {
+                    "recent-delta-successor"
+                },
+                "the first inventory establishes a new boundary; later changes bridge from it"
             );
             if cycle >= 3 {
                 assert_eq!(
@@ -1705,7 +1721,7 @@ async fn inventory_upgrade_actual_cli_expands_fixed_dates_and_preserves_other_ac
         }
         assert_eq!(
             conn.query_row::<String, _, _>(
-                "SELECT value FROM metadata WHERE key='sync_token:OldUnknownScope'",
+                "SELECT value FROM historical_v030_checkpoints WHERE key='sync_token:OldUnknownScope'",
                 [],
                 |r| r.get(0)
             )
@@ -1895,7 +1911,7 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
     }
     drop(conn);
     // Deliberately turn the current-shape synthetic seed into an owned schema33
-    // fixture, then let the actual binary run schema34's additive migration.
+    // fixture, then let the actual binary run the fresh-start migration.
     // The independent released-upgrade history covers schema25 preservation.
     Connection::open(&account.path).unwrap().execute_batch("DROP TABLE provider_active_sources; DROP TABLE provider_active_destinations; DROP TABLE provider_active_decisions; DROP TABLE provider_selection_rank_records; DROP TABLE provider_selection_rank_pages; DROP TABLE provider_active_generations; PRAGMA user_version=33;").unwrap();
     success(&command(root, &account, &["status"]));
@@ -1938,9 +1954,16 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
     assert_eq!(
         rows(
             &account.path,
-            "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'"
+            "SELECT value FROM historical_v030_checkpoints WHERE key='sync_token:PrimarySync'"
         ),
         vec![vec![rusqlite::types::Value::Text("A-cursor".into())]]
+    );
+    assert!(
+        rows(
+            &account.path,
+            "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'"
+        )
+        .is_empty()
     );
     Connection::open(&account.path)
         .unwrap()

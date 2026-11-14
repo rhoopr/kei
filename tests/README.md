@@ -582,8 +582,7 @@ full-zone history, expired-epoch completeness or inbox-driven materialization.
 
 ## Transactional source catalog replay
 
-Owned file-backed fixtures replay schema-29 captured sources through migration
-and two quiet reopens. Independent expected facts include masters, assets,
+Owned file-backed fixtures preserve schema-29 captured sources as historical evidence through migration, then rebuild current sources and check two quiet reopens. Independent expected facts include masters, assets,
 albums, membership, unknown records, typeless tombstones and incomplete links.
 Literal references retain escaped source field paths and cross-zone provenance;
 original JSON bytes and numeric lexemes remain unchanged. Distinct revisions and
@@ -591,7 +590,7 @@ private/shared scopes stay separate; replaying an old page cannot overwrite fact
 
 A receipt trigger aborts after real record, reference and unresolved-evidence
 writes. The index rolls back completely while the original capture survives.
-An actual CLI fixture starts with a schema-29 backlog, fails projection in two
+An actual CLI fixture starts with a current-schema backlog, fails projection in two
 processes, removes only the injected trigger, recovers and repeats quietly twice.
 Existing media, downloaded receipts, metadata revisions, pending retry and old
 scope sparse debt remain intact. That retained debt keeps the overall CLI cycle
@@ -695,7 +694,7 @@ These tests qualify bounded supported-path admission and targeted queue recovery
 
 ## Count retirement and guarded inventory
 
-`cargo test --lib sync_loop::runner::tests::inventory_reconciliation::` exercises the production cycle and dispatcher with account-owned file-backed SQLite, historical media, unrelated sidecars, retained retry evidence and a source cursor. Schema-36 fixtures upgrade to schema 37, retaining exact old receipt bytes for malformed, future-version and already-complete-but-mismatched payloads. Matching, missing and mismatched enumeration hashes cannot hide the new presence-only inventory obligation. A separate schema-owner test checks exact old-key prefix matching, existing-request preservation and no reseeding after completion.
+`cargo test --lib sync_loop::runner::tests::inventory_reconciliation::` exercises the production cycle and dispatcher with account-owned file-backed SQLite, historical media, unrelated sidecars, retained retry evidence and a source cursor. Fixtures explicitly run historical migration steps to construct the outstanding inventory request, retaining exact old receipt bytes for malformed, future-version and already-complete-but-mismatched payloads. Schema-38 production upgrades instead retire those historical cursors. Matching, missing and mismatched enumeration hashes cannot hide a current presence-only inventory obligation. A separate schema-owner test checks the historical step's exact old-key prefix matching, existing-request preservation and no reseeding after completion.
 
 The shared/private histories require replay from P to S, one current inventory, and a terminal raw-empty replay from S. Query tokens differ from source successors. A multi-page rank displacement and an unknown raw record that emits no asset event must retain the request and trusted cursor. Later quiet evidence recovers the omitted asset exactly once. Healthy media still publishes when initial delta identity, transfer or state work fails; those failures cannot qualify the inventory. The private-generation case bounds the attempt without implicit extra generation scans.
 
@@ -724,6 +723,10 @@ These requirements do not retire raw-inbox limits, all-generation provider-work 
 `historical_legacy_counters_do_not_fail_completed_reporting` asserts successful JSON reporting and health updates with nonzero historical counts. `historical_legacy_counters_do_not_fail_idle_health` checks all-catalogue counts during skipped watch cycles without failing health, including a stored certificate with stale dependencies. The behavioral `preserved_legacy_status_and_reconcile_keep_attribution_separate_from_failure` checks the separate unsafe historical-backup status and protects original receipts from integrity-retry conversion. These are test entry points and assertion contracts, not a record of the latest qualification results.
 
 ## State-transition proof
+
+`cargo test --lib fresh_start_ -- --test-threads=1` checks the schema-38 fresh-start boundary. The production-cycle fixture starts with existing media and sidecar bytes, completed peers and a failed transfer, then damages historical planning payloads and sparse identity evidence. It checks that retirement preserves historical bytes, starts a full enumeration, keeps a current transfer failure checkpoint-blocking, and completes the retry without downloading completed peers again. A separate process reopens the same database for two quiet cycles. Other controls cover transaction rollback, retirement before old payload compaction and recovery of an interrupted primary publication. The ignored restart worker is invoked by its parent test.
+
+Provider-inbox compaction tests exercise historical migration steps explicitly through a test-only entry point. Current upgrades retire those historical pages before compaction; these tests retain coverage of alias validation and the historical algorithm without treating old pages as current work.
 
 Owned-schema backup checks run with `cargo test --lib owned_migration_backup` and `cargo test --test behavioral migration_backup`. They use existing file-backed databases, committed WAL rows and exact startup configuration bytes through the production writable opener. They check independent snapshot restoration, writer exclusion, backup failure before migration, late migration rollback, private permissions, no-overwrite publication and unchanged reopens. On Linux, subprocess checks kill the owner at six backup/migration boundaries and reopen the resulting state. These are process-interruption checks, not power-loss qualification.
 
@@ -1359,7 +1362,7 @@ mutations before unchanged success.
 
 `behavioral::released_upgrade::released_v0240_history_preserves_durable_evidence_through_upgrade`
 starts from the SQL schema emitted by the official v0.24.0 Linux x86_64
-binary (schema 25), then executes the current production CLI through schema 34.
+binary (schema 25), then executes the current production CLI through schema 38.
 The fixture contains no captured user data. SQL explicitly reconstructs a
 synthetic history with original and edited renditions, repeated IDs in two
 libraries, a local removal, metadata debt, an unfinished sync ledger row,
@@ -1373,7 +1376,7 @@ Restoring a file alone must not falsely finalize its failed row. The companion l
 the same schema fixture (or actual released-binary-created schema), retains an
 explicit authoritative source/master mapping and failed media row, and runs
 three production cycles. The first injects a state-write failure and must retain
-the checkpoint and a pending retry row (retry routing resets failed to
+the archived checkpoint, no active replacement checkpoint and a pending retry row (retry routing resets failed to
 pending before the injected write). After reopening SQLite, authoritative synthetic
 provider evidence and a local HTTP JPEG must finish recovery on the second
 cycle. The third must retain the recovered path and bytes without another

@@ -803,6 +803,15 @@ async fn primary_layout_foreign_collision_and_local_modification_hold() {
 #[tokio::test]
 async fn contract_source_checkpoint_requires_durable_recovery_primary_layout_after_database_failure()
  {
+    primary_layout_after_database_failure(false).await;
+}
+
+#[tokio::test]
+async fn fresh_start_preserves_interrupted_primary_publication() {
+    primary_layout_after_database_failure(true).await;
+}
+
+async fn primary_layout_after_database_failure(upgrade: bool) {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
@@ -877,6 +886,12 @@ async fn contract_source_checkpoint_requires_durable_recovery_primary_layout_aft
         .unwrap()
         .execute_batch("DROP TRIGGER fail_layout_commit")
         .unwrap();
+    if upgrade {
+        rusqlite::Connection::open(root.path().join("state.db"))
+            .unwrap()
+            .pragma_update(None, "user_version", 37)
+            .unwrap();
+    }
     let (recovered, _) = cycle(root.path(), edited, true, EditedNaming::Primary).await;
     assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
     assert!(recovered.db_sync_token_advance_safe);

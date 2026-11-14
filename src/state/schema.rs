@@ -7,7 +7,77 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 37;
+pub(crate) const SCHEMA_VERSION: i32 = 38;
+const FRESH_START_VERSION: i32 = 38;
+
+/// Retire provider planning authority once, without interpreting historical
+/// payloads or changing file records. The enclosing migration savepoint makes
+/// preservation and retirement atomic; these snapshots have no runtime writers.
+fn retire_historical_provider_plans(conn: &Connection) -> Result<(), StateError> {
+    // Children precede parents so foreign-key enforcement can remain enabled.
+    for table in [
+        "provider_active_sources",
+        "provider_active_destinations",
+        "provider_active_decisions",
+        "provider_selection_rank_records",
+        "provider_selection_rank_pages",
+        "provider_active_generations",
+        "provider_selection_sources",
+        "provider_selection_destinations",
+        "provider_selection_decisions",
+        "provider_selection_generations",
+        "provider_work_obligations",
+        "provider_work_retries",
+        "provider_work_receipts",
+        "provider_work_scan",
+        "provider_catalog_references",
+        "provider_catalog_debt",
+        "provider_catalog_records",
+        "provider_catalog_pages",
+        "provider_transport_aliases",
+        "provider_transport_canonical",
+        "provider_shadow_receipts",
+        "provider_shadow_records",
+        "provider_shadow_pages",
+        "scoped_db_sync_tokens",
+        "unresolved_sparse_identities",
+    ] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            continue;
+        }
+        conn.execute_batch(&format!(
+            "CREATE TABLE historical_v030_{table} AS SELECT * FROM {table}; DELETE FROM {table};"
+        ))?;
+    }
+    // Keep historical values byte-for-byte, including malformed tokens. Removing
+    // both zone and database cursors makes the existing startup choose full sync.
+    let has_metadata: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='metadata' AND type='table')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_metadata {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE historical_v030_checkpoints AS SELECT * FROM metadata WHERE
+            key GLOB 'sync_token:*' OR key GLOB 'pending_sync_token:*'
+            OR key GLOB 'inventory_anchor_v1:*' OR key GLOB 'retained_checkpoint_hold:*'
+            OR key GLOB 'indexing_*' OR key GLOB 'inventory_reconciliation_required:*'
+            OR key GLOB 'enum_in_progress:*'
+            OR key GLOB 'unresolved_asset_identity:*'
+            OR key IN ('enum_config_hash','pending_enum_config_hash',
+                       'config_hash','pending_download_config_hash',
+                        'active_selection_metadata_retry_offset','sparse_identity_generation');
+         DELETE FROM metadata WHERE key IN (SELECT key FROM historical_v030_checkpoints);",
+    )?;
+    Ok(())
+}
 
 fn migrate_active_selection(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(r"CREATE TABLE IF NOT EXISTS provider_active_generations (
@@ -661,9 +731,39 @@ fn set_schema_version(conn: &Connection, version: i32) -> Result<(), StateError>
 /// Initialize or migrate the database schema.
 ///
 /// This function is idempotent and safe to call on both new and existing databases.
-/// Each migration step is wrapped in a SAVEPOINT so that a failure rolls back
-/// only the current step, leaving the database at the last successfully applied version.
+/// Fresh-start upgrades roll back retirement and all schema steps together.
+/// Other migrations retain the per-step savepoint boundary.
 pub(crate) fn migrate(conn: &Connection) -> Result<(), StateError> {
+    let version = get_schema_version(conn)?;
+    let existing: bool = version > 0
+        || conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='assets')",
+            [],
+            |row| row.get(0),
+        )?;
+    if existing && version < FRESH_START_VERSION {
+        // Retire before older migration steps can parse or compact obsolete
+        // provider payloads. Owned startup has already backed up state/config.
+        // Keep the whole transition atomic even for the unowned test opener.
+        conn.execute_batch("SAVEPOINT fresh_start")?;
+        let result = retire_historical_provider_plans(conn).and_then(|()| migrate_steps(conn));
+        if result.is_err() {
+            conn.execute_batch("ROLLBACK TO fresh_start; RELEASE fresh_start")?;
+        } else {
+            conn.execute_batch("RELEASE fresh_start")?;
+        }
+        return result;
+    }
+    migrate_steps(conn)
+}
+
+/// Exercise historical migration behavior independently of fresh-start retirement.
+#[cfg(test)]
+pub(crate) fn migrate_historical_fixture(conn: &Connection) -> Result<(), StateError> {
+    migrate_steps(conn)
+}
+
+fn migrate_steps(conn: &Connection) -> Result<(), StateError> {
     let current_version = get_schema_version(conn)?;
 
     if current_version > SCHEMA_VERSION {
@@ -1427,9 +1527,13 @@ pub(crate) fn migrate_to_version(
             conn.execute_batch(
                 "INSERT OR IGNORE INTO metadata(key,value) \
                  SELECT 'inventory_reconciliation_required:' || substr(key,27), '1' \
-                 FROM metadata WHERE substr(key,1,26)='recent_selection_recovery:';",
+                  FROM metadata WHERE substr(key,1,26)='recent_selection_recovery:' \
+                  AND NOT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='historical_v030_checkpoints');",
             )?;
         }
+        // The owning migration transaction retires historical plans before
+        // running any historical data interpretation steps.
+        38 => {}
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1454,6 +1558,202 @@ pub(crate) fn migrate_genuine_v28(conn: &Connection) -> Result<(), StateError> {
 
 #[cfg(test)]
 mod tests {
+    fn assert_retired_checkpoint(conn: &Connection, key: &str, expected: &str) {
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM metadata WHERE key=?1", [key], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM historical_v030_checkpoints WHERE key=?1",
+                [key],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            expected
+        );
+    }
+    fn historical_provider_fixture(version: i32) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=version {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch(
+            "INSERT INTO provider_shadow_pages VALUES
+                (1,'old-account','old-provider','scope','before','after',0,'invalid',X'00ff',2,1);
+             INSERT INTO provider_shadow_records VALUES (1,0,'child','CPLAsset',0);
+             INSERT INTO provider_shadow_receipts VALUES ('scope',1);
+             INSERT INTO provider_active_generations
+                (id,account_key,provider_key,scope,config_hash,basis,metadata_enabled,
+                 specification,specification_hash,created_at,charged_bytes)
+                VALUES ('old','old-account','old-provider','scope','config','basis',1,X'00ff','invalid',1,2);
+             INSERT INTO provider_active_decisions
+                (generation,pass_key,child,manifest,manifest_hash,outcome,admission,reason,charged_bytes)
+                VALUES ('old','pass','child',X'00ff','invalid','selected','admitted','',2);
+             INSERT INTO provider_active_destinations
+                (generation,pass_key,child,library,asset_id,master,version_size,path,compat_path,
+                 checksum,size_bytes,created_at,metadata_hash,admitted)
+                VALUES ('old','pass','child','PrimarySync','child','master','medium',
+                        'retained-native-path','retained.jpg','old-resource',12,1,'old-metadata',1);
+             INSERT INTO metadata VALUES ('sync_token:PrimarySync',X'00ff');
+             INSERT INTO metadata VALUES ('unrelated-setting','keep');",
+        ).unwrap();
+        conn
+    }
+
+    #[test]
+    fn fresh_start_retires_planning_without_decoding_or_repeating_it() {
+        let conn = historical_provider_fixture(37);
+        migrate(&conn).unwrap();
+        let raw: Vec<u8> = conn
+            .query_row(
+                "SELECT body FROM historical_v030_provider_shadow_pages",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, [0, 255]);
+        let path: String = conn
+            .query_row(
+                "SELECT path FROM historical_v030_provider_active_destinations",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(path, "retained-native-path");
+        for table in [
+            "provider_shadow_pages",
+            "provider_active_generations",
+            "provider_active_destinations",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        let cursor: Vec<u8> = conn
+            .query_row(
+                "SELECT value FROM historical_v030_checkpoints WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, [0, 255]);
+        conn.execute(
+            "INSERT INTO metadata VALUES ('sync_token:PrimarySync','current')",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "current"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM metadata WHERE key='unrelated-setting'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "keep"
+        );
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fresh_start_retirement_failure_rolls_back_evidence_and_authority() {
+        let conn = historical_provider_fixture(37);
+        conn.execute_batch("CREATE TRIGGER refuse_retirement BEFORE DELETE ON provider_shadow_pages BEGIN SELECT RAISE(ABORT,'injected retirement failure'); END;").unwrap();
+        assert!(migrate(&conn).is_err());
+        assert_eq!(get_schema_version(&conn).unwrap(), 37);
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM provider_active_destinations",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name GLOB 'historical_v030_*'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let cursor: Vec<u8> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, [0, 255]);
+    }
+
+    #[test]
+    fn fresh_start_precedes_obsolete_transport_compaction() {
+        let conn = historical_provider_fixture(35);
+        migrate(&conn).unwrap();
+        let body: Vec<u8> = conn
+            .query_row(
+                "SELECT body FROM historical_v030_provider_shadow_pages",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, [0, 255]);
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM provider_shadow_pages", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn fresh_start_preserves_checkpoints_in_existing_unversioned_state() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute(
+            "INSERT INTO metadata VALUES ('sync_token:PrimarySync','old')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 0);
+        migrate(&conn).unwrap();
+        assert_retired_checkpoint(&conn, "sync_token:PrimarySync", "old");
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
     #[test]
     fn inventory_upgrade_seeds_exact_receipt_keys_once_without_reading_their_values() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1486,7 +1786,7 @@ mod tests {
             .unwrap();
         }
         conn.execute("INSERT INTO metadata(key,value) VALUES('inventory_reconciliation_required:SharedSync-KEPT','existing obligation')",[]).unwrap();
-        migrate(&conn).unwrap();
+        migrate_to_version(&conn, 36, 37).unwrap();
         let requests: Vec<(String,String)> = conn.prepare(
             "SELECT key,value FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*' ORDER BY key"
         ).unwrap().query_map([],|row|Ok((row.get(0)?,row.get(1)?))).unwrap()
@@ -1533,7 +1833,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn inventory_upgrade_owned_v36_seed_failure_rolls_back_then_recovers_and_stays_quiet() {
+    async fn fresh_start_owned_v36_failure_rolls_back_then_recovers_and_stays_quiet() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("owned-v36.db");
         let username = "seed-migration@example.invalid";
@@ -1567,15 +1867,19 @@ mod tests {
                     bytes
                 );
             }
-            assert_eq!(
-                conn.query_row::<String, _, _>(
-                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
-                    [],
-                    |row| row.get(0)
-                )
-                .unwrap(),
-                "saved-source-cursor"
-            );
+            if get_schema_version(conn).unwrap() == SCHEMA_VERSION {
+                assert_retired_checkpoint(conn, "sync_token:PrimarySync", "saved-source-cursor");
+            } else {
+                assert_eq!(
+                    conn.query_row::<String, _, _>(
+                        "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    "saved-source-cursor"
+                );
+            }
         };
         {
             let conn = Connection::open(&path).unwrap();
@@ -1600,10 +1904,9 @@ mod tests {
             }
             conn.execute_batch(
                 "INSERT INTO metadata(key,value) VALUES('sync_token:PrimarySync','saved-source-cursor');
-                 CREATE TRIGGER fail_second_inventory_seed BEFORE INSERT ON metadata
-                 WHEN substr(NEW.key,1,34)='inventory_reconciliation_required:'
-                  AND (SELECT COUNT(*) FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*')=1
-                 BEGIN SELECT RAISE(FAIL,'schema37 seed after first request'); END;"
+                 CREATE TRIGGER fail_second_inventory_seed BEFORE DELETE ON metadata
+                 WHEN OLD.key='sync_token:PrimarySync'
+                 BEGIN SELECT RAISE(FAIL,'fresh-start retirement after preservation'); END;"
             ).unwrap();
             assert_eq!(get_schema_version(&conn).unwrap(), 36);
         }
@@ -1615,8 +1918,8 @@ mod tests {
             "{error:?}"
         );
         assert!(
-            format!("{error:?}").contains("schema37 seed after first request"),
-            "failure must occur after the first seed insert, not before migration: {error:?}"
+            format!("{error:?}").contains("fresh-start retirement after preservation"),
+            "failure must occur during retirement, not before migration: {error:?}"
         );
         {
             let conn = Connection::open(&path).unwrap();
@@ -1624,7 +1927,7 @@ mod tests {
             assert_receipts(&conn);
             assert_eq!(conn.query_row::<i64, _, _>(
                 "SELECT COUNT(*) FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*'", [], |row| row.get(0)
-            ).unwrap(), 0, "even RAISE(FAIL)'s earlier insert must roll back through the owned opener");
+            ).unwrap(), 0, "failed retirement must not activate inventory work");
             conn.execute_batch("DROP TRIGGER fail_second_inventory_seed")
                 .unwrap();
         }
@@ -1639,22 +1942,9 @@ mod tests {
                 "SELECT key,value FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*' ORDER BY key"
             ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap()
                 .collect::<Result<_, _>>().unwrap();
-            assert_eq!(
-                requests,
-                vec![
-                    (
-                        "inventory_reconciliation_required:PrimarySync".into(),
-                        "1".into()
-                    ),
-                    (
-                        "inventory_reconciliation_required:SharedSync-OTHER".into(),
-                        "1".into()
-                    ),
-                    (
-                        "inventory_reconciliation_required:SharedSync-THIRD".into(),
-                        "1".into()
-                    ),
-                ]
+            assert!(
+                requests.is_empty(),
+                "historical receipts must not seed current work"
             );
             conn.execute(
                 "DELETE FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*'",
@@ -1742,18 +2032,20 @@ mod tests {
                     .await
                     .unwrap()
                     .as_deref(),
-                Some("saved")
+                None
             );
             assert_eq!(
                 db.get_metadata("pending_sync_token:old:PrimarySync")
                     .await
                     .unwrap()
                     .as_deref(),
-                Some("debt")
+                None
             );
             let conn = db
                 .acquire_lock("independent migration recovery facts")
                 .unwrap();
+            assert_retired_checkpoint(&conn, "sync_token:PrimarySync", "saved");
+            assert_retired_checkpoint(&conn, "pending_sync_token:old:PrimarySync", "debt");
             assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
             assert_eq!(
                 conn.query_row::<Vec<u8>, _, _>("SELECT payload FROM future_unknown", [], |row| {
@@ -1831,14 +2123,18 @@ mod tests {
             };
             drop(db);
             for _ in 0..2 {
+                let result = crate::state::SqliteStateDb::open_owned(&path, &owner).await;
+                let diagnostic = format!("{result:?}");
                 assert!(
                     matches!(
-                        crate::state::SqliteStateDb::open_owned(&path, &owner).await,
+                        result,
                         Err(StateError::BackedUpMigration { source, backup })
-                            if matches!(*source, StateError::ProviderInboxInvalid)
+                            if (matches!(*source, StateError::ProviderInboxInvalid)
+                                || matches!(&*source, StateError::Migration(rusqlite::Error::SqliteFailure(_, Some(detail)))
+                                    if detail == "no such table: main.provider_shadow_records"))
                                 && backup.join("manifest.json").is_file()
                     ),
-                    "{key}: unsupported identity must refuse migration"
+                    "{key}: unsupported identity must refuse migration: {diagnostic}"
                 );
                 let conn = Connection::open(&path).unwrap();
                 assert_eq!(get_schema_version(&conn).unwrap(), 28, "{key}");
@@ -1924,7 +2220,12 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         for (table, original) in tables.iter().zip(before) {
-            assert_eq!(rows(&conn, table), original, "{table}");
+            if *table == "metadata" {
+                assert!(rows(&conn, table).is_empty());
+                assert_eq!(rows(&conn, "historical_v030_checkpoints"), original);
+            } else {
+                assert_eq!(rows(&conn, table), original, "{table}");
+            }
         }
         for table in [
             "unattributed_legacy",
@@ -2030,15 +2331,7 @@ mod tests {
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
-        assert_eq!(
-            conn.query_row(
-                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
-                [],
-                |r| r.get::<_, String>(0)
-            )
-            .unwrap(),
-            "retained"
-        );
+        assert_retired_checkpoint(&conn, "sync_token:PrimarySync", "retained");
         assert_eq!(
             conn.query_row(
                 "SELECT pending_revision,failed_assets FROM metadata_capture_state",
@@ -2070,7 +2363,7 @@ mod tests {
         )
         .unwrap();
         conn.pragma_update(None, "user_version", 26).unwrap();
-        migrate(&conn).unwrap();
+        migrate_to_version(&conn, 26, 27).unwrap();
         assert_eq!(
             conn.query_row(
                 "SELECT asset_id,next_retry_at FROM metadata_capture_retries",
@@ -2093,24 +2386,8 @@ mod tests {
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
-        assert_eq!(
-            conn.query_row(
-                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-            "before"
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT value FROM metadata WHERE key='unresolved_asset_identity:PrimarySync'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-            "1"
-        );
+        assert_retired_checkpoint(&conn, "sync_token:PrimarySync", "before");
+        assert_retired_checkpoint(&conn, "unresolved_asset_identity:PrimarySync", "1");
         assert_eq!(
             conn.query_row(
                 "SELECT local_path,local_checksum,status FROM assets WHERE id='child'",
@@ -2224,15 +2501,7 @@ mod tests {
         for _ in 0..2 {
             migrate(&conn).unwrap();
             assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
-            assert_eq!(
-                conn.query_row::<String, _, _>(
-                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
-                    [],
-                    |row| row.get(0)
-                )
-                .unwrap(),
-                "old-token"
-            );
+            assert_retired_checkpoint(&conn, "sync_token:PrimarySync", "old-token");
             assert_eq!(
                 conn.query_row::<Vec<u8>, _, _>(
                     "SELECT body FROM independent_native_evidence WHERE path=X'00FF01'",
@@ -2658,7 +2927,7 @@ mod tests {
         // test the gate by setting user_version back to 5 and calling
         // migrate again; then lower to 4 once more to trigger re-entry.
         set_schema_version(&conn, 5).unwrap();
-        migrate(&conn).unwrap();
+        migrate_to_version(&conn, 5, 5).unwrap();
         let tokens: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM metadata WHERE key = 'sync_token:PrimarySync'",
@@ -3656,15 +3925,7 @@ mod tests {
                 2048
             )
         );
-        assert_eq!(
-            conn.query_row(
-                "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-            "preserved-token"
-        );
+        assert_retired_checkpoint(&conn, "sync_token:PrimarySync", "preserved-token");
         assert!(conn.execute("INSERT INTO reconciliation_paths SELECT library, id, version_size, requested_path_key, destination_path_key, destination_path, 'invalid', -1 FROM reconciliation_paths", []).is_err());
     }
 
@@ -3697,15 +3958,7 @@ mod tests {
                 "provider-hash".into()
             )
         );
-        assert_eq!(
-            conn.query_row(
-                "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-            "preserved-token"
-        );
+        assert_retired_checkpoint(&conn, "sync_token:PrimarySync", "preserved-token");
         assert_eq!(
             conn.query_row("SELECT count(*) FROM reconciliation_paths", [], |row| row
                 .get::<_, i64>(
@@ -3759,7 +4012,6 @@ mod tests {
         .unwrap();
         migrate_to_version(&conn, 22, 23).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), 23);
-        migrate(&conn).unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, local_checksum, download_checksum, source_checksum, metadata_write_failed_at \
              FROM asset_metadata_paths ORDER BY id"
@@ -3797,7 +4049,7 @@ mod tests {
                 ("missing".into(), None, None, None, 7),
             ]
         );
-        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(get_schema_version(&conn).unwrap(), 23);
     }
 
     #[test]
