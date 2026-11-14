@@ -22,7 +22,11 @@ trak = "trak"
 [default]
 # The `mis-` prefix (mis-routing, mis-attributed, mis-directed) is grammatical
 # English; typos wants to "fix" it to `miss`/`mist`. Suppress those matches.
-extend-ignore-re = ["\\bmis-\\w+"]
+extend-ignore-re = [
+    "\\bmis-\\w+",
+    # Exact durable configuration golden hash, not prose.
+    "\\b238f3f4ded9518f7\\b",
+]
 
 [type.cc-by-2]
 extend-glob = ["LICENSE-osxphotos-media"]
