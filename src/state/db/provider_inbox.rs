@@ -1205,8 +1205,9 @@ mod tests {
         let snapshot = crate::support::history::test_retained_snapshot(&history);
         let cycles = snapshot["cycles"].as_array().unwrap();
         let committed = &cycles[0]["transport_compaction"];
-        assert_eq!(committed["committed"], 1);
-        assert_eq!(committed["reason"], "committed");
+        assert_eq!(committed["committed"], 0);
+        assert_eq!(committed["failed"], 0);
+        assert_eq!(committed["reason"], "not_observed");
         assert_eq!(committed["compacted_aliases"], 0);
         assert!(committed["committed_reclaim"].is_null());
         assert!(committed["logical_charge_before"].is_null());

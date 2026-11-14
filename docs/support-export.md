@@ -117,9 +117,7 @@ older than the latest decision. `last_observed_limit` is that admission's logica
 budget. Both are null when no capacity check has reported a budget. These are
 logical charge values, not physical file sizes.
 
-Transport compaction evidence describes only the latest migration result in
-that record. Counts, logical charge before and after, and committed reclaim are
-replaced by that result; failed migrations do not claim reclaimed bytes.
+Transport compaction evidence is retained from older runs. The compaction event writer is retired; new records use `not_observed`, zero event counts and null charge and reclaim totals. Existing records retain their counts, reason and logical charge observations across history updates.
 Committed reclaim is a logical budget release, not proof that physical disk space
 shrank. Group omission, queue drop and generation-loss counts mean evidence is
 incomplete. None of these counters are unique asset counts. No identifiers,

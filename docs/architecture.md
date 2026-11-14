@@ -423,7 +423,7 @@ an invalid private page or a mismatched index entry fails validation. A replay
 always reprojects the durable source, so an interruption after capture but before
 projection recovers on the next equivalent observation.
 
-The transport-index schema step creates and validates its tables without compacting historical bodies. Schema 38 retires historical pages before that step; the legacy compaction algorithm and its dependency-validation checks have been removed. The existing migration diagnostic shape remains, with zero compaction counts and unknown byte-reclaim totals. Current capture still uses the canonical index to avoid repeated equivalent observations.
+The transport-index schema step creates and validates its tables without compacting historical bodies. Schema 38 retires historical pages before that step; the legacy compaction algorithm, dependency-validation checks and telemetry event path have been removed. Historical diagnostic fields remain readable. New cycles record `not_observed`, zero event counts and unknown byte-reclaim totals. Current capture still uses the canonical index to avoid repeated equivalent observations.
 
 Current page loading has one raw-byte path: it validates the stored owner, continuation flag, size bound, SHA-256 and ordinal identities. Current capture verifies exact or provider-classified equivalent raw observations against that loaded page. Historical alias records and their representative bytes remain in the upgrade snapshots; they have no runtime readers or writers. The empty legacy-alias table remains in the schema for compatibility with existing schema shapes.
 
@@ -2268,14 +2268,11 @@ SQL observations before transaction commit are explicitly identified as attempts
 projection. It exports fixed classes and numeric status codes from the cause
 chain, never messages or provider payloads, and does not decide retry policy.
 
-The inbox, catalogue, selection and work owners publish fixed storage counters
+The inbox, catalogue and work owners publish fixed storage counters
 after successful transaction commit and at existing capacity refusal branches.
 The history worker retains a fixed summary per cycle, not response rows.
 Budgets reuse existing admission accounting and are labeled last observed,
-pre-admission logical charges. Migration returns its compaction summary to the
-schema owner, which publishes it only after the migration savepoint commits;
-failed migration reports no committed reclaim. Optional charge observations
-cannot fail migration. Retained reasons and counters contain no source identity,
+pre-admission logical charges. Historical selection and compaction fields remain readable, but their runtime event writers are retired. Migration retains its savepoints, rollback attempts and error reporting without emitting compaction events. Retained reasons and counters contain no source identity,
 URL or arbitrary error text, and remain subject to queue loss and bounded
 history retention. Unknown observations stay explicitly unavailable.
 

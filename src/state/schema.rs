@@ -332,9 +332,7 @@ CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
 /// `provider_shadow_pages.body_hash` remains the historical observation hash.
 /// For a legacy alias it is the original transport hash of bytes removed by
 /// older versions of this migration, never a digest of the representative body.
-fn migrate_provider_transport_index(
-    conn: &Connection,
-) -> Result<crate::support::CompactionSummary, StateError> {
+fn migrate_provider_transport_index(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(
         r"
 CREATE TABLE IF NOT EXISTS provider_transport_canonical (
@@ -374,9 +372,7 @@ CREATE INDEX IF NOT EXISTS idx_transport_alias_canonical
     if actual != ["page_id"] {
         return Err(StateError::ProviderInboxInvalid);
     }
-    // Historical pages have already been retired by the upgrade boundary.
-    // Keep the existing migration diagnostic shape with no compaction work.
-    Ok(crate::support::CompactionSummary::default())
+    Ok(())
 }
 
 /// Scheduling evidence neither completes work nor changes checkpoint authority.
@@ -775,44 +771,18 @@ fn migrate_steps(conn: &Connection) -> Result<(), StateError> {
 
     for version in (current_version + 1)..=SCHEMA_VERSION {
         conn.execute_batch("SAVEPOINT migration")?;
-        let summary = match migrate_to_version(conn, current_version, version) {
-            Ok(summary) => summary,
-            Err(error) => {
-                let rolled_back = match conn.execute_batch("ROLLBACK TO migration") {
-                    Ok(()) => true,
-                    Err(rollback_err) => {
-                        tracing::error!(
-                            version,
-                            migration_error = %error,
-                            rollback_error = %rollback_err,
-                            "Migration rollback failed — database may be inconsistent"
-                        );
-                        false
-                    }
-                };
-                if version == 36 {
-                    crate::support::record_transport_compaction_failure(if rolled_back {
-                        crate::support::MigrationFailure::MigrationFailed
-                    } else {
-                        crate::support::MigrationFailure::RollbackFailed
-                    });
-                }
-                return Err(error);
-            }
-        };
-        if let Err(error) = conn.execute_batch("RELEASE migration") {
-            if version == 36 {
-                crate::support::record_transport_compaction_failure(
-                    crate::support::MigrationFailure::MigrationFailed,
+        if let Err(error) = migrate_to_version(conn, current_version, version) {
+            if let Err(rollback_err) = conn.execute_batch("ROLLBACK TO migration") {
+                tracing::error!(
+                    version,
+                    migration_error = %error,
+                    rollback_error = %rollback_err,
+                    "Migration rollback failed — database may be inconsistent"
                 );
             }
-            return Err(error.into());
+            return Err(error);
         }
-        if version == 36
-            && let Some(summary) = summary
-        {
-            crate::support::record_transport_compaction(summary);
-        }
+        conn.execute_batch("RELEASE migration")?;
     }
 
     Ok(())
@@ -1340,8 +1310,7 @@ pub(crate) fn migrate_to_version(
     conn: &Connection,
     start_version: i32,
     version: i32,
-) -> Result<Option<crate::support::CompactionSummary>, StateError> {
-    let mut summary = None;
+) -> Result<(), StateError> {
     match version {
         1 => conn.execute_batch(SCHEMA_V1)?,
         2 => conn.execute_batch(SCHEMA_V2)?,
@@ -1519,7 +1488,7 @@ pub(crate) fn migrate_to_version(
         33 => migrate_provider_selection(conn)?,
         34 => migrate_active_selection(conn)?,
         35 => conn.execute_batch(super::db::primary_layout::DDL)?,
-        36 => summary = Some(migrate_provider_transport_index(conn)?),
+        36 => migrate_provider_transport_index(conn)?,
         37 => {
             // Receipt existence is the only upgrade input. Preserve every old
             // key and value, including malformed/future bytes. The schema
@@ -1543,7 +1512,7 @@ pub(crate) fn migrate_to_version(
     }
     set_schema_version(conn, version)?;
     tracing::info!(version, "Migrated database schema");
-    Ok(summary)
+    Ok(())
 }
 
 /// Build a genuine schema-28 database by running every released migration

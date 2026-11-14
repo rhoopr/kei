@@ -37,24 +37,6 @@ pub(super) struct History {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub(crate) struct CompactionSummary {
-    pub examined_raw_pages: u64,
-    pub eligible: u64,
-    pub compacted_aliases: u64,
-    pub retained_unsupported_shape: u64,
-    pub retained_projection_or_dependency: u64,
-    pub no_equivalent_peer: u64,
-    pub invalid_canonical_or_member: u64,
-    pub no_positive_saving: u64,
-    pub retained_representative: u64,
-    /// Logical `charged_bytes` before compaction, when the aggregate was readable.
-    pub logical_charge_before: Option<u64>,
-    /// Logical `charged_bytes` after compaction, when the aggregate was readable.
-    pub logical_charge_after: Option<u64>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
 pub(super) struct StorageReuse {
     pub inbox: ReuseCounters,
     pub catalogue: ReuseCounters,
@@ -180,18 +162,6 @@ pub(crate) enum StorageOutcome {
     Equivalent,
     CapacityRejected,
     SingleItemLimit,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum MigrationFailure {
-    MigrationFailed,
-    RollbackFailed,
-}
-
-#[derive(Clone, Debug)]
-enum MigrationEvent {
-    Committed(CompactionSummary),
-    Failed(MigrationFailure),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -366,7 +336,6 @@ enum Message {
     Observe(&'static str, Map<String, Value>),
     Event(String, Map<String, Value>),
     Storage(StorageComponent, StorageOutcome, Option<(u64, u64)>),
-    Migration(MigrationEvent),
     Stop,
 }
 
@@ -405,18 +374,6 @@ pub(crate) fn record_storage(
 ) {
     if let Some(recorder) = ACTIVE.get() {
         recorder.send(Message::Storage(component, outcome, budget));
-    }
-}
-
-pub(crate) fn record_transport_compaction(summary: CompactionSummary) {
-    if let Some(recorder) = ACTIVE.get() {
-        recorder.send(Message::Migration(MigrationEvent::Committed(summary)));
-    }
-}
-
-pub(crate) fn record_transport_compaction_failure(failure: MigrationFailure) {
-    if let Some(recorder) = ACTIVE.get() {
-        recorder.send(Message::Migration(MigrationEvent::Failed(failure)));
     }
 }
 
@@ -628,7 +585,6 @@ fn apply(history: &mut History, message: Message) -> bool {
                 cycle.storage_reuse.record(component, outcome, budget);
             }
         }
-        Message::Migration(event) => apply_migration(history, event),
         #[cfg(test)]
         Message::Observe(kind, fields) => add(history, kind, fields),
         Message::Event(kind, fields) => add(history, &kind, fields),
@@ -653,54 +609,6 @@ fn apply(history: &mut History, message: Message) -> bool {
         }
     }
     false
-}
-
-fn apply_migration(history: &mut History, event: MigrationEvent) {
-    let Some(cycle) = history.cycles.last_mut() else {
-        return;
-    };
-    let evidence = &mut cycle.transport_compaction;
-    match event {
-        MigrationEvent::Committed(summary) => {
-            evidence.committed = evidence.committed.saturating_add(1);
-            evidence.reason = CompactionReason::Committed;
-            evidence.examined_raw_pages = summary.examined_raw_pages;
-            evidence.eligible = summary.eligible;
-            evidence.compacted_aliases = summary.compacted_aliases;
-            evidence.retained_unsupported_shape = summary.retained_unsupported_shape;
-            evidence.retained_projection_or_dependency = summary.retained_projection_or_dependency;
-            evidence.no_equivalent_peer = summary.no_equivalent_peer;
-            evidence.invalid_canonical_or_member = summary.invalid_canonical_or_member;
-            evidence.no_positive_saving = summary.no_positive_saving;
-            evidence.retained_representative = summary.retained_representative;
-            evidence.logical_charge_before = summary.logical_charge_before;
-            evidence.logical_charge_after = summary.logical_charge_after;
-            evidence.committed_reclaim =
-                match (summary.logical_charge_before, summary.logical_charge_after) {
-                    (Some(before), Some(after)) => Some(before.saturating_sub(after)),
-                    _ => None,
-                };
-        }
-        MigrationEvent::Failed(failure) => {
-            evidence.failed = evidence.failed.saturating_add(1);
-            evidence.reason = match failure {
-                MigrationFailure::MigrationFailed => CompactionReason::MigrationFailed,
-                MigrationFailure::RollbackFailed => CompactionReason::RollbackFailed,
-            };
-            evidence.examined_raw_pages = 0;
-            evidence.eligible = 0;
-            evidence.compacted_aliases = 0;
-            evidence.retained_unsupported_shape = 0;
-            evidence.retained_projection_or_dependency = 0;
-            evidence.no_equivalent_peer = 0;
-            evidence.invalid_canonical_or_member = 0;
-            evidence.no_positive_saving = 0;
-            evidence.retained_representative = 0;
-            evidence.logical_charge_before = None;
-            evidence.logical_charge_after = None;
-            evidence.committed_reclaim = Some(0);
-        }
-    }
 }
 
 fn begin_record(history: &mut History, configuration: Value, complete_startup: bool) {

@@ -9,9 +9,7 @@ mod privacy;
 pub(crate) mod token_equivalence;
 
 pub(crate) use history::{
-    CompactionSummary, MigrationFailure, StorageComponent, StorageOutcome, begin, complete,
-    observe, observe_scoped, record_storage, record_transport_compaction,
-    record_transport_compaction_failure,
+    StorageComponent, StorageOutcome, begin, complete, observe, observe_scoped, record_storage,
 };
 pub(crate) use privacy::fixed_label;
 
