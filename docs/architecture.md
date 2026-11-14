@@ -425,7 +425,7 @@ projection recovers on the next equivalent observation.
 
 The transport-index schema step creates and validates its tables without compacting historical bodies. Schema 38 retires historical pages before that step; the legacy compaction algorithm and its dependency-validation checks have been removed. The existing migration diagnostic shape remains, with zero compaction counts and unknown byte-reclaim totals. Current capture still uses the canonical index to avoid repeated equivalent observations.
 
-The checked page loader retains support for previously encoded `LegacyAlias` provenance. It verifies the representative hash, certificate, provenance binding and index on every access and refuses alias chains and cycles. A historical observation hash is never presented as a hash of representative bytes. Alias fixtures exercise this read boundary directly; no production writer creates new legacy aliases.
+Current page loading has one raw-byte path: it validates the stored owner, continuation flag, size bound, SHA-256 and ordinal identities. Current capture verifies exact or provider-classified equivalent raw observations against that loaded page. Historical alias records and their representative bytes remain in the upgrade snapshots; they have no runtime readers or writers. The empty legacy-alias table remains in the schema for compatibility with existing schema shapes.
 
 A shadow receipt is only the last observed page, and replay can move it back. It
 is not a coverage frontier, materialization receipt or verified filesystem
