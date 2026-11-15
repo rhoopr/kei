@@ -1391,6 +1391,8 @@ Request retirement writes no source checkpoint. A fixed-date selection can compl
 
 `TaskPlanner::verified_downloaded_path` retains an existing recorded filename when the provider renames the same rendition within the current pass directory. Reuse still requires the same provider content generation, exclusive recorded ownership, an allowed destination and the recorded local checksum. A changed cloud filename alone does not create another local copy. Cross-directory template changes and missing-file destination recovery remain separate decisions.
 
+For captured selection generations, `verified_selection_paths` returns the retained pass key with each published path. Projection keeps a same-pass, same-generation destination across folder-template changes within the configured root. New assets use the new template. An absent recorded destination remains the recovery target when ownership and protected-path checks permit it; publication still uses the no-overwrite path. Other passes' copies need the existing path-family match. This reuses retained generation evidence and adds no mapping table or serialized field.
+
 ```text
 PhotoAsset
   -> planner::TaskPlanner

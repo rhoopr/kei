@@ -670,17 +670,46 @@ impl SelectionRun {
                         (derived.checksum.to_string(), derived.size),
                     )
                     .await?;
-                for candidate in candidates {
+                for (previous_key, candidate) in candidates {
                     let path = candidate.to_path();
-                    if filter::stored_path_matches_download_family(
-                        asset.state_id(),
-                        derived,
-                        &derived_paths,
-                        config,
-                        &path,
-                    ) && let Ok(fingerprint) =
-                        crate::download::file::fingerprint_downloaded_path(&config.directory, &path)
+                    if previous_key == key
+                        && tokio::fs::symlink_metadata(&path)
                             .await
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                        && let Ok(path) =
+                            crate::fs_util::reserved_path_under_root(&config.directory, &path)
+                        && planner.retry_path_allowed(
+                            asset.source_zone().unwrap_or(&config.library),
+                            asset.state_id(),
+                            derived.version_size,
+                            &derived.checksum,
+                            derived.size,
+                            &path,
+                        )
+                        && crate::download::legacy_preservation::current_path_is_independent(
+                            self.capture.db.as_ref(),
+                            &path,
+                        )
+                        .await?
+                    {
+                        retained = Some(path);
+                        break;
+                    }
+                    // Published destinations belong to their pass, not the
+                    // latest rendering of its folder template or filename.
+                    if (previous_key == key
+                        || filter::stored_path_matches_download_family(
+                            asset.state_id(),
+                            derived,
+                            &derived_paths,
+                            config,
+                            &path,
+                        ))
+                        && let Ok(fingerprint) = crate::download::file::fingerprint_downloaded_path(
+                            &config.directory,
+                            &path,
+                        )
+                        .await
                         && self
                             .capture
                             .db

@@ -2140,6 +2140,8 @@ impl SqliteStateDb {
     /// Lossless paths from independently verified generations, limited before
     /// materialization. Current provider facts supplied by the caller decide
     /// version compatibility; generation order only schedules candidate reuse.
+    /// Return each retained pass key so callers can distinguish its established
+    /// destination from another pass's reusable copy after template changes.
     pub(crate) async fn verified_selection_paths(
         &self,
         owner: account::AccountOwner,
@@ -2149,7 +2151,7 @@ impl SqliteStateDb {
         master: String,
         version: String,
         resource: (String, u64),
-    ) -> Result<Vec<super::provider_selection::SelectionPath>, StateError> {
+    ) -> Result<Vec<(String, super::provider_selection::SelectionPath)>, StateError> {
         let (checksum, size) = resource;
         self.with_conn("reading independent native publication paths",move|conn|{
             account::validate_authenticated(conn,&owner)?;
@@ -2157,7 +2159,7 @@ impl SqliteStateDb {
             let mut paths=Vec::with_capacity(candidates.len());
             for (generation,path,previous_key) in candidates {
                 let root=load_generation(conn,&generation)?;load_decision(conn,&root,&previous_key,&child)?;
-                paths.push(serde_json::from_str(&path).map_err(|_invalid|StateError::ProviderSelectionInvalid)?);
+                paths.push((previous_key, serde_json::from_str(&path).map_err(|_invalid|StateError::ProviderSelectionInvalid)?));
             }
             Ok(paths)
         }).await

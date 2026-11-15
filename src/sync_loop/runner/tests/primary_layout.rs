@@ -120,7 +120,7 @@ impl PhotosSession for Session {
         if url.contains("/records/query/batch?") || url.contains("/internal/records/query/batch") {
             let body: Value = serde_json::from_str(&body)?;
             return Ok(
-                json!({"batch":body["batch"].as_array().unwrap().iter().map(|_|json!({"records":[{"fields":{"itemCount":{"value":if self.indexing.is_some() {self.records.len()/2} else {1}}}}]})).collect::<Vec<_>>()}),
+                json!({"batch":body["batch"].as_array().unwrap().iter().map(|_|json!({"records":[{"fields":{"itemCount":{"value":self.records.len()/2}}}]})).collect::<Vec<_>>()}),
             );
         }
         if url.contains("/records/query?") {
@@ -459,6 +459,99 @@ async fn startup_archive_adoption_flows_into_managed_sync_without_downloads() {
         ),
         1
     );
+}
+
+#[tokio::test]
+async fn recorded_generation_destinations_survive_template_changes() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let old = records(&server, Some(("edit-one", EDIT_ONE)));
+    let (initial, _) = cycle_options(
+        root.path(),
+        old.clone(),
+        false,
+        EditedNaming::Suffix,
+        CycleOptions {
+            private: true,
+            folder_structure: "before",
+            ..CycleOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    assert!(initial.db_sync_token_advance_safe);
+    let media = root.path().join("media");
+    let recorded: Vec<_> = std::fs::read_dir(media.join("before"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file())
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    assert_eq!(recorded.len(), 2);
+    let initial_requests = server.received_requests().await.unwrap().len();
+    assert_eq!(initial_requests, 2);
+    let mut added = full_album_page_with_download(
+        "PrimarySync",
+        "502",
+        "new-token",
+        &format!("{}/original", server.uri()),
+        ORIGINAL.len() as u64,
+        &provider_hash(ORIGINAL),
+    );
+    added["records"][0]["fields"]["filenameEnc"]["value"] = json!("NEW.JPG");
+    let mut current = old;
+    current.extend(added["records"].as_array().unwrap().iter().cloned());
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            quiet,
+            EditedNaming::Suffix,
+            CycleOptions {
+                private: true,
+                folder_structure: "after",
+                ..CycleOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        for (path, bytes) in &recorded {
+            assert_bytes(path, bytes);
+        }
+        assert_bytes(&media.join("after/NEW.JPG"), ORIGINAL);
+        assert!(!media.join("after/IMG_0501.JPG").exists());
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            initial_requests + 1
+        );
+    }
+    std::fs::remove_file(media.join("before/IMG_0501.JPG")).unwrap();
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            quiet,
+            EditedNaming::Suffix,
+            CycleOptions {
+                private: true,
+                folder_structure: "after",
+                ..CycleOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        assert_bytes(&media.join("before/IMG_0501.JPG"), ORIGINAL);
+        assert!(!media.join("after/IMG_0501.JPG").exists());
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            initial_requests + 2
+        );
+    }
 }
 
 #[tokio::test]
