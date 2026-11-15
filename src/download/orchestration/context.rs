@@ -49,10 +49,6 @@ type LibraryAssetVersionSet = FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashSet<
 /// already known in the same CloudKit zone.
 type LibraryAssetSet = FxHashMap<Arc<str>, FxHashSet<Arc<str>>>;
 
-/// `library -> asset_id -> attempt count`. Used by max-attempt gating without
-/// leaking failures across libraries that happen to share an id.
-type LibraryAssetAttemptCounts = FxHashMap<Arc<str>, FxHashMap<Arc<str>, u32>>;
-
 /// `library -> asset_id -> (version_size -> value)`. Used by
 /// `DownloadContext::downloaded_checksums` and
 /// `downloaded_metadata_hashes`.
@@ -172,9 +168,6 @@ pub(crate) struct DownloadContext {
     pub(in crate::download) legacy_master_state_owners: Option<LibraryMasterAssetMap>,
     legacy_added_dates: LegacyAddedDates,
     protected_legacy_ids: LibraryAssetSet,
-    /// Per-library/asset maximum download attempt count (from failed assets).
-    /// Used to skip assets that have exceeded `max_download_attempts`.
-    pub(in crate::download) attempt_counts: LibraryAssetAttemptCounts,
     /// True when at least one downloaded asset-version lacks a metadata hash.
     /// Cached because the producer checks this on hot on-disk skip paths.
     pub(in crate::download) downloaded_without_metadata_hash: bool,
@@ -216,7 +209,6 @@ impl DownloadContext {
             hashes,
             markers,
             pending,
-            attempts,
             mapping_rows,
             legacy_owner_rows,
             protected_legacy_rows,
@@ -250,12 +242,6 @@ impl DownloadContext {
             async {
                 db.get_pending().await.unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "Failed to load pending assets from state DB");
-                    Default::default()
-                })
-            },
-            async {
-                db.get_attempt_counts().await.unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to load attempt counts from state DB");
                     Default::default()
                 })
             },
@@ -480,12 +466,6 @@ impl DownloadContext {
                 tracing::warn!(%error, "Legacy preservation could not be loaded; legacy adoption disabled");
             }
         }
-        let mut attempt_counts: LibraryAssetAttemptCounts = FxHashMap::default();
-        for ((library, asset_id), count) in attempts {
-            let lib = intern_id(&mut interner, library);
-            let id = intern_id(&mut interner, asset_id);
-            attempt_counts.entry(lib).or_default().insert(id, count);
-        }
         let downloaded_without_metadata_hash = if protected_legacy_ids.is_empty() {
             count_version_set_entries(&downloaded_ids)
                 > count_value_map_entries(&downloaded_metadata_hashes)
@@ -521,16 +501,8 @@ impl DownloadContext {
             legacy_master_state_owners,
             legacy_added_dates,
             protected_legacy_ids,
-            attempt_counts,
             downloaded_without_metadata_hash,
         }
-    }
-
-    pub(in crate::download) fn attempt_count(&self, library: &str, asset_id: &str) -> Option<u32> {
-        self.attempt_counts
-            .get(library)
-            .and_then(|assets| assets.get(asset_id))
-            .copied()
     }
 
     /// Whether a downloaded asset-version needs a metadata-only rewrite:

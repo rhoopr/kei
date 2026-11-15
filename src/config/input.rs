@@ -84,10 +84,6 @@ pub(crate) struct TomlDownload {
 pub(crate) struct TomlRetry {
     /// Retries within a single transfer.
     pub per_transfer: Option<u32>,
-    /// Lifetime cap on download attempts per asset across syncs (default
-    /// `10`). Distinct from `per_transfer`, which only caps retries within a
-    /// single download. `0` disables the cap.
-    pub per_asset: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -205,7 +201,9 @@ pub(crate) fn load_toml_config_with_source(
                 );
                 if parse_error.contains("unknown field") {
                     message.push_str("\n\n");
-                    if parse_error.contains("`edited_naming`") {
+                    if parse_error.contains("`per_asset`") {
+                        message.push_str("Lifetime retry limits are retired. Remove per_asset from [download.retry]. Unfinished work remains retryable across sync cycles; per_transfer still bounds retries within a transfer. Configuration was not changed.");
+                    } else if parse_error.contains("`edited_naming`") {
                         message.push_str("The edited_naming option is retired. Remove edited_naming from [photos]. New edited files use an edited suffix; recorded managed layouts and interrupted publications retain their existing layout. Configuration was not changed.");
                     } else if parse_error.contains("`filename_exclude`") {
                         message.push_str("Filename-based selection is no longer supported. Remove filename_exclude from [filters] after reviewing the expanded selection. Use album/library selection or fixed capture-date bounds where appropriate. Configuration was not changed.");
@@ -286,7 +284,6 @@ mod tests {
             "download.temp_suffix",
             "download.legacy_preservation_allow_hardlinks",
             "download.retry.per_transfer",
-            "download.retry.per_asset",
             "filters.libraries",
             "filters.albums",
             "filters.smart_folders",

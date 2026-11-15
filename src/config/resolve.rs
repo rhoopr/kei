@@ -63,7 +63,6 @@ pub(crate) struct SyncConfigOverrides {
     pub report_json: Option<PathBuf>,
     pub http_port: Option<u16>,
     pub http_bind: Option<std::net::IpAddr>,
-    pub max_download_attempts: Option<u32>,
 }
 
 // ── Application Config ──────────────────────────────────────────────
@@ -599,15 +598,6 @@ impl Config {
             max_retries <= 100,
             "[download.retry].per_transfer must be 100 or less, got {max_retries}."
         );
-        // Lifetime cap on download attempts per asset (0 disables). CLI >
-        // TOML > 10, matching every other resolved value. The runtime
-        // skip check in download::pipeline::process_asset short-circuits
-        // when this is 0, so 0 is a valid (cap-off) sentinel.
-        let max_download_attempts = resolve(
-            overrides.max_download_attempts,
-            toml_retry.and_then(|r| r.per_asset),
-            10,
-        );
         let retry_delay_secs = smart_retry_delay(max_retries);
 
         // Filters
@@ -791,7 +781,6 @@ impl Config {
             retry: ResolvedRetryConfig {
                 max_retries,
                 retry_delay_secs,
-                max_download_attempts,
             },
             watch: WatchConfig {
                 interval: watch_with_interval,
@@ -2192,65 +2181,13 @@ mod tests {
         assert_eq!(cfg.retry.max_retries, 10);
     }
     #[test]
-    fn test_build_max_download_attempts_default() {
-        // Neither CLI nor TOML set: hardcoded fallback of 10 fires.
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(cfg.retry.max_download_attempts, 10);
-    }
-    #[test]
-    fn test_build_max_download_attempts_from_toml() {
-        // TOML-only: resolved value matches the TOML setting.
-        let toml_str = r#"
-            [download.retry]
-            per_asset = 25
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.retry.max_download_attempts, 25);
-    }
-    #[test]
-    fn test_build_max_download_attempts_cli_overrides_toml() {
-        // CLI flag wins over TOML, mirroring every other resolved value.
-        let toml_str = r#"
-            [download.retry]
-            per_asset = 25
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.max_download_attempts = Some(7);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.retry.max_download_attempts, 7);
-    }
-    #[test]
-    fn test_build_max_download_attempts_zero_disables_cap() {
-        // `0` is the documented "disable the cap" sentinel; resolution
-        // must accept it through TOML the same as through CLI.
-        let toml_str = r#"
-            [download.retry]
-            per_asset = 0
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.retry.max_download_attempts, 0);
+    fn retired_lifetime_retry_config_refuses_before_resolution() {
+        for value in ["0", "10", "25", "\"invalid\""] {
+            let error =
+                toml::from_str::<TomlConfig>(&format!("[download.retry]\nper_asset = {value}\n"))
+                    .unwrap_err();
+            assert!(error.to_string().contains("unknown field `per_asset`"));
+        }
     }
     #[test]
     fn test_build_mov_filename_policy_cli_overrides_toml() {

@@ -228,7 +228,8 @@ pub(crate) async fn context(
         "before":config.skip_created_before.map(crate::config::CreatedDateFilter::fingerprint),"after":config.skip_created_after.map(crate::config::CreatedDateFilter::fingerprint),
         "enum_hash":config.enum_config_hash.as_deref(),"metadata_flags":crate::download::pipeline::MetadataFlags::from(config).bits(),
         "capture_revision":crate::state::METADATA_CAPTURE_REVISION,"capture_repair":format!("{:?}",config.capture_timestamp_repair),
-        "repair_truncated":config.repair_truncated,"attempt_limit":config.max_download_attempts,
+        // Retain the historical fingerprint key; lifetime admission is retired.
+        "repair_truncated":config.repair_truncated,"attempt_limit":0,
     }))?.as_slice());
     Ok(Some(SelectionContext {
         capture,

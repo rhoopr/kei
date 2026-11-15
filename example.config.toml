@@ -116,12 +116,6 @@ legacy_preservation_allow_hardlinks = false
 # Description: Retries inside a single transfer. The initial retry delay is derived from this value.
 per_transfer = 3
 
-# Option: download.retry.per_asset
-# Default value: 10
-# Valid values: integer 0 or greater; 0 disables the cap
-# Description: Cap on recorded rendition attempts during a run; retry preparation resets eligible failed and stale pending counts on later runs.
-per_asset = 10
-
 [filters]
 # Option: filters.libraries
 # Default value: ["primary"]

@@ -531,8 +531,6 @@ pub(crate) struct DownloadConfig {
     pub(crate) library: Arc<str>,
     /// Asset IDs to exclude (from `--exclude-album` without `--album`).
     pub(crate) exclude_asset_ids: Arc<FxHashSet<String>>,
-    /// Maximum download attempts per asset before giving up (0 = unlimited).
-    pub(crate) max_download_attempts: u32,
     /// Preloaded asset→album and asset→person indices, shared across clones.
     pub(crate) asset_groupings: Arc<AssetGroupings>,
     /// Shared token-bucket limiter applied across all concurrent download
@@ -673,7 +671,6 @@ impl std::fmt::Debug for DownloadConfig {
             .field("enum_config_hash", &self.enum_config_hash)
             .field("album_name", &self.album_name)
             .field("exclude_asset_ids_count", &self.exclude_asset_ids.len())
-            .field("max_download_attempts", &self.max_download_attempts)
             .field("bandwidth_limiter", &self.bandwidth_limiter)
             .finish()
     }
@@ -727,7 +724,6 @@ impl DownloadConfig {
             selection_pass: None,
             provisional: false,
             indexing_inventory_only: false,
-            max_download_attempts: 10,
             sync_mode: SyncMode::Full,
             enum_config_hash: None,
             album_name: None,

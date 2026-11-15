@@ -144,6 +144,10 @@ async fn retired_selection_settings_refuse_before_provider_or_state_writes() {
         ("filters", "filename_exclude", "[\"[invalid\"]"),
         ("photos", "edited_naming", "'primary'"),
         ("photos", "edited_naming", "'suffix'"),
+        ("download.retry", "per_asset", "0"),
+        ("download.retry", "per_asset", "10"),
+        ("download.retry", "per_asset", "100"),
+        ("download.retry", "per_asset", "'invalid'"),
     ] {
         let config = format!("{original_config}[{section}]\n{key}={value}\n");
         std::fs::write(&account.config, &config).unwrap();

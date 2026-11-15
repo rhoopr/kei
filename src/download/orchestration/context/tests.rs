@@ -587,48 +587,6 @@ fn should_download_fast_no_checksum_trust_false_returns_none() {
     );
 }
 
-// ── Gap: DownloadContext attempt_counts used by producer ──────────
-
-#[test]
-fn download_context_attempt_counts_track_per_asset() {
-    let mut ctx = DownloadContext::default();
-    ctx.attempt_counts
-        .entry("PrimarySync".into())
-        .or_default()
-        .insert("asset_high".into(), 15);
-    ctx.attempt_counts
-        .entry("PrimarySync".into())
-        .or_default()
-        .insert("asset_low".into(), 2);
-    ctx.attempt_counts
-        .entry("SharedSync-AAAA".into())
-        .or_default()
-        .insert("asset_high".into(), 1);
-
-    // Simulate the producer's retry-exhaustion check
-    let max_attempts = 10u32;
-    assert!(
-        ctx.attempt_count("PrimarySync", "asset_high")
-            .is_some_and(|c| c >= max_attempts),
-        "asset_high should exceed max_download_attempts"
-    );
-    assert!(
-        ctx.attempt_count("PrimarySync", "asset_low")
-            .is_none_or(|c| c < max_attempts),
-        "asset_low should not exceed max_download_attempts"
-    );
-    assert!(
-        ctx.attempt_count("SharedSync-AAAA", "asset_high")
-            .is_none_or(|c| c < max_attempts),
-        "same asset id in another library should not inherit primary attempts"
-    );
-    assert!(
-        ctx.attempt_count("PrimarySync", "asset_never_failed")
-            .is_none(),
-        "unknown asset should not be in attempt_counts"
-    );
-}
-
 // ── Gap: should_download_fast with downloaded but different version ──
 
 #[test]

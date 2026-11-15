@@ -1510,6 +1510,8 @@ inventory. The retry owner:
 
 Unknown identity is not permission to delete or forget work.
 
+Transfer admission does not consult lifetime attempt counts. Failed work remains eligible on later cycles regardless of prior attempts; bounded transfer retries and cycle failure gates still apply. The producer no longer loads an attempt-count snapshot or marks tasks exhausted. Recorded attempt counts remain diagnostic evidence. Explicit `[download.retry].per_asset` settings refuse during configuration loading with removal guidance. The retained generation-fingerprint `attempt_limit` and support-report `per_asset` fields are always zero for current execution.
+
 Pending recovery can follow a partial source transfer failure when every reported failure maps to a distinct failed library/asset/rendition target. `SyncResult` carries those transient exclusions through result composition; the pending selector omits them for the rest of that cycle. Independent pending peers can progress without giving failed source tasks another attempt. State-write failures, interruption, authentication expiry, blocked checkpoints, incomplete identities or enumeration, and unmatched failure counts retain the recovery hold. Exclusions deliberately cover all destinations of the same rendition; they can defer another copy until the next cycle. They do not authorize provider checkpoints or change durable retry state.
 
 A pending rendition can retain a valid prior publication after a later download

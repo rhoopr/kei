@@ -273,7 +273,7 @@ Filename-based selection is no longer supported. Remove `[filters].filename_excl
 | `[metadata].set_exif_rating`, `.set_exif_gps`, `.set_exif_description` | Write more iCloud metadata into downloaded media. |
 | `[metadata].embed_xmp`, `[metadata].xmp_sidecar` | Embed XMP or write `.xmp` sidecars. |
 | `[download.retry].per_transfer` | Retry downloads inside one transfer. Default is 3. |
-| `[download.retry].per_asset` | Cap lifetime attempts per asset. Default is 10; 0 disables the cap. |
+| Retired `[download.retry].per_asset` | Remove this setting. Unfinished work remains retryable across sync cycles; `per_transfer` bounds retries within a transfer. |
 | `[download].temp_suffix` | Temp file suffix for partial downloads. Default is `.kei-tmp`. |
 | `[report].json` | Save the latest sync report as a JSON file. |
 | `[server].bind`, `[server].port` | Serve `/healthz` and `/metrics` during watch mode. |

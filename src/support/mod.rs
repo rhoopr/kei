@@ -72,10 +72,7 @@ pub(crate) fn runtime_configuration(config: &crate::config::Config) -> Value {
         map.insert("filename_exclusions".into(), json!(0));
         map.insert("watch_interval_secs".into(), json!(config.watch.interval));
         map.insert("per_transfer".into(), json!(config.retry.max_retries));
-        map.insert(
-            "per_asset".into(),
-            json!(config.retry.max_download_attempts),
-        );
+        map.insert("per_asset".into(), json!(0));
         map.insert(
             "legacy_preservation_allow_hardlinks".into(),
             json!(config.download.legacy_preservation_allow_hardlinks),

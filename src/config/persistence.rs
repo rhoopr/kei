@@ -72,15 +72,6 @@ impl Config {
                     .then_some(true),
                 retry: Some(TomlRetry {
                     per_transfer: Some(self.retry.max_retries),
-                    // Emit `per_asset` only when the user has
-                    // overridden the default of 10. Keeps the round-trip
-                    // clean for the common case and surfaces explicit
-                    // overrides in `kei config show`.
-                    per_asset: if self.retry.max_download_attempts == 10 {
-                        None
-                    } else {
-                        Some(self.retry.max_download_attempts)
-                    },
                 }),
             }),
             filters: Some(TomlFilters {
@@ -435,9 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_toml_omits_default_max_download_attempts() {
-        // Default 10 is elided from the round-trip so config dumps stay
-        // clean for the common case.
+    fn test_to_toml_omits_retired_lifetime_retry_limit() {
         let cfg = Config::build(
             &default_globals(),
             &default_password(),
@@ -445,20 +434,13 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(cfg.retry.max_download_attempts, 10);
-        let toml = cfg.to_toml();
-        let retry = toml.download.unwrap().retry.unwrap();
-        assert_eq!(retry.per_asset, None);
-    }
-    #[test]
-    fn test_to_toml_includes_non_default_max_download_attempts() {
-        // User overrides round-trip back into the dump.
-        let mut sync = default_sync();
-        sync.config_overrides.max_download_attempts = Some(42);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        let toml = cfg.to_toml();
-        let retry = toml.download.unwrap().retry.unwrap();
-        assert_eq!(retry.per_asset, Some(42));
+        let text = toml::to_string(&cfg.to_toml()).unwrap();
+        assert!(!text.contains("per_asset"));
+        let parsed: TomlConfig = toml::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.download.unwrap().retry.unwrap().per_transfer,
+            Some(cfg.retry.max_retries)
+        );
     }
     #[test]
     fn test_to_toml_roundtrip_preserves_username() {

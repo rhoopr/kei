@@ -10,7 +10,6 @@ use tokio::sync::mpsc;
 use crate::download::filter::{
     DownloadTask, FilterReason, extract_skip_candidates, is_asset_filtered,
 };
-use crate::download::finalize::finalize_failed;
 use crate::download::metadata_rewrite::MetadataFlags;
 use crate::download::orchestration::generation::{
     SelectionConfirmationErrorClass, classify_selection_confirmation_error,
@@ -99,7 +98,6 @@ fn should_resnapshot_free_space(total: u64, last_snapshot_total: u64, interval: 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 enum AssetDisposition {
     Unresolved,
-    RetryExhausted,
     StateSkip,
     AmpmVariant,
     OnDisk,
@@ -892,38 +890,6 @@ where
                                 tracing::error!(%error, "Reserved pending task confinement failed");
                                 continue 'assets;
                             }
-                            // Mark assets that have exceeded the retry limit as failed.
-                            if let Some(attempts) =
-                                download_ctx.attempt_count(&task.library, &task.asset_id)
-                                && config.max_download_attempts > 0
-                                && attempts >= config.max_download_attempts
-                            {
-                                tracing::warn!(target: "kei::download::pipeline",
-                                    asset_id = %task.asset_id,
-                                    attempts,
-                                    max = config.max_download_attempts,
-                                    "Asset exceeded max download attempts, marking as failed"
-                                );
-                                if let Some(db) = &producer_state_db {
-                                    let error = format!(
-                                        "Exceeded max download attempts ({attempts}/{})",
-                                        config.max_download_attempts
-                                    );
-                                    if let Err(e) =
-                                        finalize_failed(db.as_ref(), &task.library, &task, &error)
-                                            .await
-                                    {
-                                        tracing::warn!(target: "kei::download::pipeline",
-                                            asset_id = %task.asset_id,
-                                            error = %e,
-                                            "Failed to mark asset as failed"
-                                        );
-                                    }
-                                }
-                                disposition = disposition.max(AssetDisposition::RetryExhausted);
-                                continue;
-                            }
-
                             if let Some(db) = &producer_state_db {
                                 let adoption = match adopt_pending_on_disk_task(
                                     producer_state_db.as_deref(),
@@ -1106,7 +1072,6 @@ where
                             AssetDisposition::OnDisk => skips.on_disk += 1,
                             AssetDisposition::AmpmVariant => skips.ampm_variant += 1,
                             AssetDisposition::StateSkip => skips.by_state += 1,
-                            AssetDisposition::RetryExhausted => skips.retry_exhausted += 1,
                             AssetDisposition::Unresolved => {
                                 tracing::warn!(target: "kei::download::pipeline",
                                     asset_id = %asset.id(),

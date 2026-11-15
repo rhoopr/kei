@@ -309,7 +309,6 @@ impl Fixture {
             let mut config = base(mode, excludes, groups, zone);
             let config_mut = Arc::make_mut(&mut config);
             config_mut.retry.max_retries = 0;
-            config_mut.max_download_attempts = 1;
             config
         };
         let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
@@ -737,6 +736,19 @@ async fn inventory_initial_delta_failure_cannot_advance_before_inventory_qualifi
     for id in ["A", "B", "D"] {
         assert_eq!(fixture.gets(id).await, 1);
     }
+    // Historical attempts are evidence, never permission to abandon current work.
+    // The next cycle reopens this database and must recover without resetting them.
+    let db = fixture.open().await;
+    let updated = db
+        .acquire_lock("seed historical transfer failures")
+        .unwrap()
+        .execute(
+            "UPDATE assets SET download_attempts=100 WHERE status='failed'",
+            [],
+        )
+        .unwrap();
+    assert!(updated > 0);
+    drop(db);
     fixture.server.reset().await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(BYTES))

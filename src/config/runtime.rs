@@ -292,7 +292,6 @@ pub struct PhotoConfig {
 pub struct ResolvedRetryConfig {
     pub max_retries: u32,
     pub retry_delay_secs: u64,
-    pub max_download_attempts: u32,
 }
 
 #[derive(Debug)]
