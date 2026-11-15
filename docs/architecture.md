@@ -1510,6 +1510,8 @@ inventory. The retry owner:
 
 Unknown identity is not permission to delete or forget work.
 
+Pending recovery can follow a partial source transfer failure when every reported failure maps to a distinct failed library/asset/rendition target. `SyncResult` carries those transient exclusions through result composition; the pending selector omits them for the rest of that cycle. Independent pending peers can progress without giving failed source tasks another attempt. State-write failures, interruption, authentication expiry, blocked checkpoints, incomplete identities or enumeration, and unmatched failure counts retain the recovery hold. Exclusions deliberately cover all destinations of the same rendition; they can defer another copy until the next cycle. They do not authorize provider checkpoints or change durable retry state.
+
 A pending rendition can retain a valid prior publication after a later download
 attempt failed. Ordinary sync and targeted retry recovery may reuse only its
 current catalog path when prior

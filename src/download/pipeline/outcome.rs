@@ -306,6 +306,7 @@ fn mark_producer_enumeration_incomplete(
 /// Build a `DownloadOutcome` from a `StreamingResult`, running a cleanup
 /// pass if there were failures. Shared between `download_photos` and
 /// `download_photos_full_with_token`.
+#[cfg(test)]
 pub(in crate::download) async fn build_download_outcome(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
@@ -706,7 +707,8 @@ pub(in crate::download) async fn build_download_result(
             },
             stats,
             checkpoint,
-        ));
+        )
+        .with_retry_exclusions(&remaining_failed));
     }
 
     Ok(finish_download_result(
@@ -725,6 +727,7 @@ fn finish_download_result(
     checkpoint.project(&mut stats);
     SyncResult {
         deferred_album_snapshots: Vec::new(),
+        retry_exclusions: Default::default(),
         outcome,
         sync_token: None,
         stats,

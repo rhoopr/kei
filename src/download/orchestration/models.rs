@@ -173,6 +173,9 @@ impl DownloadControls {
 /// Result of a sync cycle, including the optional new syncToken.
 #[derive(Debug)]
 pub struct SyncResult {
+    /// Exact transfer targets already handled by this cycle's bounded retry.
+    /// This is transient scheduling evidence, never checkpoint permission.
+    pub(crate) retry_exclusions: rustc_hash::FxHashSet<crate::download::retry::PendingRetryTarget>,
     /// Exact running snapshots, completed only with guarded inventory retirement.
     pub(crate) deferred_album_snapshots: Vec<(String, String, i64)>,
     /// The outcome of the download pass (success, session expired, partial failure).
@@ -325,6 +328,7 @@ impl SyncResult {
         let checkpoint = CheckpointEvidence::from_execution_stats(&stats);
         Self {
             deferred_album_snapshots: Vec::new(),
+            retry_exclusions: Default::default(),
             outcome,
             sync_token,
             stats,
@@ -337,6 +341,8 @@ impl SyncResult {
     /// Compose evidence and reports in one zone. The caller retains ownership
     /// of outcome precedence and source-token selection.
     pub(crate) fn accumulate(&mut self, other: &Self) {
+        self.retry_exclusions
+            .extend(other.retry_exclusions.iter().cloned());
         self.stats.accumulate_report_counters(&other.stats);
         self.checkpoint.accumulate(&other.checkpoint);
         self.checkpoint.project(&mut self.stats);
@@ -345,6 +351,19 @@ impl SyncResult {
             .extend(other.deferred_album_snapshots.iter().cloned());
         // Inventory belongs only to the original query invocation. Do not
         // import a later smart refresh, targeted retry, or bridge measurement.
+    }
+
+    #[must_use]
+    pub(in crate::download) fn with_retry_exclusions(
+        mut self,
+        tasks: &[crate::download::filter::DownloadTask],
+    ) -> Self {
+        self.retry_exclusions.extend(
+            tasks
+                .iter()
+                .map(crate::download::retry::PendingRetryTarget::from_task),
+        );
+        self
     }
 
     pub(crate) fn block_for_metadata_capture(&mut self) {

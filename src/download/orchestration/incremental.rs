@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::download::filter::DownloadTask;
 use crate::download::metadata_rewrite::CaptureTimestampRepair;
 use crate::download::pipeline::{
-    AUTH_ERROR_THRESHOLD, MetadataFlags, PassConfig, StreamRuntime, build_download_outcome,
+    AUTH_ERROR_THRESHOLD, MetadataFlags, PassConfig, StreamRuntime, build_download_result,
     format_duration, log_sync_summary, mark_reserved_pending_task, run_download_pass,
     state_confirmed_current_path_exists, stream_and_download_from_stream,
     validate_enumerated_reserved_pending,
@@ -315,7 +315,7 @@ async fn download_photos_incremental_streaming(
         streaming_result.enumeration_complete = false;
     }
 
-    let (mut outcome, mut stats) = build_download_outcome(
+    let execution = build_download_result(
         download_client,
         std::slice::from_ref(pass),
         &pass_config,
@@ -326,6 +326,7 @@ async fn download_photos_incremental_streaming(
     )
     .await?;
 
+    let (mut outcome, mut stats) = (execution.outcome, execution.stats);
     stats.state_write_failures += delta_summary.state_transition_failures;
     stats.interrupted = stats.interrupted || shutdown_token.is_cancelled();
     stats.accumulate(&delta_summary.sparse_target_stats);
@@ -350,13 +351,15 @@ async fn download_photos_incremental_streaming(
             .flatten()
     };
 
-    Ok(SyncResult::from_incremental_execution(
+    let mut result = SyncResult::from_incremental_execution(
         outcome,
         sync_token,
         stats,
         delta_summary.sparse_identity_proofs,
         completed_delta_replay,
-    ))
+    );
+    result.retry_exclusions = execution.retry_exclusions;
+    Ok(result)
 }
 
 /// Incremental delta sync via `changes_stream`.
@@ -1364,7 +1367,8 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         stats,
         delta_summary.sparse_identity_proofs,
         completed_delta_replay,
-    ))
+    )
+    .with_retry_exclusions(&pass_result.failed))
 }
 
 #[cfg(test)]

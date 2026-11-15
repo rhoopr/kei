@@ -216,7 +216,7 @@ async fn incremental_with_failed_rows_uses_targeted_retry_not_full_enumeration()
 
 #[tokio::test]
 #[tracing_test::traced_test]
-async fn pending_peer_recovers_after_partial_failure_without_extra_same_cycle_attempts() {
+async fn pending_peer_progresses_during_partial_failure_without_extra_same_cycle_attempts() {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -291,7 +291,7 @@ async fn pending_peer_recovers_after_partial_failure_without_extra_same_cycle_at
     Mock::given(method("GET"))
         .and(path("/peer"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
-        .expect(0)
+        .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -336,6 +336,11 @@ async fn pending_peer_recovers_after_partial_failure_without_extra_same_cycle_at
                 (DownloadOutcome::PartialFailure { failed_count: 1 }, 0, true),
             ] {
                 let mut blocked = SyncResult::from_execution(outcome, None, Default::default());
+                blocked.retry_exclusions.insert(PendingRetryTarget {
+                    library: "PrimarySync".into(),
+                    asset_id: "asset-failing".into(),
+                    version_size: VersionSizeKey::Original,
+                });
                 blocked.checkpoint.state_write_failures = state_failures;
                 blocked.checkpoint.interrupted = interrupted;
                 let result = super::append_targeted_recovery_to_sync_result(
@@ -353,6 +358,44 @@ async fn pending_peer_recovers_after_partial_failure_without_extra_same_cycle_at
                 assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
                 assert!(server.received_requests().await.unwrap().is_empty());
             }
+            for guard in 0..6 {
+                let mut blocked = SyncResult::from_execution(
+                    DownloadOutcome::PartialFailure { failed_count: 1 },
+                    None,
+                    Default::default(),
+                );
+                let mut source =
+                    SyncResult::from_execution(DownloadOutcome::Success, None, Default::default());
+                source.retry_exclusions.insert(PendingRetryTarget {
+                    library: "PrimarySync".into(),
+                    asset_id: "asset-failing".into(),
+                    version_size: VersionSizeKey::Original,
+                });
+                blocked.accumulate(&source);
+                assert_eq!(blocked.retry_exclusions, source.retry_exclusions);
+                match guard {
+                    0 => blocked.checkpoint.sync_token_blocked = true,
+                    1 => blocked.checkpoint.identity_incomplete = true,
+                    2 => blocked.checkpoint.enumeration_incomplete = true,
+                    3 => blocked.checkpoint.enumeration_errors = 1,
+                    4 => blocked.retry_exclusions.clear(),
+                    _ => blocked.outcome = DownloadOutcome::PartialFailure { failed_count: 2 },
+                }
+                let result = super::append_targeted_recovery_to_sync_result(
+                    &Client::new(),
+                    &passes,
+                    &Arc::new(config.clone()),
+                    DownloadControls::download_hidden(),
+                    CancellationToken::new(),
+                    blocked,
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.stats.downloaded, 0, "guard {guard}");
+                assert_eq!(db.get_pending().await.unwrap().len(), 1);
+                assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
+                assert!(server.received_requests().await.unwrap().is_empty());
+            }
         }
         let result = download_photos_with_sync(
             &Client::new(),
@@ -365,12 +408,12 @@ async fn pending_peer_recovers_after_partial_failure_without_extra_same_cycle_at
         .unwrap();
         assert_eq!(
             result.stats.downloaded,
-            if round == 1 { 2 } else { 0 },
+            usize::from(round < 2),
             "{result:?}"
         );
         assert!(!result.full_enumeration_ran);
         let completed = db.get_downloaded_page(0, 10).await.unwrap();
-        assert_eq!(completed.len(), if round == 0 { 0 } else { 2 });
+        assert_eq!(completed.len(), if round == 0 { 1 } else { 2 });
         for record in completed {
             assert_eq!(std::fs::read(record.local_path.unwrap()).unwrap(), bytes);
         }
@@ -380,13 +423,12 @@ async fn pending_peer_recovers_after_partial_failure_without_extra_same_cycle_at
                 DownloadOutcome::PartialFailure { failed_count: 1 }
             ));
             let failed = db.get_failed().await.unwrap();
-            assert_eq!(failed.len(), 2);
+            assert_eq!(failed.len(), 1);
             assert!(
                 failed
                     .iter()
                     .any(|record| record.id.as_ref() == "asset-failing")
             );
-            assert!(failed.iter().any(|record| record.id.as_ref() == "peer"));
             server.verify().await;
             server.reset().await;
             Mock::given(method("GET"))
@@ -398,7 +440,7 @@ async fn pending_peer_recovers_after_partial_failure_without_extra_same_cycle_at
             Mock::given(method("GET"))
                 .and(path("/peer"))
                 .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
-                .expect(1)
+                .expect(0)
                 .mount(&server)
                 .await;
         } else {

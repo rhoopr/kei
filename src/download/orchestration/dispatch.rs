@@ -556,6 +556,7 @@ async fn download_photos_with_sync_inner(
     if metadata_capture_repair.auth_errors > 0 {
         return Ok(SyncResult {
             deferred_album_snapshots: Vec::new(),
+            retry_exclusions: Default::default(),
             outcome: DownloadOutcome::SessionExpired {
                 auth_error_count: metadata_capture_repair.auth_errors,
             },
@@ -817,6 +818,7 @@ async fn download_photos_with_sync_inner(
     };
     let repair = SyncResult {
         deferred_album_snapshots: Vec::new(),
+        retry_exclusions: Default::default(),
         outcome: repair_outcome,
         sync_token: None,
         stats: metadata_capture_repair.stats,

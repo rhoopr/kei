@@ -17,7 +17,7 @@ use crate::state::types::legacy_added_date_matches;
 use crate::state::{AssetVerificationState, VersionSizeKey};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct PendingRetryTarget {
+pub(crate) struct PendingRetryTarget {
     pub(super) library: Arc<str>,
     pub(super) asset_id: Arc<str>,
     pub(super) version_size: VersionSizeKey,
@@ -720,11 +720,29 @@ async fn revalidate_policy_excluded_assets(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) async fn build_pending_retry_download_tasks(
     passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
     run_mode: super::DownloadRunMode,
     shutdown_token: CancellationToken,
+) -> Result<PendingRetryPlan> {
+    build_pending_retry_download_tasks_excluding(
+        passes,
+        config,
+        run_mode,
+        shutdown_token,
+        &FxHashSet::default(),
+    )
+    .await
+}
+
+pub(super) async fn build_pending_retry_download_tasks_excluding(
+    passes: &[crate::commands::AlbumPass],
+    config: &DownloadConfig,
+    run_mode: super::DownloadRunMode,
+    shutdown_token: CancellationToken,
+    excluded: &FxHashSet<PendingRetryTarget>,
 ) -> Result<PendingRetryPlan> {
     let Some(db) = &config.state_db else {
         return Ok(PendingRetryPlan::default());
@@ -732,7 +750,12 @@ pub(super) async fn build_pending_retry_download_tasks(
 
     revalidate_policy_excluded_assets(passes, config, &shutdown_token).await?;
 
-    let pending = db.get_pending().await?;
+    let pending: Vec<_> = db
+        .get_pending()
+        .await?
+        .into_iter()
+        .filter(|record| !excluded.contains(&PendingRetryTarget::from_record(record)))
+        .collect();
     let mut pending_targets: FxHashSet<PendingRetryTarget> = pending
         .iter()
         .filter(|record| record.library.as_ref() == config.library.as_ref())

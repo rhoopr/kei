@@ -11,7 +11,7 @@ use crate::download::metadata_rewrite::CaptureTimestampRepair;
 use crate::download::pipeline::{
     AUTH_ERROR_THRESHOLD, MetadataFlags, PassConfig, run_download_pass,
 };
-use crate::download::retry::{PendingRetryPlan, build_pending_retry_download_tasks};
+use crate::download::retry::{PendingRetryPlan, build_pending_retry_download_tasks_excluding};
 use crate::icloud::photos::ProviderRecordId;
 
 use super::config::DownloadConfig;
@@ -27,13 +27,15 @@ async fn run_targeted_recovery_pass(
     config: &Arc<DownloadConfig>,
     controls: DownloadControls,
     shutdown_token: CancellationToken,
+    excluded: &rustc_hash::FxHashSet<crate::download::retry::PendingRetryTarget>,
 ) -> Result<SyncResult> {
     let started = Instant::now();
-    let plan = build_pending_retry_download_tasks(
+    let plan = build_pending_retry_download_tasks_excluding(
         passes,
         config,
         controls.run_mode,
         shutdown_token.clone(),
+        excluded,
     )
     .await?;
     let PendingRetryPlan {
@@ -162,6 +164,7 @@ async fn run_targeted_recovery_pass(
     checkpoint.project(&mut stats);
     Ok(SyncResult {
         deferred_album_snapshots: Vec::new(),
+        retry_exclusions: Default::default(),
         outcome,
         sync_token: None,
         stats,
@@ -198,6 +201,7 @@ fn pending_retry_no_download_result(
     checkpoint.project(&mut stats);
     SyncResult {
         deferred_album_snapshots: Vec::new(),
+        retry_exclusions: Default::default(),
         outcome,
         sync_token: None,
         stats,
@@ -215,8 +219,24 @@ pub(super) async fn append_targeted_recovery_to_sync_result(
     shutdown_token: CancellationToken,
     mut sync_result: SyncResult,
 ) -> Result<SyncResult> {
-    if !matches!(sync_result.outcome, DownloadOutcome::Success)
+    // Partial transfer failure can coexist with independent pending progress.
+    // Other failures, including publication holds without exact task outcomes,
+    // retain the existing recovery hold. Never infer coverage from row status.
+    let recovery_safe = match sync_result.outcome {
+        DownloadOutcome::Success => true,
+        DownloadOutcome::PartialFailure { failed_count } => {
+            failed_count > 0
+                && failed_count == sync_result.retry_exclusions.len()
+                && !sync_result.checkpoint.sync_token_blocked
+                && !sync_result.checkpoint.identity_incomplete
+                && !sync_result.checkpoint.enumeration_incomplete
+                && sync_result.checkpoint.enumeration_errors == 0
+        }
+        DownloadOutcome::SessionExpired { .. } => false,
+    };
+    if !recovery_safe
         || sync_result.checkpoint.interrupted
+        || sync_result.checkpoint.state_write_failures > 0
         || shutdown_token.is_cancelled()
     {
         return Ok(sync_result);
@@ -228,6 +248,7 @@ pub(super) async fn append_targeted_recovery_to_sync_result(
         config,
         controls,
         shutdown_token.clone(),
+        &sync_result.retry_exclusions,
     )
     .await
     {

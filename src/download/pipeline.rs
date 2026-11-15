@@ -31,7 +31,9 @@ pub(super) use adoption::{
     recover_current_pending_publication, state_confirmed_current_path_exists,
     validate_enumerated_reserved_pending,
 };
-pub(super) use outcome::{StreamingResult, build_download_outcome, build_download_result};
+#[cfg(test)]
+pub(super) use outcome::build_download_outcome;
+pub(super) use outcome::{StreamingResult, build_download_result};
 pub(super) use pass::{PassConfig, PassResult, run_download_pass};
 #[expect(
     unused_imports,
