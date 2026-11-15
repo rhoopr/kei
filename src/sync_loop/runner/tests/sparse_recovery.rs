@@ -271,7 +271,6 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                 &libraries,
                 &config,
                 Some(db.as_ref()),
-                false,
                 &builder,
                 download::DownloadControls::download_hidden(),
                 &shared_session,

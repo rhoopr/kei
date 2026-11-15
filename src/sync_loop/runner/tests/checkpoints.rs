@@ -133,7 +133,6 @@ async fn run_cycle_recent_exact_inventory_stores_zone_token() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -173,7 +172,6 @@ async fn run_cycle_true_token_unsafe_condition_still_warns() {
 
     let result = run_full_cycle_with_album(
         make_empty_full_album(""),
-        false,
         download::DownloadControls::download_hidden(),
     )
     .await;
@@ -228,7 +226,6 @@ async fn contract_malformed_required_asset_fields_block_checkpoint() {
         &[&lib_state],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -277,7 +274,6 @@ async fn watch_recent_exact_first_cycle_seeds_incremental_token() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -294,7 +290,6 @@ async fn watch_recent_exact_first_cycle_seeds_incremental_token() {
         Some("zone-tok-watch".to_owned())
     );
     let next_mode = determine_sync_mode(
-        false,
         1,
         Some(db.as_ref()),
         "sync_token:PrimarySync",
@@ -307,53 +302,49 @@ async fn watch_recent_exact_first_cycle_seeds_incremental_token() {
     );
 }
 
-/// Retry work is rehydrated independently from source enumeration, so a
-/// stored provider checkpoint remains usable during `--retry-failed`.
+/// Recovery work is independent from source enumeration.
 #[tokio::test]
-async fn determine_sync_mode_retry_failed_with_token_returns_incremental() {
+async fn determine_sync_mode_with_pending_failure_keeps_stored_token() {
     let db = make_state_db();
     let sync_token_key = "sync_token:PrimarySync";
-    // Pre-populate a stored token so we can verify it is ignored.
+    db.upsert_seen(&crate::test_helpers::TestAssetRecord::new("failed").build())
+        .await
+        .unwrap();
+    db.mark_failed("PrimarySync", "failed", "original", "transfer failed")
+        .await
+        .unwrap();
     db.set_metadata(sync_token_key, "stored-token-abc")
         .await
         .expect("set token");
 
-    let mode = determine_sync_mode(
-        true, // is_retry_failed
-        1,
-        Some(db.as_ref()),
-        sync_token_key,
-        "PrimarySync",
-    )
-    .await;
+    let mode = determine_sync_mode(1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
 
     assert!(
         matches!(mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "stored-token-abc"),
-        "retry-failed should keep source tracking incremental, got {mode:?}"
+        "pending failure should keep source tracking incremental, got {mode:?}"
     );
 }
 
-/// Retry-failed must neither consume nor clear the stored provider token.
+/// Mode selection must neither consume nor clear the stored provider token.
 #[tokio::test]
-async fn determine_sync_mode_retry_failed_does_not_consume_or_clear_stored_token() {
+async fn determine_sync_mode_does_not_consume_or_clear_stored_token() {
     let db = make_state_db();
     let sync_token_key = "sync_token:PrimarySync";
     db.set_metadata(sync_token_key, "stored-token-abc")
         .await
         .expect("set token");
 
-    let retry_mode =
-        determine_sync_mode(true, 1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
+    let retry_mode = determine_sync_mode(1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
     assert!(
         matches!(retry_mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "stored-token-abc"),
-        "retry-failed should use the stored token, got {retry_mode:?}"
+        "mode selection should use the stored token, got {retry_mode:?}"
     );
 
     let normal_mode =
-        determine_sync_mode(false, 1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
+        determine_sync_mode(1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
     assert!(
         matches!(normal_mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "stored-token-abc"),
-        "normal sync should still use the stored token after retry-failed, got {normal_mode:?}"
+        "repeated mode selection should still use the stored token, got {normal_mode:?}"
     );
 }
 
@@ -366,8 +357,7 @@ async fn determine_sync_mode_empty_stored_token_falls_back_to_full() {
         .await
         .expect("set empty token");
 
-    let mode =
-        determine_sync_mode(false, 1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
+    let mode = determine_sync_mode(1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
 
     assert!(
         matches!(mode, download::SyncMode::Full),
@@ -380,8 +370,7 @@ async fn determine_sync_mode_empty_stored_token_falls_back_to_full() {
     db.set_metadata(sync_token_key, "real-token")
         .await
         .expect("set real token");
-    let mode =
-        determine_sync_mode(false, 1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
+    let mode = determine_sync_mode(1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
     assert!(
         matches!(mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "real-token"),
         "non-empty token must yield Incremental with that token, got {mode:?}"
@@ -436,8 +425,7 @@ async fn determine_sync_mode_state_db_error_falls_back_to_full() {
 
     let db = FailingDb;
 
-    let mode =
-        determine_sync_mode(false, 1, Some(&db), "sync_token:PrimarySync", "PrimarySync").await;
+    let mode = determine_sync_mode(1, Some(&db), "sync_token:PrimarySync", "PrimarySync").await;
 
     assert!(
         matches!(mode, download::SyncMode::Full),
@@ -451,7 +439,6 @@ async fn determine_sync_mode_state_db_error_falls_back_to_full() {
 #[tokio::test]
 async fn determine_sync_mode_no_state_db_returns_full() {
     let mode = determine_sync_mode::<state::SqliteStateDb>(
-        false,
         1,
         None,
         "sync_token:PrimarySync",
@@ -597,7 +584,6 @@ async fn run_cycle_clean_zone_advances_despite_other_stale_plan() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -655,7 +641,6 @@ async fn run_cycle_stale_plan_blocks_database_precheck_token() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -706,7 +691,6 @@ async fn run_cycle_zone_token_write_failure_blocks_database_precheck_token() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -799,7 +783,6 @@ async fn run_cycle_published_file_state_write_failure_blocks_token() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -925,7 +908,6 @@ async fn run_cycle_album_membership_failure_preserves_and_replays_checkpoint() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -970,7 +952,6 @@ async fn run_cycle_album_membership_failure_preserves_and_replays_checkpoint() {
             &states,
             &config,
             Some(db.as_ref()),
-            false,
             &build_download_config,
             download::DownloadControls::download_hidden(),
             &shared_session,
@@ -1058,7 +1039,6 @@ async fn run_cycle_durable_expired_url_failure_advances_zone_checkpoint() {
         &[&lib_state],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1134,7 +1114,6 @@ async fn run_cycle_expired_url_without_durable_retry_preserves_zone_checkpoint()
         &[&lib_state],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1205,7 +1184,6 @@ async fn run_cycle_durable_retry_survives_checkpoint_commit_failure() {
         &[&lib_state],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1262,7 +1240,6 @@ async fn run_cycle_failed_token_repair_preserves_prior_sqlite_checkpoint() {
         &[&lib_state],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1332,7 +1309,6 @@ async fn run_cycle_legacy_pending_delete_self_heals_without_full_inventory() {
         &[&lib_state],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1387,7 +1363,6 @@ async fn run_cycle_multi_zone_status_preserves_an_earlier_checkpoint_hold() {
         &[&held, &advanced],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1456,7 +1431,6 @@ async fn run_cycle_interrupted_incremental_download_blocks_sync_token_advance() 
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1535,7 +1509,6 @@ async fn checkpoint_pilot_holds_preserve_file_backed_state_across_cycles() {
                 &[&library],
                 &config,
                 Some(db.as_ref()),
-                false,
                 &build_download_config,
                 controls,
                 &shared_session,
@@ -1616,7 +1589,6 @@ async fn full_checkpoint_pilot_advances_with_durable_transfer_failure() {
         &[&library],
         &config,
         Some(db.as_ref()),
-        false,
         &builder,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1779,7 +1751,6 @@ async fn run_cycle_rejected_zone_page_preserves_cursor_debt_and_media_across_res
             &[&library],
             &config,
             Some(db.as_ref()),
-            false,
             &builder,
             download::DownloadControls::download_hidden(),
             &shared_session,
@@ -2039,7 +2010,6 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
                 &[&library],
                 &config,
                 Some(db.as_ref()),
-                false,
                 &builder,
                 download::DownloadControls::download_hidden(),
                 &shared_session,
@@ -2298,7 +2268,6 @@ async fn account_adoption_reopens_owned_state_and_runs_two_production_quiet_cycl
             &[&library],
             &config,
             Some(db.as_ref()),
-            false,
             &builder,
             download::DownloadControls::download_hidden(),
             &shared,
@@ -2446,7 +2415,6 @@ async fn run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_res
             &[&library],
             &config,
             Some(db.as_ref()),
-            false,
             &builder,
             download::DownloadControls::download_hidden(),
             &shared_session,

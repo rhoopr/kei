@@ -382,7 +382,6 @@ async fn try_cycle_options(
         &[&library],
         &config,
         Some(db.as_ref()),
-        false,
         &build,
         options.controls,
         &session,

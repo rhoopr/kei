@@ -182,7 +182,6 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
                 &[&primary],
                 &config,
                 Some(db.as_ref()),
-                false,
                 &builder,
                 download::DownloadControls::download_hidden(),
                 &shared_session,

@@ -598,13 +598,11 @@ fn should_warn_zero_assets(
     sync_result: &download::SyncResult,
     library_completed_without_errors: bool,
     run_mode: download::DownloadRunMode,
-    is_retry_failed: bool,
     lib_state: &LibraryState,
 ) -> bool {
     sync_result.full_enumeration_ran
         && library_completed_without_errors
         && run_mode.downloads_files()
-        && !is_retry_failed
         && sync_result.stats.assets_seen == 0
         && has_active_passes(lib_state)
 }
@@ -923,7 +921,6 @@ pub(crate) async fn run_cycle(
     library_states: &[&LibraryState],
     config: &config::Config,
     state_db: Option<&dyn download::DownloadStore>,
-    is_retry_failed: bool,
     build_download_config: &BuildDownloadConfigFn<'_>,
     download_controls: download::DownloadControls,
     shared_session: &auth::SharedSession,
@@ -1363,7 +1360,6 @@ pub(crate) async fn run_cycle(
             }
         } else {
             determine_sync_mode_decision(
-                is_retry_failed,
                 library_states.len(),
                 state_db,
                 &lib_state.sync_token_key,
@@ -1435,7 +1431,7 @@ pub(crate) async fn run_cycle(
         // Only an unrestricted current full-library selection can admit an exact
         // sparse target without inventing album/rank membership.
         let mut sparse_targets = Vec::new();
-        if download_controls.run_mode.downloads_files() && !is_retry_failed {
+        if download_controls.run_mode.downloads_files() {
             for target in library_states.iter().copied().filter(|target| {
                 target.zone_name != lib_state.zone_name
                     && !target.plan_is_stale
@@ -1577,7 +1573,8 @@ pub(crate) async fn run_cycle(
         };
         if (matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed)
             || unresolved_identity
-            || ((indexing_replay_pending || indexing_materialization_pending) && !is_retry_failed))
+            || indexing_replay_pending
+            || indexing_materialization_pending)
             && indexing_finished
             && !indexing_reconciliation
             && sync_result.full_enumeration_ran
@@ -1758,7 +1755,6 @@ pub(crate) async fn run_cycle(
             && checkpoint_transition_state_safe
             && !lib_state.plan_is_stale
             && !lib_state.plan_needs_refresh
-            && !is_retry_failed
             && download_controls.run_mode.downloads_files();
         if path_reconciliation_requires_smart_query {
             // Historical smart membership cannot certify the current selection.
@@ -1771,7 +1767,6 @@ pub(crate) async fn run_cycle(
             &sync_result,
             library_completed_without_errors,
             download_controls.run_mode,
-            is_retry_failed,
             lib_state,
         ) {
             tracing::warn!(
@@ -1788,7 +1783,6 @@ pub(crate) async fn run_cycle(
             && !sync_result.checkpoint.enumeration_incomplete
             && sync_result.checkpoint.state_write_failures == 0
             && !cycle_has_stale_plan
-            && !is_retry_failed
             && download_controls.run_mode.downloads_files()
             && let Some(inventory) = inventory.as_ref()
             && let Some(db) = state_db
@@ -1856,27 +1850,14 @@ pub(crate) async fn run_cycle(
             db_sync_token_advance_safe = false;
             path_reconciliation_complete = false;
         }
-        // Retry-only work cannot discharge either phase: new assets may be
-        // skipped before they acquire durable retry rows. Keep their cursor.
-        let recovery_retry_only = (indexing_reconciliation
-            || indexing_replay_pending
-            || indexing_materialization_pending)
-            && is_retry_failed;
-        if recovery_retry_only
-            || (indexing_reconciliation
-                && (!sync_result.full_enumeration_ran
-                    || !library_completed_without_errors
-                    || sync_result.stats.failed > 0
-                    || sync_result.stats.exif_failures > 0))
+        if indexing_reconciliation
+            && (!sync_result.full_enumeration_ran
+                || !library_completed_without_errors
+                || sync_result.stats.failed > 0
+                || sync_result.stats.exif_failures > 0)
         {
             sync_result.checkpoint.sync_token_blocked = true;
             sync_result.checkpoint.project(&mut sync_result.stats);
-            if recovery_retry_only && !indexing_reconciliation {
-                sync_result.stats.sync_token_blocked_reason = Some("indexing_replay_required");
-                sync_result.stats.sync_token_blocked_source = Some("kei");
-                sync_result.stats.sync_token_blocked_explanation =
-                    Some("retry-only processing cannot discharge retained-cursor replay");
-            }
         }
 
         // An inventory-only pass queued nothing. Unlike ordinary durable
@@ -1937,8 +1918,7 @@ pub(crate) async fn run_cycle(
             if matches!(
                 checkpoint_decision,
                 SourceCheckpointDecision::Advance { .. }
-            ) && !is_retry_failed
-                && !indexing_hold_required
+            ) && !indexing_hold_required
                 && indexing_finished
                 && sync_result.full_enumeration_ran
                 && library_completed_without_errors
@@ -2497,7 +2477,6 @@ where
 
 /// Determine the sync mode for a library: full enumeration or incremental.
 pub(crate) async fn determine_sync_mode_decision<D>(
-    _is_retry_failed: bool,
     _library_count: usize,
     state_db: Option<&D>,
     sync_token_key: &str,
@@ -2552,7 +2531,6 @@ where
 
 #[cfg(test)]
 pub(crate) async fn determine_sync_mode<D>(
-    is_retry_failed: bool,
     library_count: usize,
     state_db: Option<&D>,
     sync_token_key: &str,
@@ -2561,15 +2539,9 @@ pub(crate) async fn determine_sync_mode<D>(
 where
     D: state::SyncTokenStore + ?Sized,
 {
-    determine_sync_mode_decision(
-        is_retry_failed,
-        library_count,
-        state_db,
-        sync_token_key,
-        zone_name,
-    )
-    .await
-    .mode
+    determine_sync_mode_decision(library_count, state_db, sync_token_key, zone_name)
+        .await
+        .mode
 }
 
 /// Keep strict-policy hashes byte-compatible with existing preservation proofs.
@@ -2731,7 +2703,6 @@ mod tests {
             &sync_result,
             true,
             download::DownloadRunMode::Download,
-            false,
             &make_library_state(false),
         ));
     }
@@ -2753,7 +2724,6 @@ mod tests {
             &sync_result,
             true,
             download::DownloadRunMode::Download,
-            false,
             &make_library_state(true),
         ));
     }
@@ -3038,8 +3008,7 @@ mod tests {
             .expect("set token");
 
         for cycle in 1..=2 {
-            let mode =
-                determine_sync_mode(false, 1, Some(&db), &sync_token_key, "PrimarySync").await;
+            let mode = determine_sync_mode(1, Some(&db), &sync_token_key, "PrimarySync").await;
             assert!(
                 matches!(mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "stored-token-abc"),
                 "normal sync cycle {cycle} should use the stored token, got {mode:?}"
@@ -3074,7 +3043,7 @@ mod tests {
             .expect("set token");
 
         let retry =
-            determine_sync_mode_decision(true, 1, Some(&db), &sync_token_key, "PrimarySync").await;
+            determine_sync_mode_decision(1, Some(&db), &sync_token_key, "PrimarySync").await;
         assert!(matches!(
             retry.mode,
             download::SyncMode::Incremental { ref zone_sync_token }
@@ -3086,7 +3055,7 @@ mod tests {
             .await
             .expect("clear token");
         let no_token =
-            determine_sync_mode_decision(false, 1, Some(&db), &sync_token_key, "PrimarySync").await;
+            determine_sync_mode_decision(1, Some(&db), &sync_token_key, "PrimarySync").await;
         assert!(matches!(no_token.mode, download::SyncMode::Full));
         assert_eq!(
             no_token.full_enumeration_reason,

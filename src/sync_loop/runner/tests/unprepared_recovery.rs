@@ -404,7 +404,6 @@ async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_
                 &[&primary],
                 config,
                 Some(db.as_ref()),
-                false,
                 &builder,
                 download::DownloadControls::download_hidden(),
                 shared_session,

@@ -29,24 +29,12 @@ fn make_one_photo_full_album_for_zone(
     )
 }
 
-async fn run_empty_full_cycle(is_retry_failed: bool) -> CycleResult {
-    run_empty_full_cycle_with_controls(
-        is_retry_failed,
-        download::DownloadControls::download_hidden(),
-    )
-    .await
+async fn run_empty_full_cycle() -> CycleResult {
+    run_empty_full_cycle_with_controls(download::DownloadControls::download_hidden()).await
 }
 
-async fn run_empty_full_cycle_with_controls(
-    is_retry_failed: bool,
-    controls: download::DownloadControls,
-) -> CycleResult {
-    run_full_cycle_with_album(
-        make_empty_full_album("zone-tok-empty"),
-        is_retry_failed,
-        controls,
-    )
-    .await
+async fn run_empty_full_cycle_with_controls(controls: download::DownloadControls) -> CycleResult {
+    run_full_cycle_with_album(make_empty_full_album("zone-tok-empty"), controls).await
 }
 
 async fn run_one_photo_full_cycle_with_controls(
@@ -54,7 +42,6 @@ async fn run_one_photo_full_cycle_with_controls(
 ) -> CycleResult {
     run_full_cycle_with_album(
         make_one_photo_full_album_for_zone("PrimarySync", "zone-tok-one"),
-        false,
         controls,
     )
     .await
@@ -99,7 +86,6 @@ async fn run_cycle_recent_exact_multiple_libraries_advance_each_zone() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -162,7 +148,6 @@ async fn run_cycle_destination_replaced_after_enumeration_reports_partial_failur
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -223,7 +208,7 @@ async fn run_cycle_destination_replaced_after_enumeration_reports_partial_failur
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn run_cycle_full_zero_assets_warns_once() {
-    let result = run_empty_full_cycle(false).await;
+    let result = run_empty_full_cycle().await;
 
     assert_eq!(result.failed_count, 0);
     assert_eq!(result.stats.assets_seen, 0);
@@ -247,8 +232,9 @@ async fn run_cycle_full_zero_assets_warns_once() {
 
 #[tokio::test]
 #[tracing_test::traced_test]
-async fn run_cycle_retry_failed_zero_assets_does_not_warn() {
-    let result = run_empty_full_cycle(true).await;
+async fn run_cycle_dry_run_zero_assets_does_not_warn() {
+    let result =
+        run_empty_full_cycle_with_controls(download::DownloadControls::dry_run_hidden()).await;
 
     assert_eq!(result.failed_count, 0);
     assert_eq!(result.stats.assets_seen, 0);
@@ -258,7 +244,7 @@ async fn run_cycle_retry_failed_zero_assets_does_not_warn() {
     );
     assert!(
         !logs_contain(ZERO_ASSET_WARNING_PREFIX),
-        "retry-failed no-op cycles must stay quiet"
+        "read-only previews must not emit the writable-sync warning"
     );
 }
 
@@ -292,7 +278,6 @@ async fn run_cycle_incremental_fallback_zero_assets_warns() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -345,7 +330,6 @@ async fn run_cycle_warns_for_empty_library_when_another_library_has_assets() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -409,7 +393,7 @@ async fn offline_replay_full_pass_reaches_sync_loop_planning_boundary() {
     );
 
     let result =
-        run_full_cycle_with_album(album, false, download::DownloadControls::dry_run_hidden()).await;
+        run_full_cycle_with_album(album, download::DownloadControls::dry_run_hidden()).await;
 
     assert_eq!(result.failed_count, 0);
     assert_eq!(

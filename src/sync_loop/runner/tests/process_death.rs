@@ -249,7 +249,6 @@ async fn cycle(root: &Path, url: &str, quiet: bool) -> (usize, usize) {
         &[&library],
         &config,
         Some(db.as_ref()),
-        false,
         &build,
         download::DownloadControls::download_hidden(),
         &session,

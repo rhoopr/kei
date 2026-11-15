@@ -633,7 +633,6 @@ async fn smart_reconciliation_lifecycle_with_capture(
                 &states,
                 &config,
                 Some(db.as_ref()),
-                false,
                 &builder,
                 download::DownloadControls::download_hidden(),
                 &session,

@@ -578,7 +578,6 @@ impl Fixture {
                 &libraries,
                 &config,
                 Some(store.as_ref()),
-                false,
                 &builder,
                 download::DownloadControls::download_hidden(),
                 &session,

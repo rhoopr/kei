@@ -201,7 +201,6 @@ async fn run_case(root: &Path, case: &str) {
             &[&lib],
             &config,
             Some(db.as_ref()),
-            false,
             &builder,
             download::DownloadControls::download_hidden(),
             &session,

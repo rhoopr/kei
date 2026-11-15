@@ -250,7 +250,6 @@ async fn mixed_lifecycle(drift: bool, fault: Option<MixedFault>) {
             &[&library],
             &config,
             Some(db.as_ref()),
-            false,
             &builder,
             download::DownloadControls::download_hidden(),
             &shared,
@@ -520,7 +519,6 @@ struct InventoryStep {
     full: bool,
     drift: bool,
     stale: bool,
-    retry: bool,
     mode: download::DownloadRunMode,
     fault: Option<InventoryFault>,
     download_url: Option<String>,
@@ -538,7 +536,6 @@ impl InventoryStep {
             full: true,
             drift: false,
             stale: false,
-            retry: false,
             mode: download::DownloadRunMode::Download,
             fault: None,
             download_url: None,
@@ -704,7 +701,6 @@ async fn inventory_cycle(
         &[&library],
         &config,
         Some(store.as_ref()),
-        step.retry,
         &builder,
         download::DownloadControls::new(step.mode, download::DownloadReporting::hidden()),
         &shared,
@@ -962,8 +958,8 @@ async fn comparable_inventory_four_percent_decline_does_not_warn() {
 #[tokio::test]
 async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
     use crate::config::CreatedDateFilter;
-    // Count-only vetoes were retired; the surviving date vetoes still run.
-    for case in [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12] {
+    // Count-only and retry-only vetoes were retired; date vetoes still run.
+    for case in [0, 1, 2, 3, 4, 6, 7, 8, 9, 11, 12] {
         let root = inventory_root();
         inventory_cycle(root.path(), &InventoryStep::mixed(90, 10)).await;
         let before = inventory_anchors(root.path()).await;
@@ -986,7 +982,6 @@ async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
             }
             8 => step.mode = download::DownloadRunMode::DryRun,
             9 => step.mode = download::DownloadRunMode::PrintFilenames,
-            10 => step.retry = true,
             11 => {
                 step.drift = true;
                 step.fault = Some(InventoryFault::BridgeQuery);

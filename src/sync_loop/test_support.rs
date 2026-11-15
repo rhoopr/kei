@@ -443,7 +443,6 @@ pub(super) fn make_run_cycle_config() -> config::Config {
 
 pub(super) async fn run_full_cycle_with_album(
     album: crate::icloud::photos::PhotoAlbum,
-    is_retry_failed: bool,
     controls: download::DownloadControls,
 ) -> CycleResult {
     let config = make_run_cycle_config();
@@ -461,7 +460,6 @@ pub(super) async fn run_full_cycle_with_album(
         &states,
         &config,
         Some(db.as_ref()),
-        is_retry_failed,
         &build_download_config,
         controls,
         &shared_session,

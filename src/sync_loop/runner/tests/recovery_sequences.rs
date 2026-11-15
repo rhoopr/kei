@@ -183,7 +183,6 @@ async fn run_capture_history(seed: u64, trace: &[Event]) {
             &[&library],
             &config,
             Some(db.as_ref()),
-            false,
             &build,
             download::DownloadControls::download_hidden(),
             &session,

@@ -719,7 +719,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &cycle_library_states,
                 &config,
                 state_db.as_deref(),
-                false,
                 &build_download_config,
                 download_controls,
                 &shared_session,

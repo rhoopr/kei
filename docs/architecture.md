@@ -505,7 +505,7 @@ are retained. Duplicate keys, duplicate or omitted records, provider errors,
 wrong owners, wrong zones and changed child/master relationships cannot confirm
 work. Provider confirmation is an observation, not an atomic provider snapshot.
 
-This slice supports one private library-wide pass with an explicit default owner, without album exclusions, retry-only selection or metadata backfill-only execution. Default `PrimarySync` selection lazily discovers the private `/zones/list` response using the pinned authenticated session. Discovery requires bounded original JSON with unique keys, an explicit zones array, unique zone names, no zone errors and no unsupported continuation. Only a live exact `PrimarySync` entry with a nonblank string owner replaces the constructor's ownerless primary library after that exact selected scope returns a recognized indexing state. `RUNNING` retains provisional readiness and requires durable reconciliation; owner qualification alone never certifies a checkpoint. The complete discovered scope is preserved, including explicit owners other than `_defaultOwner`; lookup and inventory references must still match it. The complete validated private zone descriptors are cached separately from initialized libraries. Primary-only lookup initializes only the selected primary; unrelated private indexing failures do not block it. Private and shared library maps publish only after all requested library initialization succeeds. A failed full-map initialization preserves an already qualified primary and retries initialization using the validated private descriptors. Shared endpoint evidence cannot replace private primary ownership. Missing, deleted, blank or malformed primary owners preserve the ownerless constructor; no owner is inferred from a name. The current-work admission slice still requires `_defaultOwner` and is unchanged.
+This slice supports one private library-wide pass with an explicit default owner, without album exclusions or metadata backfill-only execution. Default `PrimarySync` selection lazily discovers the private `/zones/list` response using the pinned authenticated session. Discovery requires bounded original JSON with unique keys, an explicit zones array, unique zone names, no zone errors and no unsupported continuation. Only a live exact `PrimarySync` entry with a nonblank string owner replaces the constructor's ownerless primary library after that exact selected scope returns a recognized indexing state. `RUNNING` retains provisional readiness and requires durable reconciliation; owner qualification alone never certifies a checkpoint. The complete discovered scope is preserved, including explicit owners other than `_defaultOwner`; lookup and inventory references must still match it. The complete validated private zone descriptors are cached separately from initialized libraries. Primary-only lookup initializes only the selected primary; unrelated private indexing failures do not block it. Private and shared library maps publish only after all requested library initialization succeeds. A failed full-map initialization preserves an already qualified primary and retries initialization using the validated private descriptors. Shared endpoint evidence cannot replace private primary ownership. Missing, deleted, blank or malformed primary owners preserve the ownerless constructor; no owner is inferred from a name. The current-work admission slice still requires `_defaultOwner` and is unchanged.
 Default selection needs only the cached private listing and selected primary's
 indexing success. Normal sync planning and import still request all libraries;
 their existing full-map initialization contract is unchanged.
@@ -616,7 +616,7 @@ Activation requires an authenticated account-owned database and one exact
 private provider scope with an explicit default owner. Every selected pass must
 be a supported private named album, Unfiled query or provider-defined smart query
 using the same concrete store and scope. Shared, cross-zone and unsupported
-profiles keep the whole existing dispatcher. Retry-only, metadata backfill, read-only execution
+profiles keep the whole existing dispatcher. Metadata backfill, read-only execution
 and capture-local timestamp replacement keep their existing owners. Ordinary
 explicit metadata refresh with preservation can use active destinations.
 
@@ -732,9 +732,8 @@ collection and album plans so omitted albums can reappear after indexing.
 
 A retained hold forces full reconciliation after `FINISHED`. A scope refreshed
 while readiness is `RUNNING` remains stale even if the cycle's later probe says
-`FINISHED`; the next wake rebuilds it after readiness. Retry-only inventory can
-download known failed work but cannot discharge recovery of previously omitted
-assets. The held full-query path continues to suppress deletion-capable
+`FINISHED`; the next wake rebuilds it after readiness. Ordinary inventory recovers
+failed work and discovers previously omitted assets. The held full-query path continues to suppress deletion-capable
 maintenance, album snapshot completion, and the retained-token bridge even when
 its initial probe reports `FINISHED`.
 
@@ -748,7 +747,7 @@ the watch database shortcut across reopen. Only normal checkpoint promotion
 removes replay debt, including aggregate config-drift promotion. Rejection of
 the retained cursor preserves the existing checkpoint gates.
 
-Bounded coverage, interruption, retry-only selection, failed transfers or
+Bounded coverage, interruption, failed transfers or
 metadata, stale scope, missing proof, state-write failure, and readiness
 regression cannot qualify an inventory or advance its cursor. Provisional
 inventory cannot replace a comparable inventory anchor.
@@ -767,7 +766,7 @@ publication owners before retained-cursor replay. It bypasses quiet watch
 shortcuts and refreshes plans across restarts. An empty change feed therefore
 cannot omit assets that inventory-only qualification never queued.
 
-Managed materialization debt survives retry-only/bounded runs, failed transfers,
+Managed materialization debt survives bounded runs, failed transfers,
 metadata failure, interruption, regression and checkpoint-write failure. When an
 old cursor exists, both full publication and its incremental bridge must qualify
 before one checkpoint transaction removes materialization and replay debt.
@@ -1398,6 +1397,8 @@ For captured selection generations, `verified_selection_paths` returns the retai
 Pending recovery and collected incremental execution share `url_refresh::refresh_expired_download_pass` for one exact-task refresh, execution and result merge. Their cycle-specific failure gates run before calling it. The shared owner carries prior authentication failures and fresh URL timestamps into the retry, starts a separate rate-limit counter and merges only the expired candidate results. Provider authentication failures return separately to checkpoint reporting.
 
 The CLI rejects the retired `--retry-failed` flag before configuration, authentication or state startup. Ordinary sync owns automatic retry. The runner no longer resets failed rows or exits early through a separate retry-only startup path; regular dispatch retains its existing pending-work preparation.
+
+The cycle owner has no retry-only argument or alternate eligibility gates. Inventory qualification, smart-folder path reconciliation, sparse-target preparation and zero-asset warnings all use ordinary sync rules. Pending failures do not reset or consume the provider cursor. Indexing qualification, materialization and retained-cursor replay still require their existing evidence before checkpoint promotion.
 
 Download configuration no longer has a retry-only selection mode. Context loading and the producer do not load or filter against a known-ID set. Current selection can therefore recover pending destinations while discovering new assets. Historical skip diagnostics remain readable, and the inventory fingerprint retains `"retry_only": false` for ordinary-sync compatibility.
 
