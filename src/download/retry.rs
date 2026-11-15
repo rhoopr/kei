@@ -400,20 +400,8 @@ impl PendingRetryPlanning<'_> {
                     .await?;
             }
             for task in &mut retry_tasks {
-                if !self
-                    .task_planner
-                    .cross_parent_retry_destinations(
-                        &task.library,
-                        &task.asset_id,
-                        task.version_size,
-                        &task.checksum,
-                        task.size,
-                    )?
-                    .is_empty()
-                {
-                    task.pending_cross_parent_root =
-                        Some(Arc::new(pass_config.directory.to_path_buf()));
-                }
+                self.task_planner
+                    .bind_pending_destination_proof(task, &pass_config.directory)?;
             }
             let queued_targets: Vec<PendingRetryTarget> = retry_tasks
                 .iter()

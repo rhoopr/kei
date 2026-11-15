@@ -155,18 +155,8 @@ pub(in crate::download) fn mark_reserved_pending_task(
         .get(task.library.as_ref())
         .and_then(|assets| assets.get(task.asset_id.as_ref()))
         .is_some_and(|versions| versions.contains(task.version_size.as_str()));
-    if pending
-        && !planner
-            .cross_parent_retry_destinations(
-                &task.library,
-                &task.asset_id,
-                task.version_size,
-                &task.checksum,
-                task.size,
-            )?
-            .is_empty()
-    {
-        task.pending_cross_parent_root = Some(Arc::new(config.directory.to_path_buf()));
+    if pending {
+        planner.bind_pending_destination_proof(task, &config.directory)?;
     }
     Ok(())
 }

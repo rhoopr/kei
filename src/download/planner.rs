@@ -746,6 +746,28 @@ impl TaskPlanner {
             )
     }
 
+    /// Carry cross-directory finalization proof only for a caller-confirmed
+    /// pending task whose current content has saved destination reservations.
+    pub(super) fn bind_pending_destination_proof(
+        &self,
+        task: &mut DownloadTask,
+        root: &Path,
+    ) -> Result<()> {
+        if !self
+            .cross_parent_retry_destinations(
+                &task.library,
+                &task.asset_id,
+                task.version_size,
+                &task.checksum,
+                task.size,
+            )?
+            .is_empty()
+        {
+            task.pending_cross_parent_root = Some(Arc::new(root.to_path_buf()));
+        }
+        Ok(())
+    }
+
     /// Inspect every saved alias before a pass can fall back to size-only adoption.
     pub(super) fn cross_parent_retry_destinations(
         &self,
