@@ -42,7 +42,7 @@ impl PendingRetryTarget {
 }
 
 #[derive(Debug)]
-struct PendingRetryEvidence {
+pub(super) struct PendingRetryEvidence {
     added_at: Option<chrono::DateTime<chrono::Utc>>,
     checksum: Arc<str>,
     filename: Arc<str>,
@@ -69,7 +69,7 @@ impl PendingRetryEvidence {
         }
     }
 
-    async fn truncated_repair_fingerprint(
+    pub(super) async fn truncated_repair_fingerprint(
         &self,
         enabled: bool,
     ) -> Result<Option<file::ExistingFileFingerprint>> {
@@ -115,11 +115,11 @@ impl PendingRetryEvidence {
         Ok(Some(fingerprint))
     }
 
-    fn matches_provider_version(&self, task: &DownloadTask) -> bool {
+    pub(super) fn matches_provider_version(&self, task: &DownloadTask) -> bool {
         self.checksum.as_ref() == task.checksum.as_ref() && self.size_bytes == task.size
     }
 
-    fn local_path_under<'a>(&'a self, directory: &Path) -> Option<&'a Path> {
+    pub(super) fn local_path_under<'a>(&'a self, directory: &Path) -> Option<&'a Path> {
         self.local_file
             .as_ref()
             .map(|file| file.path.as_path())
@@ -374,62 +374,21 @@ impl PendingRetryPlanning<'_> {
                 );
             }
             let mut retry_tasks = Vec::with_capacity(plan.tasks.len());
-            for mut task in plan.tasks.into_iter().filter(|task| {
+            for task in plan.tasks.into_iter().filter(|task| {
                 !state_write_failed_targets.contains(&PendingRetryTarget::from_task(task))
             }) {
                 let target = PendingRetryTarget::from_task(&task);
-                if let Some(evidence) = self.pending_evidence.get(&target)
-                    && let Some(local_path) = evidence.local_path_under(&pass_config.directory)
-                    && (!self.task_planner.has_durable_destination(&task)
-                        || task.download_path == local_path)
-                    && self.task_planner.retry_path_allowed(
-                        &task.library,
-                        &task.asset_id,
-                        task.version_size,
-                        &task.checksum,
-                        task.size,
-                        local_path,
+                if let Some(task) = self
+                    .task_planner
+                    .retain_pending_destination(
+                        task,
+                        pass_config,
+                        self.pending_evidence.get(&target),
                     )
+                    .await?
                 {
-                    if evidence.matches_provider_version(&task)
-                        && let Some(fingerprint) = evidence
-                            .truncated_repair_fingerprint(pass_config.repair_truncated)
-                            .await?
-                    {
-                        if !self
-                            .task_planner
-                            .claim_recorded_repair_path(local_path, &task)
-                            .await
-                        {
-                            tracing::warn!(
-                                asset_id = %task.asset_id,
-                                version_size = %task.version_size.as_str(),
-                                path = %local_path.display(),
-                                "Could not reserve the recorded truncated path; retaining pending work"
-                            );
-                            continue;
-                        }
-                        task.download_path = local_path.to_path_buf();
-                        task.replacement_fingerprint = Some(Arc::new(fingerprint));
-                    } else {
-                        let Some(retry_path) = self
-                            .task_planner
-                            .resolve_recorded_retry_path(local_path, &task)
-                            .await
-                        else {
-                            tracing::warn!(
-                                asset_id = %task.asset_id,
-                                version_size = %task.version_size.as_str(),
-                                path = %local_path.display(),
-                                "Could not choose a safe sibling for the recorded retry path; retaining pending work"
-                            );
-                            continue;
-                        };
-                        task.download_path = retry_path;
-                    }
+                    retry_tasks.push(task);
                 }
-                self.task_planner.retain_retry_claim(&task)?;
-                retry_tasks.push(task);
             }
             retry_tasks.retain(|task| {
                 self.pending_targets

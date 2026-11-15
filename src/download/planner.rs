@@ -1161,7 +1161,62 @@ impl TaskPlanner {
         })
     }
 
-    pub(super) fn retain_retry_claim(&mut self, task: &DownloadTask) -> Result<()> {
+    /// Choose and claim a pending task's destination in the same owner as fresh
+    /// planning. A refused path leaves its durable retry target unresolved.
+    #[must_use = "Only an accepted destination may be queued for retry"]
+    pub(super) async fn retain_pending_destination(
+        &mut self,
+        mut task: DownloadTask,
+        config: &DownloadConfig,
+        evidence: Option<&super::retry::PendingRetryEvidence>,
+    ) -> Result<Option<DownloadTask>> {
+        if let Some(evidence) = evidence
+            && let Some(local_path) = evidence.local_path_under(&config.directory)
+            && (!self.has_durable_destination(&task) || task.download_path == local_path)
+            && self.retry_path_allowed(
+                &task.library,
+                &task.asset_id,
+                task.version_size,
+                &task.checksum,
+                task.size,
+                local_path,
+            )
+        {
+            if evidence.matches_provider_version(&task)
+                && let Some(fingerprint) = evidence
+                    .truncated_repair_fingerprint(config.repair_truncated)
+                    .await?
+            {
+                if !self.claim_recorded_repair_path(local_path, &task).await {
+                    tracing::warn!(
+                        asset_id = %task.asset_id,
+                        version_size = %task.version_size.as_str(),
+                        path = %local_path.display(),
+                        "Could not reserve the recorded truncated path; retaining pending work"
+                    );
+                    return Ok(None);
+                }
+                task.download_path = local_path.to_path_buf();
+                task.replacement_fingerprint = Some(Arc::new(fingerprint));
+            } else {
+                let Some(retry_path) = self.resolve_recorded_retry_path(local_path, &task).await
+                else {
+                    tracing::warn!(
+                        asset_id = %task.asset_id,
+                        version_size = %task.version_size.as_str(),
+                        path = %local_path.display(),
+                        "Could not choose a safe sibling for the recorded retry path; retaining pending work"
+                    );
+                    return Ok(None);
+                };
+                task.download_path = retry_path;
+            }
+        }
+        self.retain_retry_claim(&task)?;
+        Ok(Some(task))
+    }
+
+    fn retain_retry_claim(&mut self, task: &DownloadTask) -> Result<()> {
         if !matches!(self.path_mode, PathPlanningMode::Download) {
             self.add_reconciliation_claim(
                 ReconciliationOwner {
@@ -1201,7 +1256,7 @@ impl TaskPlanner {
         true
     }
 
-    pub(super) async fn resolve_recorded_retry_path(
+    async fn resolve_recorded_retry_path(
         &mut self,
         recorded_path: &Path,
         task: &DownloadTask,
