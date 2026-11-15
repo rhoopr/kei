@@ -335,9 +335,9 @@ fn domain_invalid_rejected() {
 }
 
 #[test]
-fn dry_run_and_retry_failed_conflict() {
+fn dry_run_does_not_bypass_retired_retry_failed_refusal() {
     let dir = tempfile::tempdir().unwrap();
-    // clap-level conflicts_with should reject this
+    // Refuse during parsing before state or authentication startup.
     clean_cmd()
         .env("KEI_DATA_DIR", dir.path())
         .args(["sync", "--dry-run", "--retry-failed"])

@@ -238,6 +238,45 @@ fn command(root: &Path, account: &Account, args: &[&str]) -> std::process::Outpu
         .unwrap()
 }
 
+async fn migration_command(root: &Path, account: &Account, args: &[&str]) {
+    if args != ["service", "run"] {
+        success(&command(root, account, args));
+        return;
+    }
+    // Ordinary service execution now reaches watch mode. Stop only after its
+    // first cycle, retaining the real startup/migration and reopen coverage.
+    let log = root.join("migration-service.log");
+    let mut child = QuietServiceChild(
+        std::process::Command::new(assert_cmd::cargo::cargo_bin!("kei"))
+            .env_clear()
+            .envs(std::env::var_os("SystemRoot").map(|value| ("SystemRoot", value)))
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", root)
+            .env("KEI_DATA_DIR", root)
+            .env("ICLOUD_USERNAME", account.username)
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .args(["--config", account.config.to_str().unwrap()])
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let started = std::time::Instant::now();
+    loop {
+        let diagnostics = std::fs::read_to_string(&log).unwrap();
+        if diagnostics.contains("Waiting before next cycle") {
+            break;
+        }
+        assert!(child.0.try_wait().unwrap().is_none(), "{diagnostics}");
+        assert!(started.elapsed() < Duration::from_secs(30), "{diagnostics}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+}
+
 fn success(out: &std::process::Output) {
     assert!(
         out.status.success(),
@@ -256,6 +295,8 @@ impl Respond for OfflinePhotos {
         let label = path.split('/').nth(1).unwrap();
         let value = if path.ends_with("/zones/list") {
             json!({"zones":[]})
+        } else if path.ends_with("/changes/database") {
+            json!({"syncToken":"offline-database-cursor","moreComing":false,"zones":[]})
         } else if body
             .get("query")
             .and_then(|query| query.get("recordType"))
@@ -515,7 +556,7 @@ async fn migration_backup_every_writable_cli_path_preserves_matching_config_and_
             "--skip-created-before",
             "2020-01-01",
         ],
-        &["service", "run", "--retry-failed"],
+        &["service", "run"],
         &["reset", "sync-token", "--yes"],
     ];
     for args in paths {
@@ -523,6 +564,9 @@ async fn migration_backup_every_writable_cli_path_preserves_matching_config_and_
         let root = directory.path();
         let account = seed(root, ACCOUNTS[0], "A", &server.uri());
         let mut config_bytes = std::fs::read(&account.config).unwrap();
+        if *args == ["service", "run"] {
+            config_bytes.extend_from_slice(b"\n[server]\nport=0\n");
+        }
         config_bytes.extend_from_slice(b"\r\n# exact private input, not a regenerated config\r\n");
         std::fs::write(&account.config, &config_bytes).unwrap();
         let conn = Connection::open(&account.path).unwrap();
@@ -540,7 +584,7 @@ async fn migration_backup_every_writable_cli_path_preserves_matching_config_and_
                 > 0
         );
         let before = state(&account.path);
-        success(&command(root, &account, args));
+        migration_command(root, &account, args).await;
         let (saved, incomplete) = migration_backup_bundles(root);
         assert!(
             incomplete.is_empty(),
@@ -585,7 +629,7 @@ async fn migration_backup_every_writable_cli_path_preserves_matching_config_and_
             super::HELPER_SCHEMA_VERSION
         );
         for _ in 0..2 {
-            success(&command(root, &account, args));
+            migration_command(root, &account, args).await;
             let (reopened, incomplete) = migration_backup_bundles(root);
             assert!(
                 incomplete.is_empty(),

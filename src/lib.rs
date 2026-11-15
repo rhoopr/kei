@@ -1142,7 +1142,7 @@ async fn dispatch_command(
                 .await;
             }
         },
-        Command::Sync { password, sync, .. } => (sync.retry_failed, password, sync),
+        Command::Sync { password, sync, .. } => (false, password, sync),
     };
     Box::pin(sync_loop::run_sync(
         globals,

@@ -177,16 +177,12 @@ pub struct SyncArgs {
     #[arg(long)]
     pub save_password: bool,
 
-    /// Re-sync only previously failed assets
-    #[arg(long, conflicts_with = "dry_run")]
-    pub retry_failed: bool,
-
     /// One-shot full-library repair that refreshes metadata for every downloaded version without re-downloading media.
     /// Requires a complete selected-library sweep and rewrites EXIF/XMP per the configured metadata outputs.
     /// Use with sync, not service run. A configured watch interval is ignored.
     #[arg(
         long,
-        conflicts_with_all = ["dry_run", "retry_failed", "only_print_filenames"]
+        conflicts_with_all = ["dry_run", "only_print_filenames"]
     )]
     pub refresh_metadata: bool,
 
@@ -784,6 +780,11 @@ fn should_append_removed_sync_surface_hint(argv: &[OsString], err: &clap::Error)
 }
 
 fn with_removed_sync_surface_hint(message: String) -> String {
+    if message.contains("--retry-failed") {
+        return format!(
+            "{message}\n\nnote: --retry-failed is retired. Run ordinary `kei sync`; it retries unfinished destinations alongside current selected work. Pending work and configuration were not changed."
+        );
+    }
     if message.contains("--recent") {
         return format!(
             "{message}\n\nnote: sync count selection is no longer supported. Remove --recent and --recent-scope, and remove recent/recent_scope from [filters]. To bound sync, set a fixed YYYY-MM-DD with --skip-created-before/--skip-created-after or [filters].skip_created_before/skip_created_after. Configuration was not changed."
@@ -1419,7 +1420,7 @@ mod tests {
     }
     #[test]
     fn test_sync_retry_failed_flag() {
-        assert_removed_sync_flag(&["kei", "sync", "--retry-failed", "--download-dir", "/photos"]);
+        assert_removed_sync_flag(&["kei", "sync", "--retry-failed"]);
     }
 
     // ── Legacy subcommand compat ──────────────────────────────────
@@ -2467,15 +2468,17 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
     #[test]
-    fn retry_failed_with_sync_flag_parses_under_sync() {
-        Cli::try_parse_from([
+    fn retry_failed_with_sync_flag_has_migration_guidance() {
+        let error = parse_cli_with_sources([
             "kei",
             "sync",
             "--retry-failed",
             "--skip-created-before",
             "2025-01-01",
         ])
-        .expect("sync --retry-failed accepts kept per-run sync flags");
+        .expect_err("retired retry-only selection must refuse before startup");
+        assert!(error.rendered.contains("--retry-failed is retired"));
+        assert!(error.rendered.contains("ordinary `kei sync`"));
     }
 
     #[test]

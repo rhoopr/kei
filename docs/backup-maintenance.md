@@ -42,7 +42,7 @@ It does not download media again. Embedded and sidecar changes follow the
 configured metadata writers. Disable embedded outputs if media bytes must stay
 unchanged; disable sidecar output too if no local metadata should change.
 
-This is one-shot even when the TOML file sets a watch interval. It rejects `--dry-run`, `--retry-failed`, `--only-print-filenames`, narrowing selection, and `service run`. See [Metadata output](metadata.md) for automatic bounded capture repair, which is different from this explicit full sweep.
+This is one-shot even when the TOML file sets a watch interval. It rejects `--dry-run`, `--only-print-filenames`, narrowing selection, and `service run`. The retired `--retry-failed` flag is rejected by all sync invocations; ordinary sync retries unfinished work automatically. See [Metadata output](metadata.md) for automatic bounded capture repair, which is different from this explicit full sweep.
 
 ### Replace capture timestamps
 

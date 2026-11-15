@@ -1073,7 +1073,7 @@ happens:
   Content policies and metadata use bundled production-path tests under
   `src/download/orchestration/fixture_tests/`.
 - **`state_auth.rs`** - live iCloud, `#[ignore]` gated. Covers status /
-  reset state / verify / import-existing / sync --retry-failed.
+  reset state / verify / import-existing / automatic retry through ordinary sync.
 - **`import_existing_live.rs`** - live iCloud, `#[ignore]` gated.
   Comprehensive `import-existing` scenarios: matches a real-sync fixture,
   dry-run, idempotency, `--recent` cap, `--recent Nd` rejection, truncated

@@ -681,31 +681,26 @@ fn list_albums_new_syntax() {
 }
 
 #[test]
-#[ignore]
-fn sync_retry_failed_flag() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-        let config_path = config_for_download_dir(&cookie_dir, download_dir.path());
-
-        // sync --retry-failed with no prior failures should succeed (noop)
-        common::cmd()
-            .env("ICLOUD_USERNAME", &username)
-            .env("KEI_DATA_DIR", &cookie_dir)
-            .args([
-                "sync",
-                "--retry-failed",
-                "--password",
-                &password,
-                "--config",
-                config_path.to_str().unwrap(),
-                "--no-progress-bar",
-            ])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
-    });
+fn sync_retry_failed_refuses_before_startup() {
+    let root = tempdir().unwrap();
+    let config = root.path().join("config.toml");
+    std::fs::write(&config, b"private config must not be read or rewritten").unwrap();
+    common::cmd()
+        .env("KEI_DATA_DIR", root.path())
+        .args([
+            "sync",
+            "--retry-failed",
+            "--config",
+            config.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--retry-failed is retired"));
+    assert_eq!(
+        std::fs::read(&config).unwrap(),
+        b"private config must not be read or rewritten"
+    );
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
 }
 
 #[test]

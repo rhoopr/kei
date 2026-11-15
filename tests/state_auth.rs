@@ -117,9 +117,9 @@ fn import_cmd(
     cmd
 }
 
-/// Like [`sync_cmd`] but for `--retry-failed` runs. Uses the same bounded
-/// primary-library selection to exercise retry state transitions.
-fn retry_failed_cmd(
+/// Run ordinary sync with the same bounded primary-library selection to
+/// exercise automatic retry state transitions.
+fn recovery_sync_cmd(
     username: &str,
     password: &str,
     cookie_dir: &Path,
@@ -131,7 +131,6 @@ fn retry_failed_cmd(
         .env("KEI_DATA_DIR", cookie_dir);
     cmd.args([
         "sync",
-        "--retry-failed",
         "--password",
         password,
         "--config",
@@ -553,12 +552,12 @@ fn import_existing_custom_folder_structure() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-//  RETRY-FAILED
+//  AUTOMATIC RETRY THROUGH ORDINARY SYNC
 // ══════════════════════════════════════════════════════════════════════════
 
 #[test]
 #[ignore]
-fn retry_failed_after_successful_sync_is_noop() {
+fn normal_sync_after_successful_sync_does_not_download_again() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
@@ -569,39 +568,38 @@ fn retry_failed_after_successful_sync_is_noop() {
             .assert()
             .success();
 
-        let assertion = retry_failed_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .timeout(std::time::Duration::from_secs(60))
+        let files = common::walkdir(download_dir.path());
+        assert!(!files.is_empty());
+        let assertion = recovery_sync_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
 
         let stderr = String::from_utf8_lossy(&assertion.get_output().stderr);
         assert!(
-            stderr.contains("No failed assets to retry"),
-            "retry-failed after successful sync should report no failures, stderr:\n{stderr}"
+            stderr.contains("No new photos to download")
+                || stderr.contains("All incremental assets already downloaded")
+                || stderr.contains("0 downloaded"),
+            "ordinary sync must not redownload completed files: {stderr}"
         );
+        assert_eq!(common::walkdir(download_dir.path()).len(), files.len());
     });
 }
 
 #[test]
 #[ignore]
-fn retry_failed_with_no_db_succeeds() {
+fn normal_sync_initializes_a_fresh_destination() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        let output = retry_failed_cmd(&username, &password, &cookie_dir, download_dir.path())
+        recovery_sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
-            .success()
-            .get_output()
-            .clone();
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("No failed assets to retry"),
-            "retry-failed with no DB should report nothing to retry, stderr:\n{stderr}"
-        );
+            .success();
+        assert!(!common::walkdir(download_dir.path()).is_empty());
+        assert!(db_file_count(cookie_dir.as_path()) > 0);
     });
 }
 

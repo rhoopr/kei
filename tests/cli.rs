@@ -1086,10 +1086,10 @@ fn auth_flags_rejected_on_all_subcommands() {
     }
 }
 
-// ── retry-failed shares sync flags ──────────────────────────────────
+// ── Retired retry-only selection ──────────────────────────────────
 
 #[test]
-fn retry_failed_accepts_sync_flags() {
+fn retry_failed_rejects_even_with_sync_flags() {
     common::cmd()
         .args([
             "sync",
@@ -1099,7 +1099,8 @@ fn retry_failed_accepts_sync_flags() {
             "--help",
         ])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("--retry-failed is retired"));
 }
 
 #[test]
@@ -1394,11 +1395,12 @@ fn config_setup_help_succeeds() {
 }
 
 #[test]
-fn sync_retry_failed_help_succeeds() {
+fn sync_help_does_not_advertise_retry_failed() {
     common::cmd()
-        .args(["sync", "--retry-failed", "--help"])
+        .args(["sync", "--help"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("--retry-failed").not());
 }
 
 // ── Removed legacy commands not in help ─────────────────────────────────

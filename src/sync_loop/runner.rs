@@ -45,7 +45,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         input_mode,
     } = args;
 
-    let is_retry_failed = sync.retry_failed;
     let toml_existed = toml_config.is_some();
     let cli_data_dir = globals.data_dir.clone();
     let mut config = config::Config::build_inner(
@@ -143,14 +142,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     if config.auth.username.is_empty() {
         anyhow::bail!("Set your iCloud username with ICLOUD_USERNAME or [auth].username.");
-    }
-
-    // retry-failed + dry-run is unsupported: dry-run skips the state DB,
-    // but retry-failed needs it to know which assets failed.
-    if is_retry_failed && config.runtime.dry_run {
-        anyhow::bail!(
-            "`--dry-run` cannot be used with `--retry-failed` because retrying failed downloads needs to update the state database."
-        );
     }
 
     // Validate download directory early (before auth) to avoid wasting a 2FA code
@@ -372,22 +363,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     }
                 }
 
-                // For retry-failed, reset failed assets to pending
-                if is_retry_failed {
-                    match db.reset_failed().await {
-                        Ok(0) => {
-                            tracing::info!("No failed assets to retry");
-                            return Ok(());
-                        }
-                        Ok(count) => {
-                            tracing::debug!(count, "Reset failed assets to pending");
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Failed to reset failed assets");
-                        }
-                    }
-                }
-
                 Some(db)
             }
             Err(e) => {
@@ -499,7 +474,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             selection_context: None,
             selection_run: None,
             selection_pass: None,
-            retry_only: is_retry_failed,
+            retry_only: false,
             provisional: false,
             indexing_inventory_only: false,
             max_download_attempts: config.retry.max_download_attempts,
@@ -553,7 +528,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let (mut library_states, mut collection_context) =
         super::planning::resolve_library_plans(&mut photos_service, &libraries, &config).await?;
     if run_mode.downloads_files()
-        && !is_retry_failed
         && let Some(db) = startup_db.as_deref()
     {
         let plans: Vec<_> = library_states
@@ -746,7 +720,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &cycle_library_states,
                 &config,
                 state_db.as_deref(),
-                is_retry_failed,
+                false,
                 &build_download_config,
                 download_controls,
                 &shared_session,
