@@ -112,18 +112,9 @@ async fn run_targeted_recovery_pass(
         bandwidth_limiter: config.bandwidth_limiter.clone(),
         library: Arc::clone(&config.library),
     };
-    let mut provider_auth_errors = 0usize;
     let mut pass_result = run_download_pass(pass_config.clone(), tasks).await;
-    if pass_result.url_expired
-        && pass_result.auth_errors < AUTH_ERROR_THRESHOLD
-        && provider_auth_errors == 0
-        && pass_result.state_write_failures == 0
-        && !shutdown_token.is_cancelled()
-    {
-        provider_auth_errors +=
-            refresh_expired_download_pass(passes, &retry_sources, pass_config, &mut pass_result)
-                .await;
-    }
+    let provider_auth_errors =
+        refresh_expired_download_pass(passes, &retry_sources, pass_config, &mut pass_result).await;
     let failed = pass_result.failed.len();
     if failed > 0 {
         for task in &pass_result.failed {

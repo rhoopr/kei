@@ -1264,13 +1264,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     pass_result.failed.extend(unrefreshed);
     pass_result.rate_limit_observations += refresh_rate_limits;
 
-    if pass_result.url_expired
-        && pass_result.auth_errors < AUTH_ERROR_THRESHOLD
-        && provider_auth_errors == 0
-        && pass_result.state_write_failures == 0
-        && planning_state_write_failures == 0
-        && !shutdown_token.is_cancelled()
-    {
+    if provider_auth_errors == 0 && planning_state_write_failures == 0 {
         pass_config.shutdown_token = shutdown_token.clone();
         provider_auth_errors +=
             refresh_expired_download_pass(passes, &retry_sources, pass_config, &mut pass_result)

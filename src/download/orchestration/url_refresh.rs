@@ -10,12 +10,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::download::filter::DownloadTask;
-use crate::download::pipeline::{PassConfig, PassResult, run_download_pass};
+use crate::download::pipeline::{AUTH_ERROR_THRESHOLD, PassConfig, PassResult, run_download_pass};
 use crate::state::VersionSizeKey;
 
 pub(super) const INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
 
-/// Execute one exact-task URL refresh after the caller's cycle failure gates.
+/// Admit and execute one expired-task retry after source-specific failure gates.
 /// Return provider authentication failures separately from transfer failures.
 #[must_use]
 pub(super) async fn refresh_expired_download_pass(
@@ -24,6 +24,13 @@ pub(super) async fn refresh_expired_download_pass(
     mut config: PassConfig<'_>,
     result: &mut PassResult,
 ) -> usize {
+    if !result.url_expired
+        || result.auth_errors >= AUTH_ERROR_THRESHOLD
+        || result.state_write_failures > 0
+        || config.shutdown_token.is_cancelled()
+    {
+        return 0;
+    }
     let candidates = result.expired_tasks.clone();
     let plan = refresh_failed_download_urls(
         passes,
