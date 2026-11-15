@@ -11,7 +11,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::download::filter::DownloadTask;
-use crate::download::pipeline::PassResult;
+use crate::download::pipeline::{PassConfig, PassResult, run_download_pass};
 use crate::download::planner;
 use crate::state::VersionSizeKey;
 
@@ -19,6 +19,40 @@ use super::config::DownloadConfig;
 use super::selection::build_pass_configs_resolving_deferred_excludes;
 
 pub(super) const INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// Execute one exact-task URL refresh after the caller's cycle failure gates.
+/// Return provider authentication failures separately from transfer failures.
+#[must_use]
+pub(super) async fn refresh_expired_download_pass(
+    passes: &[crate::commands::AlbumPass],
+    retry_sources: &FxHashMap<RetryTaskKey, UrlRetrySource>,
+    mut config: PassConfig<'_>,
+    result: &mut PassResult,
+) -> usize {
+    let candidates = result.expired_tasks.clone();
+    let plan = build_incremental_expired_url_retry_tasks(
+        passes,
+        retry_sources,
+        &candidates,
+        config.shutdown_token.clone(),
+    )
+    .await;
+    result.rate_limit_observations += plan.rate_limit_observations;
+    if !plan.tasks.is_empty() {
+        tracing::info!(
+            count = plan.tasks.len(),
+            "Retrying tasks after targeted URL refresh"
+        );
+        config.prior_auth_errors = result.auth_errors;
+        config.url_obtained_at = plan.url_obtained_at;
+        // The initial pass has already reported its observations. A retry pass
+        // starts a separate counter even though the execution settings agree.
+        config.rate_limit_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let retried = run_download_pass(config, plan.tasks).await;
+        merge_expired_url_retry_result(result, candidates, retried);
+    }
+    plan.provider_auth_errors
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(in crate::download) struct RetryTaskKey {

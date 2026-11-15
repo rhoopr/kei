@@ -44,8 +44,7 @@ use super::selection::{
 };
 use super::url_refresh::{
     INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER, RetryTaskKey, UrlRetrySource,
-    build_incremental_expired_url_retry_tasks, merge_expired_url_retry_result,
-    refresh_stale_incremental_tasks_before_download,
+    refresh_expired_download_pass, refresh_stale_incremental_tasks_before_download,
 };
 
 fn single_unfiled_streaming_pass<'a>(
@@ -1234,7 +1233,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     );
 
     // Run the download pass on the collected tasks
-    let pass_config = PassConfig {
+    let mut pass_config = PassConfig {
         prior_auth_errors: 0,
         url_obtained_at,
         client: download_client,
@@ -1253,7 +1252,15 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         bandwidth_limiter: config.bandwidth_limiter.clone(),
         library: Arc::clone(&config.library),
     };
-    let mut pass_result = run_download_pass(pass_config, tasks).await;
+    let initial_url_obtained_at = std::mem::take(&mut pass_config.url_obtained_at);
+    let mut pass_result = run_download_pass(
+        PassConfig {
+            url_obtained_at: initial_url_obtained_at,
+            ..pass_config.clone()
+        },
+        tasks,
+    )
+    .await;
     pass_result.failed.extend(unrefreshed);
     pass_result.rate_limit_observations += refresh_rate_limits;
 
@@ -1264,49 +1271,10 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         && planning_state_write_failures == 0
         && !shutdown_token.is_cancelled()
     {
-        let expired_retry_candidates = pass_result.expired_tasks.clone();
-        let retry_plan = build_incremental_expired_url_retry_tasks(
-            passes,
-            &retry_sources,
-            &expired_retry_candidates,
-            shutdown_token.clone(),
-        )
-        .await;
-        provider_auth_errors += retry_plan.provider_auth_errors;
-        pass_result.rate_limit_observations += retry_plan.rate_limit_observations;
-        let retry_tasks = retry_plan.tasks;
-        if !retry_tasks.is_empty() {
-            let retry_task_count = retry_tasks.len();
-            tracing::info!(
-                count = retry_task_count,
-                "Retrying tasks after targeted incremental URL refresh"
-            );
-            let retry_pass_config = PassConfig {
-                prior_auth_errors: pass_result.auth_errors,
-                url_obtained_at: retry_plan.url_obtained_at,
-                client: download_client,
-                retry_config: &config.retry,
-                metadata: MetadataFlags::from(config.as_ref()),
-                mark_capture_repair_after_download: matches!(
-                    config.capture_timestamp_repair,
-                    CaptureTimestampRepair::ReplaceWithCaptureLocal
-                ),
-                concurrency: config.concurrent_downloads,
-                reporting: controls.reporting,
-                temp_suffix: Arc::clone(&config.temp_suffix),
-                shutdown_token: shutdown_token.clone(),
-                state_db: config.state_db.clone(),
-                rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                bandwidth_limiter: config.bandwidth_limiter.clone(),
-                library: Arc::clone(&config.library),
-            };
-            let retry_result = run_download_pass(retry_pass_config, retry_tasks).await;
-            merge_expired_url_retry_result(
-                &mut pass_result,
-                expired_retry_candidates,
-                retry_result,
-            );
-        }
+        pass_config.shutdown_token = shutdown_token.clone();
+        provider_auth_errors +=
+            refresh_expired_download_pass(passes, &retry_sources, pass_config, &mut pass_result)
+                .await;
     }
 
     pass_result.exif_failures = pass_result.exif_failures.saturating_add(

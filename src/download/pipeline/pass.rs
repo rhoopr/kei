@@ -21,6 +21,7 @@ use super::task::{
 };
 
 /// Configuration for a download pass.
+#[derive(Clone)]
 pub(in crate::download) struct PassConfig<'a> {
     pub(in crate::download) prior_auth_errors: usize,
     pub(in crate::download) url_obtained_at:
