@@ -536,6 +536,12 @@ async fn production_download_recovers_before_work_but_dry_run_does_not_mutate() 
     .unwrap();
     assert!(!target.exists());
     assert!(directory_path(&target).unwrap().exists());
+    let config = Arc::new(DownloadConfig {
+        state_db: Some(Arc::new(
+            crate::state::SqliteStateDb::open_in_memory().unwrap(),
+        )),
+        ..config.as_ref().clone()
+    });
     download_photos_with_sync(
         &reqwest::Client::new(),
         &[],

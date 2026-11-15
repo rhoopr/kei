@@ -427,6 +427,10 @@ pub async fn download_photos_with_sync(
     controls: DownloadControls,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
+    anyhow::ensure!(
+        !controls.run_mode.downloads_files() || config.state_db.is_some(),
+        "Writable sync requires a state database; use dry-run for a state-free preview"
+    );
     // Bound the complete cycle's new selection/replay state at its owner,
     // preserving one opaque public future and avoiding caller-specific boxing.
     Box::pin(download_photos_with_sync_inner(

@@ -131,6 +131,86 @@ struct CountingQuerySession {
     fail_records_query: bool,
 }
 
+#[tokio::test]
+async fn writable_dispatch_requires_state_before_provider_or_file_work() {
+    for provisional in [false, true] {
+        for incremental in [false, true] {
+            let root = TempDir::new().unwrap();
+            let media = root.path().join("existing.jpg");
+            std::fs::write(&media, b"retained media").unwrap();
+            let session = CountingQuerySession::new(json!({"records": []}), 0);
+            let pass = AlbumPass {
+                kind: PassKind::Unfiled,
+                album: super::super::test_support::album_with_session(
+                    "PrimarySync",
+                    "",
+                    Box::new(session.clone()),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            };
+            let mut config = test_config();
+            config.directory = Arc::from(root.path());
+            config.state_db = None;
+            config.provisional = provisional;
+            if incremental {
+                config.sync_mode = SyncMode::Incremental {
+                    zone_sync_token: "saved-token".into(),
+                };
+            }
+            let error = download_photos_with_sync(
+                &Client::new(),
+                &[pass],
+                Arc::new(config),
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("requires a state database"),
+                "{error}"
+            );
+            assert_eq!(session.count_query_count(), 0);
+            assert_eq!(session.records_query_count(), 0);
+            assert_eq!(std::fs::read(&media).unwrap(), b"retained media");
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn state_free_previews_still_enumerate_without_local_writes() {
+    for mode in [DownloadRunMode::DryRun, DownloadRunMode::PrintFilenames] {
+        let root = TempDir::new().unwrap();
+        let session = CountingQuerySession::new(json!({"records": []}), 0);
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: super::super::test_support::album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(session.clone()),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(root.path());
+        config.state_db = None;
+        let mut controls = DownloadControls::download_hidden();
+        controls.run_mode = mode;
+        download_photos_with_sync(
+            &Client::new(),
+            &[pass],
+            Arc::new(config),
+            controls,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(session.records_query_count() > 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+}
+
 impl CountingQuerySession {
     fn new(page: Value, asset_count: u64) -> Self {
         Self {
@@ -370,7 +450,8 @@ async fn smart_folder_refresh_blank_query_token_does_not_block_incremental_zone_
         smart_session.clone(),
     );
     let dir = TempDir::new().expect("temp dir");
-    let config = incremental_test_config(&dir);
+    let mut config = incremental_test_config(&dir);
+    config.state_db = Some(Arc::new(SqliteStateDb::open_in_memory().unwrap()));
 
     let result = download_photos_with_sync(
         &Client::new(),
@@ -661,6 +742,8 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
     }
     for expired in [false, true] {
         let directory = TempDir::new().unwrap();
+        let mut config = incremental_test_config(&directory);
+        config.state_db = Some(Arc::new(SqliteStateDb::open_in_memory().unwrap()));
         let passes = vec![AlbumPass {
             kind: PassKind::Unfiled,
             album: changes_album("", FallbackSession { expired }),
@@ -669,7 +752,7 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
         let result = download_photos_with_sync(
             &Client::new(),
             &passes,
-            Arc::new(incremental_test_config(&directory)),
+            Arc::new(config),
             DownloadControls::download_hidden(),
             CancellationToken::new(),
         )
@@ -701,7 +784,9 @@ async fn smart_only_delta_replays_source_without_admitting_unselected_media() {
         exclude_ids: Arc::new(FxHashSet::default()),
     }];
     let dir = TempDir::new().unwrap();
-    let config = Arc::new(incremental_test_config(&dir));
+    let mut config = incremental_test_config(&dir);
+    config.state_db = Some(Arc::new(SqliteStateDb::open_in_memory().unwrap()));
+    let config = Arc::new(config);
     let expected_scope = crate::download::inventory_scope(&passes, &config);
     let result = download_photos_with_sync(
         &Client::new(),
@@ -748,10 +833,12 @@ async fn smart_only_delta_successor_retains_missing_query_token_hold() {
             exclude_ids: Arc::new(FxHashSet::default()),
         }];
         let dir = TempDir::new().unwrap();
+        let mut config = incremental_test_config(&dir);
+        config.state_db = Some(Arc::new(SqliteStateDb::open_in_memory().unwrap()));
         let result = download_photos_with_sync(
             &Client::new(),
             &passes,
-            Arc::new(incremental_test_config(&dir)),
+            Arc::new(config),
             DownloadControls::download_hidden(),
             CancellationToken::new(),
         )

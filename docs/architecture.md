@@ -318,6 +318,8 @@ is canceled, so cleanup cannot unlock while a generation write is pending.
 
 ### Account ownership and legacy adoption
 
+Writable download dispatch requires a state store before provisional, full or incremental routing can start. `sync_loop/runner.rs` supplies authenticated owned state and fails startup if opening it fails. `download/orchestration/dispatch.rs` also rejects missing state at its entry boundary, before provider calls or local file work. Dry-run and filename previews may enumerate without a store and do not create one.
+
 Configured login and realm determine collision-resistant names for state,
 auth artifacts and encrypted credentials. Account-owner format version 1 is
 independent of the application schema version and must be checked before its
