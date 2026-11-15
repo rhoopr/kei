@@ -424,20 +424,17 @@ fn test_producer_skip_summary_default_is_zero() {
 /// If variant order changes, `.max()` silently picks the wrong winner.
 #[test]
 fn test_asset_disposition_ordering() {
-    use AssetDisposition::{
-        AmpmVariant, Forwarded, OnDisk, RetryExhausted, RetryOnly, StateSkip, Unresolved,
-    };
+    use AssetDisposition::{AmpmVariant, Forwarded, OnDisk, RetryExhausted, StateSkip, Unresolved};
     assert!(Forwarded > OnDisk);
     assert!(OnDisk > AmpmVariant);
     assert!(AmpmVariant > StateSkip);
     assert!(StateSkip > RetryExhausted);
-    assert!(RetryExhausted > RetryOnly);
-    assert!(RetryOnly > Unresolved);
+    assert!(RetryExhausted > Unresolved);
 
     // .max() picks the highest priority
     assert_eq!(Unresolved.max(Forwarded), Forwarded);
     assert_eq!(OnDisk.max(RetryExhausted), OnDisk);
-    assert_eq!(RetryOnly.max(RetryExhausted), RetryExhausted);
+    assert_eq!(Unresolved.max(RetryExhausted), RetryExhausted);
 }
 
 /// T-11: When the API returns the same asset ID on two different pages,

@@ -99,7 +99,6 @@ fn should_resnapshot_free_space(total: u64, last_snapshot_total: u64, interval: 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 enum AssetDisposition {
     Unresolved,
-    RetryOnly,
     RetryExhausted,
     StateSkip,
     AmpmVariant,
@@ -925,17 +924,6 @@ where
                                 continue;
                             }
 
-                            if config.retry_only
-                                && !download_ctx.is_known(&task.library, &task.asset_id)
-                            {
-                                tracing::debug!(target: "kei::download::pipeline",
-                                    asset_id = %task.asset_id,
-                                    "Skipping new asset in retry-only mode"
-                                );
-                                disposition = disposition.max(AssetDisposition::RetryOnly);
-                                continue;
-                            }
-
                             if let Some(db) = &producer_state_db {
                                 let adoption = match adopt_pending_on_disk_task(
                                     producer_state_db.as_deref(),
@@ -1119,7 +1107,6 @@ where
                             AssetDisposition::AmpmVariant => skips.ampm_variant += 1,
                             AssetDisposition::StateSkip => skips.by_state += 1,
                             AssetDisposition::RetryExhausted => skips.retry_exhausted += 1,
-                            AssetDisposition::RetryOnly => skips.retry_only += 1,
                             AssetDisposition::Unresolved => {
                                 tracing::warn!(target: "kei::download::pipeline",
                                     asset_id = %asset.id(),

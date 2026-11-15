@@ -889,7 +889,7 @@ where
     tokio::pin!(stream);
     let mut stats = ImportStats::default();
     let mut scan_started_emitted = false;
-    let identity_context = download::DownloadContext::load(db, false).await;
+    let identity_context = download::DownloadContext::load(db).await;
     let import_root = Arc::new(path_config.directory().to_path_buf());
     let mut claimed_legacy_master_states = download::ClaimedLegacyMasterStates::default();
     if preflight.durable.is_none() {
@@ -1959,7 +1959,6 @@ mod wiremock_tests {
             keep_unicode_in_filenames: false,
             temp_suffix: Arc::from(".kei-tmp"),
             state_db: None,
-            retry_only: false,
             provisional: false,
             indexing_inventory_only: false,
             max_download_attempts: 0,

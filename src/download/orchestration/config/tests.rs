@@ -322,8 +322,6 @@ fn test_compute_config_hash_matches_hash_download_config() {
     );
 }
 
-// ── Gap coverage: retry_only known_ids filtering ────────────────────
-
 // ── Gap coverage: skip_created_before AND skip_created_after ────────
 
 // ── Gap coverage: incremental Modified events are downloadable ──────

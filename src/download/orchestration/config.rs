@@ -346,7 +346,7 @@ pub(crate) fn inventory_scope(
                 "skip_created_after": config.skip_created_after.map(crate::config::CreatedDateFilter::fingerprint),
                 "recent": null,
                 "recent_scope": "global",
-                "retry_only": config.retry_only,
+                "retry_only": false,
             },
         })
         .to_string(),
@@ -512,9 +512,6 @@ pub(crate) struct DownloadConfig {
     pub(crate) temp_suffix: Arc<str>,
     /// State database for tracking download progress.
     pub(crate) state_db: Option<Arc<dyn DownloadStore>>,
-    /// When true (retry-failed mode), only download assets already known to the
-    /// state DB. Skip new assets discovered from iCloud that were never synced.
-    pub(crate) retry_only: bool,
     /// Incomplete provider inventory may download, but cannot certify absence.
     pub(crate) provisional: bool,
     /// Qualify managed recovery without planning or publishing local work.
@@ -672,7 +669,6 @@ impl std::fmt::Debug for DownloadConfig {
             .field("keep_unicode_in_filenames", &self.keep_unicode_in_filenames)
             .field("temp_suffix", &self.temp_suffix)
             .field("state_db", &self.state_db.is_some())
-            .field("retry_only", &self.retry_only)
             .field("sync_mode", &self.sync_mode)
             .field("enum_config_hash", &self.enum_config_hash)
             .field("album_name", &self.album_name)
@@ -729,7 +725,6 @@ impl DownloadConfig {
             selection_context: None,
             selection_run: None,
             selection_pass: None,
-            retry_only: false,
             provisional: false,
             indexing_inventory_only: false,
             max_download_attempts: 10,

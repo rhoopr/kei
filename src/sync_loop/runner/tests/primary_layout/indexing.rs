@@ -23,7 +23,6 @@ fn readiness(state: &'static str) -> IndexingOptions {
         interrupt: false,
         stale_plan: false,
         date_bound: false,
-        retry_only: false,
         token: Some("query-token"),
         queries: Arc::new(AtomicUsize::new(0)),
         cursors: Arc::new(Mutex::new(Vec::new())),
@@ -146,12 +145,6 @@ async fn indexing_managed_reopen_qualifies_then_materializes_omissions_with_quie
         assert_eq!(media(root.path()), before_media);
         assert_eq!(managed_state(root.path()), before_state);
         let materialize = readiness("FINISHED");
-        let mut retry = readiness("FINISHED");
-        retry.retry_only = true;
-        let (retry_result, _) =
-            cycle_options(root.path(), all.clone(), true, naming, options(&retry)).await;
-        assert!(!retry_result.can_advance_database_checkpoint());
-        assert_hold(root.path(), &cursor, false, true);
         let (recovered, _) = cycle_options(
             root.path(),
             all.clone(),

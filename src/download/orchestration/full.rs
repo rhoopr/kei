@@ -1829,7 +1829,6 @@ pub(super) async fn download_photos_full_with_token_policy(
         && !result.checkpoint.interrupted
         && matches!(result.outcome, super::models::DownloadOutcome::Success)
         && controls.run_mode.downloads_files()
-        && !config.retry_only
         && config.skip_created_before.is_none()
         && config.skip_created_after.is_none()
         && !bounds_truncated.load(Ordering::Relaxed)

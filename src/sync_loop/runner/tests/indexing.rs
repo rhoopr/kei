@@ -682,7 +682,7 @@ async fn indexing_cross_zone_source_requires_reconciliation_without_permanent_ho
 }
 
 #[tokio::test]
-async fn indexing_retry_only_keeps_hold_until_normal_inventory_recovers_omitted_photo() {
+async fn indexing_normal_recovery_restores_failed_and_omitted_photos_across_restart() {
     let server = wiremock::MockServer::start().await;
     for id in ["known", "omitted", "late"] {
         Mock::given(method("GET"))
@@ -720,26 +720,21 @@ async fn indexing_retry_only_keeps_hold_until_normal_inventory_recovers_omitted_
             .unwrap();
     }
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
-    for (round, retry_only) in [true, false, true, false].into_iter().enumerate() {
+    for round in 0..4 {
         let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
         let db: Arc<dyn download::DownloadStore> = inner.clone();
         let mut session = provider("FINISHED", &["known", "omitted"], &server.uri());
-        if round >= 2 {
+        if round >= 1 {
             session.change_records = provider("FINISHED", &["late"], &server.uri()).records;
         }
         let provider = session;
         let library = library(&provider).await;
-        let base = make_run_cycle_download_config_builder(&media, db.clone());
-        let build = |mode, exclude, groups, zone| {
-            let mut config = base(mode, exclude, groups, zone);
-            Arc::make_mut(&mut config).retry_only = retry_only;
-            config
-        };
+        let build = make_run_cycle_download_config_builder(&media, db.clone());
         let result = run_cycle(
             &[&library],
             &config,
             Some(db.as_ref()),
-            retry_only,
+            false,
             &build,
             download::DownloadControls::download_hidden(),
             &shared,
@@ -748,44 +743,44 @@ async fn indexing_retry_only_keeps_hold_until_normal_inventory_recovers_omitted_
         .await
         .unwrap();
         assert_eq!(result.failed_count, 0, "{:?}", result.stats);
-        assert_eq!(result.can_advance_database_checkpoint(), round == 3);
+        assert_eq!(result.can_advance_database_checkpoint(), round > 0);
         assert_eq!(
             inner.get_metadata(CURSOR).await.unwrap().as_deref(),
-            Some(if round < 3 {
+            Some(if round == 0 {
                 "trusted-before"
             } else {
                 "trusted-after"
             })
         );
-        assert_eq!(
-            inner.get_metadata(&hold).await.unwrap().is_some(),
-            round == 0
-        );
-        assert_eq!(
-            inner.get_downloaded_page(0, 10).await.unwrap().len(),
-            if round == 0 {
-                1
-            } else if round == 3 {
-                3
-            } else {
-                2
-            }
-        );
+        assert!(inner.get_metadata(&hold).await.unwrap().is_none());
+        let downloaded = inner.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(downloaded.len(), if round == 0 { 2 } else { 3 });
+        for record in downloaded {
+            assert_eq!(std::fs::read(record.local_path.unwrap()).unwrap(), BYTES);
+        }
+        assert!(inner.get_pending().await.unwrap().is_empty());
         assert_eq!(
             inner
                 .get_metadata(&crate::sync_cycle::indexing_replay_key(ZONE))
                 .await
                 .unwrap()
                 .is_some(),
-            round == 1 || round == 2
+            round == 0
         );
-        if round < 2 {
+        if round == 0 {
             assert!(
                 provider.changes.lock().unwrap().is_empty(),
-                "held/retry inventory must retain old cursor"
+                "qualification inventory must retain old cursor"
             );
         } else {
-            assert_eq!(*provider.changes.lock().unwrap(), ["trusted-before"]);
+            assert_eq!(
+                *provider.changes.lock().unwrap(),
+                [if round == 1 {
+                    "trusted-before"
+                } else {
+                    "trusted-after"
+                }]
+            );
         }
     }
     server.verify().await;

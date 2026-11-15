@@ -32,7 +32,6 @@ struct IndexingOptions {
     interrupt: bool,
     stale_plan: bool,
     date_bound: bool,
-    retry_only: bool,
     token: Option<&'static str>,
     queries: Arc<AtomicUsize>,
     cursors: Arc<std::sync::Mutex<Vec<String>>>,
@@ -333,10 +332,6 @@ async fn try_cycle_options(
             .then_some(crate::config::CreatedDateFilter::CaptureDate(
                 chrono::NaiveDate::from_ymd_opt(2100, 1, 1).unwrap(),
             ));
-        config.retry_only = options
-            .indexing
-            .as_ref()
-            .is_some_and(|indexing| indexing.retry_only);
         config.resolution = resolution;
         #[cfg(feature = "xmp")]
         {

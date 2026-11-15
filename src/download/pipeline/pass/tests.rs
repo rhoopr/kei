@@ -432,7 +432,6 @@ async fn shutdown_cancellation_exits_download_pass_promptly() {
         selection_context: None,
         selection_run: None,
         selection_pass: None,
-        retry_only: false,
         provisional: false,
         indexing_inventory_only: false,
         max_download_attempts: 10,

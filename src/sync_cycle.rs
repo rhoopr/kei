@@ -1463,7 +1463,6 @@ pub(crate) async fn run_cycle(
                 );
                 if target_config.skip_created_before.is_some()
                     || target_config.skip_created_after.is_some()
-                    || target_config.retry_only
                     || target_config.edited_naming == crate::types::EditedNaming::Primary
                 {
                     continue;
@@ -1578,9 +1577,7 @@ pub(crate) async fn run_cycle(
         };
         if (matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed)
             || unresolved_identity
-            || ((indexing_replay_pending || indexing_materialization_pending)
-                && !is_retry_failed
-                && !download_config.retry_only))
+            || ((indexing_replay_pending || indexing_materialization_pending) && !is_retry_failed))
             && indexing_finished
             && !indexing_reconciliation
             && sync_result.full_enumeration_ran
@@ -1762,7 +1759,6 @@ pub(crate) async fn run_cycle(
             && !lib_state.plan_is_stale
             && !lib_state.plan_needs_refresh
             && !is_retry_failed
-            && !download_config.retry_only
             && download_controls.run_mode.downloads_files();
         if path_reconciliation_requires_smart_query {
             // Historical smart membership cannot certify the current selection.
@@ -1865,7 +1861,7 @@ pub(crate) async fn run_cycle(
         let recovery_retry_only = (indexing_reconciliation
             || indexing_replay_pending
             || indexing_materialization_pending)
-            && (is_retry_failed || download_config.retry_only);
+            && is_retry_failed;
         if recovery_retry_only
             || (indexing_reconciliation
                 && (!sync_result.full_enumeration_ran
@@ -1942,7 +1938,6 @@ pub(crate) async fn run_cycle(
                 checkpoint_decision,
                 SourceCheckpointDecision::Advance { .. }
             ) && !is_retry_failed
-                && !download_config.retry_only
                 && !indexing_hold_required
                 && indexing_finished
                 && sync_result.full_enumeration_ran

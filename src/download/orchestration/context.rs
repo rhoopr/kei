@@ -172,10 +172,6 @@ pub(crate) struct DownloadContext {
     pub(in crate::download) legacy_master_state_owners: Option<LibraryMasterAssetMap>,
     legacy_added_dates: LegacyAddedDates,
     protected_legacy_ids: LibraryAssetSet,
-    /// Nested map: `library` -> set of asset IDs known to the state DB (any
-    /// status). Used in retry-only mode to skip new assets that were never
-    /// synced in the same CloudKit zone.
-    pub(in crate::download) known_ids: LibraryAssetSet,
     /// Per-library/asset maximum download attempt count (from failed assets).
     /// Used to skip assets that have exceeded `max_download_attempts`.
     pub(in crate::download) attempt_counts: LibraryAssetAttemptCounts,
@@ -210,20 +206,10 @@ impl DownloadContext {
     /// Load the download context from the state database. All state queries
     /// are independent and run concurrently so sync start doesn't serialize
     /// on round-trip latency across them.
-    pub(crate) async fn load<D>(db: &D, retry_only: bool) -> Self
+    pub(crate) async fn load<D>(db: &D) -> Self
     where
         D: DownloadContextStateStore + DownloadStateStore + MetadataRewriteStore + ?Sized,
     {
-        let known_ids_fut = async {
-            if retry_only {
-                db.get_all_known_ids().await.unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to load known IDs from state DB");
-                    Default::default()
-                })
-            } else {
-                Default::default()
-            }
-        };
         let (
             downloaded_records,
             soft_deleted,
@@ -231,7 +217,6 @@ impl DownloadContext {
             markers,
             pending,
             attempts,
-            known_id_rows,
             mapping_rows,
             legacy_owner_rows,
             protected_legacy_rows,
@@ -274,7 +259,6 @@ impl DownloadContext {
                     Default::default()
                 })
             },
-            known_ids_fut,
             db.get_asset_master_mappings(),
             db.get_legacy_master_state_owners(),
             db.get_protected_legacy_ids(),
@@ -496,13 +480,6 @@ impl DownloadContext {
                 tracing::warn!(%error, "Legacy preservation could not be loaded; legacy adoption disabled");
             }
         }
-        let mut known_ids: LibraryAssetSet = FxHashMap::default();
-        for (library, asset_id) in known_id_rows {
-            let lib = intern_id(&mut interner, library);
-            let id = intern_id(&mut interner, asset_id);
-            known_ids.entry(lib).or_default().insert(id);
-        }
-
         let mut attempt_counts: LibraryAssetAttemptCounts = FxHashMap::default();
         for ((library, asset_id), count) in attempts {
             let lib = intern_id(&mut interner, library);
@@ -544,16 +521,9 @@ impl DownloadContext {
             legacy_master_state_owners,
             legacy_added_dates,
             protected_legacy_ids,
-            known_ids,
             attempt_counts,
             downloaded_without_metadata_hash,
         }
-    }
-
-    pub(in crate::download) fn is_known(&self, library: &str, asset_id: &str) -> bool {
-        self.known_ids
-            .get(library)
-            .is_some_and(|ids| ids.contains(asset_id))
     }
 
     pub(in crate::download) fn attempt_count(&self, library: &str, asset_id: &str) -> Option<u32> {
@@ -1065,7 +1035,7 @@ pub(in crate::download) async fn preload_download_context(
 ) -> Arc<DownloadContext> {
     let download_ctx = if let Some(db) = &config.state_db {
         tracing::debug!("Pre-loading download state from database");
-        DownloadContext::load(db.as_ref(), config.retry_only).await
+        DownloadContext::load(db.as_ref()).await
     } else {
         DownloadContext::default()
     };

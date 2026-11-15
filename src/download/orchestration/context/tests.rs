@@ -449,36 +449,6 @@ fn test_should_download_fast_different_version_size() {
 }
 
 #[test]
-fn test_download_context_known_ids_populated_for_retry_only() {
-    // Simulate retry-only mode: known_ids is populated
-    let mut ctx = DownloadContext::default();
-    ctx.known_ids
-        .entry("PrimarySync".into())
-        .or_default()
-        .insert("known_asset".into());
-
-    // A known asset that's not in downloaded_ids needs download
-    assert_eq!(
-        ctx.should_download_fast(
-            "PrimarySync",
-            "known_asset",
-            VersionSizeKey::Original,
-            "ck",
-            true
-        ),
-        Some(true)
-    );
-    // The known_ids set is used externally to decide whether to skip new assets;
-    // verify the set membership works
-    assert!(ctx.is_known("PrimarySync", "known_asset"));
-    assert!(!ctx.is_known("PrimarySync", "new_asset"));
-    assert!(
-        !ctx.is_known("SharedSync-AAAA", "known_asset"),
-        "retry-only known IDs are library-scoped"
-    );
-}
-
-#[test]
 fn download_context_detects_downloaded_rows_missing_metadata_hashes() {
     let mut ctx = DownloadContext::default();
     ctx.downloaded_ids
@@ -818,39 +788,5 @@ fn should_download_fast_multiple_versions_independent() {
         ),
         Some(true),
         "changed MOV checksum should trigger re-download"
-    );
-}
-
-// ── Gap: retry_only mode filters new assets ──────────────────────
-
-#[test]
-fn download_context_retry_only_known_ids_filtering() {
-    let mut ctx = DownloadContext::default();
-    ctx.known_ids
-        .entry("PrimarySync".into())
-        .or_default()
-        .insert("previously_synced".into());
-
-    // Known asset: should_download_fast returns Some(true) (it needs
-    // download because it's not in downloaded_ids)
-    assert_eq!(
-        ctx.should_download_fast(
-            "PrimarySync",
-            "previously_synced",
-            VersionSizeKey::Original,
-            "ck",
-            true
-        ),
-        Some(true)
-    );
-    // The producer checks known_ids separately before forwarding:
-    assert!(ctx.is_known("PrimarySync", "previously_synced"));
-    assert!(
-        !ctx.is_known("PrimarySync", "brand_new_asset"),
-        "new asset should not be in known_ids in retry_only mode"
-    );
-    assert!(
-        !ctx.is_known("SharedSync-AAAA", "previously_synced"),
-        "same asset id in another library should stay retry-only-new"
     );
 }

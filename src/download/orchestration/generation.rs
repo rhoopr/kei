@@ -172,7 +172,6 @@ pub(crate) async fn context(
     controls: DownloadControls,
 ) -> Result<Option<SelectionContext>> {
     if !controls.run_mode.downloads_files()
-        || config.retry_only
         || passes.is_empty()
         || matches!(
             config.capture_timestamp_repair,

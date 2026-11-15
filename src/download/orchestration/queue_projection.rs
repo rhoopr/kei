@@ -44,7 +44,6 @@ fn work_context(
     // Selection that needs rank or membership evidence remains with its existing
     // owner. These observations are retained without an admission receipt.
     if !controls.run_mode.downloads_files()
-        || config.retry_only
         || config.refresh_metadata
         || !config.exclude_asset_ids.is_empty()
     {

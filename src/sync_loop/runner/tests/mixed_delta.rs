@@ -696,7 +696,6 @@ async fn inventory_cycle(
     let builder = |mode, excludes, groupings, zone| {
         let mut config = build(mode, excludes, groupings, zone);
         let selected = Arc::make_mut(&mut config);
-        selected.retry_only = step.retry;
         selected.refresh_metadata = step.full;
         config
     };

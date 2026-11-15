@@ -1241,19 +1241,11 @@ async fn queue_projection_lookup_failures_retain_fixed_debt_and_recover_current_
 
 #[tokio::test]
 async fn queue_projection_unsupported_selection_and_read_only_modes_do_not_publish() {
-    for fault in [
-        "retry_only",
-        "repair",
-        "album",
-        "exclude",
-        "dry_run",
-        "print",
-    ] {
+    for fault in ["repair", "album", "exclude", "dry_run", "print"] {
         let mut f = Fixture::new().await;
         f.capture(records("m", OLD, "source"), "old").await;
         let mut controls = controls();
         match fault {
-            "retry_only" => f.config.retry_only = true,
             "repair" => f.config.refresh_metadata = true,
             "album" => f.pass.kind = PassKind::Album,
             "exclude" => {
