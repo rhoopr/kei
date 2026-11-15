@@ -753,10 +753,10 @@ async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
         base_delay_secs: 0,
         max_delay_secs: 0,
     };
-    let result = run_download_pass(
-        PassConfig {
+    let result = plan
+        .execute(PassConfig {
             prior_auth_errors: 0,
-            url_obtained_at: plan.url_obtained_at,
+            url_obtained_at: Default::default(),
             client: &client,
             retry_config: &retry,
             metadata: MetadataFlags::default(),
@@ -766,15 +766,17 @@ async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
             temp_suffix: ".part".into(),
             shutdown_token: CancellationToken::new(),
             state_db: Some(db.clone()),
-            rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(7)),
             bandwidth_limiter: None,
             library: "PrimarySync".into(),
-        },
-        plan.tasks,
-    )
-    .await;
+        })
+        .await;
     assert_eq!(result.downloaded, 0);
     assert_eq!(result.failed.len(), 1);
+    assert_eq!(
+        result.rate_limit_observations, 0,
+        "prior pass observations must not be counted again"
+    );
     assert_eq!(std::fs::read(&path).unwrap(), b"external file edit");
     drop(db);
     let reopened = SqliteStateDb::open(&db_path).await.unwrap();

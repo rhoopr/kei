@@ -32,21 +32,19 @@ pub(super) async fn refresh_expired_download_pass(
         Some(retry_sources),
     )
     .await;
-    result.rate_limit_observations += plan.rate_limit_observations;
-    if !plan.tasks.is_empty() {
+    let provider_auth_errors = plan.provider_auth_errors;
+    if plan.tasks.is_empty() {
+        result.rate_limit_observations += plan.rate_limit_observations;
+    } else {
         tracing::info!(
             count = plan.tasks.len(),
             "Retrying tasks after targeted URL refresh"
         );
         config.prior_auth_errors = result.auth_errors;
-        config.url_obtained_at = plan.url_obtained_at;
-        // The initial pass has already reported its observations. A retry pass
-        // starts a separate counter even though the execution settings agree.
-        config.rate_limit_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let retried = run_download_pass(config, plan.tasks).await;
-        merge_expired_url_retry_result(result, candidates, retried);
+        let retried = plan.execute(config).await;
+        merge_expired_url_retry_result(result, retried);
     }
-    plan.provider_auth_errors
+    provider_auth_errors
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -86,6 +84,22 @@ pub(in crate::download) struct CleanupRetryPlan {
 }
 
 impl CleanupRetryPlan {
+    /// Execute this exact refresh once, retaining URL age and lookup accounting.
+    /// Callers keep provider authentication evidence separate from transfer errors.
+    #[must_use]
+    pub(in crate::download) async fn execute(self, mut config: PassConfig<'_>) -> PassResult {
+        config.url_obtained_at = self.url_obtained_at;
+        // The first pass already reported its observations. Retry execution
+        // uses a fresh counter even when its settings came from that pass.
+        config.rate_limit_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut result = run_download_pass(config, self.tasks).await;
+        // A lookup refusal is unfinished selected work, just like a failed
+        // transfer. Return both through the existing pass-result owner.
+        result.failed.extend(self.unrefreshed);
+        result.rate_limit_observations += self.rate_limit_observations;
+        result
+    }
+
     fn observe_lookup(&mut self, batch: &RecordResolutionBatch) {
         self.rate_limit_observations = self
             .rate_limit_observations
@@ -380,7 +394,6 @@ pub(in crate::download) async fn refresh_failed_download_urls(
 
 pub(super) fn merge_expired_url_retry_result(
     pass_result: &mut PassResult,
-    expired_retry_candidates: Vec<DownloadTask>,
     retry_result: PassResult,
 ) {
     let downloaded_keys: FxHashSet<_> = retry_result
@@ -391,7 +404,6 @@ pub(super) fn merge_expired_url_retry_result(
     let mut still_failed: Vec<_> = pass_result
         .failed
         .drain(..)
-        .chain(expired_retry_candidates)
         .filter(|task| !downloaded_keys.contains(&RetryTaskKey::from(task)))
         .collect();
     still_failed.extend(retry_result.failed);
