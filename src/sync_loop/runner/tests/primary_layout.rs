@@ -462,6 +462,67 @@ async fn startup_archive_adoption_flows_into_managed_sync_without_downloads() {
 }
 
 #[tokio::test]
+async fn primary_layout_cloud_filename_change_keeps_bound_rendition_paths() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let initial = records(&server, Some(("edit-one", EDIT_ONE)));
+    let (first, _) = cycle(root.path(), initial.clone(), false, EditedNaming::Suffix).await;
+    assert_eq!(first.failed_count, 0, "{:?}", first.stats);
+    let media = root.path().join("media");
+    let before: Vec<_> = std::fs::read_dir(&media)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file())
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    assert_eq!(before.len(), 2);
+    let requests = server.received_requests().await.unwrap().len();
+    assert_eq!(requests, 2);
+    let mut renamed = initial;
+    renamed[0]["fields"]["filenameEnc"]["value"] = json!("RENAMED.JPG");
+    let (preview, _) = cycle_options(
+        root.path(),
+        renamed.clone(),
+        false,
+        EditedNaming::Suffix,
+        CycleOptions {
+            controls: download::DownloadControls::dry_run_hidden(),
+            ..CycleOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(preview.failed_count, 0, "{:?}", preview.stats);
+    for quiet in [false, true, true] {
+        let (result, _) = cycle(root.path(), renamed.clone(), quiet, EditedNaming::Suffix).await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+        assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+        for (path, bytes) in &before {
+            assert_bytes(path, bytes);
+        }
+        assert!(!media.join("RENAMED.JPG").exists());
+        assert_eq!(
+            std::fs::read_dir(&media)
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().path().is_file())
+                .count(),
+            2
+        );
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM assets WHERE status='downloaded'"
+        ),
+        2
+    );
+}
+
+#[tokio::test]
 async fn contract_file_publish_no_overwrite_primary_layout_edits_revert_and_quiet_reopen() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();

@@ -250,7 +250,7 @@ impl TaskPlanner {
         }
     }
 
-    /// Accept only a current-content receipt in this pass's filename family.
+    /// Accept a current-content receipt in this pass's directory or filename family.
     /// Additional copies and legacy numbered companions require exact local hashes.
     pub(super) async fn verified_downloaded_path(
         &self,
@@ -293,14 +293,18 @@ impl TaskPlanner {
             {
                 continue;
             }
+            // A recorded rendition may keep its filename within this pass's
+            // directory when the provider renames it. Content-generation,
+            // exclusive ownership and local-receipt checks still apply below.
             if record.checksum != derived.checksum.as_ref()
-                || !super::filter::stored_path_matches_download_family(
-                    asset.state_id(),
-                    derived,
-                    &derived_paths,
-                    config,
-                    path,
-                )
+                || !(path.parent() == derived.path.parent()
+                    || super::filter::stored_path_matches_download_family(
+                        asset.state_id(),
+                        derived,
+                        &derived_paths,
+                        config,
+                        path,
+                    ))
                 || !self.retry_path_allowed(
                     &owner.library,
                     &owner.asset_id,

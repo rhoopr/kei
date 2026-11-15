@@ -1389,6 +1389,8 @@ Request retirement writes no source checkpoint. A fixed-date selection can compl
 
 ### Download and publication
 
+`TaskPlanner::verified_downloaded_path` retains an existing recorded filename when the provider renames the same rendition within the current pass directory. Reuse still requires the same provider content generation, exclusive recorded ownership, an allowed destination and the recorded local checksum. A changed cloud filename alone does not create another local copy. Cross-directory template changes and missing-file destination recovery remain separate decisions.
+
 ```text
 PhotoAsset
   -> planner::TaskPlanner
