@@ -1130,8 +1130,14 @@ pub(crate) async fn run_import_existing(
         &auth_result.data,
     )?;
     let db = Arc::new(
-        state::SqliteStateDb::open_owned_with_config(&db_path, &owner, &globals.config_source)
-            .await?,
+        state::db::account::open_sync_state(
+            &cookie_directory,
+            &username,
+            domain.as_str(),
+            &owner,
+            &globals.config_source,
+        )
+        .await?,
     );
     tracing::debug!(path = %db_path.display(), "State database opened");
 

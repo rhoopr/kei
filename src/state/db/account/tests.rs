@@ -1,6 +1,87 @@
 use super::{AccountOwner, adopt_legacy, state_path};
 use crate::state::{SqliteStateDb, error::StateError};
 
+#[tokio::test]
+async fn sync_startup_refuses_unproven_identity_before_creating_state() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("not-created");
+    let config = crate::config::ConfigSource::Absent {
+        path: root.path().join("config.toml"),
+    };
+    for identity in [
+        AccountOwner::configured("synthetic@example.invalid", "com"),
+        owner("other@example.invalid", "com", "provider"),
+    ] {
+        let result = super::open_sync_state(
+            &directory,
+            "synthetic@example.invalid",
+            "com",
+            &identity,
+            &config,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(StateError::AccountIdentityUnavailable | StateError::AccountOwnerMismatch)
+        ));
+        assert!(!directory.exists());
+    }
+}
+
+#[tokio::test]
+async fn sync_startup_reopens_owned_state_and_preserves_unowned_legacy_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let config = crate::config::ConfigSource::Absent {
+        path: root.path().join("config.toml"),
+    };
+    let identity = owner("synthetic@example.invalid", "com", "provider");
+    let legacy = root.path().join(format!(
+        "{}.db",
+        crate::auth::session::sanitize_username("synthetic@example.invalid")
+    ));
+    std::fs::write(&legacy, b"unowned legacy evidence").unwrap();
+    assert!(matches!(
+        super::open_sync_state(
+            root.path(),
+            "synthetic@example.invalid",
+            "com",
+            &identity,
+            &config
+        )
+        .await,
+        Err(StateError::LegacyAccountMigrationRequired)
+    ));
+    assert_eq!(std::fs::read(&legacy).unwrap(), b"unowned legacy evidence");
+    let fresh = root.path().join("fresh");
+    let db = super::open_sync_state(
+        &fresh,
+        "synthetic@example.invalid",
+        "com",
+        &identity,
+        &config,
+    )
+    .await
+    .unwrap();
+    db.set_metadata("startup-canary", "retained").await.unwrap();
+    drop(db);
+    for _ in 0..2 {
+        let db = super::open_sync_state(
+            &fresh,
+            "synthetic@example.invalid",
+            "com",
+            &identity,
+            &config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_metadata("startup-canary").await.unwrap().as_deref(),
+            Some("retained")
+        );
+    }
+    assert_eq!(std::fs::read(&legacy).unwrap(), b"unowned legacy evidence");
+}
+
 // A separate test process exits without dropping its connection, leaving the
 // same WAL/SHM state as an interrupted process. This uses no external runtime.
 #[test]

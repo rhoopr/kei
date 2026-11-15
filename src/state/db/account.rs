@@ -213,6 +213,26 @@ pub(crate) async fn state_path(
     Ok(path)
 }
 
+/// Resolve and open authenticated sync/import state through one startup boundary.
+/// Identity refusal precedes directory creation; schema upgrades retain the
+/// loaded configuration through the existing durable backup owner.
+pub(crate) async fn open_sync_state(
+    directory: &Path,
+    username: &str,
+    realm: &str,
+    owner: &AccountOwner,
+    config: &crate::config::ConfigSource,
+) -> Result<super::SqliteStateDb, StateError> {
+    if owner.key != crate::account::namespace(username, realm) {
+        return Err(StateError::AccountOwnerMismatch);
+    }
+    if owner.provider.is_none() {
+        return Err(StateError::AccountIdentityUnavailable);
+    }
+    let path = state_path(directory, username, realm).await?;
+    super::SqliteStateDb::open_owned_with_config(&path, owner, config).await
+}
+
 /// Copy a confirmed legacy snapshot, bind the staged copy and publish without
 /// replacement. Source rows, checkpoints, debt and SQLite companions remain.
 pub(crate) async fn adopt_legacy(

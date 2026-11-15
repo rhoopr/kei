@@ -310,14 +310,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let state_db: Option<Arc<dyn download::DownloadStore>> = if config.runtime.dry_run {
         None
     } else {
-        let db_path = state::db::account::state_path(
+        match state::db::account::open_sync_state(
             &config.auth.cookie_directory,
             &config.auth.username,
             config.auth.domain.as_str(),
-        )
-        .await?;
-        match state::SqliteStateDb::open_owned_with_config(
-            &db_path,
             account_owner
                 .as_ref()
                 .ok_or(state::error::StateError::AccountIdentityUnavailable)?,
@@ -326,7 +322,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .await
         {
             Ok(db) => {
-                tracing::debug!(path = %db_path.display(), "State database opened");
+                tracing::debug!("Account state database opened");
                 let db = Arc::new(db);
                 photos_service.set_shadow_capture(
                     crate::icloud::photos::inbox::ShadowCapture::new(
@@ -395,7 +391,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 Some(db as Arc<dyn download::DownloadStore>)
             }
             Err(e) => {
-                anyhow::bail!("Could not open state database {}: {e}", db_path.display());
+                anyhow::bail!("Could not open account state database: {e}");
             }
         }
     };
