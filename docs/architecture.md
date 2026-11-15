@@ -1115,7 +1115,7 @@ bounded deferred finalization. Each attempt revalidates both identity and the
 publication fingerprint. Changes observed at revalidation retain the media and
 pending debt instead of committing stale verified provenance. Retained ownership
 and revalidation do not atomically exclude arbitrary Unix changes after the last
-validation while a database write awaits execution. Cleanup re-enumeration and
+validation while a database write awaits execution. Targeted cleanup and
 collecting incremental dispatch preserve the affected task's proof requirement;
 cleanup also requires the original failed generation's checksum and size.
 Equivalent root spelling is rebased component-wise using platform ownership keys;
@@ -1395,6 +1395,8 @@ For captured selection generations, `verified_selection_paths` returns the retai
 `TaskPlanner::recorded_selection_path` owns that retained-path choice, alongside receipt reuse and retry-path resolution. Generation projection supplies authenticated scope/pass evidence and keeps authority over frozen decisions and admission. The planner preserves confinement, protected-path checks and local completion proof validation. Managed publication paths remain with the layout owner.
 
 Pending recovery and collected incremental execution share `url_refresh::refresh_expired_download_pass` for one exact-task refresh, execution and result merge. Their cycle-specific failure gates run before calling it. The shared owner carries prior authentication failures and fresh URL timestamps into the retry, starts a separate rate-limit counter and merges only the expired candidate results. Provider authentication failures return separately to checkpoint reporting.
+
+Streaming cleanup uses the same exact-task lookup owner for ordinary transfer failures and expired URLs. It no longer re-enumerates albums or replans failed destinations. Refreshed records must match the selected rendition's content generation; the task retains its original path, metadata and publication authorization. Unmatched work remains pending. Cleanup still runs within the existing bounded pass and authentication/cancellation gates.
 
 The CLI rejects the retired `--retry-failed` flag before configuration, authentication or state startup. Ordinary sync owns automatic retry. The runner no longer resets failed rows or exits early through a separate retry-only startup path; regular dispatch retains its existing pending-work preparation.
 

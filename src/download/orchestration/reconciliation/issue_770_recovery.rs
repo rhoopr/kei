@@ -1941,7 +1941,7 @@ async fn issue_770_recovery_case_equivalent_root_replays_absence_and_durable_pro
 }
 
 #[tokio::test]
-async fn issue_770_recovery_enumerated_cleanup_preserves_required_publication_proof() {
+async fn issue_770_recovery_targeted_cleanup_preserves_required_publication_proof() {
     let server = crate::start_wiremock_or_skip!();
     let fixture = RecoveryFixture::new(&server).await;
     Mock::given(method("GET"))
@@ -1980,41 +1980,30 @@ async fn issue_770_recovery_enumerated_cleanup_preserves_required_publication_pr
         "",
         Box::new(RecoveryLookupSession {
             records: Arc::new(fixture.records.clone()),
-            enumerate: true,
+            enumerate: false,
         }),
     );
-    for mode in [
-        crate::download::CleanupUrlRefresh::Enumerate,
-        crate::download::CleanupUrlRefresh::Lookup,
-    ] {
-        let retry = crate::download::build_retry_download_tasks(
-            &[pass.clone()],
-            &config,
-            &failed,
-            mode,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(retry.tasks.len(), 1);
-        assert_eq!(retry.tasks[0].download_path, failed[0].download_path);
-        assert_eq!(
-            retry.tasks[0].pending_cross_parent_root, failed[0].pending_cross_parent_root,
-            "both cleanup routes must retain the affected task's required publication proof"
-        );
-    }
+    let retry = crate::download::build_retry_download_tasks(
+        &[pass.clone()],
+        &failed,
+        CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(retry.tasks.len(), 1);
+    assert_eq!(retry.tasks[0].download_path, failed[0].download_path);
+    assert_eq!(
+        retry.tasks[0].pending_cross_parent_root, failed[0].pending_cross_parent_root,
+        "targeted cleanup must retain the affected task's required publication proof"
+    );
     // Ordinary failures retain their ordinary finalization policy.
     let mut ordinary = failed.clone();
     ordinary[0].pending_cross_parent_root = None;
     let retry = crate::download::build_retry_download_tasks(
         &[pass.clone()],
-        &config,
         &ordinary,
-        crate::download::CleanupUrlRefresh::Enumerate,
         CancellationToken::new(),
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(retry.tasks.len(), 1);
     assert!(retry.tasks[0].pending_cross_parent_root.is_none());
     for changed_size in [false, true] {
@@ -2031,7 +2020,7 @@ async fn issue_770_recovery_enumerated_cleanup_preserves_required_publication_pr
             "",
             Box::new(RecoveryLookupSession {
                 records: Arc::new(records.clone()),
-                enumerate: true,
+                enumerate: false,
             }),
         );
         // Bypass saved-generation reservation refusal to test cleanup's own
@@ -2048,13 +2037,10 @@ async fn issue_770_recovery_enumerated_cleanup_preserves_required_publication_pr
         assert_eq!(plan.tasks[0].download_path, failed[0].download_path);
         let retry = crate::download::build_retry_download_tasks(
             &[changed_pass],
-            &fresh_config,
             &failed,
-            crate::download::CleanupUrlRefresh::Enumerate,
             CancellationToken::new(),
         )
-        .await
-        .unwrap();
+        .await;
         assert!(
             retry.tasks.is_empty(),
             "old failure cannot authorize changed provider content"

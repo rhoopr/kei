@@ -17,9 +17,8 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::commands::{AlbumPass, PassKind};
-use crate::download::filter::DownloadTask;
 use crate::icloud::photos::PhotosSession;
-use crate::state::{SqliteStateDb, VersionSizeKey};
+use crate::state::SqliteStateDb;
 use crate::test_helpers::MockPhotosFlow;
 
 use super::super::dispatch::download_photos_with_sync;
@@ -27,46 +26,9 @@ use super::super::incremental::download_photos_incremental_collecting_inner;
 use super::super::models::{DownloadControls, DownloadOutcome, SyncMode};
 use super::super::test_support::{
     album_with_session, album_with_session_and_container, changes_zone_response,
-    incremental_photo_records_with_url, mock_album, relation_delta_record, retry_test_task,
+    incremental_photo_records_with_url, mock_album, relation_delta_record,
     seed_complete_album_snapshot, test_config,
 };
-use super::{RetryTaskKey, take_matching_retry_tasks};
-
-#[test]
-fn cleanup_retry_filter_keeps_only_exact_failed_task_keys() {
-    let failed = retry_test_task("ASSET_A", VersionSizeKey::Original, "a.jpg");
-    let matching_refresh = DownloadTask {
-        url: "https://p01.icloud-content.com/fresh-a".into(),
-        ..failed.clone()
-    };
-    let wrong_version = retry_test_task("ASSET_A", VersionSizeKey::Medium, "a.jpg");
-    let wrong_path = retry_test_task("ASSET_A", VersionSizeKey::Original, "elsewhere/a.jpg");
-    let unrelated = retry_test_task("ASSET_B", VersionSizeKey::Original, "b.jpg");
-    let mut pending_keys: FxHashSet<RetryTaskKey> =
-        std::iter::once(RetryTaskKey::from(&failed)).collect();
-    let mut out = Vec::new();
-
-    take_matching_retry_tasks(
-        vec![
-            wrong_version,
-            wrong_path,
-            unrelated,
-            matching_refresh.clone(),
-        ],
-        &mut pending_keys,
-        &mut out,
-    );
-
-    assert!(pending_keys.is_empty());
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].asset_id.as_ref(), "ASSET_A");
-    assert_eq!(out[0].version_size, VersionSizeKey::Original);
-    assert_eq!(out[0].download_path, matching_refresh.download_path);
-    assert_eq!(
-        out[0].url.as_ref(),
-        "https://p01.icloud-content.com/fresh-a"
-    );
-}
 
 #[derive(Clone, Debug)]
 struct SharedChangesZoneSession {
@@ -882,7 +844,7 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
 }
 
 #[tokio::test]
-async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
+async fn full_failed_task_cleanup_is_targeted_bounded_and_durable() {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -937,6 +899,7 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
     }
 
     for recovery in [
+        "transfer_failure",
         "fresh",
         "album_fresh",
         "album_unfiled",
@@ -956,14 +919,23 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
         let (capture, _guard) = TracingCapture::install();
         let downloads = matches!(
             recovery,
-            "fresh" | "album_fresh" | "album_unfiled" | "rate_asset" | "rate_master"
+            "transfer_failure"
+                | "fresh"
+                | "album_fresh"
+                | "album_unfiled"
+                | "rate_asset"
+                | "rate_master"
         );
         let shutdown = CancellationToken::new();
         let server = crate::start_wiremock_or_skip!();
         let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
         Mock::given(method("GET"))
             .and(path("/old.jpg"))
-            .respond_with(ResponseTemplate::new(410))
+            .respond_with(ResponseTemplate::new(if recovery == "transfer_failure" {
+                503
+            } else {
+                410
+            }))
             .expect(1)
             .mount(&server)
             .await;
@@ -1035,6 +1007,7 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
         let db_path = dir.path().join("state.db");
         let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
         let mut config = test_config();
+        config.retry.max_retries = 0;
         config.directory = Arc::from(dir.path().join("media"));
         config.state_db = Some(db.clone());
         if recovery.starts_with("album_") {
@@ -1046,7 +1019,7 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
             &passes[0]
         };
         let stream_config = Arc::new(config.with_pass(source_pass));
-        let config = Arc::new(config);
+        let mut config = Arc::new(config);
         let client = Client::new();
         let controls = DownloadControls::download_hidden();
         let streaming = pipeline::stream_and_download_from_stream(
@@ -1060,7 +1033,10 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
         )
         .await
         .unwrap();
-        assert!(streaming.url_expired_abort);
+        assert_eq!(streaming.url_expired_abort, recovery != "transfer_failure");
+        if recovery == "transfer_failure" {
+            Arc::make_mut(&mut config).folder_structure = "changed-template".into();
+        }
         let original_path = streaming.failed[0].download_path.clone();
         if recovery == "album_cancelled" {
             shutdown.cancel();
@@ -1077,7 +1053,9 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
         .await
         .unwrap();
         assert!(
-            if recovery.starts_with("auth_") {
+            if recovery == "transfer_failure" {
+                matches!(outcome, DownloadOutcome::Success)
+            } else if recovery.starts_with("auth_") {
                 matches!(outcome, DownloadOutcome::SessionExpired { .. })
             } else {
                 matches!(outcome, DownloadOutcome::PartialFailure { .. })
@@ -1094,7 +1072,7 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
         assert_eq!(
             stats.rate_limited,
             match recovery {
-                "rate_asset" | "rate_master" => 1,
+                "transfer_failure" | "rate_asset" | "rate_master" => 1,
                 "exhausted_asset" | "exhausted_master" => 2,
                 _ => 0,
             }
@@ -1140,6 +1118,7 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
             let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].local_path.as_ref(), Some(&original_path));
+            assert!(!config.directory.join("changed-template").exists());
             if recovery == "album_fresh" {
                 assert!(original_path.starts_with(config.directory.join("Album A")));
                 assert!(!config.directory.join("full-expired.jpg").exists());
@@ -1151,19 +1130,25 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
                 std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
                 body
             );
-            let stable = pipeline::stream_and_download_from_stream(
-                &client,
-                futures_util::stream::iter(vec![Ok(fresh_asset)]),
-                &stream_config,
-                controls,
-                1,
-                CancellationToken::new(),
-                pipeline::StreamRuntime::new(None, None),
-            )
-            .await
-            .unwrap();
-            assert_eq!(stable.downloaded, 0);
-            assert!(stable.failed.is_empty());
+            for _ in 0..2 {
+                let mut stable_config = stream_config.as_ref().clone();
+                stable_config.state_db =
+                    Some(Arc::new(SqliteStateDb::open(&db_path).await.unwrap()));
+                let stable = pipeline::stream_and_download_from_stream(
+                    &client,
+                    futures_util::stream::iter(vec![Ok(fresh_asset.clone())]),
+                    &Arc::new(stable_config),
+                    controls,
+                    1,
+                    CancellationToken::new(),
+                    pipeline::StreamRuntime::new(None, None),
+                )
+                .await
+                .unwrap();
+                assert_eq!(stable.downloaded, 0);
+                assert!(stable.failed.is_empty());
+                assert_eq!(std::fs::read(&original_path).unwrap(), body);
+            }
         } else {
             assert_eq!(
                 summary.pending + summary.failed,

@@ -250,8 +250,7 @@ impl PhotoAlbum {
         Self::fetch_len_many(albums).await
     }
 
-    /// Convenience wrapper over `photo_stream()` that collects all assets
-    /// into a `Vec`. Prefer `photo_stream()` when memory is a concern.
+    /// Test collector over the production stream, including its panic receipt.
     ///
     /// Fetcher panics are surfaced as an `Err` so the caller cannot mistake
     /// a truncated enumeration for a complete one. Propagating the real
@@ -259,6 +258,7 @@ impl PhotoAlbum {
     /// sentinel string is enough for the operator to know the enumeration
     /// was incomplete and to correlate with the fetcher's prior
     /// `tracing::error!` log line.
+    #[cfg(test)]
     pub async fn photos(&self, limit: Option<u32>) -> anyhow::Result<Vec<PhotoAsset>> {
         use tokio_stream::StreamExt;
         let (stream, panic_rx) = self.photo_stream(limit, None, 1);
