@@ -288,10 +288,57 @@ impl PendingRetryPlanning<'_> {
                 .filter(|target| target.asset_id.as_ref() == state_id)
                 .cloned()
                 .collect();
+            let mut completed_peers = FxHashSet::default();
             for target in targets {
                 let Some(evidence) = self.pending_evidence.get(&target) else {
                     continue;
                 };
+                // A completed copy cannot retire a rendition while a later
+                // currently selected pass still needs its own destination.
+                let current_copy = if evidence.downloaded_at.is_some()
+                    && plan.tasks.iter().any(|task| {
+                        task.version_size == target.version_size
+                            && evidence.matches_provider_version(task)
+                    })
+                    && let Some(file) = &evidence.local_file
+                {
+                    pipeline::recorded_current_path_exists(
+                        pass_config,
+                        asset,
+                        target.version_size,
+                        self.task_planner,
+                        file,
+                    )
+                    .await
+                } else {
+                    None
+                };
+                if current_copy.is_some()
+                    || self
+                        .task_planner
+                        .verified_downloaded_path(asset, pass_config, target.version_size)
+                        .await
+                        .is_some()
+                {
+                    for other in self.pass_configs.iter().skip(pass_index + 1) {
+                        if filter::is_asset_filtered(asset, other.as_ref()).is_none()
+                            && filter::derive_expected_paths(asset, other.as_ref())
+                                .iter()
+                                .any(|path| path.version_size == target.version_size)
+                            && self
+                                .task_planner
+                                .verified_downloaded_path(asset, other, target.version_size)
+                                .await
+                                .is_none()
+                        {
+                            completed_peers.insert(target.clone());
+                            break;
+                        }
+                    }
+                }
+                if completed_peers.contains(&target) {
+                    continue;
+                }
                 let recovered = if self.run_mode.downloads_files()
                     && plan.filter_reason.is_none()
                     && plan.malformed_resource.is_none()
@@ -377,6 +424,7 @@ impl PendingRetryPlanning<'_> {
             let mut retry_tasks = Vec::with_capacity(plan.tasks.len());
             for task in plan.tasks.into_iter().filter(|task| {
                 !state_write_failed_targets.contains(&PendingRetryTarget::from_task(task))
+                    && !completed_peers.contains(&PendingRetryTarget::from_task(task))
             }) {
                 let target = PendingRetryTarget::from_task(&task);
                 if let Some(task) = self

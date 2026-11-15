@@ -2779,7 +2779,14 @@ fn destination_pass_with(
     capture: &ShadowCapture,
     name: &str,
 ) -> AlbumPass {
-    let mut album = PhotoAlbum::new(
+    let mut pass = uncaptured_destination_pass(session, name);
+    pass.album
+        .set_shadow_capture(capture.clone(), Arc::from("private"));
+    pass
+}
+
+fn uncaptured_destination_pass(session: &CurrentSession, name: &str) -> AlbumPass {
+    let album = PhotoAlbum::new(
         PhotoAlbumConfig {
             params: Arc::new(std::collections::HashMap::new()),
             service_endpoint: Arc::from("https://example.invalid"),
@@ -2799,7 +2806,6 @@ fn destination_pass_with(
         },
         Box::new(DestinationSelectionSession(session.clone())),
     );
-    album.set_shadow_capture(capture.clone(), Arc::from("private"));
     AlbumPass {
         kind: PassKind::Album,
         album,
@@ -5550,6 +5556,150 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
             assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), before_ranks);
         }
         f.preserved().await;
+    }
+}
+
+#[tokio::test]
+async fn selected_destination_retry_does_not_resurrect_historical_reservations() {
+    selected_destination_retry_fixture(true).await;
+}
+
+#[tokio::test]
+async fn ordinary_destination_retry_does_not_resurrect_historical_reservations() {
+    selected_destination_retry_fixture(false).await;
+}
+
+async fn selected_destination_retry_fixture(captured: bool) {
+    let (trace, _guard) = crate::test_helpers::TracingCapture::install();
+    use crate::state::ReconciliationStateStore;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let bytes = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
+    let checksum = data_encoding::BASE64.encode(&Sha256::digest(bytes));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let requests = calls.clone();
+    let fail = failing.clone();
+    Mock::given(method("GET"))
+        .respond_with(move |_: &wiremock::Request| {
+            let ordinal = requests.fetch_add(1, Ordering::SeqCst);
+            if ordinal > 0 && fail.load(Ordering::SeqCst) {
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200).set_body_bytes(bytes)
+            }
+        })
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("{album}");
+    f.config.retry.max_retries = 0;
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/media",server.uri()),"size":bytes.len(),"fileChecksum":checksum});
+    let historical = f.config.directory.join("historical/never-recreate.JPG");
+    std::fs::create_dir_all(historical.parent().unwrap()).unwrap();
+    let retained = historical.with_file_name("retained.bin");
+    std::fs::write(&retained, b"historical bytes").unwrap();
+    let key = crate::state::ReconciliationPathKey(
+        crate::fs_util::confined_path_key(&historical).unwrap(),
+    );
+    let reservation = crate::state::ReconciliationReservation {
+        library: Arc::from("PrimarySync"),
+        asset_id: "asset-m".into(),
+        version_size: VersionSizeKey::Original,
+        content: Some(crate::state::ReconciliationContent {
+            checksum: checksum.clone().into(),
+            size: bytes.len() as u64,
+        }),
+        requested_path_key: key.clone(),
+        destination_path_key: key,
+        destination_path: historical.clone(),
+    };
+    f.db.reserve_reconciliation_paths(std::slice::from_ref(&reservation))
+        .await
+        .unwrap();
+    let mut completed_path = None;
+    for round in 0..4 {
+        if round > 0 {
+            f = reopen_destination_fixture(f).await;
+            failing.store(false, Ordering::SeqCst);
+        }
+        let before = calls.load(Ordering::SeqCst);
+        let passes = if captured {
+            [destination_pass(&f, "A"), destination_pass(&f, "B")]
+        } else {
+            [
+                uncaptured_destination_pass(&f.session, "A"),
+                uncaptured_destination_pass(&f.session, "B"),
+            ]
+        };
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &passes,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.stats.downloaded,
+            usize::from(round < 2),
+            "captured={captured} round {round}: {result:?}\n{:?}",
+            trace.events()
+        );
+        let paths = [
+            f.config.directory.join("A/changed.JPG"),
+            f.config.directory.join("B/changed.JPG"),
+        ];
+        if round == 0 {
+            assert!(matches!(
+                result.outcome,
+                crate::download::DownloadOutcome::PartialFailure { .. }
+            ));
+            if captured {
+                assert!(result.checkpoint.sync_token_blocked);
+                assert!(result.sync_token.is_none());
+            }
+            let existing: Vec<_> = paths.iter().filter(|path| path.exists()).cloned().collect();
+            assert_eq!(existing.len(), 1);
+            completed_path = Some(existing[0].clone());
+        } else {
+            assert_eq!(
+                calls.load(Ordering::SeqCst) - before,
+                usize::from(round == 1)
+            );
+            for path in &paths {
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+        }
+        assert_eq!(
+            std::fs::read(completed_path.as_ref().unwrap()).unwrap(),
+            bytes
+        );
+        assert!(!historical.exists());
+        assert_eq!(std::fs::read(&retained).unwrap(), b"historical bytes");
+        assert!(
+            f.db.get_reconciliation_reservations()
+                .await
+                .unwrap()
+                .contains(&reservation)
+        );
+        if captured {
+            assert_eq!(
+                f.db.acquire_lock("current destination obligations")
+                    .unwrap()
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM provider_active_destinations WHERE verified_media=0",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                i64::from(round == 0)
+            );
+        }
     }
 }
 

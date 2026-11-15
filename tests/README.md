@@ -734,6 +734,8 @@ These requirements do not retire raw-inbox limits, all-generation provider-work 
 
 ## State-transition proof
 
+`cargo test --lib destination_retry_does_not_resurrect_historical_reservations` runs the same two-album partial-transfer scenario through captured selection and ordinary dispatch. One copy completes, the other fails, and an unselected same-content historical reservation points to an absent file. After SQLite reopen with a quiet provider delta, only the failed selected copy downloads. Two further reopens make zero media requests. Both selected copies have the expected bytes, the historical reservation remains exact, unrelated historical bytes stay untouched and the historical missing file is not recreated.
+
 `refused_recorded_destination_remains_pending_across_reopen` exercises the retry planner with a recorded truncated file and a competing in-flight path claim. Refusal preserves pending state through two database reopens, including path, attempt count, repair reason and bytes. Removing the competing claim permits the recorded repair task and clears its transient marker. This proves retry admission; the publication/recovery suite covers subsequent transfer and publication safety.
 
 `inventory_initial_delta_failure_cannot_advance_before_inventory_qualifies` retains the provider cursor after a transfer failure, then seeds 100 historical attempts and reopens through the production runner. Recovery completes only the failed media, preserves completed peers and reaches two quiet cycles. The real-CLI retired-setting matrix checks `per_asset` values zero, ten, one hundred and malformed text, with unchanged config/state/media and zero provider requests.

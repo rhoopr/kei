@@ -397,17 +397,24 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
     // reserved sibling was published but finalization failed. Its immutable
     // content-specific reservation and verified bytes permit adoption; the old
     // recorded file still cannot stand in for the new provider generation.
+    let mut has_reserved_destination = false;
     for task in planned_tasks.iter().filter(|task| {
         task.version_size == evidence.version_size
             && task.checksum.as_ref() == evidence.checksum
             && task.size == evidence.size
     }) {
-        if task_planner.has_durable_destination(task)
-            && let Some(adoption) =
+        if task_planner.has_durable_destination(task) {
+            has_reserved_destination = true;
+            if let Some(adoption) =
                 adopt_pending_task_path(db, config, asset, task_planner, task, None).await
-        {
-            return Ok(adoption.into());
+            {
+                return Ok(adoption.into());
+            }
         }
+    }
+    // An older catalog copy is not completion of this selected reservation.
+    if has_reserved_destination {
+        return Ok(PendingRetryAdoption::NotFound);
     }
     if matches!(evidence.local_path, PendingRetryLocalPath::Historical) {
         return Ok(PendingRetryAdoption::NotFound);
