@@ -19,7 +19,7 @@ use super::models::{
 };
 use crate::commands::{AlbumPass, PassKind};
 use crate::download::filter;
-use crate::download::planner::{AssetTaskPlan, TaskPlanner};
+use crate::download::planner::{AssetTaskPlan, SelectionPathEvidence, TaskPlanner};
 use crate::icloud::photos::{
     PhotoAlbum, PhotoAsset, current_asset, inbox::ShadowCapture, same_selected_facts,
 };
@@ -656,80 +656,20 @@ impl SelectionRun {
                     frozen_key(derived.version_size, &derived.checksum, derived.size)?;
             }
             for derived in &derived_paths {
-                let mut retained = None;
-                let candidates = self
-                    .capture
-                    .db
-                    .verified_selection_paths(
-                        self.capture.owner.clone(),
-                        self.root.spec.scope.clone(),
-                        key.to_owned(),
-                        asset.asset_record_name().to_owned(),
-                        asset.id().to_owned(),
-                        derived.version_size.as_str().to_owned(),
-                        (derived.checksum.to_string(), derived.size),
+                let retained = planner
+                    .recorded_selection_path(
+                        asset,
+                        config,
+                        derived,
+                        &derived_paths,
+                        &SelectionPathEvidence {
+                            db: self.capture.db.as_ref(),
+                            owner: &self.capture.owner,
+                            scope: &self.root.spec.scope,
+                            pass_key: key,
+                        },
                     )
                     .await?;
-                for (previous_key, candidate) in candidates {
-                    let path = candidate.to_path();
-                    if previous_key == key
-                        && tokio::fs::symlink_metadata(&path)
-                            .await
-                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                        && let Ok(path) =
-                            crate::fs_util::reserved_path_under_root(&config.directory, &path)
-                        && planner.retry_path_allowed(
-                            asset.source_zone().unwrap_or(&config.library),
-                            asset.state_id(),
-                            derived.version_size,
-                            &derived.checksum,
-                            derived.size,
-                            &path,
-                        )
-                        && crate::download::legacy_preservation::current_path_is_independent(
-                            self.capture.db.as_ref(),
-                            &path,
-                        )
-                        .await?
-                    {
-                        retained = Some(path);
-                        break;
-                    }
-                    // Published destinations belong to their pass, not the
-                    // latest rendering of its folder template or filename.
-                    if (previous_key == key
-                        || filter::stored_path_matches_download_family(
-                            asset.state_id(),
-                            derived,
-                            &derived_paths,
-                            config,
-                            &path,
-                        ))
-                        && let Ok(fingerprint) = crate::download::file::fingerprint_downloaded_path(
-                            &config.directory,
-                            &path,
-                        )
-                        .await
-                        && self
-                            .capture
-                            .db
-                            .selection_path_matches_local(
-                                self.capture.owner.clone(),
-                                self.root.spec.scope.clone(),
-                                key.to_owned(),
-                                asset.asset_record_name().to_owned(),
-                                candidate.clone(),
-                                (
-                                    data_encoding::HEXLOWER.encode(&fingerprint.sha256),
-                                    fingerprint.size,
-                                ),
-                            )
-                            .await?
-                    {
-                        retained = Some(path);
-                        break;
-                    }
-                }
                 let path = if planner.managed_layout_session().is_some() {
                     plan.tasks
                         .iter()

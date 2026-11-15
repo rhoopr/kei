@@ -5511,6 +5511,33 @@ async fn private_multi_destination_raw_edited_alternative_and_companion_failure_
             }
         }
         assert_eq!(f.db.acquire_lock("asset versus physical rendition oracle").unwrap().query_row::<(i64,i64),_,_>("SELECT count(DISTINCT child),count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap(),(2,10));
+        // A new configuration generation must keep each album's established
+        // copies, including both Live Photo components, at their recorded paths.
+        f.config.folder_structure_albums = Arc::from("new-template/{album}");
+        f = reopen_destination_fixture(f).await;
+        let changed = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &[destination_pass(&f, "A"), destination_pass(&f, "B")],
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed.stats.downloaded, 0, "{policy:?}: {changed:?}");
+        assert!(!f.config.directory.join("new-template").exists());
+        for album in ["A", "B"] {
+            for (name, bytes) in names.iter().copied().chain([
+                ("r_edited.JPG", edited.as_slice()),
+                ("l.JPG", jpeg.as_slice()),
+                ("l.MOV", movie.as_slice()),
+            ]) {
+                assert_eq!(
+                    std::fs::read(f.config.directory.join(album).join(name)).unwrap(),
+                    bytes
+                );
+            }
+        }
         let lookups = f.session.calls.load(Ordering::SeqCst);
         let ranks = f.session.rank_calls.load(Ordering::SeqCst);
         for _ in 0..2 {

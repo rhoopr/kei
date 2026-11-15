@@ -28,6 +28,14 @@ struct ReconciliationOwner {
     version_size: VersionSizeKey,
 }
 
+/// Authenticated retained-generation evidence for this destination pass.
+pub(super) struct SelectionPathEvidence<'a> {
+    pub db: &'a crate::state::SqliteStateDb,
+    pub owner: &'a crate::state::db::account::AccountOwner,
+    pub scope: &'a str,
+    pub pass_key: &'a str,
+}
+
 #[derive(Clone, Copy)]
 enum ReservedReplay {
     RequestedDirectory,
@@ -248,6 +256,79 @@ impl TaskPlanner {
                 .or_default()
                 .push(record);
         }
+    }
+
+    /// Retain published same-pass destinations across template changes. Other
+    /// passes remain reuse candidates only within the requested filename family.
+    pub(super) async fn recorded_selection_path(
+        &self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        derived: &super::filter::DerivedPath,
+        derived_paths: &[super::filter::DerivedPath],
+        evidence: &SelectionPathEvidence<'_>,
+    ) -> Result<Option<std::path::PathBuf>> {
+        let candidates = evidence
+            .db
+            .verified_selection_paths(
+                evidence.owner.clone(),
+                evidence.scope.to_owned(),
+                evidence.pass_key.to_owned(),
+                asset.asset_record_name().to_owned(),
+                asset.id().to_owned(),
+                derived.version_size.as_str().to_owned(),
+                (derived.checksum.to_string(), derived.size),
+            )
+            .await?;
+        for (previous_key, candidate) in candidates {
+            let path = candidate.to_path();
+            if previous_key == evidence.pass_key
+                && tokio::fs::symlink_metadata(&path)
+                    .await
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                && let Ok(path) = crate::fs_util::reserved_path_under_root(&config.directory, &path)
+                && self.retry_path_allowed(
+                    asset.source_zone().unwrap_or(&config.library),
+                    asset.state_id(),
+                    derived.version_size,
+                    &derived.checksum,
+                    derived.size,
+                    &path,
+                )
+                && super::legacy_preservation::current_path_is_independent(evidence.db, &path)
+                    .await?
+            {
+                return Ok(Some(path));
+            }
+            if (previous_key == evidence.pass_key
+                || super::filter::stored_path_matches_download_family(
+                    asset.state_id(),
+                    derived,
+                    derived_paths,
+                    config,
+                    &path,
+                ))
+                && let Ok(fingerprint) =
+                    super::file::fingerprint_downloaded_path(&config.directory, &path).await
+                && evidence
+                    .db
+                    .selection_path_matches_local(
+                        evidence.owner.clone(),
+                        evidence.scope.to_owned(),
+                        evidence.pass_key.to_owned(),
+                        asset.asset_record_name().to_owned(),
+                        candidate,
+                        (
+                            data_encoding::HEXLOWER.encode(&fingerprint.sha256),
+                            fingerprint.size,
+                        ),
+                    )
+                    .await?
+            {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
     }
 
     /// Accept a current-content receipt in this pass's directory or filename family.
