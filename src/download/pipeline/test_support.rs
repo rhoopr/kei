@@ -177,10 +177,6 @@ impl DownloadStateStore for FailingDownloadStore {
         Ok(Vec::new())
     }
 
-    async fn reset_failed(&self) -> Result<u64, StateError> {
-        unimplemented!()
-    }
-
     async fn prepare_for_retry(
         &self,
         _library: Option<&str>,

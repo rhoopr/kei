@@ -357,13 +357,6 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn reset_failed(&self) -> Result<u64, StateError> {
-        let (failed, _, _) = self
-            .prepare_for_retry(None, RetryErrorRetention::Clear)
-            .await?;
-        Ok(failed)
-    }
-
     pub(crate) async fn prepare_for_retry(
         &self,
         library: Option<&str>,
@@ -1216,10 +1209,6 @@ impl DownloadStateStore for SqliteStateDb {
         library: &str,
     ) -> Result<Vec<String>, StateError> {
         SqliteStateDb::get_policy_excluded_ids_for_revalidation(self, library).await
-    }
-
-    async fn reset_failed(&self) -> Result<u64, StateError> {
-        SqliteStateDb::reset_failed(self).await
     }
 
     async fn prepare_for_retry(

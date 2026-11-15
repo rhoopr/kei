@@ -842,10 +842,6 @@ impl state::DownloadStateStore for FailingMetadataSetDb {
             .await
     }
 
-    async fn reset_failed(&self) -> Result<u64, state::error::StateError> {
-        self.inner.reset_failed().await
-    }
-
     async fn prepare_for_retry(
         &self,
         library: Option<&str>,

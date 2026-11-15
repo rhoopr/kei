@@ -1400,6 +1400,8 @@ Streaming cleanup uses the same exact-task lookup owner for ordinary transfer fa
 
 The CLI rejects the retired `--retry-failed` flag before configuration, authentication or state startup. Ordinary sync owns automatic retry. The runner no longer resets failed rows or exits early through a separate retry-only startup path; regular dispatch retains its existing pending-work preparation.
 
+`prepare_for_retry` is the state owner's retry-preparation operation, including library scoping, attempt reset and error retention. The retired `reset_failed` wrapper and trait entry have no remaining execution path.
+
 The cycle owner has no retry-only argument or alternate eligibility gates. Inventory qualification, smart-folder path reconciliation, sparse-target preparation and zero-asset warnings all use ordinary sync rules. Pending failures do not reset or consume the provider cursor. Indexing qualification, materialization and retained-cursor replay still require their existing evidence before checkpoint promotion.
 
 Download configuration no longer has a retry-only selection mode. Context loading and the producer do not load or filter against a known-ID set. Current selection can therefore recover pending destinations while discovering new assets. Historical skip diagnostics remain readable, and the inventory fingerprint retains `"retry_only": false` for ordinary-sync compatibility.

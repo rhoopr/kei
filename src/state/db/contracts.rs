@@ -524,7 +524,6 @@ pub trait DownloadStateStore: Send + Sync {
         &self,
         library: &str,
     ) -> Result<Vec<String>, StateError>;
-    async fn reset_failed(&self) -> Result<u64, StateError>;
     async fn prepare_for_retry(
         &self,
         library: Option<&str>,

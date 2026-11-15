@@ -678,7 +678,7 @@ async fn get_pending_orders_by_last_seen_desc() {
 }
 
 #[tokio::test]
-async fn test_reset_failed() {
+async fn prepare_for_retry_resets_failed_rows() {
     let db = SqliteStateDb::open_in_memory().unwrap();
 
     let record = TestAssetRecord::new("ABC123").build();
@@ -688,7 +688,10 @@ async fn test_reset_failed() {
         .await
         .unwrap();
 
-    let count = db.reset_failed().await.unwrap();
+    let (count, _, _) = db
+        .prepare_for_retry(None, RetryErrorRetention::Clear)
+        .await
+        .unwrap();
     assert_eq!(count, 1);
 
     let failed = db.get_failed().await.unwrap();
@@ -1048,11 +1051,14 @@ async fn test_get_all_known_ids() {
 }
 
 #[tokio::test]
-async fn test_retry_failed_returns_zero_when_no_failures() {
+async fn prepare_for_retry_returns_zero_when_no_failures() {
     let db = SqliteStateDb::open_in_memory().unwrap();
 
-    // With no assets at all, reset_failed returns 0
-    let count = db.reset_failed().await.unwrap();
+    // With no assets at all, ordinary retry preparation changes no rows.
+    let (count, _, _) = db
+        .prepare_for_retry(None, RetryErrorRetention::Clear)
+        .await
+        .unwrap();
     assert_eq!(count, 0);
 
     // Add a downloaded asset — still no failures
@@ -1068,12 +1074,15 @@ async fn test_retry_failed_returns_zero_when_no_failures() {
         .await
         .unwrap();
 
-    let count = db.reset_failed().await.unwrap();
+    let (count, _, _) = db
+        .prepare_for_retry(None, RetryErrorRetention::Clear)
+        .await
+        .unwrap();
     assert_eq!(count, 0);
 }
 
 #[tokio::test]
-async fn test_retry_failed_resets_only_failed() {
+async fn prepare_for_retry_preserves_completed_rows() {
     let db = SqliteStateDb::open_in_memory().unwrap();
     let dir = test_dir();
 
@@ -1101,8 +1110,11 @@ async fn test_retry_failed_resets_only_failed() {
         .await
         .unwrap();
 
-    // reset_failed should reset exactly 1
-    let count = db.reset_failed().await.unwrap();
+    // Retry preparation should reset exactly one failed row.
+    let (count, _, _) = db
+        .prepare_for_retry(None, RetryErrorRetention::Clear)
+        .await
+        .unwrap();
     assert_eq!(count, 1);
 
     // After reset, the failed asset should be in known_ids but not downloaded_ids
@@ -1299,7 +1311,7 @@ async fn test_downloads_reflected_immediately_not_batched() {
 }
 
 #[tokio::test]
-async fn reset_failed_precise_count_with_mixed_statuses() {
+async fn prepare_for_retry_precise_failed_count_with_mixed_statuses() {
     // Arrange: create assets across all three statuses with multiple failed entries
     let db = SqliteStateDb::open_in_memory().unwrap();
     let dir = test_dir();
@@ -1374,7 +1386,10 @@ async fn reset_failed_precise_count_with_mixed_statuses() {
     assert_eq!(before.failed, 4);
 
     // Act
-    let reset_count = db.reset_failed().await.unwrap();
+    let (reset_count, _, _) = db
+        .prepare_for_retry(None, RetryErrorRetention::Clear)
+        .await
+        .unwrap();
 
     // Assert: exactly 4 were reset
     assert_eq!(reset_count, 4);
