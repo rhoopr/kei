@@ -236,6 +236,16 @@ where
     let mut deferred = 0usize;
     let mut retired_from_selected_queue = 0usize;
     for (idx, pending_rewrite) in pending.into_iter().enumerate() {
+        // Selected destinations already carry an exact prepared-output receipt.
+        // Use that publication owner for an explicitly requested timestamp
+        // rewrite rather than requiring a second legacy repair receipt.
+        let selected_queue = if pending_rewrite.selection_receipt.is_some()
+            && pending_rewrite.capture_repair_receipt.is_none()
+        {
+            MetadataRewriteQueue::Ordinary
+        } else {
+            selected_queue
+        };
         let record = &pending_rewrite.asset;
         let metadata_flags = if let Some(receipt) = &pending_rewrite.selection_receipt {
             let Some(flags) = MetadataFlags::from_bits(receipt.metadata_flags) else {

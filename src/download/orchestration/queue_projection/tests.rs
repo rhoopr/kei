@@ -5567,7 +5567,12 @@ async fn selected_destination_retry_does_not_resurrect_historical_reservations()
         Some(&["B"][..]),
         Some(&["A", "B"][..]),
     ] {
-        selected_destination_retry_fixture(true, failed_album).await;
+        selected_destination_retry_fixture(
+            true,
+            failed_album,
+            crate::download::CaptureTimestampRepair::Preserve,
+        )
+        .await;
     }
 }
 
@@ -5823,13 +5828,29 @@ async fn ordinary_destination_retry_does_not_resurrect_historical_reservations()
         Some(&["B"][..]),
         Some(&["A", "B"][..]),
     ] {
-        selected_destination_retry_fixture(false, failed_album).await;
+        selected_destination_retry_fixture(
+            false,
+            failed_album,
+            crate::download::CaptureTimestampRepair::Preserve,
+        )
+        .await;
     }
+}
+
+#[tokio::test]
+async fn capture_repair_destination_retry_does_not_resurrect_historical_reservations() {
+    selected_destination_retry_fixture(
+        true,
+        Some(&["A", "B"]),
+        crate::download::CaptureTimestampRepair::ReplaceWithCaptureLocal,
+    )
+    .await;
 }
 
 async fn selected_destination_retry_fixture(
     captured: bool,
     failed_album: Option<&'static [&'static str]>,
+    capture_timestamp_repair: crate::download::CaptureTimestampRepair,
 ) {
     let (trace, _guard) = crate::test_helpers::TracingCapture::install();
     use crate::state::ReconciliationStateStore;
@@ -5858,6 +5879,7 @@ async fn selected_destination_retry_fixture(
     let mut f = Fixture::new().await;
     f.config.folder_structure_albums = Arc::from("{album}");
     f.config.retry.max_retries = 0;
+    f.config.capture_timestamp_repair = capture_timestamp_repair;
     if !captured {
         f.session.zone_name = Arc::from("SharedSync-destination");
         f.config.library = Arc::clone(&f.session.zone_name);
@@ -7021,34 +7043,108 @@ async fn private_lookup_session_recovery(multi: bool) {
 }
 
 #[tokio::test]
-async fn private_capture_timestamp_repair_keeps_its_whole_existing_receipt_owner() {
+async fn private_capture_timestamp_repair_uses_selected_destinations_and_existing_writer() {
+    let (trace, _guard) = crate::test_helpers::TracingCapture::install();
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
     let mut f = Fixture::new().await;
-    f.pass = destination_pass_with(&f.session, &f.capture, "A");
-    f.config.refresh_metadata = true;
-    assert!(
-        crate::download::orchestration::generation::context(
+    let source = f.dir.path().join("source.jpg");
+    std::fs::write(
+        &source,
+        include_bytes!("../../../../tests/data/media/pattern.jpg"),
+    )
+    .unwrap();
+    crate::download::metadata::apply_metadata(
+        &source,
+        &crate::download::metadata::MetadataWrite {
+            datetime: Some("2001:01:01 01:01:01".into()),
+            offset_time_original: Some("+05:00".into()),
+            ..Default::default()
+        },
+        ".seed",
+    )
+    .unwrap();
+    let original_timestamp = crate::download::metadata::probe_exif(&source).unwrap();
+    let bytes = std::fs::read(&source).unwrap();
+    let checksum = data_encoding::BASE64.encode(&Sha256::digest(&bytes));
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/media",server.uri()),"size":bytes.len(),"fileChecksum":checksum});
+    f.config.folder_structure_albums = Arc::from("{album}");
+    f.config.metadata.set_exif_datetime = true;
+    f.session.records.lock().unwrap()[1]["fields"]["timeZoneOffset"] =
+        json!({"type":"INT64","value":0});
+    for round in 0..5 {
+        if round > 0 {
+            f = reopen_destination_fixture(f).await;
+            f.config.refresh_metadata = true;
+            f.config.capture_timestamp_repair =
+                crate::download::CaptureTimestampRepair::ReplaceWithCaptureLocal;
+        }
+        if round == 1 {
+            f.db.acquire_lock("interrupt repaired metadata finalization").unwrap().execute_batch(
+                "CREATE TRIGGER repair_finish_fault BEFORE UPDATE OF verified_metadata ON provider_active_destinations WHEN OLD.prepared_checksum IS NOT NULL AND NEW.verified_metadata=1 BEGIN SELECT RAISE(ABORT,'synthetic repair finalization failure'); END;"
+            ).unwrap();
+        } else if round == 2 {
+            f.db.acquire_lock("resume repaired metadata finalization")
+                .unwrap()
+                .execute_batch("DROP TRIGGER repair_finish_fault")
+                .unwrap();
+        }
+        f.pass = destination_pass_with(&f.session, &f.capture, "A");
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
             std::slice::from_ref(&f.pass),
-            &f.config,
-            controls()
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
         )
         .await
-        .unwrap()
-        .is_some()
-    );
-    f.config.capture_timestamp_repair =
-        crate::download::metadata_rewrite::CaptureTimestampRepair::ReplaceWithCaptureLocal;
-    assert!(
-        crate::download::orchestration::generation::context(
-            std::slice::from_ref(&f.pass),
-            &f.config,
-            controls()
-        )
-        .await
-        .unwrap()
-        .is_none()
-    );
-    assert_eq!(f.count("provider_active_generations"), 0);
-    f.preserved().await;
+        .unwrap();
+        if round == 1 {
+            assert!(
+                matches!(
+                    result.outcome,
+                    crate::download::DownloadOutcome::PartialFailure { .. }
+                ),
+                "{result:?}"
+            );
+            assert!(result.checkpoint.sync_token_blocked);
+            assert_eq!(f.db.acquire_lock("prepared timestamp repair survives failure").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE prepared_checksum IS NOT NULL AND verified_metadata=0",[],|row|row.get(0)).unwrap(), 1);
+        } else {
+            assert!(
+                matches!(result.outcome, crate::download::DownloadOutcome::Success),
+                "round {round}: {result:?}\n{:?}",
+                trace.events()
+            );
+        }
+        assert_eq!(result.stats.downloaded, usize::from(round == 0));
+        let probe =
+            crate::download::metadata::probe_exif(&f.config.directory.join("A/changed.JPG"))
+                .unwrap();
+        if round == 0 {
+            assert_eq!(
+                probe.datetime_original,
+                original_timestamp.datetime_original
+            );
+            assert_eq!(
+                probe.offset_time_original,
+                original_timestamp.offset_time_original
+            );
+        } else {
+            let created = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+                .unwrap()
+                .fixed_offset();
+            assert!(probe.denotes_capture_time(&created), "{probe:?}");
+        }
+        assert!(f.count("provider_active_destinations") > 0);
+        f.preserved().await;
+    }
 }
 
 #[tokio::test]

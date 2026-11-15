@@ -171,13 +171,7 @@ pub(crate) async fn context(
     config: &DownloadConfig,
     controls: DownloadControls,
 ) -> Result<Option<SelectionContext>> {
-    if !controls.run_mode.downloads_files()
-        || passes.is_empty()
-        || matches!(
-            config.capture_timestamp_repair,
-            crate::download::metadata_rewrite::CaptureTimestampRepair::ReplaceWithCaptureLocal
-        )
-    {
+    if !controls.run_mode.downloads_files() || passes.is_empty() {
         return Ok(None);
     }
     let mut qualified = None;
@@ -1144,7 +1138,7 @@ async fn metadata_tail(
     let priority = crate::download::metadata_rewrite::run_pending_rows(
         db.as_ref(),
         flags,
-        crate::download::metadata_rewrite::CaptureTimestampRepair::Preserve,
+        config.capture_timestamp_repair,
         config.temp_suffix.clone(),
         cancel,
         current,
@@ -1152,13 +1146,19 @@ async fn metadata_tail(
     .await;
     let remaining = budget.saturating_sub(priority.fetched);
     let original = offset;
+    let library_scope = [config.library.as_ref()];
+    let repair_scope = matches!(
+        config.capture_timestamp_repair,
+        crate::download::CaptureTimestampRepair::ReplaceWithCaptureLocal
+    )
+    .then_some(library_scope.as_slice());
     let mut result = crate::download::metadata_rewrite::run_pending_budget(
         db.as_ref(),
         flags,
-        crate::download::metadata_rewrite::CaptureTimestampRepair::Preserve,
+        config.capture_timestamp_repair,
         config.temp_suffix.clone(),
         cancel,
-        None,
+        repair_scope,
         (offset, remaining),
     )
     .await;
@@ -1167,10 +1167,10 @@ async fn metadata_tail(
         result = crate::download::metadata_rewrite::run_pending_budget(
             db.as_ref(),
             flags,
-            crate::download::metadata_rewrite::CaptureTimestampRepair::Preserve,
+            config.capture_timestamp_repair,
             config.temp_suffix.clone(),
             cancel,
-            None,
+            repair_scope,
             (0, remaining),
         )
         .await;
