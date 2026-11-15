@@ -144,7 +144,9 @@ async fn bundled_partial_failure_recovers_after_restart() {
     Mock::given(method("GET"))
         .and(path("/failure"))
         .respond_with(ResponseTemplate::new(503))
-        .expect(2)
+        // The enumeration-only mock returns no records for exact cleanup lookup.
+        // Keep the failed work for restart rather than replaying its stale URL.
+        .expect(1)
         .mount(&h.server)
         .await;
     records.extend(bad);
@@ -162,7 +164,10 @@ async fn bundled_partial_failure_recovers_after_restart() {
     let good = h.config.directory.join("Good.JPG");
     let modified = std::fs::metadata(&good).unwrap().modified().unwrap();
     h.reopen().await;
-    assert_eq!(h.db().get_failed().await.unwrap().len(), 1);
+    let failed = h.db().get_failed().await.unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].id.as_ref(), "asset-bad");
+    assert!(!h.config.directory.join("Retry.JPG").exists());
     h.server.verify().await;
     h.server.reset().await;
     Mock::given(method("GET"))
@@ -171,7 +176,7 @@ async fn bundled_partial_failure_recovers_after_restart() {
         .expect(1)
         .mount(&h.server)
         .await;
-    for downloaded in [1, 0] {
+    for downloaded in [1, 0, 0] {
         let result = cycle(&h.config, records.clone()).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),

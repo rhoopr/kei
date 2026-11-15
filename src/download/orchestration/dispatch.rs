@@ -94,6 +94,50 @@ fn is_transient_reqwest_error(error: &reqwest::Error) -> bool {
         || error.is_connect()
 }
 
+/// Apply one incremental failure decision and preserve its checkpoint evidence.
+/// Captured selections retain their stricter state-refusal boundary and their
+/// existing inventory owner; ordinary selections retain their full-pass reason.
+async fn finish_incremental_attempt(
+    attempt: Result<SyncResult>,
+    client: &Client,
+    passes: &[crate::commands::AlbumPass],
+    config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
+    cancel: CancellationToken,
+) -> Result<SyncResult> {
+    let error = match attempt {
+        Ok(result) => return Ok(result),
+        Err(error) => error,
+    };
+    let class = if config.selection_context.is_some() {
+        classify_selection_incremental_error(&error)
+    } else {
+        classify_incremental_error(&error)
+    };
+    match class {
+        IncrementalErrorClass::SessionExpired
+        | IncrementalErrorClass::TransientFailure
+        | IncrementalErrorClass::CaptureRefused => return Err(error),
+        IncrementalErrorClass::TokenFallback | IncrementalErrorClass::StaticFallback => {}
+    }
+    let mut result = if config.selection_context.is_some() {
+        Box::pin(super::generation::inventory(
+            client, passes, config, controls, cancel,
+        ))
+        .await?
+    } else {
+        let reason = FullEnumerationReason::OtherStaticReason;
+        tracing::warn!(
+            error = %error,
+            full_enumeration_reason = reason.as_str(),
+            "Incremental sync failed, falling back to full enumeration"
+        );
+        download_photos_full_with_reason(client, passes, config, controls, cancel, reason).await?
+    };
+    result.checkpoint.retained_token_rejected = class == IncrementalErrorClass::TokenFallback;
+    Ok(result)
+}
+
 async fn targeted_backfill_snapshots_complete(
     passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
@@ -605,7 +649,7 @@ async fn download_photos_with_sync_inner(
             .await
         }
         SyncMode::Incremental { zone_sync_token } if config.selection_context.is_some() => {
-            match download_photos_incremental(
+            let attempt = download_photos_incremental(
                 download_client,
                 passes,
                 &config,
@@ -613,31 +657,16 @@ async fn download_photos_with_sync_inner(
                 controls,
                 shutdown_token.clone(),
             )
+            .await;
+            finish_incremental_attempt(
+                attempt,
+                download_client,
+                passes,
+                &config,
+                controls,
+                shutdown_token.clone(),
+            )
             .await
-            {
-                Ok(result) => Ok(result),
-                Err(error) => match classify_selection_incremental_error(&error) {
-                    class @ (IncrementalErrorClass::TokenFallback
-                    | IncrementalErrorClass::StaticFallback) => {
-                        Box::pin(super::generation::inventory(
-                            download_client,
-                            passes,
-                            &config,
-                            controls,
-                            shutdown_token.clone(),
-                        ))
-                        .await
-                        .map(|mut result| {
-                            result.checkpoint.retained_token_rejected =
-                                class == IncrementalErrorClass::TokenFallback;
-                            result
-                        })
-                    }
-                    IncrementalErrorClass::SessionExpired
-                    | IncrementalErrorClass::TransientFailure
-                    | IncrementalErrorClass::CaptureRefused => Err(error),
-                },
-            }
         }
         SyncMode::Full => {
             download_photos_full_with_token(
@@ -734,37 +763,15 @@ async fn download_photos_with_sync_inner(
                         )
                         .await
                     };
-                    match incremental_result {
-                        Ok(result) => Ok(result),
-                        Err(e) => match classify_incremental_error(&e) {
-                            class @ (IncrementalErrorClass::TokenFallback
-                            | IncrementalErrorClass::StaticFallback) => {
-                                let reason = FullEnumerationReason::OtherStaticReason;
-                                tracing::warn!(
-                                    error = %e,
-                                    full_enumeration_reason = reason.as_str(),
-                                    "Incremental sync failed, falling back to full enumeration"
-                                );
-                                download_photos_full_with_reason(
-                                    download_client,
-                                    passes,
-                                    &config,
-                                    controls,
-                                    shutdown_token.clone(),
-                                    reason,
-                                )
-                                .await
-                                .map(|mut result| {
-                                    result.checkpoint.retained_token_rejected =
-                                        class == IncrementalErrorClass::TokenFallback;
-                                    result
-                                })
-                            }
-                            IncrementalErrorClass::SessionExpired
-                            | IncrementalErrorClass::TransientFailure
-                            | IncrementalErrorClass::CaptureRefused => Err(e),
-                        },
-                    }
+                    finish_incremental_attempt(
+                        incremental_result,
+                        download_client,
+                        passes,
+                        &config,
+                        controls,
+                        shutdown_token.clone(),
+                    )
+                    .await
                 }
             }
         }
