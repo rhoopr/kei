@@ -613,12 +613,14 @@ current confirmation, transactional queue projection and destination replay.
 admission, frozen metadata intent and completion validation.
 
 Activation requires an authenticated account-owned database and one exact
-private provider scope with an explicit default owner. Every selected pass must
-be a supported private named album, Unfiled query or provider-defined smart query
-using the same concrete store and scope. Shared, cross-zone and unsupported
-profiles keep the whole existing dispatcher. Metadata backfill, read-only execution
+private or shared provider scope with an explicit default owner. Every selected pass must
+be a supported named album, Unfiled query or provider-defined smart query
+using the same concrete store and scope. Cross-zone and unsupported
+profiles keep the whole existing dispatcher. Both database scopes use the same validated source admission and per-destination completion owner. Database identity remains part of the durable scope; a receipt in one database cannot complete work in the other. Metadata backfill, read-only execution
 and capture-local timestamp replacement keep their existing owners. Ordinary
 explicit metadata refresh with preservation can use active destinations.
+
+Dispatch does not append the rendition-wide targeted retry tail when current selection owns the run. Inventory or replay has already admitted and completed work per selected destination. The legacy tail remains only for routes without a selection context.
 
 A generation binds account and provider ownership, full zone identity, selected passes and queries, source dependencies and selection, rendition, path and metadata configuration. Lossless native destination paths are independently anchored. A rank page records its exact request and original response bytes, including unknown fields and tombstones. Rank pagination remains an observation window. EOF plus a delta bridge does not establish a snapshot or prove absence. Current paired confirmation determines resource identity; observed order and opaque rank or source tokens do not select versions. Ambiguous or incompatible facts remain deferred. Existing fixed-date, exclusion, RAW, companion and naming owners decide eligibility. Sync has no newest-N frontier or per-filter count cap.
 

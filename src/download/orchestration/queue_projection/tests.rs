@@ -241,7 +241,7 @@ impl Fixture {
         }
     }
     async fn capture(&self, records: Vec<Value>, cursor: &str) {
-        let (_, scope, zone) = self.pass.album.owned_private_scope().unwrap().unwrap();
+        let (_, scope, zone) = self.pass.album.owned_selection_scope().unwrap().unwrap();
         let raw=serde_json::to_vec(&json!({"zones":[{"zoneID":zone,"records":records,"syncToken":format!("{cursor}-successor"),"moreComing":false}]})).unwrap();
         self.capture
             .capture(crate::icloud::photos::catalog_observed_page(raw, &scope, cursor).unwrap())
@@ -2798,7 +2798,7 @@ fn uncaptured_destination_pass(session: &CurrentSession, name: &str) -> AlbumPas
             )),
             page_size: 2,
             zone_id: Arc::new(
-                json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}),
+                json!({"zoneName":session.zone_name.as_ref(),"ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}),
             ),
             retry_config: crate::retry::RetryConfig::default(),
             container_id: Some(Arc::from(name)),
@@ -2870,11 +2870,11 @@ async fn private_smart_folder_destinations_survive_template_changes_and_reopen()
     for name in crate::icloud::photos::smart_folders::smart_folder_names() {
         let mut pass = smart_pass(&f, name);
         assert!(
-            pass.album.private_selection_scope().unwrap().is_some(),
+            pass.album.current_selection_scope().unwrap().is_some(),
             "{name}"
         );
         pass.album.name = Arc::from("unknown-smart-query");
-        assert!(pass.album.private_selection_scope().unwrap().is_none());
+        assert!(pass.album.current_selection_scope().unwrap().is_none());
     }
     for cycle in 0..4 {
         if cycle > 0 {
@@ -4312,7 +4312,7 @@ async fn admit_pending_fixture(
     f.capture(records("m", OLD, "retained"), "active-proofs")
         .await;
     f.pass = destination_pass_with(&f.session, &f.capture, "A");
-    let (_, scope, zone) = f.pass.album.private_selection_scope().unwrap().unwrap();
+    let (_, scope, zone) = f.pass.album.current_selection_scope().unwrap().unwrap();
     let key = crate::download::orchestration::generation::pass_key(&f.pass);
     let root=f.db.begin_selection_generation(owner(),GenerationSpec {
         format:1,scope:scope.clone(),zone:zone.clone(),config_hash:"a".repeat(64),
@@ -4472,7 +4472,7 @@ async fn private_historical_replay_windows_round_robin_and_persist_past_64_after
     *f.session.records.lock().unwrap() = (0..72)
         .flat_map(|n| records(&format!("history-{n:03}"), CURRENT, "retained"))
         .collect();
-    let (_, scope, zone) = f.pass.album.private_selection_scope().unwrap().unwrap();
+    let (_, scope, zone) = f.pass.album.current_selection_scope().unwrap().unwrap();
     let key = crate::download::orchestration::generation::pass_key(&f.pass);
     let config_hash = "a".repeat(64);
     let mut roots = Vec::new();
@@ -5561,15 +5561,276 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
 
 #[tokio::test]
 async fn selected_destination_retry_does_not_resurrect_historical_reservations() {
-    selected_destination_retry_fixture(true).await;
+    for failed_album in [
+        None,
+        Some(&["A"][..]),
+        Some(&["B"][..]),
+        Some(&["A", "B"][..]),
+    ] {
+        selected_destination_retry_fixture(true, failed_album).await;
+    }
+}
+
+#[tokio::test]
+async fn shared_selection_admission_preserves_account_and_zone_boundaries() {
+    let f = Fixture::new().await;
+    let mut pass = uncaptured_destination_pass(&f.session, "A");
+    pass.album
+        .set_shadow_capture(f.capture.clone(), Arc::from("shared"));
+    let root = crate::download::orchestration::generation::begin_frozen_fixture(
+        std::slice::from_ref(&pass),
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    let scope: Value = serde_json::from_str(&root.spec.scope).unwrap();
+    assert_eq!(scope["database"], "shared");
+    for fault in ["account", "zone", "owner", "database"] {
+        let mut spec = root.spec.clone();
+        let mut authenticated = owner();
+        match fault {
+            "account" => authenticated = AccountOwner::configured("other@example.invalid", "com"),
+            "zone" => spec.zone["zoneName"] = json!("another-zone"),
+            "owner" => spec.zone["ownerRecordName"] = json!("another-owner"),
+            "database" => {
+                let mut invalid_scope = scope.clone();
+                invalid_scope["database"] = json!("public");
+                spec.scope = invalid_scope.to_string();
+            }
+            _ => panic!("unknown selection admission fault: {fault}"),
+        }
+        assert!(
+            f.db.begin_selection_generation(
+                authenticated,
+                spec,
+                crate::state::db::provider_generations::MAX_GENERATION_BYTES,
+            )
+            .await
+            .is_err(),
+            "{fault}"
+        );
+        assert_eq!(f.count("provider_active_generations"), 1);
+        assert_eq!(f.count("provider_active_destinations"), 0);
+        assert_eq!(f.count("assets"), 0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn shared_process_fixture(url: &str) -> Fixture {
+    use sha2::{Digest, Sha256};
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("{album}");
+    f.config.retry.max_retries = 0;
+    let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    let checksum = data_encoding::BASE64.encode(&Sha256::digest(bytes));
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] =
+        json!({"downloadURL":url,"size":bytes.len(),"fileChecksum":checksum});
+    f
+}
+
+#[cfg(target_os = "linux")]
+fn shared_process_passes(f: &Fixture) -> [AlbumPass; 2] {
+    ["A", "B"].map(|name| {
+        let mut pass = uncaptured_destination_pass(&f.session, name);
+        pass.album
+            .set_shadow_capture(f.capture.clone(), Arc::from("shared"));
+        pass
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "isolated subprocess controlled by the shared destination process-death parent"]
+async fn shared_destination_process_death_child() {
+    use crate::state::ReconciliationStateStore;
+    let url = std::env::var("KEI_TEST_DESTINATION_URL").unwrap();
+    let marker = std::env::var_os("KEI_TEST_DESTINATION_MARKER").unwrap();
+    let f = shared_process_fixture(&url).await;
+    let historical = f.config.directory.join("historical/never-recreate.JPG");
+    std::fs::create_dir_all(historical.parent().unwrap()).unwrap();
+    std::fs::write(
+        historical.with_file_name("retained.bin"),
+        b"historical bytes",
+    )
+    .unwrap();
+    let key = crate::state::ReconciliationPathKey(
+        crate::fs_util::confined_path_key(&historical).unwrap(),
+    );
+    let checksum: Box<str> =
+        f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"]
+            .as_str()
+            .unwrap()
+            .into();
+    f.db.reserve_reconciliation_paths(&[crate::state::ReconciliationReservation {
+        library: Arc::clone(&f.config.library),
+        asset_id: "asset-m".into(),
+        version_size: VersionSizeKey::Original,
+        content: Some(crate::state::ReconciliationContent {
+            checksum,
+            size: include_bytes!("../../../../tests/data/media/pattern.jpg").len() as u64,
+        }),
+        requested_path_key: key.clone(),
+        destination_path_key: key,
+        destination_path: historical,
+    }])
+    .await
+    .unwrap();
+    std::fs::write(marker, f.dir.path().to_str().unwrap()).unwrap();
+    crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &shared_process_passes(&f),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shared_destination_process_death_preserves_unfinished_peer() {
+    use crate::state::ReconciliationStateStore;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::clone(&calls);
+    Mock::given(method("GET"))
+        .respond_with(move |_: &wiremock::Request| {
+            let response = ResponseTemplate::new(200).set_body_bytes(bytes);
+            if requests.fetch_add(1, Ordering::SeqCst) == 1 {
+                response.set_delay(std::time::Duration::from_secs(60))
+            } else {
+                response
+            }
+        })
+        .mount(&server)
+        .await;
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("destination-child");
+    let url = format!("{}/media", server.uri());
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "download::orchestration::queue_projection::tests::shared_destination_process_death_child", "--ignored", "--nocapture"])
+        .env("TMPDIR", root.path())
+        .env("KEI_TEST_DESTINATION_URL", &url)
+        .env("KEI_TEST_DESTINATION_MARKER", &marker)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut paused = None;
+    for _ in 0..800 {
+        if let Ok(directory) = std::fs::read_to_string(&marker) {
+            let directory = std::path::PathBuf::from(directory);
+            let conn = rusqlite::Connection::open(directory.join("state.db")).unwrap();
+            let counts = conn.query_row::<(i64, i64), _, _>(
+                "SELECT count(*),coalesce(sum(verified_media),0) FROM provider_active_destinations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            if counts == (2, 1) && calls.load(Ordering::SeqCst) == 2 {
+                paused = Some(directory);
+                break;
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("destination child exited before interruption boundary: {status}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    let directory = paused.expect("child must publish one destination with its peer unfinished");
+    let mut f = shared_process_fixture(&url).await;
+    f.config.directory = Arc::from(directory.join("media").as_path());
+    f.config.sync_mode = crate::download::SyncMode::Incremental {
+        zone_sync_token: "old-cursor".into(),
+    };
+    let mut historical_reservation = None;
+    for round in 0..3 {
+        f.db = Arc::new(
+            SqliteStateDb::open_owned(&directory.join("state.db"), &owner())
+                .await
+                .unwrap(),
+        );
+        f.capture = ShadowCapture::new(Arc::clone(&f.db), owner(), "com");
+        f.config.state_db = Some(Arc::clone(&f.db) as Arc<dyn DownloadStore>);
+        let historical = f.config.directory.join("historical/never-recreate.JPG");
+        let reservation =
+            f.db.get_reconciliation_reservations()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|reservation| reservation.destination_path == historical)
+                .unwrap();
+        if let Some(previous) = &historical_reservation {
+            assert_eq!(&reservation, previous);
+        } else {
+            historical_reservation = Some(reservation);
+        }
+        let before = calls.load(Ordering::SeqCst);
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &shared_process_passes(&f),
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result.outcome, crate::download::DownloadOutcome::Success),
+            "{result:?}"
+        );
+        assert_eq!(result.stats.downloaded, usize::from(round == 0));
+        assert_eq!(
+            calls.load(Ordering::SeqCst) - before,
+            usize::from(round == 0)
+        );
+        for album in ["A", "B"] {
+            assert_eq!(
+                std::fs::read(f.config.directory.join(album).join("changed.JPG")).unwrap(),
+                bytes
+            );
+        }
+        assert!(!historical.exists());
+        assert_eq!(
+            std::fs::read(historical.with_file_name("retained.bin")).unwrap(),
+            b"historical bytes"
+        );
+        assert_eq!(
+            f.db.acquire_lock("unfinished peer after process death")
+                .unwrap()
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_active_destinations WHERE verified_media=0",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
 }
 
 #[tokio::test]
 async fn ordinary_destination_retry_does_not_resurrect_historical_reservations() {
-    selected_destination_retry_fixture(false).await;
+    for failed_album in [
+        None,
+        Some(&["A"][..]),
+        Some(&["B"][..]),
+        Some(&["A", "B"][..]),
+    ] {
+        selected_destination_retry_fixture(false, failed_album).await;
+    }
 }
 
-async fn selected_destination_retry_fixture(captured: bool) {
+async fn selected_destination_retry_fixture(
+    captured: bool,
+    failed_album: Option<&'static [&'static str]>,
+) {
     let (trace, _guard) = crate::test_helpers::TracingCapture::install();
     use crate::state::ReconciliationStateStore;
     use sha2::{Digest, Sha256};
@@ -5586,7 +5847,7 @@ async fn selected_destination_retry_fixture(captured: bool) {
     Mock::given(method("GET"))
         .respond_with(move |_: &wiremock::Request| {
             let ordinal = requests.fetch_add(1, Ordering::SeqCst);
-            if ordinal > 0 && fail.load(Ordering::SeqCst) {
+            if failed_album.is_none() && ordinal > 0 && fail.load(Ordering::SeqCst) {
                 ResponseTemplate::new(500)
             } else {
                 ResponseTemplate::new(200).set_body_bytes(bytes)
@@ -5597,6 +5858,16 @@ async fn selected_destination_retry_fixture(captured: bool) {
     let mut f = Fixture::new().await;
     f.config.folder_structure_albums = Arc::from("{album}");
     f.config.retry.max_retries = 0;
+    if !captured {
+        f.session.zone_name = Arc::from("SharedSync-destination");
+        f.config.library = Arc::clone(&f.session.zone_name);
+        f.session.records.lock().unwrap()[1]["fields"]["masterRef"]["value"]["zoneID"]["zoneName"] =
+            json!(f.session.zone_name.as_ref());
+    }
+    for album in failed_album.into_iter().flatten() {
+        std::fs::create_dir_all(&f.config.directory).unwrap();
+        std::fs::write(f.config.directory.join(album), b"blocked parent").unwrap();
+    }
     f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/media",server.uri()),"size":bytes.len(),"fileChecksum":checksum});
     let historical = f.config.directory.join("historical/never-recreate.JPG");
     std::fs::create_dir_all(historical.parent().unwrap()).unwrap();
@@ -5606,7 +5877,7 @@ async fn selected_destination_retry_fixture(captured: bool) {
         crate::fs_util::confined_path_key(&historical).unwrap(),
     );
     let reservation = crate::state::ReconciliationReservation {
-        library: Arc::from("PrimarySync"),
+        library: Arc::clone(&f.config.library),
         asset_id: "asset-m".into(),
         version_size: VersionSizeKey::Original,
         content: Some(crate::state::ReconciliationContent {
@@ -5623,6 +5894,11 @@ async fn selected_destination_retry_fixture(captured: bool) {
     let mut completed_path = None;
     for round in 0..4 {
         if round > 0 {
+            if round == 1 {
+                for album in failed_album.into_iter().flatten() {
+                    std::fs::remove_file(f.config.directory.join(album)).unwrap();
+                }
+            }
             f = reopen_destination_fixture(f).await;
             failing.store(false, Ordering::SeqCst);
         }
@@ -5630,10 +5906,12 @@ async fn selected_destination_retry_fixture(captured: bool) {
         let passes = if captured {
             [destination_pass(&f, "A"), destination_pass(&f, "B")]
         } else {
-            [
-                uncaptured_destination_pass(&f.session, "A"),
-                uncaptured_destination_pass(&f.session, "B"),
-            ]
+            ["A", "B"].map(|name| {
+                let mut pass = uncaptured_destination_pass(&f.session, name);
+                pass.album
+                    .set_shadow_capture(f.capture.clone(), Arc::from("shared"));
+                pass
+            })
         };
         let result = crate::download::download_photos_with_sync(
             &reqwest::Client::new(),
@@ -5646,8 +5924,12 @@ async fn selected_destination_retry_fixture(captured: bool) {
         .unwrap();
         assert_eq!(
             result.stats.downloaded,
-            usize::from(round < 2),
-            "captured={captured} round {round}: {result:?}\n{:?}",
+            match round {
+                0 => 2 - failed_album.map_or(1, |albums| albums.len()),
+                1 => failed_album.map_or(1, |albums| albums.len()),
+                _ => 0,
+            },
+            "captured={captured} failed_album={failed_album:?} round {round}: {result:?}\n{:?}",
             trace.events()
         );
         let paths = [
@@ -5659,26 +5941,30 @@ async fn selected_destination_retry_fixture(captured: bool) {
                 result.outcome,
                 crate::download::DownloadOutcome::PartialFailure { .. }
             ));
-            if captured {
-                assert!(result.checkpoint.sync_token_blocked);
-                assert!(result.sync_token.is_none());
-            }
+            assert!(result.checkpoint.sync_token_blocked);
+            assert!(result.sync_token.is_none());
             let existing: Vec<_> = paths.iter().filter(|path| path.exists()).cloned().collect();
-            assert_eq!(existing.len(), 1);
-            completed_path = Some(existing[0].clone());
+            assert_eq!(
+                existing.len(),
+                2 - failed_album.map_or(1, |albums| albums.len())
+            );
+            completed_path = existing.first().cloned();
         } else {
             assert_eq!(
                 calls.load(Ordering::SeqCst) - before,
-                usize::from(round == 1)
+                if round == 1 {
+                    failed_album.map_or(1, |albums| albums.len())
+                } else {
+                    0
+                }
             );
             for path in &paths {
                 assert_eq!(std::fs::read(path).unwrap(), bytes);
             }
         }
-        assert_eq!(
-            std::fs::read(completed_path.as_ref().unwrap()).unwrap(),
-            bytes
-        );
+        if let Some(path) = &completed_path {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
         assert!(!historical.exists());
         assert_eq!(std::fs::read(&retained).unwrap(), b"historical bytes");
         assert!(
@@ -5687,7 +5973,7 @@ async fn selected_destination_retry_fixture(captured: bool) {
                 .unwrap()
                 .contains(&reservation)
         );
-        if captured {
+        {
             assert_eq!(
                 f.db.acquire_lock("current destination obligations")
                     .unwrap()
@@ -5697,7 +5983,11 @@ async fn selected_destination_retry_fixture(captured: bool) {
                         |row| row.get(0),
                     )
                     .unwrap(),
-                i64::from(round == 0)
+                if round == 0 {
+                    failed_album.map_or(1, |albums| albums.len()) as i64
+                } else {
+                    0
+                }
             );
         }
     }

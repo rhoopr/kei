@@ -797,15 +797,21 @@ async fn download_photos_with_sync_inner(
         })
     })?;
 
-    let mut result = append_targeted_recovery_to_sync_result(
-        download_client,
-        passes,
-        &config,
-        controls,
-        shutdown_token.clone(),
-        result,
-    )
-    .await?;
+    // Current selection already owns admission, replay and completion of every
+    // selected destination. Aggregate rendition retry cannot add authority here.
+    let mut result = if config.selection_context.is_some() {
+        result
+    } else {
+        append_targeted_recovery_to_sync_result(
+            download_client,
+            passes,
+            &config,
+            controls,
+            shutdown_token.clone(),
+            result,
+        )
+        .await?
+    };
 
     let repair_outcome = if metadata_capture_repair.failures > 0
         || metadata_capture_repair.stats.metadata_capture_unresolved > 0

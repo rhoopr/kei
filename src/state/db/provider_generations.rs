@@ -1,4 +1,4 @@
-//! Bounded private selection roots and independently verified destinations.
+//! Bounded scoped selection roots and independently verified destinations.
 //!
 //! Rank coverage is observational. Neither these roots nor their page IDs own a
 //! provider cursor, determine a current version, prove absence or retire debt.
@@ -114,7 +114,10 @@ fn validate_spec(spec: &GenerationSpec) -> Result<(), StateError> {
     if spec.format != 1
         || spec.metadata_enabled != (spec.metadata_flags != 0)
         || spec.metadata_flags & !0b0011_1111 != 0
-        || scope.get("database").and_then(Value::as_str) != Some("private")
+        || !matches!(
+            scope.get("database").and_then(Value::as_str),
+            Some("private" | "shared")
+        )
         || spec.zone.get("ownerRecordName").and_then(Value::as_str) != Some("_defaultOwner")
         || spec.zone.get("zoneName") != scope.pointer("/zone/zoneName")
         || spec.zone.get("ownerRecordName") != scope.pointer("/zone/ownerRecordName")

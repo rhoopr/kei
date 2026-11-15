@@ -1,4 +1,4 @@
-//! Private selection generation composition using existing selection and queues.
+//! Current selection generation composition using existing selection and queues.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -111,7 +111,7 @@ pub(super) async fn freeze_before_sync(
     };
     let mut scopes = std::collections::HashSet::new();
     for pass in passes {
-        let Some((capture, scope, _zone)) = pass.album.owned_private_scope()? else {
+        let Some((capture, scope, _zone)) = pass.album.owned_selection_scope()? else {
             continue;
         };
         let concrete = Arc::clone(&capture.db) as Arc<dyn super::models::DownloadStore>;
@@ -145,7 +145,7 @@ pub(super) async fn hold_retained_debt(
     };
     let mut scopes = std::collections::HashSet::new();
     for pass in passes {
-        let Some((capture, scope, _zone)) = pass.album.owned_private_scope()? else {
+        let Some((capture, scope, _zone)) = pass.album.owned_selection_scope()? else {
             continue;
         };
         let concrete = Arc::clone(&capture.db) as Arc<dyn super::models::DownloadStore>;
@@ -186,7 +186,7 @@ pub(crate) async fn context(
         if pass.kind == PassKind::SmartFolder && !pass.album.is_supported_smart_folder() {
             return Ok(None);
         }
-        let Some((capture, scope, zone)) = pass.album.private_selection_scope()? else {
+        let Some((capture, scope, zone)) = pass.album.current_selection_scope()? else {
             return Ok(None);
         };
         if zone.get("zoneName").and_then(Value::as_str) != Some(config.library.as_ref()) {

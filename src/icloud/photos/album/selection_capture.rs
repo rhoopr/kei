@@ -120,13 +120,13 @@ impl PhotoAlbum {
                 })
     }
 
-    /// Independently bound ownership protects old private obligations even if
+    /// Independently bound ownership protects admitted obligations even if
     /// the current pass is not an eligible activation selector.
-    pub(crate) fn owned_private_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {
+    pub(crate) fn owned_selection_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {
         let Some((capture, database)) = &self.shadow_capture else {
             return Ok(None);
         };
-        if database.as_ref() != "private"
+        if !matches!(database.as_ref(), "private" | "shared")
             || self.zone_id.get("ownerRecordName").and_then(Value::as_str) != Some("_defaultOwner")
         {
             return Ok(None);
@@ -138,10 +138,10 @@ impl PhotoAlbum {
         )))
     }
 
-    /// Qualify each member before enabling the whole private pass set. Named
+    /// Qualify each member before enabling the whole scoped pass set. Named
     /// folder predicates are supplied by the provider owner, never invented.
-    pub(crate) fn private_selection_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {
-        let Some(owned) = self.owned_private_scope()? else {
+    pub(crate) fn current_selection_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {
+        let Some(owned) = self.owned_selection_scope()? else {
             return Ok(None);
         };
         if !self.cross_zone_sources.is_empty() {

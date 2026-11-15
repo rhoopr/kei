@@ -268,7 +268,7 @@ async fn private_master_metadata_and_relationship_only_invalidation_reseeds_curr
                 .flat_map(|name| [name.clone(), format!("asset-{name}")])
                 .collect(),
         );
-        let (_, scope, zone) = selected[0].album.owned_private_scope().unwrap().unwrap();
+        let (_, scope, zone) = selected[0].album.owned_selection_scope().unwrap().unwrap();
         let capture = ShadowCapture::new(db.clone(), owner(), "com");
         let observed = match cycle {
             1 => vec![current[0][0].clone()],

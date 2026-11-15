@@ -518,7 +518,7 @@ async fn smart_reconciliation_lifecycle_with_capture(
                 crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com"),
                 Arc::from("private"),
             );
-            let (_, scope, zone) = pass.album.owned_private_scope().unwrap().unwrap();
+            let (_, scope, zone) = pass.album.owned_selection_scope().unwrap().unwrap();
             let key = "b".repeat(64);
             let generation = db.begin_selection_generation(owner.clone(), GenerationSpec {
                 format: 1, scope: scope.clone(), zone, config_hash: "a".repeat(64),
@@ -788,7 +788,7 @@ async fn smart_reconciliation_lifecycle_with_capture(
             assert!(!result.can_advance_database_checkpoint());
             let (_, scope, _) = lib.plan.passes[0]
                 .album
-                .owned_private_scope()
+                .owned_selection_scope()
                 .unwrap()
                 .unwrap();
             assert!(
