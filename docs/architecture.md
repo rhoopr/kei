@@ -1393,6 +1393,8 @@ Request retirement writes no source checkpoint. A fixed-date selection can compl
 
 For captured selection generations, `verified_selection_paths` returns the retained pass key with each published path. Projection keeps a same-pass, same-generation destination across folder-template changes within the configured root. New assets use the new template. An absent recorded destination remains the recovery target when ownership and protected-path checks permit it; publication still uses the no-overwrite path. Other passes' copies need the existing path-family match. This reuses retained generation evidence and adds no mapping table or serialized field.
 
+Before a selection-work watch shortcut and before replaying a quiet delta, the generation owner checks completed selected paths for existence in pages of 256. Only `NotFound` reopens the affected destination in the existing generation queue. Existing files are not hashed or treated as damaged by this check. The state transaction clears that copy's active completion proof while retaining its recorded path, catalog receipts, provider facts and retry timing. Replay supplies the existing targeted confirmation and publication path; completed peers remain complete. Filesystem inspection and state-write errors propagate instead of certifying a quiet cycle.
+
 ```text
 PhotoAsset
   -> planner::TaskPlanner

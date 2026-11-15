@@ -184,6 +184,7 @@ async fn cycle_resolution(
     .await
 }
 struct CycleOptions {
+    expected_due_selection: Option<bool>,
     indexing: Option<IndexingOptions>,
     refresh_metadata: bool,
     media_directory: &'static str,
@@ -201,6 +202,7 @@ struct CycleOptions {
 impl Default for CycleOptions {
     fn default() -> Self {
         Self {
+            expected_due_selection: None,
             indexing: None,
             refresh_metadata: false,
             media_directory: "media",
@@ -363,6 +365,20 @@ async fn try_cycle_options(
     config.photos.live_photo_mov_filename_policy = options.mov_policy;
     config.photos.live_photo_mode = options.live_mode;
     let (_session_root, session) = make_shared_session_for_run_cycle().await;
+    if let Some(expected) = options.expected_due_selection {
+        let check = build(
+            download::SyncMode::Full,
+            Arc::default(),
+            Arc::default(),
+            Arc::from("PrimarySync"),
+        );
+        assert_eq!(
+            download::has_due_selection_work(&library.plan.passes, &check, options.controls)
+                .await
+                .unwrap(),
+            Some(expected)
+        );
+    }
     let shutdown = options
         .indexing
         .as_ref()
@@ -530,13 +546,14 @@ async fn recorded_generation_destinations_survive_template_changes() {
         );
     }
     std::fs::remove_file(media.join("before/IMG_0501.JPG")).unwrap();
-    for quiet in [false, true, true] {
+    for cycle_index in 0..3 {
         let (result, _) = cycle_options(
             root.path(),
             current.clone(),
-            quiet,
+            true,
             EditedNaming::Suffix,
             CycleOptions {
+                expected_due_selection: Some(cycle_index == 0),
                 private: true,
                 folder_structure: "after",
                 ..CycleOptions::default()
@@ -552,6 +569,83 @@ async fn recorded_generation_destinations_survive_template_changes() {
             initial_requests + 2
         );
     }
+}
+
+#[tokio::test]
+async fn quiet_missing_file_requeue_failure_rolls_back_and_recovers_after_reopen() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let current = records(&server, Some(("edit-one", EDIT_ONE)));
+    let options = || CycleOptions {
+        private: true,
+        ..CycleOptions::default()
+    };
+    let (initial, _) = cycle_options(
+        root.path(),
+        current.clone(),
+        false,
+        EditedNaming::Suffix,
+        options(),
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0);
+    let media = root.path().join("media");
+    std::fs::remove_file(media.join("IMG_0501.JPG")).unwrap();
+    {
+        let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        db.acquire_lock("inject missing-file requeue failure").unwrap().execute_batch(
+            "CREATE TRIGGER fail_missing_requeue BEFORE UPDATE OF verified_media ON provider_active_destinations WHEN OLD.verified_media=1 AND NEW.verified_media=0 BEGIN SELECT RAISE(ABORT, 'injected missing requeue failure'); END;"
+        ).unwrap();
+    }
+    let failed = try_cycle_options(
+        root.path(),
+        current.clone(),
+        true,
+        EditedNaming::Suffix,
+        options(),
+    )
+    .await;
+    assert!(failed.is_err());
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM provider_active_destinations WHERE verified_media=0"
+        ),
+        0
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    {
+        let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        db.acquire_lock("restore missing-file requeue writes")
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_missing_requeue")
+            .unwrap();
+    }
+    for _ in 0..3 {
+        let (result, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Suffix,
+            options(),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+        assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+    // Existence discovery must not interpret an existing local edit as absence.
+    std::fs::write(media.join("IMG_0501.JPG"), b"local user edit").unwrap();
+    let (quiet, _) =
+        cycle_options(root.path(), current, true, EditedNaming::Suffix, options()).await;
+    assert_eq!(quiet.failed_count, 0);
+    assert_bytes(&media.join("IMG_0501.JPG"), b"local user edit");
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
 }
 
 #[tokio::test]

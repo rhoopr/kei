@@ -922,6 +922,61 @@ impl SelectionRun {
     }
 }
 
+async fn discover_missing_files(
+    context: &SelectionContext,
+    generation: &str,
+    directory: &std::path::Path,
+    cancel: Option<&CancellationToken>,
+) -> Result<()> {
+    let mut after = None;
+    loop {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Ok(());
+        }
+        let files = context
+            .capture
+            .db
+            .completed_selection_files(context.capture.owner.clone(), generation.to_owned(), after)
+            .await?;
+        let Some(last) = files.last() else {
+            return Ok(());
+        };
+        after = Some((
+            last.pass_key.clone(),
+            last.child.clone(),
+            last.version.clone(),
+            last.path.key()?,
+        ));
+        for file in files {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Ok(());
+            }
+            let Ok(path) =
+                crate::fs_util::reserved_path_under_root(directory, &file.path.to_path())
+            else {
+                continue;
+            };
+            match tokio::fs::symlink_metadata(&path).await {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    context
+                        .capture
+                        .db
+                        .reopen_missing_selection_file(
+                            context.capture.owner.clone(),
+                            generation.to_owned(),
+                            file,
+                        )
+                        .await?;
+                }
+                Err(error) => {
+                    return Err(error).context("Could not inspect recorded selected file");
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn has_due(
     passes: &[AlbumPass],
     config: &DownloadConfig,
@@ -933,6 +988,7 @@ pub(crate) async fn has_due(
     let Some(root) = context.current().await? else {
         return Ok(Some(true));
     };
+    discover_missing_files(&context, &root.id, &config.directory, None).await?;
     if !root.sealed
         && !context
             .capture
@@ -1470,6 +1526,9 @@ pub(super) async fn after_delta(
         return Ok(delta_result);
     }
     let root = context.current().await?;
+    if let Some(root) = &root {
+        discover_missing_files(context, &root.id, &config.directory, Some(&cancel)).await?;
+    }
     let mut selected = match root {
         Some(root)
             if root.sealed

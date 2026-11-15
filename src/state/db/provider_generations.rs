@@ -2166,7 +2166,58 @@ impl SqliteStateDb {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct CompletedSelectionFile {
+    pub(crate) pass_key: String,
+    pub(crate) child: String,
+    pub(crate) version: String,
+    pub(crate) path: super::provider_selection::SelectionPath,
+}
+
+const COMPLETED_SELECTION_PAGE_SIZE: i64 = 256;
+
 impl SqliteStateDb {
+    pub(crate) async fn completed_selection_files(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        after: Option<(String, String, String, String)>,
+    ) -> Result<Vec<CompletedSelectionFile>, StateError> {
+        self.with_conn("reading completed selection files", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            load_generation(conn, &generation)?;
+            let mut statement = conn.prepare("SELECT pass_key,child,version_size,path FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND verified_media=1 AND (?2 IS NULL OR (pass_key,child,version_size,path)>(?2,?3,?4,?5)) ORDER BY pass_key,child,version_size,path LIMIT ?6")?;
+            let rows = statement.query_map(params![generation, after.as_ref().map(|v| &v.0), after.as_ref().map(|v| &v.1), after.as_ref().map(|v| &v.2), after.as_ref().map(|v| &v.3), COMPLETED_SELECTION_PAGE_SIZE], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+            })?;
+            rows.map(|row| {
+                let (pass_key, child, version, path) = row?;
+                Ok(CompletedSelectionFile { pass_key, child, version,
+                    path: serde_json::from_str(&path).map_err(|_invalid| StateError::ProviderSelectionInvalid)?,
+                })
+            }).collect()
+        }).await
+    }
+
+    pub(crate) async fn reopen_missing_selection_file(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        file: CompletedSelectionFile,
+    ) -> Result<(), StateError> {
+        self.with_conn_mut("reopening missing selection file", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            account::validate_authenticated(&tx, &owner)?;
+            let root = load_generation(&tx, &generation)?;
+            load_decision(&tx, &root, &file.pass_key, &file.child)?;
+            // Keep catalog/path receipts and provider retry timing. Only the
+            // active completion proof for the absent copy becomes unfinished.
+            tx.execute("UPDATE provider_active_destinations SET verified_media=0,verified_metadata=0,local_checksum=NULL,source_checksum=NULL,progress_hash=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=1", params![generation, file.pass_key, file.child, file.version, file.path.key()?])?;
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
     pub(crate) async fn selection_path_matches_local(
         &self,
         owner: account::AccountOwner,
