@@ -1512,6 +1512,10 @@ version and that its filename matches the recorded task filename.
 
 ### Import-existing
 
+Writable sync calls `commands/import.rs::adopt_startup_archive` once for an empty state database, including recovery after state loss. It collects the resolved selected passes through the ordinary import matcher before starting downloads. Existing nonempty state skips this startup census. Missing or empty destinations need no provider scan. Adoption reads provider metadata and hashes local files; it makes no media requests and leaves media and sidecars unchanged. Ambiguous candidates remain unowned so normal sync can choose safe unique destinations.
+
+The metadata key `startup_archive_adoption_v1` records `pending` before the census and `complete` after adoption. Cancellation, incomplete enumeration and local hash or state-write failures retain `pending`, including when earlier candidates were committed. A later process retries that census despite its now nonempty database. Completed startup adoption does not scan again on ordinary sync or watch cycles. Startup adoption errors are reported while independently identified current sync work proceeds; adoption does not advance provider checkpoints.
+
 `src/commands/import.rs` shares configuration, selection, pass planning, and
 path derivation with normal sync. Before matching or consulting prior imports,
 it uses the download context's identity selector to install the same child or

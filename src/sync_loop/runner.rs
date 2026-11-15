@@ -307,7 +307,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // Skip for --dry-run so a preview doesn't create the DB or poison
     // sync tokens, which would cause a subsequent real sync to believe
     // nothing has changed and download 0 photos.
-    let state_db: Option<Arc<dyn download::DownloadStore>> = if config.runtime.dry_run {
+    let startup_db = if config.runtime.dry_run {
         None
     } else {
         match state::db::account::open_sync_state(
@@ -388,13 +388,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     }
                 }
 
-                Some(db as Arc<dyn download::DownloadStore>)
+                Some(db)
             }
             Err(e) => {
                 anyhow::bail!("Could not open account state database: {e}");
             }
         }
     };
+
+    let state_db: Option<Arc<dyn download::DownloadStore>> = startup_db
+        .as_ref()
+        .map(|db| Arc::clone(db) as Arc<dyn download::DownloadStore>);
 
     // Persist first-run settings only after the state upgrade boundary: an old
     // owned database must be backed up before creating a previously absent config.
@@ -548,6 +552,30 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     let (mut library_states, mut collection_context) =
         super::planning::resolve_library_plans(&mut photos_service, &libraries, &config).await?;
+    if run_mode.downloads_files()
+        && !is_retry_failed
+        && let Some(db) = startup_db.as_deref()
+    {
+        let plans: Vec<_> = library_states
+            .iter()
+            .map(|library| {
+                (
+                    build_download_config(
+                        download::SyncMode::Full,
+                        Arc::new(rustc_hash::FxHashSet::default()),
+                        Arc::new(download::AssetGroupings::default()),
+                        Arc::from(library.zone_name.as_str()),
+                    ),
+                    library.plan.passes.as_slice(),
+                )
+            })
+            .collect();
+        if let Err(error) =
+            crate::commands::adopt_startup_archive(db, &plans, &shutdown_token).await
+        {
+            tracing::warn!(%error, "Startup archive adoption incomplete; continuing current sync");
+        }
+    }
     let db_precheck_scope = DbPrecheckScope::from_config(
         &config,
         &library_states,

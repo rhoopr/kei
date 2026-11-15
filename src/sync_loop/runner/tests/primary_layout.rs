@@ -407,6 +407,61 @@ async fn server() -> MockServer {
     server
 }
 #[tokio::test]
+async fn startup_archive_adoption_flows_into_managed_sync_without_downloads() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    std::fs::create_dir(&media).unwrap();
+    std::fs::write(media.join("IMG_0501.JPG"), ORIGINAL).unwrap();
+    std::fs::write(media.join("IMG_0501.xmp"), b"retained user sidecar").unwrap();
+    let unedited = records(&server, None);
+    let provider = Session {
+        records: unedited.clone(),
+        quiet: false,
+        lookups: Arc::new(AtomicUsize::new(0)),
+        current: None,
+        indexing: None,
+    };
+    let passes = [AlbumPass {
+        kind: PassKind::Unfiled,
+        album: make_full_album_with_boxed_session("PrimarySync", Box::new(provider)),
+        exclude_ids: Arc::default(),
+    }];
+    let db = Arc::new(
+        state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap(),
+    );
+    let mut config = download::DownloadConfig::test_default();
+    config.directory = Arc::from(media.as_path());
+    config.folder_structure = String::new();
+    let stats = crate::commands::adopt_startup_archive(
+        &db,
+        &[(Arc::new(config), passes.as_slice())],
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.matched, 1);
+    drop(db);
+    for quiet in [false, true, true] {
+        let (result, _) = cycle(root.path(), unedited.clone(), quiet, EditedNaming::Suffix).await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+        assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(&media.join("IMG_0501.xmp"), b"retained user sidecar");
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM assets WHERE status='downloaded'"
+        ),
+        1
+    );
+}
+
+#[tokio::test]
 async fn contract_file_publish_no_overwrite_primary_layout_edits_revert_and_quiet_reopen() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();

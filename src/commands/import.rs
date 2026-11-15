@@ -60,6 +60,7 @@ pub(crate) struct ImportStats {
     pub strict_refused: u64,
     pub hash_errors: u64,
     pub skipped_already_imported: u64,
+    pub state_write_failures: u64,
 }
 
 impl std::ops::AddAssign for ImportStats {
@@ -71,6 +72,7 @@ impl std::ops::AddAssign for ImportStats {
         self.strict_refused += rhs.strict_refused;
         self.hash_errors += rhs.hash_errors;
         self.skipped_already_imported += rhs.skipped_already_imported;
+        self.state_write_failures += rhs.state_write_failures;
     }
 }
 
@@ -716,6 +718,7 @@ impl ImportPreflight {
                 .await
                 {
                     tracing::warn!(error = %e, "Failed to adopt asset");
+                    stats.state_write_failures += 1;
                     continue;
                 }
                 stats.matched += 1;
@@ -753,6 +756,84 @@ fn record_import_summary(stats: &ImportStats, dry_run: bool) {
             "dry_run": dry_run,
         }),
     );
+}
+
+const STARTUP_ADOPTION_KEY: &str = "startup_archive_adoption_v1";
+
+/// Adopt a first-run archive using the ordinary import census, without fetching
+/// media. A pending marker survives partial adoption and process interruption.
+pub(crate) async fn adopt_startup_archive(
+    db: &state::SqliteStateDb,
+    plans: &[(Arc<download::DownloadConfig>, &[super::AlbumPass])],
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<ImportStats> {
+    let marker = db.get_metadata(STARTUP_ADOPTION_KEY).await?;
+    if marker.as_deref() == Some("complete")
+        || (marker.is_none() && db.get_summary().await?.total_assets > 0)
+    {
+        return Ok(ImportStats::default());
+    }
+    anyhow::ensure!(
+        marker.is_none() || marker.as_deref() == Some("pending"),
+        "Unknown startup archive adoption state"
+    );
+    db.set_metadata(STARTUP_ADOPTION_KEY, "pending").await?;
+    anyhow::ensure!(
+        !shutdown.is_cancelled(),
+        "Startup archive adoption interrupted"
+    );
+    let mut preflight = ImportPreflight::default();
+    let mut cache = DirCache::new();
+    let mut stats = ImportStats::default();
+    let options = ImportRunOptions {
+        shutdown_token: Some(shutdown),
+        ..ImportRunOptions::default()
+    };
+    for (config, passes) in plans {
+        let mut directory = match tokio::fs::read_dir(&config.directory).await {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if directory.next_entry().await?.is_none() {
+            continue;
+        }
+        for pass in *passes {
+            anyhow::ensure!(
+                !shutdown.is_cancelled(),
+                "Startup archive adoption interrupted"
+            );
+            let pass_config = config.with_pass(pass);
+            let (stream, panic_rx) = pass.album.photo_stream(None, None, 1);
+            stats += collect_import_assets(
+                stream,
+                panic_rx,
+                db,
+                &pass_config,
+                &config.library,
+                &mut cache,
+                options,
+                &mut preflight,
+            )
+            .await?;
+        }
+    }
+    stats += preflight.adopt(db, options).await?;
+    anyhow::ensure!(
+        !shutdown.is_cancelled(),
+        "Startup archive adoption interrupted"
+    );
+    if stats.hash_errors == 0 && stats.state_write_failures == 0 {
+        db.set_metadata(STARTUP_ADOPTION_KEY, "complete").await?;
+    }
+    tracing::info!(
+        matched = stats.matched,
+        unmatched = stats.unmatched,
+        hash_errors = stats.hash_errors,
+        state_write_failures = stats.state_write_failures,
+        "Startup archive adoption finished"
+    );
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -2093,6 +2174,131 @@ mod wiremock_tests {
     }
 
     #[tokio::test]
+    async fn startup_archive_adopts_without_media_requests_and_stays_quiet_after_reopen() {
+        let server = crate::start_wiremock_or_skip!();
+        let asset = WiremockAsset::new("STARTUP", "archive.JPG", "public.jpeg").orig(
+            12,
+            "provider-generation",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(base_config(&tmp.path().join("photos")));
+        let paths = stage_expected(&asset.to_photo_asset(), &config);
+        let sidecar = paths[0].with_extension("xmp");
+        std::fs::write(&sidecar, b"existing metadata").unwrap();
+        let original = std::fs::read(&paths[0]).unwrap();
+        stub_records_query(&server, &[asset]).await;
+        let passes = [crate::commands::AlbumPass {
+            kind: crate::commands::PassKind::Unfiled,
+            album: album_pointed_at(&server),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let plans = [(config, passes.as_slice())];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let db = open_db(&tmp).await;
+        let stats = super::adopt_startup_archive(&db, &plans, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(stats.matched, 1);
+        assert_eq!(stats.state_write_failures, 0);
+        assert_eq!(all_downloaded(db.as_ref()).await.len(), 1);
+        assert_eq!(
+            db.get_metadata(super::STARTUP_ADOPTION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("complete")
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method.as_str() == "POST")
+        );
+        drop(db);
+        server.reset().await;
+        for _ in 0..2 {
+            let db = open_db(&tmp).await;
+            let stats = super::adopt_startup_archive(&db, &plans, &cancel)
+                .await
+                .unwrap();
+            assert_eq!(stats.total, 0);
+            assert_eq!(all_downloaded(db.as_ref()).await.len(), 1);
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), original);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), b"existing metadata");
+    }
+
+    #[tokio::test]
+    async fn startup_archive_retries_failed_state_write_without_rewriting_media() {
+        let server = crate::start_wiremock_or_skip!();
+        let asset = WiremockAsset::new("STARTUP_RETRY", "archive.JPG", "public.jpeg").orig(
+            12,
+            "provider-generation",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(base_config(&tmp.path().join("photos")));
+        let paths = stage_expected(&asset.to_photo_asset(), &config);
+        let peer = WiremockAsset::new("STARTUP_PEER", "peer.JPG", "public.jpeg").orig(
+            12,
+            "peer-generation",
+            "public.jpeg",
+        );
+        stage_expected(&peer.to_photo_asset(), &config);
+        let assets = [peer, asset];
+        stub_records_query(&server, &assets).await;
+        let passes = [crate::commands::AlbumPass {
+            kind: crate::commands::PassKind::Unfiled,
+            album: album_pointed_at(&server),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let plans = [(config, passes.as_slice())];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let db = open_db(&tmp).await;
+        db.acquire_lock("inject adoption failure").unwrap().execute_batch(
+            "CREATE TRIGGER fail_startup_adoption BEFORE INSERT ON assets WHEN NEW.filename = 'archive.JPG' BEGIN SELECT RAISE(ABORT, 'injected'); END;"
+        ).unwrap();
+        let stats = super::adopt_startup_archive(&db, &plans, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(stats.state_write_failures, 1);
+        assert_eq!(stats.matched, 1);
+        assert_eq!(all_downloaded(db.as_ref()).await.len(), 1);
+        assert_eq!(
+            db.get_metadata(super::STARTUP_ADOPTION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("pending")
+        );
+        db.acquire_lock("restore adoption writes")
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_startup_adoption")
+            .unwrap();
+        drop(db);
+        server.reset().await;
+        stub_records_query(&server, &assets).await;
+        let db = open_db(&tmp).await;
+        let stats = super::adopt_startup_archive(&db, &plans, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(stats.matched, 2);
+        assert_eq!(all_downloaded(db.as_ref()).await.len(), 2);
+        assert_eq!(
+            db.get_metadata(super::STARTUP_ADOPTION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("complete")
+        );
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), vec![0; 12]);
+    }
+
+    #[tokio::test]
     async fn unmatched_when_size_differs() {
         let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("A2", "IMG_0002.JPG", "public.jpeg").orig(
@@ -2117,6 +2323,67 @@ mod wiremock_tests {
         assert_eq!(stats.matched, 0);
         assert_eq!(stats.unmatched, 1);
         assert!(all_downloaded(db.as_ref()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_archive_preserves_ambiguous_files_and_resumes_after_cancellation() {
+        let server = crate::start_wiremock_or_skip!();
+        let assets = [
+            WiremockAsset::new("AMBIG_A", "same.JPG", "public.jpeg").orig(
+                12,
+                "a-generation",
+                "public.jpeg",
+            ),
+            WiremockAsset::new("AMBIG_B", "same.JPG", "public.jpeg").orig(
+                12,
+                "b-generation",
+                "public.jpeg",
+            ),
+        ];
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(base_config(&tmp.path().join("photos")));
+        let paths = stage_expected(&assets[0].to_photo_asset(), &config);
+        stub_records_query(&server, &assets).await;
+        let passes = [crate::commands::AlbumPass {
+            kind: crate::commands::PassKind::Unfiled,
+            album: album_pointed_at(&server),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let plans = [(config, passes.as_slice())];
+        let db = open_db(&tmp).await;
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            super::adopt_startup_archive(&db, &plans, &cancelled)
+                .await
+                .is_err()
+        );
+        assert!(all_downloaded(db.as_ref()).await.is_empty());
+        assert_eq!(
+            db.get_metadata(super::STARTUP_ADOPTION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("pending")
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        server.reset().await;
+        stub_records_query(&server, &assets).await;
+        let stats =
+            super::adopt_startup_archive(&db, &plans, &tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap();
+        assert_eq!(stats.matched, 0);
+        assert_eq!(stats.unmatched, 2);
+        assert!(all_downloaded(db.as_ref()).await.is_empty());
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), vec![0; 12]);
+        assert_eq!(
+            db.get_metadata(super::STARTUP_ADOPTION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("complete")
+        );
     }
 
     #[tokio::test]
