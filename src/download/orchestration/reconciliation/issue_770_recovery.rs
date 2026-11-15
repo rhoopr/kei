@@ -1983,10 +1983,11 @@ async fn issue_770_recovery_targeted_cleanup_preserves_required_publication_proo
             enumerate: false,
         }),
     );
-    let retry = crate::download::build_retry_download_tasks(
+    let retry = crate::download::orchestration::url_refresh::refresh_failed_download_urls(
         &[pass.clone()],
         &failed,
-        CancellationToken::new(),
+        &CancellationToken::new(),
+        None,
     )
     .await;
     assert_eq!(retry.tasks.len(), 1);
@@ -1998,10 +1999,11 @@ async fn issue_770_recovery_targeted_cleanup_preserves_required_publication_proo
     // Ordinary failures retain their ordinary finalization policy.
     let mut ordinary = failed.clone();
     ordinary[0].pending_cross_parent_root = None;
-    let retry = crate::download::build_retry_download_tasks(
+    let retry = crate::download::orchestration::url_refresh::refresh_failed_download_urls(
         &[pass.clone()],
         &ordinary,
-        CancellationToken::new(),
+        &CancellationToken::new(),
+        None,
     )
     .await;
     assert_eq!(retry.tasks.len(), 1);
@@ -2035,10 +2037,11 @@ async fn issue_770_recovery_targeted_cleanup_preserves_required_publication_proo
             .unwrap();
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].download_path, failed[0].download_path);
-        let retry = crate::download::build_retry_download_tasks(
+        let retry = crate::download::orchestration::url_refresh::refresh_failed_download_urls(
             &[changed_pass],
             &failed,
-            CancellationToken::new(),
+            &CancellationToken::new(),
+            None,
         )
         .await;
         assert!(

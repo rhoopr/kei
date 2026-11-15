@@ -653,7 +653,7 @@ async fn refresh_authentication_and_shutdown_remain_authoritative() {
 
 #[tokio::test]
 async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
-    use super::{RetryTaskKey, UrlRetrySource, build_incremental_expired_url_retry_tasks};
+    use super::{RetryTaskKey, UrlRetrySource, refresh_failed_download_urls};
     use wiremock::matchers::method;
     use wiremock::{Mock, ResponseTemplate};
     let server = crate::start_wiremock_or_skip!();
@@ -685,6 +685,7 @@ async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
     )
     .await
     .unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
     let passes = vec![AlbumPass {
         kind: PassKind::Unfiled,
         album: album_with_session(
@@ -693,7 +694,7 @@ async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
             Box::new(BoundedSession {
                 delta: Arc::new(Vec::new()),
                 fresh: Arc::new(records),
-                requests: Arc::new(Mutex::new(Vec::new())),
+                requests: Arc::clone(&requests),
             }),
         ),
         exclude_ids: Arc::new(FxHashSet::default()),
@@ -708,11 +709,29 @@ async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
             pass_index: 0,
         },
     );
-    let plan = build_incremental_expired_url_retry_tasks(
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    for evidence in [None, Some(&sources)] {
+        let held = refresh_failed_download_urls(
+            &passes,
+            std::slice::from_ref(&task),
+            &cancelled,
+            evidence,
+        )
+        .await;
+        assert!(held.tasks.is_empty());
+        assert_eq!(held.unrefreshed.len(), 1);
+        assert_eq!(
+            RetryTaskKey::from(&held.unrefreshed[0]),
+            RetryTaskKey::from(&task)
+        );
+        assert!(requests.lock().unwrap().is_empty());
+    }
+    let plan = refresh_failed_download_urls(
         &passes,
-        &sources,
         &[task.clone()],
-        CancellationToken::new(),
+        &CancellationToken::new(),
+        Some(&sources),
     )
     .await;
     assert_eq!(plan.tasks.len(), 1);

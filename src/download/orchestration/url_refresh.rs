@@ -25,11 +25,11 @@ pub(super) async fn refresh_expired_download_pass(
     result: &mut PassResult,
 ) -> usize {
     let candidates = result.expired_tasks.clone();
-    let plan = build_incremental_expired_url_retry_tasks(
+    let plan = refresh_failed_download_urls(
         passes,
-        retry_sources,
         &candidates,
-        config.shutdown_token.clone(),
+        &config.shutdown_token,
+        Some(retry_sources),
     )
     .await;
     result.rate_limit_observations += plan.rate_limit_observations;
@@ -114,7 +114,7 @@ impl CleanupRetryPlan {
 /// Refresh only the URL on already-selected tasks. Their original destination,
 /// rendition, metadata and publication authorization retain the first pass's
 /// selection evidence, including deferred unfiled exclusions.
-async fn refresh_failed_download_urls(
+pub(in crate::download) async fn refresh_failed_download_urls(
     passes: &[crate::commands::AlbumPass],
     failed_tasks: &[DownloadTask],
     shutdown_token: &CancellationToken,
@@ -378,36 +378,6 @@ async fn refresh_failed_download_urls(
     retry
 }
 
-/// Refresh failed tasks with fresh CDN URLs using targeted lookups.
-///
-/// The first pass may fail because signed content URLs expired before the
-/// worker reached them. Retrying the complete library after that is both slow
-/// and risky: newly-issued URLs for early tasks can age again while unrelated
-/// albums are planned. Limit cleanup to the exact asset/version/path tuples
-/// that failed so the retry pass starts consuming refreshed URLs quickly.
-pub(in crate::download) async fn build_retry_download_tasks(
-    passes: &[crate::commands::AlbumPass],
-    failed_tasks: &[DownloadTask],
-    shutdown_token: CancellationToken,
-) -> CleanupRetryPlan {
-    if failed_tasks.is_empty() || shutdown_token.is_cancelled() {
-        return CleanupRetryPlan::default();
-    }
-    refresh_failed_download_urls(passes, failed_tasks, &shutdown_token, None).await
-}
-
-/// Refresh exact selected resources through the authenticated source zone's
-/// bounded child/master lookup. Replanning and zone enumeration cannot change
-/// the task's path, rendition, metadata or publication authorization.
-pub(in crate::download) async fn build_incremental_expired_url_retry_tasks(
-    passes: &[crate::commands::AlbumPass],
-    retry_sources: &FxHashMap<RetryTaskKey, UrlRetrySource>,
-    failed_tasks: &[DownloadTask],
-    shutdown_token: CancellationToken,
-) -> CleanupRetryPlan {
-    refresh_failed_download_urls(passes, failed_tasks, &shutdown_token, Some(retry_sources)).await
-}
-
 pub(super) fn merge_expired_url_retry_result(
     pass_result: &mut PassResult,
     expired_retry_candidates: Vec<DownloadTask>,
@@ -480,7 +450,7 @@ pub(super) async fn refresh_stale_incremental_tasks_before_download(
         "Refreshing incremental download URLs before starting downloads"
     );
 
-    build_incremental_expired_url_retry_tasks(passes, retry_sources, &tasks, shutdown_token).await
+    refresh_failed_download_urls(passes, &tasks, &shutdown_token, Some(retry_sources)).await
 }
 
 #[cfg(test)]

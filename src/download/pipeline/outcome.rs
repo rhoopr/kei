@@ -561,22 +561,21 @@ pub(in crate::download) async fn build_download_result(
         "── Cleanup pass: re-fetching URLs and retrying failed downloads ──"
     );
 
-    let retry_plan = if let Some(context) = &config.selection_context {
+    let retry_sources = if let Some(context) = &config.selection_context {
         if let Some(run) = &config.selection_run {
             run.remember_retry_sources(&failed_tasks, passes).await?;
         }
-        let sources = context.exact_retry_sources()?;
-        crate::download::orchestration::url_refresh::build_incremental_expired_url_retry_tasks(
-            passes,
-            &sources,
-            &failed_tasks,
-            shutdown_token.clone(),
-        )
-        .await
+        Some(context.exact_retry_sources()?)
     } else {
-        crate::download::build_retry_download_tasks(passes, &failed_tasks, shutdown_token.clone())
-            .await
+        None
     };
+    let retry_plan = crate::download::orchestration::url_refresh::refresh_failed_download_urls(
+        passes,
+        &failed_tasks,
+        &shutdown_token,
+        retry_sources.as_ref(),
+    )
+    .await;
     tracing::debug!(target: "kei::download::pipeline",
         count = retry_plan.tasks.len(),
         "  Re-fetched failed tasks with fresh URLs"

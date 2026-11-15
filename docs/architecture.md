@@ -1398,6 +1398,8 @@ Pending recovery and collected incremental execution share `url_refresh::refresh
 
 Streaming cleanup uses the same exact-task lookup owner for ordinary transfer failures and expired URLs. It no longer re-enumerates albums or replans failed destinations. Refreshed records must match the selected rendition's content generation; the task retains its original path, metadata and publication authorization. Unmatched work remains pending. Cleanup still runs within the existing bounded pass and authentication/cancellation gates.
 
+`url_refresh::refresh_failed_download_urls` is the direct refresh entry point for streaming cleanup, expired-task retry and stale-URL preflight. Captured selections supply their exact source evidence to that owner; ordinary tasks use their selected source identity. The former ordinary and incremental builder wrappers are removed. Cancellation returns the original tasks as unrefreshed without provider requests, retaining exact destination evidence in either case.
+
 Targeted pending recovery currently requires successful source work. A pending row alone does not prove that a destination is unattempted: expired transfers and incomplete managed publication can retain pending state. Removing this gate requires distinguishing that work before scheduling another attempt. The existing gate preserves bounded attempts; remaining pending work survives for ordinary retry after reopen.
 
 The CLI rejects the retired `--retry-failed` flag before configuration, authentication or state startup. Ordinary sync owns automatic retry. The runner no longer resets failed rows or exits early through a separate retry-only startup path; regular dispatch retains its existing pending-work preparation.
