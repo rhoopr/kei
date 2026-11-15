@@ -572,6 +572,144 @@ async fn recorded_generation_destinations_survive_template_changes() {
 }
 
 #[tokio::test]
+async fn established_primary_layout_keeps_its_directory_after_template_change() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let (initial, _) = cycle_options(
+        root.path(),
+        records(&server, Some(("edit-one", EDIT_ONE))),
+        false,
+        EditedNaming::Primary,
+        CycleOptions {
+            private: true,
+            folder_structure: "before",
+            ..CycleOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    let requests = server.received_requests().await.unwrap().len();
+    let bindings = db_count(root.path(), "SELECT COUNT(*) FROM primary_layout_bindings");
+    let renamed = |edit| {
+        let mut current = records(&server, edit);
+        current[0]["fields"]["filenameEnc"]["value"] = json!("RENAMED.JPG");
+        current
+    };
+    {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+        let operations = db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_operations",
+        );
+        let (preview, _) = cycle_options(
+            root.path(),
+            renamed(Some(("edit-one", EDIT_ONE))),
+            false,
+            EditedNaming::Suffix,
+            CycleOptions {
+                private: true,
+                folder_structure: "after",
+                controls: download::DownloadControls::dry_run_hidden(),
+                ..CycleOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(preview.failed_count, 0);
+        assert!(capture.contains_event(|event| {
+            event.message() == Some("[PLAN] Current selected rendition destination")
+                && event.field("version") == Some("adjusted")
+                && event.field("path") == root.path().join("media/before/IMG_0501.JPG").to_str()
+        }));
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations"
+            ),
+            operations
+        );
+    }
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            renamed(Some(("edit-one", EDIT_ONE))),
+            quiet,
+            EditedNaming::Suffix,
+            CycleOptions {
+                private: true,
+                folder_structure: "after",
+                ..CycleOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+        assert_bytes(&root.path().join("media/before/IMG_0501.JPG"), EDIT_ONE);
+        assert_bytes(
+            &root.path().join("media/before/IMG_0501_original.JPG"),
+            ORIGINAL,
+        );
+        assert!(!root.path().join("media/after/IMG_0501.JPG").exists());
+        assert_eq!(
+            db_count(root.path(), "SELECT COUNT(*) FROM primary_layout_bindings"),
+            bindings
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    }
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_template_commit BEFORE INSERT ON primary_layout_bindings BEGIN SELECT RAISE(FAIL,'injected layout commit failure'); END;").unwrap();
+    drop(conn);
+    let interrupted = try_cycle_options(
+        root.path(),
+        renamed(Some(("edit-two", EDIT_TWO))),
+        false,
+        EditedNaming::Suffix,
+        CycleOptions {
+            private: true,
+            folder_structure: "after",
+            ..CycleOptions::default()
+        },
+    )
+    .await;
+    if let Ok((result, _)) = interrupted {
+        assert!(result.failed_count > 0);
+    }
+    assert!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_operations WHERE phase NOT IN ('committed','cancelled')"
+        ) > 0
+    );
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    conn.execute_batch("DROP TRIGGER fail_template_commit")
+        .unwrap();
+    drop(conn);
+    let (updated, _) = cycle_options(
+        root.path(),
+        renamed(Some(("edit-two", EDIT_TWO))),
+        false,
+        EditedNaming::Suffix,
+        CycleOptions {
+            private: true,
+            folder_structure: "final",
+            ..CycleOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(updated.failed_count, 0, "{:?}", updated.stats);
+    assert_bytes(&root.path().join("media/before/IMG_0501.JPG"), EDIT_TWO);
+    assert_bytes(
+        &root.path().join("media/before/IMG_0501_original.JPG"),
+        ORIGINAL,
+    );
+    assert!(!root.path().join("media/after/IMG_0501.JPG").exists());
+    assert!(!root.path().join("media/final/IMG_0501.JPG").exists());
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        requests + 1
+    );
+}
+
+#[tokio::test]
 async fn quiet_missing_file_requeue_failure_rolls_back_and_recovers_after_reopen() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
@@ -2700,17 +2838,24 @@ async fn review501_started_old_root_finishes_before_new_root_commits() {
                 .execute_batch("DROP TRIGGER fail_layout_commit")
                 .unwrap();
             let current = records(&server, Some(("edit-two", EDIT_TWO)));
-            let parent = root.path().join(directory).join(template);
-            let adjusted_path = parent.join(if naming == EditedNaming::Primary {
-                "IMG_0501.JPG"
+            let retained_template = directory == "media";
+            let parent = if retained_template {
+                old_media.clone()
             } else {
-                "IMG_0501_edited.JPG"
-            });
-            let original_path = parent.join(if naming == EditedNaming::Primary {
-                "IMG_0501_original.JPG"
-            } else {
-                "IMG_0501.JPG"
-            });
+                root.path().join(directory).join(template)
+            };
+            let adjusted_path =
+                parent.join(if retained_template || naming == EditedNaming::Primary {
+                    "IMG_0501.JPG"
+                } else {
+                    "IMG_0501_edited.JPG"
+                });
+            let original_path =
+                parent.join(if retained_template || naming == EditedNaming::Primary {
+                    "IMG_0501_original.JPG"
+                } else {
+                    "IMG_0501.JPG"
+                });
             for quiet in [false, true, true] {
                 let before_requests = server.received_requests().await.unwrap().len();
                 let (result, lookups) = cycle_options(
@@ -2741,9 +2886,41 @@ async fn review501_started_old_root_finishes_before_new_root_commits() {
                 assert!(result.db_sync_token_advance_safe);
                 assert_bytes(&adjusted_path, EDIT_TWO);
                 assert_bytes(&original_path, ORIGINAL);
-                assert_bytes(&old_media.join("IMG_0501.JPG"), EDIT_ONE);
+                assert_bytes(
+                    &old_media.join("IMG_0501.JPG"),
+                    if retained_template {
+                        EDIT_TWO
+                    } else {
+                        EDIT_ONE
+                    },
+                );
                 assert_bytes(&old_media.join("IMG_0501_original.JPG"), ORIGINAL);
                 let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+                if retained_template {
+                    assert!(
+                        !root
+                            .path()
+                            .join(directory)
+                            .join(template)
+                            .join("IMG_0501.JPG")
+                            .exists()
+                    );
+                    let preserved: Vec<Vec<u8>> = conn
+                        .prepare("SELECT native_path FROM primary_layout_preserved")
+                        .unwrap()
+                        .query_map([], |row| row.get(0))
+                        .unwrap()
+                        .collect::<Result<_, _>>()
+                        .unwrap();
+                    assert!(preserved.iter().any(|path| {
+                        let path = serde_json::from_slice::<
+                            state::db::provider_selection::SelectionPath,
+                        >(path)
+                        .unwrap()
+                        .to_path();
+                        std::fs::read(path).unwrap() == EDIT_ONE
+                    }));
+                }
                 let (checksum, local_path): (String, String) = conn.query_row(
                     "SELECT checksum,local_path FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted'",
                     [], |row| Ok((row.get(0)?, row.get(1)?)),

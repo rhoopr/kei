@@ -5017,15 +5017,36 @@ async fn exercise_legacy_child_cycles_with_provenance(
                 }
                 let requests = server.received_requests().await.unwrap().len();
                 if cycle == 1 {
-                    assert!(
-                        requests
-                            >= names.len()
-                                - usize::from(matches!(
-                                    fault,
-                                    AmbiguousChildFault::PreserveHiddenUnselected
-                                )),
-                        "fresh child downloads {label}"
-                    );
+                    if matches!(
+                        fault,
+                        AmbiguousChildFault::PreserveHistoricalClaim
+                            | AmbiguousChildFault::PreserveHistoricalReplacement
+                    ) {
+                        assert_eq!(
+                            requests, 0,
+                            "verified independent child copies are reused {label}"
+                        );
+                        let conn = rusqlite::Connection::open(&database).unwrap();
+                        for (index, child) in names.iter().enumerate() {
+                            let expected = destination.join(format!("independent-{index}.jpg"));
+                            assert_eq!(std::fs::read(&expected).unwrap(), bytes);
+                            let recorded: String = conn.query_row(
+                                "SELECT local_path FROM assets WHERE library='PrimarySync' AND id=?1 AND version_size='original'",
+                                [child], |row| row.get(0),
+                            ).unwrap();
+                            assert_eq!(std::path::PathBuf::from(recorded), expected);
+                        }
+                    } else {
+                        assert!(
+                            requests
+                                >= names.len()
+                                    - usize::from(matches!(
+                                        fault,
+                                        AmbiguousChildFault::PreserveHiddenUnselected
+                                    )),
+                            "fresh child downloads {label}"
+                        );
+                    }
                     completed_requests = requests;
                 }
                 if cycle == 2 && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery) {

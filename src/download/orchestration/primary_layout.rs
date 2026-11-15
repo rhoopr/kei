@@ -125,6 +125,10 @@ fn family(asset: &PhotoAsset, config: &DownloadConfig) -> Result<String> {
         &asset.created_local(),
         config.album_name.as_deref(),
     );
+    family_in_parent(asset, config, &parent)
+}
+
+fn family_in_parent(asset: &PhotoAsset, config: &DownloadConfig, parent: &Path) -> Result<String> {
     Ok(digest(serde_json::to_vec(&serde_json::json!([
         1,
         asset.source_zone().unwrap_or(&config.library),
@@ -135,6 +139,82 @@ fn family(asset: &PhotoAsset, config: &DownloadConfig) -> Result<String> {
             .unwrap_or(config.pass_label()),
         SelectionPath::from_path(&std::path::absolute(parent)?)
     ]))?))
+}
+
+async fn recorded_family(
+    asset: &PhotoAsset,
+    config: &DownloadConfig,
+    session: &LayoutSession,
+) -> Result<String> {
+    let requested = family(asset, config)?;
+    let Some(db) = config.state_db.as_deref() else {
+        return Ok(requested);
+    };
+    if db
+        .primary_layout_binding(requested.clone())
+        .await?
+        .is_some()
+    {
+        return Ok(requested);
+    }
+    let mut candidates = rustc_hash::FxHashSet::default();
+    for record in session.receipts(
+        asset.source_zone().unwrap_or(&config.library),
+        asset.state_id(),
+    ) {
+        if record.is_preserved_history {
+            continue;
+        }
+        let Some(path) = &record.local_path else {
+            continue;
+        };
+        if crate::fs_util::reserved_path_under_root(&config.directory, path).is_err() {
+            continue;
+        }
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let key = family_in_parent(asset, config, parent)?;
+        if db.primary_layout_binding(key.clone()).await?.is_some() {
+            candidates.insert(key);
+        }
+    }
+    for operation in db
+        .primary_layout_operations(config.library.to_string())
+        .await?
+    {
+        if operation.child != asset.state_id()
+            || operation.pass
+                != config
+                    .primary_layout_pass
+                    .as_deref()
+                    .unwrap_or(config.pass_label())
+        {
+            continue;
+        }
+        for member in &operation.members {
+            let Some(destination) = &member.destination else {
+                continue;
+            };
+            let path = destination.to_path();
+            if crate::fs_util::reserved_path_under_root(&config.directory, &path).is_err() {
+                continue;
+            }
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            if family_in_parent(asset, config, parent)? == operation.family {
+                candidates.insert(operation.family.clone());
+            }
+        }
+    }
+    // Multiple historical copies are retained; they do not identify one
+    // established destination for this pass.
+    Ok(if candidates.len() == 1 {
+        candidates.into_iter().next().unwrap_or(requested)
+    } else {
+        requested
+    })
 }
 fn decision(asset: &PhotoAsset, config: &DownloadConfig) -> Result<String> {
     let paths = filter::derive_expected_paths(asset, config);
@@ -232,6 +312,37 @@ fn qualified_path(path: &Path, qualifier: &str, role: filter::NamingRole) -> Res
     )))
 }
 
+fn bound_destination(
+    derived: &filter::DerivedPath,
+    qualifier: &str,
+    binding: Option<&LayoutBinding>,
+) -> Result<PathBuf> {
+    let destination = qualified_path(&derived.path, qualifier, derived.naming_role)?;
+    if let Some(file) = binding.and_then(|binding| {
+        binding.files.iter().find(|file| {
+            file.version == derived.version_size.as_str()
+                && file.archive_original
+                    == (derived.naming_role == filter::NamingRole::OriginalArchive)
+                && (file.provider_checksum == derived.checksum.as_ref()
+                    || file.path.to_path().extension() == destination.extension())
+        })
+    }) {
+        return Ok(file.path.to_path());
+    }
+    if let Some(file) =
+        binding.and_then(|binding| binding.files.iter().find(|file| !file.archive_original))
+    {
+        let recorded = file.path.to_path();
+        let parent = recorded.parent().context("Recorded layout has no parent")?;
+        return Ok(parent.join(
+            destination
+                .file_name()
+                .context("Layout destination has no filename")?,
+        ));
+    }
+    Ok(destination)
+}
+
 /// A source observation does not authorize a revert. Confirmation belongs to
 /// the Photos adapter and uses its complete current-resource projection.
 async fn confirm(asset: &PhotoAsset, config: &DownloadConfig) -> Result<PhotoAsset> {
@@ -289,7 +400,7 @@ pub(in crate::download) async fn process_asset(
     session: &LayoutSession,
     cancel: &CancellationToken,
 ) -> Result<Option<(PhotoAsset, LayoutOutcome)>> {
-    let key = family(&observed, config)?;
+    let key = recorded_family(&observed, config, session).await?;
     let result = process_asset_inner(client, observed, config, session, cancel).await;
     if result.is_err()
         && let Some(db) = config.state_db.as_deref()
@@ -317,7 +428,7 @@ async fn process_asset_inner(
         .state_db
         .as_deref()
         .context("Primary naming requires an owned state database")?;
-    let family = family(&observed, config)?;
+    let family = recorded_family(&observed, config, session).await?;
     let binding = db.primary_layout_binding(family.clone()).await?;
     let pending = db
         .primary_layout_operations(config.library.to_string())
@@ -574,7 +685,7 @@ async fn plan(
     let mut members = Vec::new();
     let mut destinations = Vec::new();
     for derived in paths {
-        let destination = qualified_path(&derived.path, &qualifier, derived.naming_role)?;
+        let destination = bound_destination(&derived, &qualifier, binding)?;
         let target = snapshot(&config.directory, &destination).await?;
         let old = oldfiles
             .iter()
@@ -1334,7 +1445,7 @@ pub(in crate::download) async fn preview_asset(
     config: &DownloadConfig,
     session: &LayoutSession,
 ) -> Result<Option<Vec<filter::DownloadTask>>> {
-    let key = family(asset, config)?;
+    let key = recorded_family(asset, config, session).await?;
     let binding = if let Some(db) = config.state_db.as_deref() {
         db.primary_layout_binding(key.clone()).await?
     } else {
@@ -1421,7 +1532,7 @@ pub(in crate::download) async fn preview_asset(
     };
     let mut tasks = Vec::new();
     for path in filter::derive_expected_paths(&current, config) {
-        let target = qualified_path(&path.path, &qualifier, path.naming_role)?;
+        let target = bound_destination(&path, &qualifier, binding.as_ref())?;
         tracing::info!(version=path.version_size.as_str(),path=%target.display(),"[PLAN] Current selected rendition destination");
         tasks.push(task_for(
             &current,
@@ -1446,7 +1557,7 @@ pub(in crate::download) async fn plan_asset(
         .state_db
         .as_deref()
         .context("Primary naming requires an owned state database")?;
-    let key = family(asset, config)?;
+    let key = recorded_family(asset, config, session).await?;
     let binding = db.primary_layout_binding(key.clone()).await?;
     let op = db
         .primary_layout_operations(config.library.to_string())
@@ -1553,7 +1664,7 @@ pub(in crate::download) async fn plan_asset(
         .unwrap_or("");
     let mut tasks = Vec::new();
     for path in paths {
-        let target = qualified_path(&path.path, qualifier, path.naming_role)?;
+        let target = bound_destination(&path, qualifier, binding.as_ref())?;
         tasks.push(task_for(
             &current,
             config,
@@ -1603,7 +1714,7 @@ pub(super) async fn recover(
                 .await?
                 .asset
                 .with_state_record_name(Arc::from(op.child.as_str()));
-            if family(&current, &effective)? != op.family {
+            if recorded_family(&current, &effective, &session).await? != op.family {
                 db.cancel_primary_layout(op.operation.clone()).await?;
                 matched = true;
                 break;
