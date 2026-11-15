@@ -214,6 +214,206 @@ async fn incremental_with_failed_rows_uses_targeted_retry_not_full_enumeration()
     );
 }
 
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn pending_peer_recovers_after_partial_failure_without_extra_same_cycle_attempts() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[derive(Clone, Debug)]
+    struct Session {
+        delta: Vec<Value>,
+        records: Vec<Value>,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for Session {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/changes/zone?") {
+                return Ok(changes_zone_response(self.delta.clone(), "next"));
+            }
+            assert!(
+                url.contains("/records/lookup?"),
+                "recovery must not enumerate"
+            );
+            Ok(json!({"records": self.records}))
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    let server = MockServer::start().await;
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/media/pattern.jpg"
+    ));
+    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+    let records_for = |id: &str| {
+        let mut records = incremental_photo_records_with_url(
+            id,
+            &format!("{id}.jpg"),
+            &format!("{}/{id}", server.uri()),
+            bytes.len() as u64,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+        records
+    };
+    let peer = records_for("peer");
+    let failing = records_for("failing");
+    let root = TempDir::new().unwrap();
+    let database = root.path().join("state.db");
+    let mut config = test_config();
+    config.directory = Arc::from(root.path().join("media"));
+    config.retry.max_retries = 0;
+    config.sync_mode = SyncMode::Incremental {
+        zone_sync_token: "before".into(),
+    };
+    {
+        let db = SqliteStateDb::open(&database).await.unwrap();
+        let asset = PhotoAsset::new(peer[0].clone(), peer[1].clone());
+        let destination = filter::expected_paths_for(&asset, &config).remove(0).path;
+        seed_pending_retry_with_recorded_path(
+            &db,
+            &asset,
+            &checksum,
+            bytes.len() as u64,
+            &destination,
+        )
+        .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/peer"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/failing"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(2)
+        .mount(&server)
+        .await;
+    for round in 0..4 {
+        let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+        config.state_db = Some(db.clone());
+        let passes = [AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(Session {
+                    delta: if round == 0 {
+                        failing.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    records: [peer.clone(), failing.clone()].concat(),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        if round == 0 {
+            for (outcome, state_failures, interrupted) in [
+                (
+                    DownloadOutcome::SessionExpired {
+                        auth_error_count: 1,
+                    },
+                    0,
+                    false,
+                ),
+                (
+                    DownloadOutcome::PartialFailure { failed_count: 1 },
+                    1,
+                    false,
+                ),
+                (DownloadOutcome::PartialFailure { failed_count: 1 }, 0, true),
+            ] {
+                let mut blocked = SyncResult::from_execution(outcome, None, Default::default());
+                blocked.checkpoint.state_write_failures = state_failures;
+                blocked.checkpoint.interrupted = interrupted;
+                let result = super::append_targeted_recovery_to_sync_result(
+                    &Client::new(),
+                    &passes,
+                    &Arc::new(config.clone()),
+                    DownloadControls::download_hidden(),
+                    CancellationToken::new(),
+                    blocked,
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.stats.downloaded, 0);
+                assert_eq!(db.get_pending().await.unwrap().len(), 1);
+                assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
+                assert!(server.received_requests().await.unwrap().is_empty());
+            }
+        }
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.stats.downloaded,
+            if round == 1 { 2 } else { 0 },
+            "{result:?}"
+        );
+        assert!(!result.full_enumeration_ran);
+        let completed = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(completed.len(), if round == 0 { 0 } else { 2 });
+        for record in completed {
+            assert_eq!(std::fs::read(record.local_path.unwrap()).unwrap(), bytes);
+        }
+        if round == 0 {
+            assert!(matches!(
+                result.outcome,
+                DownloadOutcome::PartialFailure { failed_count: 1 }
+            ));
+            let failed = db.get_failed().await.unwrap();
+            assert_eq!(failed.len(), 2);
+            assert!(
+                failed
+                    .iter()
+                    .any(|record| record.id.as_ref() == "asset-failing")
+            );
+            assert!(failed.iter().any(|record| record.id.as_ref() == "peer"));
+            server.verify().await;
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path("/failing"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/peer"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .expect(1)
+                .mount(&server)
+                .await;
+        } else {
+            assert!(
+                matches!(result.outcome, DownloadOutcome::Success),
+                "{result:?}"
+            );
+            assert!(db.get_failed().await.unwrap().is_empty());
+        }
+        assert!(db.get_pending().await.unwrap().is_empty());
+        config.state_db = None;
+    }
+    server.verify().await;
+}
+
 async fn seed_pending_retry_with_recorded_path(
     db: &crate::state::SqliteStateDb,
     asset: &PhotoAsset,
