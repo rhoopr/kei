@@ -1187,7 +1187,7 @@ impl TaskPlanner {
                     .truncated_repair_fingerprint(config.repair_truncated)
                     .await?
             {
-                if !self.claim_recorded_repair_path(local_path, &task).await {
+                if !self.bind_reserved_destination(&mut task, local_path).await {
                     tracing::warn!(
                         asset_id = %task.asset_id,
                         version_size = %task.version_size.as_str(),
@@ -1196,7 +1196,6 @@ impl TaskPlanner {
                     );
                     return Ok(None);
                 }
-                task.download_path = local_path.to_path_buf();
                 task.replacement_fingerprint = Some(Arc::new(fingerprint));
             } else {
                 let Some(retry_path) = self.resolve_recorded_retry_path(local_path, &task).await
@@ -1231,10 +1230,12 @@ impl TaskPlanner {
         Ok(())
     }
 
-    pub(super) async fn claim_recorded_repair_path(
+    /// Bind a task only after its exact destination claim succeeds.
+    #[must_use]
+    pub(super) async fn bind_reserved_destination(
         &mut self,
+        task: &mut DownloadTask,
         recorded_path: &Path,
-        task: &DownloadTask,
     ) -> bool {
         let Ok(planned) = self.path_mode.key(&task.download_path) else {
             return false;
@@ -1253,6 +1254,7 @@ impl TaskPlanner {
         }
         self.prepare_path_parent(recorded_path).await;
         self.claimed_paths.insert(recorded, task.size);
+        task.download_path = recorded_path.to_path_buf();
         true
     }
 

@@ -847,12 +847,11 @@ impl SelectionRun {
                 .find(|destination| destination.version_size == task.version_size.as_str())
                 .context("Task has no frozen destination")?;
             let frozen = destination.path.to_path();
-            if task.download_path != frozen {
-                if !planner.claim_recorded_repair_path(&frozen, &task).await {
-                    self.held.store(true, Ordering::Relaxed);
-                    continue;
-                }
-                task.download_path = frozen;
+            if task.download_path != frozen
+                && !planner.bind_reserved_destination(&mut task, &frozen).await
+            {
+                self.held.store(true, Ordering::Relaxed);
+                continue;
             }
             retained_tasks.push(task);
         }
