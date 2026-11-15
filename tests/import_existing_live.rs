@@ -915,7 +915,7 @@ fn write_kei_toml(dir: &Path, download_dir: &Path, extra: &str) -> std::path::Pa
         "[download]\ndirectory = {dl:?}\n{extra}",
         dl = download_dir.to_string_lossy(),
     );
-    std::fs::write(&path, common::live_selection::live_config(&body)).unwrap();
+    common::write_versioned_config(&path, common::live_selection::live_config(&body)).unwrap();
     path
 }
 
