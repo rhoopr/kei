@@ -184,7 +184,7 @@ pub(crate) async fn context(
     let mut qualified = None;
     let mut profile = Vec::new();
     for pass in passes {
-        if !matches!(pass.kind, PassKind::Album | PassKind::Unfiled) {
+        if pass.kind == PassKind::SmartFolder && !pass.album.is_supported_smart_folder() {
             return Ok(None);
         }
         let Some((capture, scope, zone)) = pass.album.private_selection_scope()? else {
@@ -1469,14 +1469,18 @@ pub(super) async fn after_delta(
     if let Some(root) = &root {
         discover_missing_files(context, &root.id, &config.directory, Some(&cancel)).await?;
     }
+    // Smart-folder membership comes from its current query, not from a zone
+    // delta or the previous generation's rank observations.
+    let refresh_selection = passes.iter().any(|pass| pass.kind == PassKind::SmartFolder);
     let mut selected = match root {
         Some(root)
-            if root.sealed
-                || context
-                    .capture
-                    .db
-                    .selection_waiting_for_retry(context.capture.owner.clone(), root.id.clone())
-                    .await? =>
+            if !refresh_selection
+                && (root.sealed
+                    || context
+                        .capture
+                        .db
+                        .selection_waiting_for_retry(context.capture.owner.clone(), root.id.clone())
+                        .await?) =>
         {
             replay(client, passes, config, controls, cancel.clone(), root).await?
         }

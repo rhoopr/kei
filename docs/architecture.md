@@ -614,9 +614,9 @@ admission, frozen metadata intent and completion validation.
 
 Activation requires an authenticated account-owned database and one exact
 private provider scope with an explicit default owner. Every selected pass must
-be a supported private named album or Unfiled query using the same concrete
-store and scope. Mixed, shared, smart-folder and unsupported profiles keep the
-whole existing dispatcher. Retry-only, metadata backfill, read-only execution
+be a supported private named album, Unfiled query or provider-defined smart query
+using the same concrete store and scope. Shared, cross-zone and unsupported
+profiles keep the whole existing dispatcher. Retry-only, metadata backfill, read-only execution
 and capture-local timestamp replacement keep their existing owners. Ordinary
 explicit metadata refresh with preservation can use active destinations.
 
@@ -1394,6 +1394,8 @@ Request retirement writes no source checkpoint. A fixed-date selection can compl
 For captured selection generations, `verified_selection_paths` returns the retained pass key with each published path. Projection keeps a same-pass, same-generation destination across folder-template changes within the configured root. New assets use the new template. An absent recorded destination remains the recovery target when ownership and protected-path checks permit it; publication still uses the no-overwrite path. Other passes' copies need the existing path-family match. This reuses retained generation evidence and adds no mapping table or serialized field.
 
 `TaskPlanner::recorded_selection_path` owns that retained-path choice, alongside receipt reuse and retry-path resolution. Generation projection supplies authenticated scope/pass evidence and keeps authority over frozen decisions and admission. The planner preserves confinement, protected-path checks and local completion proof validation. Managed publication paths remain with the layout owner.
+
+Private smart-folder passes use the same captured-generation destinations when their name, query types and filter exactly match the provider's built-in definitions. The Photos adapter validates those definitions; merely labeling a pass as smart does not qualify it. Incremental cycles still refresh smart membership through the current query before admitting work. Query absence does not authorize file deletion, and only the completed zone stream supplies an incremental successor. Unsupported, cross-zone and unowned selections retain their existing dispatch and debt gates.
 
 Before a selection-work watch shortcut and before replaying a quiet delta, the generation owner checks completed selected paths for existence in pages of 256. Only `NotFound` reopens the affected destination in the existing generation queue. Existing files are not hashed or treated as damaged by this check. The state transaction clears that copy's active completion proof while retaining its recorded path, catalog receipts, provider facts and retry timing. Replay supplies the existing targeted confirmation and publication path; completed peers remain complete. Filesystem inspection and state-write errors propagate instead of certifying a quiet cycle.
 

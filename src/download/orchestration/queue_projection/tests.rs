@@ -2816,6 +2816,172 @@ fn destination_pass_with(
 }
 
 #[tokio::test]
+async fn private_smart_folder_destinations_survive_template_changes_and_reopen() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let bytes = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
+    Mock::given(method("GET"))
+        .and(path("/media"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+        .expect(4)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_smart_folders = Arc::from("before/{smart-folder}");
+    let mut current = records("m", CURRENT, "smart selection");
+    current[0]["fields"]["filenameEnc"]["value"] = json!("smart.JPG");
+    current[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/media",server.uri()),"size":bytes.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(bytes))});
+    *f.session.records.lock().unwrap() = current;
+    f.capture(
+        vec![json!({"recordName":"smart-source","recordType":"FutureOpaque"})],
+        "smart-source",
+    )
+    .await;
+    let smart_pass = |f: &Fixture, name: &str| {
+        let (_, definition) = crate::icloud::photos::smart_folders::smart_folders()
+            .into_iter()
+            .find(|(candidate, _)| *candidate == name)
+            .unwrap();
+        let mut album = PhotoAlbum::new(
+            PhotoAlbumConfig {
+                params: Arc::new(std::collections::HashMap::new()),
+                service_endpoint: Arc::from("https://example.invalid"),
+                name: Arc::from(name),
+                list_type: Arc::from(definition.list_type),
+                obj_type: Arc::from(definition.obj_type),
+                query_filter: definition.query_filter,
+                page_size: 2,
+                zone_id: Arc::new(
+                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}),
+                ),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(DestinationSelectionSession(f.session.clone())),
+        );
+        album.set_shadow_capture(f.capture.clone(), Arc::from("private"));
+        AlbumPass {
+            kind: PassKind::SmartFolder,
+            album,
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }
+    };
+    for name in crate::icloud::photos::smart_folders::smart_folder_names() {
+        let mut pass = smart_pass(&f, name);
+        assert!(
+            pass.album.private_selection_scope().unwrap().is_some(),
+            "{name}"
+        );
+        pass.album.name = Arc::from("unknown-smart-query");
+        assert!(pass.album.private_selection_scope().unwrap().is_none());
+    }
+    for cycle in 0..4 {
+        if cycle > 0 {
+            f.config.folder_structure_smart_folders = Arc::from("after/{smart-folder}");
+            if cycle == 1 {
+                let mut added = records("new", CURRENT, "new smart selection");
+                added[0]["fields"]["filenameEnc"]["value"] = json!("new.JPG");
+                added[0]["fields"]["resOriginalRes"] =
+                    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"].clone();
+                f.session.records.lock().unwrap().extend(added);
+            }
+            if cycle == 3 {
+                // Leaving a smart query is not a provider deletion fact.
+                f.session.records.lock().unwrap().retain(|record| {
+                    matches!(record["recordName"].as_str(), Some("new" | "asset-new"))
+                });
+            }
+            f = reopen_destination_fixture(f).await;
+        }
+        if cycle == 1 {
+            f.db.acquire_lock("fail smart query capture").unwrap().execute_batch(
+                "CREATE TRIGGER fail_smart_capture BEFORE INSERT ON provider_selection_rank_pages BEGIN SELECT RAISE(ABORT, 'injected smart capture failure'); END;"
+            ).unwrap();
+            let failed = crate::download::download_photos_with_sync(
+                &reqwest::Client::new(),
+                &[smart_pass(&f, "Favorites"), smart_pass(&f, "Videos")],
+                Arc::new(f.config.clone()),
+                controls(),
+                CancellationToken::new(),
+            )
+            .await;
+            if let Ok(result) = failed {
+                assert!(result.checkpoint.sync_token_blocked, "{result:?}");
+                assert!(result.sync_token.is_none(), "{result:?}");
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
+            f.db.acquire_lock("restore smart query capture")
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_smart_capture")
+                .unwrap();
+            f = reopen_destination_fixture(f).await;
+        }
+        let before_queries = f.session.rank_calls.load(Ordering::SeqCst);
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &[smart_pass(&f, "Favorites"), smart_pass(&f, "Videos")],
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.stats.downloaded,
+            if cycle <= 1 { 2 } else { 0 },
+            "cycle {cycle}: {result:?}"
+        );
+        if cycle > 0 {
+            assert_eq!(
+                result.sync_token.as_deref(),
+                Some("quiet-zone-cursor"),
+                "{result:?}"
+            );
+            assert!(!result.checkpoint.sync_token_blocked, "{result:?}");
+        }
+        assert!(
+            f.session.rank_calls.load(Ordering::SeqCst) > before_queries,
+            "smart membership must be refreshed"
+        );
+        for name in ["Favorites", "Videos"] {
+            assert_eq!(
+                std::fs::read(
+                    f.config
+                        .directory
+                        .join("before")
+                        .join(name)
+                        .join("smart.JPG")
+                )
+                .unwrap(),
+                bytes
+            );
+            assert!(
+                !f.config
+                    .directory
+                    .join("after")
+                    .join(name)
+                    .join("smart.JPG")
+                    .exists()
+            );
+            if cycle > 0 {
+                assert_eq!(
+                    std::fs::read(f.config.directory.join("after").join(name).join("new.JPG"))
+                        .unwrap(),
+                    bytes
+                );
+            }
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            if cycle == 0 { 2 } else { 4 }
+        );
+    }
+}
+
+#[tokio::test]
 async fn private_destination_reopen_materializes_missing_copy() {
     Box::pin(destination_reopen_fixture(false, false, false)).await;
 }
@@ -5036,6 +5202,8 @@ async fn private_completed_native_publications_receive_explicit_current_metadata
 #[tokio::test]
 async fn private_smart_selector_preserves_existing_dispatch_and_retained_debt_gate() {
     let (mut f, root, _, _) = Box::pin(active_pending_fixture()).await;
+    // Relabeling an album pass does not supply a provider-defined smart query.
+    // Unsupported selectors keep the fallback route and its retained debt gate.
     f.pass.kind = PassKind::SmartFolder;
     f.config.media = crate::config::MediaSelection {
         photos: false,

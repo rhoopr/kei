@@ -105,6 +105,21 @@ pub(crate) fn validated_rank_page(request: &Value, body: &[u8]) -> Result<Value>
 }
 
 impl PhotoAlbum {
+    /// Require the complete provider query definition before capturing its
+    /// selection; a display name alone cannot establish smart membership.
+    #[must_use]
+    pub(crate) fn is_supported_smart_folder(&self) -> bool {
+        self.container_id.is_none()
+            && super::super::smart_folders::smart_folders()
+                .iter()
+                .any(|(name, definition)| {
+                    self.name.as_ref() == *name
+                        && self.list_type.as_ref() == definition.list_type
+                        && self.obj_type.as_ref() == definition.obj_type
+                        && self.query_filter == definition.query_filter
+                })
+    }
+
     /// Independently bound ownership protects old private obligations even if
     /// the current pass is not an eligible activation selector.
     pub(crate) fn owned_private_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {
@@ -134,9 +149,10 @@ impl PhotoAlbum {
         }
         let supported = match self.container_id.as_deref() {
             None => {
-                self.list_type.as_ref() == super::QUERY_ALL_LIST
+                (self.list_type.as_ref() == super::QUERY_ALL_LIST
                     && self.obj_type.as_ref() == super::QUERY_ALL_OBJ
-                    && self.query_filter.is_none()
+                    && self.query_filter.is_none())
+                    || self.is_supported_smart_folder()
             }
             Some(id) => {
                 !id.trim().is_empty()

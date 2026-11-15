@@ -56,7 +56,18 @@ impl PhotosSession for SmartReconciliationSession {
             {
                 return Ok(json!({"records": []}));
             }
-            return Ok(self.records.as_ref().clone());
+            let request: Value = serde_json::from_str(&body)?;
+            let mut response = self.records.as_ref().clone();
+            let records = response["records"].as_array_mut().unwrap();
+            records.extend(self.extra_records.lock().unwrap().clone());
+            records.retain(|record| {
+                request["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|requested| requested["recordName"] == record["recordName"])
+            });
+            return Ok(response);
         }
         if url.contains("/records/query/batch?") {
             return Ok(album_count_response(
@@ -276,6 +287,44 @@ async fn smart_reconciliation_lifecycle_bounded(
     failure: Option<SmartReconciliationFault>,
     bound: Option<SmartBound>,
 ) {
+    Box::pin(smart_reconciliation_lifecycle_with_capture(
+        smart_name,
+        mixed,
+        sidecars,
+        failure,
+        bound,
+        CaptureMode::Uncaptured,
+    ))
+    .await;
+}
+
+enum CaptureMode {
+    Uncaptured,
+    Captured,
+}
+
+#[tokio::test]
+async fn run_cycle_captured_smart_folder_retains_destination_after_template_change_and_restart() {
+    Box::pin(smart_reconciliation_lifecycle_with_capture(
+        "Favorites",
+        false,
+        false,
+        None,
+        None,
+        CaptureMode::Captured,
+    ))
+    .await;
+}
+
+async fn smart_reconciliation_lifecycle_with_capture(
+    smart_name: &str,
+    mixed: bool,
+    sidecars: bool,
+    failure: Option<SmartReconciliationFault>,
+    bound: Option<SmartBound>,
+    capture_mode: CaptureMode,
+) {
+    let captured = matches!(capture_mode, CaptureMode::Captured);
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -381,7 +430,7 @@ async fn smart_reconciliation_lifecycle_bounded(
     let mut current_hash = String::new();
     let mut previous_files = std::collections::BTreeMap::new();
     let mut original_sidecar = None;
-    let final_cycle = if failure.is_some() { 3 } else { 2 };
+    let final_cycle = if failure.is_some() || captured { 3 } else { 2 };
     for cycle in 0..=final_cycle {
         let held = cycle == 1 && failure.is_some();
         if cycle == 1
@@ -439,7 +488,7 @@ async fn smart_reconciliation_lifecycle_bounded(
         )
         .unwrap();
         let db = Arc::new(
-            if failure == Some(SmartReconciliationFault::RetainedSelectionDebt) {
+            if captured || failure == Some(SmartReconciliationFault::RetainedSelectionDebt) {
                 state::SqliteStateDb::open_owned(&db_path, &owner)
                     .await
                     .unwrap()
@@ -447,6 +496,18 @@ async fn smart_reconciliation_lifecycle_bounded(
                 state::SqliteStateDb::open(&db_path).await.unwrap()
             },
         );
+        if captured {
+            for pass in &mut lib.plan.passes {
+                pass.album.set_shadow_capture(
+                    crate::icloud::photos::inbox::ShadowCapture::new(
+                        db.clone(),
+                        owner.clone(),
+                        "com",
+                    ),
+                    Arc::from("private"),
+                );
+            }
+        }
         if held && failure == Some(SmartReconciliationFault::RetainedSelectionDebt) {
             use state::db::provider_generations::{
                 ActiveDecision, GenerationSpec, MAX_GENERATION_BYTES,
@@ -686,7 +747,12 @@ async fn smart_reconciliation_lifecycle_bounded(
                 bytes
             );
         } else {
-            assert!(current.starts_with(media.join("new")));
+            if captured {
+                assert_eq!(Some(&current), original_path.as_ref());
+                assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            } else {
+                assert!(current.starts_with(media.join("new")));
+            }
             assert_eq!(
                 std::fs::read(original_path.as_ref().unwrap()).unwrap(),
                 bytes
@@ -704,10 +770,12 @@ async fn smart_reconciliation_lifecycle_bounded(
                     .unwrap(),
                 None
             );
-            assert_eq!(
-                lookups.load(Ordering::SeqCst) - before,
-                usize::from(cycle < final_cycle)
-            );
+            if !captured {
+                assert_eq!(
+                    lookups.load(Ordering::SeqCst) - before,
+                    usize::from(cycle < final_cycle)
+                );
+            }
         }
         if let Some((path, bytes)) = &original_sidecar {
             assert_eq!(std::fs::read(path).unwrap(), *bytes);
@@ -877,8 +945,12 @@ async fn smart_reconciliation_lifecycle_bounded(
     assert!(reopened.get_pending().await.unwrap().is_empty());
     // Ordinary mixed selection also lands its own unfiled copy. Failures may
     // repeat a transfer whose durable write failed, but the final cycle is quiet.
-    let expected_minimum = if mixed { 3 } else { 2 };
-    assert!(server.received_requests().await.unwrap().len() >= expected_minimum);
+    if captured {
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    } else {
+        let expected_minimum = if mixed { 3 } else { 2 };
+        assert!(server.received_requests().await.unwrap().len() >= expected_minimum);
+    }
 }
 
 fn media_snapshot(
