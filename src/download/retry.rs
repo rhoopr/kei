@@ -268,6 +268,7 @@ impl PendingRetryPlanning<'_> {
     async fn plan_resolved_asset(&mut self, asset: &PhotoAsset, state_id: &str) -> Result<()> {
         let mut malformed_targets = FxHashSet::default();
         let mut state_write_failed_targets = FxHashSet::default();
+        let mut destination_refused_targets = FxHashSet::default();
         let mut filter_reasons = Vec::<filter::FilterReason>::new();
         for (pass_index, pass_config) in self.pass_configs.iter().enumerate() {
             if !self
@@ -388,6 +389,8 @@ impl PendingRetryPlanning<'_> {
                     .await?
                 {
                     retry_tasks.push(task);
+                } else {
+                    destination_refused_targets.insert(target);
                 }
             }
             retry_tasks.retain(|task| {
@@ -445,6 +448,7 @@ impl PendingRetryPlanning<'_> {
             .filter(|target| {
                 !malformed_targets.contains(*target)
                     && !state_write_failed_targets.contains(*target)
+                    && !destination_refused_targets.contains(*target)
             })
             .cloned()
             .collect();
@@ -468,6 +472,19 @@ impl PendingRetryPlanning<'_> {
                 transitioned,
                 "Pending asset excluded: current sync policy did not produce a retry task"
             );
+        }
+        for target in destination_refused_targets {
+            if self.pending_targets.contains(&target) {
+                self.db
+                    .set_asset_verification(
+                        &target.library,
+                        &target.asset_id,
+                        target.version_size.as_str(),
+                        AssetVerificationState::TransientFailure,
+                        "recorded retry destination could not be reserved",
+                    )
+                    .await?;
+            }
         }
         for target in state_write_failed_targets {
             if !self.pending_targets.contains(&target) {
@@ -1342,6 +1359,128 @@ mod tests {
             assert_eq!(sources[&RetryTaskKey::from(task)].pass_index, pass_index);
         }
         assert_eq!(db.get_pending().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn refused_recorded_destination_remains_pending_across_reopen() {
+        let root = tempfile::TempDir::new().unwrap();
+        let database = root.path().join("state.db");
+        let recorded = root.path().join("recorded.jpg");
+        std::fs::write(&recorded, b"x").unwrap();
+        let record = TestAssetRecord::new("MASTER")
+            .checksum("checksum")
+            .size(100)
+            .build();
+        let asset = candidate("MASTER", "asset-MASTER", "checksum", 100);
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(root.path());
+        config.repair_truncated = true;
+        let configs = [Arc::new(config)];
+        for round in 0..3 {
+            let db = crate::state::SqliteStateDb::open(&database).await.unwrap();
+            if round == 0 {
+                db.upsert_seen(&record).await.unwrap();
+                db.mark_downloaded(
+                    "PrimarySync",
+                    "MASTER",
+                    "original",
+                    &recorded,
+                    "prior-hash",
+                    Some("prior-hash"),
+                )
+                .await
+                .unwrap();
+                db.mark_failed(
+                    "PrimarySync",
+                    "MASTER",
+                    "original",
+                    crate::commands::reconcile::FILE_TRUNCATED_REASON,
+                )
+                .await
+                .unwrap();
+                db.acquire_lock("prepare pending repair fixture")
+                    .unwrap()
+                    .execute("UPDATE assets SET status='pending' WHERE id='MASTER'", [])
+                    .unwrap();
+            }
+            let pending = db.get_pending().await.unwrap();
+            assert_eq!(
+                pending.len(),
+                1,
+                "recorded-path refusal must survive reopen"
+            );
+            let evidence = pending
+                .iter()
+                .map(|record| {
+                    (
+                        PendingRetryTarget::from_record(record),
+                        PendingRetryEvidence::from_record(record),
+                    )
+                })
+                .collect();
+            let mut targets = pending
+                .iter()
+                .map(PendingRetryTarget::from_record)
+                .collect();
+            let mut planner = planner::TaskPlanner::new();
+            if round < 2 {
+                let mut competing = planner
+                    .plan_pending_retry_asset(
+                        &candidate("OTHER", "asset-OTHER", "other-checksum", 200),
+                        &configs[0],
+                    )
+                    .await
+                    .unwrap()
+                    .tasks
+                    .remove(0);
+                assert!(
+                    planner
+                        .bind_reserved_destination(&mut competing, &recorded)
+                        .await
+                );
+            }
+            let mut tasks = Vec::new();
+            let mut sources = FxHashMap::default();
+            PendingRetryPlanning {
+                db: &db,
+                shutdown: &CancellationToken::new(),
+                run_mode: super::super::DownloadRunMode::Download,
+                pass_configs: &configs,
+                pending_evidence: &evidence,
+                pending_targets: &mut targets,
+                task_planner: &mut planner,
+                tasks: &mut tasks,
+                retry_sources: &mut sources,
+            }
+            .plan_resolved_asset(&asset, "MASTER")
+            .await
+            .unwrap();
+            assert_eq!(tasks.len(), usize::from(round == 2));
+            assert_eq!(targets.len(), usize::from(round < 2));
+            if let Some(task) = tasks.first() {
+                assert_eq!(task.download_path, recorded);
+                assert!(task.replacement_fingerprint.is_some());
+            }
+            let retained = db.get_pending().await.unwrap();
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[0].local_path.as_ref(), Some(&recorded));
+            assert_eq!(retained[0].download_attempts, 1);
+            assert_eq!(
+                retained[0].last_error.as_deref(),
+                Some(crate::commands::reconcile::FILE_TRUNCATED_REASON)
+            );
+            let markers: i64 = db
+                .acquire_lock("check destination refusal evidence")
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM asset_verifications WHERE id='MASTER'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(markers, i64::from(round < 2));
+            assert_eq!(std::fs::read(&recorded).unwrap(), b"x");
+        }
     }
 
     #[tokio::test]

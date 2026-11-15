@@ -734,6 +734,8 @@ These requirements do not retire raw-inbox limits, all-generation provider-work 
 
 ## State-transition proof
 
+`refused_recorded_destination_remains_pending_across_reopen` exercises the retry planner with a recorded truncated file and a competing in-flight path claim. Refusal preserves pending state through two database reopens, including path, attempt count, repair reason and bytes. Removing the competing claim permits the recorded repair task and clears its transient marker. This proves retry admission; the publication/recovery suite covers subsequent transfer and publication safety.
+
 `inventory_initial_delta_failure_cannot_advance_before_inventory_qualifies` retains the provider cursor after a transfer failure, then seeds 100 historical attempts and reopens through the production runner. Recovery completes only the failed media, preserves completed peers and reaches two quiet cycles. The real-CLI retired-setting matrix checks `per_asset` values zero, ten, one hundred and malformed text, with unchanged config/state/media and zero provider requests.
 
 `cargo test --lib pending_peer_progresses_during_partial_failure_without_extra_same_cycle_attempts` exercises ordinary incremental dispatch with a missing recorded pending destination and an unrelated new transfer failure. The pending peer completes during the failing cycle; the failed source transfer recovers after reopen, followed by two quiet reopened cycles. The fixture checks exact media GET counts, bytes and pending/failed/completed rows. Authentication, interruption, state-write, checkpoint, identity, enumeration and unmatched-count controls retain pending work without HTTP transfers. Composed results preserve retry exclusions.
