@@ -234,7 +234,7 @@ impl PhotoAlbum {
         self.clone_for_task_without_sources()
     }
 
-    fn has_cross_zone_hydration(&self) -> bool {
+    pub(crate) fn has_cross_zone_hydration(&self) -> bool {
         self.container_id.is_some() && !self.cross_zone_sources.is_empty()
     }
 
@@ -472,7 +472,7 @@ impl PhotoAlbum {
     }
 
     fn clone_for_task_without_sources(&self) -> PhotoAlbum {
-        PhotoAlbum::new(
+        let mut cloned = PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::clone(&self.params),
                 service_endpoint: Arc::clone(&self.service_endpoint),
@@ -487,7 +487,10 @@ impl PhotoAlbum {
                 cross_zone_sources: Vec::new(),
             },
             self.session.clone_box(),
-        )
+        );
+        cloned.shadow_capture = self.shadow_capture.clone();
+        cloned.rank_capture = self.rank_capture.clone();
+        cloned
     }
 
     /// Share one read only inside a library sync whose albums retain the same

@@ -192,6 +192,44 @@ pub(crate) fn catalog_observed_page(
     page.observed_page(body, scope.to_owned(), request_cursor)
 }
 
+/// Validate original album-owner membership observations before durable capture.
+/// The top-level records view lets the existing source store index either query
+/// shape while retaining the untouched original response bytes.
+pub(super) fn validated_membership_page(request: &Value, body: &[u8]) -> anyhow::Result<Value> {
+    let zones = request
+        .get("zones")
+        .and_then(Value::as_array)
+        .filter(|zones| zones.len() == 1)
+        .context("Invalid membership request scope")?;
+    let zone = zones
+        .first()
+        .context("Missing membership request scope")?
+        .get("zoneID")
+        .context("Missing membership request zone")?;
+    anyhow::ensure!(
+        zone.get("ownerRecordName").and_then(Value::as_str) == Some("_defaultOwner"),
+        "Unsupported membership owner"
+    );
+    let mut response = super::super::changes_json::parse(body)?;
+    let parsed = ValidatedChangesPage::parse(response.clone(), zone)?;
+    anyhow::ensure!(
+        parsed
+            .records
+            .iter()
+            .all(|record| !record.record_name.trim().is_empty()),
+        "Missing membership source identity"
+    );
+    let records = response
+        .pointer("/zones/0/records")
+        .context("Missing membership records")?
+        .clone();
+    response
+        .as_object_mut()
+        .context("Invalid membership response")?
+        .insert("records".to_owned(), records);
+    Ok(response)
+}
+
 impl PhotoAlbum {
     pub(super) async fn scan_changes_zone<F>(&self, mut on_record: F) -> anyhow::Result<()>
     where
@@ -208,17 +246,38 @@ impl PhotoAlbum {
         loop {
             hydration_progress::page_started();
             let body = build_changes_zone_request(&self.zone_id, current_token.as_deref(), 200);
-            let response = session::retry_post(
-                self.session.as_ref(),
-                &url,
-                &body.to_string(),
-                &[("Content-type", "text/plain")],
-                &self.retry_config,
-            )
-            .await?;
+            let (response, original) = if self.rank_capture.is_some() {
+                let original = session::retry_post_changes_body(
+                    self.session.as_ref(),
+                    &url,
+                    &body.to_string(),
+                    &[("Content-type", "text/plain")],
+                    &self.retry_config,
+                )
+                .await?;
+                (
+                    super::super::changes_json::parse(&original)?,
+                    Some(original),
+                )
+            } else {
+                (
+                    session::retry_post(
+                        self.session.as_ref(),
+                        &url,
+                        &body.to_string(),
+                        &[("Content-type", "text/plain")],
+                        &self.retry_config,
+                    )
+                    .await?,
+                    None,
+                )
+            };
 
             let zone_result = ValidatedChangesPage::parse(response, &self.zone_id)?;
             zone_result.check_continuation(&mut visited)?;
+            if let (Some(capture), Some(original)) = (&self.rank_capture, original) {
+                capture.capture(body, original).await?;
+            }
 
             hydration_progress::page_received(zone_result.records.len());
             current_token = Some(zone_result.sync_token);

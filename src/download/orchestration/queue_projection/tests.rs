@@ -2786,6 +2786,18 @@ fn destination_pass_with(
 }
 
 fn uncaptured_destination_pass(session: &CurrentSession, name: &str) -> AlbumPass {
+    destination_pass_with_session(
+        session,
+        name,
+        Box::new(DestinationSelectionSession(session.clone())),
+    )
+}
+
+fn destination_pass_with_session(
+    session: &CurrentSession,
+    name: &str,
+    transport: Box<dyn PhotosSession>,
+) -> AlbumPass {
     let album = PhotoAlbum::new(
         PhotoAlbumConfig {
             params: Arc::new(std::collections::HashMap::new()),
@@ -2804,7 +2816,7 @@ fn uncaptured_destination_pass(session: &CurrentSession, name: &str) -> AlbumPas
             container_id: Some(Arc::from(name)),
             cross_zone_sources: Vec::new(),
         },
-        Box::new(DestinationSelectionSession(session.clone())),
+        transport,
     );
     AlbumPass {
         kind: PassKind::Album,
@@ -4295,6 +4307,450 @@ async fn active_pending_fixture() -> (
     admit_pending_fixture(Fixture::new().await, &[]).await
 }
 
+#[tokio::test]
+async fn explicit_media_source_cannot_rebind_retained_membership_evidence() {
+    use crate::state::db::provider_generations::MAX_GENERATION_BYTES;
+    use crate::state::db::provider_selection::SelectionMediaSource;
+    let (f, root, original, records) = active_pending_fixture().await;
+    for fault in ["database", "zone"] {
+        let mut manifest = original.clone();
+        let mut source = SelectionMediaSource {
+            scope: root.spec.scope.clone(),
+            zone: root.spec.zone.clone(),
+        };
+        if fault == "database" {
+            let mut scope: Value = serde_json::from_str(&source.scope).unwrap();
+            scope["database"] = json!("shared");
+            source.scope = scope.to_string();
+        } else {
+            source.zone["zoneName"] = json!("SharedSync-other");
+        }
+        manifest.decision.media_source = Some(source);
+        let error =
+            f.db.project_selection_decision(
+                owner(),
+                root.id.clone(),
+                manifest,
+                records.clone(),
+                MAX_GENERATION_BYTES,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::state::error::StateError::ProviderSelectionInvalid
+            ),
+            "{fault}: {error}"
+        );
+        let reopened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        let retained = reopened
+            .selection_decision(
+                owner(),
+                root.id.clone(),
+                original.decision.pass_key.clone(),
+                original.decision.child.clone(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained, original);
+        f.preserved().await;
+    }
+}
+
+#[tokio::test]
+async fn original_membership_pages_reuse_selection_capture_and_survive_reopen() {
+    use crate::state::db::provider_generations::MAX_GENERATION_BYTES;
+    let (f, root, mut manifest, records) = active_pending_fixture().await;
+    let request =
+        crate::icloud::photos::queries::build_changes_zone_request(&root.spec.zone, None, 200);
+    let mut body = serde_json::to_vec(&json!({"zones":[{
+        "zoneID":root.spec.zone,"syncToken":"membership-boundary","moreComing":false,
+        "records":[{"recordName":"relation-A-m","recordType":"CPLContainerRelation",
+            "fields":{"containerId":{"type":"STRING","value":"A"},"itemId":{"type":"STRING","value":"asset-foreign"}}},
+            {"recordName":"asset-foreign","recordType":"CPLContainerRelation",
+            "fields":{"containerId":{"type":"STRING","value":"B"},"itemId":{"type":"STRING","value":"asset-foreign"}}},
+            {"recordName":"deleted-relation","recordType":"CPLContainerRelation","deleted":true,
+            "fields":{"containerId":{"type":"STRING","value":"A"},"itemId":{"type":"STRING","value":"asset-foreign"}}}]
+    }]})).unwrap();
+    body.pop();
+    body.extend_from_slice(b",\"membershipFutureExact\":1.2300e+30}");
+    let before = f.count("provider_selection_rank_pages");
+    for _ in 0..2 {
+        let reopened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        reopened
+            .capture_selection_rank_page(
+                owner(),
+                root.id.clone(),
+                manifest.decision.pass_key.clone(),
+                request.clone(),
+                body.clone(),
+                MAX_GENERATION_BYTES,
+            )
+            .await
+            .unwrap();
+        let sources = reopened
+            .selection_rank_sources(
+                owner(),
+                root.id.clone(),
+                manifest.decision.pass_key.clone(),
+                "asset-foreign".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sources.len(), 1);
+        let stored: Vec<u8> = reopened
+            .acquire_lock("original membership source bytes")
+            .unwrap()
+            .query_row(
+                "SELECT body FROM provider_selection_rank_pages WHERE id=?1",
+                [&sources[0].page_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, body);
+        assert_eq!(f.count("provider_selection_rank_pages"), before + 1);
+    }
+    let mut wrong_request = request.clone();
+    wrong_request["zones"][0]["zoneID"]["zoneName"] = json!("SharedSync-foreign");
+    assert!(
+        f.db.capture_selection_rank_page(
+            owner(),
+            root.id.clone(),
+            manifest.decision.pass_key.clone(),
+            wrong_request,
+            body.clone(),
+            MAX_GENERATION_BYTES
+        )
+        .await
+        .is_err()
+    );
+    let mut wrong_body: Value = serde_json::from_slice(&body).unwrap();
+    wrong_body["zones"][0]["zoneID"]["ownerRecordName"] = json!("foreign-owner");
+    assert!(
+        f.db.capture_selection_rank_page(
+            owner(),
+            root.id.clone(),
+            manifest.decision.pass_key.clone(),
+            request.clone(),
+            serde_json::to_vec(&wrong_body).unwrap(),
+            MAX_GENERATION_BYTES
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(f.count("provider_selection_rank_pages"), before + 1);
+    let next =
+        f.db.begin_selection_generation(owner(), root.spec.clone(), MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+    let mut membership: Value = serde_json::from_slice(&body).unwrap();
+    membership["zones"][0]["records"][0]["fields"]["itemId"]["value"] =
+        json!(manifest.decision.child);
+    f.db.capture_selection_rank_page(
+        owner(),
+        next.id.clone(),
+        manifest.decision.pass_key.clone(),
+        request,
+        serde_json::to_vec(&membership).unwrap(),
+        MAX_GENERATION_BYTES,
+    )
+    .await
+    .unwrap();
+    manifest.sources =
+        f.db.selection_rank_sources(
+            owner(),
+            next.id.clone(),
+            manifest.decision.pass_key.clone(),
+            manifest.decision.child.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(manifest.sources.len(), 1);
+    let admitted =
+        f.db.project_selection_decision(
+            owner(),
+            next.id.clone(),
+            manifest.clone(),
+            records,
+            MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap();
+    assert!(admitted.admitted, "{}", admitted.reason);
+    let reopened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .selection_decision(
+                owner(),
+                next.id,
+                manifest.decision.pass_key.clone(),
+                manifest.decision.child.clone()
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        manifest
+    );
+    f.preserved().await;
+}
+
+#[tokio::test]
+async fn foreign_membership_admission_keeps_media_ownership_after_reopen() {
+    use crate::state::db::provider_generations::MAX_GENERATION_BYTES;
+    use crate::state::db::provider_selection::SelectionMediaSource;
+    for unresolved in [false, true] {
+        let (f, root, mut manifest, mut records) = active_pending_fixture().await;
+        let zone = json!({"zoneName":"SharedSync-media","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"});
+        let source = SelectionMediaSource {
+            scope: f.capture.scope("shared", &zone).unwrap(),
+            zone: zone.clone(),
+        };
+        let mut spec = root.spec.clone();
+        let mut media_session = f.session.clone();
+        media_session.zone_name = Arc::from("SharedSync-media");
+        let mut media = uncaptured_destination_pass(&media_session, "A").album;
+        media.set_shadow_capture(f.capture.clone(), Arc::from("shared"));
+        let album = f.pass.album.clone().with_cross_zone_sources(vec![media]);
+        let bound_sources = album.selection_media_sources().unwrap();
+        assert_eq!(bound_sources, std::slice::from_ref(&source));
+        spec.profile["passes"][0]["media_sources"] = json!(bound_sources);
+        let next =
+            f.db.begin_selection_generation(owner(), spec, MAX_GENERATION_BYTES)
+                .await
+                .unwrap();
+        let request =
+            crate::icloud::photos::queries::build_changes_zone_request(&root.spec.zone, None, 200);
+        let body = serde_json::to_vec(&json!({"zones":[{"zoneID":root.spec.zone,
+        "syncToken":"membership-boundary","moreComing":false,"records":[{
+        "recordName":"relation-A-m","recordType":"CPLContainerRelation",
+        "fields":{"containerId":{"value":"A"},"itemId":{"value":manifest.decision.child}}}]}]}))
+        .unwrap();
+        f.db.capture_selection_rank_page(
+            owner(),
+            next.id.clone(),
+            manifest.decision.pass_key.clone(),
+            request,
+            body,
+            MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap();
+        manifest.sources =
+            f.db.selection_rank_sources(
+                owner(),
+                next.id.clone(),
+                manifest.decision.pass_key.clone(),
+                manifest.decision.child.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manifest.sources.len(), 1);
+        let confirmation =
+            String::from_utf8(manifest.decision.confirmation.take().unwrap()).unwrap();
+        manifest.decision.confirmation = Some(
+            confirmation
+                .replace("PrimarySync", "SharedSync-media")
+                .into_bytes(),
+        );
+        manifest.decision.media_source = Some(source);
+        for record in &mut records {
+            record.library = "SharedSync-media".into();
+        }
+        for fault in [
+            "unbound-source",
+            "wrong-account",
+            "wrong-confirmation",
+            "wrong-library",
+        ] {
+            let mut invalid = manifest.clone();
+            let mut invalid_records = records.clone();
+            let mut authenticated = owner();
+            match fault {
+                "unbound-source" => invalid
+                    .decision
+                    .media_source
+                    .as_mut()
+                    .unwrap()
+                    .scope
+                    .push(' '),
+                "wrong-account" => {
+                    authenticated = AccountOwner::configured("other@example.invalid", "com")
+                }
+                "wrong-confirmation" => {
+                    invalid.decision.confirmation = Some(confirmation.as_bytes().to_vec())
+                }
+                "wrong-library" => invalid_records[0].library = "PrimarySync".into(),
+                _ => panic!("unknown source fault: {fault}"),
+            }
+            assert!(
+                f.db.project_selection_decision(
+                    authenticated,
+                    next.id.clone(),
+                    invalid,
+                    invalid_records,
+                    MAX_GENERATION_BYTES
+                )
+                .await
+                .is_err(),
+                "{fault}"
+            );
+            assert_eq!(
+                f.db.acquire_lock("rejected foreign admission")
+                    .unwrap()
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM provider_active_destinations WHERE generation=?1",
+                        [&next.id],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+        if unresolved {
+            let mut deferred = manifest.clone();
+            deferred.decision.master = None;
+            deferred.decision.confirmation = None;
+            deferred.decision.outcome = SelectionOutcome::Deferred;
+            deferred.decision.reason = "current_lookup_unresolved".into();
+            deferred.decision.destinations.clear();
+            let result =
+                f.db.project_selection_decision(
+                    owner(),
+                    next.id.clone(),
+                    deferred.clone(),
+                    Vec::new(),
+                    MAX_GENERATION_BYTES,
+                )
+                .await
+                .unwrap();
+            assert!(!result.admitted);
+            let reopened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+                .await
+                .unwrap();
+            let result = reopened
+                .project_selection_decision(
+                    owner(),
+                    next.id.clone(),
+                    manifest.clone(),
+                    records.clone(),
+                    MAX_GENERATION_BYTES,
+                )
+                .await
+                .unwrap();
+            assert!(!result.admitted);
+            assert_eq!(result.reason, "original_selected_facts_unresolved");
+            assert!(
+                reopened
+                    .project_selection_decision_with_proof(
+                        owner(),
+                        next.id.clone(),
+                        manifest.clone(),
+                        records.clone(),
+                        Some(confirmation.as_bytes().to_vec()),
+                        MAX_GENERATION_BYTES,
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                reopened
+                    .selection_decision(
+                        owner(),
+                        next.id.clone(),
+                        deferred.decision.pass_key.clone(),
+                        deferred.decision.child.clone()
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                deferred
+            );
+        }
+        let admitted =
+            f.db.project_selection_decision_with_proof(
+                owner(),
+                next.id.clone(),
+                manifest.clone(),
+                records.clone(),
+                unresolved.then(|| manifest.decision.confirmation.clone().unwrap()),
+                MAX_GENERATION_BYTES,
+            )
+            .await
+            .unwrap();
+        assert!(admitted.admitted, "{}", admitted.reason);
+        let reopened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .selection_decision(
+                    owner(),
+                    next.id.clone(),
+                    manifest.decision.pass_key.clone(),
+                    manifest.decision.child.clone()
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            manifest
+        );
+        let libraries: Vec<String> = reopened
+            .acquire_lock("foreign destination owner")
+            .unwrap()
+            .prepare(
+                "SELECT DISTINCT library FROM provider_active_destinations WHERE generation=?1",
+            )
+            .unwrap()
+            .query_map([&next.id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(libraries, ["SharedSync-media"]);
+        let asset_libraries: Vec<String> = reopened
+            .acquire_lock("equal child IDs retain separate media state")
+            .unwrap()
+            .prepare("SELECT DISTINCT library FROM assets WHERE id=?1 ORDER BY library")
+            .unwrap()
+            .query_map([&manifest.state_id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(asset_libraries, ["PrimarySync", "SharedSync-media"]);
+        let replay = reopened
+            .project_selection_decision(
+                owner(),
+                next.id.clone(),
+                manifest.clone(),
+                records,
+                MAX_GENERATION_BYTES,
+            )
+            .await
+            .unwrap();
+        assert!(replay.admitted, "{}", replay.reason);
+        assert_eq!(
+            reopened
+                .acquire_lock("one foreign destination after replay")
+                .unwrap()
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_active_destinations WHERE generation=?1",
+                    [&next.id],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            manifest.decision.destinations.len() as i64
+        );
+        f.preserved().await;
+    }
+}
+
 // Explicit logical/provider key pairs model a frozen historical declaration,
 // without asking the current selector to reproduce a retired RAW preference.
 async fn admit_pending_fixture(
@@ -4342,6 +4798,7 @@ async fn admit_pending_fixture(
             child: "asset-m".into(),
             master: Some("m".into()),
             confirmation: Some(current.body),
+            media_source: None,
             outcome: SelectionOutcome::Selected,
             reason: String::new(),
             destinations: crate::download::filter::derive_expected_paths(
@@ -4500,6 +4957,7 @@ async fn private_historical_replay_windows_round_robin_and_persist_past_64_after
                     child,
                     master: None,
                     confirmation: None,
+                    media_source: None,
                     outcome: SelectionOutcome::Deferred,
                     reason: "current_lookup_unresolved".into(),
                     destinations: Vec::new(),
@@ -4832,6 +5290,7 @@ async fn private_quota_valid_large_source_declaration_keeps_same_root_healthy_ta
             child: child_name.into(),
             master: None,
             confirmation: None,
+            media_source: None,
             outcome: SelectionOutcome::Deferred,
             reason: "current_lookup_unresolved".into(),
             destinations: Vec::new(),
@@ -5621,6 +6080,149 @@ async fn shared_selection_admission_preserves_account_and_zone_boundaries() {
     }
 }
 
+#[tokio::test]
+async fn selected_confirmation_uses_bound_media_source_not_membership_library() {
+    let f = Fixture::new().await;
+    let mut media_session = f.session.clone();
+    media_session.zone_name = Arc::from("SharedSync-media");
+    media_session.calls = Arc::new(AtomicUsize::new(0));
+    let mut media_records = records("m", CURRENT, "current");
+    media_records[1]["fields"]["masterRef"]["value"]["zoneID"]["zoneName"] =
+        json!(media_session.zone_name.as_ref());
+    media_session.records = Arc::new(Mutex::new(media_records));
+    let mut media = uncaptured_destination_pass(&media_session, "A").album;
+    media.set_shadow_capture(f.capture.clone(), Arc::from("shared"));
+    let observed = media.confirm_catalog_asset("asset-m").await.unwrap().asset;
+    let owner_asset = f
+        .pass
+        .album
+        .confirm_catalog_asset("asset-m")
+        .await
+        .unwrap()
+        .asset;
+    assert!(!crate::icloud::photos::same_selected_facts(
+        &owner_asset,
+        &observed
+    ));
+    assert!(!crate::icloud::photos::same_selected_facts(
+        &observed,
+        &owner_asset
+    ));
+    assert!(crate::icloud::photos::same_selected_facts(
+        &owner_asset
+            .clone()
+            .with_source_zone(Arc::from("SharedSync-media")),
+        &observed,
+    ));
+    let owner_calls = f.session.calls.load(Ordering::SeqCst);
+    let media_calls = media_session.calls.load(Ordering::SeqCst);
+    let album = f
+        .pass
+        .album
+        .clone()
+        .with_cross_zone_sources(vec![media.clone()]);
+    let confirmed = album.confirm_selected_asset(&observed).await.unwrap();
+    assert_eq!(
+        album.selection_media_sources().unwrap(),
+        [album.selected_media_source(&observed).unwrap()]
+    );
+    assert!(f.pass.album.selection_media_sources().unwrap().is_empty());
+    let duplicate = f
+        .pass
+        .album
+        .clone()
+        .with_cross_zone_sources(vec![media.clone(), media.clone()]);
+    assert!(duplicate.selection_media_sources().is_err());
+    let same_zone = f
+        .pass
+        .album
+        .clone()
+        .with_cross_zone_sources(vec![f.pass.album.clone()]);
+    assert!(same_zone.selection_media_sources().is_err());
+    let unbound = f
+        .pass
+        .album
+        .clone()
+        .with_cross_zone_sources(vec![uncaptured_destination_pass(&media_session, "A").album]);
+    assert!(unbound.selection_media_sources().is_err());
+    let mut foreign_account = media.clone();
+    foreign_account.set_shadow_capture(
+        ShadowCapture::new(
+            f.db.clone(),
+            AccountOwner::configured("other@example.invalid", "com"),
+            "com",
+        ),
+        Arc::from("shared"),
+    );
+    assert!(
+        f.pass
+            .album
+            .clone()
+            .with_cross_zone_sources(vec![foreign_account])
+            .selection_media_sources()
+            .is_err()
+    );
+    assert_eq!(confirmed.asset.source_zone(), Some("SharedSync-media"));
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), owner_calls);
+    assert_eq!(media_session.calls.load(Ordering::SeqCst), media_calls + 2);
+    let binding = album.selected_media_source(&observed).unwrap();
+    let recovered = album
+        .confirm_selection_identity("asset-m", &binding)
+        .await
+        .unwrap();
+    assert!(crate::icloud::photos::same_selected_facts(
+        &recovered.asset,
+        &observed
+    ));
+    let mut changed_binding = binding;
+    changed_binding.scope.push(' ');
+    let calls_before_refusal = media_session.calls.load(Ordering::SeqCst);
+    assert!(
+        album
+            .confirm_selection_identity("asset-m", &changed_binding)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        media_session.calls.load(Ordering::SeqCst),
+        calls_before_refusal
+    );
+
+    let before = media_session.calls.load(Ordering::SeqCst);
+    assert!(
+        f.pass
+            .album
+            .confirm_selected_asset(&observed)
+            .await
+            .is_err()
+    );
+    let foreign = Fixture::new().await;
+    let mut foreign_realm = media.clone();
+    foreign_realm.set_shadow_capture(
+        ShadowCapture::new(f.db.clone(), owner(), "cn"),
+        Arc::from("shared"),
+    );
+    let foreign_realm = f
+        .pass
+        .album
+        .clone()
+        .with_cross_zone_sources(vec![foreign_realm]);
+    assert!(foreign_realm.selection_media_sources().is_err());
+    assert!(
+        foreign_realm
+            .confirm_selected_asset(&observed)
+            .await
+            .is_err()
+    );
+    media.set_shadow_capture(foreign.capture.clone(), Arc::from("shared"));
+    let mismatched = f.pass.album.clone().with_cross_zone_sources(vec![media]);
+    assert!(mismatched.confirm_selected_asset(&observed).await.is_err());
+    assert!(mismatched.selection_media_sources().is_err());
+    assert_eq!(media_session.calls.load(Ordering::SeqCst), before);
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), owner_calls);
+    assert_eq!(f.count("provider_active_destinations"), 0);
+}
+
 #[cfg(target_os = "linux")]
 async fn shared_process_fixture(url: &str) -> Fixture {
     use sha2::{Digest, Sha256};
@@ -5635,9 +6237,77 @@ async fn shared_process_fixture(url: &str) -> Fixture {
 }
 
 #[cfg(target_os = "linux")]
-fn shared_process_passes(f: &Fixture) -> [AlbumPass; 2] {
+#[derive(Clone, Copy, Debug)]
+enum ProcessSelection {
+    SameZone,
+    CrossZone,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct MembershipProcessSession(CurrentSession);
+
+#[cfg(target_os = "linux")]
+#[async_trait::async_trait]
+impl PhotosSession for MembershipProcessSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        if url.contains("/records/query?") {
+            self.0.rank_calls.fetch_add(1, Ordering::SeqCst);
+            return Ok(json!({"records":[],"syncToken":"owner-rank-boundary"}));
+        }
+        if url.contains("/changes/zone?") {
+            let request: Value = serde_json::from_str(&body)?;
+            let relations = if self.0.zone_name.as_ref() == "SharedSync-media" {
+                self.0.records.lock().unwrap().clone()
+            } else if request["zones"][0].get("syncToken").is_none() {
+                ["A", "B"].into_iter().map(|album| json!({"recordName":format!("relation-{album}"),"recordType":"CPLContainerRelation","fields":{"containerId":{"value":album,"type":"STRING"},"itemId":{"value":"asset-m","type":"STRING"}}})).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            return Ok(
+                json!({"zones":[{"zoneID":request["zones"][0]["zoneID"],"records":relations,"syncToken":"quiet-zone-cursor","moreComing":false}]}),
+            );
+        }
+        DestinationSelectionSession(self.0.clone())
+            .post(url, body, headers)
+            .await
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn shared_process_passes(f: &Fixture, selection: ProcessSelection) -> [AlbumPass; 2] {
     ["A", "B"].map(|name| {
         let mut pass = uncaptured_destination_pass(&f.session, name);
+        if matches!(selection, ProcessSelection::CrossZone) {
+            let mut media_session = f.session.clone();
+            media_session.zone_name = Arc::from("SharedSync-media");
+            let mut records = f.session.records.lock().unwrap().clone();
+            records[1]["fields"]["masterRef"]["value"]["zoneID"] =
+                json!({"zoneName":"SharedSync-media","ownerRecordName":"_defaultOwner"});
+            media_session.records = Arc::new(Mutex::new(records));
+            let mut media = destination_pass_with_session(
+                &media_session,
+                name,
+                Box::new(MembershipProcessSession(media_session.clone())),
+            )
+            .album;
+            media.set_shadow_capture(f.capture.clone(), Arc::from("shared"));
+            pass.album = destination_pass_with_session(
+                &f.session,
+                name,
+                Box::new(MembershipProcessSession(f.session.clone())),
+            )
+            .album
+            .with_cross_zone_sources(vec![media]);
+        }
         pass.album
             .set_shadow_capture(f.capture.clone(), Arc::from("shared"));
         pass
@@ -5648,9 +6318,18 @@ fn shared_process_passes(f: &Fixture) -> [AlbumPass; 2] {
 #[tokio::test]
 #[ignore = "isolated subprocess controlled by the shared destination process-death parent"]
 async fn shared_destination_process_death_child() {
+    let (trace, _guard) = crate::test_helpers::TracingCapture::install();
     use crate::state::ReconciliationStateStore;
     let url = std::env::var("KEI_TEST_DESTINATION_URL").unwrap();
     let marker = std::env::var_os("KEI_TEST_DESTINATION_MARKER").unwrap();
+    let selection = match std::env::var("KEI_TEST_DESTINATION_SELECTION")
+        .unwrap()
+        .as_str()
+    {
+        "SameZone" => ProcessSelection::SameZone,
+        "CrossZone" => ProcessSelection::CrossZone,
+        other => panic!("unknown selection {other}"),
+    };
     let f = shared_process_fixture(&url).await;
     let historical = f.config.directory.join("historical/never-recreate.JPG");
     std::fs::create_dir_all(historical.parent().unwrap()).unwrap();
@@ -5668,7 +6347,10 @@ async fn shared_destination_process_death_child() {
             .unwrap()
             .into();
     f.db.reserve_reconciliation_paths(&[crate::state::ReconciliationReservation {
-        library: Arc::clone(&f.config.library),
+        library: match selection {
+            ProcessSelection::SameZone => Arc::clone(&f.config.library),
+            ProcessSelection::CrossZone => Arc::from("SharedSync-media"),
+        },
         asset_id: "asset-m".into(),
         version_size: VersionSizeKey::Original,
         content: Some(crate::state::ReconciliationContent {
@@ -5682,20 +6364,45 @@ async fn shared_destination_process_death_child() {
     .await
     .unwrap();
     std::fs::write(marker, f.dir.path().to_str().unwrap()).unwrap();
-    crate::download::download_photos_with_sync(
+    assert!(
+        crate::download::orchestration::generation::context(
+            &shared_process_passes(&f, selection),
+            &f.config,
+            controls()
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+    let result = crate::download::download_photos_with_sync(
         &reqwest::Client::new(),
-        &shared_process_passes(&f),
+        &shared_process_passes(&f, selection),
         Arc::new(f.config.clone()),
         controls(),
         CancellationToken::new(),
     )
     .await
     .unwrap();
+    panic!(
+        "process-death child completed before interruption: {result:?}\n{:?}",
+        trace.events()
+    );
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn shared_destination_process_death_preserves_unfinished_peer() {
+    destination_process_death_fixture(ProcessSelection::SameZone).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cross_zone_destination_process_death_preserves_unfinished_peer() {
+    destination_process_death_fixture(ProcessSelection::CrossZone).await;
+}
+
+#[cfg(target_os = "linux")]
+async fn destination_process_death_fixture(selection: ProcessSelection) {
     use crate::state::ReconciliationStateStore;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5722,8 +6429,9 @@ async fn shared_destination_process_death_preserves_unfinished_peer() {
         .env("TMPDIR", root.path())
         .env("KEI_TEST_DESTINATION_URL", &url)
         .env("KEI_TEST_DESTINATION_MARKER", &marker)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .env("KEI_TEST_DESTINATION_SELECTION", format!("{selection:?}"))
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .unwrap();
     let mut paused = None;
@@ -5777,9 +6485,10 @@ async fn shared_destination_process_death_preserves_unfinished_peer() {
             historical_reservation = Some(reservation);
         }
         let before = calls.load(Ordering::SeqCst);
+        let ranks_before = f.session.rank_calls.load(Ordering::SeqCst);
         let result = crate::download::download_photos_with_sync(
             &reqwest::Client::new(),
-            &shared_process_passes(&f),
+            &shared_process_passes(&f, selection),
             Arc::new(f.config.clone()),
             controls(),
             CancellationToken::new(),
@@ -5817,6 +6526,15 @@ async fn shared_destination_process_death_preserves_unfinished_peer() {
                 .unwrap(),
             0
         );
+        if matches!(selection, ProcessSelection::CrossZone) {
+            assert!(f.session.rank_calls.load(Ordering::SeqCst) > ranks_before);
+            let conn =
+                f.db.acquire_lock("cross-zone durable ownership after process death")
+                    .unwrap();
+            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE library<>'SharedSync-media'", [], |row| row.get(0)).unwrap(), 0);
+            assert!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_selection_rank_pages WHERE json_type(request,'$.zones')='array'", [], |row| row.get(0)).unwrap() > 0);
+            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_decisions WHERE json_extract(manifest,'$.decision.media_source.zone.zoneName') IS NOT 'SharedSync-media'", [], |row| row.get(0)).unwrap(), 0);
+        }
     }
 }
 
@@ -5989,6 +6707,13 @@ async fn selected_destination_retry_fixture(
         }
         assert!(!historical.exists());
         assert_eq!(std::fs::read(&retained).unwrap(), b"historical bytes");
+        assert_eq!(
+            f.db.acquire_lock("explicit current media source").unwrap().query_row::<i64,_,_>(
+                "SELECT count(*) FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE json_extract(d.manifest,'$.decision.confirmation') IS NOT NULL AND json_extract(d.manifest,'$.decision.media_source.scope') IS NOT g.scope",
+                [], |row| row.get(0),
+            ).unwrap(),
+            0,
+        );
         assert!(
             f.db.get_reconciliation_reservations()
                 .await
@@ -6458,6 +7183,7 @@ async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_reso
                 child: "asset-m".into(),
                 master: Some("m".into()),
                 confirmation: Some(current.body),
+                media_source: None,
                 outcome: SelectionOutcome::Selected,
                 reason: String::new(),
                 destinations,

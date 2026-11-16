@@ -15,7 +15,7 @@ pub(crate) struct RankCapture {
 
 impl RankCapture {
     pub(crate) async fn capture(&self, request: Value, body: Vec<u8>) -> Result<Value> {
-        let response = validated_rank_page(&request, &body)?;
+        let response = validated_selection_page(&request, &body)?;
         self.capture
             .db
             .capture_selection_rank_page(
@@ -68,11 +68,14 @@ fn validate_nested(value: &Value, zone: &Value) -> Result<()> {
 
 /// Validate the entire original page before typed pairing. EOF and query tokens
 /// remain observational telemetry, not snapshot, absence or cursor authority.
-pub(crate) fn validated_rank_page(request: &Value, body: &[u8]) -> Result<Value> {
+pub(crate) fn validated_selection_page(request: &Value, body: &[u8]) -> Result<Value> {
     anyhow::ensure!(
         body.len() <= super::super::inbox::MAX_CHANGES_PAGE_BYTES,
         "Rank page exceeds capture limit"
     );
+    if request.get("zones").is_some() {
+        return super::changes::validated_membership_page(request, body);
+    }
     let zone = request
         .get("zoneID")
         .context("Missing rank request scope")?;
@@ -102,6 +105,31 @@ pub(crate) fn validated_rank_page(request: &Value, body: &[u8]) -> Result<Value>
             .map_err(|_invalid| anyhow::anyhow!("Invalid rank source record"))?;
     }
     Ok(response)
+}
+
+/// Resolve only a live relation in this exact membership query's owner scope.
+pub(crate) fn selection_membership_child<'a>(
+    record: &'a Value,
+    container: &str,
+    zone: &Value,
+) -> Result<Option<&'a str>> {
+    if record.get("recordType").and_then(Value::as_str) != Some("CPLContainerRelation")
+        || record.get("deleted").and_then(Value::as_bool) == Some(true)
+        || record
+            .pointer("/fields/containerId/value")
+            .and_then(Value::as_str)
+            != Some(container)
+    {
+        return Ok(None);
+    }
+    validate_nested(record, zone)?;
+    Ok(Some(
+        record
+            .pointer("/fields/itemId/value")
+            .and_then(Value::as_str)
+            .filter(|child| !child.trim().is_empty())
+            .context("Missing selected relation child")?,
+    ))
 }
 
 impl PhotoAlbum {
@@ -144,9 +172,10 @@ impl PhotoAlbum {
         let Some(owned) = self.owned_selection_scope()? else {
             return Ok(None);
         };
-        if !self.cross_zone_sources.is_empty() {
+        if !self.cross_zone_sources.is_empty() && self.container_id.is_none() {
             return Ok(None);
         }
+        self.selection_media_sources()?;
         let supported = match self.container_id.as_deref() {
             None => {
                 (self.list_type.as_ref() == super::QUERY_ALL_LIST

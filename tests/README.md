@@ -353,6 +353,8 @@ whole-library inventory memory or request cost at production library scale.
 
 ### Abrupt process-death recovery
 
+`cargo test --lib destination_process_death_preserves_unfinished_peer` runs the same-zone and cross-zone destination cases on Linux. The cross-zone case uses authenticated source profiles and real production dispatch, retains original membership pages, verifies media-library ownership, and refreshes current queries after owner-zone deltas. Both cases restore only the unfinished peer after killing the child, then preserve historical reservations and bytes through two quiet follow-ups. The cross-zone case also runs without default features.
+
 `private_capture_timestamp_repair_uses_selected_destinations_and_existing_writer` covers a separate returned-error boundary: ordinary sync preserves existing EXIF time, explicit repair changes it, and a finalization fault leaves exact prepared output that completes after reopen without downloading again. It checks two quiet follow-up cycles and runs with and without default features. This is not an abrupt process-death test.
 
 `cargo test --lib shared_destination_process_death_preserves_unfinished_peer` exercises shared-database selection on Linux. It kills a child after one selected album copy is durably verified while the second transfer is in flight. Production dispatch restores only the unfinished copy, then makes no media requests through two further reopens. Historical reservations and bytes remain unchanged. The ignored child test runs only under its parent.

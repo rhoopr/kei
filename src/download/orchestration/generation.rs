@@ -208,7 +208,18 @@ pub(crate) async fn context(
         }
         let mut excludes: Vec<_> = pass.exclude_ids.iter().collect();
         excludes.sort_unstable();
-        profile.push(json!({"key":pass_key(pass),"kind":format!("{:?}",pass.kind),"scope":pass.album.selection_scope(),"excludes":excludes}));
+        let mut selected = json!({"key":pass_key(pass),"kind":format!("{:?}",pass.kind),"scope":pass.album.selection_scope(),"excludes":excludes});
+        let media_sources = pass.album.selection_media_sources()?;
+        if !media_sources.is_empty() {
+            selected
+                .as_object_mut()
+                .context("Invalid selection profile")?
+                .insert(
+                    "media_sources".to_owned(),
+                    serde_json::to_value(media_sources)?,
+                );
+        }
+        profile.push(selected);
     }
     let Some((capture, scope, zone)) = qualified else {
         return Ok(None);
@@ -381,8 +392,12 @@ impl SelectionRun {
                 else {
                     continue;
                 };
-                let asset =
-                    current_asset(body, &manifest.decision.child, master, &self.root.spec.zone)?;
+                let asset = current_asset(
+                    body,
+                    &manifest.decision.child,
+                    master,
+                    manifest.media_zone(&self.root),
+                )?;
                 let Some(provider_version) = filter::provider_version_for_frozen_resource(
                     &asset,
                     task.version_size,
@@ -415,7 +430,7 @@ impl SelectionRun {
     pub(in crate::download) async fn confirm(
         &self,
         key: &str,
-        observed: PhotoAsset,
+        observed: &PhotoAsset,
     ) -> Result<(PhotoAsset, SelectionConfirmation)> {
         if !self
             .capture
@@ -447,10 +462,14 @@ impl SelectionRun {
                 &body,
                 &previous.decision.child,
                 &master,
-                &self.root.spec.zone,
+                previous
+                    .decision
+                    .media_source
+                    .as_ref()
+                    .map_or(&self.root.spec.zone, |source| &source.zone),
             )?;
             anyhow::ensure!(
-                same_selected_facts(&retained, &observed),
+                same_selected_facts(&retained, observed),
                 "Retained current proof differs from observed selection"
             );
             if self.fresh_confirmation {
@@ -458,9 +477,7 @@ impl SelectionRun {
                     .albums
                     .get(key)
                     .context("Missing retained selection pass owner")?;
-                let current = album
-                    .confirm_catalog_asset(&previous.decision.child)
-                    .await?;
+                let current = album.confirm_selected_asset(&retained).await?;
                 anyhow::ensure!(
                     same_selected_facts(&retained, &current.asset),
                     "Retained selected generation differs from current proof"
@@ -487,11 +504,9 @@ impl SelectionRun {
             .albums
             .get(key)
             .context("Missing selection pass owner")?;
-        let current = album
-            .confirm_catalog_asset(observed.asset_record_name())
-            .await?;
+        let current = album.confirm_selected_asset(observed).await?;
         anyhow::ensure!(
-            same_selected_facts(&current.asset, &observed),
+            same_selected_facts(&current.asset, observed),
             "Current confirmation changed selection facts"
         );
         Ok((
@@ -510,6 +525,7 @@ impl SelectionRun {
         &self,
         key: &str,
         child: String,
+        observed: Option<&PhotoAsset>,
     ) -> Result<()> {
         let previous = self
             .capture
@@ -539,18 +555,29 @@ impl SelectionRun {
         // A failed retry preserves the original unresolved intent. New raw
         // observations remain retained independently; a later strict proof may
         // bind their additional links in the atomic resolving transaction.
-        let sources = if let Some(previous) = previous {
-            previous.sources
+        let (sources, media_source) = if let Some(previous) = previous {
+            (previous.sources, previous.decision.media_source)
         } else {
-            self.capture
-                .db
-                .selection_rank_sources(
-                    self.capture.owner.clone(),
-                    self.root.id.clone(),
-                    key.to_owned(),
-                    child.clone(),
-                )
-                .await?
+            let media_source = observed
+                .map(|asset| {
+                    self.albums
+                        .get(key)
+                        .context("Missing selected media owner")?
+                        .selected_media_source(asset)
+                })
+                .transpose()?;
+            (
+                self.capture
+                    .db
+                    .selection_rank_sources(
+                        self.capture.owner.clone(),
+                        self.root.id.clone(),
+                        key.to_owned(),
+                        child.clone(),
+                    )
+                    .await?,
+                media_source,
+            )
         };
         let manifest = ActiveDecision {
             decision: SelectionDecision {
@@ -558,6 +585,7 @@ impl SelectionRun {
                 child: child.clone(),
                 master: None,
                 confirmation: None,
+                media_source,
                 outcome: SelectionOutcome::Deferred,
                 reason: "current_lookup_unresolved".to_owned(),
                 destinations: Vec::new(),
@@ -721,7 +749,7 @@ impl SelectionRun {
                     .context("Missing selected metadata fingerprint")?;
                 records.push(
                     crate::state::AssetRecord::new_pending(
-                        Arc::clone(&config.library),
+                        Arc::from(asset.source_zone().unwrap_or(&config.library)),
                         asset.state_id().to_owned(),
                         derived.version_size,
                         derived.checksum.to_string(),
@@ -768,6 +796,15 @@ impl SelectionRun {
                 child: asset.asset_record_name().to_owned(),
                 master: Some(asset.id().to_owned()),
                 confirmation: Some(body),
+                media_source: match previous.as_ref() {
+                    Some(previous) => previous.decision.media_source.clone(),
+                    None => Some(
+                        self.albums
+                            .get(key)
+                            .context("Missing selected media owner")?
+                            .selected_media_source(asset)?,
+                    ),
+                },
                 outcome: if reason.is_empty() {
                     SelectionOutcome::Selected
                 } else if reason == "currently_filtered" {
@@ -1242,12 +1279,12 @@ async fn recover_retained(
             .iter()
             .filter(|decision| decision.decision.pass_key == key)
         {
-            let asset = match (&decision.decision.confirmation, &decision.decision.master) {
+            let mut asset = match (&decision.decision.confirmation, &decision.decision.master) {
                 (Some(body), Some(master)) => Some(current_asset(
                     body,
                     &decision.decision.child,
                     master,
-                    &root.spec.zone,
+                    decision.media_zone(&root),
                 )?),
                 _ => {
                     match context
@@ -1267,12 +1304,40 @@ async fn recover_retained(
                     }
                 }
             };
+            if asset.is_none()
+                && let Some(binding) = &decision.decision.media_source
+            {
+                let current = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        combined.enumeration_complete = false;
+                        break;
+                    }
+                    current = pass.album.confirm_selection_identity(&decision.decision.child, binding) => current,
+                };
+                match current {
+                    Ok(current) => asset = Some(current.asset),
+                    Err(error) => {
+                        combined.enumeration_errors += 1;
+                        combined.enumeration_complete = false;
+                        run.held.store(true, Ordering::Relaxed);
+                        if matches!(
+                            classify_selection_confirmation_error(&error),
+                            SelectionConfirmationErrorClass::SessionExpired
+                        ) {
+                            combined.provider_auth_errors += 1;
+                            run.session_expired.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            }
             if let Some(asset) = asset {
                 assets.push(Ok(
                     asset.with_state_record_name(Arc::from(decision.state_id.clone()))
                 ));
             } else {
-                run.defer_confirmation(&key, decision.decision.child.clone())
+                run.defer_confirmation(&key, decision.decision.child.clone(), None)
                     .await?;
             }
         }
@@ -1358,7 +1423,7 @@ async fn replay(
                         body,
                         &decision.decision.child,
                         master,
-                        &root.spec.zone,
+                        decision.media_zone(&root),
                     )?
                     .with_state_record_name(Arc::from(decision.state_id))));
                 } else {
@@ -1468,9 +1533,11 @@ pub(super) async fn after_delta(
     if let Some(root) = &root {
         discover_missing_files(context, &root.id, &config.directory, Some(&cancel)).await?;
     }
-    // Smart-folder membership comes from its current query, not from a zone
-    // delta or the previous generation's rank observations.
-    let refresh_selection = passes.iter().any(|pass| pass.kind == PassKind::SmartFolder);
+    // Smart membership and foreign media facts are not covered by the owner's
+    // zone delta. Refresh their current queries through the same inventory path.
+    let refresh_selection = passes
+        .iter()
+        .any(|pass| pass.kind == PassKind::SmartFolder || pass.album.has_cross_zone_hydration());
     let mut selected = match root {
         Some(root)
             if !refresh_selection

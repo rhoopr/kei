@@ -552,6 +552,7 @@ async fn smart_reconciliation_lifecycle_with_capture(
                             child: child.clone(),
                             master: None,
                             confirmation: None,
+                            media_source: None,
                             outcome: SelectionOutcome::Deferred,
                             reason: "confirmation_unavailable".into(),
                             destinations: vec![],

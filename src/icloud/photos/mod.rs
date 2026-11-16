@@ -542,7 +542,7 @@ impl PhotosService {
     }
 }
 
-pub(crate) use album::selection_capture::validated_rank_page;
+pub(crate) use album::selection_capture::{selection_membership_child, validated_selection_page};
 
 #[cfg(test)]
 mod tests {

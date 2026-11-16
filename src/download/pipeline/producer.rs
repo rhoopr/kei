@@ -397,7 +397,7 @@ where
                             continue;
                         };
                         let observed_child = asset.asset_record_name().to_owned();
-                        let (current, body) = match run.confirm(key, asset).await {
+                        let (current, body) = match run.confirm(key, &asset).await {
                             Ok(confirmed) => confirmed,
                             Err(error) => {
                                 enum_errors_producer
@@ -415,8 +415,9 @@ where
                                         return skips;
                                     }
                                     SelectionConfirmationErrorClass::Refused => {
-                                        if let Err(state_error) =
-                                            run.defer_confirmation(key, observed_child).await
+                                        if let Err(state_error) = run
+                                            .defer_confirmation(key, observed_child, Some(&asset))
+                                            .await
                                         {
                                             state_write_failures_producer
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
