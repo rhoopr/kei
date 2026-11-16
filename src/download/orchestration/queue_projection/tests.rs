@@ -1434,119 +1434,142 @@ async fn current_selection_dispatch_ignores_legacy_catalog_admission_fault() {
     use sha2::{Digest, Sha256};
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    let server = MockServer::start().await;
-    let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let mut f = Fixture::new().await;
-    f.capture(records("m", OLD, "source"), "old").await;
-    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
-        "downloadURL":format!("{}/media",server.uri()),"size":bytes.len(),
-        "fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(bytes))
-    });
-    let (_, _, zone) = f.pass.album.owned_selection_scope().unwrap().unwrap();
-    f.pass.album = PhotoAlbum::new(
-        PhotoAlbumConfig {
-            params: Arc::new(std::collections::HashMap::new()),
-            service_endpoint: Arc::from("https://example.invalid"),
-            name: Arc::from(""),
-            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
-            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
-            query_filter: None,
-            page_size: 2,
-            zone_id: Arc::new(zone),
-            retry_config: crate::retry::RetryConfig::default(),
-            container_id: None,
-            cross_zone_sources: Vec::new(),
-        },
-        Box::new(DestinationSelectionSession(f.session.clone())),
-    );
-    f.pass
-        .album
-        .set_shadow_capture(f.capture.clone(), Arc::from("private"));
-    assert!(f.pass.album.catalog_work_scope().unwrap().is_some());
-    let mut historical = f.plan().await.records[0].clone();
-    historical.id = "historical-unselected".into();
-    f.db.upsert_seen(&historical).await.unwrap();
-    f.db.mark_failed(
-        &historical.library,
-        &historical.id,
-        historical.version_size.as_str(),
-        "retained historical failure",
-    )
-    .await
-    .unwrap();
-    f.db.acquire_lock("historical scheduling evidence")
-        .unwrap()
-        .execute(
-            "UPDATE assets SET download_attempts=7 WHERE id='historical-unselected'",
-            [],
-        )
-        .unwrap();
-    for run_mode in [DownloadRunMode::DryRun, DownloadRunMode::PrintFilenames] {
-        let preview = crate::download::download_photos_with_sync(
-            &reqwest::Client::new(),
-            std::slice::from_ref(&f.pass),
-            Arc::new(f.config.clone()),
-            DownloadControls {
-                run_mode,
-                ..controls()
+    for naming in [
+        crate::types::EditedNaming::Suffix,
+        crate::types::EditedNaming::Primary,
+    ] {
+        let server = MockServer::start().await;
+        let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut f = Fixture::new().await;
+        f.config.edited_naming = naming;
+        f.capture(records("m", OLD, "source"), "old").await;
+        f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+            "downloadURL":format!("{}/media",server.uri()),"size":bytes.len(),
+            "fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(bytes))
+        });
+        let (_, _, zone) = f.pass.album.owned_selection_scope().unwrap().unwrap();
+        f.pass.album = PhotoAlbum::new(
+            PhotoAlbumConfig {
+                params: Arc::new(std::collections::HashMap::new()),
+                service_endpoint: Arc::from("https://example.invalid"),
+                name: Arc::from(""),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 2,
+                zone_id: Arc::new(zone),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
             },
-            CancellationToken::new(),
+            Box::new(DestinationSelectionSession(f.session.clone())),
+        );
+        f.pass
+            .album
+            .set_shadow_capture(f.capture.clone(), Arc::from("private"));
+        assert!(f.pass.album.catalog_work_scope().unwrap().is_some());
+        let mut historical = f.plan().await.records[0].clone();
+        historical.id = "historical-unselected".into();
+        f.db.upsert_seen(&historical).await.unwrap();
+        let mut pending = historical.clone();
+        pending.id = "historical-pending".into();
+        f.db.upsert_seen(&pending).await.unwrap();
+        f.db.mark_failed(
+            &historical.library,
+            &historical.id,
+            historical.version_size.as_str(),
+            "retained historical failure",
         )
         .await
         .unwrap();
-        assert!(
-            matches!(preview.outcome, crate::download::DownloadOutcome::Success),
-            "{preview:?}"
-        );
-        assert!(server.received_requests().await.unwrap().is_empty());
-        assert_eq!(f.count("provider_active_generations"), 0);
-        assert_eq!(f.db.acquire_lock("preview preserves retry schedule").unwrap().query_row::<i64,_,_>(
+        f.db.acquire_lock("historical scheduling evidence")
+            .unwrap()
+            .execute(
+                "UPDATE assets SET download_attempts=7 WHERE id='historical-unselected'",
+                [],
+            )
+            .unwrap();
+        for run_mode in [DownloadRunMode::DryRun, DownloadRunMode::PrintFilenames] {
+            let preview = crate::download::download_photos_with_sync(
+                &reqwest::Client::new(),
+                std::slice::from_ref(&f.pass),
+                Arc::new(f.config.clone()),
+                DownloadControls {
+                    run_mode,
+                    ..controls()
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    preview.outcome,
+                    crate::download::DownloadOutcome::PartialFailure { failed_count: 1 }
+                ),
+                "{preview:?}"
+            );
+            assert!(server.received_requests().await.unwrap().is_empty());
+            assert_eq!(f.count("provider_active_generations"), 0);
+            assert_eq!(f.db.acquire_lock("preview preserves retry schedule").unwrap().query_row::<i64,_,_>(
             "SELECT download_attempts FROM assets WHERE id='historical-unselected' AND status='failed' AND last_error='retained historical failure'", [], |row| row.get(0),
         ).unwrap(), 7);
-    }
-    f.config.sync_mode = crate::download::SyncMode::Incremental {
-        zone_sync_token: "old-cursor".into(),
-    };
-    f.db.acquire_lock("dispatch fault before receipt").unwrap().execute_batch("CREATE TRIGGER work_fault BEFORE INSERT ON provider_work_receipts BEGIN SELECT RAISE(ABORT,'synthetic dispatch work fault'); END;").unwrap();
-    for round in 0..3 {
-        let result = crate::download::download_photos_with_sync(
-            &reqwest::Client::new(),
-            std::slice::from_ref(&f.pass),
-            Arc::new(f.config.clone()),
-            controls(),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert!(
-            matches!(result.outcome, crate::download::DownloadOutcome::Success),
-            "{result:?}"
-        );
-        assert_eq!(result.stats.downloaded, usize::from(round == 0));
-        assert!(f.count("provider_active_destinations") > 0);
-        assert_eq!(f.count("provider_work_receipts"), 0);
-        let evidence: (String, i64, String) = f.db.acquire_lock("historical retry remains informational").unwrap()
+        }
+        f.config.sync_mode = crate::download::SyncMode::Incremental {
+            zone_sync_token: "old-cursor".into(),
+        };
+        f.db.acquire_lock("dispatch fault before receipt").unwrap().execute_batch("CREATE TRIGGER work_fault BEFORE INSERT ON provider_work_receipts BEGIN SELECT RAISE(ABORT,'synthetic dispatch work fault'); END;").unwrap();
+        for round in 0..3 {
+            let result = crate::download::download_photos_with_sync(
+                &reqwest::Client::new(),
+                std::slice::from_ref(&f.pass),
+                Arc::new(f.config.clone()),
+                controls(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(result.outcome, crate::download::DownloadOutcome::Success),
+                "{result:?}"
+            );
+            assert_eq!(result.stats.downloaded, usize::from(round == 0));
+            assert!(f.count("provider_active_destinations") > 0);
+            assert_eq!(f.count("provider_work_receipts"), 0);
+            let evidence: (String, i64, String) = f.db.acquire_lock("historical retry remains informational").unwrap()
             .query_row("SELECT status,download_attempts,last_error FROM assets WHERE id='historical-unselected'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
-        assert_eq!(
-            evidence,
-            ("failed".into(), 7, "retained historical failure".into())
-        );
-        let downloaded: String =
-            f.db.acquire_lock("current selection publication")
-                .unwrap()
-                .query_row(
-                    "SELECT local_path FROM assets WHERE id='asset-m' AND status='downloaded'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-        assert_eq!(std::fs::read(downloaded).unwrap(), bytes);
-        f.preserved().await;
+            assert_eq!(
+                evidence,
+                ("failed".into(), 7, "retained historical failure".into())
+            );
+            let downloaded: String =
+                f.db.acquire_lock("current selection publication")
+                    .unwrap()
+                    .query_row(
+                        "SELECT local_path FROM assets WHERE id='asset-m' AND status='downloaded'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+            assert_eq!(std::fs::read(downloaded).unwrap(), bytes);
+            assert_eq!(
+                f.db.acquire_lock("historical pending is not current failure")
+                    .unwrap()
+                    .query_row::<String, _, _>(
+                        "SELECT status FROM assets WHERE id='historical-pending'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                "pending"
+            );
+            f.preserved().await;
+        }
     }
 }
 

@@ -842,10 +842,11 @@ async fn download_photos_with_sync_inner(
         result.sync_token = None;
     }
 
-    // Managed publication can complete the newly captured source in this cycle.
-    // Keep the existing bounded admission owner, but run it after capture so an
-    // otherwise quiet reopen does not need to hydrate yesterday's completed work.
+    // Legacy managed publication can complete a newly captured source this cycle.
+    // Its bounded admission runs after capture; current selection already owns
+    // admission and completion for destination-managed runs.
     if primary_layout_active
+        && config.selection_context.is_none()
         && matches!(result.outcome, DownloadOutcome::Success)
         && !shutdown_token.is_cancelled()
     {
@@ -854,9 +855,11 @@ async fn download_photos_with_sync_inner(
     }
     super::generation::hold_retained_debt(passes, &config, controls, &mut result).await?;
 
-    // Pending is transient — anything still pending after a complete sync either
-    // wasn't enumerated or failed silently. Skip on interrupt where pending is expected.
-    if let Some(db) = &config.state_db
+    // Legacy rendition retry uses failed rows as its next-cycle schedule.
+    // Destination-owned and read-only runs must not rewrite that historical state.
+    if controls.run_mode.downloads_files()
+        && config.selection_context.is_none()
+        && let Some(db) = &config.state_db
         && !shutdown_token.is_cancelled()
     {
         match db.promote_pending_to_failed(sync_started_at).await {
