@@ -1468,6 +1468,47 @@ async fn current_selection_dispatch_ignores_legacy_catalog_admission_fault() {
         .album
         .set_shadow_capture(f.capture.clone(), Arc::from("private"));
     assert!(f.pass.album.catalog_work_scope().unwrap().is_some());
+    let mut historical = f.plan().await.records[0].clone();
+    historical.id = "historical-unselected".into();
+    f.db.upsert_seen(&historical).await.unwrap();
+    f.db.mark_failed(
+        &historical.library,
+        &historical.id,
+        historical.version_size.as_str(),
+        "retained historical failure",
+    )
+    .await
+    .unwrap();
+    f.db.acquire_lock("historical scheduling evidence")
+        .unwrap()
+        .execute(
+            "UPDATE assets SET download_attempts=7 WHERE id='historical-unselected'",
+            [],
+        )
+        .unwrap();
+    for run_mode in [DownloadRunMode::DryRun, DownloadRunMode::PrintFilenames] {
+        let preview = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            std::slice::from_ref(&f.pass),
+            Arc::new(f.config.clone()),
+            DownloadControls {
+                run_mode,
+                ..controls()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(preview.outcome, crate::download::DownloadOutcome::Success),
+            "{preview:?}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(f.count("provider_active_generations"), 0);
+        assert_eq!(f.db.acquire_lock("preview preserves retry schedule").unwrap().query_row::<i64,_,_>(
+            "SELECT download_attempts FROM assets WHERE id='historical-unselected' AND status='failed' AND last_error='retained historical failure'", [], |row| row.get(0),
+        ).unwrap(), 7);
+    }
     f.config.sync_mode = crate::download::SyncMode::Incremental {
         zone_sync_token: "old-cursor".into(),
     };
@@ -1489,6 +1530,12 @@ async fn current_selection_dispatch_ignores_legacy_catalog_admission_fault() {
         assert_eq!(result.stats.downloaded, usize::from(round == 0));
         assert!(f.count("provider_active_destinations") > 0);
         assert_eq!(f.count("provider_work_receipts"), 0);
+        let evidence: (String, i64, String) = f.db.acquire_lock("historical retry remains informational").unwrap()
+            .query_row("SELECT status,download_attempts,last_error FROM assets WHERE id='historical-unselected'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(
+            evidence,
+            ("failed".into(), 7, "retained historical failure".into())
+        );
         let downloaded: String =
             f.db.acquire_lock("current selection publication")
                 .unwrap()

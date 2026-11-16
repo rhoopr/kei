@@ -568,10 +568,22 @@ async fn download_photos_with_sync_inner(
         });
     }
 
-    // Give every non-downloaded asset a fresh start this sync:
-    // failed -> pending (with attempts reset), and stale attempt counts on
-    // pending assets cleared so the per-sync cap starts from zero.
-    if let Some(db) = &config.state_db {
+    let config =
+        if let Some(context) = super::generation::context(passes, &config, controls).await? {
+            Arc::new(DownloadConfig {
+                selection_context: Some(Arc::new(context)),
+                ..config.as_ref().clone()
+            })
+        } else {
+            config
+        };
+
+    // Only the legacy retry owner resets rendition-wide scheduling. Selected
+    // destinations retain their own attempts and due times across cycles.
+    if controls.run_mode.downloads_files()
+        && config.selection_context.is_none()
+        && let Some(db) = &config.state_db
+    {
         match db.prune_source_deleted_retries(Some(&config.library)).await {
             Ok(0) => {}
             Ok(count) => {
@@ -611,16 +623,6 @@ async fn download_photos_with_sync_inner(
             }
         }
     }
-
-    let config =
-        if let Some(context) = super::generation::context(passes, &config, controls).await? {
-            Arc::new(DownloadConfig {
-                selection_context: Some(Arc::new(context)),
-                ..config.as_ref().clone()
-            })
-        } else {
-            config
-        };
 
     if !primary_layout_active && config.selection_context.is_none() {
         super::queue_projection::admit_retained_work(passes, &config, controls, &shutdown_token)
