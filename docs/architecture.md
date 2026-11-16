@@ -613,7 +613,7 @@ current confirmation, transactional queue projection and destination replay.
 admission, frozen metadata intent and completion validation.
 
 Activation requires an authenticated account-owned database and one exact
-private or shared provider scope with an explicit default owner. Every selected pass must
+private or shared provider scope with an explicit nonblank owner. The exact discovered owner remains part of request, response and durable scope validation; `_defaultOwner` is not a separate eligibility rule. Every selected pass must
 be a supported named album, Unfiled query or provider-defined smart query
 using the same concrete store and membership scope. Named albums may bind authenticated foreign media sources in that store. Unsupported
 profiles keep the whole existing dispatcher. Both database scopes use the same validated source admission and per-destination completion owner. Database identity remains part of the durable scope; a receipt in one database cannot complete work in the other. Metadata backfill and read-only execution

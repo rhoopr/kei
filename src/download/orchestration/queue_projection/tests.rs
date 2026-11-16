@@ -26,6 +26,7 @@ struct CurrentSession {
     corrupt: Arc<Mutex<Option<&'static str>>>,
     discovery: bool,
     zone_name: Arc<str>,
+    zone_owner: Arc<str>,
 }
 
 #[async_trait::async_trait]
@@ -80,7 +81,10 @@ impl PhotosSession for CurrentSession {
         }
         let request: Value = serde_json::from_str(&body)?;
         assert_eq!(request["zoneID"]["zoneName"], self.zone_name.as_ref());
-        assert_eq!(request["zoneID"]["ownerRecordName"], "_defaultOwner");
+        assert_eq!(
+            request["zoneID"]["ownerRecordName"],
+            self.zone_owner.as_ref()
+        );
         let names: Vec<_> = request["records"]
             .as_array()
             .unwrap()
@@ -198,6 +202,7 @@ impl Fixture {
             corrupt: Arc::new(Mutex::new(None)),
             discovery: false,
             zone_name: Arc::from("PrimarySync"),
+            zone_owner: Arc::from("_defaultOwner"),
         };
         let mut album = PhotoAlbum::new(
             PhotoAlbumConfig {
@@ -2846,7 +2851,7 @@ fn destination_pass_with_session(
             )),
             page_size: 2,
             zone_id: Arc::new(
-                json!({"zoneName":session.zone_name.as_ref(),"ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}),
+                json!({"zoneName":session.zone_name.as_ref(),"ownerRecordName":session.zone_owner.as_ref(),"zoneType":"REGULAR_CUSTOM_ZONE"}),
             ),
             retry_config: crate::retry::RetryConfig::default(),
             container_id: Some(Arc::from(name)),
@@ -6121,10 +6126,10 @@ async fn selected_confirmation_uses_bound_media_source_not_membership_library() 
     let f = Fixture::new().await;
     let mut media_session = f.session.clone();
     media_session.zone_name = Arc::from("SharedSync-media");
+    media_session.zone_owner = Arc::from("MEDIA_OWNER_CANARY");
     media_session.calls = Arc::new(AtomicUsize::new(0));
     let mut media_records = records("m", CURRENT, "current");
-    media_records[1]["fields"]["masterRef"]["value"]["zoneID"]["zoneName"] =
-        json!(media_session.zone_name.as_ref());
+    media_records[1]["fields"]["masterRef"]["value"]["zoneID"] = json!({"zoneName":media_session.zone_name.as_ref(),"ownerRecordName":media_session.zone_owner.as_ref()});
     media_session.records = Arc::new(Mutex::new(media_records));
     let mut media = uncaptured_destination_pass(&media_session, "A").album;
     media.set_shadow_capture(f.capture.clone(), Arc::from("shared"));
@@ -6202,6 +6207,19 @@ async fn selected_confirmation_uses_bound_media_source_not_membership_library() 
     assert_eq!(f.session.calls.load(Ordering::SeqCst), owner_calls);
     assert_eq!(media_session.calls.load(Ordering::SeqCst), media_calls + 2);
     let binding = album.selected_media_source(&observed).unwrap();
+    let mut wrong_owner = binding.clone();
+    wrong_owner.zone["ownerRecordName"] = json!("OTHER_OWNER_CANARY");
+    let calls_before_owner_refusal = media_session.calls.load(Ordering::SeqCst);
+    assert!(
+        album
+            .confirm_selection_identity("asset-m", &wrong_owner)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        media_session.calls.load(Ordering::SeqCst),
+        calls_before_owner_refusal
+    );
     let recovered = album
         .confirm_selection_identity("asset-m", &binding)
         .await
@@ -6277,6 +6295,7 @@ async fn shared_process_fixture(url: &str) -> Fixture {
 enum ProcessSelection {
     SameZone,
     CrossZone,
+    ExplicitOwners,
 }
 
 #[cfg(target_os = "linux")]
@@ -6322,12 +6341,17 @@ impl PhotosSession for MembershipProcessSession {
 fn shared_process_passes(f: &Fixture, selection: ProcessSelection) -> [AlbumPass; 2] {
     ["A", "B"].map(|name| {
         let mut pass = uncaptured_destination_pass(&f.session, name);
-        if matches!(selection, ProcessSelection::CrossZone) {
+        if !matches!(selection, ProcessSelection::SameZone) {
             let mut media_session = f.session.clone();
             media_session.zone_name = Arc::from("SharedSync-media");
+            let mut membership_session = f.session.clone();
+            if matches!(selection, ProcessSelection::ExplicitOwners) {
+                media_session.zone_owner = Arc::from("MEDIA_OWNER_CANARY");
+                membership_session.zone_owner = Arc::from("MEMBERSHIP_OWNER_CANARY");
+            }
             let mut records = f.session.records.lock().unwrap().clone();
             records[1]["fields"]["masterRef"]["value"]["zoneID"] =
-                json!({"zoneName":"SharedSync-media","ownerRecordName":"_defaultOwner"});
+                json!({"zoneName":"SharedSync-media","ownerRecordName":media_session.zone_owner.as_ref()});
             media_session.records = Arc::new(Mutex::new(records));
             let mut media = destination_pass_with_session(
                 &media_session,
@@ -6337,9 +6361,9 @@ fn shared_process_passes(f: &Fixture, selection: ProcessSelection) -> [AlbumPass
             .album;
             media.set_shadow_capture(f.capture.clone(), Arc::from("shared"));
             pass.album = destination_pass_with_session(
-                &f.session,
+                &membership_session,
                 name,
-                Box::new(MembershipProcessSession(f.session.clone())),
+                Box::new(MembershipProcessSession(membership_session.clone())),
             )
             .album
             .with_cross_zone_sources(vec![media]);
@@ -6364,6 +6388,7 @@ async fn shared_destination_process_death_child() {
     {
         "SameZone" => ProcessSelection::SameZone,
         "CrossZone" => ProcessSelection::CrossZone,
+        "ExplicitOwners" => ProcessSelection::ExplicitOwners,
         other => panic!("unknown selection {other}"),
     };
     let f = shared_process_fixture(&url).await;
@@ -6385,7 +6410,9 @@ async fn shared_destination_process_death_child() {
     f.db.reserve_reconciliation_paths(&[crate::state::ReconciliationReservation {
         library: match selection {
             ProcessSelection::SameZone => Arc::clone(&f.config.library),
-            ProcessSelection::CrossZone => Arc::from("SharedSync-media"),
+            ProcessSelection::CrossZone | ProcessSelection::ExplicitOwners => {
+                Arc::from("SharedSync-media")
+            }
         },
         asset_id: "asset-m".into(),
         version_size: VersionSizeKey::Original,
@@ -6435,6 +6462,12 @@ async fn shared_destination_process_death_preserves_unfinished_peer() {
 #[tokio::test]
 async fn cross_zone_destination_process_death_preserves_unfinished_peer() {
     destination_process_death_fixture(ProcessSelection::CrossZone).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn explicit_owner_destination_process_death_preserves_unfinished_peer() {
+    destination_process_death_fixture(ProcessSelection::ExplicitOwners).await;
 }
 
 #[cfg(target_os = "linux")]
@@ -6562,7 +6595,7 @@ async fn destination_process_death_fixture(selection: ProcessSelection) {
                 .unwrap(),
             0
         );
-        if matches!(selection, ProcessSelection::CrossZone) {
+        if !matches!(selection, ProcessSelection::SameZone) {
             assert!(f.session.rank_calls.load(Ordering::SeqCst) > ranks_before);
             let conn =
                 f.db.acquire_lock("cross-zone durable ownership after process death")
@@ -6570,6 +6603,10 @@ async fn destination_process_death_fixture(selection: ProcessSelection) {
             assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE library<>'SharedSync-media'", [], |row| row.get(0)).unwrap(), 0);
             assert!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_selection_rank_pages WHERE json_type(request,'$.zones')='array'", [], |row| row.get(0)).unwrap() > 0);
             assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_decisions WHERE json_extract(manifest,'$.decision.media_source.zone.zoneName') IS NOT 'SharedSync-media'", [], |row| row.get(0)).unwrap(), 0);
+            if matches!(selection, ProcessSelection::ExplicitOwners) {
+                assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_decisions WHERE json_extract(manifest,'$.decision.media_source.zone.ownerRecordName') IS NOT 'MEDIA_OWNER_CANARY'", [], |row| row.get(0)).unwrap(), 0);
+                assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_generations WHERE json_extract(specification,'$.zone.ownerRecordName') IS NOT 'MEMBERSHIP_OWNER_CANARY'", [], |row| row.get(0)).unwrap(), 0);
+            }
         }
     }
 }

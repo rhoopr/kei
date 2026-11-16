@@ -49,9 +49,9 @@ use crate::icloud::photos::cloudkit::ChangesDatabaseResponse;
 use crate::icloud::photos::queries::encode_params;
 use crate::retry::RetryConfig;
 
-// Syntax alone grants no authority. Callers require validated private discovery
-// and a recognized indexing response for the exact selected primary scope.
-fn has_explicit_owner(owner: Option<&Value>) -> bool {
+// Syntax alone grants no authority. Callers bind this owner to authenticated
+// discovery or durable source evidence and validate the exact selected scope.
+pub(crate) fn has_explicit_owner(owner: Option<&Value>) -> bool {
     owner
         .and_then(Value::as_str)
         .is_some_and(|owner| !owner.trim().is_empty())

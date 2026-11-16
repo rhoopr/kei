@@ -100,7 +100,7 @@ fn validate_media_source(
             scope.get("database").and_then(Value::as_str),
             Some("private" | "shared")
         )
-        || source.zone.get("ownerRecordName").and_then(Value::as_str) != Some("_defaultOwner")
+        || !crate::icloud::photos::has_explicit_owner(source.zone.get("ownerRecordName"))
         || source
             .zone
             .get("zoneName")
@@ -172,7 +172,7 @@ fn validate_spec(spec: &GenerationSpec) -> Result<(), StateError> {
             scope.get("database").and_then(Value::as_str),
             Some("private" | "shared")
         )
-        || spec.zone.get("ownerRecordName").and_then(Value::as_str) != Some("_defaultOwner")
+        || !crate::icloud::photos::has_explicit_owner(spec.zone.get("ownerRecordName"))
         || spec.zone.get("zoneName") != scope.pointer("/zone/zoneName")
         || spec.zone.get("ownerRecordName") != scope.pointer("/zone/ownerRecordName")
         || [&spec.config_hash, &spec.basis]

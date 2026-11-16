@@ -207,7 +207,7 @@ pub(super) fn validated_membership_page(request: &Value, body: &[u8]) -> anyhow:
         .get("zoneID")
         .context("Missing membership request zone")?;
     anyhow::ensure!(
-        zone.get("ownerRecordName").and_then(Value::as_str) == Some("_defaultOwner"),
+        super::super::has_explicit_owner(zone.get("ownerRecordName")),
         "Unsupported membership owner"
     );
     let mut response = super::super::changes_json::parse(body)?;

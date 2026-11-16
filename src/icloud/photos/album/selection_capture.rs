@@ -80,7 +80,7 @@ pub(crate) fn validated_selection_page(request: &Value, body: &[u8]) -> Result<V
         .get("zoneID")
         .context("Missing rank request scope")?;
     anyhow::ensure!(
-        zone.get("ownerRecordName").and_then(Value::as_str) == Some("_defaultOwner")
+        super::super::has_explicit_owner(zone.get("ownerRecordName"))
             && zone
                 .get("zoneName")
                 .and_then(Value::as_str)
@@ -155,7 +155,7 @@ impl PhotoAlbum {
             return Ok(None);
         };
         if !matches!(database.as_ref(), "private" | "shared")
-            || self.zone_id.get("ownerRecordName").and_then(Value::as_str) != Some("_defaultOwner")
+            || !super::super::has_explicit_owner(self.zone_id.get("ownerRecordName"))
         {
             return Ok(None);
         }

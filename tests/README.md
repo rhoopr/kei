@@ -353,6 +353,8 @@ whole-library inventory memory or request cost at production library scale.
 
 ### Abrupt process-death recovery
 
+The destination process-death matrix includes authenticated non-default owners with distinct membership and media owner strings. It checks exact persisted owner fields after reopen; source-confirmation tests reject a different owner before making a provider request. The explicit-owner parent also runs without default features.
+
 `cargo test --lib destination_process_death_preserves_unfinished_peer` runs the same-zone and cross-zone destination cases on Linux. The cross-zone case uses authenticated source profiles and real production dispatch, retains original membership pages, verifies media-library ownership, and refreshes current queries after owner-zone deltas. Both cases restore only the unfinished peer after killing the child, then preserve historical reservations and bytes through two quiet follow-ups. The cross-zone case also runs without default features.
 
 `private_capture_timestamp_repair_uses_selected_destinations_and_existing_writer` covers a separate returned-error boundary: ordinary sync preserves existing EXIF time, explicit repair changes it, and a finalization fault leaves exact prepared output that completes after reopen without downloading again. It checks two quiet follow-up cycles and runs with and without default features. This is not an abrupt process-death test.
