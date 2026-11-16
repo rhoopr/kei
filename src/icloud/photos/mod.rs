@@ -25,6 +25,7 @@ pub use album::PhotoAlbum;
 #[cfg(test)]
 pub use album::PhotoAlbumConfig;
 pub(crate) use album::ProviderLookupError;
+#[cfg(test)]
 pub(crate) use album::catalog_observed_page;
 pub(crate) use album::classify_legacy_inventory_error;
 pub(crate) use album::work::{current_asset, same_selected_facts};

@@ -1996,6 +1996,23 @@ async fn queue_projection_actual_discovery_qualifies_primary_and_private_shared(
             "{}",
             library.zone_name()
         );
+        if eligible {
+            let pass = AlbumPass {
+                album: library.all(),
+                ..f.pass.clone()
+            };
+            let config = crate::download::DownloadConfig {
+                library: Arc::from(library.zone_name()),
+                ..f.config.clone()
+            };
+            assert!(
+                super::super::generation::context(&[pass], &config, controls())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "every discovered legacy catalog selector has a destination owner"
+            );
+        }
     }
     f.pass.album = service.get_library("PrimarySync").await.unwrap().all();
     assert!(f.pass.album.catalog_work_scope().unwrap().is_some());

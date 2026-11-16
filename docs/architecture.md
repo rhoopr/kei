@@ -145,7 +145,7 @@ match their headings, so searching a label finds the section.
 | Observed provider pages | `src/icloud/photos/inbox.rs`, `src/state/db/provider_inbox.rs` | Binds validated incremental observations to the account, retains source identities and original bytes atomically with a shadow receipt, and applies bounded backpressure. It does not authorize provider checkpoints. |
 | Provider source catalog | `src/icloud/photos/projection.rs`, `src/state/db/provider_catalog.rs` | Validates replay provenance, derives versioned source facts, and atomically indexes records, references and unresolved evidence. Its receipt does not authorize queues or checkpoints. |
 | Shared selection decisions | `src/state/db/provider_selection.rs` | Defines decisions and lossless native destinations used by active generations and publication. Historical shadow tables have no runtime writer or replay path. |
-| Provider work admission | `src/icloud/photos/album/work.rs`, `src/download/orchestration/queue_projection.rs`, `src/state/db/provider_work.rs` | Confirms retained identities against current provider records, applies current task planning, and atomically admits guarded existing queue obligations and retained conflict debt. Checkpoint authority stays with the existing cycle. |
+| Provider work admission | `src/icloud/photos/album/work.rs`, `src/download/orchestration/generation.rs`, `src/state/db/provider_generations.rs` | Confirms current provider identities and admits per-destination obligations. `provider_work.rs` retains guards for historical catalog admissions; its old scheduler and writer compile only in tests. Checkpoint authority stays with the existing cycle. |
 | SQLite schema | `src/state/schema.rs` | Owns schema versions and migrations. |
 | State-store contracts | `src/state/db/contracts.rs` | Defines store roles and records exchanged with callers. |
 | Asset state transitions | `src/state/db/assets.rs` | Owns asset lifecycle, download finalization, retry eligibility, and provider source-state transitions. |
@@ -496,6 +496,12 @@ still require explicit policy decisions before dependent stages.
 
 ### Current provider work admission
 
+Current work uses the destination owner described under [Private selection and destination replay](#private-selection-and-destination-replay). Catalog admission and catalog wake inspection have been removed from dispatch and watch precheck. Every valid provider-discovered query supported by the old catalog scheduler has a current-selection owner. Unsupported query shapes do not acquire work authority from the old scheduler's weaker query checks. The old admission implementation compiles only in tests to construct historical databases and verify their publication guards. Existing receipts, obligations, retry deadlines and raw evidence remain stored; this retirement performs no migration or deletion.
+
+#### Historical catalog admission format
+
+The following describes the retired schema-31/32 scheduler and its retained evidence. These admission and wake operations no longer run in production.
+
 Schema 31 adds `provider_work_receipts`, generation-bound
 `provider_work_obligations`, and the `provider_work_scan` scheduling position.
 Before normal dispatch, up to 64 retained, indexed CPLAsset observations per
@@ -592,7 +598,7 @@ metadata writes, publication guards and WAL NORMAL qualification remain in force
 
 ### Selection generation shadow
 
-The schema-33 tables `provider_selection_generations`, `provider_selection_sources`, `provider_selection_decisions` and `provider_selection_destinations` remain as historical evidence. Schema 38 archives prior rows at the fresh-start boundary. Their observational writer, manifest replay and capacity gate have been removed. Current retained-work admission goes directly from current provider confirmation and task planning to `project_provider_work`, which validates ownership, source identity, current resources and metadata in its admission transaction.
+The schema-33 tables `provider_selection_generations`, `provider_selection_sources`, `provider_selection_decisions` and `provider_selection_destinations` remain as historical evidence. Schema 38 archives prior rows at the fresh-start boundary. Their observational writer, manifest replay and capacity gate have been removed. Current provider confirmation and task planning feed active destination admission. The later catalog admission writer `project_provider_work` also compiles only in historical-database tests.
 
 `provider_selection.rs` retains the shared decision, outcome, destination and lossless native-path types used by active generations. Their serialization is unchanged. Active destination publication, work retry, source checkpoint gates and raw-inbox capture keep their existing owners. Support history retains the selection storage field for compatibility; current cycles leave it unobserved.
 
@@ -620,11 +626,13 @@ profiles keep the whole existing dispatcher. Both database scopes use the same v
 keep their existing owners. Ordinary
 explicit metadata refresh with preservation can use active destinations.
 
-Dispatch does not run legacy catalog admission or append the rendition-wide targeted retry tail when current selection owns the run. Inventory or replay admits and completes work per selected destination. Watch precheck uses that owner's wake decision directly; legacy catalog work cannot add a wakeup or veto it. Legacy admission, wake inspection and retry remain only for routes without a selection context.
+Dispatch no longer runs legacy catalog admission. Inventory or replay admits and completes work per selected destination. Watch precheck uses that owner's wake decision directly; legacy catalog work cannot add a wakeup or veto it. The rendition-wide retry tail remains only for routes without a selection context.
 
 Startup resets and source-deleted retry pruning are also limited to writable legacy routes. Current-selection attempts and due times remain with the destination owner; unrelated historical rendition failures are preserved. Dry-run and filename previews do not reset retry state even when a caller supplies an existing store. Provisional/indexing inventory returns before these scheduling steps and retains its incomplete-evidence restrictions.
 
 Managed-layout completion does not re-enter legacy catalog admission when current selection owns the run. End-of-cycle pending-to-failed promotion is limited to writable legacy execution, so destination completion cannot turn unrelated historical pending rows into failures. Read-only legacy retry planning still reports planned retries and unresolved identities without running that promotion.
+
+Selection replay reuses independently verified destination publications before task execution. A remaining destination task bypasses rendition-wide on-disk adoption and uses normal transfer/publication finalization. This lets a landed file recover after a failed finalization transaction without marking only the aggregate asset row complete and stranding its destination obligation. No-overwrite publication and exact-path completion guards remain active.
 
 Explicit capture-local timestamp repair also uses current selection for destination scheduling. The existing metadata writer receives the requested repair policy. A selected destination with its own exact prepared-output receipt uses that publication owner; it does not require a second legacy capture-repair receipt. Rows with a legacy repair receipt retain that receipt's validation and finalization. Timestamp repair still requires a usable provider offset and verified local bytes, and ordinary sync preserves existing timestamps.
 

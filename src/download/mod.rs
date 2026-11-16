@@ -48,7 +48,6 @@ pub(crate) use orchestration::models::{
 pub use orchestration::models::{
     DownloadOutcome, FullEnumerationReason, SkipBreakdown, SyncMode, SyncResult, SyncStats,
 };
-pub(crate) use orchestration::queue_projection::has_due_retained_work;
 #[cfg(test)]
 pub(crate) use orchestration::reconciliation::reconcile_catalog_paths;
 pub(crate) use orchestration::reconciliation::reconcile_catalog_paths_with_client;

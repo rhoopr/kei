@@ -114,6 +114,7 @@ impl StorageReuse {
             StorageComponent::Catalogue => &mut self.catalogue,
             #[cfg(test)]
             StorageComponent::Selection => &mut self.selection,
+            #[cfg(test)]
             StorageComponent::Work => &mut self.work,
         };
         counters.record(outcome, budget);
@@ -152,6 +153,7 @@ pub(crate) enum StorageComponent {
     // Historical diagnostic compatibility; current admission has no shadow writer.
     #[cfg(test)]
     Selection,
+    #[cfg(test)]
     Work,
 }
 

@@ -940,6 +940,8 @@ async fn inventory_state_write_failure_retains_request_and_successful_media() {
         .unwrap();
     let recovered = fixture.cycle(false, CancellationToken::new()).await;
     assert_eq!(recovered.failed_count, 0, "{recovered:?}");
+    assert_eq!(fixture.open().await.acquire_lock("exact recovered destination completion").unwrap()
+        .query_row::<i64, _, _>("SELECT count(*) FROM provider_active_destinations WHERE child='asset-C' AND admitted=1 AND verified_media=1 AND verified_metadata=1 AND source_checksum IS NOT NULL", [], |row| row.get(0)).unwrap(), 1);
     fixture.preserved(false).await;
     for id in ["A", "B", "D"] {
         assert_eq!(fixture.gets(id).await, 1);

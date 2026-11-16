@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use super::PhotoAlbum;
 use crate::icloud::photos::asset::{PhotoAsset, RequiredAssetFields};
-use crate::icloud::photos::{changes_json, cloudkit, inbox::ShadowCapture, queries, session};
+#[cfg(test)]
+use crate::icloud::photos::inbox::ShadowCapture;
+use crate::icloud::photos::{changes_json, cloudkit, queries, session};
 use crate::state::db::provider_selection::SelectionMediaSource;
 
 pub(crate) struct CurrentCatalogAsset {
@@ -226,6 +228,7 @@ impl PhotoAlbum {
 
     /// This first work stage admits only an unambiguous private library-wide
     /// source. Other passes retain their source facts for later qualification.
+    #[cfg(test)]
     pub(crate) fn catalog_work_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {
         let Some((capture, database)) = &self.shadow_capture else {
             return Ok(None);

@@ -18,6 +18,7 @@ pub enum StateError {
     #[error(
         "Provider work projection is full; source observations and unfinished obligations are retained."
     )]
+    #[cfg(test)]
     ProviderWorkFull,
     #[error(
         "Provider work provenance or admission evidence is inconsistent; unfinished obligations are retained."

@@ -635,6 +635,12 @@ pub(super) async fn adopt_pending_on_disk_task(
     task_planner: &mut TaskPlanner,
     task: &DownloadTask,
 ) -> Result<Option<PendingOnDiskAdoption>> {
+    // Current selection already reused any independently verified publication.
+    // A remaining task needs exact destination finalization; rendition-wide
+    // size/hash adoption cannot complete its durable destination obligation.
+    if config.selection_run.is_some() {
+        return Ok(None);
+    }
     let Some(db) = state_db else {
         return Ok(None);
     };

@@ -186,6 +186,7 @@ pub(crate) fn classify_private_changes(bytes: &[u8]) -> Result<Option<TransportE
 /// child's `masterRef` pointing at the master. Any other lookup shape stays
 /// raw. It masks only the same complete `ASSETID` descriptor paths as the
 /// changes-page classifier and preserves every other byte.
+#[cfg(test)]
 pub(crate) fn classify_lookup_confirmation(
     bytes: &[u8],
     child: &str,

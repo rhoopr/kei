@@ -624,11 +624,6 @@ async fn download_photos_with_sync_inner(
         }
     }
 
-    if !primary_layout_active && config.selection_context.is_none() {
-        super::queue_projection::admit_retained_work(passes, &config, controls, &shutdown_token)
-            .await?;
-    }
-
     let result = match &config.sync_mode {
         SyncMode::Incremental { zone_sync_token } if config.inventory_reconciliation => {
             reconcile_inventory(
@@ -842,17 +837,6 @@ async fn download_photos_with_sync_inner(
         result.sync_token = None;
     }
 
-    // Legacy managed publication can complete a newly captured source this cycle.
-    // Its bounded admission runs after capture; current selection already owns
-    // admission and completion for destination-managed runs.
-    if primary_layout_active
-        && config.selection_context.is_none()
-        && matches!(result.outcome, DownloadOutcome::Success)
-        && !shutdown_token.is_cancelled()
-    {
-        super::queue_projection::admit_retained_work(passes, &config, controls, &shutdown_token)
-            .await?;
-    }
     super::generation::hold_retained_debt(passes, &config, controls, &mut result).await?;
 
     // Legacy rendition retry uses failed rows as its next-cycle schedule.
