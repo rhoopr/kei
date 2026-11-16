@@ -1425,14 +1425,49 @@ async fn queue_projection_hidden_current_asset_retains_source_without_queue_work
 }
 
 #[tokio::test]
-async fn queue_projection_dispatch_fault_holds_cursor_and_does_not_rank_fallback() {
+async fn current_selection_dispatch_ignores_legacy_catalog_admission_fault() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+        .expect(1)
+        .mount(&server)
+        .await;
     let mut f = Fixture::new().await;
     f.capture(records("m", OLD, "source"), "old").await;
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL":format!("{}/media",server.uri()),"size":bytes.len(),
+        "fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(bytes))
+    });
+    let (_, _, zone) = f.pass.album.owned_selection_scope().unwrap().unwrap();
+    f.pass.album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: Arc::from("https://example.invalid"),
+            name: Arc::from(""),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 2,
+            zone_id: Arc::new(zone),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(DestinationSelectionSession(f.session.clone())),
+    );
+    f.pass
+        .album
+        .set_shadow_capture(f.capture.clone(), Arc::from("private"));
+    assert!(f.pass.album.catalog_work_scope().unwrap().is_some());
     f.config.sync_mode = crate::download::SyncMode::Incremental {
         zone_sync_token: "old-cursor".into(),
     };
     f.db.acquire_lock("dispatch fault before receipt").unwrap().execute_batch("CREATE TRIGGER work_fault BEFORE INSERT ON provider_work_receipts BEGIN SELECT RAISE(ABORT,'synthetic dispatch work fault'); END;").unwrap();
-    for _ in 0..2 {
+    for round in 0..3 {
         let result = crate::download::download_photos_with_sync(
             &reqwest::Client::new(),
             std::slice::from_ref(&f.pass),
@@ -1440,26 +1475,27 @@ async fn queue_projection_dispatch_fault_holds_cursor_and_does_not_rank_fallback
             controls(),
             CancellationToken::new(),
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("synthetic dispatch work fault")
+            matches!(result.outcome, crate::download::DownloadOutcome::Success),
+            "{result:?}"
         );
-        assert_eq!(f.count("assets"), 0);
+        assert_eq!(result.stats.downloaded, usize::from(round == 0));
+        assert!(f.count("provider_active_destinations") > 0);
         assert_eq!(f.count("provider_work_receipts"), 0);
+        let downloaded: String =
+            f.db.acquire_lock("current selection publication")
+                .unwrap()
+                .query_row(
+                    "SELECT local_path FROM assets WHERE id='asset-m' AND status='downloaded'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert_eq!(std::fs::read(downloaded).unwrap(), bytes);
         f.preserved().await;
     }
-    f.db.acquire_lock("restore fixture")
-        .unwrap()
-        .execute_batch("DROP TRIGGER work_fault")
-        .unwrap();
-    f.cycle().await.unwrap();
-    let baseline = f.queue();
-    f.cycle().await.unwrap();
-    assert_eq!(f.queue(), baseline);
-    f.preserved().await;
 }
 
 #[tokio::test]

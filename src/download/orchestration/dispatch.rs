@@ -622,7 +622,7 @@ async fn download_photos_with_sync_inner(
             config
         };
 
-    if !primary_layout_active {
+    if !primary_layout_active && config.selection_context.is_none() {
         super::queue_projection::admit_retained_work(passes, &config, controls, &shutdown_token)
             .await?;
     }

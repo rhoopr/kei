@@ -620,7 +620,7 @@ profiles keep the whole existing dispatcher. Both database scopes use the same v
 keep their existing owners. Ordinary
 explicit metadata refresh with preservation can use active destinations.
 
-Dispatch does not append the rendition-wide targeted retry tail when current selection owns the run. Inventory or replay has already admitted and completed work per selected destination. The legacy tail remains only for routes without a selection context.
+Dispatch does not run legacy catalog admission or append the rendition-wide targeted retry tail when current selection owns the run. Inventory or replay admits and completes work per selected destination. Watch precheck uses that owner's wake decision directly; legacy catalog work cannot add a wakeup or veto it. Legacy admission, wake inspection and retry remain only for routes without a selection context.
 
 Explicit capture-local timestamp repair also uses current selection for destination scheduling. The existing metadata writer receives the requested repair policy. A selected destination with its own exact prepared-output receipt uses that publication owner; it does not require a second legacy capture-repair receipt. Rows with a legacy repair receipt retain that receipt's validation and finalization. Timestamp repair still requires a usable provider offset and verified local bytes, and ordinary sync preserves existing timestamps.
 
