@@ -10,7 +10,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::asset_writes::upsert_asset_row;
@@ -452,6 +452,57 @@ pub(crate) struct ActiveGeneration {
     pub(crate) checkpoint_veto: Option<String>,
 }
 
+/// Shared selector handoff: exact published selector-to-container evidence.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct BoundAlbumSelection {
+    pub(crate) generation: String,
+    pub(crate) container_id: String,
+    pub(crate) components: Vec<String>,
+    pub(crate) deleted: bool,
+}
+
+impl SqliteStateDb {
+    pub(crate) async fn bound_album_selections(
+        &self,
+        owner: account::AccountOwner,
+        zone: Value,
+        database: String,
+    ) -> Result<Vec<BoundAlbumSelection>, StateError> {
+        const PRIOR_ALBUM_GENERATION_LIMIT: i64 = 128;
+        self.with_conn("reading prior exact album selections", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            let library = zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?;
+            // Historical selection evidence is not current file retirement authority.
+            let ids: Vec<String> = conn.prepare("SELECT DISTINCT g.id,g.created_at FROM provider_active_generations g JOIN provider_active_destinations d ON d.generation=g.id WHERE json_extract(CAST(g.specification AS TEXT),'$.zone.zoneName')=?1 AND d.verified_media=1 ORDER BY g.created_at DESC,g.id DESC LIMIT ?2")?
+                .query_map(params![library,PRIOR_ALBUM_GENERATION_LIMIT], |row| row.get(0))?.collect::<Result<_, _>>()?;
+            let mut result = Vec::new();
+            let mut seen = HashSet::new();
+            for id in ids {
+                let root = load_generation(conn, &id)?;
+                if root.spec.zone != zone { continue; }
+                let scope: Value = serde_json::from_str(&root.spec.scope).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+                if scope.get("database").and_then(Value::as_str) != Some(database.as_str()) { continue; }
+                let passes = root.spec.profile.get("passes").and_then(Value::as_array).ok_or(StateError::ProviderSelectionInvalid)?;
+                for pass in passes {
+                    if pass.get("kind").and_then(Value::as_str) != Some("Album") { continue; }
+                    let Some(container) = pass.pointer("/scope/container_id").and_then(Value::as_str) else { continue; };
+                    if !seen.insert(container.to_owned()) { continue; }
+                    let Some(raw) = pass.get("selector_components") else { continue; };
+                    let components: Vec<String> = serde_json::from_value(raw.clone()).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+                    if components.is_empty() { return invalid(); }
+                    let key = pass.get("key").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?;
+                    let published: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND verified_media=1)",params![id,key], |row| row.get(0))?;
+                    if !published { continue; }
+                    let deleted: Option<bool> = conn.query_row("SELECT is_deleted FROM album_containers WHERE library=?1 AND container_id=?2 AND pass_kind='album'", params![library,container], |row| row.get(0)).optional()?;
+                    let Some(deleted) = deleted else { continue; };
+                    result.push(BoundAlbumSelection { generation:id.clone(),container_id:container.to_owned(),components,deleted });
+                }
+            }
+            Ok(result)
+        }).await
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RankSource {
     pub(crate) page_id: String,
@@ -615,7 +666,7 @@ fn validate_spec(spec: &GenerationSpec) -> Result<(), StateError> {
         .get("passes")
         .and_then(Value::as_array)
         .ok_or(StateError::ProviderSelectionInvalid)?;
-    if passes.is_empty()
+    if (passes.is_empty() && spec.profile.get("deleted_album_bindings").is_none())
         || passes.iter().any(|p| {
             p.get("key")
                 .and_then(Value::as_str)
@@ -679,6 +730,7 @@ fn load_generation(conn: &Connection, id: &str) -> Result<ActiveGeneration, Stat
     let spec: GenerationSpec =
         serde_json::from_slice(&bytes).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
     validate_spec(&spec)?;
+    validate_deleted_selection(conn, &spec)?;
     let metadata_enabled: bool = conn.query_row(
         "SELECT metadata_enabled FROM provider_active_generations WHERE id=?1",
         [id],
@@ -1490,7 +1542,7 @@ impl SqliteStateDb {
         capacity: u64,
     ) -> Result<ActiveGeneration, StateError> {
         self.with_conn_mut("starting selection generation",move|conn|{
-            let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;validate_spec(&spec)?;
+            let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;validate_spec(&spec)?;validate_current_deleted_selection(&tx,&spec)?;
             if basis(&tx,&spec.scope)?!=spec.basis {return Err(StateError::ProviderWorkConflict)}
             freeze_interrupted_groupings(&tx, &spec.scope)?;
             let bytes=encode(&spec)?;let (account,provider)=owner_keys(&tx)?;
@@ -2288,6 +2340,7 @@ impl SqliteStateDb {
         self.with_conn_mut("sealing observed selection coverage",move|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
             let root=load_generation(&tx,&generation)?;
+            validate_current_deleted_selection(&tx,&root.spec)?;
             if basis(&tx,&root.spec.scope)?!=root.spec.basis {return Err(StateError::ProviderWorkConflict)}
             if !root.sealed {
                 let assets:Vec<(String,String)>=tx.prepare("SELECT DISTINCT library,asset_id FROM provider_active_destinations WHERE generation=?1")?.query_map([&generation],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
@@ -2332,6 +2385,334 @@ impl SqliteStateDb {
     }
 }
 
+pub(crate) struct MembershipLayout {
+    pub(crate) native_seed: bool,
+    pub(crate) binding: super::primary_layout::LayoutBinding,
+    pub(crate) previous: super::primary_layout::LayoutOperation,
+    pub(crate) container: String,
+    pub(crate) selected: Vec<crate::icloud::photos::PhotoAsset>,
+}
+
+fn validate_deleted_selection(
+    conn: &Connection,
+    spec: &GenerationSpec,
+) -> Result<Vec<BoundAlbumSelection>, StateError> {
+    let Some(encoded) = spec.profile.get("deleted_album_bindings") else {
+        return Ok(Vec::new());
+    };
+    let bindings: Vec<BoundAlbumSelection> = serde_json::from_value(encoded.clone())
+        .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+    if bindings.is_empty()
+        || bindings.len() > 128
+        || spec
+            .profile
+            .get("passes")
+            .and_then(Value::as_array)
+            .is_none_or(|passes| !passes.is_empty())
+    {
+        return invalid();
+    }
+    let mut seen = HashSet::new();
+    for binding in &bindings {
+        if !binding.deleted || binding.components.is_empty() || !seen.insert(&binding.container_id)
+        {
+            return invalid();
+        }
+        // Reject self/cyclic recovery references before loading their headers.
+        let ordinary:bool=conn.query_row("SELECT json_array_length(specification,'$.profile.passes')>0 FROM provider_active_generations WHERE id=?1",[&binding.generation],|row|row.get(0))?;
+        if !ordinary {
+            return invalid();
+        }
+        let prior = load_generation(conn, &binding.generation)?;
+        if !prior.sealed
+            || prior.spec.scope != spec.scope
+            || prior.spec.zone != spec.zone
+            || prior.spec.profile.get("selection_config") != spec.profile.get("selection_config")
+            || spec
+                .profile
+                .get("selection_config")
+                .and_then(Value::as_str)
+                .is_none()
+        {
+            return invalid();
+        }
+        let prior_passes = prior
+            .spec
+            .profile
+            .get("passes")
+            .and_then(Value::as_array)
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        for pass in prior_passes {
+            if pass.get("kind").and_then(Value::as_str) != Some("Album") {
+                return invalid();
+            }
+            let container = pass
+                .pointer("/scope/container_id")
+                .and_then(Value::as_str)
+                .ok_or(StateError::ProviderSelectionInvalid)?;
+            if !bindings.iter().any(|bound| {
+                bound.container_id == container
+                    && pass.get("selector_components") == Some(&json!(bound.components))
+            }) {
+                return invalid();
+            }
+        }
+        if !prior_passes.iter().any(|pass| {
+            pass.pointer("/scope/container_id").and_then(Value::as_str)
+                == Some(&binding.container_id)
+                && pass.get("selector_components") == Some(&json!(binding.components))
+        }) {
+            return invalid();
+        }
+    }
+    Ok(bindings)
+}
+
+fn validate_current_deleted_selection(
+    conn: &Connection,
+    spec: &GenerationSpec,
+) -> Result<(), StateError> {
+    // Mutable deletion status gates execution, not historical header integrity.
+    for binding in validate_deleted_selection(conn, spec)? {
+        let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM album_containers WHERE library=?1 AND container_id=?2 AND pass_kind='album' AND is_deleted=1) AND EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation JOIN json_each(CAST(g.specification AS TEXT),'$.profile.passes') p ON json_extract(p.value,'$.key')=w.pass_key WHERE w.generation=?3 AND json_extract(p.value,'$.scope.container_id')=?2 AND w.admitted=1 AND w.verified_media=1)",params![spec.zone.get("zoneName").and_then(Value::as_str),binding.container_id,binding.generation],|row|row.get(0))?;
+        if !valid {
+            return invalid();
+        }
+    }
+    Ok(())
+}
+
+/// Exact native publication evidence, not a legacy asset or path row.
+pub(crate) struct MembershipDestination {
+    pub(crate) generation: String,
+    pub(crate) pass: String,
+    pub(crate) child: String,
+    pub(crate) state_id: String,
+    pub(crate) library: String,
+    pub(crate) container: String,
+    pub(crate) destination: SelectionDestination,
+    pub(crate) local: String,
+    pub(crate) source: String,
+    pub(crate) selected: Vec<crate::icloud::photos::PhotoAsset>,
+}
+
+pub(crate) type MembershipCursor = (String, String, String, String, String);
+
+pub(super) fn validate_membership_seed(
+    conn: &Connection,
+    op: &super::primary_layout::LayoutOperation,
+    binding: &super::primary_layout::LayoutBinding,
+) -> Result<(), StateError> {
+    let file = binding
+        .files
+        .first()
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    if !op.is_membership_retirement()
+        || !op.family.starts_with("native-membership:")
+        || binding.files.len() != 1
+        || op.generation != 1
+        || binding.generation != 1
+        || binding.family != op.family
+        || binding.library != op.library
+        || binding.child != op.child
+        || binding.source_library != op.source_library
+        || binding.decision != op.decision
+        || binding.qualifier != op.qualifier
+        || file.sidecar.is_some()
+        || file.local_preserved
+    {
+        return invalid();
+    }
+    let root = load_generation(conn, &op.qualifier)?;
+    let manifest = load_decision(conn, &root, &op.pass, &op.asset_record_name)?;
+    let current = load_generation(
+        conn,
+        op.decision
+            .strip_prefix(super::primary_layout::MEMBERSHIP_RETIREMENT_PREFIX)
+            .ok_or(StateError::ProviderSelectionInvalid)?,
+    )?;
+    validate_current_deleted_selection(conn, &current.spec)?;
+    if !current.sealed
+        || !current.checkpoint_ready
+        || basis(conn, &current.spec.scope)? != current.spec.basis
+        || current.spec.scope != root.spec.scope
+        || current.spec.profile.get("selection_config") != root.spec.profile.get("selection_config")
+    {
+        return invalid();
+    }
+    if manifest.state_id != op.child
+        || manifest
+            .media_zone(&root)
+            .get("zoneName")
+            .and_then(Value::as_str)
+            != Some(&op.library)
+        || root.spec.zone.get("zoneName").and_then(Value::as_str) != Some(&op.source_library)
+    {
+        return invalid();
+    }
+    let destination = manifest
+        .decision
+        .destinations
+        .iter()
+        .find(|d| {
+            d.path == file.path
+                && d.version_size == file.version
+                && d.checksum == file.provider_checksum
+        })
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    if native_membership_contested(conn, &root, &manifest, destination)? {
+        return invalid();
+    }
+    let current_work:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND (admission='deferred' OR (pass_key=?2 AND child=?3))) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND (path=?4 OR (verified_media=0 AND preserved_local IS NULL) OR (?5=1 AND verified_metadata=0)))",params![current.id,op.pass,op.asset_record_name,destination.path.key()?,current.spec.metadata_enabled],|r|r.get(0))?;
+    if current_work {
+        return invalid();
+    }
+    let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=1 AND current_publication=1 AND preserved_local IS NULL AND (?13=0 OR verified_metadata=1) AND prepared_hash IS NULL AND local_checksum=?6 AND source_checksum=?7) AND NOT EXISTS(SELECT 1 FROM primary_layout_claims WHERE path_key=?8) AND NOT EXISTS(SELECT 1 FROM primary_layout_superseded_paths WHERE library=?9 AND child=?10 AND version=?4 AND provider_checksum=?11 AND native_path=?12)",params![root.id,op.pass,op.asset_record_name,file.version,destination.path.key()?,data_encoding::HEXLOWER.encode(&file.fingerprint.sha256),file.source_checksum,super::primary_layout::path_key(&file.path.to_path())?,op.library,op.child,file.provider_checksum,encode(&file.path)?,root.spec.metadata_enabled],|r|r.get(0))?;
+    if !valid {
+        return invalid();
+    }
+    Ok(())
+}
+
+/// Called within the layout retirement/detach transaction. Historical proof stays
+/// intact; a newer or preserved publication never loses its authority here.
+pub(super) fn retire_membership_publication(
+    conn: &Connection,
+    op: &super::primary_layout::LayoutOperation,
+    file: &super::primary_layout::LayoutFile,
+) -> Result<(), StateError> {
+    if op.is_membership_retirement()
+        && op.family.starts_with("native-membership:")
+        && !file.local_preserved
+    {
+        conn.execute("UPDATE provider_active_destinations SET current_publication=0 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND library=?4 AND asset_id=?5 AND version_size=?6 AND path=?7 AND checksum=?8 AND local_checksum=?9 AND source_checksum IS ?10 AND current_publication=1 AND verified_media=1 AND preserved_local IS NULL",params![op.qualifier,op.pass,op.asset_record_name,op.library,op.child,file.version,file.path.key()?,file.provider_checksum,data_encoding::HEXLOWER.encode(&file.fingerprint.sha256),file.source_checksum])?;
+    }
+    Ok(())
+}
+
+fn native_membership_contested(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    manifest: &ActiveDecision,
+    destination: &SelectionDestination,
+) -> Result<bool, StateError> {
+    // Other passes and sources defeat exclusive ownership, even for equal bytes.
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.path=?1 AND (w.pass_key<>?2 OR w.child<>?3 OR w.library<>?4 OR w.preserved_local IS NOT NULL OR (w.admitted=1 AND w.verified_media=0) OR (w.current_publication=1 AND w.generation<>?5)))",params![destination.path.key()?,manifest.decision.pass_key,manifest.decision.child,manifest.media_zone(root).get("zoneName").and_then(Value::as_str),root.id],|r|r.get(0))?)
+}
+
+impl SqliteStateDb {
+    /// Durable tombstones are refresh hints; retirement still checks exact receipts.
+    pub(crate) async fn pending_deleted_membership_containers(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        selection_config: String,
+    ) -> Result<Vec<String>, StateError> {
+        self.with_conn("reading pending deleted album copies",move |conn| {
+            account::validate_authenticated(conn,&owner)?;
+            Ok(conn.prepare("SELECT DISTINCT c.container_id FROM provider_active_generations g JOIN provider_active_destinations w ON w.generation=g.id JOIN json_each(CAST(g.specification AS TEXT),'$.profile.passes') p ON json_extract(p.value,'$.key')=w.pass_key JOIN album_containers c ON c.library=json_extract(g.specification,'$.zone.zoneName') AND c.container_id=json_extract(p.value,'$.scope.container_id') AND c.pass_kind='album' WHERE g.scope=?1 AND json_extract(g.specification,'$.profile.selection_config')=?2 AND c.is_deleted=1 AND w.admitted=1 AND w.verified_media=1 AND w.current_publication=1 AND w.preserved_local IS NULL AND NOT EXISTS(SELECT 1 FROM primary_layout_superseded_paths s WHERE s.library=w.library AND s.child=w.asset_id AND s.version=w.version_size AND s.provider_checksum=w.checksum AND CAST(s.native_path AS TEXT)=w.path)")?.query_map(params![scope,selection_config],|row|row.get(0))?.collect::<Result<_,_>>()?)
+        }).await
+    }
+
+    pub(crate) async fn membership_destinations(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        after: Option<MembershipCursor>,
+    ) -> Result<(Vec<MembershipDestination>, Option<MembershipCursor>), StateError> {
+        self.with_conn("reading native membership publications", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            let root = load_generation(conn, &generation)?;
+            let Some(config) = root.spec.profile.get("selection_config").and_then(Value::as_str) else { return Ok((Vec::new(),None)) };
+            let after=after.unwrap_or_default();
+            let rows: Vec<MembershipCursor> = conn.prepare("SELECT w.generation,w.pass_key,w.child,w.version_size,w.path FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.generation<>?2 AND w.admitted=1 AND w.verified_media=1 AND w.current_publication=1 AND w.preserved_local IS NULL AND (g.metadata_enabled=0 OR w.verified_metadata=1) AND w.prepared_hash IS NULL AND (w.generation,w.pass_key,w.child,w.version_size,w.path)>(?3,?4,?5,?6,?7) ORDER BY w.generation,w.pass_key,w.child,w.version_size,w.path LIMIT 256")?.query_map(params![root.spec.scope,generation,after.0,after.1,after.2,after.3,after.4], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<Result<_,_>>()?;
+            let next=if rows.len()==256 {rows.last().cloned()} else {None};
+            let mut result = Vec::new();
+            for (prior,key,child,version,path) in rows {
+                let old_root = load_generation(conn,&prior)?;
+                if old_root.spec.profile.get("selection_config").and_then(Value::as_str)!=Some(config) { continue; }
+                let old_pass = pass(&old_root,&key)?;
+                if old_pass.get("kind").and_then(Value::as_str)!=Some("Album") { continue; }
+                let Some(container)=old_pass.pointer("/scope/container_id").and_then(Value::as_str) else { continue };
+                let present:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND path=?4 AND admitted=1)",params![generation,key,child,path],|r|r.get(0))?;
+                if present { continue; }
+                let manifest=load_decision(conn,&old_root,&key,&child)?;
+                let destination=manifest.decision.destinations.iter().find(|d|d.version_size==version && d.path.key().ok().as_deref()==Some(&path)).ok_or(StateError::ProviderSelectionInvalid)?.clone();
+                if native_membership_contested(conn,&old_root,&manifest,&destination)? { continue; }
+                let library=manifest.media_zone(&old_root).get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?.to_owned();
+                let protected:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM primary_layout_claims WHERE path_key=?1) OR EXISTS(SELECT 1 FROM primary_layout_superseded_paths WHERE library=?2 AND child=?3 AND version=?4 AND provider_checksum=?5 AND native_path=?6) OR EXISTS(SELECT 1 FROM assets WHERE library=?2 AND id=?3 AND is_deleted=1)",params![super::primary_layout::path_key(&destination.path.to_path())?,library,manifest.state_id,version,destination.checksum,encode(&destination.path)?],|r|r.get(0))?;
+                if protected { continue; }
+                let (local,source):(String,String)=conn.query_row("SELECT local_checksum,source_checksum FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND verified_media=1 AND current_publication=1 AND preserved_local IS NULL AND prepared_hash IS NULL",params![prior,key,child,version,path],|r|Ok((r.get(0)?,r.get(1)?)))?;
+                let keys:Vec<String>=conn.prepare("SELECT pass_key FROM provider_active_decisions WHERE generation=?1 AND child=?2 AND admission='admitted'")?.query_map(params![generation,child],|r|r.get(0))?.collect::<Result<_,_>>()?;
+                let mut selected=Vec::new();
+                for selected_key in keys {
+                    let selected_manifest=load_decision(conn,&root,&selected_key,&child)?;
+                    let decision=&selected_manifest.decision;
+                    selected.push(crate::icloud::photos::current_asset(decision.confirmation.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,&child,decision.master.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,selected_manifest.media_zone(&root)).map_err(|_invalid|StateError::ProviderSelectionInvalid)?);
+                }
+                result.push(MembershipDestination {generation:prior,pass:key,child,state_id:manifest.state_id,library,container:container.to_owned(),destination,local,source,selected});
+            }
+            Ok((result,next))
+        }).await
+    }
+
+    /// Current destinations must complete before old selected bindings can retire.
+    pub(crate) async fn completed_membership_layouts(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+    ) -> Result<Option<Vec<MembershipLayout>>, StateError> {
+        self.with_conn("reading completed membership layouts", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            let root = load_generation(conn, &generation)?;
+            validate_current_deleted_selection(conn,&root.spec)?;
+            let incomplete: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred') OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND ((verified_media=0 AND preserved_local IS NULL) OR (?2=1 AND verified_metadata=0)))", params![generation, root.spec.metadata_enabled], |row| row.get(0))?;
+            if !root.sealed || !root.checkpoint_ready || incomplete || basis(conn, &root.spec.scope)? != root.spec.basis { return Ok(None); }
+            let library = root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?;
+            let rows: Vec<(Vec<u8>, Vec<u8>)> = conn.prepare("SELECT b.binding,o.header FROM primary_layout_bindings b JOIN primary_layout_operations o ON o.family=b.family AND ((o.prior_generation+1=b.generation AND o.phase='committed') OR (b.family LIKE 'native-membership:%' AND o.prior_generation=b.generation AND o.phase NOT IN ('committed','cancelled'))) WHERE b.source_library=?1 ORDER BY b.family")?.query_map([library], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<_, _>>()?;
+            let current_passes = root.spec.profile.get("passes").and_then(Value::as_array).ok_or(StateError::ProviderSelectionInvalid)?;
+            let mut layouts = Vec::new();
+            for (binding, previous) in rows {
+                let binding: super::primary_layout::LayoutBinding = super::primary_layout::decode(&binding)?;
+                let previous: super::primary_layout::LayoutOperation = super::primary_layout::decode(&previous)?;
+                if previous.family != binding.family || previous.child != binding.child || previous.library != binding.library || previous.source_library != binding.source_library
+                    || (previous.generation.checked_add(1) != Some(binding.generation) && !(previous.is_membership_retirement() && previous.generation == binding.generation && previous.phase != "committed"))
+                    || previous.decision != binding.decision || previous.policy != binding.policy { return invalid(); }
+                if binding.files.is_empty() || (previous.is_membership_retirement() && previous.phase == "committed") { continue; }
+                if previous.is_membership_retirement() && previous.family.starts_with("native-membership:") {
+                    let publication = load_generation(conn, &previous.qualifier)?;
+                    if publication.spec.scope != root.spec.scope || publication.spec.profile.get("selection_config") != root.spec.profile.get("selection_config") { return Ok(None); }
+                    for file in &binding.files {
+                        let authoritative:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND library=?4 AND asset_id=?5 AND version_size=?6 AND path=?7 AND checksum=?8 AND local_checksum=?9 AND source_checksum IS ?10 AND current_publication=1 AND verified_media=1 AND preserved_local IS NULL)",params![previous.qualifier,previous.pass,previous.asset_record_name,previous.library,previous.child,file.version,file.path.key()?,file.provider_checksum,data_encoding::HEXLOWER.encode(&file.fingerprint.sha256),file.source_checksum],|row|row.get(0))?;
+                        if file.local_preserved || !authoritative { return Ok(None); }
+                    }
+                }
+                let current = current_passes.iter().find(|pass| pass.get("key").and_then(Value::as_str) == Some(&previous.pass));
+                let selected_pass = if let Some(pass) = current { Some(pass.clone()) }
+                else if let Some(config) = root.spec.profile.get("selection_config").and_then(Value::as_str) {
+                    let encoded: Option<String> = conn.query_row("SELECT p.value FROM provider_active_generations g,json_each(CAST(g.specification AS TEXT),'$.profile.passes') p WHERE g.scope=?1 AND json_extract(g.specification,'$.profile.selection_config')=?2 AND json_extract(p.value,'$.key')=?3 ORDER BY g.created_at DESC,g.id DESC LIMIT 1", params![root.spec.scope, config, previous.pass], |row| row.get(0)).optional()?;
+                    encoded.map(|value| serde_json::from_str::<Value>(&value).map_err(|_invalid|StateError::ProviderSelectionInvalid)).transpose()?
+                } else { None };
+                let Some(pass) = selected_pass.filter(|pass| pass.get("kind").and_then(Value::as_str) == Some("Album")) else { continue };
+                let Some(container) = pass.pointer("/scope/container_id").and_then(Value::as_str) else { continue };
+                let still_present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3)", params![generation, previous.pass, previous.asset_record_name], |row|row.get(0))?;
+                let deleted: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND is_deleted=1)", params![binding.library, binding.child], |row|row.get(0))?;
+                if !still_present && !deleted {
+                    let keys:Vec<String>=conn.prepare("SELECT pass_key FROM provider_active_decisions WHERE generation=?1 AND child=?2 AND admission='admitted'")?.query_map(params![generation,previous.asset_record_name],|row|row.get(0))?.collect::<Result<_,_>>()?;
+                    let mut selected=Vec::new();
+                    for key in keys {
+                        let manifest=load_decision(conn,&root,&key,&previous.asset_record_name)?;
+                        let decision=&manifest.decision;
+                        selected.push(crate::icloud::photos::current_asset(decision.confirmation.as_deref().ok_or(StateError::ProviderSelectionInvalid)?, &decision.child,decision.master.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,manifest.media_zone(&root)).map_err(|_invalid|StateError::ProviderSelectionInvalid)?);
+                    }
+                    layouts.push(MembershipLayout { native_seed: false, binding, previous, container: container.to_owned(), selected });
+                }
+            }
+            Ok(Some(layouts))
+        }).await
+    }
+}
+
 fn seal_hash(
     conn: &Connection,
     root: &ActiveGeneration,
@@ -2344,7 +2725,7 @@ fn seal_hash(
         .prepare("SELECT id FROM provider_selection_rank_pages WHERE generation=?1 ORDER BY id")?
         .query_map([&root.id], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
-    if pages.is_empty() {
+    if pages.is_empty() && root.spec.profile.get("deleted_album_bindings").is_none() {
         return invalid();
     }
     for page in pages {

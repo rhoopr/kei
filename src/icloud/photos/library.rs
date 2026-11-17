@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,6 +14,9 @@ use super::queries::encode_params;
 use super::session::PhotosSession;
 use super::smart_folders::smart_folders;
 use crate::icloud::error::ICloudError;
+
+const ALBUM_TREE_DEPTH_LIMIT: usize = 64;
+const ALBUM_TREE_RECORD_LIMIT: usize = 12_800;
 
 /// CloudKit zone name for the user's own (non-shared) library. Used as the
 /// fallback when a `zone_id` JSON object lacks `zoneName`, as the backfill
@@ -236,16 +239,69 @@ impl PhotoLibrary {
         super::owner_diagnostic_shape(self.zone_id.get("ownerRecordName"))
     }
 
-    /// Return smart-folder albums plus user-created albums.
-    pub async fn albums(&self) -> anyhow::Result<HashMap<String, PhotoAlbum>> {
-        let mut albums = HashMap::new();
+    pub(crate) fn selection_zone(&self) -> &Value {
+        &self.zone_id
+    }
+
+    pub(crate) fn selection_database(&self) -> &str {
+        &self.library_type
+    }
+
+    /// Only an explicit, exact, same-zone tombstone confirms album deletion.
+    pub(crate) async fn confirms_album_deleted(&self, container: &str) -> anyhow::Result<bool> {
+        let url = format!(
+            "{}/records/lookup?{}",
+            self.service_endpoint,
+            encode_params(&self.params)
+        );
+        let body = json!({"zoneID": self.zone_id.as_ref(), "records":[{"recordName":container}]});
+        let response = super::session::retry_post_allowing_record_errors(
+            self.session.as_ref(),
+            &url,
+            &body.to_string(),
+            &[("Content-type", "text/plain")],
+            &self.retry_config,
+        )
+        .await
+        .response?;
+        let Some(records) = response.get("records").and_then(Value::as_array) else {
+            return Ok(false);
+        };
+        let [record] = records.as_slice() else {
+            return Ok(false);
+        };
+        if response.get("serverErrorCode").is_some()
+            || record.get("serverErrorCode").is_some()
+            || record.get("recordName").and_then(Value::as_str) != Some(container)
+            || record
+                .get("recordType")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "CPLAlbum")
+        {
+            return Ok(false);
+        }
+        if let Some(zone) = record.get("zoneID")
+            && (zone.get("zoneName") != self.zone_id.get("zoneName")
+                || zone.get("ownerRecordName") != self.zone_id.get("ownerRecordName"))
+        {
+            return Ok(false);
+        }
+        Ok(record.get("deleted").and_then(Value::as_bool) == Some(true)
+            || record
+                .pointer("/fields/isDeleted/value")
+                .is_some_and(|value| value == &Value::Bool(true) || value.as_i64() == Some(1)))
+    }
+
+    /// Return smart folders and all same-named user containers, sorted by identity.
+    pub async fn albums(&self) -> anyhow::Result<HashMap<String, Vec<PhotoAlbum>>> {
+        let mut albums: HashMap<String, Vec<PhotoAlbum>> = HashMap::new();
 
         // Smart folders are user-scoped and can include assets from shared
         // zones, so always inject their query definitions for every zone.
         for (name, def) in smart_folders() {
             albums.insert(
                 name.to_string(),
-                PhotoAlbum::new(
+                vec![PhotoAlbum::new(
                     PhotoAlbumConfig {
                         params: Arc::clone(&self.params),
                         service_endpoint: Arc::clone(&self.service_endpoint),
@@ -260,24 +316,24 @@ impl PhotoLibrary {
                         cross_zone_sources: Vec::new(),
                     },
                     self.clone_session(),
-                ),
+                )],
             );
         }
 
         // Shared zones currently skip user-created album folder queries.
         if !is_shared_zone(self.zone_name()) {
             let folders = self.fetch_folders().await?;
+            let by_id: HashMap<_, _> = folders
+                .iter()
+                .map(|folder| (folder.record_name.as_str(), folder))
+                .collect();
             for folder in &folders {
                 let record_name = &folder.record_name;
-                if record_name == ROOT_FOLDER || record_name == PROJECT_ROOT_FOLDER {
-                    continue;
-                }
                 if folder
                     .fields
-                    .get("isDeleted")
-                    .and_then(|f| f.get("value"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
+                    .pointer("/albumType/value")
+                    .and_then(Value::as_i64)
+                    == Some(3)
                 {
                     continue;
                 }
@@ -285,22 +341,51 @@ impl PhotoLibrary {
                 let folder_obj_type =
                     format!("CPLContainerRelationNotDeletedByAssetDate:{record_name}");
 
-                let folder_name = match folder
-                    .fields
-                    .get("albumNameEnc")
-                    .and_then(|f| f.get("value"))
-                    .and_then(Value::as_str)
-                {
-                    Some(enc) => {
-                        let decoded = base64::engine::general_purpose::STANDARD
-                            .decode(enc)
-                            .unwrap_or_default();
-                        let raw_name =
-                            String::from_utf8(decoded).unwrap_or_else(|_| record_name.clone());
-                        crate::download::paths::sanitize_path_component(&raw_name)
+                let mut components = Vec::new();
+                let mut current = folder;
+                loop {
+                    let folder_name = match current
+                        .fields
+                        .get("albumNameEnc")
+                        .and_then(|f| f.get("value"))
+                        .and_then(Value::as_str)
+                    {
+                        Some(enc) => {
+                            let decoded = base64::engine::general_purpose::STANDARD
+                                .decode(enc)
+                                .context("Album name is not valid base64")?;
+                            String::from_utf8(decoded).context("Album name is not UTF-8")?
+                        }
+                        None => current.record_name.clone(),
+                    };
+                    components.push(folder_name);
+                    match current
+                        .fields
+                        .pointer("/parentId/value")
+                        .and_then(Value::as_str)
+                    {
+                        None => break,
+                        Some(parent) if parent == ROOT_FOLDER || parent == PROJECT_ROOT_FOLDER => {
+                            break;
+                        }
+                        Some(parent) => {
+                            current = by_id
+                                .get(parent)
+                                .context("Album parent was not discovered")?
+                        }
                     }
-                    None => record_name.clone(),
-                };
+                    anyhow::ensure!(
+                        components.len() <= ALBUM_TREE_DEPTH_LIMIT,
+                        "Album hierarchy depth limit exceeded"
+                    );
+                }
+                components.reverse();
+                let selector_name = components.join("/");
+                let folder_name = components
+                    .iter()
+                    .map(|component| crate::download::paths::sanitize_path_component(component))
+                    .collect::<Vec<_>>()
+                    .join("/");
 
                 let query_filter = Some(Arc::new(json!([{
                     "fieldName": "parentId",
@@ -309,8 +394,7 @@ impl PhotoLibrary {
                 }])));
 
                 let name_arc: Arc<str> = Arc::from(folder_name.as_str());
-                albums.insert(
-                    folder_name,
+                albums.entry(selector_name).or_default().push(
                     PhotoAlbum::new(
                         PhotoAlbumConfig {
                             params: Arc::clone(&self.params),
@@ -326,15 +410,19 @@ impl PhotoLibrary {
                             cross_zone_sources: Vec::new(),
                         },
                         self.clone_session(),
-                    ),
+                    )
+                    .with_selector_components(components),
                 );
             }
         }
 
         if let Some(capture) = &self.shadow_capture {
-            for album in albums.values_mut() {
+            for album in albums.values_mut().flatten() {
                 album.set_shadow_capture(capture.clone(), Arc::clone(&self.library_type));
             }
+        }
+        for entries in albums.values_mut() {
+            entries.sort_by(|left, right| left.container_id().cmp(&right.container_id()));
         }
         Ok(albums)
     }
@@ -363,6 +451,72 @@ impl PhotoLibrary {
     }
 
     async fn fetch_folders(&self) -> anyhow::Result<Vec<super::cloudkit::Record>> {
+        let mut pending = VecDeque::from([(None, 0usize)]);
+        let mut seen = HashSet::new();
+        let mut records = Vec::new();
+        while let Some((parent, depth)) = pending.pop_front() {
+            anyhow::ensure!(
+                depth <= ALBUM_TREE_DEPTH_LIMIT,
+                "Album hierarchy depth limit exceeded"
+            );
+            let page = self.fetch_folder_level(parent.as_deref()).await?;
+            for record in page {
+                if record.record_name == ROOT_FOLDER || record.record_name == PROJECT_ROOT_FOLDER {
+                    continue;
+                }
+                if record.deleted == Some(true)
+                    || record
+                        .fields
+                        .pointer("/isDeleted/value")
+                        .is_some_and(|value| value == &Value::Bool(true) || value == &json!(1))
+                {
+                    continue;
+                }
+                anyhow::ensure!(
+                    record.record_type == "CPLAlbum" && !record.record_name.is_empty(),
+                    "Unexpected album discovery record type"
+                );
+                let observed_parent = match record.fields.get("parentId") {
+                    None => None,
+                    Some(field) => Some(
+                        field
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .context("Malformed album parent")?,
+                    ),
+                };
+                let observed_parent =
+                    observed_parent.filter(|id| *id != ROOT_FOLDER && *id != PROJECT_ROOT_FOLDER);
+                anyhow::ensure!(
+                    observed_parent == parent.as_deref(),
+                    "Album discovery parent mismatch"
+                );
+                anyhow::ensure!(
+                    seen.insert(record.record_name.clone()),
+                    "Repeated album identity in discovery"
+                );
+                anyhow::ensure!(
+                    seen.len() <= ALBUM_TREE_RECORD_LIMIT,
+                    "Album discovery record limit exceeded"
+                );
+                match record.fields.get("albumType") {
+                    None => {}
+                    Some(field) => match field.get("value").and_then(Value::as_i64) {
+                        Some(0) => {}
+                        Some(3) => pending.push_back((Some(record.record_name.clone()), depth + 1)),
+                        _ => anyhow::bail!("Unknown album container type"),
+                    },
+                }
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    async fn fetch_folder_level(
+        &self,
+        parent: Option<&str>,
+    ) -> anyhow::Result<Vec<super::cloudkit::Record>> {
         let url = format!(
             "{}/records/query?{}",
             self.service_endpoint,
@@ -378,16 +532,23 @@ impl PhotoLibrary {
         const FOLDER_PAGE_CAP: usize = 64;
         let mut all_records = Vec::new();
         let mut continuation: Option<String> = None;
+        let mut markers = HashSet::new();
 
         for page in 0..FOLDER_PAGE_CAP {
+            let query = match parent {
+                Some(parent) => {
+                    json!({"recordType":"CPLAlbumByPositionLive","filterBy":[{"fieldName":"parentId","comparator":"EQUALS","fieldValue":{"type":"STRING","value":parent}}]})
+                }
+                None => json!({"recordType":"CPLAlbumByPositionLive"}),
+            };
             let body = match &continuation {
                 Some(marker) => json!({
-                    "query": {"recordType": "CPLAlbumByPositionLive"},
+                    "query": query,
                     "zoneID": &*self.zone_id,
                     "continuationMarker": marker,
                 }),
                 None => json!({
-                    "query": {"recordType": "CPLAlbumByPositionLive"},
+                    "query": query,
                     "zoneID": &*self.zone_id,
                 }),
             };
@@ -401,14 +562,27 @@ impl PhotoLibrary {
             )
             .await?;
 
+            anyhow::ensure!(
+                response.get("records").is_some_and(Value::is_array)
+                    && response.get("serverErrorCode").is_none(),
+                "Album discovery response is incomplete"
+            );
             let query: super::cloudkit::QueryResponse = serde_json::from_value(response)
                 .context("Could not read Apple's library query response")?;
 
             let page_size = query.records.len();
+            anyhow::ensure!(
+                all_records.len() + page_size <= ALBUM_TREE_RECORD_LIMIT,
+                "Album discovery record limit exceeded"
+            );
             all_records.extend(query.records);
 
             match query.continuation_marker {
                 Some(marker) if !marker.is_empty() => {
+                    anyhow::ensure!(
+                        markers.insert(marker.clone()),
+                        "Repeated album discovery continuation marker"
+                    );
                     tracing::debug!(
                         page = page,
                         page_size,
@@ -421,20 +595,7 @@ impl PhotoLibrary {
             }
         }
 
-        // Fell through the cap with the marker still set. Surface loudly
-        // so a regression that loosens the cap or a server pathology is
-        // visible in routine logs. Return what we have rather than an
-        // Err — partial results are more useful than a hard failure on
-        // the album-discovery path, and downstream consumers
-        // (`pick_album_names`) already bail loudly on missing names.
-        tracing::warn!(
-            cap = FOLDER_PAGE_CAP,
-            running_total = all_records.len(),
-            "fetch_folders: hit pagination cap with more pages still indicated; \
-             returning truncated album list. If you genuinely have >12,000 albums \
-             please file an issue."
-        );
-        Ok(all_records)
+        anyhow::bail!("Album discovery pagination limit exceeded")
     }
 
     /// Returns the zone name (e.g., "`PrimarySync`", "SharedSync-{UUID}").
@@ -1140,6 +1301,153 @@ mod tests {
         }
     }
 
+    fn hierarchy_record(id: &str, kind: i64, parent: Option<&str>) -> Value {
+        let mut record = json!({"recordName":id,"recordType":"CPLAlbum","fields":{"albumType":{"type":"INT64","value":kind}}});
+        if let Some(parent) = parent {
+            record["fields"]["parentId"] = json!({"type":"STRING","value":parent});
+        }
+        record
+    }
+
+    #[tokio::test]
+    async fn album_deletion_lookup_requires_exact_tombstone() {
+        for (record, expected) in [
+            (
+                json!({"recordName":"bound","recordType":"CPLAlbum","deleted":true}),
+                true,
+            ),
+            (
+                json!({"recordName":"bound","recordType":"CPLAlbum","fields":{"isDeleted":{"value":1}}}),
+                true,
+            ),
+            (
+                json!({"recordName":"bound","serverErrorCode":"UNKNOWN_ITEM"}),
+                false,
+            ),
+            (
+                json!({"recordName":"other","recordType":"CPLAlbum","deleted":true}),
+                false,
+            ),
+            (
+                json!({"recordName":"bound","recordType":"CPLAsset","deleted":true}),
+                false,
+            ),
+            (
+                json!({"recordName":"bound","recordType":"CPLAlbum","deleted":true,"zoneID":{"zoneName":"Other"}}),
+                false,
+            ),
+            (json!({"recordName":"bound","recordType":"CPLAlbum"}), false),
+        ] {
+            let session = PaginatingFolderSession::new(vec![json!({"records":[record]})]);
+            let log = session.body_log();
+            let library = make_library_with_session(Box::new(session));
+            assert_eq!(
+                library.confirms_album_deleted("bound").await.unwrap(),
+                expected
+            );
+            let request: Value = serde_json::from_str(&log.lock().unwrap()[0]).unwrap();
+            assert_eq!(request["zoneID"], *library.zone_id);
+            assert_eq!(request["records"], json!([{"recordName":"bound"}]));
+        }
+        let library = make_library_with_session(Box::new(PaginatingFolderSession::new(vec![
+            json!({"records":[]}),
+        ])));
+        assert!(!library.confirms_album_deleted("bound").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn fetch_folders_breadth_first_preserves_zone_and_parent_across_pages() {
+        let session = PaginatingFolderSession::new(vec![
+            json!({"records":[hierarchy_record("folder-a",3,None),hierarchy_record("folder-b",3,None)]}),
+            json!({"records":[hierarchy_record("album-a",0,Some("folder-a"))],"continuationMarker":"next"}),
+            json!({"records":[hierarchy_record("album-a2",0,Some("folder-a"))]}),
+            json!({"records":[hierarchy_record("album-b",0,Some("folder-b"))]}),
+        ]);
+        let log = session.body_log();
+        let mut library = make_library_with_session(Box::new(session));
+        library.zone_id = Arc::new(
+            json!({"zoneName":"PrimarySync","ownerRecordName":"synthetic-owner","zoneType":"REGULAR_CUSTOM_ZONE"}),
+        );
+        assert_eq!(library.fetch_folders().await.unwrap().len(), 5);
+        let requests: Vec<Value> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| serde_json::from_str(body).unwrap())
+            .collect();
+        assert_eq!(requests.len(), 4);
+        for request in &requests {
+            assert_eq!(request["zoneID"], *library.zone_id);
+        }
+        assert!(requests[0]["query"].get("filterBy").is_none());
+        assert_eq!(
+            requests[1]["query"]["filterBy"][0]["fieldValue"]["value"],
+            "folder-a"
+        );
+        assert_eq!(requests[1]["query"], requests[2]["query"]);
+        assert_eq!(requests[2]["continuationMarker"], "next");
+        assert_eq!(
+            requests[3]["query"]["filterBy"][0]["fieldValue"]["value"],
+            "folder-b"
+        );
+        assert!(requests[3].get("continuationMarker").is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_folders_bounds_depth_and_record_count() {
+        let responses = (0..=ALBUM_TREE_DEPTH_LIMIT)
+            .map(|depth| {
+                let id = format!("folder-{depth}");
+                let parent = depth.checked_sub(1).map(|value| format!("folder-{value}"));
+                json!({"records":[hierarchy_record(&id,3,parent.as_deref())]})
+            })
+            .collect();
+        let session = PaginatingFolderSession::new(responses);
+        let log = session.body_log();
+        let library = make_library_with_session(Box::new(session));
+        assert!(
+            library
+                .fetch_folders()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("depth limit")
+        );
+        assert_eq!(log.lock().unwrap().len(), ALBUM_TREE_DEPTH_LIMIT + 1);
+        let library = make_library_with_session(Box::new(PaginatingFolderSession::new(vec![
+            json!({"records":make_folder_records(ALBUM_TREE_RECORD_LIMIT + 1,"bounded")}),
+        ])));
+        assert!(
+            library
+                .fetch_folders()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("record limit")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_folders_refuses_cycles_unknown_types_and_incomplete_responses() {
+        for responses in [
+            vec![
+                json!({"records":[hierarchy_record("folder-a",3,None)]}),
+                json!({"records":[hierarchy_record("folder-a",3,Some("folder-a"))]}),
+            ],
+            vec![json!({"records":[hierarchy_record("album",0,Some("missing-parent"))]})],
+            vec![json!({"records":[hierarchy_record("unknown",17,None)]})],
+            vec![json!({"serverErrorCode":"UNKNOWN_ERROR"})],
+            vec![
+                json!({"records":[],"continuationMarker":"same"}),
+                json!({"records":[],"continuationMarker":"same"}),
+            ],
+        ] {
+            let library =
+                make_library_with_session(Box::new(PaginatingFolderSession::new(responses)));
+            assert!(library.fetch_folders().await.is_err());
+        }
+    }
+
     /// CF-1: with >200 albums, the second page must be fetched and
     /// merged. Pre-fix, fetch_folders returned only the first page.
     #[tokio::test]
@@ -1202,10 +1510,7 @@ mod tests {
 
     /// CF-1 defensive cap: if the server keeps returning a marker forever
     /// (server bug or pathological account), fetch_folders must bail
-    /// rather than loop unbounded. The cap and warn message are part of
-    /// the contract — a future refactor that drops them would silently
-    /// allow infinite loops.
-    #[tracing_test::traced_test]
+    /// rather than return a partial tree or loop unbounded.
     #[tokio::test]
     async fn fetch_folders_caps_iteration_when_continuation_never_clears() {
         // Far more responses than the cap; every one carries a marker.
@@ -1220,17 +1525,13 @@ mod tests {
         let body_log = session.body_log();
         let lib = make_library_with_session(Box::new(session));
 
-        let _ = lib.fetch_folders().await;
+        let error = lib.fetch_folders().await.unwrap_err();
+        assert!(error.to_string().contains("pagination limit"));
 
         let post_count = body_log.lock().unwrap().len();
         assert!(
             post_count <= 64,
             "fetch_folders must stop within the documented cap; made {post_count} POSTs"
-        );
-        assert!(
-            logs_contain("fetch_folders") && logs_contain("cap"),
-            "the cap-fired event must surface in logs so a future regression \
-             that silently loosens the cap is loud"
         );
     }
 }

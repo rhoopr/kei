@@ -24,6 +24,8 @@ pub(crate) struct LibraryState {
     /// Ordered list of download passes. Each pass carries its own
     /// exclude-asset-ids set. See [`crate::commands::AlbumPlan`].
     pub(crate) plan: crate::commands::AlbumPlan,
+    pub(crate) deleted_album_bindings:
+        Vec<crate::state::db::provider_generations::BoundAlbumSelection>,
     /// True when `resolve_passes` failed at the end of the prior cycle and
     /// the plan above is the previous cycle's stale snapshot. Album
     /// membership data captured under a stale plan can route assets to the
@@ -1130,6 +1132,33 @@ async fn run_cycle_inner(
         let indexing_reconciliation = indexing_hold_at_start.is_some() || !indexing_finished;
         if !has_active_passes(lib_state) {
             db_sync_token_advance_safe &= !indexing_reconciliation;
+            if !lib_state.deleted_album_bindings.is_empty() {
+                // Recovery coverage is never a provider change-stream checkpoint.
+                db_sync_token_advance_safe = false;
+                path_reconciliation_complete = false;
+                if !lib_state.plan_is_stale
+                    && !indexing_reconciliation
+                    && !config.runtime.dry_run
+                    && download_controls.run_mode.downloads_files()
+                {
+                    let recovery_config = build_download_config(
+                        download::SyncMode::Full,
+                        Arc::default(),
+                        Arc::default(),
+                        Arc::from(lib_state.zone_name.as_str()),
+                    );
+                    if !download::recover_deleted_album_selection(
+                        &lib_state.library.all(),
+                        &lib_state.deleted_album_bindings,
+                        &recovery_config,
+                        shutdown_token,
+                    )
+                    .await?
+                    {
+                        cycle_failed_count = cycle_failed_count.saturating_add(1);
+                    }
+                }
+            }
             continue;
         }
         let mut legacy_probe = build_download_config(
@@ -2747,6 +2776,7 @@ mod tests {
                     Vec::new()
                 },
             },
+            deleted_album_bindings: Vec::new(),
             plan_is_stale: false,
             plan_needs_refresh: false,
         }

@@ -23,6 +23,7 @@ const ORIGINAL: &[u8] = b"\xff\xd8\xff\xe0original immutable bytes";
 const EDIT_ONE: &[u8] = b"\xff\xd8\xff\xe0first adjusted independent bytes";
 const EDIT_TWO: &[u8] = b"\xff\xd8\xff\xe0second adjusted independent bytes";
 mod indexing;
+mod membership;
 
 #[derive(Clone)]
 struct IndexingOptions {

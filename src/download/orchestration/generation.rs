@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::config::{DownloadConfig, hash_download_config};
-use super::delta::IncrementalDeltaSummary;
+use super::delta::{IncrementalDeltaSummary, MembershipDelta};
 use super::models::{
     DownloadControls, DownloadOutcome, SyncResult, SyncStats,
     block_sync_token_for_incremental_delta, merge_download_outcomes,
@@ -80,6 +80,7 @@ pub(crate) struct SelectionContext {
     config_hash: String,
     profile: Value,
     retry_sources: Arc<std::sync::Mutex<SelectionRetrySources>>,
+    inventory_membership_delta: Arc<std::sync::Mutex<Option<Box<MembershipDelta>>>>,
 }
 
 /// Begin a synthetic historical generation through the normal admission owner.
@@ -203,6 +204,15 @@ pub(crate) async fn context(
         let mut excludes: Vec<_> = pass.exclude_ids.iter().collect();
         excludes.sort_unstable();
         let mut selected = json!({"key":pass_key(pass),"kind":format!("{:?}",pass.kind),"scope":pass.album.selection_scope(),"excludes":excludes});
+        if pass.kind == PassKind::Album {
+            selected
+                .as_object_mut()
+                .context("Invalid selection profile")?
+                .insert(
+                    "selector_components".into(),
+                    serde_json::to_value(pass.album.selector_components())?,
+                );
+        }
         let media_sources = pass.album.selection_media_sources()?;
         if !media_sources.is_empty() {
             selected
@@ -221,6 +231,7 @@ pub(crate) async fn context(
     let mut excludes: Vec<_> = config.exclude_asset_ids.iter().collect();
     excludes.sort_unstable();
     let mut profile = json!({"format":1,"coverage":"observed_selection_window","passes":profile,
+        "selection_config":config.enum_config_hash.as_deref(),
         "recent":null,"recent_scope":"Global","excludes":excludes});
     let config_hash=digest(serde_json::to_vec(&json!({"format":1,"profile":profile,"scope":scope,"zone":zone,
         "paths":hash_download_config(config),"anchored_root":SelectionPath::from_path(&std::path::absolute(&config.directory)?),
@@ -244,6 +255,7 @@ pub(crate) async fn context(
         config_hash,
         profile,
         retry_sources: Arc::new(std::sync::Mutex::new(rustc_hash::FxHashMap::default())),
+        inventory_membership_delta: Arc::default(),
     }))
 }
 
@@ -270,6 +282,54 @@ pub(crate) struct SelectionRun {
 }
 
 impl SelectionContext {
+    async fn include_durable_membership_deletions(
+        &self,
+        delta: &mut MembershipDelta,
+    ) -> Result<()> {
+        let Some(config) = self.profile.get("selection_config").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        for container in self
+            .capture
+            .db
+            .pending_deleted_membership_containers(
+                self.capture.owner.clone(),
+                self.scope.clone(),
+                config.to_owned(),
+            )
+            .await?
+        {
+            delta.containers.entry(container).or_insert(true);
+        }
+        Ok(())
+    }
+
+    async fn reconcile_membership(
+        &self,
+        passes: &[AlbumPass],
+        config: &DownloadConfig,
+        delta: &MembershipDelta,
+        cancel: &CancellationToken,
+    ) -> Result<bool> {
+        if !delta.relations.values().any(|deleted| *deleted)
+            && !delta.containers.values().any(|deleted| *deleted)
+        {
+            return Ok(true);
+        }
+        let Some(root) = self.current().await? else {
+            return Ok(false);
+        };
+        Box::pin(super::primary_layout::membership::reconcile(
+            passes,
+            config,
+            &self.capture,
+            &root,
+            delta,
+            None,
+            cancel,
+        ))
+        .await
+    }
     pub(in crate::download) fn exact_retry_sources(
         &self,
     ) -> Result<
@@ -362,6 +422,85 @@ impl SelectionContext {
             retry_sources: Arc::clone(&self.retry_sources),
         })
     }
+}
+
+/// Empty selected coverage uses an authenticated exact lookup source, never a
+/// synthetic unfiled selection or a provider checkpoint candidate.
+pub(crate) async fn recover_deleted_album_selection(
+    source: &PhotoAlbum,
+    bindings: &[crate::state::db::provider_generations::BoundAlbumSelection],
+    config: &DownloadConfig,
+    cancel: &CancellationToken,
+) -> Result<bool> {
+    if bindings.is_empty() || cancel.is_cancelled() {
+        return Ok(false);
+    }
+    let Some((capture, scope, zone)) = source.current_selection_scope()? else {
+        return Ok(false);
+    };
+    let Some(store) = &config.state_db else {
+        return Ok(false);
+    };
+    let concrete = Arc::clone(&capture.db) as Arc<dyn super::models::DownloadStore>;
+    anyhow::ensure!(
+        Arc::ptr_eq(store, &concrete),
+        "Deleted selection database context mismatch"
+    );
+    anyhow::ensure!(
+        zone.get("zoneName").and_then(Value::as_str) == Some(config.library.as_ref()),
+        "Deleted selection source scope mismatch"
+    );
+    let mut bindings = bindings.to_vec();
+    bindings.sort_by(|a, b| a.container_id.cmp(&b.container_id));
+    let profile = json!({"format":1,"coverage":"observed_selection_window","passes":[],(INDEPENDENT_ALBUM_COPIES):true,"selection_config":config.enum_config_hash.as_deref(),"deleted_album_bindings":bindings});
+    let config_hash = digest(
+        serde_json::to_vec(&json!([
+            profile,
+            scope,
+            zone,
+            hash_download_config(config),
+            SelectionPath::from_path(&std::path::absolute(&config.directory)?)
+        ]))?
+        .as_slice(),
+    );
+    let context = SelectionContext {
+        capture,
+        scope,
+        zone,
+        config_hash,
+        profile,
+        retry_sources: Arc::default(),
+        inventory_membership_delta: Arc::default(),
+    };
+    let mut root = match context.current().await? {
+        Some(root) => root,
+        None => context.start(&[], config).await?.root.clone(),
+    };
+    if !root.sealed {
+        context
+            .capture
+            .db
+            .seal_selection_generation(context.capture.owner.clone(), root.id.clone(), true, None)
+            .await?;
+        root = context
+            .current()
+            .await?
+            .context("Missing deleted selection coverage")?;
+    }
+    let mut delta = MembershipDelta::default();
+    for binding in bindings {
+        delta.containers.insert(binding.container_id, true);
+    }
+    Box::pin(super::primary_layout::membership::reconcile(
+        &[],
+        config,
+        &context.capture,
+        &root,
+        &delta,
+        Some(source),
+        cancel,
+    ))
+    .await
 }
 
 impl SelectionRun {
@@ -1453,6 +1592,25 @@ pub(super) async fn inventory(
         result.block_incremental_token(DEFERRED_REASON)
     }
     result.checkpoint.project(&mut result.stats);
+    let mut membership_delta = context
+        .inventory_membership_delta
+        .lock()
+        .map_err(|_poisoned| anyhow::anyhow!("Membership observation lock poisoned"))?
+        .take()
+        .unwrap_or_default();
+    context
+        .include_durable_membership_deletions(&mut membership_delta)
+        .await?;
+    if !result.checkpoint.sync_token_blocked
+        && !result.checkpoint.identity_incomplete
+        && covered
+        && !context
+            .reconcile_membership(passes, config, &membership_delta, &cancel)
+            .await?
+    {
+        result.sync_token = None;
+        result.block_incremental_token("membership_layout_unresolved");
+    }
     Ok(result)
 }
 
@@ -1901,7 +2059,7 @@ pub(super) async fn after_delta(
     config: &Arc<DownloadConfig>,
     controls: DownloadControls,
     cancel: CancellationToken,
-    delta: IncrementalDeltaSummary,
+    mut delta: IncrementalDeltaSummary,
 ) -> Result<SyncResult> {
     let context = config
         .selection_context
@@ -1928,9 +2086,19 @@ pub(super) async fn after_delta(
         },
         None,
         stats,
-        delta.sparse_identity_proofs,
+        std::mem::take(&mut delta.sparse_identity_proofs),
         completed_delta_replay,
     );
+    context
+        .include_durable_membership_deletions(&mut delta.membership)
+        .await?;
+    if delta.membership.incomplete
+        || ((!delta.membership.relations.is_empty() || !delta.membership.containers.is_empty())
+            && (delta.sync_token.is_none() || delta.token_unsafe_reason.is_some()))
+    {
+        delta_result.block_incremental_token("membership_delta_incomplete");
+        return Ok(delta_result);
+    }
     if config.inventory_reconciliation {
         // The dispatcher already owns exactly one current inventory between
         // these two delta passes. Do not start another implicit generation scan
@@ -1942,7 +2110,12 @@ pub(super) async fn after_delta(
             && !delta_result.checkpoint.interrupted
             && delta_result.checkpoint.state_write_failures == 0
         {
-            delta_result.sync_token = delta.sync_token;
+            delta_result.sync_token = delta.sync_token.clone();
+            *context
+                .inventory_membership_delta
+                .lock()
+                .map_err(|_poisoned| anyhow::anyhow!("Membership observation lock poisoned"))? =
+                Some(delta.membership);
         }
         return Ok(delta_result);
     }
@@ -1955,6 +2128,8 @@ pub(super) async fn after_delta(
     let refresh_selection = passes
         .iter()
         .any(|pass| pass.kind == PassKind::SmartFolder || pass.album.has_cross_zone_hydration())
+        || !delta.membership.relations.is_empty()
+        || !delta.membership.containers.is_empty()
         || (config.primary_layout_active
             && (config.refresh_metadata
                 || match config.state_db.as_deref() {
@@ -1995,7 +2170,14 @@ pub(super) async fn after_delta(
         && selected.checkpoint.enumeration_errors == 0
         && selected.checkpoint.state_write_failures == 0
     {
-        selected.sync_token = delta.sync_token;
+        if context
+            .reconcile_membership(passes, config, &delta.membership, &cancel)
+            .await?
+        {
+            selected.sync_token = delta.sync_token;
+        } else {
+            selected.block_incremental_token("membership_layout_unresolved");
+        }
     }
     Ok(selected)
 }

@@ -124,7 +124,11 @@ pub(in crate::download) fn folder_structure_for_pass(
         crate::commands::PassKind::Unfiled => folder_structure,
     };
     let name_ref = Some(pass.album.name.as_ref()).filter(|n: &&str| !n.is_empty());
-    let category_expanded = paths::expand_named_token(template, pass.kind.token(), name_ref);
+    let category_expanded = if pass.kind == crate::commands::PassKind::Album {
+        paths::expand_album_components(template, pass.album.selector_components())
+    } else {
+        paths::expand_named_token(template, pass.kind.token(), name_ref)
+    };
     // Apply `{library}` last with the path-friendly truncated zone name,
     // so callers see `SharedSync-A1B2C3D4/...` instead of the full UUID.
     // The state-DB key still uses the full zone name.
@@ -241,5 +245,30 @@ impl PathDerivationSource for DownloadConfig {
 
     fn exclude_asset_ids(&self) -> &FxHashSet<String> {
         &self.exclude_asset_ids
+    }
+}
+
+#[cfg(test)]
+mod hierarchy_tests {
+    use super::folder_structure_for_pass;
+    use crate::commands::{AlbumPass, PassKind};
+    use crate::icloud::photos::PhotoAlbum;
+    use std::sync::Arc;
+
+    #[test]
+    fn album_hierarchy_renders_components_without_inventing_separators() {
+        let pass = AlbumPass {
+            kind: PassKind::Album,
+            album: PhotoAlbum::stub_for_test(Arc::from("unused-rendered-name"))
+                .with_selector_components(vec![
+                    "Family/Work".into(),
+                    "..".into(),
+                    "100% Trips".into(),
+                ]),
+            exclude_ids: Arc::default(),
+        };
+        let template = folder_structure_for_pass("", "{album}/%Y", "", "PrimarySync", &pass);
+        assert_eq!(template, "Family_Work/_/100%% Trips/%Y");
+        assert_eq!(pass.album.selector_components()[0], "Family/Work");
     }
 }

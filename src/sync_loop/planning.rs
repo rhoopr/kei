@@ -1,7 +1,7 @@
 //! Library pass refresh, shared-library notices, and path warnings.
 
 use crate::commands::{
-    CollectionContext, build_collection_context, collection_libraries, pass_scope_for_zone,
+    CollectionContext, collection_libraries, pass_scope_for_zone,
     resolve_cross_zone_libraries_for_album_hydration, resolve_passes_for_scope, zone_name_set,
 };
 use crate::sync_cycle::{LibraryState, sync_token_key as make_sync_token_key};
@@ -182,6 +182,12 @@ pub(super) async fn refresh_needed_library_plans(
         {
             Ok(refreshed) => {
                 lib_state.plan = refreshed;
+                lib_state.deleted_album_bindings = collection_context
+                    .deleted_album_bindings
+                    .iter()
+                    .filter(|(zone, _)| zone == &lib_state.zone_name)
+                    .map(|(_, binding)| binding.clone())
+                    .collect();
                 lib_state.plan_is_stale = false;
                 lib_state.plan_needs_refresh = false;
                 *consecutive_album_refresh_failures = 0;
@@ -317,10 +323,20 @@ fn warn_if_multi_library_paths_commingle(
 }
 
 /// Resolve selected library passes and report the active plan and path warnings.
+#[cfg(test)]
 pub(super) async fn resolve_library_plans(
     photos_service: &mut crate::icloud::photos::PhotosService,
     libraries: &[crate::icloud::photos::PhotoLibrary],
     config: &config::Config,
+) -> anyhow::Result<(Vec<LibraryState>, CollectionContext)> {
+    resolve_library_plans_with_recovery(photos_service, libraries, config, None).await
+}
+
+pub(super) async fn resolve_library_plans_with_recovery(
+    photos_service: &mut crate::icloud::photos::PhotosService,
+    libraries: &[crate::icloud::photos::PhotoLibrary],
+    config: &config::Config,
+    recovery: Option<(&state::SqliteStateDb, &state::db::account::AccountOwner)>,
 ) -> anyhow::Result<(Vec<LibraryState>, CollectionContext)> {
     let all_libraries = photos_service.all_libraries().await?;
     let cross_zone_libraries =
@@ -331,8 +347,24 @@ pub(super) async fn resolve_library_plans(
 
     let collection_libraries =
         collection_libraries(&config.filters.selection, libraries, &all_libraries);
-    let collection_context =
-        build_collection_context(&config.filters.selection, collection_libraries).await?;
+    let collection_context = crate::commands::build_collection_context_for_sync(
+        &config.filters.selection,
+        collection_libraries,
+        recovery,
+    )
+    .await?;
+    if !collection_context.deleted_album_bindings.is_empty() {
+        let generations: std::collections::BTreeSet<_> = collection_context
+            .deleted_album_bindings
+            .iter()
+            .map(|(_, binding)| &binding.generation)
+            .collect();
+        tracing::warn!(
+            deleted_album_bindings = collection_context.deleted_album_bindings.len(),
+            prior_generations = generations.len(),
+            "Previously selected bound albums were deleted by the provider; continuing remaining selection and recovery"
+        );
+    }
     let selected_zones = zone_name_set(libraries);
     let collection_zones = zone_name_set(collection_libraries);
 
@@ -373,6 +405,12 @@ pub(super) async fn resolve_library_plans(
             zone_name,
             sync_token_key,
             plan,
+            deleted_album_bindings: collection_context
+                .deleted_album_bindings
+                .iter()
+                .filter(|(zone, _)| zone == library.zone_name())
+                .map(|(_, binding)| binding.clone())
+                .collect(),
             plan_is_stale: false,
             plan_needs_refresh: false,
         });
@@ -391,6 +429,7 @@ mod tests;
 
 /// Scope observed during RUNNING can download provisionally, but cannot prove
 /// recovery even when a later cycle probe reports FINISHED.
+#[cfg(test)]
 pub(super) async fn refresh_indexing_library_plans(
     photos_service: &mut crate::icloud::photos::PhotosService,
     libraries: &[crate::icloud::photos::PhotoLibrary],
@@ -398,6 +437,27 @@ pub(super) async fn refresh_indexing_library_plans(
     state_db: Option<&dyn crate::download::DownloadStore>,
     library_states: &mut Vec<LibraryState>,
     collection_context: &mut CollectionContext,
+) -> anyhow::Result<()> {
+    refresh_indexing_library_plans_with_recovery(
+        photos_service,
+        libraries,
+        config,
+        state_db,
+        library_states,
+        collection_context,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn refresh_indexing_library_plans_with_recovery(
+    photos_service: &mut crate::icloud::photos::PhotosService,
+    libraries: &[crate::icloud::photos::PhotoLibrary],
+    config: &config::Config,
+    state_db: Option<&dyn crate::download::DownloadStore>,
+    library_states: &mut Vec<LibraryState>,
+    collection_context: &mut CollectionContext,
+    recovery: Option<(&state::SqliteStateDb, &state::db::account::AccountOwner)>,
 ) -> anyhow::Result<()> {
     let mut indexing_hold = false;
     let mut finished_before_scope = true;
@@ -418,7 +478,8 @@ pub(super) async fn refresh_indexing_library_plans(
     }
     if indexing_hold {
         (*library_states, *collection_context) =
-            resolve_library_plans(photos_service, libraries, config).await?;
+            resolve_library_plans_with_recovery(photos_service, libraries, config, recovery)
+                .await?;
         if !finished_before_scope {
             for library in library_states {
                 // A fresh but provisional scope must not be certified by a

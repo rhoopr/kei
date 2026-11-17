@@ -125,6 +125,15 @@ pub(crate) struct LayoutOperation {
     pub(crate) members: Vec<LayoutMember>,
 }
 
+pub(crate) const MEMBERSHIP_RETIREMENT_PREFIX: &str = "membership-departure:";
+
+impl LayoutOperation {
+    #[must_use]
+    pub(crate) fn is_membership_retirement(&self) -> bool {
+        self.decision.starts_with(MEMBERSHIP_RETIREMENT_PREFIX)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PreservedManifestFile {
     pub(crate) operation: String,
@@ -321,15 +330,51 @@ impl SqliteStateDb {
                 if !matches || op.source_library!=library || !op.members.is_empty() {return Err(invalid("stored layout operation identity is inconsistent"));}
                 let mut stmt=conn.prepare("SELECT evidence FROM primary_layout_members WHERE operation=?1 ORDER BY member LIMIT 17")?;
                 op.members=stmt.query_map([&op.operation],|r|r.get::<_,Vec<u8>>(0))?.map(|row|decode(&row?)).collect::<Result<Vec<_>,StateError>>()?;
-                if op.members.is_empty() || op.members.len()>16 {return Err(invalid("stored layout membership exceeds budget"));}
+                if (op.members.is_empty() && !op.is_membership_retirement()) || op.members.len()>16 {return Err(invalid("stored layout membership exceeds budget"));}
                 result.push(op);
             }
             Ok(result)
         }).await
     }
     pub(crate) async fn begin_primary_layout(&self, op: LayoutOperation) -> Result<(), StateError> {
+        self.begin_primary_layout_seeded(op, None).await
+    }
+
+    /// Create a retirement binding only at departure, atomically with its journal.
+    pub(crate) async fn begin_native_membership(
+        &self,
+        op: LayoutOperation,
+        binding: LayoutBinding,
+    ) -> Result<(), StateError> {
+        self.begin_primary_layout_seeded(op, Some(binding)).await
+    }
+
+    /// Changed native bytes detach without a file operation or new verification.
+    pub(crate) async fn detach_native_membership(
+        &self,
+        op: LayoutOperation,
+        binding: LayoutBinding,
+    ) -> Result<(), StateError> {
+        self.with_conn("detach_native_membership", move |conn| {
+            let tx=rusqlite::Transaction::new_unchecked(conn,rusqlite::TransactionBehavior::Immediate)?;
+            if !op.members.is_empty() {return Err(invalid("native detach contains file work"));}
+            super::provider_generations::validate_membership_seed(&tx,&op,&binding)?;
+            for file in binding.files {
+                tx.execute("INSERT OR IGNORE INTO primary_layout_superseded_paths VALUES(?1,?2,?3,?4,?5,?6)",params![op.library,op.child,file.version,file.provider_checksum,encode(&file.path)?,file.path.to_path().to_str()])?;
+                super::provider_generations::retire_membership_publication(&tx,&op,&file)?;
+            }
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
+    async fn begin_primary_layout_seeded(
+        &self,
+        op: LayoutOperation,
+        seed: Option<LayoutBinding>,
+    ) -> Result<(), StateError> {
         self.with_conn("begin_primary_layout", move |conn| {
-            if op.members.is_empty() || op.members.len()>16 || op.phase!="planned" || op.generation<0 || !matches!(op.policy.as_str(),"primary"|"suffix") { return Err(invalid("invalid layout plan")); }
+            if (op.members.is_empty() && !op.is_membership_retirement()) || op.members.len()>16 || op.phase!="planned" || op.generation<0 || !matches!(op.policy.as_str(),"primary"|"suffix") { return Err(invalid("invalid layout plan")); }
             let mut destinations=std::collections::HashSet::new();
             for member in &op.members {
                 if let Some(record)=&member.record
@@ -341,9 +386,33 @@ impl SqliteStateDb {
                     if member.path_key.as_deref()!=Some(key.as_str()) || !destinations.insert(key) {return Err(invalid("layout destinations are inconsistent or duplicated"));}
                 }
             }
-            let tx=conn.unchecked_transaction()?;
+            let behavior=if seed.is_some() {rusqlite::TransactionBehavior::Immediate} else {rusqlite::TransactionBehavior::Deferred};
+            let tx=rusqlite::Transaction::new_unchecked(conn,behavior)?;
+            if let Some(binding)=seed {
+                super::provider_generations::validate_membership_seed(&tx,&op,&binding)?;
+                tx.execute("INSERT INTO primary_layout_bindings VALUES(?1,?2,?3,?4,1,?5,?6,?7)",params![binding.family,binding.library,binding.source_library,binding.child,binding.decision,binding.policy,encode(&binding)?])?;
+                for file in &binding.files {
+                    tx.execute("INSERT INTO primary_layout_claims VALUES(?1,?2,NULL,?3,?4,?5,?6,?7,?8)",params![path_key(&file.path.to_path())?,binding.family,binding.library,binding.child,file.version,file.provider_checksum,data_encoding::HEXLOWER.encode(&file.fingerprint.sha256),encode(&file.path)?])?;
+                }
+            }
             let generation:i64=tx.query_row("SELECT generation FROM primary_layout_bindings WHERE family=?1",[&op.family],|r|r.get(0)).optional()?.unwrap_or(0);
             if generation!=op.generation { return Err(invalid("stale primary layout plan")); }
+            if op.is_membership_retirement() {
+                let bytes:Vec<u8>=tx.query_row("SELECT binding FROM primary_layout_bindings WHERE family=?1",[&op.family],|r|r.get(0))?;
+                let binding:LayoutBinding=decode(&bytes)?;
+                if binding.library!=op.library || binding.source_library!=op.source_library || binding.child!=op.child {return Err(invalid("membership departure owner changed"));}
+                let fenced:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM primary_layout_claims WHERE family=?1 AND operation IS NOT NULL)",[&op.family],|row|row.get(0))?;
+                if fenced {return Err(invalid("another operation fences the departed binding"));}
+                for member in &op.members {
+                    let old=member.old.as_ref().ok_or_else(||invalid("membership retirement lacks owned input"))?;
+                    let old_bytes=encode(old)?;
+                    if old.local_preserved || member.record.is_some() || member.destination.is_some() || member.stage.is_some() || member.archive_source.is_some() || member.installed.is_some() || member.retirement.is_none() || !binding.files.iter().any(|file|encode(file).is_ok_and(|bytes|bytes==old_bytes)) {
+                        return Err(invalid("membership retirement differs from owned binding"));
+                    }
+                }
+                // Fence omitted changed members until atomic binding release.
+                tx.execute("UPDATE primary_layout_claims SET operation=?1 WHERE family=?2",params![op.operation,op.family])?;
+            }
             let mut header=op.clone();header.members.clear();
             tx.execute("INSERT INTO primary_layout_operations(operation,family,library,source_library,prior_generation,decision,policy,phase,header) VALUES(?1,?2,?3,?4,?5,?6,?7,'planned',?8)",params![op.operation,op.family,op.library,op.source_library,op.generation,op.decision,op.policy,encode(&header)?])?;
             for (index,member) in op.members.iter().enumerate() {
@@ -494,6 +563,15 @@ impl SqliteStateDb {
                 }
             }
             let binding=LayoutBinding{family:op.family.clone(),library:op.library.clone(),source_library:op.source_library.clone(),child:op.child.clone(),generation:generation+1,decision:op.decision.clone(),policy:op.policy.clone(),qualifier:op.qualifier.clone(),files};
+            if op.is_membership_retirement() {
+                let bytes:Vec<u8>=tx.query_row("SELECT binding FROM primary_layout_bindings WHERE family=?1",[&op.family],|r|r.get(0))?;
+                let previous:LayoutBinding=decode(&bytes)?;
+                for file in previous.files {
+                    tx.execute("INSERT OR IGNORE INTO primary_layout_superseded_paths VALUES(?1,?2,?3,?4,?5,?6)",params![op.library,op.child,file.version,file.provider_checksum,encode(&file.path)?,file.path.to_path().to_str()])?;
+                    super::provider_generations::retire_membership_publication(&tx,&op,&file)?;
+                }
+                tx.execute("DELETE FROM primary_layout_claims WHERE family=?1",[&op.family])?;
+            }
             tx.execute("INSERT INTO primary_layout_bindings VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(family) DO UPDATE SET generation=excluded.generation,decision=excluded.decision,policy=excluded.policy,binding=excluded.binding",params![op.family,op.library,op.source_library,op.child,generation+1,op.decision,op.policy,encode(&binding)?])?;
             tx.execute("DELETE FROM primary_layout_claims WHERE operation=?1",[&op.operation])?;
             tx.execute("UPDATE primary_layout_operations SET phase='committed',conflict=NULL WHERE operation=?1",[op.operation])?;

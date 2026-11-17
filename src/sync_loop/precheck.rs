@@ -171,6 +171,29 @@ pub(super) async fn include_pending_provider_work(
             Arc::from(library.zone_name.as_str()),
         );
         let pending = match async {
+            if library.plan.passes.is_empty() && !library.deleted_album_bindings.is_empty() {
+                let Some((capture, scope, _)) = library.library.all().current_selection_scope()?
+                else {
+                    return Ok(true);
+                };
+                let Some(selection_config) = config.enum_config_hash.as_deref() else {
+                    return Ok(true);
+                };
+                let deleted = capture
+                    .db
+                    .pending_deleted_membership_containers(
+                        capture.owner,
+                        scope,
+                        selection_config.to_owned(),
+                    )
+                    .await?;
+                return Ok(deleted.iter().any(|container| {
+                    library
+                        .deleted_album_bindings
+                        .iter()
+                        .any(|binding| binding.container_id == *container)
+                }));
+            }
             if !library.plan.passes.is_empty()
                 && let Some(db) = &config.state_db
                 && db

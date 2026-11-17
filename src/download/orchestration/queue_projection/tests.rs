@@ -3834,6 +3834,7 @@ async fn historical_shared_album_successor_fixture(metadata: bool) {
     {
         f.config.metadata.xmp_sidecar = metadata;
     }
+    f.config.enum_config_hash = Some(Arc::from("historical-membership-selection"));
     #[cfg(not(feature = "xmp"))]
     assert!(!metadata);
     f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
@@ -3935,6 +3936,26 @@ async fn historical_shared_album_successor_fixture(metadata: bool) {
     };
     let historical = snapshot(&f.db);
     assert_eq!(historical.len(), 2);
+    assert!(old.spec.profile["selection_config"].is_string());
+    // Legacy source reuse alone does not grant authority. The metadata writer
+    // publishes one current alias, which still cannot own the shared path alone.
+    assert_eq!(f.db.acquire_lock("historical current authority").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND current_publication=1",[&old.id],|row|row.get(0)).unwrap(),i64::from(metadata));
+    // A current receipt on one alias cannot establish exclusive retirement
+    // authority over a path historically owned by two selected passes.
+    let mut probe_spec = old.spec.clone();
+    probe_spec.config_hash = format!("{:x}", Sha256::digest(b"membership-shared-path-probe"));
+    probe_spec.profile[INDEPENDENT_ALBUM_COPIES] = json!(true);
+    let probe =
+        f.db.begin_selection_generation(owner(), probe_spec, MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+    let (candidates, cursor) =
+        f.db.membership_destinations(owner(), probe.id, None)
+            .await
+            .unwrap();
+    assert!(candidates.is_empty());
+    assert!(cursor.is_none());
+    assert_eq!(snapshot(&f.db), historical);
     let before = std::fs::metadata(&original).unwrap();
     drop(passes);
     let mut stable = None;

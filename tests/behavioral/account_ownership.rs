@@ -2284,6 +2284,260 @@ impl Respond for PrivateSelectionCliPhotos {
     }
 }
 
+#[derive(Clone)]
+struct DeletedBoundAlbumPhotos {
+    photos: PrivateSelectionCliPhotos,
+    mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    album_lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    media_url: String,
+}
+
+impl Respond for DeletedBoundAlbumPhotos {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        use std::sync::atomic::Ordering;
+        let mode = self.mode.load(Ordering::SeqCst);
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let kind = body.pointer("/query/recordType").and_then(Value::as_str);
+        if mode != 0 && kind == Some("CPLAlbumByPositionLive") {
+            return ResponseTemplate::new(200).set_body_json(if mode == 3 {
+                json!({"serverErrorCode":"INCOMPLETE_DISCOVERY"})
+            } else {
+                json!({"records":[]})
+            });
+        }
+        if kind == Some("CPLAlbumByPositionLive") {
+            let nested = body
+                .pointer("/query/filterBy/0/fieldValue/value")
+                .and_then(Value::as_str)
+                == Some("family-folder");
+            let (id, name, album_type) = if nested {
+                ("A", "A", 0)
+            } else {
+                ("family-folder", "Family", 3)
+            };
+            let mut record = json!({"recordName":id,"recordType":"CPLAlbum","fields":{"albumType":{"value":album_type},"albumNameEnc":{"value":base64::engine::general_purpose::STANDARD.encode(name)}}});
+            if nested {
+                record
+                    .get_mut("fields")
+                    .and_then(Value::as_object_mut)
+                    .unwrap()
+                    .insert(
+                        "parentId".into(),
+                        json!({"value":"family-folder","type":"STRING"}),
+                    );
+            }
+            return ResponseTemplate::new(200).set_body_json(json!({"records":[record]}));
+        }
+        if request.url.path().ends_with("/records/lookup")
+            && body
+                .pointer("/records/0/recordName")
+                .and_then(Value::as_str)
+                == Some("A")
+        {
+            self.album_lookups.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                body.get("zoneID"),
+                Some(&json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}))
+            );
+            let record = match mode {
+                2 => json!({"recordName":"A","recordType":"CPLAlbum","deleted":true}),
+                4 => json!({"recordName":"A","recordType":"CPLAlbum"}),
+                _ => json!({"recordName":"A","serverErrorCode":"UNKNOWN_ITEM"}),
+            };
+            return ResponseTemplate::new(200).set_body_json(json!({"records":[record]}));
+        }
+        let pair = |number| {
+            let mut records = self.photos.pair(number);
+            *records
+                .first_mut()
+                .unwrap()
+                .pointer_mut("/fields/resOriginalRes/value/downloadURL")
+                .unwrap() = json!(self.media_url);
+            records
+        };
+        if request.url.path().ends_with("/records/lookup") {
+            let names: Vec<_> = body
+                .get("records")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["recordName"].as_str().unwrap())
+                .collect();
+            return ResponseTemplate::new(200).set_body_json(json!({"records":(0..4).flat_map(pair).filter(|record|names.contains(&record["recordName"].as_str().unwrap())).collect::<Vec<_>>()}));
+        }
+        if request.url.path().ends_with("/records/query") && kind != Some("CheckIndexingState") {
+            let filters = body
+                .pointer("/query/filterBy")
+                .and_then(Value::as_array)
+                .unwrap();
+            let field = |name: &str| {
+                filters
+                    .iter()
+                    .find(|filter| filter["fieldName"] == name)
+                    .and_then(|filter| filter.pointer("/fieldValue/value"))
+            };
+            let scope = field("parentId").and_then(Value::as_str);
+            let offset = field("startRank").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let limit = body.get("resultsLimit").and_then(Value::as_u64).unwrap() as usize / 2;
+            self.photos.ranks.fetch_add(1, Ordering::SeqCst);
+            return ResponseTemplate::new(200).set_body_json(json!({"records":PrivateSelectionCliPhotos::members(scope).into_iter().skip(offset).take(limit).flat_map(pair).collect::<Vec<_>>(),"syncToken":"private-observational-rank"}));
+        }
+        self.photos.respond(request)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated HTTPS media proxy and test CA via KEI_TEST_HTTPS_PROXY and KEI_TEST_CA"]
+async fn deleted_bound_album_actual_cli_redistributes_real_publications() {
+    use std::sync::atomic::Ordering;
+    let proxy = std::env::var("KEI_TEST_HTTPS_PROXY").unwrap();
+    let ca = std::env::var("KEI_TEST_CA").unwrap();
+    let command = |root: &Path, account: &Account, args: &[&str]| {
+        clean_cmd()
+            .env("KEI_DATA_DIR", root)
+            .env("ICLOUD_USERNAME", account.username)
+            .env("HTTPS_PROXY", &proxy)
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("SSL_CERT_FILE", &ca)
+            .args(["--config", account.config.to_str().unwrap()])
+            .args(args)
+            .timeout(Duration::from_secs(30))
+            .output()
+            .unwrap()
+    };
+    for unfiled in [true, false] {
+        let server = MockServer::start().await;
+        let photos = DeletedBoundAlbumPhotos {
+            photos: PrivateSelectionCliPhotos {
+                ranks: Default::default(),
+                rank_cycles: Default::default(),
+                lookups: Default::default(),
+                checks: Default::default(),
+            },
+            mode: Default::default(),
+            album_lookups: Default::default(),
+            media_url: "https://p01.icloud-content.com/media".into(),
+        };
+        Mock::given(method("POST"))
+            .respond_with(photos.clone())
+            .mount(&server)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let account = seed(root, ACCOUNTS[0], "A", &server.uri());
+        let media_root = account.media.parent().unwrap();
+        let conn = Connection::open(&account.path).unwrap();
+        conn.execute_batch("UPDATE assets SET library='OldUnknownScope' WHERE id='retry'; DELETE FROM metadata WHERE key='pending_sync_token:old:PrimarySync';").unwrap();
+        drop(conn);
+        let config = std::fs::read_to_string(&account.config).unwrap().replace("[ui]",&format!("folder_structure=\"\"\nfolder_structure_albums=\"{{album}}\"\n[filters]\nalbums=[\"Family/A\"]\nunfiled={unfiled}\n[ui]"));
+        std::fs::write(&account.config, &config).unwrap();
+        success(&command(root, &account, &["sync", "--no-progress-bar"]));
+        let old = media_root.join("Family/A/private-0.JPG");
+        let kept = media_root.join("Family/A/private-1.JPG");
+        assert_eq!(std::fs::read(&old).unwrap(), QUIET_MEDIA);
+        assert_eq!(std::fs::read(&kept).unwrap(), QUIET_MEDIA);
+        assert!(!media_root.join("private-0.JPG").exists());
+        let conn = Connection::open(&account.path).unwrap();
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_media=1 AND current_publication=1 AND replace(compat_path,char(92),'/') LIKE '%/A/%'",[],|row|row.get(0)).unwrap(),2);
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM primary_layout_operations",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_generations,json_each(CAST(specification AS TEXT),'$.profile.passes') WHERE json_extract(json_each.value,'$.selector_components[0]')='Family' AND json_extract(json_each.value,'$.selector_components[1]')='A'",[],|row|row.get(0)).unwrap()>0);
+        drop(conn);
+        std::fs::write(kept.with_extension("JPG.xmp"), b"foreign sidecar").unwrap();
+        for mode in [1, 4] {
+            photos.mode.store(mode, Ordering::SeqCst);
+            assert!(
+                !command(root, &account, &["sync", "--no-progress-bar"])
+                    .status
+                    .success()
+            );
+            assert_eq!(std::fs::read(&old).unwrap(), QUIET_MEDIA);
+        }
+        let checkpoint = rows(
+            &account.path,
+            "SELECT key,value FROM metadata WHERE key='sync_token:PrimarySync'",
+        );
+        photos.mode.store(2, Ordering::SeqCst);
+        success(&command(root, &account, &["sync", "--no-progress-bar"]));
+        assert!(!old.exists());
+        assert_eq!(std::fs::read(&kept).unwrap(), QUIET_MEDIA);
+        assert_eq!(
+            std::fs::read(kept.with_extension("JPG.xmp")).unwrap(),
+            b"foreign sidecar"
+        );
+        if unfiled {
+            let conn = Connection::open(&account.path).unwrap();
+            for number in 0..2 {
+                let path = media_root.join(format!("private-{number}.JPG"));
+                assert_eq!(std::fs::read(&path).unwrap(), QUIET_MEDIA);
+                assert!(conn.query_row::<bool,_,_>("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE compat_path=?1 AND admitted=1 AND verified_media=1 AND current_publication=1)",[path.to_str().unwrap()],|row|row.get(0)).unwrap());
+            }
+        } else {
+            assert!(!media_root.join("private-0.JPG").exists());
+            assert_eq!(
+                rows(
+                    &account.path,
+                    "SELECT key,value FROM metadata WHERE key='sync_token:PrimarySync'"
+                ),
+                checkpoint
+            );
+        }
+        let operations = rows(
+            &account.path,
+            "SELECT * FROM primary_layout_operations ORDER BY operation",
+        );
+        let probes = photos.album_lookups.load(Ordering::SeqCst);
+        let ranks = photos.photos.ranks.load(Ordering::SeqCst);
+        for _ in 0..2 {
+            success(&command(root, &account, &["sync", "--no-progress-bar"]));
+            assert_eq!(
+                rows(
+                    &account.path,
+                    "SELECT * FROM primary_layout_operations ORDER BY operation"
+                ),
+                operations
+            );
+            assert_eq!(photos.album_lookups.load(Ordering::SeqCst), probes);
+            assert_eq!(photos.photos.ranks.load(Ordering::SeqCst), ranks);
+            if !unfiled {
+                assert_eq!(
+                    rows(
+                        &account.path,
+                        "SELECT key,value FROM metadata WHERE key='sync_token:PrimarySync'"
+                    ),
+                    checkpoint
+                );
+            }
+        }
+        photos.mode.store(3, Ordering::SeqCst);
+        assert!(
+            !command(root, &account, &["sync", "--no-progress-bar"])
+                .status
+                .success()
+        );
+        photos.mode.store(2, Ordering::SeqCst);
+        std::fs::write(
+            &account.config,
+            config.replace("albums=[\"Family/A\"]", "albums=[\"NeverBound\"]"),
+        )
+        .unwrap();
+        assert!(
+            !command(root, &account, &["sync", "--no-progress-bar"])
+                .status
+                .success()
+        );
+        assert_eq!(photos.album_lookups.load(Ordering::SeqCst), probes);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn private_selection_actual_cli_and_watch_reopen_independent_destination_debt() {
     use std::sync::Arc;

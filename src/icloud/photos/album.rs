@@ -90,6 +90,7 @@ pub struct PhotoAlbum {
     shadow_capture: Option<(super::inbox::ShadowCapture, Arc<str>)>,
     rank_capture: Option<selection_capture::RankCapture>,
     pub(crate) name: Arc<str>,
+    selector_components: Vec<String>,
     params: Arc<HashMap<String, Value>>,
     session: Box<dyn PhotosSession>,
     service_endpoint: Arc<str>,
@@ -123,6 +124,7 @@ impl Clone for PhotoAlbum {
         );
         cloned.shadow_capture = self.shadow_capture.clone();
         cloned.rank_capture = self.rank_capture.clone();
+        cloned.selector_components = self.selector_components.clone();
         cloned
     }
 }
@@ -152,6 +154,7 @@ impl PhotoAlbum {
         Self {
             shadow_capture: None,
             rank_capture: None,
+            selector_components: vec![config.name.to_string()],
             name: config.name,
             params: config.params,
             session,
@@ -164,6 +167,26 @@ impl PhotoAlbum {
             retry_config: config.retry_config,
             container_id: config.container_id,
             cross_zone_sources: config.cross_zone_sources,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_selector_components(mut self, components: Vec<String>) -> Self {
+        self.selector_components = components;
+        self
+    }
+
+    pub(crate) fn selector_components(&self) -> &[String] {
+        &self.selector_components
+    }
+
+    pub(crate) fn matches_selector(&self, selector: &str) -> bool {
+        if selector.contains('/') {
+            self.selector_components.join("/") == selector
+        } else {
+            self.selector_components
+                .last()
+                .is_some_and(|leaf| leaf == selector)
         }
     }
 
@@ -490,6 +513,7 @@ impl PhotoAlbum {
         );
         cloned.shadow_capture = self.shadow_capture.clone();
         cloned.rank_capture = self.rank_capture.clone();
+        cloned.selector_components = self.selector_components.clone();
         cloned
     }
 

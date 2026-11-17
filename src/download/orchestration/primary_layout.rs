@@ -1,6 +1,8 @@
 //! Owns recorded current-primary layout transitions across selected renditions.
 
 use crate::download::{DownloadConfig, DownloadStore, file, filter, planner};
+pub(super) mod membership;
+
 use crate::icloud::photos::PhotoAsset;
 use crate::state::db::primary_layout::{
     LayoutBinding, LayoutFile, LayoutMember, LayoutOperation, path_key,
@@ -681,6 +683,10 @@ async fn process_asset_inner(
             op
         } else {
             if op.phase == "publishing" {
+                anyhow::ensure!(
+                    !op.is_membership_retirement(),
+                    "Membership retirement requires completed current source evidence"
+                );
                 finish(db, &mut op.clone(), cancel, &mut LayoutOutcome::default()).await?;
             } else {
                 db.cancel_primary_layout(op.operation).await?;
@@ -1497,7 +1503,8 @@ pub(in crate::download) async fn finish(
     // Preserve every member before the first visible change, including sidecars.
     for index in 0..op.members.len() {
         let member = op.members.get(index).context("Layout member disappeared")?;
-        if member.preserved.is_some() {
+        if let Some(preserved) = &member.preserved {
+            validate_file(&root, preserved).await?;
             continue;
         }
         let Some(old) = &member.old else { continue };
@@ -1531,6 +1538,10 @@ pub(in crate::download) async fn finish(
     if op.phase != "publishing" {
         op.phase = "preserved".into();
         db.save_primary_layout(op.clone()).await?;
+        #[cfg(all(test, target_os = "linux"))]
+        if op.is_membership_retirement() {
+            crate::test_helpers::process_death_point("membership-layout-preserved");
+        }
         #[cfg(all(test, target_os = "linux"))]
         crate::test_helpers::process_death_point("layout-preserved");
         anyhow::ensure!(
@@ -1647,7 +1658,7 @@ pub(in crate::download) async fn finish(
                         .path
                         .to_path()
                         .with_file_name(format!(".retired-sidecar-{}-{index}", op.operation));
-                    file::primary_layout::retire(&root, &xmp_path, &retired, old).await?;
+                    file::primary_layout::retire(&root, &xmp_path, &retired, old, None).await?;
                 } else {
                     anyhow::ensure!(
                         snapshot(&root, &xmp_path).await?.is_none(),
@@ -1677,17 +1688,15 @@ pub(in crate::download) async fn finish(
                 &old.path.to_path(),
                 &retirement.to_path(),
                 &old.fingerprint,
+                Some(file::primary_layout::RetirementCompanion {
+                    path: &sidecar(&old.path.to_path()),
+                    retired: &sidecar(&retirement.to_path()),
+                    expected: old.sidecar.as_ref(),
+                }),
             )
             .await?;
-            if let Some(xmp) = &old.sidecar {
-                file::primary_layout::retire(
-                    &root,
-                    &sidecar(&old.path.to_path()),
-                    &sidecar(&retirement.to_path()),
-                    xmp,
-                )
-                .await?;
-            }
+            #[cfg(all(test, target_os = "linux"))]
+            crate::test_helpers::process_death_point("layout-member-retired");
         }
         if let Some(file) = &member.installed {
             validate_file(&root, file).await?;
@@ -1878,6 +1887,10 @@ pub(in crate::download) async fn plan_asset(
             Some(op)
         } else {
             if op.phase == "publishing" {
+                anyhow::ensure!(
+                    !op.is_membership_retirement(),
+                    "Membership retirement requires completed current source evidence"
+                );
                 finish(
                     db,
                     &mut op,
@@ -1960,6 +1973,9 @@ pub(super) async fn recover(
     }
     let session = LayoutSession::load(db).await?;
     for mut op in operations {
+        if op.is_membership_retirement() {
+            continue;
+        }
         let protected =
             crate::download::legacy_preservation::protected_replacement_paths(Some(db)).await?;
         file::recover_conditional_replacements(&op.root.to_path(), &protected).await?;

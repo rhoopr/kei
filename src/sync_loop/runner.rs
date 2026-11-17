@@ -524,7 +524,13 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let mut cumulative_failed_count = 0usize;
 
     let (mut library_states, mut collection_context) =
-        super::planning::resolve_library_plans(&mut photos_service, &libraries, &config).await?;
+        super::planning::resolve_library_plans_with_recovery(
+            &mut photos_service,
+            &libraries,
+            &config,
+            startup_db.as_deref().zip(account_owner.as_ref()),
+        )
+        .await?;
     if run_mode.downloads_files()
         && let Some(db) = startup_db.as_deref()
     {
@@ -624,7 +630,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         // Readiness may change without changes/database events. Persist holds
         // before any shortcut and rebuild collection/pass scope while held so
         // a provisional album list cannot certify FINISHED reconciliation.
-        super::planning::refresh_indexing_library_plans(
+        super::planning::refresh_indexing_library_plans_with_recovery(
             &mut photos_service,
             &libraries,
             &config,
@@ -633,6 +639,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 .map(|db| db as &dyn download::DownloadStore),
             &mut library_states,
             &mut collection_context,
+            startup_db.as_deref().zip(account_owner.as_ref()),
         )
         .await?;
 
