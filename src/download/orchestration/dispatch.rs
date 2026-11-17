@@ -572,7 +572,8 @@ async fn download_photos_with_sync_inner(
     if controls.run_mode.downloads_files() {
         cleanup_orphan_part_files(&config).await;
     }
-    if matches!(config.sync_mode, SyncMode::Incremental { .. })
+    if controls.run_mode.downloads_files()
+        && matches!(config.sync_mode, SyncMode::Incremental { .. })
         && let Some(db) = &config.state_db
     {
         backfill_asset_master_mappings_from_album_history(db.as_ref()).await;

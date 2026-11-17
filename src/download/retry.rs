@@ -368,7 +368,7 @@ impl PendingRetryPlanning<'_> {
                         }
                     }
                     recovered
-                } else {
+                } else if self.run_mode.downloads_files() {
                     pipeline::adopt_pending_on_disk_for_retry(
                         self.db,
                         pass_config,
@@ -387,6 +387,8 @@ impl PendingRetryPlanning<'_> {
                         },
                     )
                     .await?
+                } else {
+                    pipeline::PendingRetryAdoption::NotFound
                 };
                 match adoption {
                     pipeline::PendingRetryAdoption::Adopted => {
@@ -462,7 +464,7 @@ impl PendingRetryPlanning<'_> {
             let first_new_task = self.tasks.len();
             take_matching_pending_retry_tasks(retry_tasks, self.pending_targets, self.tasks);
             for target in queued_targets {
-                if !self.pending_targets.contains(&target) {
+                if self.run_mode.downloads_files() && !self.pending_targets.contains(&target) {
                     self.db
                         .clear_asset_verification(
                             &target.library,
@@ -487,6 +489,11 @@ impl PendingRetryPlanning<'_> {
                     },
                 );
             }
+        }
+
+        // Preview planning keeps all durable retry and verification evidence intact.
+        if !self.run_mode.downloads_files() {
+            return Ok(());
         }
 
         let deferred_targets: Vec<PendingRetryTarget> = self
@@ -569,11 +576,15 @@ impl PendingRetryPlanning<'_> {
 
 async fn set_verification_for_state_id(
     db: &dyn DownloadStore,
+    run_mode: super::DownloadRunMode,
     pending_targets: &FxHashSet<PendingRetryTarget>,
     state_id: &str,
     state: AssetVerificationState,
     reason: &str,
 ) -> Result<()> {
+    if !run_mode.downloads_files() {
+        return Ok(());
+    }
     for target in pending_targets
         .iter()
         .filter(|target| target.asset_id.as_ref() == state_id)
@@ -801,7 +812,9 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
         return Ok(PendingRetryPlan::default());
     };
 
-    revalidate_policy_excluded_assets(passes, config, &shutdown_token).await?;
+    if run_mode.downloads_files() {
+        revalidate_policy_excluded_assets(passes, config, &shutdown_token).await?;
+    }
 
     let pending: Vec<_> = db
         .get_pending()
@@ -835,9 +848,12 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
         .map(|(_, master_record_name, asset_record_name)| (master_record_name, asset_record_name))
         .collect();
 
-    let backfilled = db
-        .backfill_asset_master_mappings_from_album_memberships()
-        .await?;
+    let backfilled = if run_mode.downloads_files() {
+        db.backfill_asset_master_mappings_from_album_memberships()
+            .await?
+    } else {
+        0
+    };
     if backfilled > 0 {
         tracing::info!(
             inserted = backfilled,
@@ -866,7 +882,7 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
         .map(|request| request.state_id.as_str())
         .collect();
     for target in &pending_targets {
-        if !requested_state_ids.contains(target.asset_id.as_ref()) {
+        if run_mode.downloads_files() && !requested_state_ids.contains(target.asset_id.as_ref()) {
             db.set_asset_verification(
                 &target.library,
                 &target.asset_id,
@@ -903,6 +919,7 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
                     identity_incomplete = true;
                     set_verification_for_state_id(
                         db.as_ref(),
+                        run_mode,
                         &pending_targets,
                         state_id.as_str(),
                         AssetVerificationState::Unknown,
@@ -944,7 +961,7 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
                         .await?
                     {
                         identity_incomplete = true;
-                        set_verification_for_state_id(db.as_ref(), &pending_targets, state_id.as_str(), AssetVerificationState::Unknown,
+                        set_verification_for_state_id(db.as_ref(), run_mode, &pending_targets, state_id.as_str(), AssetVerificationState::Unknown,
                             "legacy ownership is not established by durable family and date evidence").await?;
                         continue;
                     }
@@ -979,6 +996,7 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
                 {
                     set_verification_for_state_id(
                         db.as_ref(),
+                        run_mode,
                         &pending_targets,
                         state_id,
                         AssetVerificationState::Unknown,
@@ -986,6 +1004,9 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
                     )
                     .await?;
                     identity_incomplete = true;
+                    continue;
+                }
+                if !run_mode.downloads_files() {
                     continue;
                 }
                 let resolved = if master_family {
@@ -1018,6 +1039,7 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
                 // CONTRACT: UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING
                 set_verification_for_state_id(
                     db.as_ref(),
+                    run_mode,
                     &pending_targets,
                     state_id.as_str(),
                     AssetVerificationState::Unknown,
@@ -1033,6 +1055,7 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
             RecordResolution::TransientFailure(error) => {
                 set_verification_for_state_id(
                     db.as_ref(),
+                    run_mode,
                     &pending_targets,
                     state_id.as_str(),
                     AssetVerificationState::TransientFailure,
@@ -1070,6 +1093,7 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
                     for state_id in &legacy_present_state_ids {
                         set_verification_for_state_id(
                             db.as_ref(),
+                            run_mode,
                             &pending_targets,
                             state_id,
                             AssetVerificationState::TransientFailure,
@@ -1129,6 +1153,7 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
                     {
                         set_verification_for_state_id(
                             db.as_ref(),
+                            run_mode,
                             &pending_targets,
                             &state_id,
                             AssetVerificationState::Unknown,
@@ -1144,12 +1169,14 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
                         identity_incomplete = true;
                         continue;
                     }
-                    db.upsert_asset_master_mapping(
-                        &config.library,
-                        asset.asset_record_name(),
-                        asset.id(),
-                    )
-                    .await?;
+                    if run_mode.downloads_files() {
+                        db.upsert_asset_master_mapping(
+                            &config.library,
+                            asset.asset_record_name(),
+                            asset.id(),
+                        )
+                        .await?;
+                    }
                     tracing::info!(
                         library = %config.library,
                         state_id,
@@ -1174,6 +1201,7 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
                 LegacyCandidateSelection::InvalidCaptureDate => {
                     set_verification_for_state_id(
                         db.as_ref(),
+                        run_mode,
                         &pending_targets,
                         &state_id,
                         AssetVerificationState::Unknown,
@@ -1184,6 +1212,7 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
                 LegacyCandidateSelection::Missing => {
                     set_verification_for_state_id(
                         db.as_ref(),
+                        run_mode,
                         &pending_targets,
                         &state_id,
                         AssetVerificationState::Unknown,
@@ -1199,6 +1228,7 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
                 LegacyCandidateSelection::EvidenceMismatch { candidates } => {
                     set_verification_for_state_id(
                         db.as_ref(),
+                        run_mode,
                         &pending_targets,
                         &state_id,
                         AssetVerificationState::Unknown,
@@ -1215,6 +1245,7 @@ pub(super) async fn build_pending_retry_download_tasks_excluding(
                 LegacyCandidateSelection::Ambiguous { matches } => {
                     set_verification_for_state_id(
                         db.as_ref(),
+                        run_mode,
                         &pending_targets,
                         &state_id,
                         AssetVerificationState::Unknown,

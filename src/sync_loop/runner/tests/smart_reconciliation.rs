@@ -20,6 +20,7 @@ struct SmartReconciliationSession {
     records: Arc<Value>,
     extra_records: Arc<std::sync::Mutex<Vec<Value>>>,
     lookups: Arc<AtomicUsize>,
+    lookup_names: Arc<std::sync::Mutex<Vec<String>>>,
     queries: Arc<AtomicUsize>,
     incomplete_pages: Arc<AtomicUsize>,
     delta_calls: Arc<AtomicUsize>,
@@ -41,7 +42,7 @@ enum SmartReconciliationFault {
     DownloadWrite,
     IncompleteAlbumSnapshot,
     OtherLibraryFailure,
-    RetainedSelectionDebt,
+    HistoricalSelectionDebt,
 }
 
 impl SmartReconciliationSession {
@@ -71,6 +72,14 @@ impl PhotosSession for SmartReconciliationSession {
     ) -> anyhow::Result<Value> {
         if url.contains("/records/lookup?") {
             self.lookups.fetch_add(1, Ordering::SeqCst);
+            let request: Value = serde_json::from_str(&body)?;
+            self.lookup_names.lock().unwrap().extend(
+                request["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|record| record["recordName"].as_str().unwrap().to_owned()),
+            );
             if *self.fault.lock().unwrap() == Some(SmartReconciliationFault::UnknownCatalogIdentity)
             {
                 return Ok(json!({"records": []}));
@@ -174,6 +183,240 @@ impl PhotosSession for SmartReconciliationSession {
 #[tokio::test]
 async fn run_cycle_smart_reconciliation_promotes_after_fresh_query_and_stays_quiet() {
     Box::pin(smart_reconciliation_lifecycle("Hidden", false, false, None)).await;
+}
+
+#[tokio::test]
+async fn run_cycle_current_debt_commits_successor_and_configuration_with_unknown_history() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    fn evidence(db: &state::SqliteStateDb, hash: &str) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        let conn = db.acquire_lock("historical selection evidence").unwrap();
+        ["provider_active_generations", "provider_active_decisions", "provider_active_sources", "provider_selection_rank_pages"].iter().map(|table| {
+            let sql = if *table == "provider_active_generations" {
+                "SELECT * FROM provider_active_generations WHERE config_hash=?1 ORDER BY id".to_owned()
+            } else {
+                format!("SELECT d.* FROM {table} d JOIN provider_active_generations g ON g.id=d.generation WHERE g.config_hash=?1 ORDER BY 1,2,3")
+            };
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let columns = stmt.column_count();
+            stmt.query_map([hash], |row| (0..columns).map(|i| row.get(i)).collect()).unwrap().collect::<Result<Vec<_>,_>>().unwrap()
+        }).collect()
+    }
+
+    let server = crate::start_wiremock_or_skip!();
+    let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+    Mock::given(method("GET"))
+        .and(path("/current.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let root = tempfile::tempdir().unwrap();
+    let db_path = root.path().join("state.db");
+    let media = root.path().join("media");
+    std::fs::create_dir(&media).unwrap();
+    let config = make_run_cycle_config();
+    let owner = state::db::account::AccountOwner::authenticated(
+        "runner-debt@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"runner-debt-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+    let names = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut old_hash = String::new();
+    let mut old_evidence = None;
+    let mut completed_media = None;
+    for cycle in 0..4 {
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&db_path, &owner)
+                .await
+                .unwrap(),
+        );
+        let mut records = full_album_page_with_download(
+            "PrimarySync",
+            if cycle == 0 { "HISTORY" } else { "CURRENT" },
+            "smart-current",
+            &format!("{}/current.jpg", server.uri()),
+            bytes.len() as u64,
+            &checksum,
+        );
+        records["records"][1]["fields"]["isHidden"] = json!({"value":1,"type":"INT64"});
+        records["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+            json!("_defaultOwner");
+        let provider = SmartReconciliationSession {
+            zone: "PrimarySync",
+            records: Arc::new(records),
+            extra_records: Arc::default(),
+            lookups: Arc::default(),
+            lookup_names: names.clone(),
+            queries: Arc::default(),
+            incomplete_pages: Arc::default(),
+            delta_calls: Arc::default(),
+            fault: Arc::new(std::sync::Mutex::new(if cycle == 0 {
+                Some(SmartReconciliationFault::UnknownCatalogIdentity)
+            } else {
+                None
+            })),
+            cancel: Arc::default(),
+        };
+        let mut album = smart_album("PrimarySync", "Hidden", Box::new(provider));
+        album.set_shadow_capture(
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com"),
+            Arc::from("private"),
+        );
+        let (_, scope, _) = album.owned_selection_scope().unwrap().unwrap();
+        let lib = make_run_cycle_library_state_with_passes(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            vec![AlbumPass {
+                kind: PassKind::SmartFolder,
+                album,
+                exclude_ids: Arc::default(),
+            }],
+        );
+        let base = make_run_cycle_download_config_builder(&media, db.clone());
+        let builder = |mode, excluded, groups, library| {
+            let mut result = (*base(mode, excluded, groups, library)).clone();
+            result.folder_structure_smart_folders = Arc::from(if cycle == 0 { "A" } else { "B" });
+            Arc::new(result)
+        };
+        let hash = download::hash_download_config(&builder(
+            download::SyncMode::Full,
+            Arc::default(),
+            Arc::default(),
+            Arc::from("PrimarySync"),
+        ));
+        let before = names.lock().unwrap().len();
+        let result = run_cycle(
+            &[&lib],
+            &config,
+            Some(db.as_ref()),
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        if cycle == 0 {
+            old_hash = db.acquire_lock("source-bound failed configuration").unwrap()
+                .query_row("SELECT DISTINCT g.config_hash FROM provider_active_generations g JOIN provider_active_decisions d ON d.generation=g.id WHERE d.child='asset-HISTORY' AND d.admission='deferred'", [], |row| row.get(0)).unwrap();
+            assert!(!result.can_advance_database_checkpoint(), "{result:?}");
+            assert!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                db.unfinished_selection_debt(owner.clone(), scope, old_hash.clone())
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                names
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|name| name == "asset-HISTORY")
+            );
+            let captured = evidence(&db, &old_hash);
+            assert!(captured.iter().all(|rows| !rows.is_empty()));
+            old_evidence = Some(captured);
+            assert_eq!(server.received_requests().await.unwrap().len(), 0);
+            continue;
+        }
+        assert!(
+            result.can_advance_database_checkpoint(),
+            "cycle {cycle}: {result:?}"
+        );
+        assert!(!result.stats.sync_token_blocked, "{result:?}");
+        assert_eq!(result.failed_count, 0);
+        assert!(
+            names.lock().unwrap()[before..]
+                .iter()
+                .all(|name| name != "asset-HISTORY" && name != "HISTORY")
+        );
+        if cycle > 1 {
+            // Smart-folder cycles reconfirm current membership. Only B's exact
+            // child and paired master may be looked up; A remains untouched.
+            let mut requested = names.lock().unwrap()[before..].to_vec();
+            requested.sort();
+            assert_eq!(requested, ["CURRENT", "asset-CURRENT", "asset-CURRENT"]);
+            assert_eq!(result.stats.downloaded, 0);
+        } else {
+            assert_eq!(result.stats.downloaded, 1);
+        }
+        let reopened = state::SqliteStateDb::open_owned(&db_path, &owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("smart-current")
+        );
+        assert_eq!(
+            reopened
+                .get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(hash.as_str())
+        );
+        assert_eq!(
+            reopened
+                .get_metadata(ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(download::compute_config_hash(&config).as_str())
+        );
+        assert!(
+            reopened
+                .get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reopened
+                .get_metadata(crate::sync_cycle::PENDING_ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reopened
+                .unfinished_selection_debt(owner.clone(), scope.clone(), old_hash.clone())
+                .await
+                .unwrap()
+        );
+        let current_selection_hash = reopened.acquire_lock("completed current configuration").unwrap()
+            .query_row("SELECT DISTINCT g.config_hash FROM provider_active_generations g JOIN provider_active_decisions d ON d.generation=g.id WHERE d.child='asset-CURRENT' AND g.config_hash<>?1", [&old_hash], |row| row.get(0)).unwrap();
+        assert!(
+            !reopened
+                .unfinished_selection_debt(owner.clone(), scope, current_selection_hash)
+                .await
+                .unwrap()
+        );
+        assert_eq!(Some(evidence(&reopened, &old_hash)), old_evidence);
+        let files = media_snapshot(&media);
+        if let Some(expected) = &completed_media {
+            assert_eq!(&files, expected);
+        }
+        completed_media = Some(files);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 }
 
 #[tokio::test]
@@ -300,12 +543,13 @@ async fn run_cycle_bounded_smart_reconciliation_failures_retain_then_recover() {
 }
 
 #[tokio::test]
-async fn run_cycle_bounded_smart_reconciliation_retained_selection_debt_holds_promotion() {
+async fn run_cycle_bounded_smart_reconciliation_historical_selection_debt_preserves_current_promotion()
+ {
     Box::pin(smart_reconciliation_lifecycle_bounded(
         "Hidden",
         false,
         false,
-        Some(SmartReconciliationFault::RetainedSelectionDebt),
+        Some(SmartReconciliationFault::HistoricalSelectionDebt),
         Some(SmartBound::Date),
     ))
     .await;
@@ -416,6 +660,7 @@ async fn smart_reconciliation_lifecycle_with_capture(
         records: records.clone(),
         extra_records: extra_records.clone(),
         lookups: lookups.clone(),
+        lookup_names: Arc::default(),
         queries: queries.clone(),
         incomplete_pages: incomplete_pages.clone(),
         delta_calls: delta_calls.clone(),
@@ -455,6 +700,7 @@ async fn smart_reconciliation_lifecycle_with_capture(
                     records: Arc::new(json!({"records": [], "syncToken": "smart-current"})),
                     extra_records: Arc::new(std::sync::Mutex::new(Vec::new())),
                     lookups: Arc::new(AtomicUsize::new(0)),
+                    lookup_names: Arc::default(),
                     queries: Arc::new(AtomicUsize::new(0)),
                     incomplete_pages: Arc::new(AtomicUsize::new(0)),
                     delta_calls: Arc::new(AtomicUsize::new(0)),
@@ -474,13 +720,16 @@ async fn smart_reconciliation_lifecycle_with_capture(
     let mut current_hash = String::new();
     let mut previous_files = std::collections::BTreeMap::new();
     let mut original_sidecar = None;
+    let mut historical_manifest = None;
     let final_cycle = if failure.is_some() || add_new_asset {
         3
     } else {
         2
     };
     for cycle in 0..=final_cycle {
-        let held = cycle == 1 && failure.is_some();
+        let historical_debt =
+            cycle > 0 && failure == Some(SmartReconciliationFault::HistoricalSelectionDebt);
+        let held = cycle == 1 && failure.is_some() && !historical_debt;
         if cycle == 1
             && let Some(bound) = bound
         {
@@ -595,7 +844,7 @@ async fn smart_reconciliation_lifecycle_with_capture(
                 assert!(pass.album.current_selection_scope().unwrap().is_some());
             }
         }
-        if held && failure == Some(SmartReconciliationFault::RetainedSelectionDebt) {
+        if historical_debt && cycle == 1 {
             use state::db::provider_generations::{
                 ActiveDecision, GenerationSpec, MAX_GENERATION_BYTES,
             };
@@ -655,10 +904,12 @@ async fn smart_reconciliation_lifecycle_with_capture(
                 .admitted
             );
             assert!(
-                db.unfinished_selection_debt(owner.clone(), scope)
+                db.unfinished_selection_debt(owner.clone(), scope, generation.spec.config_hash)
                     .await
                     .unwrap()
             );
+            historical_manifest = Some(db.acquire_lock("historical smart selection manifest").unwrap()
+                .query_row::<Vec<u8>,_,_>("SELECT d.manifest FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE g.config_hash=?1", ["a".repeat(64)], |row| row.get(0)).unwrap());
         }
         if held
             && matches!(
@@ -964,7 +1215,7 @@ async fn smart_reconciliation_lifecycle_with_capture(
                 "path drift must not copy or rewrite retained publications"
             );
         }
-        if held && failure == Some(SmartReconciliationFault::RetainedSelectionDebt) {
+        if historical_debt {
             assert_eq!(
                 result.stats.sync_token_blocked_reason,
                 Some("date_bounded_full_enumeration")
@@ -976,11 +1227,10 @@ async fn smart_reconciliation_lifecycle_with_capture(
                 .unwrap()
                 .unwrap();
             assert!(
-                db.unfinished_selection_debt(owner.clone(), scope.clone())
+                db.unfinished_selection_debt(owner.clone(), scope.clone(), "a".repeat(64))
                     .await
                     .unwrap()
             );
-            drop(db);
             let reopened = state::SqliteStateDb::open_owned(&db_path, &owner)
                 .await
                 .unwrap();
@@ -990,7 +1240,7 @@ async fn smart_reconciliation_lifecycle_with_capture(
                     .await
                     .unwrap()
                     .as_deref(),
-                Some(initial_hash.as_str())
+                Some(hash.as_str())
             );
             assert_eq!(
                 reopened
@@ -998,7 +1248,7 @@ async fn smart_reconciliation_lifecycle_with_capture(
                     .await
                     .unwrap()
                     .as_deref(),
-                Some(hash.as_str())
+                None
             );
             assert_eq!(
                 reopened
@@ -1010,15 +1260,17 @@ async fn smart_reconciliation_lifecycle_with_capture(
             );
             assert!(
                 reopened
-                    .unfinished_selection_debt(owner, scope)
+                    .unfinished_selection_debt(owner, scope, "a".repeat(64))
                     .await
                     .unwrap()
             );
+            let retained = reopened.acquire_lock("unchanged historical smart selection manifest").unwrap()
+                .query_row::<Vec<u8>,_,_>("SELECT d.manifest FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE g.config_hash=?1 AND d.admission='deferred'", ["a".repeat(64)], |row| row.get(0)).unwrap();
+            assert_eq!(Some(retained), historical_manifest);
             assert_eq!(
                 std::fs::read(original_path.as_ref().unwrap()).unwrap(),
                 bytes
             );
-            return;
         }
         if cycle == final_cycle {
             assert_eq!(

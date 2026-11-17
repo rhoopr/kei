@@ -298,6 +298,217 @@ async fn state_free_previews_still_enumerate_without_local_writes() {
     }
 }
 
+#[tokio::test]
+async fn unsupported_previews_preserve_existing_store_after_reopen() {
+    use super::super::test_support::open_fixture_db;
+    use crate::state::AssetVerificationState;
+    use crate::test_helpers::{TestAssetRecord, mock_photo_records_for_zone_with_filename};
+
+    fn snapshot(db: &SqliteStateDb) -> Vec<(String, Vec<String>)> {
+        let connection = db.acquire_lock("preview snapshot").unwrap();
+        let tables: Vec<String> = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let mut statement = connection
+                    .prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))
+                    .unwrap();
+                let columns = statement.column_count();
+                let mut rows: Vec<String> = statement
+                    .query_map([], |row| {
+                        let values = (0..columns)
+                            .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        Ok(format!("{values:?}"))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                rows.sort();
+                (table, rows)
+            })
+            .collect()
+    }
+
+    #[derive(Clone)]
+    struct PreviewSession {
+        records: Vec<Value>,
+        lookups: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for PreviewSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/records/lookup?") {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                return Ok(json!({"records": self.records}));
+            }
+            if url.contains("/changes/zone?") {
+                return Ok(
+                    json!({"zones": [{"zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"}, "syncToken": "next", "moreComing": false, "records": []}]}),
+                );
+            }
+            if url.contains("/internal/records/query/batch") {
+                return Ok(
+                    json!({"batch": [{"records": [{"fields": {"itemCount": {"value": 0}}}]}]}),
+                );
+            }
+            Ok(json!({"records": []}))
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    for mode in [DownloadRunMode::DryRun, DownloadRunMode::PrintFilenames] {
+        for incremental in [false, true] {
+            let server = crate::start_wiremock_or_skip!();
+            let root = TempDir::new().unwrap();
+            let database = root.path().join("state.db");
+            let media = root.path().join("media");
+            std::fs::create_dir(&media).unwrap();
+            std::fs::write(media.join("retained.jpg"), b"retained media").unwrap();
+            let db = open_fixture_db(&database).await;
+            for id in [
+                "asset-READY",
+                "asset-UNKNOWN",
+                "asset-MISSING",
+                "asset-EXCLUDED",
+                "asset-DELETED",
+            ] {
+                db.upsert_seen(
+                    &TestAssetRecord::new(id)
+                        .filename("ready.jpg")
+                        .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                        .size(1024)
+                        .build(),
+                )
+                .await
+                .unwrap();
+                db.set_asset_verification(
+                    "PrimarySync",
+                    id,
+                    "original",
+                    AssetVerificationState::Unknown,
+                    "retained verification",
+                )
+                .await
+                .unwrap();
+                if id != "asset-MISSING" {
+                    db.upsert_asset_master_mapping(
+                        "PrimarySync",
+                        id,
+                        id.strip_prefix("asset-").unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            db.mark_policy_excluded("PrimarySync", "asset-EXCLUDED", "original")
+                .await
+                .unwrap();
+            db.upsert_album_membership_delta(
+                "PrimarySync",
+                "album",
+                "asset-MISSING",
+                Some("MISSING"),
+                "icloud",
+            )
+            .await
+            .unwrap();
+            db.set_metadata("sync_token:PrimarySync", "retained-token")
+                .await
+                .unwrap();
+            db.set_metadata("enum_in_progress:PrimarySync", "retained-interruption")
+                .await
+                .unwrap();
+            let before = snapshot(&db);
+            drop(db);
+            let mut records =
+                mock_photo_records_for_zone_with_filename("READY", "PrimarySync", "ready.jpg");
+            records[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+                json!(format!("{}/ready.jpg", server.uri()));
+            for id in ["asset-EXCLUDED", "asset-DELETED"] {
+                records.push(json!({"recordName": id, "serverErrorCode": "NOT_FOUND"}));
+            }
+            for _ in 0..2 {
+                let db = open_fixture_db(&database).await;
+                let changes = db.acquire_lock("before preview").unwrap().total_changes();
+                let lookups = Arc::new(AtomicUsize::new(0));
+                let pass = AlbumPass {
+                    kind: PassKind::Unfiled,
+                    album: super::super::test_support::album_with_session(
+                        "PrimarySync",
+                        "",
+                        Box::new(PreviewSession {
+                            records: records.clone(),
+                            lookups: lookups.clone(),
+                        }),
+                    ),
+                    exclude_ids: Arc::new(FxHashSet::default()),
+                };
+                assert!(pass.album.current_selection_scope().unwrap().is_none());
+                let mut config = test_config();
+                config.directory = Arc::from(media.as_path());
+                config.state_db = Some(db.clone());
+                config.sync_mode = if incremental {
+                    SyncMode::Incremental {
+                        zone_sync_token: "retained-token".into(),
+                    }
+                } else {
+                    SyncMode::Full
+                };
+                let result = download_photos_with_sync(
+                    &Client::new(),
+                    &[pass],
+                    Arc::new(config),
+                    DownloadControls::new(mode, DownloadReporting::hidden()),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    lookups.load(Ordering::SeqCst) > 0,
+                    "compatibility retry must run"
+                );
+                assert_eq!(
+                    result.stats.downloaded,
+                    usize::from(mode == DownloadRunMode::DryRun)
+                );
+                for ((table, actual), (_, expected)) in snapshot(&db).iter().zip(&before) {
+                    assert_eq!(
+                        actual, expected,
+                        "{mode:?}, incremental={incremental}, table={table}"
+                    );
+                }
+                assert_eq!(
+                    db.acquire_lock("after preview").unwrap().total_changes(),
+                    changes
+                );
+                drop(db);
+                let reopened = open_fixture_db(&database).await;
+                assert_eq!(snapshot(&reopened), before);
+                assert_eq!(
+                    std::fs::read(media.join("retained.jpg")).unwrap(),
+                    b"retained media"
+                );
+                assert_eq!(std::fs::read_dir(&media).unwrap().count(), 1);
+                assert!(server.received_requests().await.unwrap().is_empty());
+            }
+        }
+    }
+}
+
 impl CountingQuerySession {
     fn new(page: Value, asset_count: u64) -> Self {
         Self {

@@ -1978,7 +1978,7 @@ impl SqliteStateDb {
             let conn=&tx;
             account::validate_authenticated(conn,&owner)?;
             validate_scope_decisions(conn, &scope)?;
-            let id:Option<String>=conn.query_row(&format!("SELECT g.id FROM provider_active_generations g WHERE g.scope=?1 AND g.config_hash=?2 AND g.id<>?3 AND (EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.admission='deferred' AND d.next_retry_at<=?4) OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=g.id AND {UNFINISHED} AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child AND d.next_retry_at<=?4))) ORDER BY g.last_replayed_at,g.created_at,g.id LIMIT 1"),params![scope,config_hash,current,Utc::now().timestamp()],|r|r.get(0)).optional()?;
+            let id:Option<String>=conn.query_row(&format!("SELECT g.id FROM provider_active_generations g WHERE {CURRENT_SELECTION_CONFIGURATION} AND g.id<>?3 AND (EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.admission='deferred' AND d.next_retry_at<=?4) OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=g.id AND {UNFINISHED} AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child AND d.next_retry_at<=?4))) ORDER BY g.last_replayed_at,g.created_at,g.id LIMIT 1"),params![scope,config_hash,current,Utc::now().timestamp()],|r|r.get(0)).optional()?;
             id.map(|id|load_generation(conn,&id)).transpose()
         }).await
     }
@@ -2450,6 +2450,10 @@ fn validate_identity_decisions(
     }
     Ok(())
 }
+
+// Retry scheduling and checkpoint debt share current configuration authority.
+// This predicate must not narrow admission or physical publication guards.
+const CURRENT_SELECTION_CONFIGURATION: &str = "g.scope=?1 AND g.config_hash=?2";
 
 // A never-published path is planning evidence, not another required copy, once
 // a later complete query with the same selection and source facts has finalized
@@ -3259,20 +3263,27 @@ impl SqliteStateDb {
 }
 
 impl SqliteStateDb {
-    /// Unfinished current obligations and unresolved identities veto the cursor.
+    /// Unfinished current-configuration obligations and identities veto the cursor.
+    /// Other configurations retain physical publication guards, but uncertainty
+    /// alone cannot hold a successor they cannot recover through current selection.
     /// Exact completed current-selection proof can supersede an unstarted old
     /// path without acknowledging or modifying its retained publication evidence.
     pub(crate) async fn unfinished_selection_debt(
         &self,
         owner: account::AccountOwner,
         scope: String,
+        config_hash: String,
     ) -> Result<bool, StateError> {
         self.with_conn("inspecting retained selection debt",move|conn|{
             let tx=conn.unchecked_transaction()?;
             account::validate_authenticated(&tx,&owner)?;
             let conn=&tx;
             validate_scope_decisions(conn, &scope)?;
-            Ok(conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE g.scope=?1 AND d.admission='deferred') OR EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND {UNFINISHED})"),[scope],|r|r.get(0))?)
+            // A prepared output can already be on disk while its receipt is
+            // unfinished. Preserve its fence at an overlapping selected path,
+            // even if current writer options differ. Historical planned paths
+            // without such an artifact do not create current selection.
+            Ok(conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE {CURRENT_SELECTION_CONFIGURATION} AND d.admission='deferred') OR EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND (g.config_hash=?2 OR (w.prepared_hash IS NOT NULL AND EXISTS(SELECT 1 FROM provider_active_destinations selected JOIN provider_active_generations current ON current.id=selected.generation WHERE current.scope=?1 AND current.config_hash=?2 AND selected.admitted=1 AND selected.path=w.path))) AND {UNFINISHED})"),params![scope,config_hash],|r|r.get(0))?)
         }).await
     }
 }

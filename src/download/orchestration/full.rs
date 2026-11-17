@@ -861,7 +861,9 @@ pub(super) async fn download_photos_full_with_token_policy(
         .collect();
     enum_zones.sort();
     enum_zones.dedup();
-    if let Some(db) = &config.state_db {
+    if controls.run_mode.downloads_files()
+        && let Some(db) = &config.state_db
+    {
         for zone in &enum_zones {
             if let Err(e) = db.begin_enum_progress(zone).await {
                 tracing::debug!(error = %e, zone, "Failed to mark enumeration start");
@@ -1805,7 +1807,10 @@ pub(super) async fn download_photos_full_with_token_policy(
     // doesn't leave the marker set forever. Shutdown still suppresses the
     // clear because the producer's cancellation path leaves
     // `enumeration_complete = false`.
-    if enumeration_complete && let Some(db) = &config.state_db {
+    if controls.run_mode.downloads_files()
+        && enumeration_complete
+        && let Some(db) = &config.state_db
+    {
         for zone in &enum_zones {
             if let Err(e) = db.end_enum_progress(zone).await {
                 tracing::debug!(error = %e, zone, "Failed to clear enumeration marker");

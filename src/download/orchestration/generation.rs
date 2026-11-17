@@ -129,39 +129,32 @@ pub(super) async fn freeze_before_sync(
     Ok(())
 }
 
-/// Existing selected obligations remain a checkpoint veto when a later
-/// selector uses the legacy dispatcher. Eligibility changes cannot retire debt.
+/// Compose only the authenticated current selection's checkpoint debt.
+/// Historical physical publication protection stays with admission and journals.
 pub(super) async fn hold_retained_debt(
     passes: &[AlbumPass],
     config: &DownloadConfig,
     controls: DownloadControls,
     result: &mut SyncResult,
 ) -> Result<()> {
-    if !controls.run_mode.downloads_files() {
+    if !controls.run_mode.downloads_files() || passes.is_empty() {
         return Ok(());
     }
-    let Some(store) = &config.state_db else {
+    let Some(context) = &config.selection_context else {
         return Ok(());
     };
-    let mut scopes = std::collections::HashSet::new();
-    for pass in passes {
-        let Some((capture, scope, _zone)) = pass.album.owned_selection_scope()? else {
-            continue;
-        };
-        let concrete = Arc::clone(&capture.db) as Arc<dyn super::models::DownloadStore>;
-        anyhow::ensure!(
-            Arc::ptr_eq(store, &concrete),
-            "Selection database context mismatch"
-        );
-        if scopes.insert(scope.clone())
-            && capture
-                .db
-                .unfinished_selection_debt(capture.owner, scope)
-                .await?
-        {
-            result.block_incremental_token(DEFERRED_REASON);
-            result.sync_token = None;
-        }
+    if context
+        .capture
+        .db
+        .unfinished_selection_debt(
+            context.capture.owner.clone(),
+            context.scope.clone(),
+            context.config_hash.clone(),
+        )
+        .await?
+    {
+        result.block_incremental_token(DEFERRED_REASON);
+        result.sync_token = None;
     }
     Ok(())
 }
@@ -1287,7 +1280,11 @@ pub(super) async fn inventory(
     if context
         .capture
         .db
-        .unfinished_selection_debt(context.capture.owner.clone(), context.scope.clone())
+        .unfinished_selection_debt(
+            context.capture.owner.clone(),
+            context.scope.clone(),
+            context.config_hash.clone(),
+        )
         .await?
     {
         result.block_incremental_token(DEFERRED_REASON)
@@ -1642,7 +1639,11 @@ async fn replay(
     if context
         .capture
         .db
-        .unfinished_selection_debt(context.capture.owner.clone(), context.scope.clone())
+        .unfinished_selection_debt(
+            context.capture.owner.clone(),
+            context.scope.clone(),
+            context.config_hash.clone(),
+        )
         .await?
     {
         result.block_incremental_token(DEFERRED_REASON)

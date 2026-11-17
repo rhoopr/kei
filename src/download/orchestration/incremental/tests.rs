@@ -2365,7 +2365,7 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
     let owner = super::super::test_support::fixture_owner();
     assert!(
         !reopened
-            .unfinished_selection_debt(owner.clone(), scope.clone())
+            .unfinished_selection_debt(owner.clone(), scope.clone(), historical_config.clone())
             .await
             .unwrap()
     );
@@ -2395,7 +2395,7 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
         .unwrap();
     assert!(
         reopened
-            .unfinished_selection_debt(owner.clone(), scope.clone())
+            .unfinished_selection_debt(owner.clone(), scope.clone(), historical_config.clone())
             .await
             .is_err(),
         "an invalid current completion receipt must not hide retained debt"

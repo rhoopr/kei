@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+mod current_debt;
+
 use super::{admit_retained_work, config_hash, has_due_retained_work};
 use crate::commands::{AlbumPass, PassKind};
 use crate::download::orchestration::models::{
@@ -24,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 struct CurrentSession {
     records: Arc<Mutex<Vec<Value>>>,
     calls: Arc<AtomicUsize>,
+    lookup_names: Arc<Mutex<Vec<String>>>,
     rank_calls: Arc<AtomicUsize>,
     corrupt: Arc<Mutex<Option<&'static str>>>,
     discovery: bool,
@@ -93,6 +96,10 @@ impl PhotosSession for CurrentSession {
             .iter()
             .map(|r| r["recordName"].as_str().unwrap())
             .collect();
+        self.lookup_names
+            .lock()
+            .unwrap()
+            .extend(names.iter().map(|name| (*name).to_owned()));
         let mut records: Vec<_> = self
             .records
             .lock()
@@ -200,6 +207,7 @@ impl Fixture {
         let session = CurrentSession {
             records: Arc::new(Mutex::new(records("m", CURRENT, "current"))),
             calls: Arc::new(AtomicUsize::new(0)),
+            lookup_names: Arc::new(Mutex::new(Vec::new())),
             rank_calls: Arc::new(AtomicUsize::new(0)),
             corrupt: Arc::new(Mutex::new(None)),
             discovery: false,
@@ -6004,9 +6012,13 @@ async fn private_invalidated_old_root_cannot_hide_corrupted_destination_or_heade
             .is_none()
         );
         assert!(
-            f.db.unfinished_selection_debt(owner(), root.spec.scope.clone())
-                .await
-                .unwrap()
+            f.db.unfinished_selection_debt(
+                owner(),
+                root.spec.scope.clone(),
+                root.spec.config_hash.clone()
+            )
+            .await
+            .unwrap()
         );
         let before = f.queue();
         f.db.acquire_lock("committed historical corruption")
@@ -6014,9 +6026,13 @@ async fn private_invalidated_old_root_cannot_hide_corrupted_destination_or_heade
             .execute_batch(mutation)
             .unwrap();
         let error =
-            f.db.unfinished_selection_debt(owner(), root.spec.scope.clone())
-                .await
-                .expect_err(mutation);
+            f.db.unfinished_selection_debt(
+                owner(),
+                root.spec.scope.clone(),
+                root.spec.config_hash.clone(),
+            )
+            .await
+            .expect_err(mutation);
         assert!(
             matches!(
                 error,
@@ -6044,7 +6060,7 @@ async fn private_metadata_retry_schedule_is_bounded_and_never_publication_proof(
         501
     );
     assert!(
-        f.db.unfinished_selection_debt(owner(), root.spec.scope)
+        f.db.unfinished_selection_debt(owner(), root.spec.scope, root.spec.config_hash)
             .await
             .unwrap()
     );
@@ -6134,7 +6150,7 @@ async fn unsupported_smart_selector_refuses_before_work_and_preserves_retained_d
     assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), ranks);
     assert_eq!(f.count("provider_active_generations"), 1);
     assert!(
-        f.db.unfinished_selection_debt(owner(), root.spec.scope)
+        f.db.unfinished_selection_debt(owner(), root.spec.scope, root.spec.config_hash)
             .await
             .unwrap()
     );
@@ -6293,11 +6309,15 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
     .await
     .unwrap();
     assert_eq!(current.stats.downloaded, 1, "{current:?}");
+    // Current publication reuse independently verifies and settles the prepared
+    // bytes. It does not complete the disabled historical metadata intent.
     assert!(
-        current.sync_token.is_none(),
-        "disabled historical writer remains unfinished debt"
+        matches!(current.outcome, crate::download::DownloadOutcome::Success),
+        "{current:?}"
     );
-    assert_eq!(f.db.acquire_lock("disabled frozen embed cannot be acknowledged by sidecar only").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND verified_metadata=0",[&old],|r|r.get(0)).unwrap(),2);
+    assert!(!current.checkpoint.sync_token_blocked, "{current:?}");
+    assert_eq!(current.sync_token.as_deref(), Some("quiet-zone-cursor"));
+    assert_eq!(f.db.acquire_lock("settled bytes do not acknowledge disabled frozen embed").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND verified_media=1 AND verified_metadata=0 AND prepared_hash IS NULL AND prepared_checksum IS NULL",[&old],|r|r.get(0)).unwrap(),2);
     assert_eq!(
         std::fs::read(&path).unwrap(),
         original.0,

@@ -664,6 +664,8 @@ For destination-owned selection, HTTP 410 cancels the transfer batch through a c
 
 Authenticated current-selection previews do not append the aggregate pending-retry preview. They count or print current selected paths once and preserve historical failures without treating those failures as current preview debt. Preview sessions without authenticated selection scope retain the compatibility path.
 
+Compatibility dry-run and filename planning read existing retry evidence without changing the supplied store. Targeted lookup and legacy hydration may resolve preview paths, but planning does not backfill mappings, claim owners, adopt local files, persist reservations, revalidate policy-excluded deletions, or update verification and retry rows. Full previews preserve enumeration-interruption markers; incremental previews skip startup mapping backfill. Unknown and deleted lookup results leave durable evidence intact.
+
 After confirming a current provider selection, the producer can recover a pending or failed aggregate row whose exact prior publication still matches its source, local hash, size and ownership. It uses the existing `pending_publication` transaction before destination planning, preserving the original publication timestamp, receipts and retry count. The selected destination still needs its independent completion proof. Healthy downloaded rows and managed layout journals stay with their existing replay owners. A failed recovery transaction blocks that asset without transferring comparison media; conflicting reserved paths retain an enumeration hold.
 
 If a raw file lands before its destination finalization transaction fails, destination reuse can finish it without another transfer. The current admitted path, provider SHA-256, local SHA-256, size and asset facts must match. This recovery is limited to non-imported pending or failed rows whose canonical publication is absent or still points to another path, or downloaded rows with a recorded publication at a different path. The destination must have no prepared output. Matching raw media does not complete metadata intent; selected sidecar and embed obligations remain with the metadata owner. Same-resource root drift can retain the old downloaded row when new-path finalization fails. Recovery commits downloaded state, the new path source receipt and native destination verification together through the existing publication guards, preserving the old path receipt. Opaque provider checksums and metadata-rewritten media still require their existing receipts. A failed recovery transaction retains the checkpoint hold and does not download comparison media.
@@ -769,9 +771,13 @@ Captured observations, admitted decisions, verified media and verified metadata
 are separate durable facts. CLI download counts retain the existing task
 semantics and do not claim unique-file counts or full-zone completion. Active
 progress cannot replace `CheckpointEvidence`, sparse generation proofs,
-filesystem guards or source checkpoint policy. Unfinished old selection debt
-vetoes the source successor, including when later configuration uses the legacy
-dispatcher. Local wake-up cannot invent a provider cursor. Tombstones do not
+filesystem guards or source checkpoint policy. Selection checkpoint debt uses
+the same authenticated scope and configuration as retained recovery. Unresolved
+decisions from other configurations remain evidence without independently
+vetoing the current successor. Unsettled prepared metadata outputs at overlapping current
+destinations retain their veto across configuration changes. Admission,
+publication and journal guards retain their cross-configuration protection.
+Local wake-up cannot invent a provider cursor. Tombstones do not
 authorize local media deletion. WAL `NORMAL`, filesystem support and power-loss
 limits remain unchanged. Capture-owned cursor promotion, historical intermediate
 retention, unrecoverable-debt acknowledgment, expired-epoch replacement,
