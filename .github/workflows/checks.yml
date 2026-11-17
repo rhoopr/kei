@@ -286,7 +286,7 @@ jobs:
             just = "1.50.0"
       - name: Run coverage
         run: |
-          cargo llvm-cov --all-features --no-report -- --skip download::orchestration::queue_projection::tests::private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes
+          cargo llvm-cov --all-features --no-report -- --skip download::orchestration::queue_projection::tests::private_600_independent_album_writers_finish_through_reseeds_without_repeated_writes
           # Human-readable report for the Actions log
           cargo llvm-cov report
           # Structured data for parsing - cargo-llvm-cov's text format is
@@ -334,7 +334,7 @@ jobs:
             just = "1.50.0"
       - name: Run coverage
         run: |
-          cargo llvm-cov --all-features --no-report -- --skip download::orchestration::queue_projection::tests::private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes
+          cargo llvm-cov --all-features --no-report -- --skip download::orchestration::queue_projection::tests::private_600_independent_album_writers_finish_through_reseeds_without_repeated_writes
           cargo llvm-cov report --json --output-path base_coverage.json
           cargo llvm-cov report --lcov --output-path base_coverage.lcov
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

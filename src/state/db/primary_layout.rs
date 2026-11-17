@@ -2,6 +2,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::SqliteStateDb;
 use super::provider_selection::SelectionPath;
@@ -220,6 +221,49 @@ pub(super) fn guard_downloaded_checksum(
         ));
     }
     Ok(())
+}
+
+/// Stable family identity shared by journal planning and destination admission.
+/// Keep this encoding unchanged: existing bindings include the original parent.
+pub(crate) fn family_key(
+    library: &str,
+    child: &str,
+    pass: &str,
+    parent: &std::path::Path,
+) -> Result<String, StateError> {
+    let parent = std::path::absolute(parent)
+        .map_err(|_error| invalid("layout parent cannot be resolved"))?;
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(encode(&serde_json::json!([
+            1,
+            library,
+            child,
+            pass,
+            SelectionPath::from_path(&parent)
+        ]))?)
+    ))
+}
+
+pub(super) fn path_owned_by_pass(
+    conn: &Connection,
+    path: &std::path::Path,
+    pass: &str,
+) -> Result<bool, StateError> {
+    let claim: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT family,library,child FROM primary_layout_claims WHERE path_key=?1",
+            [path_key(path)?],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((family, library, child)) = claim else {
+        return Ok(false);
+    };
+    let Some(parent) = path.parent() else {
+        return Ok(false);
+    };
+    Ok(family == family_key(&library, &child, pass, parent)?)
 }
 
 pub(super) fn path_is_managed(
@@ -469,6 +513,21 @@ mod tests {
         AssetMetadata, AssetRecord, AssetStatus, MediaType, SqliteStateDb, VersionSizeKey,
     };
     use std::sync::Arc;
+
+    #[cfg(unix)]
+    #[test]
+    fn family_key_retains_historical_encoding() {
+        assert_eq!(
+            super::family_key(
+                "PrimarySync",
+                "asset-m",
+                "album-pass",
+                std::path::Path::new("/media")
+            )
+            .unwrap(),
+            "4428f65e543689dbc6bdb2e177f1ab19eca270856161a5062b9e1be2d879f2d4",
+        );
+    }
 
     fn fixture(root: &std::path::Path) -> LayoutOperation {
         let identity_file = std::fs::File::create(root.join("identity")).unwrap();

@@ -703,10 +703,11 @@ replaying a newer inventory cannot seal an interrupted old window. Configuration
 or source changes create a distinct generation or require existing validated
 reseed. They cannot acknowledge omitted eligibility or old unresolved debt.
 
+Named albums and smart folders keep independent physical copies even when their templates render the same directory. Current selection qualifies colliding filenames with the stable pass key and retains that exact destination on replay. Planning keeps each selected rendition eligible until its own destination is verified; adoption cannot skip it using another selected album or smart folder's path. Same-pass template drift and managed bindings retain their established paths. The immediate admission transaction checks competing album and smart-folder ownership before every transition to admitted, including confirmed selected declarations deferred by an earlier conflict. A conflict retains the frozen declaration; a racing producer with an unfrozen decision can replan once through the existing sibling guards. Historical shared-path declarations remain unchanged and trigger a successor inventory. Their original receipts and metadata work retain their existing owners. The declaration's `independent_album_copies` marker distinguishes current destination policy from historical replay without changing the user configuration fingerprint or adding a ledger. Unfiled behavior is unchanged.
+
 Destination media completion requires an actual confined file fingerprint and
 independently verified selected source checksum. An exact active physical
-receipt can be reused across compatible passes after current selection and
-file verification; another path retains its own obligation. Opaque provider
+receipt remains reusable as source evidence and for compatible historical aliases after current selection and file verification; a new album destination retains its own obligation. Opaque provider
 signatures remain independent from source and local SHA-256. Fresh or legacy
 fallback publication requires a separately verified per-path source receipt;
 validated native reuse relies on its own lossless generation/destination receipt,

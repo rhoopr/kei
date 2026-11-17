@@ -164,16 +164,15 @@ fn family(asset: &PhotoAsset, config: &DownloadConfig) -> Result<String> {
 }
 
 fn family_in_parent(asset: &PhotoAsset, config: &DownloadConfig, parent: &Path) -> Result<String> {
-    Ok(digest(serde_json::to_vec(&serde_json::json!([
-        1,
+    Ok(crate::state::db::primary_layout::family_key(
         asset.source_zone().unwrap_or(&config.library),
         asset.state_id(),
         config
             .primary_layout_pass
             .as_deref()
             .unwrap_or(config.pass_label()),
-        SelectionPath::from_path(&std::path::absolute(parent)?)
-    ]))?))
+        parent,
+    )?)
 }
 
 async fn recorded_family(
@@ -771,6 +770,11 @@ async fn plan(
             if record.is_preserved_history
                 || path.parent() != Some(parent.as_path())
                 || session.history_paths.contains(&path_key(path)?)
+                || if let Some(run) = &config.selection_run {
+                    run.album_path_claimed(config, path).await?
+                } else {
+                    false
+                }
             {
                 continue;
             }
@@ -869,26 +873,30 @@ async fn plan(
     let mut qualifier = binding.map_or(String::new(), |b| b.qualifier.clone());
     if binding.is_none() {
         for derived in &paths {
-            if oldfiles.iter().all(|f| f.path.to_path() != derived.path)
-                && (snapshot(&config.directory, &derived.path).await?.is_some()
-                    || session.owners(&derived.path)?.any(|owner| {
-                        owner.library.as_ref() != asset.source_zone().unwrap_or(&config.library)
-                            || owner.asset_id.as_ref() != asset.state_id()
-                    })
-                    || preview_claims.contains(&path_key(&derived.path)?)
-                    || if let Some(db) = db {
-                        db.guard_primary_slot(
-                            asset.source_zone().unwrap_or(&config.library),
-                            asset.state_id(),
-                            derived.version_size.as_str(),
-                            &derived.checksum,
-                            &derived.path,
-                        )
-                        .await
-                        .is_err()
-                    } else {
-                        false
-                    })
+            if config
+                .selection_run
+                .as_ref()
+                .is_some_and(|run| run.colliding_album_parent(asset, config))
+                || oldfiles.iter().all(|f| f.path.to_path() != derived.path)
+                    && (snapshot(&config.directory, &derived.path).await?.is_some()
+                        || session.owners(&derived.path)?.any(|owner| {
+                            owner.library.as_ref() != asset.source_zone().unwrap_or(&config.library)
+                                || owner.asset_id.as_ref() != asset.state_id()
+                        })
+                        || preview_claims.contains(&path_key(&derived.path)?)
+                        || if let Some(db) = db {
+                            db.guard_primary_slot(
+                                asset.source_zone().unwrap_or(&config.library),
+                                asset.state_id(),
+                                derived.version_size.as_str(),
+                                &derived.checksum,
+                                &derived.path,
+                            )
+                            .await
+                            .is_err()
+                        } else {
+                            false
+                        })
             {
                 qualifier = format!(
                     "-{}",

@@ -115,18 +115,12 @@ library suite and need no credentials or stored media fixtures.
 
 Ordinary `cargo test`, `just gate`, coverage, and their all-feature and
 no-default-feature runs exclude the ignored 300-photo stress case. The
-three-photo fixture still checks two source reseeds, two quiet SQLite reopens,
-unchanged media and sidecar timestamps, logical obligations, and preserved
-proof. A separate three-photo, single-cycle test uses a task-scoped test-only
-budget of four writers, crossing the same priority/remaining scheduling branch
-with a reserve of two. The scheduler owner separately asserts the production
-250-current/500-total limits. The small test retains the physical-writer versus
-logical-alias assertions on every code PR with XMP enabled; the full 300-photo
-case crosses the real default limits. The override cannot affect parallel tests
-or production builds.
+three-photo fixture checks two independent album copies per photo, two source reseeds, two quiet SQLite reopens, unchanged completed media and sidecar timestamps, logical obligations, and preserved proof. A separate three-photo, single-cycle test uses a task-scoped budget of eight writers with a reserve of four, crossing the priority/remaining scheduling branch with six physical writers. A five-writer budget exercises overflow across reseeds with the same six copies. The scheduler owner separately asserts the production 250-current/500-total limits. The 300-photo case has 600 independent physical writers. Each reseed leaves 100 current metadata receipts pending under the 500-row budget; the first unchanged cycle drains them, followed by two quiet reopens. Completed physical sidecars must remain unchanged across every later cycle, including source reseeds. Task-scoped overrides cannot affect parallel tests or production builds.
+
+The collision regressions cover album/album, album/smart-folder and smart-folder/smart-folder destinations, completed-copy deletion, exact-path recovery, locally edited peer preservation, and two quiet reopens. Admission regressions cover both concurrent fresh decisions and a confirmed selected deferred decision whose path was claimed before its original blocker cleared. The latter retains its frozen declaration on conflict and recovers through a current-configuration successor. Historical shared-path receipts remain intact; the historical metadata control still requires one physical writer for two retained aliases. Current colliding-album metadata fixtures retain prepared-output corruption, writer-option drift, finalization faults and native-path controls for independent physical copies.
 
 Run `just test stress` (or `bash scripts/test-copies-stress.sh`) for the full
-300-photo, five-cycle proof. The runner requires exactly one ignored test in
+300-photo, six-cycle proof. The runner requires exactly one ignored test in
 the catalog and one passing execution; `--check` validates only the catalog.
 The regular Linux CI test job checks this catalog so a rename, lost ignore
 marker, or feature change cannot silently remove the stress proof.

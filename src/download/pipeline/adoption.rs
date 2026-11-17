@@ -1102,6 +1102,13 @@ pub(in crate::download) async fn state_confirmed_current_path_exists(
     task: &DownloadTask,
     task_planner: &mut TaskPlanner,
 ) -> Option<PathBuf> {
+    let matches_destination = |path: &std::path::Path| {
+        !config
+            .selection_run
+            .as_ref()
+            .is_some_and(|run| run.independent_album(config))
+            || path == task.download_path
+    };
     if let Some(recorded_file) =
         ctx.downloaded_file(&task.library, &task.asset_id, task.version_size)
         && let Some(path) = recorded_current_path_exists(
@@ -1112,12 +1119,14 @@ pub(in crate::download) async fn state_confirmed_current_path_exists(
             recorded_file,
         )
         .await
+        && matches_destination(&path)
     {
         return Some(path);
     }
     task_planner
         .verified_downloaded_path(asset, config, task.version_size)
         .await
+        .filter(|path| matches_destination(path))
 }
 #[cfg(test)]
 mod tests;

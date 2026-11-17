@@ -22,6 +22,7 @@ use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
 
 pub(crate) const MAX_GENERATION_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const INDEPENDENT_ALBUM_COPIES: &str = "independent_album_copies";
 const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 // Original serialized inputs per validation operation, not an allocator or disk bound.
 const MAX_VALIDATION_BYTES: usize = 512 * 1024 * 1024;
@@ -602,6 +603,10 @@ fn validate_spec(spec: &GenerationSpec) -> Result<(), StateError> {
             .iter()
             .any(|v| v.len() != 64 || !v.bytes().all(|b| b.is_ascii_hexdigit()))
         || spec.profile.get("coverage").and_then(Value::as_str) != Some("observed_selection_window")
+        || spec
+            .profile
+            .get(INDEPENDENT_ALBUM_COPIES)
+            .is_some_and(|value| value != &Value::Bool(true))
     {
         return invalid();
     }
@@ -2177,6 +2182,19 @@ impl SqliteStateDb {
                 }
                 if admission!="deferred" {tx.commit()?;return Ok(GenerationProjection {admitted:admission=="admitted",reason:String::new()})}
             } else if root.sealed {return invalid()} else if changed_basis {return Err(StateError::ProviderWorkConflict)}
+            // This check and admission share the immediate transaction. Two
+            // producers cannot freeze one physical path for different albums or
+            // smart folders. Every deferred retry rechecks ownership, including
+            // confirmed selected declarations whose original blocker cleared.
+            // Already admitted replay returned above; conflicts leave frozen
+            // declarations unchanged through transaction rollback.
+            if root.spec.profile.get(INDEPENDENT_ALBUM_COPIES)==Some(&Value::Bool(true)) && matches!(pass(&root,&d.pass_key)?.get("kind").and_then(Value::as_str), Some("Album" | "SmartFolder")) {
+                for destination in &d.destinations {
+                    if album_path_claimed(&tx, &root.spec.scope, &d.pass_key, &destination.path)? {
+                        return Err(StateError::ProviderWorkConflict);
+                    }
+                }
+            }
             let mut reason=d.reason.clone();
             let mut staged = false;
             if existing.is_none() && !layouts.is_empty() && d.outcome == SelectionOutcome::Selected && d.reason.is_empty() {
@@ -3153,7 +3171,68 @@ pub(super) fn finish_metadata_receipt(
     Ok(Some(changed > 0 && complete))
 }
 
+/// Destination policy is separate from source receipt compatibility. Historical
+/// receipts from another album remain sources, but cannot assign its path to a
+/// new album copy. Validate the retained declaration before trusting ownership.
+fn album_path_claimed(
+    conn: &Connection,
+    scope: &str,
+    key: &str,
+    path: &super::provider_selection::SelectionPath,
+) -> Result<bool, StateError> {
+    let mut statement = conn.prepare("SELECT DISTINCT w.generation,w.pass_key,w.child FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.path=?2 AND w.pass_key<>?3 AND w.admitted=1 ORDER BY w.generation,w.pass_key,w.child LIMIT 33")?;
+    let rows = statement.query_map(params![scope, path.key()?, key], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for (index, row) in rows.enumerate() {
+        if index == 32 {
+            return Err(StateError::ProviderSelectionFull);
+        }
+        let (generation, previous_key, child) = row?;
+        let root = load_generation(conn, &generation)?;
+        if matches!(
+            pass(&root, &previous_key)?
+                .get("kind")
+                .and_then(Value::as_str),
+            Some("Album" | "SmartFolder")
+        ) {
+            load_decision(conn, &root, &previous_key, &child)?;
+            // A committed/pending managed family keeps its own physical slot.
+            // Legacy aliases remain historical source proof; another current
+            // independent declaration still cannot claim this managed slot.
+            if root.spec.profile.get(INDEPENDENT_ALBUM_COPIES) != Some(&Value::Bool(true))
+                && super::primary_layout::path_owned_by_pass(conn, &path.to_path(), key)?
+            {
+                continue;
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 impl SqliteStateDb {
+    pub(crate) async fn selection_album_path_claimed(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        key: String,
+        path: super::provider_selection::SelectionPath,
+    ) -> Result<bool, StateError> {
+        self.with_conn(
+            "checking independent album destination ownership",
+            move |conn| {
+                account::validate_authenticated(conn, &owner)?;
+                album_path_claimed(conn, &scope, &key, &path)
+            },
+        )
+        .await
+    }
+
     /// Lossless paths from independently verified generations, limited before
     /// materialization. Current provider facts supplied by the caller decide
     /// version compatibility; generation order only schedules candidate reuse.

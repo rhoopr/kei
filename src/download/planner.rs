@@ -624,6 +624,32 @@ impl TaskPlanner {
         config: &DownloadConfig,
     ) -> Result<AssetTaskPlan> {
         let mut plan = self.plan_pending_retry_asset(asset, config).await?;
+        if !self.managed_plan
+            && plan.filter_reason.is_none()
+            && config
+                .selection_run
+                .as_ref()
+                .is_some_and(|run| run.independent_album(config))
+        {
+            // Equal-sized peer files may suppress ordinary tasks. Selection
+            // still has to verify its own frozen destination before skipping.
+            let candidates = filter_asset_to_tasks(
+                asset,
+                config,
+                &mut FxHashMap::default(),
+                &mut self.dir_cache,
+                PathPlanningMode::Reconciliation,
+            )?;
+            for task in candidates {
+                if !plan
+                    .tasks
+                    .iter()
+                    .any(|planned| planned.version_size == task.version_size)
+                {
+                    plan.tasks.push(task);
+                }
+            }
+        }
         if matches!(self.path_mode, PathPlanningMode::Download) && !self.managed_plan {
             self.relocate_protected_tasks(&mut plan, config).await?;
         }
@@ -1200,6 +1226,54 @@ impl TaskPlanner {
         if let Some(parent) = path.parent() {
             self.dir_cache.ensure_dir_async(parent).await;
         }
+    }
+
+    /// A pass-qualified sibling is a new physical obligation, never adoption
+    /// of another album's file. Existing same-pass destinations are resolved
+    /// before this method; unfamiliar occupied siblings remain untouched.
+    pub(super) async fn independent_album_path(
+        &mut self,
+        requested: &Path,
+        pass_key: &str,
+        config: &DownloadConfig,
+    ) -> Result<std::path::PathBuf> {
+        let parent = requested
+            .parent()
+            .context("Album destination has no parent")?;
+        let filename = requested
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("Album destination has no filename")?;
+        const MAX_ALBUM_PATH_CANDIDATES: u64 = 64;
+        for ordinal in 1..=MAX_ALBUM_PATH_CANDIDATES {
+            let qualifier = if ordinal == 1 {
+                format!("-{pass_key}")
+            } else {
+                format!("-{pass_key}-{ordinal}")
+            };
+            // Retain the full pass qualifier even at the filename byte limit.
+            let name = paths::role_filename(filename, &qualifier, "");
+            let candidate =
+                crate::fs_util::reserved_path_under_root(&config.directory, &parent.join(name))?;
+            let key = self.path_mode.key(&candidate)?;
+            if self.claimed_paths.contains_key(key.as_ref())
+                || self.reconciliation.path_owners.contains_key(&key)
+                || config
+                    .selection_run
+                    .as_ref()
+                    .context("Album destination has no selection")?
+                    .album_path_claimed(config, &candidate)
+                    .await?
+            {
+                continue;
+            }
+            match tokio::fs::symlink_metadata(&candidate).await {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        anyhow::bail!("No unoccupied independent album destination within collision budget")
     }
 
     fn retry_claim_available(&self, task: &DownloadTask, path: &Path) -> bool {

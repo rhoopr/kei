@@ -2960,6 +2960,37 @@ fn destination_pass_with_session(
     }
 }
 
+fn smart_pass(f: &Fixture, name: &str) -> AlbumPass {
+    let (_, definition) = crate::icloud::photos::smart_folders::smart_folders()
+        .into_iter()
+        .find(|(candidate, _)| *candidate == name)
+        .unwrap();
+    let mut album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: Arc::from("https://example.invalid"),
+            name: Arc::from(name),
+            list_type: Arc::from(definition.list_type),
+            obj_type: Arc::from(definition.obj_type),
+            query_filter: definition.query_filter,
+            page_size: 2,
+            zone_id: Arc::new(
+                json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}),
+            ),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(DestinationSelectionSession(f.session.clone())),
+    );
+    album.set_shadow_capture(f.capture.clone(), Arc::from("private"));
+    AlbumPass {
+        kind: PassKind::SmartFolder,
+        album,
+        exclude_ids: Arc::new(FxHashSet::default()),
+    }
+}
+
 #[tokio::test]
 async fn private_smart_folder_destinations_survive_template_changes_and_reopen() {
     use sha2::{Digest, Sha256};
@@ -2984,36 +3015,6 @@ async fn private_smart_folder_destinations_survive_template_changes_and_reopen()
         "smart-source",
     )
     .await;
-    let smart_pass = |f: &Fixture, name: &str| {
-        let (_, definition) = crate::icloud::photos::smart_folders::smart_folders()
-            .into_iter()
-            .find(|(candidate, _)| *candidate == name)
-            .unwrap();
-        let mut album = PhotoAlbum::new(
-            PhotoAlbumConfig {
-                params: Arc::new(std::collections::HashMap::new()),
-                service_endpoint: Arc::from("https://example.invalid"),
-                name: Arc::from(name),
-                list_type: Arc::from(definition.list_type),
-                obj_type: Arc::from(definition.obj_type),
-                query_filter: definition.query_filter,
-                page_size: 2,
-                zone_id: Arc::new(
-                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}),
-                ),
-                retry_config: crate::retry::RetryConfig::default(),
-                container_id: None,
-                cross_zone_sources: Vec::new(),
-            },
-            Box::new(DestinationSelectionSession(f.session.clone())),
-        );
-        album.set_shadow_capture(f.capture.clone(), Arc::from("private"));
-        AlbumPass {
-            kind: PassKind::SmartFolder,
-            album,
-            exclude_ids: Arc::new(FxHashSet::default()),
-        }
-    };
     for name in crate::icloud::photos::smart_folders::smart_folder_names() {
         let mut pass = smart_pass(&f, name);
         assert!(
@@ -3133,21 +3134,158 @@ async fn private_destination_reopen_materializes_missing_copy() {
 
 #[tokio::test]
 async fn private_completed_album_copy_is_repaired_independently_after_reopen() {
+    Box::pin(completed_album_copy_reopen_fixture(
+        false,
+        crate::types::EditedNaming::Suffix,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn colliding_album_and_smart_folder_copies_repair_independently() {
+    Box::pin(smart_copy_reopen_fixture(PassKind::Album)).await;
+}
+
+#[tokio::test]
+async fn colliding_two_smart_folder_copies_repair_independently() {
+    Box::pin(smart_copy_reopen_fixture(PassKind::SmartFolder)).await;
+}
+
+async fn smart_copy_reopen_fixture(first_kind: PassKind) {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    for preserve_peer in [false, true] {
+        let server = MockServer::start().await;
+        let media = b"\xff\xd8\xff\xe0independent smart copy";
+        Mock::given(method("GET"))
+            .and(path("/smart-copy"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let mut f = Fixture::new().await;
+        f.config.folder_structure_albums = Arc::from("copies");
+        f.config.folder_structure_smart_folders = Arc::from("copies");
+        f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+            "downloadURL":format!("{}/smart-copy",server.uri()),"size":media.len(),
+            "fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media)),
+        });
+        f.capture(records("m", OLD, "historical"), "smart-copies")
+            .await;
+        let passes = |f: &Fixture| {
+            [
+                if first_kind == PassKind::Album {
+                    destination_pass(f, "A")
+                } else {
+                    smart_pass(f, "Favorites")
+                },
+                smart_pass(f, "Videos"),
+            ]
+        };
+        let run = |f: &Fixture| {
+            let selected = passes(f);
+            let config = Arc::new(f.config.clone());
+            async move {
+                crate::download::download_photos_with_sync(
+                    &reqwest::Client::new(),
+                    &selected,
+                    config,
+                    controls(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let first = run(&f).await;
+        assert_eq!(first.stats.downloaded, 2, "{first:?}");
+        assert!(!first.checkpoint.sync_token_blocked, "{first:?}");
+        let paths: Vec<_> = {
+            let conn =
+                f.db.acquire_lock("two complete independent destinations")
+                    .unwrap();
+            conn.prepare("SELECT DISTINCT path FROM provider_active_destinations WHERE admitted=1 AND verified_media=1 AND verified_metadata=1 ORDER BY path").unwrap()
+                .query_map([], |row| row.get::<_, String>(0)).unwrap()
+                .map(|row| serde_json::from_str::<SelectionPath>(&row.unwrap()).unwrap().to_path()).collect()
+        };
+        assert_eq!(paths.len(), 2);
+        for path in &paths {
+            assert_eq!(std::fs::read(path).unwrap(), media);
+        }
+        let [peer, missing] = <[_; 2]>::try_from(paths).unwrap();
+        if preserve_peer {
+            std::fs::write(&peer, b"local user edit").unwrap();
+        }
+        let peer_bytes = std::fs::read(&peer).unwrap();
+        let peer_time = std::fs::metadata(&peer).unwrap().modified().unwrap();
+        std::fs::remove_file(&missing).unwrap();
+        let mut repaired_time = None;
+        for cycle in 0..3 {
+            f = reopen_destination_fixture(f).await;
+            let result = run(&f).await;
+            assert_eq!(
+                result.stats.downloaded,
+                usize::from(cycle == 0),
+                "{result:?}"
+            );
+            assert!(!result.checkpoint.sync_token_blocked, "{result:?}");
+            assert_eq!(std::fs::read(&peer).unwrap(), peer_bytes);
+            assert_eq!(
+                std::fs::metadata(&peer).unwrap().modified().unwrap(),
+                peer_time
+            );
+            assert_eq!(std::fs::read(&missing).unwrap(), media);
+            let modified = std::fs::metadata(&missing).unwrap().modified().unwrap();
+            if let Some(previous) = repaired_time {
+                assert_eq!(modified, previous);
+            }
+            repaired_time = Some(modified);
+            assert_eq!(server.received_requests().await.unwrap().len(), 3);
+            if preserve_peer {
+                assert!(f.db.acquire_lock("preserved local peer").unwrap().query_row::<bool,_,_>("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE preserved_local IS NOT NULL)",[],|row|row.get(0)).unwrap());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn colliding_album_paths_keep_independent_copies_after_missing_file_and_quiet_reopens() {
+    Box::pin(completed_album_copy_reopen_fixture(
+        true,
+        crate::types::EditedNaming::Suffix,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn colliding_managed_album_families_keep_bound_paths_across_template_drift() {
+    Box::pin(completed_album_copy_reopen_fixture(
+        true,
+        crate::types::EditedNaming::Primary,
+    ))
+    .await;
+}
+
+async fn completed_album_copy_reopen_fixture(colliding: bool, naming: crate::types::EditedNaming) {
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
+    let managed = naming == crate::types::EditedNaming::Primary;
     let media = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\0\xff\xd9";
     let checksum = format!("{:x}", Sha256::digest(media));
     Mock::given(method("GET"))
         .and(path("/completed-copy"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
-        .expect(3)
+        .expect(if managed { 1..=2 } else { 3..=3 })
         .mount(&server)
         .await;
     let mut f = Fixture::new().await;
-    f.config.folder_structure_albums = Arc::from("{album}");
+    f.config.edited_naming = naming;
+    f.config.folder_structure_albums = Arc::from(if colliding { "copies" } else { "{album}" });
     f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
         "downloadURL": format!("{}/completed-copy", server.uri()),
         "size": media.len(),
@@ -3164,21 +3302,6 @@ async fn private_completed_album_copy_is_repaired_independently_after_reopen() {
         )
         .await;
     }
-    let a = f.config.directory.join("A/changed.JPG");
-    let b = f.config.directory.join("B/changed.JPG");
-    let mut expected = passes
-        .iter()
-        .zip([&a, &b])
-        .map(|(pass, path)| {
-            (
-                crate::download::orchestration::generation::pass_key(pass),
-                path.clone(),
-                checksum.clone(),
-                checksum.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    expected.sort();
     let receipts = |db: &SqliteStateDb| {
         let conn = db
             .acquire_lock("independent completed album receipts")
@@ -3209,14 +3332,66 @@ async fn private_completed_album_copy_is_repaired_independently_after_reopen() {
     )
     .await
     .unwrap();
-    assert_eq!(initial.stats.downloaded, 2, "{initial:?}");
+    let initial_requests = server.received_requests().await.unwrap().len();
+    if managed {
+        // Managed journals may copy the first verified source locally.
+        assert!((1..=2).contains(&initial_requests));
+    } else {
+        assert_eq!(initial.stats.downloaded, 2, "{initial:?}");
+        assert_eq!(initial_requests, 2);
+    }
     assert!(initial.stats.sync_token_blocked_reason.is_none());
-    assert_eq!(receipts(&f.db), expected);
+    let expected = receipts(&f.db);
+    assert_eq!(expected.len(), 2);
+    let paths = passes
+        .iter()
+        .map(|pass| {
+            let key = crate::download::orchestration::generation::pass_key(pass);
+            let (_, path, source, local) = expected.iter().find(|row| row.0 == key).unwrap();
+            assert_eq!((source, local), (&checksum, &checksum));
+            if colliding {
+                assert_eq!(
+                    path.parent(),
+                    Some(f.config.directory.join("copies").as_path())
+                );
+                assert_eq!(path.extension().unwrap(), "JPG");
+                assert!(
+                    path.file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .starts_with("changed")
+                );
+            } else {
+                assert_eq!(
+                    *path,
+                    f.config
+                        .directory
+                        .join(pass.album.name.as_ref())
+                        .join("changed.JPG")
+                );
+            }
+            path.clone()
+        })
+        .collect::<Vec<_>>();
+    let [a, b] = <[std::path::PathBuf; 2]>::try_from(paths).unwrap();
+    assert_ne!(
+        a, b,
+        "selected albums must have distinct physical destinations"
+    );
     assert_eq!(std::fs::read(&a).unwrap(), media);
     assert_eq!(std::fs::read(&b).unwrap(), media);
-    assert_eq!(server.received_requests().await.unwrap().len(), 2);
-    let original_metadata = std::fs::metadata(&a).unwrap();
-    std::fs::remove_file(&b).unwrap();
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        initial_requests
+    );
+    let mut original_metadata = std::fs::metadata(&a).unwrap();
+    if managed {
+        f.config.edited_naming = crate::types::EditedNaming::Suffix;
+        f.config.folder_structure_albums = Arc::from("after");
+    } else {
+        std::fs::remove_file(&b).unwrap();
+    }
     drop(passes);
     let mut settled_lookups = None;
     for cycle in 0..3 {
@@ -3239,8 +3414,9 @@ async fn private_completed_album_copy_is_repaired_independently_after_reopen() {
         .unwrap();
         assert_eq!(
             result.stats.downloaded,
-            usize::from(cycle == 0),
-            "{result:?}"
+            usize::from(cycle == 0 && !managed),
+            "{result:?}\n{:?}",
+            capture.events()
         );
         assert!(matches!(
             result.outcome,
@@ -3250,9 +3426,17 @@ async fn private_completed_album_copy_is_repaired_independently_after_reopen() {
         assert_eq!(std::fs::read(&a).unwrap(), media);
         assert_eq!(std::fs::read(&b).unwrap(), media);
         let unchanged = std::fs::metadata(&a).unwrap();
+        if managed && cycle == 0 {
+            // Config drift commits a preservation-backed managed generation;
+            // both subsequent quiet reopens must retain its physical files.
+            assert!(f.count("primary_layout_preserved") > 0);
+            original_metadata = unchanged.clone();
+        }
         assert_eq!(
             unchanged.modified().unwrap(),
-            original_metadata.modified().unwrap()
+            original_metadata.modified().unwrap(),
+            "{:?}",
+            capture.events()
         );
         #[cfg(unix)]
         {
@@ -3264,7 +3448,14 @@ async fn private_completed_album_copy_is_repaired_independently_after_reopen() {
             assert_ne!(unchanged.ino(), std::fs::metadata(&b).unwrap().ino());
         }
         assert_eq!(receipts(&f.db), expected);
-        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            if managed { initial_requests } else { 3 }
+        );
+        if managed {
+            assert!(!f.config.directory.join("after/changed.JPG").exists());
+            assert_eq!(f.count("primary_layout_bindings"), 2);
+        }
         let lookups = f.session.calls.load(Ordering::SeqCst);
         if let Some(settled) = settled_lookups {
             assert_eq!(lookups, settled, "quiet reopen repeated provider lookup");
@@ -3277,6 +3468,519 @@ async fn private_completed_album_copy_is_repaired_independently_after_reopen() {
 #[tokio::test]
 async fn private_destination_reopen_finishes_exact_sidecar_receipts() {
     Box::pin(destination_reopen_fixture(false, true, false)).await;
+}
+
+async fn album_collision_declarations(
+    f: &Fixture,
+    passes: &[AlbumPass],
+    root: &crate::state::db::provider_generations::ActiveGeneration,
+) -> Vec<(
+    crate::state::db::provider_generations::ActiveDecision,
+    Vec<crate::state::AssetRecord>,
+)> {
+    let mut declarations = Vec::new();
+    for pass in passes {
+        let key = crate::download::orchestration::generation::pass_key(pass);
+        let album = pass.album.clone().with_rank_capture(&root.id, &key);
+        assert_eq!(album.photos(None).await.unwrap().len(), 1);
+        let current = pass.album.confirm_catalog_asset("asset-m").await.unwrap();
+        let config = f.config.with_pass(pass);
+        let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+            .await
+            .unwrap();
+        let plan = planner
+            .plan_download_asset(&current.asset, &config)
+            .await
+            .unwrap();
+        let records = plan
+            .tasks
+            .iter()
+            .map(|task| pending_record_for_task(&config, &current.asset, task))
+            .collect();
+        let destinations = crate::download::filter::derive_expected_paths(&current.asset, &config)
+            .into_iter()
+            .map(
+                |path| crate::state::db::provider_selection::SelectionDestination {
+                    version_size: path.version_size.as_str().into(),
+                    path: SelectionPath::from_path(&std::path::absolute(path.path).unwrap()),
+                    checksum: path.checksum.into(),
+                    size: path.size,
+                    metadata_hash: crate::download::filter::metadata_for_selected_version(
+                        &current.asset,
+                        &config,
+                        path.version_size,
+                    )
+                    .metadata_hash
+                    .clone()
+                    .unwrap(),
+                },
+            )
+            .collect();
+        declarations.push((
+            crate::state::db::provider_generations::ActiveDecision {
+                state_id: "asset-m".into(),
+                sources: f
+                    .db
+                    .selection_rank_sources(owner(), root.id.clone(), key.clone(), "asset-m".into())
+                    .await
+                    .unwrap(),
+                decision: crate::state::db::provider_selection::SelectionDecision {
+                    pass_key: key,
+                    child: "asset-m".into(),
+                    master: Some("m".into()),
+                    confirmation: Some(current.body),
+                    media_source: None,
+                    outcome: SelectionOutcome::Selected,
+                    reason: String::new(),
+                    destinations,
+                },
+            },
+            records,
+        ));
+    }
+    declarations
+}
+
+#[tokio::test]
+async fn concurrent_album_admission_cannot_freeze_one_physical_destination_twice() {
+    use crate::state::db::provider_generations::MAX_GENERATION_BYTES;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("copies");
+    f.capture(records("m", OLD, "historical"), "collision")
+        .await;
+    let passes = [destination_pass(&f, "A"), destination_pass(&f, "B")];
+    let root = crate::download::orchestration::generation::begin_frozen_fixture(
+        &passes,
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    let mut declarations = album_collision_declarations(&f, &passes, &root).await;
+    let (b, b_records) = declarations.pop().unwrap();
+    let (a, a_records) = declarations.pop().unwrap();
+    assert_eq!(
+        a.decision.destinations[0].path,
+        b.decision.destinations[0].path
+    );
+    let (first, second) = tokio::join!(
+        f.db.project_selection_decision(
+            owner(),
+            root.id.clone(),
+            a,
+            a_records,
+            MAX_GENERATION_BYTES
+        ),
+        f.db.project_selection_decision(
+            owner(),
+            root.id.clone(),
+            b,
+            b_records,
+            MAX_GENERATION_BYTES
+        ),
+    );
+    let outcomes = [first, second];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| result.as_ref().is_ok_and(|projection| projection.admitted))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| matches!(
+                result,
+                Err(crate::state::error::StateError::ProviderWorkConflict)
+            ))
+            .count(),
+        1
+    );
+    drop(passes);
+    f = reopen_destination_fixture(f).await;
+    assert_eq!(
+        f.count("provider_active_decisions"),
+        1,
+        "loser must remain unfrozen for replanning"
+    );
+    assert_eq!(f.count("provider_active_destinations"), 1);
+    f.preserved().await;
+}
+
+#[tokio::test]
+async fn historical_shared_album_receipts_survive_independent_successor_and_quiet_reopens() {
+    Box::pin(historical_shared_album_successor_fixture(false)).await;
+}
+
+#[tokio::test]
+async fn confirmed_deferred_copy_rechecks_ownership_before_admission() {
+    use crate::state::db::provider_generations::MAX_GENERATION_BYTES;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let media = b"\xff\xd8\xff\xe0deferred independent copy";
+    Mock::given(method("GET"))
+        .and(path("/deferred-copy"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("copies");
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL":format!("{}/deferred-copy",server.uri()),"size":media.len(),
+        "fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    f.capture(records("m", OLD, "historical"), "deferred-collision")
+        .await;
+    let current = f.session.records.lock().unwrap().clone();
+    *f.session.records.lock().unwrap() =
+        eligible_records("m", "https://p01.icloud-content.com/older-resource.jpg");
+    let blocked =
+        f.db.project_provider_work(owner(), f.plan().await, MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+    assert_eq!(
+        blocked,
+        WorkAdmission::Admitted,
+        "{}",
+        f.db.acquire_lock("blocker reason")
+            .unwrap()
+            .query_row::<String, _, _>(
+                "SELECT reason FROM provider_work_receipts LIMIT 1",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap()
+    );
+    *f.session.records.lock().unwrap() = current;
+    let passes = [destination_pass(&f, "A"), destination_pass(&f, "B")];
+    let root = crate::download::orchestration::generation::begin_frozen_fixture(
+        &passes,
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    let mut declarations = album_collision_declarations(&f, &passes, &root).await;
+    let (b, b_records) = declarations.pop().unwrap();
+    let (a, a_records) = declarations.pop().unwrap();
+    assert_eq!(
+        a.decision.destinations[0].path,
+        b.decision.destinations[0].path
+    );
+    let deferred =
+        f.db.project_selection_decision(
+            owner(),
+            root.id.clone(),
+            a.clone(),
+            a_records.clone(),
+            MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap();
+    assert!(!deferred.admitted);
+    assert_eq!(deferred.reason, "unfinished_generation_conflict");
+    let snapshot = |db: &SqliteStateDb| {
+        db.acquire_lock("frozen confirmed deferred declaration").unwrap().query_row::<(Vec<u8>,String,String,i64),_,_>(
+            "SELECT manifest,manifest_hash,admission,attempts FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+            rusqlite::params![root.id,a.decision.pass_key,a.decision.child],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap()
+    };
+    let frozen = snapshot(&f.db);
+    let old_path = f.config.directory.join("completed-history.JPG");
+    std::fs::create_dir_all(&f.config.directory).unwrap();
+    std::fs::write(&old_path, b"older resource").unwrap();
+    let old_hash = format!("{:x}", Sha256::digest(b"older resource"));
+    f.db.mark_downloaded(
+        "PrimarySync",
+        "asset-m",
+        "original",
+        &old_path,
+        &old_hash,
+        Some(&old_hash),
+    )
+    .await
+    .unwrap();
+    let old_time = std::fs::metadata(&old_path).unwrap().modified().unwrap();
+    assert!(
+        f.db.project_selection_decision(
+            owner(),
+            root.id.clone(),
+            b,
+            b_records,
+            MAX_GENERATION_BYTES
+        )
+        .await
+        .unwrap()
+        .admitted
+    );
+    f = reopen_destination_fixture(f).await;
+    for _ in 0..2 {
+        assert!(matches!(
+            f.db.project_selection_decision(
+                owner(),
+                root.id.clone(),
+                a.clone(),
+                a_records.clone(),
+                MAX_GENERATION_BYTES
+            )
+            .await,
+            Err(crate::state::error::StateError::ProviderWorkConflict)
+        ));
+        assert_eq!(snapshot(&f.db), frozen);
+        assert_eq!(
+            f.db.acquire_lock("only peer admitted")
+                .unwrap()
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_active_destinations WHERE admitted=1",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            f.db.selection_decision(
+                owner(),
+                root.id.clone(),
+                a.decision.pass_key.clone(),
+                a.decision.child.clone()
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .sources,
+            a.sources
+        );
+    }
+    // A current configuration successor may plan a new destination. The old
+    // confirmed declaration remains frozen and unadmitted as historical debt.
+    f.config.folder_structure_albums = Arc::from("recovered");
+    for cycle in 0..3 {
+        f = reopen_destination_fixture(f).await;
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &[destination_pass(&f, "A"), destination_pass(&f, "B")],
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.stats.downloaded,
+            if cycle == 0 { 2 } else { 0 },
+            "{result:?}"
+        );
+        assert!(!result.checkpoint.sync_token_blocked, "{result:?}");
+        assert_eq!(snapshot(&f.db), frozen);
+        let paths: Vec<String> =
+            f.db.acquire_lock("successor has independent physical receipts")
+                .unwrap()
+                .prepare(
+                    "SELECT DISTINCT path FROM provider_active_destinations WHERE verified_media=1",
+                )
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        assert_eq!(paths.len(), 2);
+        for path in paths {
+            assert_eq!(
+                std::fs::read(
+                    serde_json::from_str::<SelectionPath>(&path)
+                        .unwrap()
+                        .to_path()
+                )
+                .unwrap(),
+                media
+            );
+        }
+        assert_eq!(std::fs::read(&old_path).unwrap(), b"older resource");
+        assert_eq!(
+            std::fs::metadata(&old_path).unwrap().modified().unwrap(),
+            old_time
+        );
+        f.preserved().await;
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn historical_shared_album_metadata_keeps_one_physical_writer_before_successor() {
+    Box::pin(historical_shared_album_successor_fixture(true)).await;
+}
+
+async fn historical_shared_album_successor_fixture(metadata: bool) {
+    use crate::state::db::provider_generations::{INDEPENDENT_ALBUM_COPIES, MAX_GENERATION_BYTES};
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let media = b"\xff\xd8\xff\xe0historical shared album source";
+    let checksum = format!("{:x}", Sha256::digest(media));
+    Mock::given(method("GET"))
+        .and(path("/historical-copy"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("copies");
+    #[cfg(feature = "xmp")]
+    {
+        f.config.metadata.xmp_sidecar = metadata;
+    }
+    #[cfg(not(feature = "xmp"))]
+    assert!(!metadata);
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL":format!("{}/historical-copy",server.uri()), "size":media.len(),
+        "fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    f.capture(records("m", OLD, "historical"), "shared-history")
+        .await;
+    let passes = [destination_pass(&f, "A"), destination_pass(&f, "B")];
+    let template = crate::download::orchestration::generation::begin_frozen_fixture(
+        &passes,
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    let mut spec = template.spec;
+    spec.profile
+        .as_object_mut()
+        .unwrap()
+        .remove(INDEPENDENT_ALBUM_COPIES);
+    let old =
+        f.db.begin_selection_generation(owner(), spec, MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+    let declarations = album_collision_declarations(&f, &passes, &old).await;
+    let original = f.config.directory.join("copies/changed.JPG");
+    std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+    std::fs::write(&original, media).unwrap();
+    // Publish a historical source through the real downloaded-state owner;
+    // subsequent native receipts must validate that exact local/source proof.
+    f.db.upsert_seen(&declarations[0].1[0]).await.unwrap();
+    f.db.mark_downloaded(
+        "PrimarySync",
+        "asset-m",
+        "original",
+        &original,
+        &checksum,
+        Some(&checksum),
+    )
+    .await
+    .unwrap();
+    for (manifest, records) in declarations {
+        let key = manifest.decision.pass_key.clone();
+        assert!(
+            f.db.project_selection_decision(
+                owner(),
+                old.id.clone(),
+                manifest,
+                records,
+                MAX_GENERATION_BYTES
+            )
+            .await
+            .unwrap()
+            .admitted
+        );
+        assert!(
+            f.db.reuse_selection_publication(
+                owner(),
+                old.id.clone(),
+                key,
+                "asset-m".into(),
+                SelectionPath::from_path(&original),
+                (checksum.clone(), media.len() as u64)
+            )
+            .await
+            .unwrap()
+        );
+    }
+    f.db.seal_selection_generation(owner(), old.id.clone(), true, None)
+        .await
+        .unwrap();
+    #[cfg(feature = "xmp")]
+    if metadata {
+        let written = crate::download::metadata_rewrite::run_pending_budget(
+            f.db.as_ref(),
+            crate::download::pipeline::MetadataFlags::from(&f.config),
+            crate::download::CaptureTimestampRepair::Preserve,
+            f.config.temp_suffix.clone(),
+            &CancellationToken::new(),
+            None,
+            (0, 500),
+        )
+        .await;
+        assert_eq!(
+            written.applied, 1,
+            "two historical aliases require one physical sidecar writer"
+        );
+        assert!(original.with_file_name("changed.JPG.xmp").is_file());
+        assert_eq!(f.db.acquire_lock("historical aliases share one completed writer").unwrap()
+            .query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND verified_metadata=1",[&old.id],|row|row.get(0)).unwrap(),2);
+    }
+    let snapshot = |db: &SqliteStateDb| {
+        let conn = db
+            .acquire_lock("immutable historical shared evidence")
+            .unwrap();
+        conn.prepare("SELECT hex(d.manifest)||d.manifest_hash||w.path||w.source_checksum||w.local_checksum||w.verified_media||w.verified_metadata FROM provider_active_decisions d JOIN provider_active_destinations w USING(generation,pass_key,child) WHERE d.generation=?1 ORDER BY d.pass_key,w.path").unwrap()
+            .query_map([&old.id], |row| row.get::<_,String>(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap()
+    };
+    let historical = snapshot(&f.db);
+    assert_eq!(historical.len(), 2);
+    let before = std::fs::metadata(&original).unwrap();
+    drop(passes);
+    let mut stable = None;
+    for cycle in 0..3 {
+        f = reopen_destination_fixture(f).await;
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &[destination_pass(&f, "A"), destination_pass(&f, "B")],
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result.outcome, crate::download::DownloadOutcome::Success),
+            "{result:?}"
+        );
+        assert_eq!(result.stats.downloaded, if cycle == 0 { 2 } else { 0 });
+        assert!(result.stats.sync_token_blocked_reason.is_none());
+        assert_eq!(snapshot(&f.db), historical);
+        assert_eq!(std::fs::read(&original).unwrap(), media);
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        let paths = {
+            let conn =
+                f.db.acquire_lock("independent successor destinations")
+                    .unwrap();
+            conn.prepare("SELECT DISTINCT path FROM provider_active_destinations WHERE generation<>?1 AND admitted=1 AND verified_media=1 ORDER BY path").unwrap().query_map([&old.id],|row|row.get::<_,String>(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap()
+        };
+        assert_eq!(paths.len(), 2);
+        for path in &paths {
+            let path = serde_json::from_str::<SelectionPath>(path)
+                .unwrap()
+                .to_path();
+            assert_ne!(path, original);
+            assert_eq!(std::fs::read(path).unwrap(), media);
+        }
+        if let Some(stable) = &stable {
+            assert_eq!(stable, &paths);
+        }
+        stable = Some(paths);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "xmp"))]
@@ -3617,7 +4321,7 @@ async fn destination_reopen_fixture_with_signature(
 
 #[cfg(feature = "xmp")]
 #[tokio::test]
-async fn private_metadata_shared_native_path_completes_compatible_pass_aliases() {
+async fn private_metadata_colliding_album_paths_complete_independent_native_writers() {
     Box::pin(private_metadata_recovery_fixture(
         true,
         false,
@@ -3710,7 +4414,7 @@ async fn private_metadata_recovery_fixture_with_signature(
     Mock::given(method("GET"))
         .and(path("/metadata-history"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
-        .expect(if shared { 1 } else { 2 })
+        .expect(2)
         .mount(&server)
         .await;
     let mut f = Fixture::new().await;
@@ -3813,8 +4517,8 @@ async fn private_metadata_recovery_fixture_with_signature(
         f.capture(vec![json!({"recordName":"new-unresolved-observation","recordType":"FutureOpaque","future":{"payload":"keep"}})],"changed-basis").await;
     } else if finalization_fault != MetadataStateFault::None {
         let first = first.unwrap();
-        assert_eq!(first.stats.downloaded, usize::from(!native));
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(first.stats.downloaded, if native { 1 } else { 2 });
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
         assert!(
             first.stats.sync_token_blocked_reason.is_some(),
             "unfinished exact receipts must hold publication: {first:?}"
@@ -3827,7 +4531,7 @@ async fn private_metadata_recovery_fixture_with_signature(
         );
         let written_path = f.config.directory.join(format!("copies/{filename}"));
         let own_output = std::fs::read(&written_path).unwrap();
-        let (generation,key,child,prepared):(String,String,String,String)=f.db.acquire_lock("prepared output independently persisted").unwrap().query_row("SELECT generation,pass_key,child,prepared_checksum FROM provider_active_destinations WHERE prepared_checksum IS NOT NULL",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        let (generation,key,child,prepared):(String,String,String,String)=f.db.acquire_lock("prepared output independently persisted").unwrap().query_row("SELECT generation,pass_key,child,prepared_checksum FROM provider_active_destinations WHERE prepared_checksum IS NOT NULL AND path=?1",[SelectionPath::from_path(&written_path).key().unwrap()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
         assert_eq!(prepared, format!("{:x}", Sha256::digest(&own_output)));
         f.db.acquire_lock("negative corrupted prepared output proof").unwrap().execute("UPDATE provider_active_destinations SET prepared_checksum=?4 WHERE generation=?1 AND pass_key=?2 AND child=?3",rusqlite::params![generation,key,child,"0".repeat(64)]).unwrap();
         assert!(
@@ -3883,7 +4587,7 @@ async fn private_metadata_recovery_fixture_with_signature(
                 .filter(|e| e.level <= tracing::Level::WARN)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(first.stats.downloaded, if shared { 1 } else { 2 });
+        assert_eq!(first.stats.downloaded, 2);
     }
     // The TEXT projection collides with this distinct real UTF-8 sibling.
     // Its matching old resource bytes cannot authorize writes under the native
@@ -3891,11 +4595,22 @@ async fn private_metadata_recovery_fixture_with_signature(
     let native_collision = if native
         && finalization_fault == MetadataStateFault::AfterWriteAndSourceDrift
     {
-        let mirror = std::path::PathBuf::from(f.config.directory.to_string_lossy().into_owned())
-            .join(format!("copies/{filename}"));
+        let mirror = std::path::PathBuf::from(
+            f.db.acquire_lock("exact ambiguous canonical path")
+                .unwrap()
+                .query_row::<String, _, _>(
+                    "SELECT local_path FROM assets WHERE id='asset-m'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+        );
         std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
         std::fs::write(&mirror, media).unwrap();
-        let sidecar = mirror.with_file_name(format!("{filename}.xmp"));
+        let sidecar = mirror.with_file_name(format!(
+            "{}.xmp",
+            mirror.file_name().unwrap().to_str().unwrap()
+        ));
         std::fs::write(&sidecar, b"unrelated-sibling-sidecar").unwrap();
         let legacy =
             f.db.acquire_lock("retain ambiguous legacy sibling debt")
@@ -3911,23 +4626,30 @@ async fn private_metadata_recovery_fixture_with_signature(
     } else {
         None
     };
-    let media_paths: Vec<_> = if shared {
-        vec![f.config.directory.join(format!("copies/{filename}"))]
-    } else {
-        vec![
-            f.config.directory.join(format!("A/{filename}")),
-            f.config.directory.join(format!("B/{filename}")),
-        ]
+    let media_paths: Vec<_> = {
+        let conn =
+            f.db.acquire_lock("independent physical metadata destinations")
+                .unwrap();
+        conn.prepare("SELECT DISTINCT path FROM provider_active_destinations WHERE admitted=1 AND verified_media=1 ORDER BY path").unwrap()
+            .query_map([], |row|row.get::<_,String>(0)).unwrap()
+            .map(|row|serde_json::from_str::<SelectionPath>(&row.unwrap()).unwrap().to_path()).collect()
     };
+    assert_eq!(
+        media_paths.len(),
+        2,
+        "each album keeps its own writer and exact receipt"
+    );
     for media_path in &media_paths {
         assert!(media_path.is_file());
     }
     if shared {
-        assert_ne!(
-            std::fs::read(&media_paths[0]).unwrap(),
-            media,
-            "embedded metadata must actually change media bytes"
-        );
+        for path in &media_paths {
+            assert_ne!(
+                std::fs::read(path).unwrap(),
+                media,
+                "embedded metadata must actually change media bytes"
+            );
+        }
     }
     if finalization_fault == MetadataStateFault::AfterWriteAndSourceDrift {
         f.capture(vec![json!({"recordName":"independent-source-drift-after-own-output","recordType":"FutureOpaque","unknown":{"keep":"all"}})],"prepared-output-source-drift").await;
@@ -6247,7 +6969,7 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
         Mock::given(method("GET"))
             .and(path(format!("/{name}")))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
     }
@@ -6266,7 +6988,7 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
     )
     .await
     .unwrap();
-    assert_eq!(first.stats.downloaded, 1, "{first:?}");
+    assert_eq!(first.stats.downloaded, 2, "{first:?}");
     assert!(first.sync_token.is_none());
     let old =
         f.db.acquire_lock("prepared original writer proof")
@@ -6308,7 +7030,7 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
     )
     .await
     .unwrap();
-    assert_eq!(current.stats.downloaded, 1, "{current:?}");
+    assert_eq!(current.stats.downloaded, 2, "{current:?}");
     // Current publication reuse independently verifies and settles the prepared
     // bytes. It does not complete the disabled historical metadata intent.
     assert!(
@@ -6401,9 +7123,8 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
 #[cfg(feature = "xmp")]
 #[tokio::test]
 #[ignore = "300-photo stress coverage: scripts/test-copies-stress.sh"]
-async fn private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes()
- {
-    Box::pin(current_writers_reseed_fixture(300, 5)).await;
+async fn private_600_independent_album_writers_finish_through_reseeds_without_repeated_writes() {
+    Box::pin(current_writers_reseed_fixture(300, 6)).await;
 }
 
 #[cfg(feature = "xmp")]
@@ -6412,14 +7133,22 @@ async fn private_unchanged_sidecar_packets_survive_reseeds_and_two_quiet_reopens
     Box::pin(current_writers_reseed_fixture(3, 5)).await;
 }
 
-// Cross the same priority/remaining scheduling branch with three writers.
+// Cross the same priority/remaining scheduling branch with six writers.
 // The owner separately pins production's 250-current/500-total limits; the
 // full stress case crosses those real limits without the test-only override.
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn private_current_writers_cross_priority_reserve_with_small_budget() {
     crate::download::orchestration::generation::TEST_METADATA_WRITER_BUDGET
-        .scope(4, Box::pin(current_writers_reseed_fixture(3, 1)))
+        .scope(8, Box::pin(current_writers_reseed_fixture(3, 1)))
+        .await;
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn private_independent_writers_exceed_budget_then_finish_across_reseeds() {
+    crate::download::orchestration::generation::TEST_METADATA_WRITER_BUDGET
+        .scope(5, Box::pin(current_writers_reseed_fixture(3, 6)))
         .await;
 }
 
@@ -6429,11 +7158,14 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     let server = MockServer::start().await;
+    let budget = crate::download::orchestration::generation::TEST_METADATA_WRITER_BUDGET
+        .try_with(|budget| *budget)
+        .unwrap_or(500);
     let media = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
     Mock::given(method("GET"))
         .and(path("/many-owned-current"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
-        .expect(u64::try_from(writers).unwrap())
+        .expect(u64::try_from(2 * writers).unwrap())
         .mount(&server)
         .await;
     let mut f = Fixture::new().await;
@@ -6444,7 +7176,11 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
         pair[0]["fields"]["filenameEnc"]["value"]=json!(format!("writer-{n:03}.jpg"));
         pair[0]["fields"]["resOriginalRes"]["value"]=json!({"downloadURL":format!("{}/many-owned-current",server.uri()),"size":media.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media))});pair
     }).collect();
-    let mut stable = None;
+    type WriterSnapshot = (
+        std::path::PathBuf,
+        (std::time::SystemTime, std::time::SystemTime, bool),
+    );
+    let mut stable: Option<Vec<WriterSnapshot>> = None;
     for cycle in 0..cycles {
         if cycle > 0 {
             f = reopen_destination_fixture(f).await;
@@ -6465,14 +7201,14 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
         .unwrap();
         assert_eq!(
             result.stats.downloaded,
-            if cycle == 0 { writers } else { 0 },
+            if cycle == 0 { 2 * writers } else { 0 },
             "cycle{cycle}: {result:?}"
         );
         {
             let conn =
                 f.db.acquire_lock("physical writer versus pass obligation oracle")
                     .unwrap();
-            assert_eq!(conn.query_row::<(i64,i64),_,_>("SELECT count(DISTINCT path),count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap(),(i64::try_from(writers).unwrap(),i64::try_from(2*writers*(cycle.min(2)+1)).unwrap()));
+            assert_eq!(conn.query_row::<(i64,i64),_,_>("SELECT count(DISTINCT path),count(*) FROM provider_active_destinations WHERE verified_media=1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap(),(i64::try_from(2*writers).unwrap(),i64::try_from(2*writers*(cycle.min(2)+1)).unwrap()));
             assert_eq!(
                 conn.query_row::<i64, _, _>(
                     "SELECT count(*) FROM provider_active_destinations WHERE verified_metadata=0",
@@ -6480,39 +7216,68 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
                     |r| r.get(0)
                 )
                 .unwrap(),
-                0,
-                "current lane and remaining budget must finish every physical writer"
+                if cycle < 3 {
+                    i64::try_from((2 * writers).saturating_sub(budget)).unwrap()
+                } else {
+                    0
+                },
+                "cycle {cycle}: each reseed revalidates exact metadata receipts within the writer budget; the first unchanged cycle drains the remainder"
             );
         }
-        let files: Vec<_> = (0..writers)
-            .map(|n| {
-                let path = f
-                    .config
-                    .directory
-                    .join("copies")
-                    .join(format!("writer-{n:03}.JPG"));
-                let sidecar = path.with_file_name(format!("writer-{n:03}.JPG.xmp"));
+        let paths: Vec<_> = {
+            let conn = f.db.acquire_lock("all independent writer paths").unwrap();
+            conn.prepare("SELECT path,max(verified_metadata) FROM provider_active_destinations WHERE admitted=1 AND verified_media=1 GROUP BY path ORDER BY path").unwrap().query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,bool>(1)?))).unwrap()
+                .map(|row|{let (path,complete)=row.unwrap();(serde_json::from_str::<SelectionPath>(&path).unwrap().to_path(),complete)}).collect()
+        };
+        assert_eq!(paths.len(), 2 * writers);
+        let files: Vec<_> = paths
+            .into_iter()
+            .map(|(path, complete)| {
+                let sidecar = path.with_file_name(format!(
+                    "{}.xmp",
+                    path.file_name().unwrap().to_str().unwrap()
+                ));
                 assert_eq!(std::fs::read(&path).unwrap(), media);
                 assert!(
                     std::fs::read_to_string(&sidecar)
                         .unwrap()
                         .contains("Current metadata")
                 );
-                (
-                    std::fs::metadata(path).unwrap().modified().unwrap(),
-                    std::fs::metadata(sidecar).unwrap().modified().unwrap(),
-                )
+                let sidecar_time = std::fs::metadata(sidecar).unwrap().modified().unwrap();
+                let media_time = std::fs::metadata(&path).unwrap().modified().unwrap();
+                (path, (media_time, sidecar_time, complete))
             })
             .collect();
         if let Some(stable) = &stable {
-            assert_eq!(
-                stable, &files,
-                "unchanged current receipts must survive source reseeds without repeated physical writes"
-            );
-        } else {
-            stable = Some(files);
+            for ((old_path, (old_media, old_sidecar, complete)), (path, (media, sidecar, _))) in
+                std::iter::zip(stable, &files)
+            {
+                assert_eq!(old_path, path);
+                assert_eq!(
+                    old_media, media,
+                    "media must survive every reseed unchanged"
+                );
+                if *complete {
+                    assert_eq!(
+                        old_sidecar, sidecar,
+                        "completed sidecars must survive every reseed without repeated physical writes"
+                    );
+                }
+            }
         }
-        if cycle >= 3 {
+        assert_eq!(
+            files
+                .iter()
+                .filter(|(_, (_, _, complete))| *complete)
+                .count(),
+            if cycle == 0 {
+                (2 * writers).min(budget)
+            } else {
+                2 * writers
+            }
+        );
+        stable = Some(files);
+        if cycle >= if 2 * writers > budget { 4 } else { 3 } {
             assert_eq!(f.session.calls.load(Ordering::SeqCst), before_calls);
             assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), before_ranks);
         }
@@ -7641,13 +8406,13 @@ async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_reso
     Mock::given(method("GET"))
         .and(path("/fresh-original-raw"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(raw))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/unused-jpeg"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(jpeg))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     let passes = [destination_pass(&f, "A"), destination_pass(&f, "B")];
@@ -7691,6 +8456,11 @@ async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_reso
                 VersionSizeKey::Original => (VersionSizeKey::Alternative, "changed_alt.JPG"),
                 VersionSizeKey::Alternative => (VersionSizeKey::Original, "changed.DNG"),
                 _ => panic!("historical fixture contains only RAW/JPEG siblings"),
+            };
+            let filename = if pass.album.name.as_ref() == "B" {
+                format!("B-{filename}")
+            } else {
+                filename.to_owned()
             };
             task.download_path = f.config.directory.join("copies").join(filename);
             let mut record = pending_record_for_task(&effective, &current.asset, &task);
@@ -7751,7 +8521,7 @@ async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_reso
     .unwrap();
     assert_eq!(
         first.stats.downloaded,
-        1,
+        2,
         "{first:?}\n{:?}",
         capture.events()
     );
@@ -7781,7 +8551,7 @@ async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_reso
     )
     .await
     .unwrap();
-    assert_eq!(recovered.stats.downloaded, 1, "{recovered:?}");
+    assert_eq!(recovered.stats.downloaded, 2, "{recovered:?}");
     assert_eq!(
         f.session.rank_calls.load(Ordering::SeqCst),
         rank_calls,
@@ -7790,6 +8560,10 @@ async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_reso
     assert_eq!(f.count("provider_active_generations"), roots);
     let physical = f.config.directory.join("copies/changed.DNG");
     assert_eq!(std::fs::read(&physical).unwrap(), raw);
+    assert_eq!(
+        std::fs::read(f.config.directory.join("copies/B-changed.DNG")).unwrap(),
+        raw
+    );
     assert_eq!(f.db.acquire_lock("RAW provider swap cannot retire a JPEG or only one alias").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE version_size='original' AND verified_media=1 AND verified_metadata=1",[],|r|r.get(0)).unwrap(),2);
     let modified = std::fs::metadata(&physical).unwrap().modified().unwrap();
     let requests = server.received_requests().await.unwrap().len();

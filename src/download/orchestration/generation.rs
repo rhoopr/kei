@@ -24,7 +24,8 @@ use crate::icloud::photos::{
     PhotoAlbum, PhotoAsset, current_asset, inbox::ShadowCapture, same_selected_facts,
 };
 use crate::state::db::provider_generations::{
-    ActiveDecision, ActiveGeneration, GenerationSpec, MAX_GENERATION_BYTES,
+    ActiveDecision, ActiveGeneration, GenerationSpec, INDEPENDENT_ALBUM_COPIES,
+    MAX_GENERATION_BYTES,
 };
 use crate::state::db::provider_selection::{
     SelectionDecision, SelectionDestination, SelectionOutcome, SelectionPath,
@@ -219,7 +220,7 @@ pub(crate) async fn context(
     };
     let mut excludes: Vec<_> = config.exclude_asset_ids.iter().collect();
     excludes.sort_unstable();
-    let profile = json!({"format":1,"coverage":"observed_selection_window","passes":profile,
+    let mut profile = json!({"format":1,"coverage":"observed_selection_window","passes":profile,
         "recent":null,"recent_scope":"Global","excludes":excludes});
     let config_hash=digest(serde_json::to_vec(&json!({"format":1,"profile":profile,"scope":scope,"zone":zone,
         "paths":hash_download_config(config),"anchored_root":SelectionPath::from_path(&std::path::absolute(&config.directory)?),
@@ -229,6 +230,13 @@ pub(crate) async fn context(
         // Retain the historical fingerprint key; lifetime admission is retired.
         "repair_truncated":config.repair_truncated,"attempt_limit":0,
     }))?.as_slice());
+    // This execution policy requires a successor declaration, not a different
+    // user configuration. Keep the configuration fingerprint compatible so the
+    // existing retained scheduler can finish old, immutable shared-path work.
+    profile
+        .as_object_mut()
+        .context("Selection profile is not an object")?
+        .insert(INDEPENDENT_ALBUM_COPIES.to_owned(), Value::Bool(true));
     Ok(Some(SelectionContext {
         capture,
         scope,
@@ -283,7 +291,10 @@ impl SelectionContext {
                 self.scope.clone(),
                 self.config_hash.clone(),
             )
-            .await?)
+            .await?
+            .filter(|root| {
+                root.spec.profile.get(INDEPENDENT_ALBUM_COPIES) == Some(&Value::Bool(true))
+            }))
     }
 
     async fn start(
@@ -354,6 +365,99 @@ impl SelectionContext {
 }
 
 impl SelectionRun {
+    #[must_use]
+    pub(in crate::download) fn independent_album(&self, config: &DownloadConfig) -> bool {
+        self.root.spec.profile.get(INDEPENDENT_ALBUM_COPIES) == Some(&Value::Bool(true))
+            && matches!(
+                config.primary_layout_pass_kind,
+                Some(PassKind::Album | PassKind::SmartFolder)
+            )
+    }
+
+    /// Qualify a later album before concurrent producers can choose the same
+    /// fresh filename. Durable same-pass paths still take precedence over this
+    /// current-template hint, and admission rechecks actual path ownership.
+    #[must_use]
+    pub(super) fn colliding_album_parent(
+        &self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+    ) -> bool {
+        if !self.independent_album(config) {
+            return false;
+        }
+        let Some(key) = config.primary_layout_pass.as_deref() else {
+            return false;
+        };
+        let parent = crate::download::paths::local_download_dir(
+            &config.directory,
+            &config.folder_structure,
+            &asset.created_local(),
+            config.album_name.as_deref(),
+        );
+        let Some(passes) = self
+            .root
+            .spec
+            .profile
+            .get("passes")
+            .and_then(Value::as_array)
+        else {
+            return false;
+        };
+        passes.iter().any(|pass| {
+            let Some(other_key) = pass.get("key").and_then(Value::as_str) else {
+                return false;
+            };
+            let kind = match pass.get("kind").and_then(Value::as_str) {
+                Some("Album") => PassKind::Album,
+                Some("SmartFolder") => PassKind::SmartFolder,
+                _ => return false,
+            };
+            if other_key >= key {
+                return false;
+            }
+            let Some(album) = self.albums.get(other_key) else {
+                return false;
+            };
+            let other = config.with_pass(&AlbumPass {
+                kind,
+                album: album.clone(),
+                exclude_ids: Arc::default(),
+            });
+            parent
+                == crate::download::paths::local_download_dir(
+                    &other.directory,
+                    &other.folder_structure,
+                    &asset.created_local(),
+                    other.album_name.as_deref(),
+                )
+        })
+    }
+
+    pub(in crate::download) async fn album_path_claimed(
+        &self,
+        config: &DownloadConfig,
+        path: &std::path::Path,
+    ) -> Result<bool> {
+        if !self.independent_album(config) {
+            return Ok(false);
+        }
+        let key = config
+            .primary_layout_pass
+            .as_deref()
+            .context("Album destination has no pass owner")?;
+        Ok(self
+            .capture
+            .db
+            .selection_album_path_claimed(
+                self.capture.owner.clone(),
+                self.root.spec.scope.clone(),
+                key.to_owned(),
+                SelectionPath::from_path(&std::path::absolute(path)?),
+            )
+            .await?)
+    }
+
     /// Capture only failed tasks' original selected provenance. This transient
     /// map supplements the exact frozen task, never changes its path or metadata,
     /// and ends with this sync invocation. Durable replay rebuilds it from SQLite.
@@ -694,7 +798,8 @@ impl SelectionRun {
                         },
                     )
                     .await?;
-                let path = if planner.managed_layout_session().is_some() {
+                let has_retained = retained.is_some();
+                let mut path = if planner.managed_layout_session().is_some() {
                     plan.tasks
                         .iter()
                         .find(|task| task.version_size == derived.version_size)
@@ -730,6 +835,26 @@ impl SelectionRun {
                 } else {
                     derived.path.clone()
                 };
+                if planner.managed_layout_session().is_none()
+                    && previous
+                        .as_ref()
+                        .is_none_or(|previous| previous.decision.confirmation.is_none())
+                    && !has_retained
+                    && self.album_path_claimed(config, &path).await?
+                {
+                    // A peer's canonical receipt supplies content proof, not
+                    // this album's destination or an extra filename qualifier.
+                    path = derived.path.clone();
+                }
+                if planner.managed_layout_session().is_none()
+                    && previous
+                        .as_ref()
+                        .is_none_or(|previous| previous.decision.confirmation.is_none())
+                    && (self.album_path_claimed(config, &path).await?
+                        || (!has_retained && self.colliding_album_parent(asset, config)))
+                {
+                    path = planner.independent_album_path(&path, key, config).await?;
+                }
                 let metadata = if previous
                     .as_ref()
                     .is_some_and(|p| p.decision.confirmation.is_some())
@@ -790,7 +915,7 @@ impl SelectionRun {
                 )
                 .await?
         };
-        let manifest = ActiveDecision {
+        let mut manifest = ActiveDecision {
             state_id: asset.state_id().to_owned(),
             sources,
             decision: SelectionDecision {
@@ -833,18 +958,56 @@ impl SelectionRun {
         } else {
             Vec::new()
         };
-        let projection = self
-            .capture
-            .db
-            .project_selection_decision_with_layout_proof(
-                self.capture.owner.clone(),
-                self.root.id.clone(),
-                manifest.clone(),
-                records,
-                fresh,
-                (MAX_GENERATION_BYTES, layouts),
-            )
-            .await?;
+        let mut retried_collision = false;
+        let projection = loop {
+            let projected = self
+                .capture
+                .db
+                .project_selection_decision_with_layout_proof(
+                    self.capture.owner.clone(),
+                    self.root.id.clone(),
+                    manifest.clone(),
+                    records.clone(),
+                    fresh.clone(),
+                    (MAX_GENERATION_BYTES, layouts.clone()),
+                )
+                .await;
+            match projected {
+                Ok(projection) => break projection,
+                Err(crate::state::error::StateError::ProviderWorkConflict)
+                    if !retried_collision
+                        && previous
+                            .as_ref()
+                            .is_none_or(|previous| previous.decision.confirmation.is_none())
+                        && planner.managed_layout_session().is_none() =>
+                {
+                    let mut changed = false;
+                    for (destination, record) in
+                        manifest.decision.destinations.iter_mut().zip(&mut records)
+                    {
+                        if self
+                            .album_path_claimed(config, &destination.path.to_path())
+                            .await?
+                        {
+                            let path = planner
+                                .independent_album_path(&destination.path.to_path(), key, config)
+                                .await?;
+                            record.filename = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .context("Album destination has no filename")?
+                                .into();
+                            destination.path =
+                                SelectionPath::from_path(&std::path::absolute(path)?);
+                            changed = true;
+                        }
+                    }
+                    anyhow::ensure!(changed, "Selected destination admission conflict");
+                    retried_collision = true;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         if !projection.admitted && manifest.decision.outcome != SelectionOutcome::Excluded {
             tracing::debug!(reason = %projection.reason, "Selection destination admission deferred");
             self.held.store(true, Ordering::Relaxed);
@@ -1470,8 +1633,13 @@ async fn recover_retained(
             ..crate::download::pipeline::StreamingResult::default()
         });
     };
+    let mut retained_profile = root.spec.profile.clone();
+    retained_profile
+        .as_object_mut()
+        .context("Retained selection profile is not an object")?
+        .insert(INDEPENDENT_ALBUM_COPIES.to_owned(), Value::Bool(true));
     anyhow::ensure!(
-        root.spec.profile == current.spec.profile
+        retained_profile == current.spec.profile
             && root.spec.zone == current.spec.zone
             && root.spec.metadata_flags == current.spec.metadata_flags,
         "Retained selection configuration disagrees"

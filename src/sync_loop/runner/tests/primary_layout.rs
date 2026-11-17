@@ -851,8 +851,21 @@ async fn local_policy_native_original_authority_survives_aliases_and_config_drif
                 root.path(),
                 "SELECT count(*) FROM provider_active_destinations WHERE version_size='original' AND current_publication=1"
             ),
-            1
+            2
         );
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let paths = conn.prepare("SELECT DISTINCT path FROM provider_active_destinations WHERE version_size='original' AND current_publication=1").unwrap()
+            .query_map([], |row| row.get::<_, String>(0)).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(paths.len(), 2);
+        for path in paths {
+            assert_bytes(
+                &serde_json::from_str::<SelectionPath>(&path)
+                    .unwrap()
+                    .to_path(),
+                bytes,
+            );
+        }
     }
     let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
     assert!(
