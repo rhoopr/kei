@@ -111,6 +111,15 @@ impl CaptureRepairReceipt {
 
 /// Exact native destination selected by the generation owner. The metadata
 /// writer receives this receipt without translating its path through SQLite TEXT.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreservedLocal {
+    pub(crate) intent: String,
+    pub(crate) checksum: String,
+    pub(crate) size: u64,
+    pub(crate) modified: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SelectionMetadataReceipt {
     pub(crate) generation: String,
@@ -119,6 +128,7 @@ pub(crate) struct SelectionMetadataReceipt {
     pub(crate) grouping_hash: String,
     pub(crate) metadata_flags: u8,
     pub(crate) prepared: Option<(String, u64)>,
+    pub(crate) preserved_local: Option<PreservedLocal>,
 }
 
 /// One queued metadata rewrite and its independently persisted capture debt.

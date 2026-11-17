@@ -864,14 +864,16 @@ impl SelectionRun {
                 // to the journal owner, which acknowledges its binding below.
                 continue;
             }
-            if let Ok(fingerprint) = crate::download::file::fingerprint_downloaded_path(
+            if let Some(retained) = crate::download::file::retain_pending_file(
                 &config.directory,
                 &destination.path.to_path(),
             )
-            .await
+            .await?
             {
+                let fingerprint = retained.fingerprint;
                 crate::fs_util::fsync_parent_dir_async(&destination.path.to_path()).await?;
-                self.capture
+                let reused = self
+                    .capture
                     .db
                     .reuse_selection_publication(
                         self.capture.owner.clone(),
@@ -885,6 +887,80 @@ impl SelectionRun {
                         ),
                     )
                     .await?;
+                if reused {
+                    retained.validate().await?;
+                    continue;
+                }
+                let established = self
+                    .capture
+                    .db
+                    .established_selection_path(
+                        self.capture.owner.clone(),
+                        self.root.spec.scope.clone(),
+                        key.to_owned(),
+                        asset.asset_record_name().to_owned(),
+                        asset.id().to_owned(),
+                        destination.version_size.clone(),
+                    )
+                    .await?;
+                if established.as_ref() != Some(&destination.path) {
+                    continue;
+                }
+                let unchanged = self
+                    .capture
+                    .db
+                    .selection_path_matches_local(
+                        self.capture.owner.clone(),
+                        self.root.spec.scope.clone(),
+                        key.to_owned(),
+                        (
+                            asset.asset_record_name().to_owned(),
+                            asset.source_zone().unwrap_or(&config.library).to_owned(),
+                        ),
+                        destination.path.clone(),
+                        (
+                            data_encoding::HEXLOWER.encode(&fingerprint.sha256),
+                            fingerprint.size,
+                        ),
+                    )
+                    .await?;
+                let version = crate::state::VersionSizeKey::from_str(&destination.version_size)
+                    .context("Invalid selected local rendition")?;
+                let cloud_newer = asset
+                    .media_modified_at(version)
+                    .zip(retained.modified.map(chrono::DateTime::<chrono::Utc>::from))
+                    .is_some_and(|(cloud, local)| cloud > local);
+                retained.validate().await?;
+                if unchanged || cloud_newer {
+                    if let Some(task) = plan
+                        .tasks
+                        .iter_mut()
+                        .find(|task| task.version_size == version)
+                    {
+                        task.replacement_fingerprint = Some(Arc::new(
+                            crate::download::file::FinalPublication::ReplaceLocal {
+                                fingerprint,
+                                modified: (!unchanged).then_some(retained.modified).flatten(),
+                            },
+                        ));
+                    }
+                } else {
+                    self.capture
+                        .db
+                        .preserve_selection_local(
+                            self.capture.owner.clone(),
+                            self.root.id.clone(),
+                            key.to_owned(),
+                            asset.asset_record_name().to_owned(),
+                            destination.path.clone(),
+                            (
+                                data_encoding::HEXLOWER.encode(&fingerprint.sha256),
+                                fingerprint.size,
+                                retained.modified.map(chrono::DateTime::<chrono::Utc>::from),
+                            ),
+                        )
+                        .await?;
+                }
             }
         }
         let mut retained_tasks = Vec::with_capacity(plan.tasks.len());
@@ -892,7 +968,7 @@ impl SelectionRun {
             if self
                 .capture
                 .db
-                .selection_destination_verified(
+                .selection_destination_resolved(
                     self.capture.owner.clone(),
                     self.root.id.clone(),
                     key.to_owned(),

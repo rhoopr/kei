@@ -14,6 +14,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::asset_writes::upsert_asset_row;
+use super::contracts::PreservedLocal;
 use super::membership::refresh_asset_album_groupings_tx;
 use super::provider_selection::{SelectionDecision, SelectionDestination, SelectionOutcome};
 use super::rows::encode_asset_date;
@@ -27,6 +28,68 @@ const MAX_VALIDATION_BYTES: usize = 512 * 1024 * 1024;
 const MAX_OBSERVED_BYTES: usize = 64 * 1024 * 1024;
 
 const MANAGED_SUCCESSOR_PREFIX: &str = "managed_successor:";
+
+fn preservation_intent(
+    root: &ActiveGeneration,
+    manifest: &ActiveDecision,
+    destination: &SelectionDestination,
+) -> Result<String, StateError> {
+    Ok(digest(&encode(&(
+        "preserved-local-v1",
+        &root.id,
+        &root.spec,
+        &manifest.decision.pass_key,
+        &manifest.decision.child,
+        &manifest.decision.master,
+        destination,
+    ))?))
+}
+
+fn preserved_local(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    manifest: &ActiveDecision,
+    destination: &SelectionDestination,
+) -> Result<Option<PreservedLocal>, StateError> {
+    let bytes: Option<Vec<u8>> = conn.query_row(
+        "SELECT preserved_local FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND (preserved_local IS NULL OR length(preserved_local)<=1024)",
+        params![root.id, manifest.decision.pass_key, manifest.decision.child, destination.version_size, destination.path.key()?],
+        |row| row.get(0),
+    )?;
+    let Some(bytes) = bytes else { return Ok(None) };
+    if bytes.len() > 1024 {
+        return invalid();
+    }
+    let evidence: PreservedLocal =
+        serde_json::from_slice(&bytes).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+    if evidence.intent != preservation_intent(root, manifest, destination)?
+        || evidence.checksum.len() != 64
+        || !evidence
+            .checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || evidence.size > i64::MAX as u64
+    {
+        return invalid();
+    }
+    Ok(Some(evidence))
+}
+
+fn preserved_progress_hash(
+    root: &ActiveGeneration,
+    manifest: &ActiveDecision,
+    destination: &SelectionDestination,
+    intent: Option<&str>,
+    metadata: bool,
+    evidence: &PreservedLocal,
+) -> Result<String, StateError> {
+    Ok(digest(&encode(&(
+        preservation_intent(root, manifest, destination)?,
+        intent,
+        metadata,
+        evidence,
+    ))?))
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -232,7 +295,7 @@ fn managed_predecessors(
             return Err(StateError::ProviderWorkConflict);
         }
     }
-    let keys: Vec<String> = conn.prepare("SELECT DISTINCT d.generation FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE g.scope=?1 AND g.config_hash=?2 AND d.pass_key=?3 AND d.child=?4 AND d.admission='admitted' AND d.generation<>?5 AND EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND (w.verified_media=0 OR (g.metadata_enabled=1 AND w.verified_metadata=0))) ORDER BY g.created_at LIMIT 17")?
+    let keys: Vec<String> = conn.prepare("SELECT DISTINCT d.generation FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE g.scope=?1 AND g.config_hash=?2 AND d.pass_key=?3 AND d.child=?4 AND d.admission='admitted' AND d.generation<>?5 AND EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR (g.metadata_enabled=1 AND w.verified_metadata=0))) ORDER BY g.created_at LIMIT 17")?
         .query_map(params![root.spec.scope,root.spec.config_hash,manifest.decision.pass_key,manifest.decision.child,root.id], |row| row.get(0))?.collect::<Result<_, _>>()?;
     if keys.len() > 16 {
         return Err(StateError::ProviderSelectionFull);
@@ -362,7 +425,7 @@ impl SqliteStateDb {
         self.with_conn("checking native managed recovery ownership", move |conn| {
             account::validate_authenticated(conn, &owner)?;
             validate_identity_decisions(conn, &library, &child)?;
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND (w.verified_media=0 OR (g.metadata_enabled=1 AND w.verified_metadata=0)))", params![library,child], |row| row.get(0))?)
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR (g.metadata_enabled=1 AND w.verified_metadata=0)))", params![library,child], |row| row.get(0))?)
         }).await
     }
 }
@@ -765,11 +828,16 @@ fn prepared_metadata_hash(
     if output.len() != 64 || !output.bytes().all(|b| b.is_ascii_hexdigit()) {
         return invalid();
     }
-    let (intent,local,source):(String,String,String)=conn.query_row(
-        "SELECT intent_hash,local_checksum,source_checksum FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=1",
+    let (intent,local,source):(String,String,Option<String>)=conn.query_row(
+        "SELECT intent_hash,local_checksum,source_checksum FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL)",
         params![root.id,manifest.decision.pass_key,manifest.decision.child,destination.version_size,destination.path.key()?],
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
     )?;
+    if let Some(preserved) = preserved_local(conn, root, manifest, destination)? {
+        return Ok(digest(&encode(&(
+            intent, local, source, output, size, preserved,
+        ))?));
+    }
     Ok(digest(&encode(&(intent, local, source, output, size))?))
 }
 
@@ -806,7 +874,20 @@ fn refresh_progress_hash(
 ) -> Result<(), StateError> {
     let path = destination.path.key()?;
     let (media,metadata,local,source,intent):(bool,bool,Option<String>,Option<String>,Option<String>)=conn.query_row("SELECT verified_media,verified_metadata,local_checksum,source_checksum,intent_hash FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![root.id,manifest.decision.pass_key,manifest.decision.child,destination.version_size,path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
-    let hash = if media {
+    let preserved = preserved_local(conn, root, manifest, destination)?;
+    let hash = if let Some(preserved) = &preserved {
+        if media || source.is_some() || local.as_deref() != Some(&preserved.checksum) {
+            return invalid();
+        }
+        Some(preserved_progress_hash(
+            root,
+            manifest,
+            destination,
+            intent.as_deref(),
+            metadata,
+            preserved,
+        )?)
+    } else if media {
         Some(progress_hash(
             root,
             manifest,
@@ -1662,15 +1743,36 @@ fn validate_decision_rows(
                 if intent_hash(root, manifest, destination, group)? == *stored => {}
             _ => return invalid(),
         }
+        let preserved = preserved_local(conn, root, manifest, destination)?;
+        let resolved = media || preserved.is_some();
         if prepared_metadata(conn, root, manifest, destination)?.is_some()
-            && (!media || metadata || !root.spec.metadata_enabled || intent.is_none())
+            && (!resolved || metadata || !root.spec.metadata_enabled || intent.is_none())
         {
             return invalid();
         }
-        if metadata && (!media || (root.spec.metadata_enabled && intent.is_none())) {
+        if metadata && (!resolved || (root.spec.metadata_enabled && intent.is_none())) {
             return invalid();
         }
-        if media {
+        if let Some(preserved) = &preserved {
+            if media
+                || source.is_some()
+                || local.as_deref() != Some(&preserved.checksum)
+                || progress.as_deref()
+                    != Some(
+                        preserved_progress_hash(
+                            root,
+                            manifest,
+                            destination,
+                            intent.as_deref(),
+                            metadata,
+                            preserved,
+                        )?
+                        .as_str(),
+                    )
+            {
+                return invalid();
+            }
+        } else if media {
             let (Some(local), Some(source), Some(stored)) = (local, source, progress) else {
                 return invalid();
             };
@@ -1962,7 +2064,7 @@ impl SqliteStateDb {
             let mut statement=conn.prepare("SELECT pass_key,child FROM provider_active_decisions WHERE generation=?1")?;
             let mut rows=statement.query([&generation])?;
             while let Some(row)=rows.next()? {let key:String=row.get(0)?;let child:String=row.get(1)?;load_decision_with_sources(conn,&root,&key,&child,false)?;}
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission<>'excluded' AND next_retry_at>?2) AND NOT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) AND NOT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND (verified_media=0 OR (?3=1 AND verified_metadata=0)))",params![generation,Utc::now().timestamp(),root.spec.metadata_enabled],|r|r.get(0))?)
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission<>'excluded' AND next_retry_at>?2) AND NOT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) AND NOT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND ((verified_media=0 AND preserved_local IS NULL) OR (?3=1 AND verified_metadata=0)))",params![generation,Utc::now().timestamp(),root.spec.metadata_enabled],|r|r.get(0))?)
         }).await
     }
 
@@ -2195,7 +2297,7 @@ impl SqliteStateDb {
     ) -> Result<Vec<ActiveDecision>, StateError> {
         self.with_conn("reading unfinished selected destinations",move|conn|{
             account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;pass(&root,&key)?;
-            let children:Vec<String>=conn.prepare("SELECT d.child FROM provider_active_decisions d WHERE d.generation=?1 AND d.pass_key=?2 AND (?3 IS NULL OR d.child>?3) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND (w.verified_media=0 OR (?5=1 AND w.verified_metadata=0)))) ORDER BY d.child LIMIT ?6")?.query_map(params![generation,key,after,Utc::now().timestamp(),root.spec.metadata_enabled,limit],|r|r.get(0))?.collect::<Result<_,_>>()?;
+            let children:Vec<String>=conn.prepare("SELECT d.child FROM provider_active_decisions d WHERE d.generation=?1 AND d.pass_key=?2 AND (?3 IS NULL OR d.child>?3) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR (?5=1 AND w.verified_metadata=0)))) ORDER BY d.child LIMIT ?6")?.query_map(params![generation,key,after,Utc::now().timestamp(),root.spec.metadata_enabled,limit],|r|r.get(0))?.collect::<Result<_,_>>()?;
             children.iter().map(|child|load_decision(conn,&root,&key,child)).collect()
         }).await
     }
@@ -2207,7 +2309,7 @@ impl SqliteStateDb {
     ) -> Result<bool, StateError> {
         self.with_conn("inspecting destination wake-up",move|conn|{
             account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND (verified_media=0 OR (?3=1 AND verified_metadata=0)))",params![generation,Utc::now().timestamp(),root.spec.metadata_enabled],|r|r.get(0))?)
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND ((verified_media=0 AND preserved_local IS NULL) OR (?3=1 AND verified_metadata=0)))",params![generation,Utc::now().timestamp(),root.spec.metadata_enabled],|r|r.get(0))?)
         }).await
     }
 }
@@ -2354,8 +2456,8 @@ fn validate_identity_decisions(
 // this rendition at its current path. Keep every old row and prepared output.
 // Callers validate generation/decision proofs before relying on these columns.
 const UNFINISHED: &str = "w.admitted=1
-    AND (w.verified_media=0 OR (g.metadata_enabled=1 AND w.verified_metadata=0))
-    AND NOT (w.verified_media=0 AND w.prepared_hash IS NULL AND EXISTS (
+    AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR (g.metadata_enabled=1 AND w.verified_metadata=0))
+    AND NOT (w.verified_media=0 AND w.preserved_local IS NULL AND w.prepared_hash IS NULL AND EXISTS (
         SELECT 1 FROM provider_active_destinations current
         JOIN provider_active_generations newer ON newer.id=current.generation
         WHERE newer.scope=g.scope AND newer.config_hash=g.config_hash
@@ -2430,13 +2532,37 @@ pub(super) fn guard_metadata(
 /// native path and SHA-verified source checksum, never a lossy legacy path row.
 /// A preservation-backed layout commit proves the selected destination using
 /// pinned provider identity, independent local bytes, and prepared metadata.
+/// Commit a managed journal's installed output. Binding acknowledgement uses
+/// the generation-specific reuse path and does not establish new authority.
 pub(super) fn record_layout_destination(
     conn: &Connection,
     record: &AssetRecord,
     file: &super::primary_layout::LayoutFile,
     flags: u8,
 ) -> Result<(), StateError> {
-    record_layout_destination_for_generation(conn, record, file, flags, None)
+    record_layout_destination_for_generation(conn, record, file, flags, None)?;
+    let path = file.path.key()?;
+    let local = data_encoding::HEXLOWER.encode(&file.fingerprint.sha256);
+    let current: Option<(String, String, String)> = if file.local_preserved
+        || file.source_checksum.is_none()
+    {
+        None
+    } else {
+        conn.query_row("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND checksum=?5 AND local_checksum=?6 AND source_checksum IS ?7 AND admitted=1 AND verified_media=1 AND preserved_local IS NULL ORDER BY generation,pass_key,child LIMIT 1", params![record.library,record.id,record.version_size.as_str(),path,file.provider_checksum,local,file.source_checksum], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?
+    };
+    replace_current_publication(
+        conn,
+        &record.library,
+        &path,
+        current.as_ref().map(|(generation, key, child)| {
+            (
+                generation.as_str(),
+                key.as_str(),
+                child.as_str(),
+                record.version_size.as_str(),
+            )
+        }),
+    )
 }
 
 fn record_layout_destination_for_generation(
@@ -2486,7 +2612,20 @@ fn record_layout_destination_for_generation(
                 && file.metadata_decision.is_some()
                 && group.as_deref()
                     == Some(grouping_hash(conn, &record.library, &record.id)?.as_str()));
-        conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,verified_media=1,verified_metadata=?8,local_checksum=?6,source_checksum=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,record.version_size.as_str(),path,local,file.source_checksum,metadata_complete])?;
+        if file.local_preserved {
+            if file.source_checksum.is_some() {
+                return invalid();
+            }
+            let preserved = PreservedLocal {
+                intent: preservation_intent(&root, &manifest, destination)?,
+                checksum: local.clone(),
+                size: file.fingerprint.size,
+                modified: file.local_modified,
+            };
+            conn.execute("UPDATE provider_active_destinations SET preserved_local=?8,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,verified_media=0,verified_metadata=?7,local_checksum=?6,source_checksum=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,record.version_size.as_str(),path,local,metadata_complete,encode(&preserved)?])?;
+        } else {
+            conn.execute("UPDATE provider_active_destinations SET current_publication=CASE WHEN local_checksum IS ?6 AND source_checksum IS ?7 THEN current_publication ELSE 0 END,preserved_local=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,verified_media=1,verified_metadata=?8,local_checksum=?6,source_checksum=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,record.version_size.as_str(),path,local,file.source_checksum,metadata_complete])?;
+        }
         refresh_progress_hash(conn, &root, &manifest, destination)?;
         validate_decision_rows(conn, &root, &manifest)?;
     }
@@ -2540,6 +2679,9 @@ impl SqliteStateDb {
 
 enum VerifiedDestinationSource<'a> {
     PathPublication(&'a str),
+    // An unfinished admitted destination independently measured as its exact
+    // current raw SHA-256 provider resource after publication lost state.
+    RecoveredPublication(&'a str),
     // Only the reuse owner constructs this after validating the retained
     // native generation/decision and exact source, path and local fingerprint.
     RetainedNative(&'a str),
@@ -2550,6 +2692,32 @@ enum VerifiedDestinationSource<'a> {
     PriorPublication(&'a str),
 }
 
+/// Move exact native-path authority only inside the transaction finalizing a
+/// checked publication. Historical verification remains intact. Selection,
+/// import and receipt reuse must never call this to establish authority.
+pub(super) fn replace_current_publication(
+    conn: &Connection,
+    library: &str,
+    path: &str,
+    current: Option<(&str, &str, &str, &str)>,
+) -> Result<(), StateError> {
+    if conn.is_autocommit() {
+        return invalid();
+    }
+    conn.execute("UPDATE provider_active_destinations SET current_publication=0 WHERE library=?1 AND path=?2 AND current_publication=1", params![library,path])?;
+    if let Some((generation, key, child, version)) = current {
+        let root = load_generation(conn, generation)?;
+        load_decision(conn, &root, key, child)?;
+        let changed = conn.execute("UPDATE provider_active_destinations SET current_publication=1 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND library=?6 AND admitted=1 AND verified_media=1 AND preserved_local IS NULL AND length(local_checksum)=64 AND length(source_checksum)=64 AND EXISTS(SELECT 1 FROM provider_active_generations g JOIN account_owner a ON a.account_key=g.account_key AND a.provider_key=g.provider_key WHERE g.id=?1)", params![generation,key,child,version,path,library])?;
+        if changed != 1 {
+            return invalid();
+        }
+    }
+    Ok(())
+}
+
+/// Finalize actual provider publication under the caller's durable transaction.
+/// Confirmation, import and receipt reuse must use their non-publishing paths.
 pub(super) fn record_verified_destination(
     conn: &Connection,
     library: &str,
@@ -2579,11 +2747,12 @@ fn record_destination_source(
     local: &str,
     source: VerifiedDestinationSource<'_>,
 ) -> Result<(), StateError> {
-    let (source, require_path_receipt) = match source {
-        VerifiedDestinationSource::PathPublication(source) => (source, true),
-        VerifiedDestinationSource::RetainedNative(source) => (source, false),
-        VerifiedDestinationSource::ImportedLocal(source) => (source, false),
-        VerifiedDestinationSource::PriorPublication(source) => (source, false),
+    let (source, require_path_receipt, published) = match source {
+        VerifiedDestinationSource::PathPublication(source) => (source, true, true),
+        VerifiedDestinationSource::RecoveredPublication(source) => (source, false, true),
+        VerifiedDestinationSource::RetainedNative(source) => (source, false, false),
+        VerifiedDestinationSource::ImportedLocal(source) => (source, false, false),
+        VerifiedDestinationSource::PriorPublication(source) => (source, false, false),
     };
     validate_identity_decisions(conn, library, asset)?;
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND admitted=1)",params![library,asset,version],|r|r.get(0))?;
@@ -2611,9 +2780,9 @@ fn record_destination_source(
     // rewrite outputs that must not update a lossy TEXT sibling's checksum.
     // Bind MMCS as a provider generation, never as a local content digest.
     let rows:Vec<(String,String,String)>=conn.prepare("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND admitted=1 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND a.checksum=provider_active_destinations.checksum AND a.size_bytes=provider_active_destinations.size_bytes AND a.metadata_hash=provider_active_destinations.metadata_hash AND a.created_at IS provider_active_destinations.created_at AND a.added_at IS provider_active_destinations.added_at AND a.status='downloaded' AND a.is_deleted=0 AND (?7=0 OR EXISTS(SELECT 1 FROM asset_metadata_paths p WHERE p.library=a.library AND p.id=a.id AND p.version_size=a.version_size AND p.provider_checksum=a.checksum AND p.local_path=provider_active_destinations.compat_path AND p.local_checksum=?5 AND p.source_checksum=?6)))")?.query_map(params![library,asset,version,path,local,source,require_path_receipt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
-    for (generation, key, child) in rows {
-        let root = load_generation(conn, &generation)?;
-        let manifest = load_decision(conn, &root, &key, &child)?;
+    for (generation, key, child) in &rows {
+        let root = load_generation(conn, generation)?;
+        let manifest = load_decision(conn, &root, key, child)?;
         let destination = manifest
             .decision
             .destinations
@@ -2622,8 +2791,18 @@ fn record_destination_source(
                 d.version_size == version && d.path.key().ok().as_deref() == Some(path.as_str())
             })
             .ok_or(StateError::ProviderSelectionInvalid)?;
-        conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,verified_media=1,local_checksum=?6,source_checksum=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,version,path,local,source])?;
+        conn.execute("UPDATE provider_active_destinations SET current_publication=CASE WHEN local_checksum IS ?6 AND source_checksum IS ?7 THEN current_publication ELSE 0 END,preserved_local=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,verified_media=1,local_checksum=?6,source_checksum=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,version,path,local,source])?;
         refresh_progress_hash(conn, &root, &manifest, destination)?;
+    }
+    if published {
+        replace_current_publication(
+            conn,
+            library,
+            &path,
+            rows.first().map(|(generation, key, child)| {
+                (generation.as_str(), key.as_str(), child.as_str(), version)
+            }),
+        )?;
     }
     Ok(())
 }
@@ -2668,7 +2847,7 @@ impl SqliteStateDb {
                 record_destination_source(&tx,manifest.media_zone(&root).get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::RetainedNative(&source))?;
                 tx.commit()?;return Ok(true)
             }
-            let Some(text)=native.to_str() else {tx.commit()?;return Ok(false)};
+            let text=native.to_str();
             // Legacy metadata publication retains its original download hash
             // separately from the final local bytes. Neither hash can transfer
             // from another path or provider version.
@@ -2695,7 +2874,7 @@ impl SqliteStateDb {
                     let now=chrono::Utc::now().timestamp();
                     super::asset_writes::update_status_to_downloaded(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,Some(&local),false,now)?;
                     tx.execute("UPDATE asset_metadata_paths SET source_checksum=?5 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4",params![library,manifest.state_id,selected.version_size,text,local])?;
-                    record_verified_destination(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,&local)?;
+                    record_destination_source(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::RecoveredPublication(&local))?;
                     super::asset_writes::record_metadata_capture_revision(&tx,library,&manifest.state_id,crate::state::types::METADATA_CAPTURE_REVISION,now)?;
                     tx.commit()?;
                     return Ok(true);
@@ -2703,8 +2882,8 @@ impl SqliteStateDb {
             }
             let receipt:Option<String>=tx.query_row("SELECT p.source_checksum FROM asset_metadata_paths p JOIN assets a USING(library,id,version_size) WHERE p.library=?1 AND p.id=?2 AND p.local_path=?3 AND p.local_checksum=?4 AND p.source_checksum IS NOT NULL AND a.metadata_hash IS ?5 AND p.version_size=?6 AND p.provider_checksum=?7 AND a.checksum=p.provider_checksum",params![manifest.media_zone(&root).get("zoneName").and_then(Value::as_str),manifest.state_id,text,local,manifest.decision.destinations.iter().find(|d|d.path==path).map(|d|&d.metadata_hash),manifest.decision.destinations.iter().find(|d|d.path==path).map(|d|&d.version_size),selected.checksum],|r|r.get(0)).optional()?;
             if let Some(source)=receipt {
-                record_verified_destination(&tx,manifest.media_zone(&root).get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,
-                    &manifest.decision.destinations.iter().find(|d|d.path==path).ok_or(StateError::ProviderSelectionInvalid)?.version_size,&native,&local,&source)?;
+                record_destination_source(&tx,manifest.media_zone(&root).get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,
+                    &manifest.decision.destinations.iter().find(|d|d.path==path).ok_or(StateError::ProviderSelectionInvalid)?.version_size,&native,&local,VerifiedDestinationSource::PriorPublication(&source))?;
                 tx.commit()?;Ok(true)
             } else {
                 // An import or prior exact adoption has no download/source receipt. Its durable local
@@ -2730,10 +2909,10 @@ impl SqliteStateDb {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
             let root=load_generation(&tx,&generation)?;
             if !root.spec.metadata_enabled {
-                let keys:Vec<(String,String)>=tx.prepare("SELECT DISTINCT pass_key,child FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND verified_media=1")?.query_map([&generation],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
+                let keys:Vec<(String,String)>=tx.prepare("SELECT DISTINCT pass_key,child FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL)")?.query_map([&generation],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
                 for (key,child) in keys {
                     let manifest=load_decision(&tx,&root,&key,&child)?;
-                    tx.execute("UPDATE provider_active_destinations SET verified_metadata=1 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND admitted=1 AND verified_media=1",params![generation,key,child])?;
+                    tx.execute("UPDATE provider_active_destinations SET verified_metadata=1 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL)",params![generation,key,child])?;
                     for destination in &manifest.decision.destinations {refresh_progress_hash(&tx,&root,&manifest,destination)?;}
                 }
             }
@@ -2760,7 +2939,7 @@ pub(super) fn metadata_receipt(
         .iter()
         .find(|d| d.version_size == version && d.path.key().ok().as_deref() == Some(path_key))
         .ok_or(StateError::ProviderSelectionInvalid)?;
-    let (local,source,group):(String,String,String)=conn.query_row("SELECT local_checksum,source_checksum,grouping_hash FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=1 AND verified_metadata=0",params![generation,key,child,version,path_key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    let (local,source,group):(String,Option<String>,String)=conn.query_row("SELECT local_checksum,source_checksum,grouping_hash FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL) AND verified_metadata=0",params![generation,key,child,version,path_key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     let library = manifest
         .media_zone(&root)
         .get("zoneName")
@@ -2772,13 +2951,14 @@ pub(super) fn metadata_receipt(
     let mut asset=conn.query_row(&format!("SELECT {} FROM assets WHERE library=?1 AND id=?2 AND version_size=?3 AND checksum=?4 AND metadata_hash=?5 AND is_deleted=0",super::rows::ASSET_COLUMNS),params![library,manifest.state_id,version,destination.checksum,destination.metadata_hash],super::rows::row_to_asset_record)?;
     asset.local_path = Some(destination.path.to_path());
     asset.local_checksum = Some(local.clone());
-    asset.download_checksum = Some(source.clone());
+    asset.download_checksum = source.clone();
     asset.status = crate::state::AssetStatus::Downloaded;
     Ok(super::PendingMetadataRewrite {
         asset,
         capture_repair_receipt: None,
-        source_checksum: Some(source),
+        source_checksum: source,
         selection_receipt: Some(super::contracts::SelectionMetadataReceipt {
+            preserved_local: preserved_local(conn, &root, &manifest, destination)?,
             generation: generation.to_owned(),
             pass_key: key.to_owned(),
             child: child.to_owned(),
@@ -2837,8 +3017,31 @@ pub(super) fn finish_metadata_receipt(
     {
         return invalid();
     }
-    let changed=conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,local_checksum=COALESCE(?8,local_checksum),verified_metadata=CASE WHEN ?9=1 THEN 1 ELSE verified_metadata END WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=1 AND verified_metadata=0 AND local_checksum IS ?6 AND grouping_hash=?7 AND source_checksum IS ?10 AND metadata_hash IS ?11 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=provider_active_destinations.library AND a.id=provider_active_destinations.asset_id AND a.version_size=provider_active_destinations.version_size AND a.checksum=provider_active_destinations.checksum AND a.metadata_hash=provider_active_destinations.metadata_hash AND a.created_at IS provider_active_destinations.created_at AND a.added_at IS provider_active_destinations.added_at AND a.is_deleted=0)",params![receipt.generation,receipt.pass_key,receipt.child,pending.asset.version_size.as_str(),path,pending.asset.local_checksum,receipt.grouping_hash,local,complete,pending.source_checksum,pending.asset.metadata.metadata_hash])?;
-    if changed > 0 {
+    let changed = if let Some(expected) = &receipt.preserved_local {
+        if preserved_local(conn, &root, &manifest, selected_destination)?.as_ref() != Some(expected)
+            || pending.source_checksum.is_some()
+        {
+            return Err(StateError::ProviderWorkConflict);
+        }
+        let mut updated = expected.clone();
+        if let Some(local) = local {
+            updated.checksum = local.to_owned();
+            if let Some((output, size)) = &receipt.prepared
+                && output == local
+            {
+                updated.size = *size;
+            }
+        }
+        let changed = conn.execute(
+            "UPDATE provider_active_destinations SET preserved_local=?6,local_checksum=?7,verified_metadata=?8,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=0 AND source_checksum IS NULL AND preserved_local=?9",
+            params![root.id,receipt.pass_key,receipt.child,selected_destination.version_size,path,encode(&updated)?,updated.checksum,complete,encode(expected)?],
+        )?;
+        refresh_progress_hash(conn, &root, &manifest, selected_destination)?;
+        changed
+    } else {
+        conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,local_checksum=COALESCE(?8,local_checksum),verified_metadata=CASE WHEN ?9=1 THEN 1 ELSE verified_metadata END WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=1 AND verified_metadata=0 AND local_checksum IS ?6 AND grouping_hash=?7 AND source_checksum IS ?10 AND metadata_hash IS ?11 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=provider_active_destinations.library AND a.id=provider_active_destinations.asset_id AND a.version_size=provider_active_destinations.version_size AND a.checksum=provider_active_destinations.checksum AND a.metadata_hash=provider_active_destinations.metadata_hash AND a.created_at IS provider_active_destinations.created_at AND a.added_at IS provider_active_destinations.added_at AND a.is_deleted=0)",params![receipt.generation,receipt.pass_key,receipt.child,pending.asset.version_size.as_str(),path,pending.asset.local_checksum,receipt.grouping_hash,local,complete,pending.source_checksum,pending.asset.metadata.metadata_hash])?
+    };
+    if changed > 0 && receipt.preserved_local.is_none() {
         if let Some(prepared) = receipt.prepared.as_ref()
             && local == Some(prepared.0.as_str())
         {
@@ -2859,7 +3062,7 @@ pub(super) fn finish_metadata_receipt(
         // A single physical write can satisfy multiple passes only when every
         // frozen input and writer dependency is exactly compatible. Different
         // native paths always retain independent publication obligations.
-        let mut statement=conn.prepare("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND checksum=?5 AND metadata_hash IS ?6 AND created_at IS ?7 AND added_at IS ?8 AND admitted=1 AND verified_media=1 AND verified_metadata=0 AND local_checksum IS ?9 AND source_checksum IS ?10 AND grouping_hash=?11 AND size_bytes=?12 ORDER BY generation,pass_key,child")?;
+        let mut statement=conn.prepare("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND checksum=?5 AND metadata_hash IS ?6 AND created_at IS ?7 AND added_at IS ?8 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL) AND verified_metadata=0 AND local_checksum IS ?9 AND source_checksum IS ?10 AND grouping_hash=?11 AND size_bytes=?12 ORDER BY generation,pass_key,child")?;
         let aliases = statement.query_map(
             params![
                 pending.asset.library,
@@ -2896,7 +3099,6 @@ pub(super) fn finish_metadata_receipt(
             if alias.decision.master != manifest.decision.master {
                 continue;
             }
-            conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,local_checksum=COALESCE(?6,local_checksum),verified_metadata=CASE WHEN ?10=1 THEN 1 ELSE verified_metadata END WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND local_checksum IS ?7 AND source_checksum IS ?8 AND grouping_hash=?9 AND verified_media=1 AND verified_metadata=0",params![generation,key,child,pending.asset.version_size.as_str(),path,local,pending.asset.local_checksum,pending.source_checksum,receipt.grouping_hash,complete])?;
             let destination = alias
                 .decision
                 .destinations
@@ -2906,8 +3108,43 @@ pub(super) fn finish_metadata_receipt(
                         && d.path.key().ok().as_deref() == Some(path.as_str())
                 })
                 .ok_or(StateError::ProviderSelectionInvalid)?;
+            let preserved = preserved_local(conn, &alias_root, &alias, destination)?;
+            match (preserved, &receipt.preserved_local) {
+                (Some(mut evidence), Some(expected))
+                    if evidence.checksum == expected.checksum
+                        && evidence.size == expected.size
+                        && evidence.modified == expected.modified =>
+                {
+                    if let Some(local) = local {
+                        evidence.checksum = local.to_owned();
+                        if let Some((output, size)) = &receipt.prepared
+                            && output == local
+                        {
+                            evidence.size = *size;
+                        }
+                    }
+                    conn.execute("UPDATE provider_active_destinations SET preserved_local=?6,local_checksum=?7,verified_metadata=?8,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,destination.version_size,path,encode(&evidence)?,evidence.checksum,complete])?;
+                }
+                (None, None) => {
+                    conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,local_checksum=COALESCE(?6,local_checksum),verified_metadata=CASE WHEN ?10=1 THEN 1 ELSE verified_metadata END WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND local_checksum IS ?7 AND source_checksum IS ?8 AND grouping_hash=?9 AND verified_media=1 AND verified_metadata=0",params![generation,key,child,pending.asset.version_size.as_str(),path,local,pending.asset.local_checksum,pending.source_checksum,receipt.grouping_hash,complete])?;
+                }
+                _ => continue,
+            }
             refresh_progress_hash(conn, &alias_root, &alias, destination)?;
         }
+    }
+    if changed > 0 && local.is_some() {
+        replace_current_publication(
+            conn,
+            &pending.asset.library,
+            &path,
+            receipt.preserved_local.is_none().then_some((
+                receipt.generation.as_str(),
+                receipt.pass_key.as_str(),
+                receipt.child.as_str(),
+                pending.asset.version_size.as_str(),
+            )),
+        )?;
     }
     Ok(Some(changed > 0 && complete))
 }
@@ -2962,7 +3199,7 @@ impl SqliteStateDb {
         self.with_conn("reading completed selection files", move |conn| {
             account::validate_authenticated(conn, &owner)?;
             load_generation(conn, &generation)?;
-            let mut statement = conn.prepare("SELECT pass_key,child,version_size,path FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND verified_media=1 AND (?2 IS NULL OR (pass_key,child,version_size,path)>(?2,?3,?4,?5)) ORDER BY pass_key,child,version_size,path LIMIT ?6")?;
+            let mut statement = conn.prepare("SELECT pass_key,child,version_size,path FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL) AND (?2 IS NULL OR (pass_key,child,version_size,path)>(?2,?3,?4,?5)) ORDER BY pass_key,child,version_size,path LIMIT ?6")?;
             let rows = statement.query_map(params![generation, after.as_ref().map(|v| &v.0), after.as_ref().map(|v| &v.1), after.as_ref().map(|v| &v.2), after.as_ref().map(|v| &v.3), COMPLETED_SELECTION_PAGE_SIZE], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
             })?;
@@ -2985,10 +3222,16 @@ impl SqliteStateDb {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             account::validate_authenticated(&tx, &owner)?;
             let root = load_generation(&tx, &generation)?;
-            load_decision(&tx, &root, &file.pass_key, &file.child)?;
+            let manifest = load_decision(&tx, &root, &file.pass_key, &file.child)?;
+            if !manifest.decision.destinations.iter().any(|destination| destination.path == file.path && destination.version_size == file.version) {
+                return invalid();
+            }
+            let zone = manifest.media_zone(&root);
+            let library = zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?;
+            replace_current_publication(&tx, library, &file.path.key()?, None)?;
             // Keep catalog/path receipts and provider retry timing. Only the
             // active completion proof for the absent copy becomes unfinished.
-            tx.execute("UPDATE provider_active_destinations SET verified_media=0,verified_metadata=0,local_checksum=NULL,source_checksum=NULL,progress_hash=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=1", params![generation, file.pass_key, file.child, file.version, file.path.key()?])?;
+            tx.execute("UPDATE provider_active_destinations SET preserved_local=NULL,verified_media=0,verified_metadata=0,local_checksum=NULL,source_checksum=NULL,progress_hash=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL)", params![generation, file.pass_key, file.child, file.version, file.path.key()?])?;
             tx.commit()?;
             Ok(())
         }).await
@@ -2999,14 +3242,17 @@ impl SqliteStateDb {
         owner: account::AccountOwner,
         scope: String,
         key: String,
-        child: String,
+        identity: (String, String),
         path: super::provider_selection::SelectionPath,
         fingerprint: (String, u64),
     ) -> Result<bool, StateError> {
-        let (local, size) = fingerprint;
+        let (child, library) = identity;
+        let (local, _size) = fingerprint;
         self.with_conn("checking independent publication fingerprint",move|conn|{
             account::validate_authenticated(conn,&owner)?;
-            let previous:Option<(String,String)>=conn.query_row("SELECT w.generation,w.pass_key FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.child=?3 AND w.path=?4 AND (w.local_checksum=?5 OR (w.prepared_checksum=?5 AND w.prepared_size=?6)) AND w.admitted=1 AND w.verified_media=1 ORDER BY (w.pass_key=?2) DESC,g.created_at DESC LIMIT 1",params![scope,key,child,path.key()?,local,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            // Only actual publication or checked metadata completion advances
+            // this lossless authority. History and generation dates never do.
+            let previous:Option<(String,String)>=conn.query_row("SELECT w.generation,w.pass_key FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.child=?3 AND w.path=?4 AND w.local_checksum=?5 AND w.library=?6 AND w.current_publication=1 AND w.admitted=1 AND w.verified_media=1 AND w.preserved_local IS NULL ORDER BY (w.pass_key=?2) DESC,w.generation,w.pass_key LIMIT 1",params![scope,key,child,path.key()?,local,library],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             if let Some((generation,previous_key))=previous {let root=load_generation(conn,&generation)?;load_decision(conn,&root,&previous_key,&child)?;Ok(true)} else {Ok(false)}
         }).await
     }
@@ -3032,7 +3278,73 @@ impl SqliteStateDb {
 }
 
 impl SqliteStateDb {
-    pub(crate) async fn selection_destination_verified(
+    /// Established destination ownership is independent of current resource proof.
+    /// This is never a reusable source candidate for another destination.
+    pub(crate) async fn established_selection_path(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        key: String,
+        child: String,
+        master: String,
+        version: String,
+    ) -> Result<Option<super::provider_selection::SelectionPath>, StateError> {
+        self.with_conn("reading established local destination", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            let previous: Option<(String, String)> = conn.query_row(
+                "SELECT w.generation,w.path FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.pass_key=?2 AND w.child=?3 AND w.version_size=?4 AND w.master=?5 AND w.admitted=1 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL) ORDER BY g.created_at DESC LIMIT 1",
+                params![scope,key,child,version,master], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).optional()?;
+            let Some((generation,path)) = previous else { return Ok(None) };
+            let root = load_generation(conn, &generation)?;
+            load_decision(conn, &root, &key, &child)?;
+            Ok(Some(serde_json::from_str(&path).map_err(|_invalid| StateError::ProviderSelectionInvalid)?))
+        }).await
+    }
+
+    /// Resolve only this copy by local preservation, never by provider verification.
+    pub(crate) async fn preserve_selection_local(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        key: String,
+        child: String,
+        path: super::provider_selection::SelectionPath,
+        observation: (String, u64, Option<chrono::DateTime<Utc>>),
+    ) -> Result<(), StateError> {
+        self.with_conn_mut("preserving selected local media", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            account::validate_authenticated(&tx, &owner)?;
+            let root = load_generation(&tx, &generation)?;
+            let manifest = load_decision(&tx, &root, &key, &child)?;
+            let destination = manifest.decision.destinations.iter().find(|d| d.path == path)
+                .ok_or(StateError::ProviderSelectionInvalid)?;
+            let zone = manifest.media_zone(&root);
+            let library = zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?;
+            replace_current_publication(&tx, library, &path.key()?, None)?;
+            let evidence = PreservedLocal {
+                intent: preservation_intent(&root, &manifest, destination)?,
+                checksum: observation.0, size: observation.1, modified: observation.2,
+            };
+            if let Some(previous) = preserved_local(&tx, &root, &manifest, destination)?
+                && (previous == evidence || (previous.modified == evidence.modified
+                    && prepared_metadata(&tx, &root, &manifest, destination)? == Some((evidence.checksum.clone(), evidence.size))))
+            {
+                tx.commit()?;
+                return Ok(());
+            }
+            if evidence.checksum.len() != 64 || !evidence.checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return invalid();
+            }
+            tx.execute("UPDATE provider_active_destinations SET preserved_local=?6,verified_media=0,verified_metadata=0,local_checksum=?7,source_checksum=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1",
+                params![generation,key,child,destination.version_size,path.key()?,encode(&evidence)?,evidence.checksum])?;
+            refresh_progress_hash(&tx, &root, &manifest, destination)?;
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
+    pub(crate) async fn selection_destination_resolved(
         &self,
         owner: account::AccountOwner,
         generation: String,
@@ -3042,7 +3354,7 @@ impl SqliteStateDb {
     ) -> Result<bool, StateError> {
         self.with_conn("checking independent destination completion",move|conn|{
             account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;load_decision(conn,&root,&key,&child)?;
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND admitted=1 AND verified_media=1)",params![generation,key,child,version],|r|r.get(0))?)
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL))",params![generation,key,child,version],|r|r.get(0))?)
         }).await
     }
 }
@@ -3061,7 +3373,7 @@ impl SqliteStateDb {
             let receipt=pending.selection_receipt.as_ref().ok_or(StateError::ProviderSelectionInvalid)?;
             let path=super::provider_selection::SelectionPath::from_path(pending.asset.local_path.as_deref().ok_or(StateError::ProviderSelectionInvalid)?).key()?;
             let current=metadata_receipt(&tx,&receipt.generation,&receipt.pass_key,&receipt.child,pending.asset.version_size.as_str(),&path)?;
-            if current.asset.local_checksum!=pending.asset.local_checksum || current.source_checksum!=pending.source_checksum || current.selection_receipt.as_ref().is_none_or(|r|r.grouping_hash!=receipt.grouping_hash || r.metadata_flags!=receipt.metadata_flags || r.prepared!=receipt.prepared) {return Ok(None)}
+            if current.asset.local_checksum!=pending.asset.local_checksum || current.source_checksum!=pending.source_checksum || current.selection_receipt.as_ref().is_none_or(|r|r.grouping_hash!=receipt.grouping_hash || r.metadata_flags!=receipt.metadata_flags || r.prepared!=receipt.prepared || r.preserved_local!=receipt.preserved_local) {return Ok(None)}
             let root=load_generation(&tx,&receipt.generation)?;
             let manifest=load_decision(&tx,&root,&receipt.pass_key,&receipt.child)?;
             let destination=manifest.decision.destinations.iter().find(|d|d.version_size==pending.asset.version_size.as_str() && d.path.key().ok().as_deref()==Some(path.as_str())).ok_or(StateError::ProviderSelectionInvalid)?;

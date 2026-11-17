@@ -268,6 +268,24 @@ impl TaskPlanner {
         derived_paths: &[super::filter::DerivedPath],
         evidence: &SelectionPathEvidence<'_>,
     ) -> Result<Option<std::path::PathBuf>> {
+        if let Some(path) = evidence
+            .db
+            .established_selection_path(
+                evidence.owner.clone(),
+                evidence.scope.to_owned(),
+                evidence.pass_key.to_owned(),
+                asset.asset_record_name().to_owned(),
+                asset.id().to_owned(),
+                derived.version_size.as_str().to_owned(),
+            )
+            .await?
+            && let Ok(path) =
+                crate::fs_util::reserved_path_under_root(&config.directory, &path.to_path())
+            && path.extension() == derived.path.extension()
+            && super::legacy_preservation::current_path_is_independent(evidence.db, &path).await?
+        {
+            return Ok(Some(path));
+        }
         let candidates = evidence
             .db
             .verified_selection_paths(
@@ -316,7 +334,10 @@ impl TaskPlanner {
                         evidence.owner.clone(),
                         evidence.scope.to_owned(),
                         evidence.pass_key.to_owned(),
-                        asset.asset_record_name().to_owned(),
+                        (
+                            asset.asset_record_name().to_owned(),
+                            asset.source_zone().unwrap_or(&config.library).to_owned(),
+                        ),
                         candidate,
                         (
                             data_encoding::HEXLOWER.encode(&fingerprint.sha256),
@@ -1232,7 +1253,9 @@ impl TaskPlanner {
                     );
                     return Ok(None);
                 }
-                task.replacement_fingerprint = Some(Arc::new(fingerprint));
+                task.replacement_fingerprint = Some(Arc::new(
+                    super::file::FinalPublication::ReplaceTruncated(fingerprint),
+                ));
             } else {
                 let Some(retry_path) = self.resolve_recorded_retry_path(local_path, &task).await
                 else {

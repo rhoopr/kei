@@ -17,6 +17,30 @@ pub(in crate::download) async fn snapshot(
     tokio::task::spawn_blocking(move || snapshot_blocking(&root, &path)).await?
 }
 
+pub(in crate::download) async fn keep_modified(
+    root: &Path,
+    path: &Path,
+    modified: std::time::SystemTime,
+) -> Result<()> {
+    let (root, path) = (root.to_owned(), path.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let confined = ConfinedPath::open(&root, &path, ConfinedParents::Existing)?;
+        let file = confined.open_regular()?;
+        let identity = crate::fs_util::file_identity(&file)?;
+        let file = confined.validate_for_metadata(identity)?;
+        file.set_modified(modified)?;
+        anyhow::ensure!(
+            file.metadata()?.modified()? == modified,
+            "Layout output cannot retain local modification time"
+        );
+        #[cfg(not(windows))]
+        file.sync_all()?;
+        confined.validate_identity(identity)?;
+        Ok(())
+    })
+    .await?
+}
+
 fn snapshot_blocking(root: &Path, path: &Path) -> Result<Option<LayoutFingerprint>> {
     let confined = match ConfinedPath::open(root, path, ConfinedParents::Existing) {
         Ok(path) => path,
@@ -88,6 +112,7 @@ pub(in crate::download) struct ManagedPrimaryAuthorization {
     expected: LayoutFingerprint,
     preserved_path: PathBuf,
     preserved: LayoutFingerprint,
+    modified: Option<std::time::SystemTime>,
 }
 
 impl ManagedPrimaryAuthorization {
@@ -108,7 +133,17 @@ impl ManagedPrimaryAuthorization {
             expected,
             preserved_path: path,
             preserved,
+            modified: None,
         })
+    }
+
+    #[must_use]
+    pub(in crate::download) fn with_modified(
+        mut self,
+        modified: Option<std::time::SystemTime>,
+    ) -> Self {
+        self.modified = modified;
+        self
     }
 }
 
@@ -133,6 +168,7 @@ pub(in crate::download) async fn publish(
             let preserved=snapshot_blocking(&root,&auth.preserved_path)?.context("Missing durable preserved primary")?;
             anyhow::ensure!(preserved==auth.preserved,"Preserved primary changed before handover");
             anyhow::ensure!(snapshot_blocking(&root,&target)?.as_ref()==Some(&auth.expected),"Owned primary changed before handover");
+            anyhow::ensure!(auth.modified.is_none_or(|time| destination.open_regular().and_then(|file| file.metadata()).and_then(|meta| meta.modified()).ok() == Some(time)), "Owned primary modification time changed before handover");
             // CONTRACT: FILE_PUBLISH_NO_OVERWRITE
             let _operation=auth.operation;
             anyhow::ensure!(snapshot_confined(&part)?.as_ref()==Some(&new) && snapshot_confined(&destination)?.as_ref()==Some(&auth.expected),"Retained primary publication input changed");
@@ -147,7 +183,7 @@ pub(in crate::download) async fn publish(
                 let exchange=if exchange.as_ref().err().is_some_and(super::platform::is_renameat2_unsupported) {
                     super::replacement_recovery::publish_confined(&part,&destination,
                         ExistingFileFingerprint{size:auth.expected.size,sha256:auth.expected.sha256},
-                        ExistingFileFingerprint{size:new.size,sha256:new.sha256})?;
+                        ExistingFileFingerprint{size:new.size,sha256:new.sha256},auth.modified)?;
                     None
                 } else {Some(exchange)};
                 #[cfg(not(target_os="linux"))]
@@ -158,7 +194,8 @@ pub(in crate::download) async fn publish(
                 let installed=snapshot_confined(&destination);
                 let displaced=displaced.as_ref().ok().and_then(|file|file.as_ref());
                 let installed=installed.as_ref().ok().and_then(|file|file.as_ref());
-                if displaced!=Some(&auth.expected) || installed!=Some(&new) {
+                let time_matches = auth.modified.is_none_or(|time| part.open_regular().and_then(|file| file.metadata()).and_then(|meta| meta.modified()).ok() == Some(time));
+                if displaced!=Some(&auth.expected) || installed!=Some(&new) || !time_matches {
                     // Restore only while the installed entry still has our
                     // exact identity and bytes. Every displaced entry remains
                     // retained in either slot, including a racing foreign file.
@@ -174,9 +211,13 @@ pub(in crate::download) async fn publish(
             {
                 let _prepared_pin=part.pin_identity(new.identity)?;
                 let _target_pin=destination.pin_identity(auth.expected.identity)?;
-                super::replacement::publish_file_if_unchanged_blocking(part.path(),destination.path(),
-                    ExistingFileFingerprint{size:auth.expected.size,sha256:auth.expected.sha256},
-                    ExistingFileFingerprint{size:new.size,sha256:new.sha256})?;
+                let expected = ExistingFileFingerprint{size:auth.expected.size,sha256:auth.expected.sha256};
+                let replacement = ExistingFileFingerprint{size:new.size,sha256:new.sha256};
+                if let Some(modified) = auth.modified {
+                    super::replacement::publish_file_if_unchanged_at_mtime_blocking(part.path(),destination.path(),expected,replacement,modified)?;
+                } else {
+                    super::replacement::publish_file_if_unchanged_blocking(part.path(),destination.path(),expected,replacement)?;
+                }
             }
         } else {
             match super::platform::publish_reconciliation_part_blocking(&part,&destination)? {

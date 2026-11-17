@@ -30,6 +30,7 @@ const PROVIDER_DATA_FIELDS: &[&str] = &[
     "adjustmentRenderType",
     "adjustmentType",
     "adjustmentSimpleDataEnc",
+    "adjustmentTimestampEnc",
     "adjustedMediaMetaDataEnc",
     "vidComplDurValue",
     "vidComplDurScale",

@@ -37,6 +37,19 @@ pub(in crate::download) async fn publish_part_to_final(
     if let FinalPublication::ReplaceTruncated(expected) = publication {
         return replace_file_if_unchanged(part_path, final_path, expected).await;
     }
+    if let FinalPublication::ReplaceLocal {
+        fingerprint,
+        modified,
+    } = publication
+    {
+        return super::replacement::replace_local_file_if_unchanged(
+            part_path,
+            final_path,
+            fingerprint,
+            modified,
+        )
+        .await;
+    }
 
     match publish_part_no_replace(part_path, final_path).await {
         Ok(PublishResult::Published) => {

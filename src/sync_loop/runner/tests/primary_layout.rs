@@ -217,6 +217,8 @@ async fn cycle_resolution(
     .await
 }
 struct CycleOptions {
+    exif_description: bool,
+    second_album: bool,
     expected_due_selection: Option<bool>,
     indexing: Option<IndexingOptions>,
     refresh_metadata: bool,
@@ -226,6 +228,8 @@ struct CycleOptions {
     resolution: crate::types::PhotoResolution,
     #[cfg(feature = "xmp")]
     sidecar: bool,
+    #[cfg(feature = "xmp")]
+    embed_xmp: bool,
     controls: download::DownloadControls,
     mov_policy: crate::types::LivePhotoMovFilenamePolicy,
     live_mode: crate::types::LivePhotoMode,
@@ -234,6 +238,8 @@ struct CycleOptions {
 impl Default for CycleOptions {
     fn default() -> Self {
         Self {
+            exif_description: false,
+            second_album: false,
             expected_due_selection: None,
             indexing: None,
             refresh_metadata: false,
@@ -243,6 +249,8 @@ impl Default for CycleOptions {
             resolution: crate::types::PhotoResolution::Original,
             #[cfg(feature = "xmp")]
             sidecar: false,
+            #[cfg(feature = "xmp")]
+            embed_xmp: false,
             controls: download::DownloadControls::download_hidden(),
             mov_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
             live_mode: crate::types::LivePhotoMode::Both,
@@ -331,11 +339,40 @@ async fn try_cycle_options(
         album,
         exclude_ids: Arc::default(),
     };
-    let mut library = make_run_cycle_library_state_with_passes(
-        "PrimarySync",
-        "sync_token:PrimarySync",
-        vec![pass],
-    );
+    let mut passes = vec![pass];
+    if options.second_album {
+        let mut album = crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::default(),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from("SecondAlbum"),
+                list_type: Arc::from("CPLContainerRelationLiveByAssetDate"),
+                obj_type: Arc::from("CPLContainerRelationNotDeletedByAssetDate:album-502"),
+                query_filter: Some(Arc::new(
+                    json!([{"fieldName":"parentId","comparator":"EQUALS","fieldValue":{"type":"STRING","value":"album-502"}}]),
+                )),
+                page_size: 100,
+                zone_id: Arc::new(
+                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                ),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: Some(Arc::from("album-502")),
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(provider.clone()),
+        );
+        album.set_shadow_capture(
+            crate::icloud::photos::inbox::ShadowCapture::new(inner.clone(), fixture_owner(), "com"),
+            Arc::from("private"),
+        );
+        passes.push(AlbumPass {
+            kind: PassKind::Album,
+            album,
+            exclude_ids: Arc::default(),
+        });
+    }
+    let mut library =
+        make_run_cycle_library_state_with_passes("PrimarySync", "sync_token:PrimarySync", passes);
     library.library = if let Some(indexing) = &options.indexing {
         library.plan_is_stale = indexing.stale_plan;
         crate::icloud::photos::PhotoLibrary::new(
@@ -360,6 +397,7 @@ async fn try_cycle_options(
         let mut config = base(mode, exclude, groups, zone);
         let config = Arc::make_mut(&mut config);
         config.refresh_metadata = options.refresh_metadata;
+        config.metadata.set_exif_description = options.exif_description;
         config.edited = true;
         config.edited_naming = naming;
         config.skip_created_after = options
@@ -373,6 +411,7 @@ async fn try_cycle_options(
         #[cfg(feature = "xmp")]
         {
             config.metadata.xmp_sidecar = options.sidecar;
+            config.metadata.embed_xmp = options.embed_xmp;
         }
         config.live_photo_mov_filename_policy = options.mov_policy;
         config.live_photo_mode = options.live_mode;
@@ -387,12 +426,14 @@ async fn try_cycle_options(
     config.download.folder_structure_albums = options.folder_structure.to_owned();
     config.download.folder_structure_smart_folders = options.folder_structure.to_owned();
     config.runtime.refresh_metadata = options.refresh_metadata;
+    config.metadata.set_exif_description = options.exif_description;
     config.photos.edited = true;
     config.photos.edited_naming = naming;
     config.photos.resolution = resolution;
     #[cfg(feature = "xmp")]
     {
         config.metadata.xmp_sidecar = options.sidecar;
+        config.metadata.embed_xmp = options.embed_xmp;
     }
     config.photos.live_photo_mov_filename_policy = options.mov_policy;
     config.photos.live_photo_mode = options.live_mode;
@@ -432,11 +473,828 @@ async fn try_cycle_options(
 fn assert_bytes(path: &std::path::Path, bytes: &[u8]) {
     assert_eq!(std::fs::read(path).unwrap(), bytes, "{}", path.display());
 }
+
+#[tokio::test]
+async fn local_policy_two_copies_update_and_preserve_across_reopen() {
+    for naming in [EditedNaming::Suffix, EditedNaming::Primary] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let options = || CycleOptions {
+            second_album: true,
+            pass_kind: PassKind::Album,
+            folder_structure: "{album}",
+            ..CycleOptions::default()
+        };
+        let initial = records(&server, Some(("edit-one", EDIT_ONE)));
+        let (result, _) = cycle_options(root.path(), initial, false, naming, options()).await;
+        assert_eq!(result.failed_count, 0, "{naming:?}: {:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+        let filename = if naming == EditedNaming::Suffix {
+            "IMG_0501_edited.JPG"
+        } else {
+            "IMG_0501.JPG"
+        };
+        let first = root.path().join("media/TestAlbum").join(filename);
+        let second = root.path().join("media/SecondAlbum").join(filename);
+        assert_bytes(&first, EDIT_ONE);
+        assert_bytes(&second, EDIT_ONE);
+        let local = b"\xff\xd8\xff\xe0independent local edit";
+        std::fs::write(&second, local).unwrap();
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_750_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&second)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let changed = records(&server, Some(("edit-two", EDIT_TWO)));
+        let current_naming = EditedNaming::Suffix;
+        let (result, _) = cycle_options(
+            root.path(),
+            changed.clone(),
+            false,
+            current_naming,
+            options(),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{naming:?}: {:?}", result.stats);
+        assert!(
+            result.db_sync_token_advance_safe,
+            "{naming:?}: {:?}",
+            result.stats
+        );
+        assert_bytes(&first, EDIT_TWO);
+        assert_bytes(&second, local);
+        assert_eq!(
+            std::fs::metadata(&second).unwrap().modified().unwrap(),
+            modified
+        );
+        assert!(
+            db_count(
+                root.path(),
+                "SELECT count(*) FROM provider_active_destinations WHERE preserved_local IS NOT NULL"
+            ) > 0
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT count(*) FROM provider_active_destinations WHERE preserved_local IS NOT NULL AND (verified_media<>0 OR source_checksum IS NOT NULL)"
+            ),
+            0
+        );
+        let requests = server.received_requests().await.unwrap().len();
+        for _ in 0..2 {
+            let (quiet, _) = cycle_options(
+                root.path(),
+                changed.clone(),
+                true,
+                current_naming,
+                options(),
+            )
+            .await;
+            assert_eq!(quiet.failed_count, 0);
+            assert!(quiet.db_sync_token_advance_safe);
+            assert_bytes(&first, EDIT_TWO);
+            assert_bytes(&second, local);
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        std::fs::remove_file(&first).unwrap();
+        let (missing_verified, _) = cycle_options(
+            root.path(),
+            changed.clone(),
+            true,
+            current_naming,
+            options(),
+        )
+        .await;
+        assert_eq!(missing_verified.failed_count, 0);
+        assert!(missing_verified.db_sync_token_advance_safe);
+        assert_bytes(&first, EDIT_TWO);
+        assert_bytes(&second, local);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            requests + 1,
+            "preserved bytes cannot supply the missing current-provider copy"
+        );
+        std::fs::remove_file(&second).unwrap();
+        let (recovered, _) = cycle_options(
+            root.path(),
+            changed.clone(),
+            true,
+            current_naming,
+            options(),
+        )
+        .await;
+        assert_eq!(
+            recovered.failed_count, 0,
+            "{naming:?}: {:?}",
+            recovered.stats
+        );
+        assert!(recovered.db_sync_token_advance_safe);
+        assert_bytes(&second, EDIT_TWO);
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let proof: (bool, bool, bool) = conn.query_row(
+            "SELECT verified_media,preserved_local IS NULL,source_checksum IS NOT NULL FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE compat_path=?1 ORDER BY g.created_at DESC LIMIT 1",
+            [second.to_str().unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(proof, (true, true, true));
+    }
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn local_policy_metadata_keeps_preserved_disposition_and_mtime() {
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+    for (naming, shared_path) in [
+        (EditedNaming::Suffix, false),
+        (EditedNaming::Primary, false),
+        (EditedNaming::Suffix, true),
+    ] {
+        let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, VALID_EDIT).await;
+        let root = tempfile::tempdir().unwrap();
+        let options = |metadata| CycleOptions {
+            second_album: true,
+            pass_kind: PassKind::Album,
+            folder_structure: if shared_path { "" } else { "{album}" },
+            sidecar: metadata,
+            embed_xmp: metadata,
+            ..CycleOptions::default()
+        };
+        let initial =
+            records_with_original(&server, VALID_ORIGINAL, Some(("edit-one", VALID_EDIT)));
+        let (first, _) =
+            cycle_options(root.path(), initial.clone(), false, naming, options(false)).await;
+        assert_eq!(first.failed_count, 0);
+        let filename = if naming == EditedNaming::Suffix {
+            "IMG_0501_edited.JPG"
+        } else {
+            "IMG_0501.JPG"
+        };
+        let preserved = root
+            .path()
+            .join(if shared_path {
+                "media"
+            } else {
+                "media/SecondAlbum"
+            })
+            .join(filename);
+        std::fs::write(&preserved, VALID_ORIGINAL).unwrap();
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_750_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&preserved)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let mut current = initial;
+        current[1]["fields"]["captionEnc"] =
+            json!({"type":"STRING","value":"local policy updated"});
+        let requests = server.received_requests().await.unwrap().len();
+        let (updated, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            false,
+            EditedNaming::Suffix,
+            options(true),
+        )
+        .await;
+        assert_eq!(
+            updated.failed_count,
+            0,
+            "{naming:?}/{shared_path}: {:?}; {:?}",
+            updated.stats,
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.level == tracing::Level::WARN
+                    || event.level == tracing::Level::ERROR)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            updated.db_sync_token_advance_safe,
+            "{naming:?}: {:?}",
+            updated.stats
+        );
+        assert_eq!(
+            std::fs::metadata(&preserved).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        let bytes = std::fs::read(&preserved).unwrap();
+        assert_ne!(bytes, VALID_EDIT);
+        let sidecar =
+            std::fs::read_to_string(preserved.with_file_name(format!("{filename}.xmp"))).unwrap();
+        assert!(sidecar.contains("local policy updated"));
+        assert!(
+            db_count(
+                root.path(),
+                "SELECT count(*) FROM provider_active_destinations WHERE preserved_local IS NOT NULL AND verified_metadata=1"
+            ) > 0
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT count(*) FROM provider_active_destinations WHERE preserved_local IS NOT NULL AND (verified_media<>0 OR source_checksum IS NOT NULL)"
+            ),
+            0
+        );
+        for _ in 0..2 {
+            let (quiet, _) = cycle_options(
+                root.path(),
+                current.clone(),
+                true,
+                EditedNaming::Suffix,
+                options(true),
+            )
+            .await;
+            assert_eq!(
+                quiet.failed_count,
+                0,
+                "{naming:?}: {:?}; {:?}",
+                quiet.stats,
+                capture
+                    .events()
+                    .into_iter()
+                    .filter(|event| event.level == tracing::Level::WARN
+                        || event.level == tracing::Level::ERROR)
+                    .collect::<Vec<_>>()
+            );
+            assert!(quiet.db_sync_token_advance_safe);
+            assert_bytes(&preserved, &bytes);
+            assert_eq!(
+                std::fs::metadata(&preserved).unwrap().modified().unwrap(),
+                modified
+            );
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    }
+}
 fn db_count(root: &std::path::Path, sql: &str) -> i64 {
     rusqlite::Connection::open(root.join("state.db"))
         .unwrap()
         .query_row(sql, [], |r| r.get(0))
         .unwrap()
+}
+
+#[tokio::test]
+async fn local_policy_restored_historical_publication_is_a_local_edit() {
+    restored_historical_publication(std::ffi::OsStr::new("utf8")).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_policy_native_current_publication_updates_but_history_does_not() {
+    use std::os::unix::ffi::OsStringExt;
+    restored_historical_publication(&std::ffi::OsString::from_vec(b"native-\xff".to_vec())).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_policy_native_authority_rollback_recovers_landed_publication() {
+    use std::os::unix::ffi::OsStringExt;
+    for (timing, condition) in [
+        (
+            "BEFORE",
+            "OLD.current_publication=1 AND NEW.current_publication=0",
+        ),
+        ("AFTER", "NEW.current_publication=1"),
+    ] {
+        let root = tempfile::Builder::new()
+            .prefix(&std::ffi::OsString::from_vec(b"native-fault-\xff".to_vec()))
+            .tempdir()
+            .unwrap();
+        let server = server().await;
+        let (first, _) = cycle(
+            root.path(),
+            records(&server, Some(("edit-one", EDIT_ONE))),
+            false,
+            EditedNaming::Suffix,
+        )
+        .await;
+        assert_eq!(first.failed_count, 0);
+        let target = root.path().join("media/IMG_0501_edited.JPG");
+        let old = data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_ONE));
+        let new = data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_TWO));
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        conn.execute_batch(&format!("CREATE TRIGGER fail_native_authority {timing} UPDATE OF current_publication ON provider_active_destinations WHEN NEW.version_size='adjusted' AND ({condition}) BEGIN SELECT RAISE(ABORT,'authority fault'); END;")).unwrap();
+        let current = records(&server, Some(("edit-two", EDIT_TWO)));
+        let (failed, _) = cycle(root.path(), current.clone(), false, EditedNaming::Suffix).await;
+        assert!(
+            failed.failed_count > 0 || !failed.db_sync_token_advance_safe,
+            "{timing}: {:?}",
+            failed.stats
+        );
+        assert_bytes(&target, EDIT_TWO);
+        let authority: String = conn.query_row("SELECT local_checksum FROM provider_active_destinations WHERE version_size='adjusted' AND current_publication=1", [], |row|row.get(0)).unwrap();
+        assert_eq!(
+            authority, old,
+            "{timing}: authority must roll back with finalization"
+        );
+        conn.execute_batch("DROP TRIGGER fail_native_authority")
+            .unwrap();
+        let requests = server.received_requests().await.unwrap().len();
+        for quiet in [false, true, true] {
+            let (recovered, _) =
+                cycle(root.path(), current.clone(), quiet, EditedNaming::Suffix).await;
+            assert_eq!(recovered.failed_count, 0, "{timing}: {:?}", recovered.stats);
+            assert!(recovered.db_sync_token_advance_safe);
+            assert_bytes(&target, EDIT_TWO);
+            let authority: String = conn.query_row("SELECT local_checksum FROM provider_active_destinations WHERE version_size='adjusted' AND current_publication=1", [], |row|row.get(0)).unwrap();
+            assert_eq!(authority, new);
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        assert!(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE version_size='adjusted' AND current_publication=0 AND verified_media=1 AND local_checksum=?1)", [&old], |row|row.get::<_,bool>(0)).unwrap());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_policy_native_original_authority_survives_aliases_and_config_drift() {
+    use state::db::provider_selection::SelectionPath;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let root = tempfile::Builder::new()
+        .prefix(&std::ffi::OsString::from_vec(
+            b"native-original-\xff".to_vec(),
+        ))
+        .tempdir()
+        .unwrap();
+    let server = server().await;
+    let options = |live_mode| CycleOptions {
+        second_album: true,
+        pass_kind: PassKind::Album,
+        live_mode,
+        ..CycleOptions::default()
+    };
+    let original = |name: &str, bytes: &[u8]| {
+        let mut current = records(&server, None);
+        current[0]["fields"]["resOriginalRes"]["value"] = json!({"size":bytes.len(),"downloadURL":format!("{}/{name}",server.uri()),"fileChecksum":provider_hash(bytes)});
+        current
+    };
+    let target = root.path().join("media/IMG_0501.JPG");
+    for (name, bytes, mode) in [
+        ("edit-one", EDIT_ONE, crate::types::LivePhotoMode::Both),
+        ("edit-two", EDIT_TWO, crate::types::LivePhotoMode::ImageOnly),
+    ] {
+        let (result, _) = cycle_options(
+            root.path(),
+            original(name, bytes),
+            false,
+            EditedNaming::Suffix,
+            options(mode),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+        assert_bytes(&target, bytes);
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT count(*) FROM provider_active_destinations WHERE version_size='original' AND current_publication=1"
+            ),
+            1
+        );
+    }
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    assert!(
+        db_count(
+            root.path(),
+            "SELECT count(DISTINCT pass_key) FROM provider_active_destinations WHERE version_size='original' AND verified_media=1"
+        ) >= 2
+    );
+    assert!(
+        db_count(
+            root.path(),
+            "SELECT count(DISTINCT config_hash) FROM provider_active_generations"
+        ) >= 2
+    );
+    let (scope,key,child,library):(String,String,String,String) = conn.query_row("SELECT g.scope,w.pass_key,w.child,w.library FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.version_size='original' AND w.current_publication=1", [], |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+    let owner = fixture_owner();
+    let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+        .await
+        .unwrap();
+    let fingerprint = (
+        data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_TWO)),
+        EDIT_TWO.len() as u64,
+    );
+    assert!(
+        db.selection_path_matches_local(
+            owner.clone(),
+            scope.clone(),
+            key.clone(),
+            (child.clone(), library.clone()),
+            SelectionPath::from_path(&target),
+            fingerprint.clone()
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !db.selection_path_matches_local(
+            owner.clone(),
+            scope.clone(),
+            key.clone(),
+            (child.clone(), "OtherSync".into()),
+            SelectionPath::from_path(&target),
+            fingerprint.clone()
+        )
+        .await
+        .unwrap()
+    );
+    let mut collision = target.as_os_str().as_bytes().to_vec();
+    *collision.iter_mut().find(|byte| **byte == 0xff).unwrap() = 0xfe;
+    let collision = std::path::PathBuf::from(std::ffi::OsString::from_vec(collision));
+    assert_eq!(collision.to_string_lossy(), target.to_string_lossy());
+    assert!(
+        !db.selection_path_matches_local(
+            owner,
+            scope.clone(),
+            key.clone(),
+            (child.clone(), library.clone()),
+            SelectionPath::from_path(&collision),
+            fingerprint.clone()
+        )
+        .await
+        .unwrap()
+    );
+    let other = state::db::account::AccountOwner::authenticated(
+        "other@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"other-provider"}})).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        db.selection_path_matches_local(
+            other,
+            scope,
+            key,
+            (child, library),
+            SelectionPath::from_path(&target),
+            fingerprint
+        )
+        .await
+        .is_err()
+    );
+    drop(db);
+    // Model an ambiguous migrated store: observing/reusing historical receipts
+    // in another configuration must not manufacture publication authority.
+    conn.execute(
+        "UPDATE provider_active_destinations SET current_publication=0",
+        [],
+    )
+    .unwrap();
+    let requests_before_reuse = server.received_requests().await.unwrap().len();
+    let (reused, _) = cycle_options(
+        root.path(),
+        original("edit-two", EDIT_TWO),
+        false,
+        EditedNaming::Suffix,
+        options(crate::types::LivePhotoMode::Both),
+    )
+    .await;
+    assert_eq!(reused.failed_count, 0, "{:?}", reused.stats);
+    assert!(reused.db_sync_token_advance_safe);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        requests_before_reuse
+    );
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM provider_active_destinations WHERE current_publication=1"
+        ),
+        0
+    );
+    std::fs::write(&target, EDIT_ONE).unwrap();
+    let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_750_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&target)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let requests = server.received_requests().await.unwrap().len();
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            original("original", ORIGINAL),
+            quiet,
+            EditedNaming::Suffix,
+            options(crate::types::LivePhotoMode::ImageOnly),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+        assert_bytes(&target, EDIT_ONE);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM provider_active_destinations WHERE current_publication=1"
+        ),
+        0
+    );
+}
+
+async fn restored_historical_publication(prefix: &std::ffi::OsStr) {
+    const EDIT_THREE: &[u8] = b"\xff\xd8\xff\xe0third provider publication";
+    let local_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    for naming in [EditedNaming::Suffix, EditedNaming::Primary] {
+        for offset in [None, Some(0_i64), Some(-60)] {
+            let server = server().await;
+            Mock::given(method("GET"))
+                .and(path("/edit-three"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(EDIT_THREE))
+                .mount(&server)
+                .await;
+            let root = tempfile::Builder::new().prefix(prefix).tempdir().unwrap();
+            let options = || CycleOptions {
+                second_album: true,
+                pass_kind: PassKind::Album,
+                folder_structure: "{album}",
+                #[cfg(feature = "xmp")]
+                sidecar: prefix.to_str().is_none(),
+                ..CycleOptions::default()
+            };
+            let filename = if naming == EditedNaming::Suffix {
+                "IMG_0501_edited.JPG"
+            } else {
+                "IMG_0501.JPG"
+            };
+            let peer = root.path().join("media/TestAlbum").join(filename);
+            let restored = root.path().join("media/SecondAlbum").join(filename);
+            for (name, bytes) in [("edit-one", EDIT_ONE), ("edit-two", EDIT_TWO)] {
+                let (result, _) = cycle_options(
+                    root.path(),
+                    records(&server, Some((name, bytes))),
+                    false,
+                    naming,
+                    options(),
+                )
+                .await;
+                assert_eq!(
+                    result.failed_count, 0,
+                    "{naming:?}/{offset:?}: {:?}",
+                    result.stats
+                );
+                assert!(result.db_sync_token_advance_safe);
+                assert_bytes(&peer, bytes);
+                assert_bytes(&restored, bytes);
+            }
+            std::fs::write(&restored, EDIT_ONE).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&restored)
+                .unwrap()
+                .set_modified(local_time)
+                .unwrap();
+            let mut current = records(&server, Some(("edit-three", EDIT_THREE)));
+            if let Some(offset) = offset {
+                let time = chrono::DateTime::from_timestamp(1_700_000_000 + offset, 0).unwrap();
+                let mut bytes = Vec::new();
+                plist::Value::Date(std::time::SystemTime::from(time).into())
+                    .to_writer_binary(&mut bytes)
+                    .unwrap();
+                current[1]["fields"]["adjustmentTimestampEnc"] = json!({"type":"ENCRYPTED_BYTES","value":base64::engine::general_purpose::STANDARD.encode(bytes)});
+            }
+            let (updated, _) =
+                cycle_options(root.path(), current.clone(), false, naming, options()).await;
+            assert_eq!(
+                updated.failed_count, 0,
+                "{naming:?}/{offset:?}: {:?}",
+                updated.stats
+            );
+            assert!(updated.db_sync_token_advance_safe);
+            assert_bytes(&peer, EDIT_THREE);
+            assert_bytes(&restored, EDIT_ONE);
+            assert_eq!(
+                std::fs::metadata(&restored).unwrap().modified().unwrap(),
+                local_time
+            );
+            assert!(
+                db_count(
+                    root.path(),
+                    "SELECT count(*) FROM provider_active_destinations WHERE preserved_local IS NOT NULL"
+                ) > 0
+            );
+            assert_eq!(
+                db_count(
+                    root.path(),
+                    "SELECT count(*) FROM provider_active_destinations WHERE preserved_local IS NOT NULL AND (verified_media<>0 OR source_checksum IS NOT NULL)"
+                ),
+                0
+            );
+            let requests = server.received_requests().await.unwrap().len();
+            for _ in 0..2 {
+                let (quiet, _) =
+                    cycle_options(root.path(), current.clone(), true, naming, options()).await;
+                assert_eq!(quiet.failed_count, 0);
+                assert!(quiet.db_sync_token_advance_safe);
+                assert_bytes(&peer, EDIT_THREE);
+                assert_bytes(&restored, EDIT_ONE);
+                assert_eq!(
+                    std::fs::metadata(&restored).unwrap().modified().unwrap(),
+                    local_time
+                );
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        }
+    }
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn local_policy_restored_old_metadata_output_is_not_current_publication() {
+    restored_metadata_publication(std::ffi::OsStr::new("utf8")).await;
+}
+
+#[cfg(all(unix, not(feature = "xmp")))]
+#[tokio::test]
+async fn local_policy_native_metadata_authority_retains_latest_output() {
+    use std::os::unix::ffi::OsStringExt;
+    restored_metadata_publication(&std::ffi::OsString::from_vec(b"native-\xff".to_vec())).await;
+}
+
+#[cfg(any(feature = "xmp", unix))]
+async fn restored_metadata_publication(prefix: &std::ffi::OsStr) {
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+    let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, VALID_ORIGINAL).await;
+    let root = tempfile::Builder::new().prefix(prefix).tempdir().unwrap();
+    let options = |embed| CycleOptions {
+        #[cfg(feature = "xmp")]
+        embed_xmp: embed,
+        #[cfg(not(feature = "xmp"))]
+        exif_description: embed,
+        ..CycleOptions::default()
+    };
+    let target = root.path().join("media/IMG_0501_edited.JPG");
+    let mut current =
+        records_with_original(&server, VALID_ORIGINAL, Some(("edit-one", VALID_EDIT)));
+    current[1]["fields"]["captionEnc"] = json!({"type":"STRING","value":"first metadata output"});
+    let (first, _) = cycle_options(
+        root.path(),
+        current.clone(),
+        false,
+        EditedNaming::Suffix,
+        options(true),
+    )
+    .await;
+    assert_eq!(
+        first.failed_count,
+        0,
+        "{:?}",
+        capture
+            .events()
+            .into_iter()
+            .filter(
+                |event| event.level == tracing::Level::WARN || event.level == tracing::Level::ERROR
+            )
+            .collect::<Vec<_>>()
+    );
+    let historical = std::fs::read(&target).unwrap();
+    current[1]["fields"]["captionEnc"] = json!({"type":"STRING","value":"second metadata output"});
+    let (second, _) = cycle_options(
+        root.path(),
+        current,
+        false,
+        EditedNaming::Suffix,
+        options(true),
+    )
+    .await;
+    assert_eq!(
+        second.failed_count,
+        0,
+        "{:?}",
+        capture
+            .events()
+            .into_iter()
+            .filter(
+                |event| event.level == tracing::Level::WARN || event.level == tracing::Level::ERROR
+            )
+            .collect::<Vec<_>>()
+    );
+    let latest = std::fs::read(&target).unwrap();
+    assert_ne!(latest, historical);
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let authority: String = conn.query_row("SELECT local_checksum FROM provider_active_destinations WHERE version_size='adjusted' AND current_publication=1", [], |row| row.get(0)).unwrap();
+    assert_eq!(
+        authority,
+        data_encoding::HEXLOWER.encode(&Sha256::digest(&latest)),
+        "checked metadata output must advance native publication authority"
+    );
+    std::fs::write(&target, &historical).unwrap();
+    let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_750_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&target)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let changed =
+        records_with_original(&server, VALID_ORIGINAL, Some(("edit-two", VALID_ORIGINAL)));
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            changed.clone(),
+            quiet,
+            EditedNaming::Suffix,
+            options(false),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0);
+        assert!(result.db_sync_token_advance_safe);
+        assert_bytes(&target, &historical);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+    assert!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM provider_active_destinations WHERE preserved_local IS NOT NULL AND verified_media=0 AND source_checksum IS NULL"
+        ) > 0
+    );
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/edit-two")
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn local_policy_adjusted_still_requires_strictly_newer_cloud_time() {
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+    let local_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    for naming in [EditedNaming::Suffix, EditedNaming::Primary] {
+        for offset in [-60_i64, 0, 60] {
+            let server = server().await;
+            let root = tempfile::tempdir().unwrap();
+            let (first, _) = cycle(
+                root.path(),
+                records(&server, Some(("edit-one", EDIT_ONE))),
+                false,
+                naming,
+            )
+            .await;
+            assert_eq!(first.failed_count, 0);
+            let filename = if naming == EditedNaming::Suffix {
+                "IMG_0501_edited.JPG"
+            } else {
+                "IMG_0501.JPG"
+            };
+            let target = root.path().join("media").join(filename);
+            let local = b"\xff\xd8\xff\xe0user media edit";
+            std::fs::write(&target, local).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&target)
+                .unwrap()
+                .set_modified(local_time)
+                .unwrap();
+            let time = chrono::DateTime::from_timestamp(1_700_000_000 + offset, 0).unwrap();
+            let mut encoded = Vec::new();
+            plist::Value::Date(std::time::SystemTime::from(time).into())
+                .to_writer_binary(&mut encoded)
+                .unwrap();
+            let mut current = records(&server, Some(("edit-two", EDIT_TWO)));
+            current[1]["fields"]["adjustmentTimestampEnc"] = json!({"type":"ENCRYPTED_BYTES","value":base64::engine::general_purpose::STANDARD.encode(encoded)});
+            let (result, _) = cycle(root.path(), current, false, EditedNaming::Suffix).await;
+            assert_eq!(
+                result.failed_count,
+                0,
+                "{naming:?}/{offset}: {:?}; {:?}",
+                result.stats,
+                capture
+                    .events()
+                    .into_iter()
+                    .filter(|event| event.level == tracing::Level::WARN
+                        || event.level == tracing::Level::ERROR)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                result.db_sync_token_advance_safe,
+                "{naming:?}/{offset}: {:?}",
+                result.stats
+            );
+            assert_bytes(&target, if offset > 0 { EDIT_TWO } else { local });
+            if offset <= 0 {
+                assert_eq!(
+                    std::fs::metadata(&target).unwrap().modified().unwrap(),
+                    local_time
+                );
+            }
+        }
+    }
 }
 async fn server() -> MockServer {
     let server = MockServer::start().await;
@@ -1261,7 +2119,7 @@ async fn primary_layout_retains_recorded_paths_after_public_naming_retirement() 
 }
 
 #[tokio::test]
-async fn primary_layout_foreign_collision_and_local_modification_hold() {
+async fn primary_layout_foreign_collision_and_local_modification_are_preserved() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
@@ -1325,7 +2183,8 @@ async fn primary_layout_foreign_collision_and_local_modification_hold() {
         EditedNaming::Primary,
     )
     .await;
-    assert!(!conflict.db_sync_token_advance_safe);
+    assert!(conflict.db_sync_token_advance_safe);
+    assert_eq!(conflict.failed_count, 0);
     assert_bytes(current, b"user changed owned bytes");
     assert_bytes(archive, ORIGINAL);
     assert_bytes(&media.join("IMG_0501.JPG"), b"foreign primary bytes");

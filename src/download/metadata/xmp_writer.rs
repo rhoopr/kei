@@ -106,6 +106,7 @@ pub(super) fn prepare_metadata_xmp_toolkit(
         .with_context(|| format!("Could not fingerprint {}", tmp_path.display()))?
         .fingerprint;
     Ok(PreparedMetadataFile {
+        required_mtime: None,
         guard,
         expected_input: expected,
         expected_output: output,

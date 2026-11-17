@@ -23,6 +23,86 @@ fn prepare(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf, Jo
 }
 
 #[test]
+fn local_policy_journal_checks_displaced_mtime_and_restores_on_race() {
+    let expected = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let changed = expected + std::time::Duration::from_secs(60);
+    for stage in [Stage::Prepared, Stage::Displaced, Stage::Installed] {
+        let dir = TempDir::new().unwrap();
+        let (target, part, mut journal) = prepare(dir.path());
+        fs::File::open(&target)
+            .unwrap()
+            .set_modified(expected)
+            .unwrap();
+        assert!(
+            super::publish_journal_with_mtime(&journal, Some(expected), |current| {
+                if current == stage {
+                    let path = if current == Stage::Prepared {
+                        &target
+                    } else {
+                        journal.original.path()
+                    };
+                    fs::File::open(path)?.set_modified(changed)?;
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!journal.commit.path().exists());
+        journal.recover().unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert_eq!(fs::metadata(&target).unwrap().modified().unwrap(), changed);
+        assert_eq!(fs::read(&part).unwrap(), b"replacement");
+        drop(journal);
+        recover_target(&target).unwrap();
+        assert_eq!(fs::metadata(&target).unwrap().modified().unwrap(), changed);
+    }
+}
+
+#[test]
+fn local_policy_journal_publishes_with_exact_time_and_recovers_interruption() {
+    let expected = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    for stage in [
+        Stage::Prepared,
+        Stage::Displaced,
+        Stage::Installed,
+        Stage::Committed,
+    ] {
+        let dir = TempDir::new().unwrap();
+        let (target, part, journal) = prepare(dir.path());
+        fs::File::open(&target)
+            .unwrap()
+            .set_modified(expected)
+            .unwrap();
+        assert!(
+            super::publish_journal_with_mtime(&journal, Some(expected), |current| {
+                anyhow::ensure!(current != stage, "interrupted fixture");
+                Ok(())
+            })
+            .is_err()
+        );
+        drop(journal);
+        recover_target(&target).unwrap();
+        if stage == Stage::Committed {
+            assert_eq!(fs::read(&target).unwrap(), b"replacement");
+        } else {
+            assert_eq!(fs::read(&target).unwrap(), b"original");
+            assert_eq!(fs::metadata(&target).unwrap().modified().unwrap(), expected);
+            super::publish_with_mtime(
+                &part,
+                &target,
+                fingerprint_regular_file_blocking(&target).unwrap(),
+                fingerprint_regular_file_blocking(&part).unwrap(),
+                Some(expected),
+            )
+            .unwrap();
+            assert_eq!(fs::read(&target).unwrap(), b"replacement");
+        }
+        recover_target(&target).unwrap();
+        assert!(!directory_path(&target).unwrap().exists());
+    }
+}
+
+#[test]
 fn manifest_round_trip_preserves_non_utf8_target_and_fingerprints() {
     let expected = Manifest {
         version: super::FORMAT_VERSION,
@@ -377,6 +457,9 @@ fn unsupported_rename_flags_exercise_the_production_publication_routes() {
         + FLAGS_ARGUMENT * std::mem::size_of::<u64>()
         + if cfg!(target_endian = "big") { 4 } else { 0 };
     let routes = [
+        "sync_loop::runner::tests::primary_layout::local_policy_adjusted_still_requires_strictly_newer_cloud_time",
+        #[cfg(feature = "xmp")]
+        "sync_loop::runner::tests::primary_layout::local_policy_metadata_keeps_preserved_disposition_and_mtime",
         "download::file::replacement::tests::approved_truncated_publish_replaces_only_expected_bytes",
         #[cfg(feature = "xmp")]
         "download::metadata::sidecar::tests::write_sidecar_creates_xmp_file_next_to_media",

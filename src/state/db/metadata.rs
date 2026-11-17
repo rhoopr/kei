@@ -290,7 +290,7 @@ fn query_selection_and_legacy_metadata(
             json_extract(g.specification,'$.metadata_flags') AS flags,
             row_number() OVER (writer ORDER BY (w.prepared_hash IS NULL),w.generation,w.pass_key,w.child) AS representative
         FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation
-        WHERE w.admitted=1 AND w.verified_media=1 AND w.verified_metadata=0
+        WHERE w.admitted=1 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL) AND w.verified_metadata=0
             AND w.grouping_hash IS NOT NULL AND g.metadata_enabled=1 {generation_filter}
             AND EXISTS(SELECT 1 FROM assets a WHERE a.library=w.library AND a.id=w.asset_id
                 AND a.version_size=w.version_size AND a.checksum=w.checksum
@@ -299,6 +299,8 @@ fn query_selection_and_legacy_metadata(
         WINDOW writer AS (PARTITION BY g.scope,w.library,w.asset_id,w.master,
             w.version_size,w.path,w.checksum,w.size_bytes,w.created_at,w.added_at,
             w.metadata_hash,w.local_checksum,w.source_checksum,w.grouping_hash,
+            (w.preserved_local IS NOT NULL),json_extract(w.preserved_local,'$.size'),
+            json_extract(w.preserved_local,'$.modified'),
             json_extract(g.specification,'$.metadata_flags'))
     ) SELECT kind,generation,pass_key,child,library,id,version_size,path FROM (
         SELECT 0 AS kind,'' AS generation,'' AS pass_key,'' AS child,library,id,version_size,
@@ -306,10 +308,14 @@ fn query_selection_and_legacy_metadata(
         FROM ({source}) rewrite_source WHERE metadata_write_failed_at IS NOT NULL AND status='downloaded'
             AND is_deleted=0 AND local_path IS NOT NULL {legacy_filter}
             AND NOT EXISTS(SELECT 1 FROM unattributed_legacy u WHERE u.library=rewrite_source.library AND u.asset_id=rewrite_source.id)
+            AND NOT EXISTS(SELECT 1 FROM provider_active_destinations preserved
+                WHERE preserved.library=rewrite_source.library AND preserved.asset_id=rewrite_source.id
+                AND preserved.version_size=rewrite_source.version_size AND preserved.compat_path=rewrite_source.local_path
+                AND preserved.admitted=1 AND preserved.preserved_local IS NOT NULL)
             AND NOT EXISTS(SELECT 1 FROM provider_active_destinations w
                 JOIN provider_active_generations g ON g.id=w.generation
                 WHERE w.library=rewrite_source.library AND w.asset_id=rewrite_source.id
-                AND w.version_size=rewrite_source.version_size AND w.admitted=1 AND w.verified_media=1
+                AND w.version_size=rewrite_source.version_size AND w.admitted=1 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL)
                 AND w.verified_metadata=0 AND g.metadata_enabled=1
                 AND w.compat_path=rewrite_source.local_path
                 AND json_extract(w.path,'$.encoding')='utf8' AND json_extract(w.path,'$.path')=rewrite_source.local_path
@@ -1009,6 +1015,18 @@ impl SqliteStateDb {
             let tx = conn
                 .transaction()
                 .map_err(|e| StateError::query("finish_metadata_rewrite::begin", e))?;
+            if selection_pending.selection_receipt.as_ref().is_some_and(|receipt| receipt.preserved_local.is_some()) {
+                let completed = super::provider_generations::finish_metadata_receipt(
+                    &tx, &selection_pending, local_checksum.as_deref(),
+                    completion.clears(MetadataRewriteQueue::Ordinary),
+                )?;
+                if completed == Some(true) {
+                    tx.execute("UPDATE asset_metadata_paths SET metadata_write_failed_at=NULL WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4", rusqlite::params![library,asset_id,version_size,path.to_str()])?;
+                    tx.execute("UPDATE assets SET metadata_write_failed_at=NULL WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4", rusqlite::params![library,asset_id,version_size,path.to_str()])?;
+                }
+                tx.commit()?;
+                return Ok(completed.unwrap_or(false));
+            }
             let target = metadata_rewrite_target(&tx, &library, &asset_id, &version_size, &path)?;
             let updated = if let Some(target) = target {
                 let (table, evidence) = target.sql();
@@ -1078,6 +1096,14 @@ impl SqliteStateDb {
                 local_checksum.as_deref(),
                 completion.clears(MetadataRewriteQueue::Ordinary),
             )?;
+            if selected.is_none() && updated > 0 && local_checksum.is_some() {
+                // Legacy completion has no validated native selection receipt.
+                // Retire obsolete native authority rather than lending a lossy
+                // catalogue path's output to an independent copy.
+                super::provider_generations::replace_current_publication(
+                    &tx, &library, &super::provider_selection::SelectionPath::from_path(&path).key()?, None,
+                )?;
+            }
             tx.commit()
                 .map_err(|e| StateError::query("finish_metadata_rewrite::commit", e))?;
             Ok(selected.unwrap_or(updated > 0 && completion.clears(selected_queue)))

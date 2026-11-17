@@ -167,6 +167,7 @@ pub(super) fn prepare_metadata_native(
         .with_context(|| format!("Could not fsync {}", tmp_path.display()))?;
     drop(file);
     Ok(PreparedMetadataFile {
+        required_mtime: None,
         guard,
         expected_input: expected,
         expected_output: output_fingerprint,

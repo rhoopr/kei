@@ -302,6 +302,8 @@ async fn file_receipt(
     source_checksum: Option<String>,
 ) -> Result<LayoutFile> {
     Ok(LayoutFile {
+        local_preserved: false,
+        local_modified: None,
         path: SelectionPath::from_path(path),
         version: version.to_owned(),
         provider_checksum: checksum.to_owned(),
@@ -313,6 +315,15 @@ async fn file_receipt(
     })
 }
 async fn validate_file(root: &Path, file: &LayoutFile) -> Result<()> {
+    if let Some(expected) = file.local_modified {
+        let retained = file::retain_pending_file(root, &file.path.to_path())
+            .await?
+            .context("Missing local layout file")?;
+        anyhow::ensure!(
+            retained.modified.map(chrono::DateTime::<chrono::Utc>::from) == Some(expected),
+            "Owned layout modification time changed locally"
+        );
+    }
     anyhow::ensure!(
         snapshot(root, &file.path.to_path()).await?.as_ref() == Some(&file.fingerprint),
         "Owned layout file changed locally"
@@ -544,7 +555,9 @@ async fn acknowledge_binding(
         guards.push(file::lock_download_destination(path, cancel).await?);
     }
     for file in &binding.files {
-        validate_file(&config.directory, file).await?;
+        if validate_file(&config.directory, file).await.is_err() {
+            return Ok(false);
+        }
         if config.selection_run.is_some()
             && filter::derive_expected_paths(asset, config)
                 .iter()
@@ -772,9 +785,14 @@ async fn plan(
                 !record.checksum.is_empty(),
                 "Legacy layout media has no trusted provider rendition"
             );
+            let locally_changed = data_encoding::HEXLOWER.encode(&actual.sha256) != checksum;
             anyhow::ensure!(
-                data_encoding::HEXLOWER.encode(&actual.sha256) == checksum,
-                "Legacy layout media changed locally"
+                !locally_changed
+                    || filter::derive_expected_paths(asset, config)
+                        .iter()
+                        .any(|derived| derived.version_size == record.version_size
+                            && derived.path == *path),
+                "Changed legacy media cannot be relocated to another rendition slot"
             );
             anyhow::ensure!(
                 session.owners(path)?.any(|owner| {
@@ -788,7 +806,7 @@ async fn plan(
                 "Ambiguous legacy primary path owner"
             );
             if oldfiles.iter().all(|f| f.path.to_path() != *path) {
-                let file = file_receipt(
+                let mut file = file_receipt(
                     &config.directory,
                     path,
                     record.version_size.as_str(),
@@ -796,6 +814,10 @@ async fn plan(
                     record.download_checksum.clone(),
                 )
                 .await?;
+                file.local_preserved = locally_changed;
+                if locally_changed {
+                    file.source_checksum = None;
+                }
                 anyhow::ensure!(
                     file.fingerprint == actual,
                     "Legacy layout media changed during ownership verification"
@@ -804,9 +826,36 @@ async fn plan(
             }
         }
     }
-    for file in &oldfiles {
-        validate_file(&config.directory, file).await?;
+    let mut present = Vec::with_capacity(oldfiles.len());
+    for mut old in oldfiles {
+        let Some(current) =
+            file::retain_pending_file(&config.directory, &old.path.to_path()).await?
+        else {
+            continue;
+        };
+        let changed = current.fingerprint.sha256 != old.fingerprint.sha256
+            || current.fingerprint.size != old.fingerprint.size;
+        if changed || old.local_preserved {
+            let mut observed = file_receipt(
+                &config.directory,
+                &old.path.to_path(),
+                &old.version,
+                &old.provider_checksum,
+                None,
+            )
+            .await?;
+            observed.local_preserved = true;
+            observed.local_modified = current.modified.map(chrono::DateTime::<chrono::Utc>::from);
+            observed.archive_original = old.archive_original;
+            old = observed;
+        } else {
+            old.local_modified = None;
+        }
+        current.validate().await?;
+        validate_file(&config.directory, &old).await?;
+        present.push(old);
     }
+    oldfiles = present;
     let paths = filter::derive_expected_paths(asset, config);
     let preview_claims = if persist {
         Default::default()
@@ -1199,11 +1248,25 @@ async fn prepare(
             .iter()
             .filter_map(|m| m.old.as_ref())
             .find(|old| {
-                old.version == record.version_size.as_str()
+                !old.local_preserved
+                    && old.version == record.version_size.as_str()
                     && old.provider_checksum == record.checksum.as_ref()
             })
             .cloned();
-        let source = if let Some(source) = owned {
+        let local_source = member
+            .old
+            .as_ref()
+            .filter(|old| {
+                old.local_preserved
+                    && asset
+                        .media_modified_at(record.version_size)
+                        .zip(old.local_modified)
+                        .is_none_or(|(cloud, local)| cloud <= local)
+            })
+            .cloned();
+        let source = if let Some(source) = local_source {
+            Some(source)
+        } else if let Some(source) = owned {
             Some(source)
         } else {
             let mut found = None;
@@ -1247,6 +1310,17 @@ async fn prepare(
                 &source.fingerprint,
             )
             .await?;
+            if source.local_preserved {
+                if let Some(modified) = source.local_modified {
+                    file::primary_layout::keep_modified(&config.directory, &stage, modified.into())
+                        .await?;
+                } else {
+                    anyhow::ensure!(
+                        crate::download::pipeline::MetadataFlags::from(config).is_empty(),
+                        "Preserved layout metadata requires a known local modification time"
+                    );
+                }
+            }
             if let Some(xmp) = &source.sidecar {
                 copy_verified(
                     &config.directory,
@@ -1284,14 +1358,20 @@ async fn prepare(
                     "Prepared primary metadata remains incomplete"
                 );
             }
-            file_receipt(
+            let mut prepared = file_receipt(
                 &config.directory,
                 &stage,
                 record.version_size.as_str(),
                 &record.checksum,
                 source.source_checksum,
             )
-            .await?
+            .await?;
+            prepared.local_preserved = source.local_preserved;
+            prepared.local_modified = source
+                .local_preserved
+                .then_some(source.local_modified)
+                .flatten();
+            prepared
         } else {
             anyhow::ensure!(
                 !cancel.is_cancelled(),
@@ -1420,6 +1500,9 @@ pub(in crate::download) async fn finish(
             .context("Missing archive reservation")?
             .to_path();
         let media = copy_verified(&root, &old.path.to_path(), &path, &old.fingerprint).await?;
+        if let Some(modified) = old.local_modified {
+            file::primary_layout::keep_modified(&root, &path, modified.into()).await?;
+        }
         let xmp = if let Some(xmp) = &old.sidecar {
             Some(copy_verified(&root, &sidecar(&old.path.to_path()), &sidecar(&path), xmp).await?)
         } else {
@@ -1483,12 +1566,15 @@ pub(in crate::download) async fn finish(
                         .preserved
                         .as_ref()
                         .context("Missing preservation proof")?;
-                    Some(ManagedPrimaryAuthorization::preserved(
-                        op.operation.clone(),
-                        old.fingerprint.clone(),
-                        preserved.path.to_path(),
-                        preserved.fingerprint.clone(),
-                    )?)
+                    Some(
+                        ManagedPrimaryAuthorization::preserved(
+                            op.operation.clone(),
+                            old.fingerprint.clone(),
+                            preserved.path.to_path(),
+                            preserved.fingerprint.clone(),
+                        )?
+                        .with_modified(old.local_modified.map(Into::into)),
+                    )
                 } else {
                     None
                 };

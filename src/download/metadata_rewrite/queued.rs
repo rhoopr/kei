@@ -395,7 +395,24 @@ where
         // Only an embedded write touches media bytes, so the drain needs the
         // pre-write hash to tell its own rewrite apart from damage that
         // arrived some other way.
-        let pre_rewrite_fingerprint = if metadata_flags.any_embed() {
+        let preserved_local = pending_rewrite
+            .selection_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.preserved_local.as_ref());
+        if let Some(preserved) = preserved_local {
+            let current_time = tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(chrono::DateTime::<chrono::Utc>::from);
+            if current_time != preserved.modified
+                || (embed_writable && preserved.modified.is_none())
+            {
+                skipped_drifted += 1;
+                continue;
+            }
+        }
+        let pre_rewrite_fingerprint = if metadata_flags.any_embed() || preserved_local.is_some() {
             match crate::download::file::fingerprint_regular_file(&path).await {
                 Ok(fingerprint) => Some(fingerprint),
                 Err(e) => {
@@ -488,6 +505,18 @@ where
             .await
             {
                 EmbedPrepareResult::Prepared(prepared) => {
+                    let prepared =
+                        if let Some(modified) = preserved_local.and_then(|local| local.modified) {
+                            match prepared.require_mtime(modified.into()).await {
+                                Ok(prepared) => prepared,
+                                Err(_) => {
+                                    errored += 1;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            prepared
+                        };
                     if selected_queue == MetadataRewriteQueue::Ordinary
                         && pending_rewrite.capture_repair_receipt.is_some()
                     {
@@ -635,6 +664,17 @@ where
         }
 
         let ordinary_complete = !outcome.any_failed() && !recovered_capture_only;
+        if let Some(preserved) = preserved_local {
+            let current_time = tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(chrono::DateTime::<chrono::Utc>::from);
+            if current_time != preserved.modified {
+                skipped_drifted += 1;
+                continue;
+            }
+        }
         let capture_complete =
             selected_queue == MetadataRewriteQueue::CaptureRepair && capture_embed_complete;
         let completion = match selected_queue {

@@ -187,6 +187,7 @@ pub(super) fn prepare_metadata_heif(
             .with_context(|| format!("Could not fsync permissions on {}", tmp_path.display()))?;
         drop(file);
         Ok(PreparedMetadataFile {
+            required_mtime: None,
             guard,
             expected_input: expected,
             expected_output: rewritten_fingerprint,

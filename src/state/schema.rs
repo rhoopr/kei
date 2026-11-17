@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 38;
+pub(crate) const SCHEMA_VERSION: i32 = 39;
 const FRESH_START_VERSION: i32 = 38;
 
 /// Retire provider planning authority once, without interpreting historical
@@ -1503,6 +1503,17 @@ pub(crate) fn migrate_to_version(
         // The owning migration transaction retires historical plans before
         // running any historical data interpretation steps.
         38 => {}
+        39 => {
+            if !column_exists(conn, "provider_active_destinations", "current_publication")? {
+                conn.execute_batch("ALTER TABLE provider_active_destinations ADD COLUMN current_publication INTEGER NOT NULL DEFAULT 0 CHECK(current_publication IN (0,1));")?;
+            }
+            conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_current_native_publication ON provider_active_destinations(library,path) WHERE current_publication=1;")?;
+            if !column_exists(conn, "provider_active_destinations", "preserved_local")? {
+                conn.execute_batch(
+                    "ALTER TABLE provider_active_destinations ADD COLUMN preserved_local BLOB;",
+                )?;
+            }
+        }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1648,6 +1659,65 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn preserved_local_migration_keeps_v38_active_and_archived_evidence() {
+        let conn = historical_provider_fixture(38);
+        conn.execute_batch("CREATE TABLE historical_v030_provider_shadow_pages(body BLOB); INSERT INTO historical_v030_provider_shadow_pages VALUES(X'00ff');").unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert!(column_exists(&conn, "provider_active_destinations", "preserved_local").unwrap());
+        assert!(
+            column_exists(&conn, "provider_active_destinations", "current_publication").unwrap()
+        );
+        let authority: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM provider_active_destinations WHERE current_publication<>0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            authority, 0,
+            "migration cannot infer publication order from history"
+        );
+        let row: (String, Option<Vec<u8>>) = conn.query_row(
+            "SELECT path,preserved_local FROM provider_active_destinations WHERE generation='old'", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(row, ("retained-native-path".to_owned(), None));
+        let evidence = serde_json::to_vec(&serde_json::json!({
+            "intent": "ab".repeat(32), "checksum": "cd".repeat(32),
+            "size": 42, "modified": "2023-11-14T22:13:20Z"
+        }))
+        .unwrap();
+        conn.execute(
+            "UPDATE provider_active_destinations SET preserved_local=?1 WHERE generation='old'",
+            [&evidence],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            migrate(&conn).unwrap();
+            let retained: Vec<u8> = conn.query_row("SELECT preserved_local FROM provider_active_destinations WHERE generation='old'", [], |row| row.get(0)).unwrap();
+            assert_eq!(retained, evidence);
+            let raw: Vec<u8> = conn
+                .query_row(
+                    "SELECT body FROM historical_v030_provider_shadow_pages",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(raw, [0, 255]);
+            let live: Vec<u8> = conn
+                .query_row(
+                    "SELECT specification FROM provider_active_generations WHERE id='old'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(live, [0, 255]);
+        }
     }
 
     #[test]

@@ -165,7 +165,8 @@ where
     D: DownloadStateStore + ?Sized,
 {
     let durable_error = match task.publication() {
-        super::file::FinalPublication::NoReplace => error,
+        super::file::FinalPublication::NoReplace
+        | super::file::FinalPublication::ReplaceLocal { .. } => error,
         super::file::FinalPublication::ReplaceTruncated(_) => {
             crate::commands::reconcile::FILE_TRUNCATED_REASON
         }
@@ -874,11 +875,14 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
         seed_pending(&db, "FINAL_REPAIR", "repair.jpg").await;
         let mut task = task("FINAL_REPAIR", PathBuf::from("repair.jpg"));
-        task.replacement_fingerprint =
-            Some(Arc::new(crate::download::file::ExistingFileFingerprint {
-                size: 3,
-                sha256: [7; 32],
-            }));
+        task.replacement_fingerprint = Some(Arc::new(
+            crate::download::file::FinalPublication::ReplaceTruncated(
+                crate::download::file::ExistingFileFingerprint {
+                    size: 3,
+                    sha256: [7; 32],
+                },
+            ),
+        ));
 
         finalize_failed(&db, &Arc::from(LIBRARY), &task, "network failed")
             .await
@@ -890,5 +894,27 @@ mod tests {
             failed[0].last_error.as_deref(),
             Some(crate::commands::reconcile::FILE_TRUNCATED_REASON)
         );
+    }
+
+    #[tokio::test]
+    async fn local_policy_failure_cannot_authorize_truncated_repair() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        seed_pending(&db, "FINAL_LOCAL", "local.jpg").await;
+        let mut task = task("FINAL_LOCAL", PathBuf::from("local.jpg"));
+        task.replacement_fingerprint = Some(Arc::new(
+            crate::download::file::FinalPublication::ReplaceLocal {
+                fingerprint: crate::download::file::ExistingFileFingerprint {
+                    size: 3,
+                    sha256: [7; 32],
+                },
+                modified: Some(std::time::UNIX_EPOCH),
+            },
+        ));
+        finalize_failed(&db, &Arc::from(LIBRARY), &task, "local input changed")
+            .await
+            .unwrap();
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].last_error.as_deref(), Some("local input changed"));
     }
 }

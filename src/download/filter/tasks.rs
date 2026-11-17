@@ -6,7 +6,7 @@ use std::sync::Arc;
 use chrono::{DateTime, FixedOffset, Local};
 use rustc_hash::FxHashMap;
 
-use crate::download::file::{ExistingFileFingerprint, FinalPublication};
+use crate::download::file::FinalPublication;
 use crate::download::{DownloadConfig, paths};
 use crate::state::{MediaType, VersionSizeKey};
 use crate::types::FileMatchPolicy;
@@ -35,10 +35,10 @@ pub(in crate::download) struct DownloadTask {
     // Heap types first
     pub(in crate::download) url: Box<str>,
     pub(in crate::download) download_path: PathBuf,
-    /// Only truncated repair stores a replacement authorization. Sharing the
+    /// Only authorized replacement stores publication evidence. Sharing the
     /// immutable fingerprint keeps platform task layouts within the existing
     /// budget; ordinary no-replace tasks do not allocate this evidence.
-    pub(in crate::download) replacement_fingerprint: Option<Arc<ExistingFileFingerprint>>,
+    pub(in crate::download) replacement_fingerprint: Option<Arc<FinalPublication>>,
     /// Only cross-parent reserved pending recovery retains publication proof
     /// through finalization; ordinary task policy is unchanged. Clones share
     /// the original current-root association.
@@ -79,7 +79,7 @@ impl DownloadTask {
     /// fingerprint variant inline in every queued task.
     pub(in crate::download) fn publication(&self) -> FinalPublication {
         match &self.replacement_fingerprint {
-            Some(expected) => FinalPublication::ReplaceTruncated(**expected),
+            Some(expected) => **expected,
             None => FinalPublication::NoReplace,
         }
     }

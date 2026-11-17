@@ -462,8 +462,7 @@ async fn indexing_managed_pending_journal_is_held_even_under_suffix_then_recover
 }
 
 #[tokio::test]
-async fn indexing_managed_local_modification_holds_materialization_and_foreign_collision_is_preserved()
- {
+async fn indexing_managed_local_modification_resolves_and_foreign_collision_is_preserved() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     cycle(
@@ -511,13 +510,12 @@ async fn indexing_managed_local_modification_holds_materialization_and_foreign_c
             options(&readiness("FINISHED")),
         )
         .await;
-        assert!(!held.can_advance_database_checkpoint(), "{:?}", held.stats);
-        assert_hold(root.path(), &cursor, false, true);
+        assert!(held.can_advance_database_checkpoint(), "{:?}", held.stats);
+        assert_hold(root.path(), "cycle-token", false, false);
         assert_bytes(&target.join("IMG_0501.JPG"), local);
         assert_bytes(&target.join("IMG_0502.JPG"), foreign);
     }
-    // Test-fixture operator restores exactly the original owned bytes.
-    std::fs::write(target.join("IMG_0501.JPG"), ORIGINAL).unwrap();
+    // Reopening retains the policy-resolved local copy without operator repair.
     let (recovered, _) = cycle_options(
         root.path(),
         current,
@@ -529,7 +527,7 @@ async fn indexing_managed_local_modification_holds_materialization_and_foreign_c
     assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
     assert!(recovered.can_advance_database_checkpoint());
     assert_hold(root.path(), "cycle-token", false, false);
-    assert_bytes(&target.join("IMG_0501.JPG"), EDIT_ONE);
+    assert_bytes(&target.join("IMG_0501.JPG"), local);
     assert_bytes(&target.join("IMG_0502.JPG"), foreign);
     assert!(
         media(root.path()).into_iter().any(|(path, bytes)| path

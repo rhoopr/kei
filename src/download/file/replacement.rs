@@ -76,6 +76,11 @@ pub(in crate::download) enum FinalPublication {
     NoReplace,
     /// Replace only the exact truncated bytes authorized by retry planning.
     ReplaceTruncated(ExistingFileFingerprint),
+    /// Replace one selected local copy after its byte and time policy was checked.
+    ReplaceLocal {
+        fingerprint: ExistingFileFingerprint,
+        modified: Option<std::time::SystemTime>,
+    },
 }
 
 /// Publish a prepared file only while the destination still matches the
@@ -118,10 +123,24 @@ pub(super) async fn replace_file_if_unchanged(
     let part_path = part_path.to_path_buf();
     let final_path = final_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        replace_file_if_unchanged_blocking(&part_path, &final_path, expected, None)
+        replace_file_if_unchanged_blocking(&part_path, &final_path, expected, None, None)
     })
     .await
     .map_err(std::io::Error::other)?
+}
+
+pub(super) async fn replace_local_file_if_unchanged(
+    part_path: &Path,
+    final_path: &Path,
+    fingerprint: ExistingFileFingerprint,
+    modified: Option<std::time::SystemTime>,
+) -> anyhow::Result<()> {
+    let part_path = part_path.to_path_buf();
+    let final_path = final_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        replace_file_if_unchanged_blocking(&part_path, &final_path, fingerprint, None, modified)
+    })
+    .await?
 }
 
 pub(in crate::download) fn publish_file_if_unchanged_blocking(
@@ -130,7 +149,29 @@ pub(in crate::download) fn publish_file_if_unchanged_blocking(
     expected: ExistingFileFingerprint,
     expected_replacement: ExistingFileFingerprint,
 ) -> anyhow::Result<()> {
-    replace_file_if_unchanged_blocking(part_path, final_path, expected, Some(expected_replacement))
+    replace_file_if_unchanged_blocking(
+        part_path,
+        final_path,
+        expected,
+        Some(expected_replacement),
+        None,
+    )
+}
+
+pub(in crate::download) fn publish_file_if_unchanged_at_mtime_blocking(
+    part_path: &Path,
+    final_path: &Path,
+    expected: ExistingFileFingerprint,
+    expected_replacement: ExistingFileFingerprint,
+    modified: std::time::SystemTime,
+) -> anyhow::Result<()> {
+    replace_file_if_unchanged_blocking(
+        part_path,
+        final_path,
+        expected,
+        Some(expected_replacement),
+        Some(modified),
+    )
 }
 
 fn replace_file_if_unchanged_blocking(
@@ -138,6 +179,7 @@ fn replace_file_if_unchanged_blocking(
     final_path: &Path,
     expected: ExistingFileFingerprint,
     expected_replacement: Option<ExistingFileFingerprint>,
+    modified: Option<std::time::SystemTime>,
 ) -> anyhow::Result<()> {
     let current = match fingerprint_regular_file_blocking(final_path) {
         Ok(current) => current,
@@ -147,7 +189,14 @@ fn replace_file_if_unchanged_blocking(
             });
         }
     };
-    if current != expected {
+    if current != expected
+        || modified.is_some_and(|time| {
+            std::fs::metadata(final_path)
+                .and_then(|m| m.modified())
+                .ok()
+                != Some(time)
+        })
+    {
         return Err(ConditionalPublishTargetChanged::AfterPlanning {
             path: final_path.to_path_buf(),
         }
@@ -180,17 +229,24 @@ fn replace_file_if_unchanged_blocking(
     if crate::test_helpers::process_death_force_journal()
         || super::replacement_recovery::tests::terminal_fixture_active(part_path)
     {
-        return super::replacement_recovery::publish(part_path, final_path, expected, replacement);
+        return super::replacement_recovery::publish_with_mtime(
+            part_path,
+            final_path,
+            expected,
+            replacement,
+            modified,
+        );
     }
     let displaced_path = match exchange_repair_files_blocking(part_path, final_path, expected) {
         Ok(displaced_path) => displaced_path,
         #[cfg(target_os = "linux")]
         Err(error) if classify_conditional_publish_error(&error).filesystem_unsupported => {
-            return super::replacement_recovery::publish(
+            return super::replacement_recovery::publish_with_mtime(
                 part_path,
                 final_path,
                 expected,
                 replacement,
+                modified,
             );
         }
         Err(error) if classify_conditional_publish_error(&error).target_changed => {
@@ -276,7 +332,14 @@ fn replace_file_if_unchanged_blocking(
             };
         }
     };
-    if displaced != expected {
+    if displaced != expected
+        || modified.is_some_and(|time| {
+            std::fs::metadata(&displaced_path)
+                .and_then(|m| m.modified())
+                .ok()
+                != Some(time)
+        })
+    {
         let restore_result = restore_repair_target_if_unchanged_blocking(
             part_path,
             final_path,

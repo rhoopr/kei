@@ -11,6 +11,57 @@ use super::{
 };
 
 #[tokio::test]
+async fn local_policy_publication_rejects_byte_and_mtime_races() {
+    for mtime_only in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("copy.jpg");
+        let part = dir.path().join("copy.part");
+        std::fs::write(&target, b"local bytes").unwrap();
+        std::fs::write(&part, b"cloud bytes").unwrap();
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let fingerprint = fingerprint_file(&target).await.unwrap();
+        let (expected, time) = if mtime_only {
+            (
+                b"local bytes".as_slice(),
+                modified + std::time::Duration::from_secs(60),
+            )
+        } else {
+            std::fs::write(&target, b"other bytes").unwrap();
+            (b"other bytes".as_slice(), modified)
+        };
+        std::fs::File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+        let error = publish_part_to_final(
+            &part,
+            &target,
+            FinalPublication::ReplaceLocal {
+                fingerprint,
+                modified: Some(modified),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(classify_conditional_publish_error(&error).target_changed);
+        assert_eq!(std::fs::read(&target).unwrap(), expected);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().modified().unwrap(),
+            time
+        );
+        assert_eq!(std::fs::read(&part).unwrap(), b"cloud bytes");
+    }
+}
+
+#[tokio::test]
 async fn approved_truncated_publish_replaces_only_expected_bytes() {
     let dir = TempDir::new().unwrap();
     let part = dir.path().join("photo.part");

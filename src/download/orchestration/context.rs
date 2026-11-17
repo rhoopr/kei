@@ -239,10 +239,15 @@ impl DownloadContext {
         if evidence.matches_provider_version(task)
             && evidence.local_path_under(&config.directory) == Some(task.download_path.as_path())
         {
-            task.replacement_fingerprint = evidence
-                .truncated_repair_fingerprint(true)
-                .await?
-                .map(Arc::new);
+            task.replacement_fingerprint =
+                evidence
+                    .truncated_repair_fingerprint(true)
+                    .await?
+                    .map(|fingerprint| {
+                        Arc::new(crate::download::file::FinalPublication::ReplaceTruncated(
+                            fingerprint,
+                        ))
+                    });
         }
         Ok(())
     }
