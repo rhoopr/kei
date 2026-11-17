@@ -593,13 +593,26 @@ impl DownloadConfig {
     /// with `--folder-structure "{album}/..."` still produce the same
     /// on-disk tree.
     pub(crate) fn with_pass(&self, pass: &crate::commands::AlbumPass) -> Self {
-        let folder_structure = filter::folder_structure_for_pass(
+        let mut folder_structure = filter::folder_structure_for_pass(
             &self.folder_structure,
             &self.folder_structure_albums,
             &self.folder_structure_smart_folders,
             &self.library,
             pass,
         );
+        if pass.kind == crate::commands::PassKind::Album
+            && self.folder_structure_albums.contains("{album}")
+            && let Some(context) = &self.selection_context
+            && let Some(container) = pass.album.container_id()
+            && let Some(directory) = context.album_directory(container)
+        {
+            folder_structure = crate::download::paths::expand_named_token(
+                &self.folder_structure_albums,
+                "{library}",
+                Some(crate::download::paths::truncate_library_zone(&self.library)),
+            )
+            .replace("{album}", directory);
+        }
         Self {
             primary_layout_source: Some(Arc::new(pass.album.clone())),
             primary_layout_pass: Some(super::generation::pass_key(pass)),

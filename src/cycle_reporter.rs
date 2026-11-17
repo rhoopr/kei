@@ -209,9 +209,12 @@ where
         health: &mut HealthStatus,
         input: CycleFacts<'_>,
     ) {
-        crate::support::complete(input.stats, input.status.as_report_str());
         let friendly_summary = self.friendly_summary().await;
         self.report_friendly_output(&input, friendly_summary.as_ref());
+        if self.run_options.dry_run {
+            return;
+        }
+        crate::support::complete(input.stats, input.status.as_report_str());
         self.update_health(health, &input);
         self.update_metrics(health, &input, friendly_summary.as_ref())
             .await;

@@ -2298,7 +2298,7 @@ impl Respond for DeletedBoundAlbumPhotos {
         let mode = self.mode.load(Ordering::SeqCst);
         let body: Value = serde_json::from_slice(&request.body).unwrap();
         let kind = body.pointer("/query/recordType").and_then(Value::as_str);
-        if mode != 0 && kind == Some("CPLAlbumByPositionLive") {
+        if mode != 0 && mode != 5 && kind == Some("CPLAlbumByPositionLive") {
             return ResponseTemplate::new(200).set_body_json(if mode == 3 {
                 json!({"serverErrorCode":"INCOMPLETE_DISCOVERY"})
             } else {
@@ -2311,7 +2311,7 @@ impl Respond for DeletedBoundAlbumPhotos {
                 .and_then(Value::as_str)
                 == Some("family-folder");
             let (id, name, album_type) = if nested {
-                ("A", "A", 0)
+                ("A", if mode == 5 { "Renamed" } else { "A" }, 0)
             } else {
                 ("family-folder", "Family", 3)
             };
@@ -2384,6 +2384,165 @@ impl Respond for DeletedBoundAlbumPhotos {
             return ResponseTemplate::new(200).set_body_json(json!({"records":PrivateSelectionCliPhotos::members(scope).into_iter().skip(offset).take(limit).flat_map(pair).collect::<Vec<_>>(),"syncToken":"private-observational-rank"}));
         }
         self.photos.respond(request)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated HTTPS media proxy and test CA via KEI_TEST_HTTPS_PROXY and KEI_TEST_CA"]
+async fn renamed_bound_album_actual_cli_preserves_user_tree_and_native_authority() {
+    use std::sync::atomic::Ordering;
+    fn snapshot_tree(root: &Path) -> Vec<(PathBuf, bool, Vec<u8>, std::time::SystemTime)> {
+        let mut result = Vec::new();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            let path = entry.path();
+            let bytes = if metadata.is_dir() {
+                Vec::new()
+            } else {
+                std::fs::read(&path).unwrap()
+            };
+            result.push((
+                path.clone(),
+                metadata.is_dir(),
+                bytes,
+                metadata.modified().unwrap(),
+            ));
+            if metadata.is_dir() {
+                result.extend(snapshot_tree(&path));
+            }
+        }
+        result.sort_by(|left, right| left.0.cmp(&right.0));
+        result
+    }
+    let proxy = std::env::var("KEI_TEST_HTTPS_PROXY").unwrap();
+    let ca = std::env::var("KEI_TEST_CA").unwrap();
+    let server = MockServer::start().await;
+    let photos = DeletedBoundAlbumPhotos {
+        photos: PrivateSelectionCliPhotos {
+            ranks: Default::default(),
+            rank_cycles: Default::default(),
+            lookups: Default::default(),
+            checks: Default::default(),
+        },
+        mode: Default::default(),
+        album_lookups: Default::default(),
+        media_url: "https://p01.icloud-content.com/media".into(),
+    };
+    Mock::given(method("POST"))
+        .respond_with(photos.clone())
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = seed(root, ACCOUNTS[0], "A", &server.uri());
+    let conn = Connection::open(&account.path).unwrap();
+    conn.execute_batch("UPDATE assets SET library='OldUnknownScope' WHERE id='retry'; DELETE FROM metadata WHERE key='pending_sync_token:old:PrimarySync';").unwrap();
+    drop(conn);
+    let config = std::fs::read_to_string(&account.config).unwrap().replace("[ui]", "folder_structure=\"\"\nfolder_structure_albums=\"{album}\"\n[filters]\nalbums=[\"Family/A\"]\nunfiled=false\n[ui]");
+    std::fs::write(&account.config, &config).unwrap();
+    let command = |args: &[&str]| {
+        clean_cmd()
+            .env("KEI_DATA_DIR", root)
+            .env("ICLOUD_USERNAME", account.username)
+            .env("HTTPS_PROXY", &proxy)
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("SSL_CERT_FILE", &ca)
+            .args(["--config", account.config.to_str().unwrap()])
+            .args(args)
+            .timeout(Duration::from_secs(30))
+            .output()
+            .unwrap()
+    };
+    success(&command(&["sync", "--no-progress-bar"]));
+    let media = account.media.parent().unwrap();
+    let old = media.join("Family/A");
+    std::fs::write(old.join("user.txt"), b"retain user entry").unwrap();
+    photos.mode.store(5, Ordering::SeqCst);
+    std::fs::write(
+        &account.config,
+        config.replace("Family/A", "Family/Renamed"),
+    )
+    .unwrap();
+    let mut stable = None;
+    let writable_config = std::fs::read_to_string(&account.config).unwrap();
+    let pid = root.join("preview.pid");
+    std::fs::write(&pid, b"retained invalid pid").unwrap();
+    let preview_config = format!(
+        "{writable_config}\n[watch]\npid_file={}\n",
+        toml::Value::String(pid.to_string_lossy().into_owned())
+    );
+    #[cfg(unix)]
+    let preview_config = {
+        let mut preview_config = preview_config;
+        use std::os::unix::fs::PermissionsExt;
+        let script = root.join("preview-notification.sh");
+        let marker = root.join("preview-notification-fired");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf fired > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        preview_config.push_str(&format!(
+            "[notifications]\nscript={}\n",
+            toml::Value::String(script.to_string_lossy().into_owned())
+        ));
+        preview_config
+    };
+    std::fs::write(&account.config, preview_config).unwrap();
+    let before_preview = snapshot_tree(root);
+    for flag in ["--dry-run", "--only-print-filenames"] {
+        for prefix in [vec!["sync"], vec!["service", "run"]] {
+            let mut args = prefix;
+            args.extend([flag, "--no-progress-bar"]);
+            let output = command(&args);
+            success(&output);
+            if flag == "--only-print-filenames" {
+                let text = String::from_utf8_lossy(&output.stdout).replace('\\', "/");
+                assert!(text.contains("Family/Renamed/private-0.JPG"), "{text}");
+                assert!(text.contains("Family/Renamed/private-1.JPG"), "{text}");
+            }
+            assert_eq!(
+                snapshot_tree(root),
+                before_preview,
+                "{flag} changed local state"
+            );
+        }
+    }
+    std::fs::write(&account.config, writable_config).unwrap();
+    for _ in 0..3 {
+        success(&command(&["sync", "--no-progress-bar"]));
+        assert!(!old.exists());
+        let renamed = media.join("Family/Renamed");
+        assert_eq!(
+            std::fs::read(renamed.join("user.txt")).unwrap(),
+            b"retain user entry"
+        );
+        for number in 0..2 {
+            assert_eq!(
+                std::fs::read(renamed.join(format!("private-{number}.JPG"))).unwrap(),
+                QUIET_MEDIA
+            );
+        }
+        let conn = Connection::open(&account.path).unwrap();
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT COUNT(*) FROM provider_active_destinations WHERE current_publication=1 AND replace(compat_path,char(92),'/') LIKE '%/Renamed/%'", [], |row| row.get(0)).unwrap(), 2);
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT COUNT(*) FROM provider_active_destinations WHERE current_publication=1 AND replace(compat_path,char(92),'/') LIKE '%/A/%'", [], |row| row.get(0)).unwrap(), 0);
+        let snapshot = (
+            rows(
+                &account.path,
+                "SELECT * FROM primary_layout_operations ORDER BY operation",
+            ),
+            rows(
+                &account.path,
+                "SELECT * FROM primary_layout_members ORDER BY operation,member",
+            ),
+            photos.photos.ranks.load(Ordering::SeqCst),
+        );
+        if let Some(previous) = &stable {
+            assert_eq!(&snapshot, previous);
+        }
+        stable = Some(snapshot);
     }
 }
 

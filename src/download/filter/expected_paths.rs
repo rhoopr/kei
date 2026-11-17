@@ -800,11 +800,55 @@ pub(in crate::download) fn derive_expected_paths(
             .iter()
             .any(|seen| seen.as_ref() == mov.url.as_ref())
         {
-            return apply_primary_naming(asset, config, &ctx, out);
+            return apply_album_binding(
+                asset,
+                config,
+                apply_primary_naming(asset, config, &ctx, out),
+            );
         }
         out.push(mov);
     }
-    apply_primary_naming(asset, config, &ctx, out)
+    apply_album_binding(
+        asset,
+        config,
+        apply_primary_naming(asset, config, &ctx, out),
+    )
+}
+
+fn apply_album_binding(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &(impl PathDerivationSource + ?Sized),
+    mut paths: Vec<DerivedPath>,
+) -> Vec<DerivedPath> {
+    for path in &mut paths {
+        apply_album_path(asset, config, path);
+    }
+    paths
+}
+
+pub(super) fn apply_album_path(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &(impl PathDerivationSource + ?Sized),
+    path: &mut DerivedPath,
+) {
+    if let Some(bound) = config.album_bound_path(
+        asset.source_zone(),
+        asset.state_id(),
+        path.version_size.as_str(),
+    ) {
+        if config.edited_naming() == crate::types::EditedNaming::Primary {
+            // The active primary policy owns rendition names and promotion.
+            // Album routing supplies only the established parent directory.
+            path.path = bound.with_file_name(&path.filename);
+            return;
+        }
+        if let Some(name) = bound.file_name().and_then(|name| name.to_str()) {
+            path.filename = name.to_owned();
+        }
+        path.path = bound;
+    } else if let Some(parent) = config.album_bound_parent(asset.source_zone(), asset.state_id()) {
+        path.path = parent.join(&path.filename);
+    }
 }
 
 fn apply_primary_naming(

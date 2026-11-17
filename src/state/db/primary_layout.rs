@@ -1,5 +1,7 @@
 //! Preservation-backed primary layout journals. Historical receipts are immutable.
 
+pub(crate) mod directory;
+
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -95,6 +97,9 @@ pub(crate) struct LayoutMember {
     pub(crate) path_key: Option<String>,
     pub(crate) stage: Option<SelectionPath>,
     pub(crate) old: Option<LayoutFile>,
+    /// A selected bound media file is absent; its surviving sidecar remains owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) missing: Option<LayoutFile>,
     pub(crate) archive_source: Option<LayoutFile>,
     pub(crate) preserved_path: Option<SelectionPath>,
     pub(crate) retirement: Option<SelectionPath>,
@@ -158,7 +163,7 @@ fn invalid(detail: impl Into<String>) -> StateError {
         detail: detail.into(),
     }
 }
-fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, StateError> {
+pub(super) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, StateError> {
     let bytes = serde_json::to_vec(value).map_err(|_error| invalid("invalid layout evidence"))?;
     if bytes.len() > 1024 * 1024 {
         return Err(invalid("layout member exceeds evidence budget"));
@@ -192,6 +197,11 @@ pub(super) fn guard_slot(
     checksum: &str,
     path: &std::path::Path,
 ) -> Result<(), StateError> {
+    if directory::fences_path(conn, path)? {
+        return Err(invalid(
+            "album directory transition fences this historical path",
+        ));
+    }
     let slot: Option<(String,String,String,String,Option<String>)> = conn.query_row(
         "SELECT library,child,version,provider_checksum,operation FROM primary_layout_claims WHERE path_key=?1",
         [path_key(path)?], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
@@ -279,6 +289,9 @@ pub(super) fn path_is_managed(
     conn: &Connection,
     path: &std::path::Path,
 ) -> Result<bool, StateError> {
+    if directory::fences_path(conn, path)? {
+        return Ok(true);
+    }
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM primary_layout_claims WHERE path_key=?1)",
         [path_key(path)?],
@@ -321,7 +334,7 @@ impl SqliteStateDb {
         library: String,
     ) -> Result<Vec<LayoutOperation>, StateError> {
         self.with_conn("primary_layout_operations", move |conn| {
-            let mut stmt=conn.prepare("SELECT header FROM primary_layout_operations WHERE source_library=?1 AND phase NOT IN ('committed','cancelled') ORDER BY operation")?;
+            let mut stmt=conn.prepare("SELECT header FROM primary_layout_operations WHERE source_library=?1 AND policy<>'album-directory-v1' AND phase NOT IN ('committed','cancelled') ORDER BY operation")?;
             let headers=stmt.query_map([&library],|r|r.get::<_,Vec<u8>>(0))?.collect::<Result<Vec<_>,_>>()?;
             let mut result=Vec::new();
             for header in headers {
@@ -377,6 +390,12 @@ impl SqliteStateDb {
             if (op.members.is_empty() && !op.is_membership_retirement()) || op.members.len()>16 || op.phase!="planned" || op.generation<0 || !matches!(op.policy.as_str(),"primary"|"suffix") { return Err(invalid("invalid layout plan")); }
             let mut destinations=std::collections::HashSet::new();
             for member in &op.members {
+                if let Some(missing) = &member.missing
+                    && (member.old.is_some() || member.destination.as_ref() != Some(&missing.path)
+                        || member.record.as_ref().is_none_or(|record| record.version_size.as_str()!=missing.version)
+                        || (missing.sidecar.is_some() && member.preserved_path.is_none())) {
+                        return Err(invalid("missing media recovery differs from its bound rendition"));
+                }
                 if let Some(record)=&member.record
                     && (record.library.as_ref()!=op.library || record.id.as_ref()!=op.child || member.destination.is_none() || member.stage.is_none()) {
                     return Err(invalid("layout member has inconsistent rendition scope"));
@@ -412,6 +431,16 @@ impl SqliteStateDb {
                 }
                 // Fence omitted changed members until atomic binding release.
                 tx.execute("UPDATE primary_layout_claims SET operation=?1 WHERE family=?2",params![op.operation,op.family])?;
+            }
+            if op.members.iter().any(|member| member.missing.is_some()) {
+                let bytes: Vec<u8> = tx.query_row("SELECT binding FROM primary_layout_bindings WHERE family=?1", [&op.family], |row| row.get(0))?;
+                let binding: LayoutBinding = decode(&bytes)?;
+                for missing in op.members.iter().filter_map(|member| member.missing.as_ref()) {
+                    let expected = encode(missing)?;
+                    if !binding.files.iter().any(|file| encode(file).is_ok_and(|bytes| bytes == expected)) {
+                        return Err(invalid("missing media proof is not the current bound file"));
+                    }
+                }
             }
             let mut header=op.clone();header.members.clear();
             tx.execute("INSERT INTO primary_layout_operations(operation,family,library,source_library,prior_generation,decision,policy,phase,header) VALUES(?1,?2,?3,?4,?5,?6,?7,'planned',?8)",params![op.operation,op.family,op.library,op.source_library,op.generation,op.decision,op.policy,encode(&header)?])?;
@@ -691,6 +720,7 @@ mod tests {
             qualifier: "-stable-qualifier".into(),
             phase: "planned".into(),
             members: vec![LayoutMember {
+                missing: None,
                 record: Some(record),
                 destination: Some(SelectionPath::from_path(&destination)),
                 path_key: Some(path_key(&destination).unwrap()),
@@ -704,6 +734,29 @@ mod tests {
                 installed: None,
             }],
         }
+    }
+
+    #[test]
+    fn primary_layout_missing_member_preserves_legacy_encoding() {
+        let root = tempfile::tempdir().unwrap();
+        let mut op = fixture(root.path());
+        let legacy = encode(&op).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&legacy).unwrap();
+        assert!(value["members"][0].get("missing").is_none());
+        assert_eq!(
+            encode(&decode::<LayoutOperation>(&legacy).unwrap()).unwrap(),
+            legacy
+        );
+        op.members[0].missing = op.members[0].old.take();
+        let bytes = encode(&op).unwrap();
+        assert_eq!(
+            encode(&decode::<LayoutOperation>(&bytes).unwrap()).unwrap(),
+            bytes
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["members"][0]["missing"]
+                .is_object()
+        );
     }
 
     #[test]

@@ -509,8 +509,9 @@ pub struct Session {
     home_endpoint: String,
     /// API client timeout (preserved for `reset_http_clients`).
     api_timeout: Duration,
-    state_guard: Arc<SessionStateGuard>,
+    state_guard: Option<Arc<SessionStateGuard>>,
     loaded_persisted_auth: bool,
+    validation_cache_usable: bool,
     principal: Option<String>,
 }
 
@@ -551,7 +552,7 @@ impl Session {
             &crate::account::namespace(username, realm),
             home_endpoint,
             None,
-            guard,
+            Some(guard),
             false,
         )
         .await
@@ -599,24 +600,48 @@ impl Session {
             &sanitized,
             home_endpoint,
             timeout_secs,
-            state_guard,
+            Some(state_guard),
             loaded_persisted_auth,
         )
         .await
     }
 
+    /// Load authentication for a preview without acquiring a writable lock or persisting responses.
+    pub(crate) async fn new_read_only(
+        cookie_dir: &Path,
+        username: &str,
+        home_endpoint: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<Self> {
+        let realm = realm_for_home(home_endpoint)?;
+        let sanitized = crate::account::namespace(username, realm);
+        let loaded = persisted_auth_files(cookie_dir, username, realm)[..2]
+            .iter()
+            .any(|path| path.exists());
+        Self::build(
+            cookie_dir.to_path_buf(),
+            &sanitized,
+            home_endpoint,
+            timeout_secs,
+            None,
+            loaded,
+        )
+        .await
+    }
+
     /// Shared constructor body: loads cookies/session from disk, builds HTTP
-    /// clients, and assembles the `Session`. Callers provide the lock file.
+    /// clients, and assembles the `Session`. Only writable callers supply an account guard.
     async fn build(
         cookie_dir: PathBuf,
         sanitized: &str,
         home_endpoint: &str,
         timeout_secs: Option<u64>,
-        state_guard: Arc<SessionStateGuard>,
+        state_guard: Option<Arc<SessionStateGuard>>,
         loaded_persisted_auth: bool,
     ) -> Result<Self> {
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
         let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
+        let mut validation_cache_usable = true;
 
         let cookiejar_path = cookie_dir.join(sanitized);
         if cookiejar_path.is_file() {
@@ -642,11 +667,12 @@ impl Session {
                         #[cfg(unix)]
                         {
                             use std::os::unix::fs::PermissionsExt;
-                            if let Err(e) = fs::set_permissions(
-                                &cookiejar_path,
-                                std::fs::Permissions::from_mode(0o600),
-                            )
-                            .await
+                            if state_guard.is_some()
+                                && let Err(e) = fs::set_permissions(
+                                    &cookiejar_path,
+                                    std::fs::Permissions::from_mode(0o600),
+                                )
+                                .await
                             {
                                 tracing::warn!(
                                     error = %e,
@@ -657,14 +683,17 @@ impl Session {
                         tracing::debug!(path = %cookiejar_path.display(), "Read cookies");
                     }
                     Err(e) => {
+                        validation_cache_usable = false;
                         tracing::warn!(
                             path = %cookiejar_path.display(),
                             error = %e,
-                            "Cookiejar file is not valid JSON; removing cookies and validation cache"
+                            "Cookiejar file is not valid JSON; ignoring cached cookies"
                         );
-                        crate::fs_util::log_remove_async(&cookiejar_path).await;
-                        let cache_path = cookie_dir.join(format!("{sanitized}.cache"));
-                        crate::fs_util::log_remove_async(&cache_path).await;
+                        if state_guard.is_some() {
+                            crate::fs_util::log_remove_async(&cookiejar_path).await;
+                            let cache_path = cookie_dir.join(format!("{sanitized}.cache"));
+                            crate::fs_util::log_remove_async(&cache_path).await;
+                        }
                     }
                 },
                 Err(e) => {
@@ -728,6 +757,7 @@ impl Session {
             api_timeout: timeout,
             state_guard,
             loaded_persisted_auth,
+            validation_cache_usable,
             principal: None,
         })
     }
@@ -782,6 +812,9 @@ impl Session {
         &self,
         grace_secs: i64,
     ) -> Option<super::responses::AccountLoginResponse> {
+        if !self.validation_cache_usable {
+            return None;
+        }
         let path = self.cache_path();
         let contents = fs::read_to_string(&path).await.ok()?;
         let cache: super::responses::ValidationCache = serde_json::from_str(&contents).ok()?;
@@ -806,6 +839,9 @@ impl Session {
         &self,
         data: &super::responses::AccountLoginResponse,
     ) {
+        if self.state_guard.is_none() {
+            return;
+        }
         let cache = super::responses::ValidationCache {
             validated_at: chrono::Utc::now().timestamp(),
             account_data: data.clone(),
@@ -833,7 +869,9 @@ impl Session {
     /// Release the exclusive file lock without dropping the Session.
     /// This allows a new Session to acquire the lock (e.g. during re-authentication).
     pub(crate) fn release_lock(&self) -> Result<()> {
-        self.state_guard.release()
+        self.state_guard
+            .as_ref()
+            .map_or(Ok(()), |guard| guard.release())
     }
 
     /// Re-acquire the exclusive file lock after a prior `release_lock()`.
@@ -841,7 +879,9 @@ impl Session {
     /// Returns `Err(AuthError::LockContention)` if another process acquired
     /// the lock in the interim (e.g. a concurrent `get-code` or `submit-code`).
     pub(crate) fn reacquire_lock(&self) -> Result<()> {
-        self.state_guard.reacquire()
+        self.state_guard
+            .as_ref()
+            .map_or(Ok(()), |guard| guard.reacquire())
     }
 
     pub(crate) fn loaded_persisted_auth(&self) -> bool {
@@ -849,11 +889,17 @@ impl Session {
     }
 
     pub(crate) fn generation(&self) -> SessionGeneration {
-        self.state_guard.generation()
+        self.state_guard
+            .as_ref()
+            .map_or(SessionGeneration(0), |guard| guard.generation())
     }
 
     pub(crate) async fn discard_persisted_auth(&self) -> Result<Vec<PathBuf>> {
-        self.state_guard.discard().await
+        self.state_guard
+            .as_ref()
+            .context("Cannot discard authentication during a read-only preview")?
+            .discard()
+            .await
     }
 
     pub fn client_id(&self) -> Option<&str> {
@@ -931,6 +977,9 @@ impl Session {
             }
         }
 
+        if self.state_guard.is_none() {
+            return Ok(());
+        }
         if session_changed {
             let session_path = self.session_path();
             let json = serde_json::to_string_pretty(&self.session_data)?;
@@ -1096,7 +1145,7 @@ pub(crate) mod lock_inheritance {
             reason = "post-fork child is a single syscall-only protocol with no Rust cleanup"
         )]
         pub(crate) fn fork(session: &super::Session) -> Self {
-            let fd = session.state_guard.lock_file.as_raw_fd();
+            let fd = session.state_guard.as_ref().unwrap().lock_file.as_raw_fd();
             let path = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).unwrap();
             let (parent, child) = UnixStream::pair().unwrap();
             parent
@@ -1223,6 +1272,66 @@ pub(crate) mod lock_inheritance {
 mod tests {
     use super::*;
     use crate::auth::{self, responses};
+
+    #[tokio::test]
+    async fn read_only_session_keeps_response_updates_in_memory() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("x-apple-session-token", "preview-token"),
+            )
+            .mount(&server)
+            .await;
+        let temp = tempfile::tempdir().unwrap();
+        let absent = temp.path().join("absent");
+        let mut session =
+            Session::new_read_only(&absent, "preview@example.invalid", &server.uri(), None)
+                .await
+                .unwrap();
+        session.get(&server.uri(), None).await.unwrap();
+        assert_eq!(
+            session
+                .session_data
+                .get("session_token")
+                .map(String::as_str),
+            Some("preview-token")
+        );
+        let account: responses::AccountLoginResponse =
+            serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"preview"}})).unwrap();
+        session.save_validation_cache(&account).await;
+        assert!(!absent.exists());
+        assert!(session.discard_persisted_auth().await.is_err());
+
+        let files = persisted_auth_files(temp.path(), "preview@example.invalid", "com");
+        std::fs::write(&files[0], b"invalid cookies").unwrap();
+        std::fs::write(&files[2], b"retained cache").unwrap();
+        let before: Vec<_> = files
+            .iter()
+            .filter(|path| path.exists())
+            .map(|path| {
+                (
+                    path.clone(),
+                    std::fs::read(path).unwrap(),
+                    std::fs::metadata(path).unwrap().modified().unwrap(),
+                )
+            })
+            .collect();
+        let session =
+            Session::new_read_only(temp.path(), "preview@example.invalid", &server.uri(), None)
+                .await
+                .unwrap();
+        assert!(session.load_validation_cache(i64::MAX).await.is_none());
+        session.save_validation_cache(&account).await;
+        for (path, bytes, modified) in before {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                modified
+            );
+        }
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
 
     /// Return a unique temp directory for a session test.
     ///

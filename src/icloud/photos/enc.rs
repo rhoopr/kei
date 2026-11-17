@@ -87,6 +87,20 @@ pub fn decode_string(fields: &Value, key: &str) -> Option<String> {
     }
 }
 
+/// A provider identifier is not a fallback display name or rename authority.
+pub(super) fn album_name(fields: &Value) -> Option<String> {
+    decode_string(fields, "albumNameEnc")
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            fields
+                .get("albumName")?
+                .get("value")?
+                .as_str()
+                .filter(|name| !name.trim().is_empty())
+                .map(ToOwned::to_owned)
+        })
+}
+
 /// Decode `keywordsEnc`: base64 -> binary plist containing an array of strings.
 /// Returns the keyword list or `None` if absent / malformed.
 pub fn decode_keywords(fields: &Value) -> Option<Vec<String>> {

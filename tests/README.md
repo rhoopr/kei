@@ -36,6 +36,8 @@ tests/
 
 ## Test catalog
 
+The `album_directory_` runner tests cover exclusive moves and independent-file fallback, modified local media, unclaimed legacy trees, dated and library-prefixed paths, hierarchy-parent changes, retained edit history, sidecars, occupied destinations, publication failures, and SIGKILL recovery. Each completed transition checks quiet reopens and checkpoint settlement. `primary_layout_missing_member_preserves_legacy_encoding` checks compatibility of missing-primary recovery evidence.
+
 `retired_selection_settings_refuse_before_provider_or_state_writes` runs the real CLI with empty, nonempty and malformed retired filename restrictions and both retired edited-naming values. It checks actionable refusal, unchanged config/database/media bytes and zero provider requests. Filtered-work recovery fixtures use fixed-date bounds; bounded inventory retains its cursor until the expanded selection completes. Managed-layout tests retain established paths under the new suffix default, including read-only previews, edits, metadata updates, interrupted publication, indexing recovery and quiet reopens.
 
 `rendition_migration_refuses_before_provider_or_state_writes` runs sync,
@@ -79,6 +81,10 @@ The three live Rust integration targets also contain offline tests. Without `--i
 they run shared helper tests; `import_existing_live` also checks fixture
 isolation, command construction, and rejection of a removed CLI flag. These
 offline tests run in `just test offline` and `just gate` without credentials.
+
+## Album directory transition checks
+
+`cargo test --lib album_directory_ -- --test-threads=1` covers exclusive initial binding, normal-sync rename with foreign-target collisions, current source ownership, retained historical receipts, current-path missing-file repair, failed state finalization, and Linux SIGKILL recovery before movement, after movement, and after parent durability. Run the same filter with `--no-default-features` for the native build. Successful transitions reopen for two quiet cycles. The schema test checks migration from schema 39 with native authority, preserved-local evidence and pending layout bytes retained across two reopens. The subprocess parent owns the ignored `album_directory_process_death_child` test and its private fixture environment; do not run that child directly. Directory tests use synthetic provider responses and local media. `cargo test --lib album_discovery_` and `cargo test --lib album_delta_` check usable provider names, duplicate leaves, tombstones, and checkpoint refusal for malformed live names.
 
 ## HEIF streaming allocation regression
 
@@ -1370,7 +1376,7 @@ mutations before unchanged success.
 
 `behavioral::released_upgrade::released_v0240_history_preserves_durable_evidence_through_upgrade`
 starts from the SQL schema emitted by the official v0.24.0 Linux x86_64
-binary (schema 25), then executes the current production CLI through schema 39.
+binary (schema 25), then executes the current production CLI through schema 40.
 The fixture contains no captured user data. SQL explicitly reconstructs a
 synthetic history with original and edited renditions, repeated IDs in two
 libraries, a local removal, metadata debt, an unfinished sync ledger row,

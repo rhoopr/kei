@@ -217,6 +217,7 @@ pub(in crate::download::orchestration) async fn reconcile(
                             path_key: None,
                             stage: None,
                             old: Some(old.clone()),
+                            missing: None,
                             archive_source: None,
                             preserved_path: Some(preserved),
                             retirement: Some(SelectionPath::from_path(&retired)),

@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 39;
+pub(crate) const SCHEMA_VERSION: i32 = 40;
 const FRESH_START_VERSION: i32 = 38;
 
 /// Retire provider planning authority once, without interpreting historical
@@ -1514,6 +1514,13 @@ pub(crate) fn migrate_to_version(
                 )?;
             }
         }
+        40 => {
+            if !column_exists(conn, "album_containers", "directory_binding")? {
+                conn.execute_batch(
+                    "ALTER TABLE album_containers ADD COLUMN directory_binding BLOB;",
+                )?;
+            }
+        }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1559,8 +1566,12 @@ mod tests {
     }
     fn historical_provider_fixture(version: i32) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        for version in 1..=version {
-            migrate_to_version(&conn, 0, version).unwrap();
+        seed_historical_provider_fixture(&conn, version);
+        conn
+    }
+    fn seed_historical_provider_fixture(conn: &Connection, version: i32) {
+        for target in 1..=version {
+            migrate_to_version(conn, 0, target).unwrap();
         }
         conn.pragma_update(None, "foreign_keys", true).unwrap();
         conn.execute_batch(
@@ -1582,8 +1593,8 @@ mod tests {
                         'retained-native-path','retained.jpg','old-resource',12,1,'old-metadata',1);
              INSERT INTO metadata VALUES ('sync_token:PrimarySync',X'00ff');
              INSERT INTO metadata VALUES ('unrelated-setting','keep');",
-        ).unwrap();
-        conn
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1752,6 +1763,211 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cursor, [0, 255]);
+    }
+
+    #[test]
+    fn album_directory_upgrade_preserves_pending_layout_and_container_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schema39.db");
+        let evidence = b"preserved-local\0\xff";
+        let header = b"retained-layout-header\0\xff";
+        {
+            let conn = Connection::open(&path).unwrap();
+            seed_historical_provider_fixture(&conn, 39);
+            assert_eq!(get_schema_version(&conn).unwrap(), 39);
+            assert!(
+                !column_exists(&conn, "album_containers", "directory_binding").unwrap(),
+                "schema 39 must not carry the directory binding"
+            );
+            conn.execute_batch(
+                "INSERT INTO album_containers
+                    (library,container_id,album_name,pass_kind,is_deleted,updated_at)
+                 VALUES
+                    ('PrimarySync','album','Old','album',0,123),
+                    ('SharedSync-OTHER','album-2','Other','album',1,456);
+                 INSERT INTO album_membership_snapshots
+                    (library,container_id,generation,status,enum_config_hash,started_at,completed_at)
+                 VALUES ('PrimarySync','album',2,'complete','config-hash',1,2);
+                 INSERT INTO asset_album_memberships
+                    (library,asset_record_name,master_record_name,container_id,generation,
+                     is_deleted,source,updated_at)
+                 VALUES ('PrimarySync','asset','master','album',2,0,'xmp',5);",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO primary_layout_operations(operation,family,library,source_library,prior_generation,decision,policy,phase,header) VALUES('old','family','PrimarySync','PrimarySync',1,'decision','primary','publishing',?1)", [header.as_slice()]).unwrap();
+            conn.execute(
+                "UPDATE provider_active_destinations
+                    SET current_publication=1,preserved_local=?1
+                  WHERE generation='old'",
+                [evidence.as_slice()],
+            )
+            .unwrap();
+        }
+
+        for reopen in 0..2 {
+            let conn = Connection::open(&path).unwrap();
+            migrate(&conn).unwrap();
+            assert_eq!(
+                get_schema_version(&conn).unwrap(),
+                SCHEMA_VERSION,
+                "reopen {reopen}"
+            );
+            assert!(column_exists(&conn, "album_containers", "directory_binding").unwrap());
+            let binding_type: String = conn
+                .query_row(
+                    "SELECT type FROM pragma_table_info('album_containers')
+                      WHERE name='directory_binding'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(binding_type, "BLOB", "reopen {reopen}");
+            assert_eq!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM album_containers WHERE directory_binding IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+                0,
+                "reopen {reopen}"
+            );
+            let albums: Vec<(String, String, i64, i64)> = conn
+                .prepare(
+                    "SELECT container_id,album_name,is_deleted,updated_at
+                       FROM album_containers ORDER BY container_id",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                albums,
+                vec![
+                    ("album".into(), "Old".into(), 0, 123),
+                    ("album-2".into(), "Other".into(), 1, 456),
+                ],
+                "reopen {reopen}"
+            );
+            let snapshot: (String, Option<String>, i64) = conn
+                .query_row(
+                    "SELECT status,enum_config_hash,completed_at
+                       FROM album_membership_snapshots
+                      WHERE library='PrimarySync' AND container_id='album' AND generation=2",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                snapshot,
+                ("complete".into(), Some("config-hash".into()), 2),
+                "reopen {reopen}"
+            );
+            let membership: (Option<String>, i64, String) = conn
+                .query_row(
+                    "SELECT master_record_name,is_deleted,source
+                       FROM asset_album_memberships
+                      WHERE library='PrimarySync' AND asset_record_name='asset'
+                        AND container_id='album'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                membership,
+                (Some("master".into()), 0, "xmp".into()),
+                "reopen {reopen}"
+            );
+
+            for column in ["current_publication", "preserved_local"] {
+                assert!(
+                    column_exists(&conn, "provider_active_destinations", column).unwrap(),
+                    "reopen {reopen}"
+                );
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM sqlite_schema
+                      WHERE type='index' AND name='idx_current_native_publication'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "reopen {reopen}"
+            );
+            let authority: (String, i64, Option<Vec<u8>>) = conn
+                .query_row(
+                    "SELECT path,current_publication,preserved_local
+                       FROM provider_active_destinations WHERE generation='old'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                authority,
+                ("retained-native-path".into(), 1, Some(evidence.to_vec())),
+                "reopen {reopen}"
+            );
+
+            let shadow: Vec<u8> = conn
+                .query_row("SELECT body FROM provider_shadow_pages", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(shadow, [0, 255], "reopen {reopen}");
+            let specification: Vec<u8> = conn
+                .query_row(
+                    "SELECT specification FROM provider_active_generations WHERE id='old'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(specification, [0, 255], "reopen {reopen}");
+            let manifest: Vec<u8> = conn
+                .query_row(
+                    "SELECT manifest FROM provider_active_decisions WHERE generation='old'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(manifest, [0, 255], "reopen {reopen}");
+            let cursor: Vec<u8> = conn
+                .query_row(
+                    "SELECT CAST(value AS BLOB) FROM metadata WHERE key='sync_token:PrimarySync'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(cursor, [0, 255], "reopen {reopen}");
+
+            let retained: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT header FROM primary_layout_operations WHERE operation='old'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                retained.as_deref(),
+                Some(header.as_slice()),
+                "reopen {reopen}"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM primary_layout_operations
+                      WHERE operation='old' AND phase='publishing'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "reopen {reopen}"
+            );
+        }
     }
 
     #[test]

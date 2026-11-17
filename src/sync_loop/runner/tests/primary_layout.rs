@@ -22,6 +22,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const ORIGINAL: &[u8] = b"\xff\xd8\xff\xe0original immutable bytes";
 const EDIT_ONE: &[u8] = b"\xff\xd8\xff\xe0first adjusted independent bytes";
 const EDIT_TWO: &[u8] = b"\xff\xd8\xff\xe0second adjusted independent bytes";
+mod directory_authority;
 mod indexing;
 mod membership;
 
@@ -50,6 +51,16 @@ fn fixture_owner() -> state::db::account::AccountOwner {
 }
 fn records(server: &MockServer, edit: Option<(&str, &[u8])>) -> Vec<Value> {
     records_at(&server.uri(), edit)
+}
+
+fn second_date_records(server: &MockServer) -> Vec<Value> {
+    let mut second = records(server, None);
+    second[0]["recordName"] = json!("502");
+    second[0]["fields"]["filenameEnc"]["value"] = json!("IMG_0502.JPG");
+    second[1]["recordName"] = json!("asset-502");
+    second[1]["fields"]["masterRef"]["value"]["recordName"] = json!("502");
+    second[1]["fields"]["assetDate"]["value"] = json!(1731628800000_i64);
+    second
 }
 fn records_at(uri: &str, edit: Option<(&str, &[u8])>) -> Vec<Value> {
     let mut page = full_album_page_with_download(
@@ -220,11 +231,13 @@ async fn cycle_resolution(
 struct CycleOptions {
     exif_description: bool,
     second_album: bool,
+    album_name: &'static str,
     expected_due_selection: Option<bool>,
     indexing: Option<IndexingOptions>,
     refresh_metadata: bool,
     media_directory: &'static str,
     folder_structure: &'static str,
+    shared_folder_structure: Option<&'static str>,
     pass_kind: PassKind,
     resolution: crate::types::PhotoResolution,
     #[cfg(feature = "xmp")]
@@ -241,11 +254,13 @@ impl Default for CycleOptions {
         Self {
             exif_description: false,
             second_album: false,
+            album_name: "TestAlbum",
             expected_due_selection: None,
             indexing: None,
             refresh_metadata: false,
             media_directory: "media",
             folder_structure: "",
+            shared_folder_structure: None,
             pass_kind: PassKind::Unfiled,
             resolution: crate::types::PhotoResolution::Original,
             #[cfg(feature = "xmp")]
@@ -295,7 +310,7 @@ async fn try_cycle_options(
     );
     let (name, list_type, obj_type, query_filter) = match options.pass_kind {
         PassKind::Album => (
-            "TestAlbum",
+            options.album_name,
             "CPLContainerRelationLiveByAssetDate",
             "CPLContainerRelationNotDeletedByAssetDate:album-501",
             Some(Arc::new(
@@ -372,6 +387,35 @@ async fn try_cycle_options(
             exclude_ids: Arc::default(),
         });
     }
+    if options.shared_folder_structure.is_some() {
+        let mut shared = crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::default(),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from("Hidden"),
+                list_type: Arc::from("CPLAssetAndMasterHiddenByAssetDate"),
+                obj_type: Arc::from("CPLAssetHiddenByAssetDate"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(
+                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                ),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(provider.clone()),
+        );
+        shared.set_shadow_capture(
+            crate::icloud::photos::inbox::ShadowCapture::new(inner.clone(), fixture_owner(), "com"),
+            Arc::from("private"),
+        );
+        passes.push(AlbumPass {
+            kind: PassKind::SmartFolder,
+            album: shared,
+            exclude_ids: Arc::default(),
+        });
+    }
     let mut library =
         make_run_cycle_library_state_with_passes("PrimarySync", "sync_token:PrimarySync", passes);
     library.library = if let Some(indexing) = &options.indexing {
@@ -416,16 +460,29 @@ async fn try_cycle_options(
         }
         config.live_photo_mov_filename_policy = options.mov_policy;
         config.live_photo_mode = options.live_mode;
-        config.folder_structure = options.folder_structure.to_owned();
+        config.folder_structure = options
+            .shared_folder_structure
+            .unwrap_or(options.folder_structure)
+            .to_owned();
         config.folder_structure_albums = Arc::from(options.folder_structure);
-        config.folder_structure_smart_folders = Arc::from(options.folder_structure);
+        config.folder_structure_smart_folders = Arc::from(
+            options
+                .shared_folder_structure
+                .unwrap_or(options.folder_structure),
+        );
         Arc::new(config.clone())
     };
     let mut config = make_run_cycle_config();
     config.download.directory = media.clone();
-    config.download.folder_structure = options.folder_structure.to_owned();
+    config.download.folder_structure = options
+        .shared_folder_structure
+        .unwrap_or(options.folder_structure)
+        .to_owned();
     config.download.folder_structure_albums = options.folder_structure.to_owned();
-    config.download.folder_structure_smart_folders = options.folder_structure.to_owned();
+    config.download.folder_structure_smart_folders = options
+        .shared_folder_structure
+        .unwrap_or(options.folder_structure)
+        .to_owned();
     config.runtime.refresh_metadata = options.refresh_metadata;
     config.metadata.set_exif_description = options.exif_description;
     config.photos.edited = true;
@@ -472,7 +529,12 @@ async fn try_cycle_options(
     Ok((result, lookups.load(Ordering::SeqCst)))
 }
 fn assert_bytes(path: &std::path::Path, bytes: &[u8]) {
-    assert_eq!(std::fs::read(path).unwrap(), bytes, "{}", path.display());
+    assert_eq!(
+        std::fs::read(path).unwrap_or_else(|error| panic!("{}: {error}", path.display())),
+        bytes,
+        "{}",
+        path.display()
+    );
 }
 
 #[tokio::test]
@@ -1324,6 +1386,1604 @@ async fn server() -> MockServer {
             .await;
     }
     server
+}
+
+fn album_directory_options(name: &'static str) -> CycleOptions {
+    CycleOptions {
+        album_name: name,
+        pass_kind: PassKind::Album,
+        folder_structure: "{album}",
+        ..CycleOptions::default()
+    }
+}
+
+fn retained_album_manifests(root: &std::path::Path) -> Vec<Vec<u8>> {
+    let conn = rusqlite::Connection::open(root.join("state.db")).unwrap();
+    conn.prepare(
+        "SELECT manifest FROM provider_active_decisions ORDER BY generation,pass_key,child",
+    )
+    .unwrap()
+    .query_map([], |row| row.get(0))
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+fn album_path_receipts(root: &std::path::Path, path: &std::path::Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(root.join("state.db")).unwrap();
+    let prefix = path.to_string_lossy().into_owned();
+    conn.prepare("SELECT json_array(library,id,version_size,local_path,provider_checksum,local_checksum,download_checksum,metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size,source_checksum) FROM asset_metadata_paths WHERE instr(local_path,?1)=1 ORDER BY library,id,version_size,local_path")
+        .unwrap().query_map([prefix], |row| row.get(0)).unwrap().collect::<Result<_,_>>().unwrap()
+}
+
+fn old_album_receipts(root: &std::path::Path) -> Vec<String> {
+    album_path_receipts(root, &root.join("media").join("Old"))
+}
+
+fn album_decision_rows(root: &std::path::Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(root.join("state.db")).unwrap();
+    conn.prepare("SELECT json_array(generation,pass_key,child,hex(manifest),admission,reason) FROM provider_active_decisions ORDER BY generation,pass_key,child")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+fn album_admitted_rows(root: &std::path::Path) -> Vec<(String, String, String, bool)> {
+    let conn = rusqlite::Connection::open(root.join("state.db")).unwrap();
+    conn.prepare("SELECT generation,pass_key,child,admitted FROM provider_active_destinations WHERE admitted=1 ORDER BY generation,pass_key,child")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn album_directory_conflicting_historical_receipt_does_not_veto_owned_rename() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let provider = records(&server, None);
+    let old = root.path().join("media/Old");
+    let next = root.path().join("media/New");
+    let (first, _) = cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Suffix,
+        album_directory_options("Old"),
+    )
+    .await;
+    assert_eq!(first.failed_count, 0, "{:?}", first.stats);
+    assert!(first.db_sync_token_advance_safe);
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    conn.execute("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum,download_checksum,source_checksum) SELECT library,id || '-conflicting',version_size,local_path,provider_checksum,local_checksum,download_checksum,source_checksum FROM asset_metadata_paths LIMIT 1", []).unwrap();
+    drop(conn);
+    let receipts = album_path_receipts(root.path(), &old);
+    assert_eq!(
+        receipts
+            .iter()
+            .filter(|row| row.contains("-conflicting"))
+            .count(),
+        1,
+        "the extra obsolete foreign receipt is historical evidence only"
+    );
+    let before_requests = server.received_requests().await.unwrap().len();
+    for quiet in [false, true, true] {
+        let mut options = album_directory_options("New");
+        options.expected_due_selection = quiet.then_some(false);
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            quiet,
+            EditedNaming::Suffix,
+            options,
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        assert!(!old.exists());
+        assert_bytes(&next.join("IMG_0501.JPG"), ORIGINAL);
+        assert_eq!(
+            album_path_receipts(root.path(), &old),
+            receipts,
+            "obsolete historical receipts must remain exactly"
+        );
+        assert_eq!(
+            album_path_receipts(root.path(), &next).len(),
+            1,
+            "the current owned copy has its own exact receipt"
+        );
+    }
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        before_requests,
+        "rename must reuse owned media"
+    );
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_operations WHERE policy='album-directory-v1' AND phase='committed'"
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn exclusive_album_directory_rename_carries_user_tree_and_preserves_old_receipts() {
+    for naming in [EditedNaming::Suffix, EditedNaming::Primary] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("media");
+        let provider = records(&server, None);
+        let (first, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            false,
+            naming,
+            album_directory_options("Old"),
+        )
+        .await;
+        assert_eq!(first.failed_count, 0, "{:?}", first.stats);
+        assert_bytes(&media.join("Old/IMG_0501.JPG"), ORIGINAL);
+        let manifests = retained_album_manifests(root.path());
+        let receipts = old_album_receipts(root.path());
+        assert!(!receipts.is_empty());
+        let decisions = album_decision_rows(root.path());
+        let admissions = album_admitted_rows(root.path());
+        std::fs::create_dir_all(media.join("Old/user/nested")).unwrap();
+        std::fs::write(media.join("Old/user/nested/notes.txt"), b"user notes").unwrap();
+        std::fs::write(media.join("Old/user.xmp"), b"user sidecar").unwrap();
+        std::fs::create_dir(media.join("New")).unwrap();
+        std::fs::write(media.join("New/foreign.txt"), b"foreign contents").unwrap();
+        let before_requests = server.received_requests().await.unwrap().len();
+        for quiet in [false, true, true] {
+            let mut options = album_directory_options("New");
+            options.expected_due_selection = quiet.then_some(false);
+            let (result, _) =
+                cycle_options(root.path(), provider.clone(), quiet, naming, options).await;
+            assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+            assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+            assert!(!media.join("Old").exists());
+            assert_bytes(&media.join("New/foreign.txt"), b"foreign contents");
+            assert_bytes(&media.join("New (1)/IMG_0501.JPG"), ORIGINAL);
+            assert_bytes(&media.join("New (1)/user/nested/notes.txt"), b"user notes");
+            assert_bytes(&media.join("New (1)/user.xmp"), b"user sidecar");
+            let retained = retained_album_manifests(root.path());
+            assert!(manifests.iter().all(|manifest| retained.contains(manifest)));
+            assert_eq!(old_album_receipts(root.path()), receipts);
+            let retained_decisions = album_decision_rows(root.path());
+            assert!(decisions.iter().all(|row| retained_decisions.contains(row)));
+            let retained_admissions = album_admitted_rows(root.path());
+            assert!(
+                admissions
+                    .iter()
+                    .all(|row| retained_admissions.contains(row))
+            );
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            before_requests,
+            "rename must reuse owned media"
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations WHERE policy='album-directory-v1' AND phase='committed'"
+            ),
+            1
+        );
+        assert!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM asset_metadata_paths WHERE instr(local_path,'Old')>0"
+            ) > 0
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM provider_active_decisions WHERE reason LIKE 'album_directory_successor:%'"
+            ),
+            0,
+            "historical selection evidence already preserves the previous receipts"
+        );
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let header: Vec<u8> = conn.query_row("SELECT header FROM primary_layout_operations WHERE policy='album-directory-v1' AND phase='committed'", [], |row| row.get(0)).unwrap();
+        let op: crate::state::db::primary_layout::directory::AlbumDirectoryOperation =
+            serde_json::from_slice(&header).unwrap();
+        let binding: Vec<u8> = conn.query_row("SELECT directory_binding FROM album_containers WHERE directory_binding IS NOT NULL", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&binding).unwrap(),
+            serde_json::to_value(&op.next).unwrap()
+        );
+        assert_eq!(op.old.generation, 1);
+        assert_eq!(op.next.generation, 2);
+        assert_eq!(op.old.container, op.next.container);
+        assert_ne!(op.old.pass, op.next.pass);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM provider_active_destinations WHERE pass_key=?1 AND admitted=1",
+                [&op.old.pass],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1,
+            "historical admission remains retained"
+        );
+        drop(conn);
+
+        // Missing-file repair must reopen only the current slot, even though
+        // historical manifests and their exact old path receipts still exist.
+        std::fs::remove_file(media.join("New (1)/IMG_0501.JPG")).unwrap();
+        for quiet in [false, true, true] {
+            let mut options = album_directory_options("New");
+            options.expected_due_selection = quiet.then_some(false);
+            let (result, _) =
+                cycle_options(root.path(), provider.clone(), quiet, naming, options).await;
+            assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+            assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+            assert_bytes(&media.join("New (1)/IMG_0501.JPG"), ORIGINAL);
+            assert!(!media.join("Old").exists());
+            assert_bytes(&media.join("New (1)/user/nested/notes.txt"), b"user notes");
+            assert_eq!(old_album_receipts(root.path()), receipts);
+            let retained_decisions = album_decision_rows(root.path());
+            assert!(decisions.iter().all(|row| retained_decisions.contains(row)));
+            let retained_admissions = album_admitted_rows(root.path());
+            assert!(
+                admissions
+                    .iter()
+                    .all(|row| retained_admissions.contains(row))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn album_directory_replaced_source_identity_refuses_before_movement() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let provider = records(&server, None);
+    cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Suffix,
+        album_directory_options("Old"),
+    )
+    .await;
+    let media = root.path().join("media");
+    std::fs::rename(media.join("Old"), media.join("retained-original")).unwrap();
+    std::fs::create_dir(media.join("Old")).unwrap();
+    std::fs::write(media.join("Old/IMG_0501.JPG"), ORIGINAL).unwrap();
+    std::fs::write(media.join("Old/user.txt"), b"replacement directory").unwrap();
+    let receipts = old_album_receipts(root.path());
+    let result = try_cycle_options(
+        root.path(),
+        provider,
+        false,
+        EditedNaming::Suffix,
+        album_directory_options("New"),
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(!media.join("New").exists());
+    assert_bytes(&media.join("retained-original/IMG_0501.JPG"), ORIGINAL);
+    assert_bytes(&media.join("Old/user.txt"), b"replacement directory");
+    assert_eq!(old_album_receipts(root.path()), receipts);
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_operations WHERE policy='album-directory-v1' AND phase='committed'"
+        ),
+        0
+    );
+}
+
+#[tokio::test]
+async fn album_directory_first_binding_never_adopts_existing_directory() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let provider = records(&server, None);
+    let media = root.path().join("media");
+    std::fs::create_dir_all(media.join("Old")).unwrap();
+    std::fs::write(media.join("Old/user.txt"), b"unowned user directory").unwrap();
+    cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Suffix,
+        album_directory_options("Old"),
+    )
+    .await;
+    assert_bytes(&media.join("Old (1)/IMG_0501.JPG"), ORIGINAL);
+    assert!(!media.join("Old/IMG_0501.JPG").exists());
+    std::fs::write(
+        media.join("Old (1)/user.txt"),
+        b"owned directory user contents",
+    )
+    .unwrap();
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            quiet,
+            EditedNaming::Suffix,
+            album_directory_options("New"),
+        )
+        .await;
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        assert!(!media.join("Old (1)").exists());
+        assert_bytes(&media.join("Old/user.txt"), b"unowned user directory");
+        assert_bytes(&media.join("New/IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(
+            &media.join("New/user.txt"),
+            b"owned directory user contents",
+        );
+    }
+}
+
+#[tokio::test]
+async fn album_directory_modified_managed_media_stays_in_place() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let provider = records(&server, None);
+    cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        album_directory_options("Old"),
+    )
+    .await;
+    let media = root.path().join("media");
+    std::fs::write(
+        media.join("Old/IMG_0501.JPG"),
+        b"user modified managed media",
+    )
+    .unwrap();
+    std::fs::write(media.join("Old/user.txt"), b"user added file").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("user.txt", media.join("Old/user-link")).unwrap();
+    let receipts = old_album_receipts(root.path());
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            quiet,
+            EditedNaming::Primary,
+            album_directory_options("New"),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        assert_bytes(
+            &media.join("Old/IMG_0501.JPG"),
+            b"user modified managed media",
+        );
+        assert_bytes(&media.join("New/user.txt"), b"user added file");
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read_link(media.join("New/user-link")).unwrap(),
+            std::path::Path::new("user.txt")
+        );
+        assert_bytes(&media.join("New/IMG_0501.JPG"), ORIGINAL);
+        assert!(!media.join("Old/user.txt").exists());
+        assert!(!media.join("New (1)").exists());
+        assert_eq!(old_album_receipts(root.path()), receipts);
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations WHERE policy='album-directory-v1'"
+            ),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn album_directory_legacy_paths_progress_without_claiming_user_tree() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let provider = records(&server, None);
+    let mut legacy = album_directory_options("Old");
+    legacy.folder_structure = "Old";
+    cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Suffix,
+        legacy,
+    )
+    .await;
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM album_containers WHERE directory_binding IS NOT NULL"
+        ),
+        0
+    );
+    std::fs::write(
+        root.path().join("media/Old/user.txt"),
+        b"uncertain user owner",
+    )
+    .unwrap();
+    cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Suffix,
+        album_directory_options("Old"),
+    )
+    .await;
+    assert_bytes(&root.path().join("media/Old/IMG_0501.JPG"), ORIGINAL);
+    assert!(!root.path().join("media/Old (1)").exists());
+    let receipts = old_album_receipts(root.path());
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            quiet,
+            EditedNaming::Suffix,
+            album_directory_options("New"),
+        )
+        .await;
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        assert_eq!(result.failed_count, 0);
+        assert_bytes(&root.path().join("media/New/IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(
+            &root.path().join("media/Old/user.txt"),
+            b"uncertain user owner",
+        );
+        assert_bytes(&root.path().join("media/Old/IMG_0501.JPG"), ORIGINAL);
+        assert!(!root.path().join("media/New/user.txt").exists());
+        assert_eq!(old_album_receipts(root.path()), receipts);
+    }
+}
+
+#[tokio::test]
+async fn album_directory_fallback_failed_new_publication_keeps_local_copy_and_checkpoint_debt() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let provider = records(&server, None);
+    cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        album_directory_options("Old"),
+    )
+    .await;
+    std::fs::write(
+        root.path().join("media/Old/IMG_0501.JPG"),
+        b"only local edited copy",
+    )
+    .unwrap();
+    let receipts = old_album_receipts(root.path());
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_new_copy BEFORE INSERT ON asset_metadata_paths WHEN instr(NEW.local_path,'New')>0 BEGIN SELECT RAISE(FAIL,'injected new copy finalization'); END;").unwrap();
+    drop(conn);
+    let (failed, _) = cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        album_directory_options("New"),
+    )
+    .await;
+    assert!(!failed.db_sync_token_advance_safe);
+    assert_bytes(
+        &root.path().join("media/Old/IMG_0501.JPG"),
+        b"only local edited copy",
+    );
+    assert_eq!(old_album_receipts(root.path()), receipts);
+    assert!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_operations WHERE phase='publishing'"
+        ) > 0
+    );
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    conn.execute_batch("DROP TRIGGER fail_new_copy").unwrap();
+    drop(conn);
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            quiet,
+            EditedNaming::Primary,
+            album_directory_options("New"),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        assert_bytes(&root.path().join("media/New/IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(
+            &root.path().join("media/Old/IMG_0501.JPG"),
+            b"only local edited copy",
+        );
+        assert_eq!(old_album_receipts(root.path()), receipts);
+    }
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn album_directory_missing_primary_preserves_owned_orphan_sidecar() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let provider = records(&server, None);
+    for name in ["Old", "New"] {
+        let mut options = album_directory_options(name);
+        options.sidecar = true;
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            false,
+            EditedNaming::Primary,
+            options,
+        )
+        .await;
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+    }
+    let receipts = old_album_receipts(root.path());
+    let xmp = std::fs::read(root.path().join("media/New/IMG_0501.JPG.xmp")).unwrap();
+    std::fs::remove_file(root.path().join("media/New/IMG_0501.JPG")).unwrap();
+    for quiet in [false, true, true] {
+        let mut options = album_directory_options("New");
+        options.sidecar = true;
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            quiet,
+            EditedNaming::Primary,
+            options,
+        )
+        .await;
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        assert_eq!(result.failed_count, 0);
+        assert_bytes(&root.path().join("media/New/IMG_0501.JPG"), ORIGINAL);
+        assert_eq!(
+            std::fs::read(root.path().join("media/New/IMG_0501.JPG.xmp")).unwrap(),
+            xmp
+        );
+        assert!(!root.path().join("media/Old").exists());
+        assert_eq!(old_album_receipts(root.path()), receipts);
+    }
+}
+
+#[tokio::test]
+async fn album_directory_first_seen_legacy_rename_preserves_uncertain_paths() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let provider = records(&server, None);
+    let mut options = album_directory_options("Old");
+    options.folder_structure = "legacy";
+    cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Suffix,
+        options,
+    )
+    .await;
+    let old = root.path().join("media/legacy/IMG_0501.JPG");
+    std::fs::write(&old, b"unowned legacy edit").unwrap();
+    let target = root.path().join("media/2023/photos-New");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("IMG_0501.JPG"), b"foreign selected name").unwrap();
+    let mut selected = None;
+    for quiet in [false, true, true] {
+        let mut options = album_directory_options("New");
+        options.folder_structure = "%Y/photos-{album}";
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            quiet,
+            EditedNaming::Suffix,
+            options,
+        )
+        .await;
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert_bytes(&old, b"unowned legacy edit");
+        assert_bytes(&target.join("IMG_0501.JPG"), b"foreign selected name");
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let path: String = conn
+            .query_row(
+                "SELECT local_path FROM assets WHERE version_size='original'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_bytes(std::path::Path::new(&path), ORIGINAL);
+        if let Some(selected) = &selected {
+            assert_eq!(&path, selected);
+        } else {
+            selected = Some(path);
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM primary_layout_operations WHERE policy='album-directory-v1'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn album_directory_projection_preserves_independent_selected_owner() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let provider = records(&server, None);
+    let mut options = album_directory_options("Old");
+    options.folder_structure = "%Y/{album}";
+    options.shared_folder_structure = Some("%Y/Old");
+    let (result, _) = cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Suffix,
+        options,
+    )
+    .await;
+    assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+    let old = root.path().join("media/2023/Old/IMG_0501.JPG");
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let album_path: String = conn.query_row("SELECT w.compat_path FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation JOIN json_each(CAST(g.specification AS TEXT),'$.profile.passes') p ON json_extract(p.value,'$.key')=w.pass_key WHERE w.current_publication=1 AND json_extract(p.value,'$.kind')='Album'", [], |row| row.get(0)).unwrap();
+    drop(conn);
+    let album_path = std::path::PathBuf::from(album_path);
+    assert_ne!(
+        album_path, old,
+        "album and smart folder own independent copies"
+    );
+    let next = root
+        .path()
+        .join("media/2023/New")
+        .join(album_path.file_name().unwrap());
+    std::fs::write(old.parent().unwrap().join("user.txt"), b"shared user entry").unwrap();
+    for quiet in [false, true, true] {
+        let mut options = album_directory_options("New");
+        options.folder_structure = "%Y/{album}";
+        options.shared_folder_structure = Some("%Y/Old");
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            quiet,
+            EditedNaming::Suffix,
+            options,
+        )
+        .await;
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        assert_eq!(result.failed_count, 0);
+        assert_bytes(&old, ORIGINAL);
+        assert_bytes(&next, ORIGINAL);
+        assert_bytes(
+            &old.parent().unwrap().join("user.txt"),
+            b"shared user entry",
+        );
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let rows: Vec<(String,String,i64,i64)> = conn.prepare("SELECT pass_key,compat_path,verified_media,admitted FROM provider_active_destinations").unwrap().query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        assert!(conn.query_row("SELECT COUNT(*) FROM provider_active_destinations WHERE compat_path=?1 AND admitted=1", [old.to_str().unwrap()], |row| row.get::<_,i64>(0)).unwrap() > 0, "{rows:?}");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM primary_layout_superseded_paths WHERE compat_path=?1",
+                [old.to_str().unwrap()],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn album_directory_projection_keeps_primary_rendition_policy_in_its_owner() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut options = album_directory_options("Old");
+    options.folder_structure = "%Y/photos-{album}";
+    cycle_options(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Primary,
+        options,
+    )
+    .await;
+    for (name, quiet) in [("Old", false), ("New", false), ("New", true), ("New", true)] {
+        let mut options = album_directory_options(name);
+        options.folder_structure = "%Y/photos-{album}";
+        options.expected_due_selection = quiet.then_some(false);
+        let (result, _) = cycle_options(
+            root.path(),
+            records(&server, Some(("edit-one", EDIT_ONE))),
+            quiet,
+            EditedNaming::Primary,
+            options,
+        )
+        .await;
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        assert_eq!(result.failed_count, 0);
+        assert_bytes(
+            &root
+                .path()
+                .join(format!("media/2023/photos-{name}/IMG_0501.JPG")),
+            EDIT_ONE,
+        );
+        assert_bytes(
+            &root
+                .path()
+                .join(format!("media/2023/photos-{name}/IMG_0501_original.JPG")),
+            ORIGINAL,
+        );
+    }
+}
+
+#[tokio::test]
+async fn album_directory_projection_template_changes_apply_only_to_future_files() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut provider = records(&server, None);
+    let mut options = album_directory_options("Old");
+    options.folder_structure = "%Y/{album}";
+    cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Suffix,
+        options,
+    )
+    .await;
+    provider.extend(second_date_records(&server));
+    let mut options = album_directory_options("Old");
+    options.folder_structure = "future/%Y/photos-{album}";
+    let (result, _) = cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Suffix,
+        options,
+    )
+    .await;
+    assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+    assert_bytes(&root.path().join("media/2023/Old/IMG_0501.JPG"), ORIGINAL);
+    assert_bytes(
+        &root
+            .path()
+            .join("media/future/2024/photos-Old/IMG_0502.JPG"),
+        ORIGINAL,
+    );
+    assert!(
+        !root
+            .path()
+            .join("media/future/2023/photos-Old/IMG_0501.JPG")
+            .exists()
+    );
+    for name in ["New", "Again"] {
+        for quiet in [false, true, true] {
+            let mut options = album_directory_options(name);
+            options.folder_structure = "later/%Y/{album}";
+            let (result, _) = cycle_options(
+                root.path(),
+                provider.clone(),
+                quiet,
+                EditedNaming::Suffix,
+                options,
+            )
+            .await;
+            assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+            assert_eq!(result.failed_count, 0);
+            assert_bytes(
+                &root.path().join(format!("media/2023/{name}/IMG_0501.JPG")),
+                ORIGINAL,
+            );
+            assert_bytes(
+                &root
+                    .path()
+                    .join(format!("media/future/2024/photos-{name}/IMG_0502.JPG")),
+                ORIGINAL,
+            );
+            assert!(!root.path().join("media/later").exists());
+        }
+    }
+}
+
+#[tokio::test]
+async fn album_directory_per_file_projection_handles_dates_and_embedded_tokens() {
+    for template in ["%Y/{album}/%m", "%Y/photos-{album}-selected/%m"] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let mut provider = records(&server, None);
+        provider.extend(second_date_records(&server));
+        let mut options = album_directory_options("Old");
+        options.folder_structure = template;
+        let (initial, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            false,
+            EditedNaming::Suffix,
+            options,
+        )
+        .await;
+        assert!(initial.db_sync_token_advance_safe, "{:?}", initial.stats);
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let old: Vec<String> = conn
+            .prepare("SELECT local_path FROM assets WHERE version_size='original' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        drop(conn);
+        assert_eq!(old.len(), 2);
+        assert_ne!(
+            std::path::Path::new(&old[0]).parent(),
+            std::path::Path::new(&old[1]).parent()
+        );
+        let mut destinations = Vec::new();
+        for path in &old {
+            let old = std::path::PathBuf::from(path);
+            let parent = old.parent().unwrap();
+            std::fs::write(parent.join("unrelated.txt"), b"unclaimed local entry").unwrap();
+            let next = std::path::PathBuf::from(path.replace("Old", "New"));
+            let occupied = next.parent().unwrap();
+            std::fs::create_dir_all(occupied).unwrap();
+            std::fs::write(occupied.join("foreign.txt"), b"foreign target contents").unwrap();
+            let sibling = occupied.with_file_name(format!(
+                "{} (1)",
+                occupied.file_name().unwrap().to_str().unwrap()
+            ));
+            destinations.push(sibling.join(next.file_name().unwrap()));
+        }
+        std::fs::write(&old[0], b"modified local media").unwrap();
+        for quiet in [false, true, true] {
+            let mut options = album_directory_options("New");
+            options.folder_structure = template;
+            let (result, _) = cycle_options(
+                root.path(),
+                provider.clone(),
+                quiet,
+                EditedNaming::Suffix,
+                options,
+            )
+            .await;
+            assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+            assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+            assert_bytes(std::path::Path::new(&old[0]), b"modified local media");
+            for (old, current) in old.iter().zip(&destinations) {
+                assert_bytes(current, ORIGINAL);
+                assert_bytes(
+                    &std::path::Path::new(old)
+                        .parent()
+                        .unwrap()
+                        .join("unrelated.txt"),
+                    b"unclaimed local entry",
+                );
+                let occupied = std::path::PathBuf::from(old.replace("Old", "New"));
+                assert_bytes(
+                    &occupied.parent().unwrap().join("foreign.txt"),
+                    b"foreign target contents",
+                );
+                assert!(
+                    !occupied
+                        .parent()
+                        .unwrap()
+                        .with_file_name(format!(
+                            "{} (2)",
+                            occupied
+                                .parent()
+                                .unwrap()
+                                .file_name()
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                        ))
+                        .exists()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn album_directory_date_templates_use_exclusive_or_per_file_transition() {
+    for (template, prefix, modified) in [
+        ("{album}/%Y", "", false),
+        ("{library}/{album}/%Y", "PrimarySync", true),
+    ] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let provider = records(&server, None);
+        let mut options = album_directory_options("Old");
+        options.folder_structure = template;
+        cycle_options(
+            root.path(),
+            provider.clone(),
+            false,
+            EditedNaming::Primary,
+            options,
+        )
+        .await;
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let old: String = conn
+            .query_row(
+                "SELECT local_path FROM assets WHERE version_size='original' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let old = std::path::PathBuf::from(old);
+        let parent = root.path().join("media").join(prefix);
+        let relative = old.strip_prefix(parent.join("Old")).unwrap().to_owned();
+        if modified {
+            std::fs::write(&old, b"dated local edit").unwrap();
+        }
+        std::fs::create_dir_all(parent.join("Old/user/nested")).unwrap();
+        std::fs::write(parent.join("Old/user/nested/file"), b"dated user contents").unwrap();
+        std::fs::create_dir(parent.join("New")).unwrap();
+        std::fs::write(parent.join("New/foreign"), b"foreign").unwrap();
+        for quiet in [false, true, true] {
+            let mut options = album_directory_options("New");
+            options.folder_structure = template;
+            let (result, _) = cycle_options(
+                root.path(),
+                provider.clone(),
+                quiet,
+                EditedNaming::Primary,
+                options,
+            )
+            .await;
+            assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+            assert_eq!(result.failed_count, 0);
+            assert_bytes(&parent.join("New (1)").join(&relative), ORIGINAL);
+            assert_bytes(
+                &parent.join("New (1)/user/nested/file"),
+                b"dated user contents",
+            );
+            assert_bytes(&parent.join("New/foreign"), b"foreign");
+            assert!(!parent.join("New (2)").exists());
+            if modified {
+                assert_bytes(&old, b"dated local edit");
+            } else {
+                assert!(!parent.join("Old").exists());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn album_directory_retained_edit_history_keeps_its_original_paths() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    for edit in [Some(("edit-one", EDIT_ONE)), Some(("edit-two", EDIT_TWO))] {
+        let (result, _) = cycle_options(
+            root.path(),
+            records(&server, edit),
+            false,
+            EditedNaming::Primary,
+            album_directory_options("Old"),
+        )
+        .await;
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+    }
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let paths: Vec<Vec<u8>> = conn
+        .prepare("SELECT native_path FROM primary_layout_preserved")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    drop(conn);
+    assert!(!paths.is_empty());
+    let paths: Vec<_> = paths
+        .into_iter()
+        .map(|bytes| {
+            serde_json::from_slice::<state::db::provider_selection::SelectionPath>(&bytes)
+                .unwrap()
+                .to_path()
+        })
+        .collect();
+    let bytes: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            records(&server, Some(("edit-two", EDIT_TWO))),
+            quiet,
+            EditedNaming::Primary,
+            album_directory_options("New"),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        assert_bytes(&root.path().join("media/New/IMG_0501.JPG"), EDIT_TWO);
+        for (path, expected) in paths.iter().zip(&bytes) {
+            assert_bytes(path, expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn album_directory_hierarchy_ancestor_change_uses_per_file_transition() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let provider = records(&server, None);
+    cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        album_directory_options("Before/Album"),
+    )
+    .await;
+    std::fs::write(
+        root.path().join("media/Before/Album/user.txt"),
+        b"leaf-owned contents",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("media/Before/ancestor.txt"),
+        b"ancestor not owned",
+    )
+    .unwrap();
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            quiet,
+            EditedNaming::Primary,
+            album_directory_options("After/Album"),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        assert_bytes(
+            &root.path().join("media/After/Album/IMG_0501.JPG"),
+            ORIGINAL,
+        );
+        assert_bytes(
+            &root.path().join("media/After/Album/user.txt"),
+            b"leaf-owned contents",
+        );
+        assert_bytes(
+            &root.path().join("media/Before/ancestor.txt"),
+            b"ancestor not owned",
+        );
+        assert!(!root.path().join("media/After/ancestor.txt").exists());
+    }
+}
+
+#[tokio::test]
+async fn album_directory_state_failure_after_move_recovers_without_rewriting_old_journals() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let provider = records(&server, None);
+    cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        album_directory_options("Old"),
+    )
+    .await;
+    let media = root.path().join("media");
+    std::fs::write(media.join("Old/user.txt"), b"carried user contents").unwrap();
+    let manifests = retained_album_manifests(root.path());
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_album_directory_commit BEFORE UPDATE OF directory_binding ON album_containers WHEN OLD.directory_binding IS NOT NULL BEGIN SELECT RAISE(FAIL,'injected album directory commit failure'); END;").unwrap();
+    drop(conn);
+    let _failed = try_cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        album_directory_options("New"),
+    )
+    .await;
+    assert!(!media.join("Old").exists());
+    assert_bytes(&media.join("New/user.txt"), b"carried user contents");
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_operations WHERE policy='album-directory-v1' AND phase='publishing'"
+        ),
+        1
+    );
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    conn.execute_batch("DROP TRIGGER fail_album_directory_commit;")
+        .unwrap();
+    drop(conn);
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            quiet,
+            EditedNaming::Primary,
+            album_directory_options("New"),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert_bytes(&media.join("New/IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(&media.join("New/user.txt"), b"carried user contents");
+    }
+    let retained = retained_album_manifests(root.path());
+    assert!(manifests.iter().all(|manifest| retained.contains(manifest)));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "parent-owned SIGKILL fixture"]
+async fn album_directory_process_death_child() {
+    let root = std::path::PathBuf::from(std::env::var_os("KEI_TEST_PROCESS_DEATH_ROOT").unwrap());
+    assert_eq!(
+        std::fs::read(root.join("fixture-owner")).unwrap(),
+        b"kei-synthetic-process-death"
+    );
+    let server = server().await;
+    let projection = root.join("projection-fixture").exists();
+    let additional = root.join("additional-projection-fixture").exists();
+    let mut options = album_directory_options("New");
+    if projection {
+        options.folder_structure = "%Y/photos-{album}";
+    }
+    let mut provider = records(&server, None);
+    if additional {
+        options.folder_structure = "later/{album}";
+        provider.extend(second_date_records(&server));
+    }
+    cycle_options(
+        &root,
+        provider,
+        false,
+        if projection || additional {
+            EditedNaming::Suffix
+        } else {
+            EditedNaming::Primary
+        },
+        options,
+    )
+    .await;
+    panic!("album directory child did not reach its process-death point");
+}
+
+#[cfg(target_os = "linux")]
+async fn kill_album_child(root: &std::path::Path, point: &str) {
+    use std::os::unix::process::ExitStatusExt;
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "sync_loop::runner::tests::primary_layout::album_directory_process_death_child",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env("KEI_TEST_PROCESS_DEATH_ROOT", root)
+        .env("KEI_TEST_PROCESS_DEATH_POINT", point)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if root.join("ready").exists() {
+            break;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("album child exited before {point}: {status}");
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _status = child.wait().unwrap();
+            panic!("album child did not reach {point}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(std::fs::read_to_string(root.join("ready")).unwrap(), point);
+    child.kill().unwrap();
+    assert_eq!(child.wait().unwrap().signal(), Some(9));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn album_directory_projection_reopens_partial_routing_and_late_collision() {
+    for point in [
+        "album-projection-planned",
+        "album-projection-directory-published",
+    ] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let mut provider = records(&server, None);
+        provider.extend(second_date_records(&server));
+        let mut options = album_directory_options("Old");
+        options.folder_structure = "%Y/photos-{album}";
+        cycle_options(
+            root.path(),
+            provider.clone(),
+            false,
+            EditedNaming::Suffix,
+            options,
+        )
+        .await;
+        std::fs::write(
+            root.path().join("fixture-owner"),
+            b"kei-synthetic-process-death",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("projection-fixture"), b"dated album").unwrap();
+        std::fs::write(
+            root.path().join("media/2023/photos-Old/IMG_0501.JPG"),
+            b"local edit",
+        )
+        .unwrap();
+        kill_album_child(root.path(), point).await;
+        let collision = point == "album-projection-planned";
+        if collision {
+            std::fs::create_dir(root.path().join("media/2024/photos-New")).unwrap();
+            std::fs::write(
+                root.path().join("media/2024/photos-New/foreign"),
+                b"racing user directory",
+            )
+            .unwrap();
+            let mut options = album_directory_options("New");
+            options.folder_structure = "%Y/photos-{album}";
+            assert!(
+                try_cycle_options(
+                    root.path(),
+                    provider.clone(),
+                    false,
+                    EditedNaming::Suffix,
+                    options
+                )
+                .await
+                .is_err()
+            );
+            assert!(!root.path().join("media/2023/photos-New").exists());
+        }
+        for quiet in [false, true, true] {
+            let mut options = album_directory_options("New");
+            options.folder_structure = "%Y/photos-{album}";
+            let (result, _) = cycle_options(
+                root.path(),
+                provider.clone(),
+                quiet,
+                EditedNaming::Suffix,
+                options,
+            )
+            .await;
+            assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+            assert_eq!(result.failed_count, 0);
+            assert_bytes(
+                &root.path().join("media/2023/photos-Old/IMG_0501.JPG"),
+                b"local edit",
+            );
+            assert_bytes(
+                &root.path().join("media/2023/photos-New/IMG_0501.JPG"),
+                ORIGINAL,
+            );
+            let second = if collision {
+                "photos-New (1)"
+            } else {
+                "photos-New"
+            };
+            assert_bytes(
+                &root
+                    .path()
+                    .join("media/2024")
+                    .join(second)
+                    .join("IMG_0502.JPG"),
+                ORIGINAL,
+            );
+            assert!(!root.path().join("media/2023/photos-New (1)").exists());
+            assert!(!root.path().join("media/2024/photos-New (2)").exists());
+            if collision {
+                assert_bytes(
+                    &root.path().join("media/2024/photos-New/foreign"),
+                    b"racing user directory",
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn album_directory_planned_move_reclassifies_a_later_local_edit() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let provider = records(&server, None);
+    cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        album_directory_options("Old"),
+    )
+    .await;
+    std::fs::write(
+        root.path().join("fixture-owner"),
+        b"kei-synthetic-process-death",
+    )
+    .unwrap();
+    kill_album_child(root.path(), "album-directory-planned").await;
+    std::fs::write(
+        root.path().join("media/Old/IMG_0501.JPG"),
+        b"edited after planning",
+    )
+    .unwrap();
+    let result = try_cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        album_directory_options("New"),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_bytes(
+        &root.path().join("media/Old/IMG_0501.JPG"),
+        b"edited after planning",
+    );
+    assert!(!root.path().join("media/New").exists());
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            quiet,
+            EditedNaming::Primary,
+            album_directory_options("New"),
+        )
+        .await;
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        assert_bytes(
+            &root.path().join("media/Old/IMG_0501.JPG"),
+            b"edited after planning",
+        );
+        assert_bytes(&root.path().join("media/New/IMG_0501.JPG"), ORIGINAL);
+        assert!(!root.path().join("media/New (1)").exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn album_directory_staged_fallback_reselects_a_racing_collision_once() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let provider = records(&server, None);
+    cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        album_directory_options("Old"),
+    )
+    .await;
+    std::fs::write(root.path().join("media/Old/IMG_0501.JPG"), b"local edit").unwrap();
+    std::fs::write(
+        root.path().join("fixture-owner"),
+        b"kei-synthetic-process-death",
+    )
+    .unwrap();
+    kill_album_child(root.path(), "album-directory-planned").await;
+    std::fs::create_dir(root.path().join("media/New")).unwrap();
+    std::fs::write(
+        root.path().join("media/New/user.txt"),
+        b"racing foreign directory",
+    )
+    .unwrap();
+    let result = try_cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        album_directory_options("New"),
+    )
+    .await;
+    assert!(result.is_err());
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            quiet,
+            EditedNaming::Primary,
+            album_directory_options("New"),
+        )
+        .await;
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        assert_bytes(&root.path().join("media/Old/IMG_0501.JPG"), b"local edit");
+        assert_bytes(
+            &root.path().join("media/New/user.txt"),
+            b"racing foreign directory",
+        );
+        assert_bytes(&root.path().join("media/New (1)/IMG_0501.JPG"), ORIGINAL);
+        assert!(!root.path().join("media/New (2)").exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn album_directory_followon_sigkill_recovers_file_routing_and_missing_primary() {
+    for point in [
+        "album-directory-before-journal",
+        "album-directory-planned",
+        "album-directory-moved",
+        "album-files-copied",
+        "layout-planned",
+        "layout-member-published",
+    ] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let provider = records(&server, None);
+        cycle_options(
+            root.path(),
+            provider.clone(),
+            false,
+            EditedNaming::Primary,
+            album_directory_options("Old"),
+        )
+        .await;
+        std::fs::write(
+            root.path().join("fixture-owner"),
+            b"kei-synthetic-process-death",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("media/Old/user.txt"), b"user contents").unwrap();
+        let receipts = old_album_receipts(root.path());
+        let fallback = point.starts_with("album-");
+        if fallback {
+            std::fs::write(root.path().join("media/Old/IMG_0501.JPG"), b"local edit").unwrap();
+        } else {
+            cycle_options(
+                root.path(),
+                provider.clone(),
+                false,
+                EditedNaming::Primary,
+                album_directory_options("New"),
+            )
+            .await;
+            std::fs::remove_file(root.path().join("media/New/IMG_0501.JPG")).unwrap();
+        }
+        kill_album_child(root.path(), point).await;
+        for quiet in [false, true, true] {
+            let (result, _) = cycle_options(
+                root.path(),
+                provider.clone(),
+                quiet,
+                EditedNaming::Primary,
+                album_directory_options("New"),
+            )
+            .await;
+            assert_eq!(result.failed_count, 0, "{point}: {:?}", result.stats);
+            assert!(
+                result.db_sync_token_advance_safe,
+                "{point}: {:?}",
+                result.stats
+            );
+            assert_bytes(&root.path().join("media/New/IMG_0501.JPG"), ORIGINAL);
+            assert_bytes(&root.path().join("media/New/user.txt"), b"user contents");
+            if fallback {
+                assert_bytes(&root.path().join("media/Old/IMG_0501.JPG"), b"local edit");
+            } else {
+                assert!(!root.path().join("media/Old").exists());
+            }
+            assert!(!root.path().join("media/New (1)").exists());
+            assert_eq!(old_album_receipts(root.path()), receipts);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn album_directory_sigkill_reopens_planned_moved_and_durable_transitions() {
+    for point in [
+        "album-directory-planned",
+        "album-directory-moved",
+        "album-directory-durable",
+    ] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let provider = records(&server, None);
+        cycle_options(
+            root.path(),
+            provider.clone(),
+            false,
+            EditedNaming::Primary,
+            album_directory_options("Old"),
+        )
+        .await;
+        std::fs::write(
+            root.path().join("fixture-owner"),
+            b"kei-synthetic-process-death",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("media/Old/user.txt"), b"survives SIGKILL").unwrap();
+        let manifests = retained_album_manifests(root.path());
+        kill_album_child(root.path(), point).await;
+        let expected = if point == "album-directory-planned" {
+            "media/Old/user.txt"
+        } else {
+            "media/New/user.txt"
+        };
+        assert_bytes(&root.path().join(expected), b"survives SIGKILL");
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations WHERE policy='album-directory-v1' AND phase='publishing'"
+            ),
+            1
+        );
+        let destination = if point == "album-directory-planned" {
+            std::fs::create_dir(root.path().join("media/New")).unwrap();
+            std::fs::write(
+                root.path().join("media/New/foreign.txt"),
+                b"racing user contents",
+            )
+            .unwrap();
+            let _failed = try_cycle_options(
+                root.path(),
+                provider.clone(),
+                false,
+                EditedNaming::Primary,
+                album_directory_options("New"),
+            )
+            .await;
+            assert_eq!(
+                db_count(
+                    root.path(),
+                    "SELECT COUNT(*) FROM primary_layout_operations WHERE policy='album-directory-v1' AND phase='cancelled'"
+                ),
+                1
+            );
+            assert_bytes(&root.path().join("media/Old/user.txt"), b"survives SIGKILL");
+            "New (1)"
+        } else {
+            "New"
+        };
+        for quiet in [false, true, true] {
+            let (result, _) = cycle_options(
+                root.path(),
+                provider.clone(),
+                quiet,
+                EditedNaming::Primary,
+                album_directory_options("New"),
+            )
+            .await;
+            assert_eq!(result.failed_count, 0, "{point}: {:?}", result.stats);
+            assert!(
+                result.db_sync_token_advance_safe,
+                "{point}: {:?}",
+                result.stats
+            );
+            assert!(!root.path().join("media/Old").exists());
+            assert_bytes(
+                &root.path().join("media").join(destination).join("user.txt"),
+                b"survives SIGKILL",
+            );
+            assert_bytes(
+                &root
+                    .path()
+                    .join("media")
+                    .join(destination)
+                    .join("IMG_0501.JPG"),
+                ORIGINAL,
+            );
+            if point == "album-directory-planned" {
+                assert_bytes(
+                    &root.path().join("media/New/foreign.txt"),
+                    b"racing user contents",
+                );
+            }
+        }
+        let retained = retained_album_manifests(root.path());
+        assert!(manifests.iter().all(|manifest| retained.contains(manifest)));
+    }
 }
 #[tokio::test]
 async fn startup_archive_adoption_flows_into_managed_sync_without_downloads() {

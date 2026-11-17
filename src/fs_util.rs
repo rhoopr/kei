@@ -301,6 +301,119 @@ impl ConfinedPath {
         self.open_regular_with_access(ConfinedAccess::Read)
     }
 
+    /// Identity of the entry itself, including a user-owned symbolic link.
+    pub(crate) fn entry_identity(&self) -> std::io::Result<FileIdentity> {
+        self.validate_namespace()?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: the retained parent descriptor and NUL-terminated leaf
+            // are live; stat points to writable storage of the required size.
+            if unsafe {
+                libc::fstatat(
+                    self.parent_dir.as_raw_fd(),
+                    self.name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: successful fstatat initialized the complete stat value.
+            let stat = unsafe { stat.assume_init() };
+            // libc device/inode widths and signedness differ across Unix hosts.
+            #[allow(
+                clippy::useless_conversion,
+                reason = "libc device and inode types are platform-dependent"
+            )]
+            let identity = FileIdentity {
+                device: stat
+                    .st_dev
+                    .try_into()
+                    .map_err(|_error| std::io::Error::other("invalid device identity"))?,
+                inode: stat
+                    .st_ino
+                    .try_into()
+                    .map_err(|_error| std::io::Error::other("invalid inode identity"))?,
+            };
+            self.validate_namespace()?;
+            Ok(identity)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+            let file = std::fs::OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&self.path)?;
+            file_identity(&file)
+        }
+    }
+
+    /// Open the directory entry itself without following a link. The returned
+    /// identity remains usable across a no-replace directory rename.
+    pub(crate) fn open_directory(&self) -> std::io::Result<std::fs::File> {
+        self.validate_namespace()?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            Ok(std::fs::File::from(openat_owned(
+                self.parent_dir.as_raw_fd(),
+                &self.name,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )?))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+                FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+            let file = std::fs::OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&self.path)?;
+            let attributes = windows_file_attributes(&file)?;
+            if attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+                || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "album entry is not a directory",
+                ));
+            }
+            Ok(file)
+        }
+    }
+
+    pub(crate) fn create_new_directory(&self) -> std::io::Result<std::fs::File> {
+        self.validate_namespace()?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the retained parent descriptor and NUL-terminated leaf
+            // name are live for this call. mkdirat never replaces an entry.
+            if unsafe { libc::mkdirat(self.parent_dir.as_raw_fd(), self.name.as_ptr(), 0o777) } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(windows)]
+        std::fs::create_dir(&self.path)?;
+        self.open_directory()
+    }
+
     pub(crate) fn open_optional_regular(&self) -> std::io::Result<Option<std::fs::File>> {
         // A missing namespace is not a missing leaf in the retained parent.
         self.validate_namespace()?;

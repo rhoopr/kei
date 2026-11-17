@@ -79,6 +79,9 @@ pub(crate) struct SelectionContext {
     zone: Value,
     config_hash: String,
     profile: Value,
+    album_directories: BTreeMap<String, String>,
+    album_files:
+        BTreeMap<String, Vec<crate::state::db::primary_layout::directory::AlbumDirectoryFile>>,
     retry_sources: Arc<std::sync::Mutex<SelectionRetrySources>>,
     inventory_membership_delta: Arc<std::sync::Mutex<Option<Box<MembershipDelta>>>>,
 }
@@ -171,6 +174,9 @@ pub(crate) async fn context(
     }
     let mut qualified = None;
     let mut profile = Vec::new();
+    let mut album_directories = BTreeMap::new();
+    let mut album_files = BTreeMap::new();
+    let mut album_projection_generations = BTreeMap::new();
     for pass in passes {
         if pass.kind == PassKind::SmartFolder && !pass.album.is_supported_smart_folder() {
             return Ok(None);
@@ -189,6 +195,42 @@ pub(crate) async fn context(
             Arc::ptr_eq(store, &concrete),
             "Selection database context mismatch"
         );
+        if let Some(container) = pass.album.container_id()
+            && let Some(binding) = capture
+                .db
+                .album_directory_binding(
+                    capture.owner.clone(),
+                    config.library.to_string(),
+                    container.to_owned(),
+                )
+                .await?
+        {
+            if binding.projection.is_some() || binding.additional_projection.is_some() {
+                album_projection_generations.insert(container.to_owned(), binding.generation);
+            }
+            album_files.insert(
+                container.to_owned(),
+                capture
+                    .db
+                    .album_projection_files(
+                        capture.owner.clone(),
+                        binding.clone(),
+                        SelectionPath::from_path(&std::path::absolute(&config.directory)?),
+                    )
+                    .await?,
+            );
+            if binding.projection.is_none()
+                && let Some(parent) = super::album_directory::template_parent(config)?
+                && binding.root.to_path() == parent
+            {
+                let path = binding.path.to_path();
+                let name = path
+                    .strip_prefix(&parent)?
+                    .to_str()
+                    .context("Album directory requires a UTF-8 relative path")?;
+                album_directories.insert(container.to_owned(), name.replace('%', "%%"));
+            }
+        }
         if let Some((previous, previous_scope, previous_zone)) = &qualified {
             let previous: &ShadowCapture = previous;
             if previous.owner != capture.owner
@@ -233,17 +275,36 @@ pub(crate) async fn context(
     let mut profile = json!({"format":1,"coverage":"observed_selection_window","passes":profile,
         "selection_config":config.enum_config_hash.as_deref(),
         "recent":null,"recent_scope":"Global","excludes":excludes});
-    let config_hash=digest(serde_json::to_vec(&json!({"format":1,"profile":profile,"scope":scope,"zone":zone,
+    let mut identity = json!({"format":1,"profile":profile,"scope":scope,"zone":zone,
         "paths":hash_download_config(config),"anchored_root":SelectionPath::from_path(&std::path::absolute(&config.directory)?),
         "before":config.skip_created_before.map(crate::config::CreatedDateFilter::fingerprint),"after":config.skip_created_after.map(crate::config::CreatedDateFilter::fingerprint),
         "enum_hash":config.enum_config_hash.as_deref(),"metadata_flags":crate::download::pipeline::MetadataFlags::from(config).bits(),
         "capture_revision":crate::state::METADATA_CAPTURE_REVISION,"capture_repair":format!("{:?}",config.capture_timestamp_repair),
         // Retain the historical fingerprint key; lifetime admission is retired.
         "repair_truncated":config.repair_truncated,"attempt_limit":0,
-    }))?.as_slice());
-    // This execution policy requires a successor declaration, not a different
-    // user configuration. Keep the configuration fingerprint compatible so the
-    // existing retained scheduler can finish old, immutable shared-path work.
+    });
+    // Keep historical fingerprints byte-for-byte when there is no exclusive
+    // directory binding. A new binding must not replay an older frozen path.
+    if !album_directories.is_empty() {
+        identity
+            .as_object_mut()
+            .context("Invalid selection identity")?
+            .insert(
+                "album_directories".to_owned(),
+                serde_json::to_value(&album_directories)?,
+            );
+    }
+    if !album_projection_generations.is_empty() {
+        identity
+            .as_object_mut()
+            .context("Invalid selection identity")?
+            .insert(
+                "album_projection_generations".to_owned(),
+                serde_json::to_value(album_projection_generations)?,
+            );
+    }
+    let config_hash = digest(&serde_json::to_vec(&identity)?);
+    // Execution policy changes the declaration, not its configuration identity.
     profile
         .as_object_mut()
         .context("Selection profile is not an object")?
@@ -254,6 +315,8 @@ pub(crate) async fn context(
         zone,
         config_hash,
         profile,
+        album_directories,
+        album_files,
         retry_sources: Arc::new(std::sync::Mutex::new(rustc_hash::FxHashMap::default())),
         inventory_membership_delta: Arc::default(),
     }))
@@ -329,6 +392,41 @@ impl SelectionContext {
             cancel,
         ))
         .await
+    }
+
+    pub(super) fn album_directory(&self, container: &str) -> Option<&str> {
+        self.album_directories.get(container).map(String::as_str)
+    }
+
+    pub(in crate::download) fn album_file(
+        &self,
+        container: &str,
+        library: &str,
+        child: &str,
+        version: &str,
+    ) -> Option<std::path::PathBuf> {
+        self.album_files
+            .get(container)?
+            .iter()
+            .find(|file| file.library == library && file.child == child && file.version == version)
+            .map(|file| file.next.to_path())
+    }
+
+    pub(in crate::download) fn album_parent(
+        &self,
+        container: &str,
+        library: &str,
+        child: &str,
+    ) -> Option<std::path::PathBuf> {
+        let mut files = self
+            .album_files
+            .get(container)?
+            .iter()
+            .filter(|file| file.library == library && file.child == child);
+        let parent = files.next()?.next.to_path().parent()?.to_path_buf();
+        files
+            .all(|file| file.next.to_path().parent() == Some(parent.as_path()))
+            .then_some(parent)
     }
     pub(in crate::download) fn exact_retry_sources(
         &self,
@@ -470,6 +568,8 @@ pub(crate) async fn recover_deleted_album_selection(
         config_hash,
         profile,
         retry_sources: Arc::default(),
+        album_directories: BTreeMap::new(),
+        album_files: BTreeMap::new(),
         inventory_membership_delta: Arc::default(),
     };
     let mut root = match context.current().await? {
@@ -1357,6 +1457,22 @@ pub(crate) async fn has_due(
     let Some(context) = context(passes, config, controls).await? else {
         return Ok(None);
     };
+    if context
+        .capture
+        .db
+        .has_album_directory_debt(
+            context.capture.owner.clone(),
+            config.library.to_string(),
+            passes
+                .iter()
+                .filter(|pass| pass.kind == PassKind::Album)
+                .filter_map(|pass| pass.album.container_id().map(str::to_owned))
+                .collect(),
+        )
+        .await?
+    {
+        return Ok(Some(true));
+    }
     let Some(root) = context.current().await? else {
         return Ok(Some(true));
     };

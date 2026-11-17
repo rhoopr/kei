@@ -722,6 +722,52 @@ async fn incremental_hard_delete_recovers_mapping_from_album_history() {
 }
 
 #[tokio::test]
+async fn album_delta_missing_name_preserves_container_and_blocks_checkpoint() {
+    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+    db.upsert_album_container("PrimarySync", "container-a", "Vacation", "album")
+        .await
+        .unwrap();
+    let session = MockPhotosFlow::new()
+        .changes_zone_page(
+            vec![
+                json!({"recordName": "container-a", "recordType": "CPLAlbum",
+                "fields": {"albumNameEnc": {"value": "not base64"}}}),
+            ],
+            "zone-token-after",
+            false,
+        )
+        .build();
+    let passes = vec![
+        AlbumPass {
+            kind: PassKind::Album,
+            album: changes_album_with_container("Vacation", Some("container-a"), session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        },
+        unused_unfiled_changes_pass(),
+    ];
+    let dir = TempDir::new().unwrap();
+    let mut config = test_config();
+    config.directory = Arc::from(dir.path());
+    config.state_db = Some(db.clone());
+    let result = download_photos_incremental(
+        &Client::new(),
+        &passes,
+        &Arc::new(config),
+        "zone-token-before",
+        DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.sync_token, None);
+    let name: String = db.acquire_lock("test").unwrap().query_row(
+        "SELECT album_name FROM album_containers WHERE library='PrimarySync' AND container_id='container-a'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(name, "Vacation");
+}
+
+#[tokio::test]
 async fn changes_stream_mixed_malformed_asset_relation_preserves_valid_and_blocks_token() {
     let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
     db.upsert_album_container("PrimarySync", "container-a", "Vacation", "album")

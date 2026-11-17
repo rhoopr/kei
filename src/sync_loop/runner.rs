@@ -55,6 +55,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         personality_mode,
         friendly_request,
     )?;
+    config.runtime.dry_run |= config.runtime.only_print_filenames;
     let capture_timestamp_repair = if config.runtime.repair_capture_timestamps {
         download::CaptureTimestampRepair::ReplaceWithCaptureLocal
     } else {
@@ -63,18 +64,20 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     // Keep fresh-install auto-config behavior, but never create a previously
     // absent config ahead of the recovery backup for retained state.
-    let defer_first_run_config = if !toml_existed && config_explicitly_set {
-        let path = state::db::account::state_path(
-            &config.auth.cookie_directory,
-            &config.auth.username,
-            config.auth.domain.as_str(),
-        )
-        .await?;
-        tokio::fs::try_exists(path).await?
-    } else {
-        false
-    };
-    if !toml_existed
+    let defer_first_run_config =
+        if !config.runtime.dry_run && !toml_existed && config_explicitly_set {
+            let path = state::db::account::state_path(
+                &config.auth.cookie_directory,
+                &config.auth.username,
+                config.auth.domain.as_str(),
+            )
+            .await?;
+            tokio::fs::try_exists(path).await?
+        } else {
+            false
+        };
+    if !config.runtime.dry_run
+        && !toml_existed
         && config_explicitly_set
         && !defer_first_run_config
         && let Err(e) =
@@ -87,7 +90,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // which would cause the process to loop forever instead of exiting.
     // retry-failed: one-shot by definition.
     // setup → "sync now": initial test sync, not a daemon.
-    if is_one_shot {
+    if is_one_shot || config.runtime.dry_run {
         config.watch.interval = None;
     }
 
@@ -108,7 +111,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // Service-mode contract: the daemon must poll. If neither CLI nor TOML
     // supplied an interval, fall through to the canonical 24h default so a
     // launchd/systemd/SCM unit still has a heartbeat.
-    if let Some(applied) = service_mode_default_interval(config.watch.interval, service_mode) {
+    if !config.runtime.dry_run
+        && let Some(applied) = service_mode_default_interval(config.watch.interval, service_mode)
+    {
         config.watch.interval = Some(applied);
         tracing::info!(
             interval_secs = applied,
@@ -132,11 +137,16 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .watch
         .pid_file
         .as_ref()
+        .filter(|_| !config.runtime.dry_run)
         .map(|p| PidFileGuard::new(p.clone()))
         .transpose()?;
 
-    let sd_notifier = SystemdNotifier::new(config.watch.notify_systemd);
-    let notifier = Notifier::new(config.notifications.script.clone());
+    let sd_notifier = SystemdNotifier::new(config.watch.notify_systemd && !config.runtime.dry_run);
+    let notifier = Notifier::new(if config.runtime.dry_run {
+        None
+    } else {
+        config.notifications.script.clone()
+    });
 
     tracing::info!(concurrency = config.download.threads_num, "Starting kei");
 
@@ -154,33 +164,35 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     }
 
     // Validate download directory is writable before spending time on authentication.
-    tokio::fs::create_dir_all(&config.download.directory)
-        .await
-        .with_context(|| {
+    if !config.runtime.dry_run {
+        tokio::fs::create_dir_all(&config.download.directory)
+            .await
+            .with_context(|| {
+                format!(
+                    "Could not create download directory {}",
+                    config.download.directory.display()
+                )
+            })?;
+        let probe = config.download.directory.join(".kei_probe");
+        tokio::fs::write(&probe, b"").await.with_context(|| {
             format!(
-                "Could not create download directory {}",
+                "Cannot write to download directory {}",
                 config.download.directory.display()
             )
         })?;
-    let probe = config.download.directory.join(".kei_probe");
-    tokio::fs::write(&probe, b"").await.with_context(|| {
-        format!(
-            "Cannot write to download directory {}",
-            config.download.directory.display()
-        )
-    })?;
-    if let Err(e) = tokio::fs::remove_file(&probe).await {
-        tracing::trace!(
-            probe = %probe.display(),
-            error = %e,
-            "Could not clean up writability-probe file; harmless leakage"
-        );
-    }
+        if let Err(e) = tokio::fs::remove_file(&probe).await {
+            tracing::trace!(
+                probe = %probe.display(),
+                error = %e,
+                "Could not clean up writability-probe file; harmless leakage"
+            );
+        }
 
-    // Abort if available disk space is too low. See `check_min_disk_space`
-    // for the pure inner check.
-    if let Some(avail) = available_disk_space(&config.download.directory) {
-        check_min_disk_space(avail, &config.download.directory)?;
+        // Abort if available disk space is too low. See `check_min_disk_space`
+        // for the pure inner check.
+        if let Some(avail) = available_disk_space(&config.download.directory) {
+            check_min_disk_space(avail, &config.download.directory)?;
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -210,9 +222,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // Compute the save-password decision while `source` is still owned here.
     // The resulting action carries no password payload and survives moving the
     // source into the provider closure below.
-    let save_password_action = config
-        .auth
-        .save_password
+    let save_password_action = (config.auth.save_password && !config.runtime.dry_run)
         .then(|| password::decide_save_password_action(&source));
     let password_provider = make_password_provider(source, input_mode);
 

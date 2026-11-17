@@ -76,6 +76,155 @@ pub(in crate::download) fn bytes_match(
     left.size == right.size && left.sha256 == right.sha256
 }
 
+pub(in crate::download) async fn rename_album_directory(
+    root: &Path,
+    source: &Path,
+    destination: &Path,
+    identity: crate::fs_util::FileIdentity,
+) -> Result<()> {
+    let (root, source, destination) = (root.to_owned(), source.to_owned(), destination.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let source = ConfinedPath::open(&root, &source, ConfinedParents::Existing)?;
+        let destination = source.sibling(&destination)?;
+        match source.open_directory() {
+            Ok(directory) => {
+                anyhow::ensure!(
+                    crate::fs_util::file_identity(&directory)? == identity,
+                    "Album directory identity changed before rename"
+                );
+                super::platform::move_layout_confined(&source, &destination)?;
+                let installed = destination.open_directory()?;
+                if crate::fs_util::file_identity(&installed)? != identity {
+                    // Preserve a substituted entry by restoring only into the
+                    // still-empty old slot. Neither operation replaces bytes.
+                    super::platform::move_layout_confined(&destination, &source)?;
+                    anyhow::bail!("Album directory changed during rename");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let installed = destination.open_directory()?;
+                anyhow::ensure!(
+                    crate::fs_util::file_identity(&installed)? == identity,
+                    "Album directory recovery target has another identity"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+        #[cfg(all(test, target_os = "linux"))]
+        crate::test_helpers::process_death_point("album-directory-moved");
+        source.sync_parent()?;
+        destination.sync_parent()?;
+        Ok(())
+    })
+    .await?
+}
+
+pub(in crate::download) async fn verify_album_directory(
+    root: &Path,
+    path: &Path,
+    expected: crate::fs_util::FileIdentity,
+) -> Result<()> {
+    let (root, path) = (root.to_owned(), path.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let directory =
+            ConfinedPath::open(&root, &path, ConfinedParents::Existing)?.open_directory()?;
+        anyhow::ensure!(
+            crate::fs_util::file_identity(&directory)? == expected,
+            "Album directory identity changed"
+        );
+        Ok(())
+    })
+    .await?
+}
+
+/// Freeze maximal user subtrees that contain no managed media or sidecars.
+/// Private layout history stays at its original receipt paths.
+pub(in crate::download) async fn album_user_entries(
+    root: &Path,
+    directory: &Path,
+    files: &[crate::state::db::primary_layout::directory::AlbumDirectoryFile],
+) -> Result<Vec<crate::state::db::primary_layout::directory::AlbumUserEntry>> {
+    let (root, directory) = (root.to_owned(), directory.to_owned());
+    let managed: Vec<_> = files
+        .iter()
+        .flat_map(|file| {
+            let path = file.old.to_path();
+            let mut sidecar = path.as_os_str().to_owned();
+            sidecar.push(".xmp");
+            [path, PathBuf::from(sidecar)]
+        })
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        let mut pending = vec![directory];
+        let mut entries = Vec::new();
+        while let Some(parent) = pending.pop() {
+            for entry in std::fs::read_dir(&parent)? {
+                let entry = entry?;
+                let path = entry.path();
+                if entry.file_name() == ".kei-history" || managed.contains(&path) {
+                    continue;
+                }
+                let directory = entry.file_type()?.is_dir();
+                let confined = ConfinedPath::open(&root, &path, ConfinedParents::Existing)?;
+                let identity = confined.entry_identity()?;
+                if managed.iter().any(|managed| managed.starts_with(&path)) {
+                    anyhow::ensure!(directory, "Managed album parent is not a directory");
+                    confined.open_directory()?;
+                    pending.push(path);
+                } else {
+                    entries.push(
+                        crate::state::db::primary_layout::directory::AlbumUserEntry {
+                            path: crate::state::db::provider_selection::SelectionPath::from_path(
+                                &path,
+                            ),
+                            identity,
+                        },
+                    );
+                }
+            }
+        }
+        entries.sort_by_key(|entry| entry.path.to_path());
+        Ok(entries)
+    })
+    .await?
+}
+
+pub(in crate::download) async fn move_album_user_entry(
+    root: &Path,
+    entry: &crate::state::db::primary_layout::directory::AlbumUserEntry,
+    destination: &Path,
+) -> Result<()> {
+    let (root, entry, destination) = (root.to_owned(), entry.clone(), destination.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let source = ConfinedPath::open(&root, &entry.path.to_path(), ConfinedParents::Existing)?;
+        let target = ConfinedPath::open(&root, &destination, ConfinedParents::Create)?;
+        match source.entry_identity() {
+            Ok(identity) => {
+                anyhow::ensure!(
+                    identity == entry.identity,
+                    "User album entry changed identity"
+                );
+                super::platform::move_layout_confined(&source, &target)?;
+                if target.entry_identity()? != entry.identity {
+                    super::platform::move_layout_confined(&target, &source)?;
+                    anyhow::bail!("User album entry changed during movement");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::ensure!(
+                    target.entry_identity()? == entry.identity,
+                    "Moved user entry changed identity"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+        source.sync_parent()?;
+        target.sync_parent()?;
+        Ok(())
+    })
+    .await?
+}
+
 pub(in crate::download) async fn copy_verified(
     root: &Path,
     source: &Path,

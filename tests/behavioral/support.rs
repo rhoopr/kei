@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 39;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 40;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -457,6 +457,7 @@ CREATE INDEX IF NOT EXISTS idx_asset_metadata_paths_retry
             pass_kind TEXT NOT NULL,
             is_deleted INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL,
+            directory_binding BLOB,
             PRIMARY KEY (library, container_id)
         );
 

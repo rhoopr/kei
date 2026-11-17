@@ -197,6 +197,7 @@ pub(crate) async fn attempt_reauth(
         crate::personality::Mode::Off,
         input_mode,
         Some(generation),
+        auth::AuthPersistence::Writable,
     )
     .await?;
 

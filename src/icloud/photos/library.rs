@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
-use base64::Engine;
 use serde_json::{Value, json};
 
 use super::album::{
@@ -344,20 +343,9 @@ impl PhotoLibrary {
                 let mut components = Vec::new();
                 let mut current = folder;
                 loop {
-                    let folder_name = match current
-                        .fields
-                        .get("albumNameEnc")
-                        .and_then(|f| f.get("value"))
-                        .and_then(Value::as_str)
-                    {
-                        Some(enc) => {
-                            let decoded = base64::engine::general_purpose::STANDARD
-                                .decode(enc)
-                                .context("Album name is not valid base64")?;
-                            String::from_utf8(decoded).context("Album name is not UTF-8")?
-                        }
-                        None => current.record_name.clone(),
-                    };
+                    let folder_name = super::enc::album_name(&current.fields).context(
+                        "Provider album has no usable name; discovery remains incomplete",
+                    )?;
                     components.push(folder_name);
                     match current
                         .fields
@@ -654,6 +642,7 @@ impl PhotoLibrary {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine;
     use serde_json::json;
 
     use super::*;
@@ -1224,15 +1213,16 @@ mod tests {
     /// successive POSTs and records every body it received. Used to
     /// exercise the pagination loop in `fetch_folders` without a real
     /// HTTP server.
+    #[derive(Clone)]
     struct PaginatingFolderSession {
-        responses: std::sync::Mutex<Vec<Value>>,
+        responses: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
         received_bodies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl PaginatingFolderSession {
         fn new(responses: Vec<Value>) -> Self {
             Self {
-                responses: std::sync::Mutex::new(responses),
+                responses: std::sync::Arc::new(std::sync::Mutex::new(responses)),
                 received_bodies: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
@@ -1259,12 +1249,64 @@ mod tests {
         }
 
         fn clone_box(&self) -> Box<dyn PhotosSession> {
-            unimplemented!(
-                "PaginatingFolderSession::clone_box is not exercised by \
-                 fetch_folders; if a future test needs it, share Arcs over \
-                 the response queue and body log"
-            )
+            Box::new(self.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn album_discovery_refuses_untrustworthy_names_and_preserves_duplicate_leaves() {
+        for fields in [
+            json!({}),
+            json!({"albumNameEnc": {"value": "not base64"}}),
+            json!({"albumNameEnc": {"type": "STRING", "value": "   "}}),
+        ] {
+            let lib = make_library_with_session(Box::new(PaginatingFolderSession::new(vec![
+                json!({"records": [{"recordName": "private-id", "recordType": "CPLAlbum", "fields": fields}]}),
+            ])));
+            let error = match lib.albums().await {
+                Ok(_) => panic!("invalid name accepted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("no usable name"));
+            assert!(!error.to_string().contains("private-id"));
+        }
+        for names in [
+            ["Trip", "Trip"],
+            ["Trip/Day", "Trip\\Day"],
+            ["Videos", "Other"],
+        ] {
+            let records: Vec<Value> = names
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    json!({"recordName": format!("private-{i}"), "recordType": "CPLAlbum",
+                        "fields": {"albumName": {"value": name}}})
+                })
+                .collect();
+            let lib = make_library_with_session(Box::new(PaginatingFolderSession::new(vec![
+                json!({"records": records}),
+            ])));
+            let albums = lib.albums().await.unwrap();
+            let selected: Vec<_> = albums
+                .values()
+                .flatten()
+                .filter_map(PhotoAlbum::container_id)
+                .collect();
+            assert_eq!(selected.len(), 2);
+            assert!(selected.contains(&"private-0"));
+            assert!(selected.contains(&"private-1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn album_discovery_accepts_plain_name_without_identifier_fallback() {
+        let lib = make_library_with_session(Box::new(PaginatingFolderSession::new(vec![
+            json!({"records": [{"recordName": "private-id", "recordType": "CPLAlbum",
+                "fields": {"albumNameEnc": {"value": "malformed"}, "albumName": {"value": "Trip"}}}]}),
+        ])));
+        let albums = lib.albums().await.unwrap();
+        assert_eq!(albums["Trip"][0].container_id(), Some("private-id"));
+        assert!(!albums.contains_key("private-id"));
     }
 
     fn make_folder_records(count: usize, prefix: &str) -> Vec<Value> {

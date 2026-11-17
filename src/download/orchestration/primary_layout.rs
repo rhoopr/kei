@@ -841,6 +841,7 @@ async fn plan(
         let Some(current) =
             file::retain_pending_file(&config.directory, &old.path.to_path()).await?
         else {
+            present.push(old);
             continue;
         };
         let changed = current.fingerprint.sha256 != old.fingerprint.sha256
@@ -867,6 +868,38 @@ async fn plan(
     }
     oldfiles = present;
     let paths = filter::derive_expected_paths(asset, config);
+    let mut missingfiles = Vec::new();
+    let mut present = Vec::with_capacity(oldfiles.len());
+    for file in oldfiles {
+        if snapshot(&config.directory, &file.path.to_path())
+            .await?
+            .is_none()
+        {
+            let selected = paths
+                .iter()
+                .find(|path| path.version_size.as_str() == file.version);
+            anyhow::ensure!(
+                selected.is_some_and(|path| bound_destination(
+                    path,
+                    binding.map_or("", |b| b.qualifier.as_str()),
+                    binding
+                )
+                .ok()
+                .as_ref()
+                    == Some(&file.path.to_path())),
+                "Missing retained media has no matching current provider rendition"
+            );
+            anyhow::ensure!(
+                snapshot(&config.directory, &sidecar(&file.path.to_path())).await? == file.sidecar,
+                "Missing media sidecar changed locally"
+            );
+            missingfiles.push(file);
+        } else {
+            validate_file(&config.directory, &file).await?;
+            present.push(file);
+        }
+    }
+    let oldfiles = present;
     let preview_claims = if persist {
         Default::default()
     } else {
@@ -951,7 +984,14 @@ async fn plan(
         );
         let record = planner::pending_record_for_task(config, asset, &task);
         // Every occupied owned target retains exact old media and sidecar evidence, even for metadata-only changes.
-        let preserved_path = old.as_ref().map(|old| preservation_path(old, &family));
+        let missing = missingfiles
+            .iter()
+            .find(|file| file.path.to_path() == destination)
+            .cloned();
+        let preserved_path = old
+            .as_ref()
+            .or(missing.as_ref())
+            .map(|old| preservation_path(old, &family));
         destinations.push(destination.clone());
         members.push(LayoutMember {
             record: Some(record),
@@ -960,6 +1000,7 @@ async fn plan(
             stage: Some(SelectionPath::from_path(&stage)),
             archive_source: None,
             old,
+            missing,
             preserved_path,
             retirement: None,
             prepared: None,
@@ -1033,6 +1074,7 @@ async fn plan(
                     stage: Some(SelectionPath::from_path(&stage)),
                     archive_source: Some(old.clone()),
                     old: None,
+                    missing: None,
                     preserved_path: None,
                     retirement: None,
                     prepared: None,
@@ -1056,6 +1098,7 @@ async fn plan(
                 stage: None,
                 archive_source: None,
                 old: Some(old.clone()),
+                missing: None,
                 preserved_path: Some(preservation_path(&old, &family)),
                 retirement: None,
                 prepared: None,
@@ -1078,6 +1121,7 @@ async fn plan(
             stage: None,
             archive_source: None,
             old: Some(old),
+            missing: None,
             preserved_path: Some(preserved_path),
             retirement: Some(SelectionPath::from_path(&retirement)),
             prepared: None,
@@ -1503,6 +1547,36 @@ pub(in crate::download) async fn finish(
     // Preserve every member before the first visible change, including sidecars.
     for index in 0..op.members.len() {
         let member = op.members.get(index).context("Layout member disappeared")?;
+        if let Some(missing) = &member.missing
+            && let Some(expected) = &missing.sidecar
+        {
+            let preserved = sidecar(
+                &member
+                    .preserved_path
+                    .as_ref()
+                    .context("Missing sidecar history path")?
+                    .to_path(),
+            );
+            if let Some(actual) = snapshot(&root, &preserved).await? {
+                anyhow::ensure!(
+                    file::primary_layout::bytes_match(expected, &actual)
+                        && actual.identity != expected.identity,
+                    "Missing media sidecar history changed"
+                );
+            } else {
+                anyhow::ensure!(
+                    op.phase != "publishing",
+                    "Missing durable sidecar preservation"
+                );
+                copy_verified(
+                    &root,
+                    &sidecar(&missing.path.to_path()),
+                    &preserved,
+                    expected,
+                )
+                .await?;
+            }
+        }
         if let Some(preserved) = &member.preserved {
             validate_file(&root, preserved).await?;
             continue;
@@ -1634,6 +1708,27 @@ pub(in crate::download) async fn finish(
                                     .clone()
                                     .context("Missing preserved sidecar")?,
                             )?)
+                        } else if let Some(old) = member
+                            .missing
+                            .as_ref()
+                            .and_then(|missing| missing.sidecar.as_ref())
+                        {
+                            let path = sidecar(
+                                &member
+                                    .preserved_path
+                                    .as_ref()
+                                    .context("Missing sidecar history path")?
+                                    .to_path(),
+                            );
+                            let preserved = snapshot(&root, &path)
+                                .await?
+                                .context("Missing preserved orphan sidecar")?;
+                            Some(ManagedPrimaryAuthorization::preserved(
+                                op.operation.clone(),
+                                old.clone(),
+                                path,
+                                preserved,
+                            )?)
                         } else {
                             None
                         };
@@ -1656,6 +1751,18 @@ pub(in crate::download) async fn finish(
                         .context("Missing sidecar preservation")?;
                     let retired = preserved
                         .path
+                        .to_path()
+                        .with_file_name(format!(".retired-sidecar-{}-{index}", op.operation));
+                    file::primary_layout::retire(&root, &xmp_path, &retired, old, None).await?;
+                } else if let Some(old) = member
+                    .missing
+                    .as_ref()
+                    .and_then(|missing| missing.sidecar.as_ref())
+                {
+                    let retired = member
+                        .preserved_path
+                        .as_ref()
+                        .context("Missing sidecar history path")?
                         .to_path()
                         .with_file_name(format!(".retired-sidecar-{}-{index}", op.operation));
                     file::primary_layout::retire(&root, &xmp_path, &retired, old, None).await?;

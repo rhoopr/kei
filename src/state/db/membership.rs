@@ -95,7 +95,16 @@ fn mark_album_groupings_dirty_tx(
     .map_err(|e| StateError::query("mark_album_groupings_dirty", e))?;
     tx.execute(
         "UPDATE asset_metadata_paths SET metadata_write_failed_at = COALESCE(metadata_write_failed_at, ?3) \
-         WHERE library = ?1 AND id = ?2",
+         WHERE library = ?1 AND id = ?2 \
+           AND NOT EXISTS(SELECT 1 FROM primary_layout_superseded_paths s \
+             WHERE s.library=asset_metadata_paths.library AND s.child=asset_metadata_paths.id \
+               AND s.version=asset_metadata_paths.version_size \
+               AND s.provider_checksum=asset_metadata_paths.provider_checksum \
+               AND s.compat_path=asset_metadata_paths.local_path \
+               AND NOT EXISTS(SELECT 1 FROM primary_layout_claims c \
+                 WHERE c.native_path=s.native_path AND c.library=s.library AND c.child=s.child \
+                   AND c.version=s.version AND c.provider_checksum=s.provider_checksum \
+                   AND c.operation IS NULL))",
         rusqlite::params![library, asset_id, Utc::now().timestamp()],
     ).map_err(|e| StateError::query("mark_album_metadata_paths_dirty", e))?;
     Ok(())

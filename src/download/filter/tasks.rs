@@ -174,7 +174,8 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
         .map(Arc::from)
         .unwrap_or_else(|| Arc::clone(&config.library));
 
-    if let Some(d) = derive_primary(asset, config, &ctx) {
+    if let Some(mut d) = derive_primary(asset, config, &ctx) {
+        super::expected_paths::apply_album_path(asset, config, &mut d);
         let strategy = match config.file_match_policy {
             FileMatchPolicy::NameId7 => CollisionStrategy::SkipIfExists,
             FileMatchPolicy::NameSizeDedupWithSuffix => CollisionStrategy::SizeDedup {
@@ -252,9 +253,10 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
         derive_live_edited_extra,
     ];
     for derive_extra in extra_derivers {
-        let Some(d) = derive_extra(asset, config, &ctx, &seen_urls) else {
+        let Some(mut d) = derive_extra(asset, config, &ctx, &seen_urls) else {
             continue;
         };
+        super::expected_paths::apply_album_path(asset, config, &mut d);
         let DerivedPath {
             path,
             filename,
@@ -309,12 +311,13 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
         }
     }
 
-    if let Some(d) = derive_mov_companion(
+    if let Some(mut d) = derive_mov_companion(
         asset,
         config,
         &ctx,
         recorded_primary_filename.or(effective_primary_filename.as_deref()),
     ) {
+        super::expected_paths::apply_album_path(asset, config, &mut d);
         let DerivedPath {
             path,
             filename,

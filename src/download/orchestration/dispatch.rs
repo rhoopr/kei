@@ -490,13 +490,14 @@ pub async fn download_photos_with_sync(
         // This read validates the database's authenticated pin and retained root
         // before recovery, cleanup, or any other dispatcher mutation.
         context.current().await?;
+        super::album_directory::prepare(passes, &config, &shutdown_token).await?;
     }
     // Bound the complete cycle's new selection/replay state at its owner,
     // preserving one opaque public future and avoiding caller-specific boxing.
     Box::pin(download_photos_with_sync_inner(
         download_client,
         passes,
-        config,
+        Arc::clone(&config),
         controls,
         shutdown_token,
     ))

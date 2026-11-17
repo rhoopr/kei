@@ -9,6 +9,21 @@ use crate::download::{DownloadConfig, paths};
 use crate::types::{FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy};
 
 pub(crate) trait PathDerivationSource {
+    fn album_bound_parent(
+        &self,
+        _library: Option<&str>,
+        _child: &str,
+    ) -> Option<std::path::PathBuf> {
+        None
+    }
+    fn album_bound_path(
+        &self,
+        _library: Option<&str>,
+        _child: &str,
+        _version: &str,
+    ) -> Option<std::path::PathBuf> {
+        None
+    }
     fn directory(&self) -> &Path;
     fn folder_structure(&self) -> &str;
     fn media(&self) -> &crate::config::MediaSelection;
@@ -195,6 +210,28 @@ impl PathDerivationSource for PathDerivationConfig {
 }
 
 impl PathDerivationSource for DownloadConfig {
+    fn album_bound_parent(&self, library: Option<&str>, child: &str) -> Option<std::path::PathBuf> {
+        let container = self.primary_layout_source.as_ref()?.container_id()?;
+        self.selection_context.as_ref()?.album_parent(
+            container,
+            library.unwrap_or(&self.library),
+            child,
+        )
+    }
+    fn album_bound_path(
+        &self,
+        library: Option<&str>,
+        child: &str,
+        version: &str,
+    ) -> Option<std::path::PathBuf> {
+        let container = self.primary_layout_source.as_ref()?.container_id()?;
+        self.selection_context.as_ref()?.album_file(
+            container,
+            library.unwrap_or(&self.library),
+            child,
+            version,
+        )
+    }
     fn directory(&self) -> &Path {
         &self.directory
     }

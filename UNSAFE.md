@@ -69,6 +69,8 @@ lint settings, and dependency lockfile entries are not counted. There are no
 - `src/fs_util.rs::openat_owned` transfers each successful syscall descriptor
   into one `OwnedFd`. The retained directory and NUL-terminated name remain
   live; the variadic mode has the promoted C integer type required on macOS.
+- `ConfinedPath::create_new_directory` uses `mkdirat` with its live retained parent descriptor and NUL-terminated leaf. It never replaces an entry; directory identity and parent durability are checked before ownership is stored.
+- `ConfinedPath::entry_identity` uses `fstatat(AT_SYMLINK_NOFOLLOW)` against a live retained parent and NUL-terminated leaf. Its writable `libc::stat` storage is read with `assume_init` only after success. Namespace validation brackets the lookup; a user symlink is identified without opening its target.
 - `ConfinedPath::open_platform` uses `mkdirat` beneath retained directories,
   then opens each component with `O_DIRECTORY | O_NOFOLLOW`. Every created
   directory's parent is synced before traversal continues.

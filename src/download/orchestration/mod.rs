@@ -1,5 +1,6 @@
 //! Responsibility-specific owners behind the download facade.
 
+mod album_directory;
 pub(super) mod cleanup;
 pub(super) mod config;
 pub(super) mod context;

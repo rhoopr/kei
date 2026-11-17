@@ -953,14 +953,19 @@ fn parse_album_delta(record: &Record, reason: ChangeReason) -> ChangeEvent {
         reason,
         ChangeReason::HardDeleted | ChangeReason::SoftDeleted
     );
-    let album_name = enc::decode_string(&record.fields, "albumNameEnc")
-        .or_else(|| field_value_str(&record.fields, "albumName").map(ToOwned::to_owned))
-        .unwrap_or_else(|| record.record_name.clone());
     let mut event = ChangeEvent::new(
         record.record_name.clone().into_boxed_str(),
         Some(record.record_type.clone().into_boxed_str()),
         reason,
     );
+    let album_name = match enc::album_name(&record.fields) {
+        Some(name) => name,
+        None if is_deleted => String::new(),
+        None => {
+            event.token_unsafe_reason = Some("album_name_unavailable");
+            return event;
+        }
+    };
     event.album = Some(AlbumContainerDelta {
         container_id: record.record_name.clone().into_boxed_str(),
         album_name: crate::download::paths::sanitize_path_component(&album_name).into_boxed_str(),
@@ -2621,6 +2626,38 @@ mod tests {
         // Flush should still be empty since album/relation records are not buffered.
         let flushed = buffer.flush();
         assert!(flushed.is_empty());
+    }
+
+    #[test]
+    fn album_delta_unusable_name_holds_token_but_tombstone_keeps_identity() {
+        for fields in [
+            json!({}),
+            json!({"albumNameEnc": {"value": "not base64"}}),
+            json!({"albumNameEnc": {"type": "STRING", "value": "   "}}),
+        ] {
+            for deleted in [false, true] {
+                let mut buffer = DeltaRecordBuffer::new();
+                let events = buffer.process_records(vec![Record {
+                    record_name: "private-id".into(),
+                    record_type: "CPLAlbum".into(),
+                    fields: fields.clone(),
+                    deleted: deleted.then_some(true),
+                }]);
+                assert_eq!(events.len(), 1);
+                if deleted {
+                    let album = events[0].album.as_ref().unwrap();
+                    assert!(album.is_deleted);
+                    assert_eq!(album.container_id.as_ref(), "private-id");
+                    assert!(events[0].token_unsafe_reason.is_none());
+                } else {
+                    assert!(events[0].album.is_none());
+                    assert_eq!(
+                        events[0].token_unsafe_reason,
+                        Some("album_name_unavailable")
+                    );
+                }
+            }
+        }
     }
 
     #[test]

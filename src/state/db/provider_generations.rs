@@ -30,6 +30,16 @@ const MAX_OBSERVED_BYTES: usize = 64 * 1024 * 1024;
 
 const MANAGED_SUCCESSOR_PREFIX: &str = "managed_successor:";
 
+fn album_pass_scope<'a>(root: &'a ActiveGeneration, key: &str) -> Option<&'a Value> {
+    root.spec
+        .profile
+        .get("passes")?
+        .as_array()?
+        .iter()
+        .find(|pass| pass.get("key").and_then(Value::as_str) == Some(key))?
+        .get("scope")
+}
+
 fn preservation_intent(
     root: &ActiveGeneration,
     manifest: &ActiveDecision,
@@ -2482,6 +2492,242 @@ fn validate_current_deleted_selection(
     Ok(())
 }
 
+/// Frozen source authority for an actual directory publication. Settlement is
+/// recorded in its existing member journal, never inferred from path receipts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectoryPublicationSource {
+    generation: String,
+    pass: String,
+    child: String,
+    source: String,
+    settled: bool,
+}
+
+pub(super) fn land_directory_publication(
+    conn: &Connection,
+    file: &super::primary_layout::directory::AlbumDirectoryFile,
+) -> Result<(), StateError> {
+    let Some(native) = &file.native else {
+        return Ok(());
+    };
+    if conn.is_autocommit() || native.settled {
+        return invalid();
+    }
+    let fingerprint = file
+        .fingerprint
+        .as_ref()
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    let root = load_generation(conn, &native.generation)?;
+    load_decision(conn, &root, &native.pass, &native.child)?;
+    let changed = conn.execute("UPDATE provider_active_destinations SET current_publication=0 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND library=?4 AND asset_id=?5 AND version_size=?6 AND path=?7 AND checksum=?8 AND local_checksum=?9 AND source_checksum=?10 AND current_publication=1 AND verified_media=1 AND preserved_local IS NULL AND prepared_hash IS NULL", params![native.generation,native.pass,native.child,file.library,file.child,file.version,file.old.key()?,file.provider_checksum,data_encoding::HEXLOWER.encode(&fingerprint.sha256),native.source])?;
+    if changed != 1 {
+        return invalid();
+    }
+    Ok(())
+}
+
+// These are actual moved publications awaiting native receipt finalization.
+// Only the current container binding may hand them to a current destination.
+fn pending_directory_publications(
+    conn: &Connection,
+    filter: Option<(&str, &super::provider_selection::SelectionPath)>,
+) -> Result<
+    Vec<(
+        String,
+        i64,
+        super::primary_layout::directory::AlbumDirectoryFile,
+    )>,
+    StateError,
+> {
+    let mut statement = conn.prepare("SELECT o.operation,m.member,m.evidence FROM primary_layout_operations o JOIN primary_layout_members m ON m.operation=o.operation WHERE o.policy='album-directory-v1' AND o.phase='committed' AND json_extract(CAST(m.evidence AS TEXT),'$.native.settled')=0")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    let mut pending = Vec::new();
+    for row in rows {
+        let (operation, member, bytes) = row?;
+        let file: super::primary_layout::directory::AlbumDirectoryFile =
+            super::primary_layout::decode(&bytes)?;
+        if filter.is_some_and(|(library, path)| file.library != library || file.next != *path) {
+            continue;
+        }
+        let (op, _) = super::primary_layout::directory::load_operation(conn, &operation)?;
+        if op.fallback.is_some() {
+            continue;
+        }
+        let current: Option<Vec<u8>> = conn.query_row("SELECT directory_binding FROM album_containers WHERE library=?1 AND container_id=?2", params![op.next.library,op.next.container], |row| row.get(0)).optional()?.flatten();
+        if current.as_deref() != Some(super::primary_layout::encode(&op.next)?.as_slice()) {
+            continue;
+        }
+        pending.push((operation, member, file));
+    }
+    Ok(pending)
+}
+
+fn settle_directory_publications(
+    conn: &Connection,
+    library: &str,
+    path: &super::provider_selection::SelectionPath,
+) -> Result<(), StateError> {
+    for (operation, member, mut file) in
+        pending_directory_publications(conn, Some((library, path)))?
+    {
+        let native = file
+            .native
+            .as_mut()
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        native.settled = true;
+        conn.execute(
+            "UPDATE primary_layout_members SET evidence=?3 WHERE operation=?1 AND member=?2",
+            params![operation, member, super::primary_layout::encode(&file)?],
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn has_unsettled_directory_publication(
+    conn: &Connection,
+    binding: &super::primary_layout::directory::AlbumDirectoryBinding,
+) -> Result<bool, StateError> {
+    for (operation, _, _) in pending_directory_publications(conn, None)? {
+        let (op, _) = super::primary_layout::directory::load_operation(conn, &operation)?;
+        if op.next.library == binding.library
+            && op.next.container == binding.container
+            && op.next.generation == binding.generation
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn directory_publication_source(
+    conn: &Connection,
+    scope: &str,
+    key: &str,
+    child: &str,
+    library: &str,
+    path: &super::provider_selection::SelectionPath,
+    fingerprint: (&str, u64),
+) -> Result<Option<(SelectionDestination, String)>, StateError> {
+    let mut source = None;
+    for (operation, _, file) in pending_directory_publications(conn, Some((library, path)))? {
+        let native = file
+            .native
+            .as_ref()
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        let observed = file
+            .fingerprint
+            .as_ref()
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        if native.child != child
+            || observed.size != fingerprint.1
+            || data_encoding::HEXLOWER.encode(&observed.sha256) != fingerprint.0
+        {
+            continue;
+        }
+        let (op, _) = super::primary_layout::directory::load_operation(conn, &operation)?;
+        if op.next.pass != key {
+            continue;
+        }
+        let root = load_generation(conn, &native.generation)?;
+        if root.spec.scope != scope {
+            continue;
+        }
+        let manifest = load_decision(conn, &root, &native.pass, &native.child)?;
+        let destination = manifest
+            .decision
+            .destinations
+            .iter()
+            .find(|destination| {
+                destination.path == file.old
+                    && destination.version_size == file.version
+                    && destination.checksum == file.provider_checksum
+            })
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND verified_media=1 AND preserved_local IS NULL AND local_checksum=?6 AND source_checksum=?7)", params![native.generation,native.pass,native.child,file.version,file.old.key()?,fingerprint.0,native.source], |row| row.get(0))?;
+        if !valid || source.is_some() {
+            return invalid();
+        }
+        source = Some((destination.clone(), native.source.clone()));
+    }
+    Ok(source)
+}
+
+/// Exact native publication evidence, not a legacy asset or path row.
+pub(super) fn album_directory_native_sources(
+    conn: &Connection,
+    pass_key: Option<&str>,
+    prefix: &Path,
+) -> Result<Vec<super::primary_layout::directory::AlbumDirectorySource>, StateError> {
+    let mut statement = conn.prepare("SELECT generation,pass_key,child,version_size,path,local_checksum,source_checksum FROM provider_active_destinations WHERE current_publication=1 AND verified_media=1 AND preserved_local IS NULL AND (?1 IS NULL OR pass_key=?1)")?;
+    let rows = statement.query_map([pass_key], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut sources = Vec::new();
+    for row in rows {
+        let (generation, key, child, version, path, local_checksum, source) = row?;
+        let path: super::provider_selection::SelectionPath =
+            serde_json::from_str(&path).map_err(|_error| StateError::ProviderSelectionInvalid)?;
+        if !path.to_path().starts_with(prefix) {
+            continue;
+        }
+        let managed: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM primary_layout_claims WHERE path_key=?1)",
+            [super::primary_layout::path_key(&path.to_path())?],
+            |row| row.get(0),
+        )?;
+        if managed {
+            continue;
+        }
+        let root = load_generation(conn, &generation)?;
+        let manifest = load_decision(conn, &root, &key, &child)?;
+        let destination = manifest
+            .decision
+            .destinations
+            .iter()
+            .find(|destination| destination.path == path && destination.version_size == version)
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        let zone = manifest.media_zone(&root);
+        let library = zone
+            .get("zoneName")
+            .and_then(Value::as_str)
+            .ok_or(StateError::ProviderSelectionInvalid)?
+            .to_owned();
+        sources.push(super::primary_layout::directory::AlbumDirectorySource {
+            library,
+            child: manifest.state_id.clone(),
+            version,
+            provider_checksum: destination.checksum.clone(),
+            path,
+            local_checksum,
+            expected_sidecar: None,
+            created: None,
+            native: Some(DirectoryPublicationSource {
+                generation,
+                pass: key,
+                child,
+                source,
+                settled: false,
+            }),
+        });
+    }
+    Ok(sources)
+}
+
 /// Exact native publication evidence, not a legacy asset or path row.
 pub(crate) struct MembershipDestination {
     pub(crate) generation: String,
@@ -3085,6 +3331,9 @@ enum VerifiedDestinationSource<'a> {
     // An unfinished admitted destination independently measured as its exact
     // current raw SHA-256 provider resource after publication lost state.
     RecoveredPublication(&'a str),
+    // The existing directory journal proves an actual durable move. Receipt
+    // settlement consumes that handoff in the same native publication transaction.
+    DirectoryPublication(&'a str),
     // Only the reuse owner constructs this after validating the retained
     // native generation/decision and exact source, path and local fingerprint.
     RetainedNative(&'a str),
@@ -3107,6 +3356,9 @@ pub(super) fn replace_current_publication(
     if conn.is_autocommit() {
         return invalid();
     }
+    let native_path =
+        serde_json::from_str(path).map_err(|_error| StateError::ProviderSelectionInvalid)?;
+    settle_directory_publications(conn, library, &native_path)?;
     conn.execute("UPDATE provider_active_destinations SET current_publication=0 WHERE library=?1 AND path=?2 AND current_publication=1", params![library,path])?;
     if let Some((generation, key, child, version)) = current {
         let root = load_generation(conn, generation)?;
@@ -3153,6 +3405,7 @@ fn record_destination_source(
     let (source, require_path_receipt, published) = match source {
         VerifiedDestinationSource::PathPublication(source) => (source, true, true),
         VerifiedDestinationSource::RecoveredPublication(source) => (source, false, true),
+        VerifiedDestinationSource::DirectoryPublication(source) => (source, false, true),
         VerifiedDestinationSource::RetainedNative(source) => (source, false, false),
         VerifiedDestinationSource::ImportedLocal(source) => (source, false, false),
         VerifiedDestinationSource::PriorPublication(source) => (source, false, false),
@@ -3230,6 +3483,16 @@ impl SqliteStateDb {
             if !manifest.decision.destinations.iter().any(|d|d.path==path) {return invalid()}
             let native=path.to_path();
             let selected=manifest.decision.destinations.iter().find(|d|d.path==path).ok_or(StateError::ProviderSelectionInvalid)?;
+            let library=manifest.media_zone(&root).get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?;
+            if let Some((moved, source)) = directory_publication_source(&tx,&root.spec.scope,&key,&child,library,&path,(&local,size))?
+                && moved.version_size == selected.version_size && moved.checksum == selected.checksum && moved.size == selected.size {
+                super::asset_writes::update_status_to_downloaded(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,Some(&source),false,chrono::Utc::now().timestamp())?;
+                record_destination_source(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::DirectoryPublication(&source))?;
+                let completed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND path=?4 AND version_size=?5 AND verified_media=1 AND preserved_local IS NULL AND local_checksum=?6 AND source_checksum=?7)",params![generation,key,child,path.key()?,selected.version_size,local,source],|row|row.get(0))?;
+                if !completed { return invalid(); }
+                tx.commit()?;
+                return Ok(true);
+            }
             let previous:Option<(String,String,String)>=tx.query_row("SELECT w.generation,w.source_checksum,w.pass_key FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.child=?3 AND w.version_size=?4 AND w.path=?5 AND w.checksum=?6 AND w.size_bytes=?7 AND w.master=?8 AND w.admitted=1 AND w.verified_media=1 AND (w.local_checksum=?9 OR (w.prepared_checksum=?9 AND w.prepared_size=?10)) ORDER BY g.created_at DESC LIMIT 1",params![root.spec.scope,key,child,selected.version_size,path.key()?,selected.checksum,i64::try_from(selected.size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,manifest.decision.master,local,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
             if let Some((previous,source,previous_key))=previous {
                 let previous_root=load_generation(&tx,&previous)?;load_decision(&tx,&previous_root,&previous_key,&child)?;
@@ -3690,6 +3953,21 @@ impl SqliteStateDb {
             if !manifest.decision.destinations.iter().any(|destination| destination.path == file.path && destination.version_size == file.version) {
                 return invalid();
             }
+            // A committed directory move preserves historical completion while
+            // current selection verifies successors. Never revive its old slot.
+            let operations: Vec<String> = tx.prepare("SELECT operation FROM primary_layout_operations WHERE policy='album-directory-v1' AND phase='committed'")?.query_map([], |row| row.get(0))?.collect::<Result<_,_>>()?;
+            for operation in operations {
+                let (op, _) = super::primary_layout::directory::load_operation(&tx, &operation)?;
+                if op.old.pass != file.pass_key || album_pass_scope(&root, &file.pass_key) != Some(&op.old.scope) { continue; }
+                let mut statement = tx.prepare("SELECT evidence FROM primary_layout_members WHERE operation=?1")?;
+                for row in statement.query_map([operation], |row| row.get::<_,Vec<u8>>(0))? {
+                    let member: super::primary_layout::directory::AlbumDirectoryFile = super::primary_layout::decode(&row?)?;
+                    if member.old == file.path && member.child == manifest.state_id && member.version == file.version
+                        && super::primary_layout::directory::relocated_path(&op, &member.old)? == member.next {
+                        return Ok(());
+                    }
+                }
+            }
             let zone = manifest.media_zone(&root);
             let library = zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?;
             replace_current_publication(&tx, library, &file.path.key()?, None)?;
@@ -3711,13 +3989,15 @@ impl SqliteStateDb {
         fingerprint: (String, u64),
     ) -> Result<bool, StateError> {
         let (child, library) = identity;
-        let (local, _size) = fingerprint;
+        let (local, size) = fingerprint;
         self.with_conn("checking independent publication fingerprint",move|conn|{
             account::validate_authenticated(conn,&owner)?;
             // Only actual publication or checked metadata completion advances
             // this lossless authority. History and generation dates never do.
             let previous:Option<(String,String)>=conn.query_row("SELECT w.generation,w.pass_key FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.child=?3 AND w.path=?4 AND w.local_checksum=?5 AND w.library=?6 AND w.current_publication=1 AND w.admitted=1 AND w.verified_media=1 AND w.preserved_local IS NULL ORDER BY (w.pass_key=?2) DESC,w.generation,w.pass_key LIMIT 1",params![scope,key,child,path.key()?,local,library],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-            if let Some((generation,previous_key))=previous {let root=load_generation(conn,&generation)?;load_decision(conn,&root,&previous_key,&child)?;Ok(true)} else {Ok(false)}
+            if let Some((generation,previous_key))=previous {let root=load_generation(conn,&generation)?;load_decision(conn,&root,&previous_key,&child)?;Ok(true)} else {
+                Ok(directory_publication_source(conn,&scope,&key,&child,&library,&path,(&local,size))?.is_some())
+            }
         }).await
     }
 }
@@ -3762,6 +4042,20 @@ impl SqliteStateDb {
     ) -> Result<Option<super::provider_selection::SelectionPath>, StateError> {
         self.with_conn("reading established local destination", move |conn| {
             account::validate_authenticated(conn, &owner)?;
+            let mut landed = None;
+            for (operation, _, file) in pending_directory_publications(conn, None)? {
+                let native = file.native.as_ref().ok_or(StateError::ProviderSelectionInvalid)?;
+                if native.child != child || file.version != version { continue; }
+                let (op, _) = super::primary_layout::directory::load_operation(conn, &operation)?;
+                if op.next.pass != key { continue; }
+                let root = load_generation(conn, &native.generation)?;
+                if root.spec.scope != scope { continue; }
+                let manifest = load_decision(conn, &root, &native.pass, &native.child)?;
+                if manifest.decision.master.as_deref() != Some(master.as_str()) { continue; }
+                if landed.as_ref().is_some_and(|path| *path != file.next) { return invalid(); }
+                landed = Some(file.next);
+            }
+            if landed.is_some() { return Ok(landed); }
             let previous: Option<(String, String)> = conn.query_row(
                 "SELECT w.generation,w.path FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.pass_key=?2 AND w.child=?3 AND w.version_size=?4 AND w.master=?5 AND w.admitted=1 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL) ORDER BY g.created_at DESC LIMIT 1",
                 params![scope,key,child,version,master], |row| Ok((row.get(0)?,row.get(1)?)),

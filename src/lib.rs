@@ -745,14 +745,22 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
     let (make_writer, _writer_guard, redact_password) = build_redacting_writer(BarSuspendingStderr);
     let mut globals = config::GlobalArgs::from_bootstrap_env();
     globals.config_source = config.source.clone();
-    let recording = matches!(
-        &cli.command,
-        cli::Command::Sync { .. }
-            | cli::Command::ImportExisting(_)
-            | cli::Command::Service {
-                action: cli::ServiceAction::Run(_)
-            }
-    );
+    let preview = match &cli.command {
+        cli::Command::Sync { sync, .. } => sync.dry_run || sync.only_print_filenames,
+        cli::Command::Service {
+            action: cli::ServiceAction::Run(args),
+        } => args.sync.dry_run || args.sync.only_print_filenames,
+        _ => false,
+    };
+    let recording = !preview
+        && matches!(
+            &cli.command,
+            cli::Command::Sync { .. }
+                | cli::Command::ImportExisting(_)
+                | cli::Command::Service {
+                    action: cli::ServiceAction::Run(_)
+                }
+        );
     let (recorder, support_guard) = if recording {
         match support::initialize(&globals, config.toml.as_ref(), config.explicitly_set) {
             Some((recorder, guard)) => (Some(recorder), Some(guard)),
