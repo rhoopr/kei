@@ -94,9 +94,11 @@ By default, kei downloads available full-resolution originals, current edits and
 
 Once the small backup looks right, review your saved choices before expanding them. Widen or remove the saved date bounds only when you want to include more dates. `kei sync` without date flags uses the saved bounds, so it can still repeat only the sample. The setup wizard can select all available libraries, including Shared Libraries. Check albums, smart folders, photos outside albums and component exclusions before treating the result as a full backup.
 
-As an alternative to the wizard, a minimal config is:
+As an alternative to the wizard, a minimal config for this development branch is below. Released v0.26 builds use the [v0.26 instructions](https://github.com/rhoopr/kei/blob/v0.26.0/README.md) and do not accept `config_version`.
 
 ```toml
+config_version = 1
+
 [auth]
 username = "you@example.com"
 

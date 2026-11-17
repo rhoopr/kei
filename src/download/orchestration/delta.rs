@@ -672,6 +672,14 @@ impl IncrementalDeltaSummary {
             ChangeReason::Hidden => {
                 self.hidden_count += 1;
                 tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
+                if config.selection_context.is_some() {
+                    // Hidden deltas carry identity evidence, not necessarily a
+                    // usable capture date or a confirmed current child. Native
+                    // selection projects the complete snapshot after admission;
+                    // a flag-only update here can mutate an unowned historical
+                    // master or partially apply an otherwise refused snapshot.
+                    return;
+                }
                 if let Some(db) = &config.state_db {
                     let update = SourceStateUpdate::Hidden;
                     let (result, state_key) =

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
 
@@ -17,13 +17,14 @@ use super::full::{
     download_photos_full_with_token_policy,
 };
 use super::incremental::download_photos_incremental;
-use super::maintenance::{has_metadata_backfill_work, run_metadata_capture_repair};
+use super::maintenance::{
+    has_metadata_backfill_work, observe_metadata_capture, run_metadata_capture_repair,
+};
 use super::models::{
     DownloadControls, DownloadOutcome, FullEnumerationReason, SMART_FOLDER_REFRESH_FAILED_REASON,
     SyncMode, SyncResult, SyncStats, TARGETED_ALBUM_BACKFILL_FAILED_REASON,
     merge_download_outcomes,
 };
-use super::recovery::append_targeted_recovery_to_sync_result;
 use super::selection::{
     IncrementalRoutingDecision, determine_incremental_routing_decision,
     split_incremental_and_smart_folder_passes,
@@ -475,6 +476,21 @@ pub async fn download_photos_with_sync(
         !controls.run_mode.downloads_files() || config.state_db.is_some(),
         "Writable sync requires a state database; use dry-run for a state-free preview"
     );
+    if passes.is_empty() {
+        return Ok(SyncResult::from_execution(
+            DownloadOutcome::Success,
+            None,
+            SyncStats::default(),
+        ));
+    }
+    if controls.run_mode.downloads_files() && !config.provisional {
+        let context = super::generation::context(passes, &config, controls).await?.context(
+            "Writable sync requires authenticated destination ownership for every selected query; refresh authenticated library discovery or use dry-run to inspect an unsupported selection",
+        )?;
+        // This read validates the database's authenticated pin and retained root
+        // before recovery, cleanup, or any other dispatcher mutation.
+        context.current().await?;
+    }
     // Bound the complete cycle's new selection/replay state at its owner,
     // preserving one opaque public future and avoiding caller-specific boxing.
     Box::pin(download_photos_with_sync_inner(
@@ -530,7 +546,17 @@ async fn download_photos_with_sync_inner(
         primary_layout_preview,
         ..config.as_ref().clone()
     });
-    let sync_started_at = chrono::Utc::now().timestamp();
+    // Bind the validated selection before historical maintenance can schedule
+    // work. The same context also owns enumeration and publication below.
+    let config =
+        if let Some(context) = super::generation::context(passes, &config, controls).await? {
+            Arc::new(DownloadConfig {
+                selection_context: Some(Arc::new(context)),
+                ..config.as_ref().clone()
+            })
+        } else {
+            config
+        };
     super::generation::freeze_before_sync(passes, &config, controls).await?;
     if matches!(controls.run_mode, super::models::DownloadRunMode::Download) {
         let protected = crate::download::legacy_preservation::protected_replacement_paths(
@@ -551,8 +577,11 @@ async fn download_photos_with_sync_inner(
     {
         backfill_asset_master_mappings_from_album_history(db.as_ref()).await;
     }
-    let metadata_capture_repair =
-        run_metadata_capture_repair(passes, &config, controls, &shutdown_token).await;
+    let metadata_capture_repair = if config.selection_context.is_some() {
+        observe_metadata_capture(&config).await
+    } else {
+        run_metadata_capture_repair(passes, &config, controls, &shutdown_token).await
+    };
     if metadata_capture_repair.auth_errors > 0 {
         return Ok(SyncResult {
             deferred_album_snapshots: Vec::new(),
@@ -568,63 +597,7 @@ async fn download_photos_with_sync_inner(
         });
     }
 
-    let config =
-        if let Some(context) = super::generation::context(passes, &config, controls).await? {
-            Arc::new(DownloadConfig {
-                selection_context: Some(Arc::new(context)),
-                ..config.as_ref().clone()
-            })
-        } else {
-            config
-        };
-
-    // Only the legacy retry owner resets rendition-wide scheduling. Selected
-    // destinations retain their own attempts and due times across cycles.
-    if controls.run_mode.downloads_files()
-        && config.selection_context.is_none()
-        && let Some(db) = &config.state_db
-    {
-        match db.prune_source_deleted_retries(Some(&config.library)).await {
-            Ok(0) => {}
-            Ok(count) => {
-                tracing::info!(
-                    count,
-                    "Pruned source-deleted pending/failed assets from retry queue"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to prune source-deleted retry assets");
-            }
-        }
-        let error_retention = if config.repair_truncated {
-            crate::state::RetryErrorRetention::Preserve(
-                crate::commands::reconcile::FILE_TRUNCATED_REASON,
-            )
-        } else {
-            crate::state::RetryErrorRetention::Clear
-        };
-        match db
-            .prepare_for_retry(Some(&config.library), error_retention)
-            .await
-        {
-            Ok((failed, stale, _)) => {
-                if failed > 0 {
-                    tracing::debug!(count = failed, "Reset failed assets for retry");
-                }
-                if stale > 0 {
-                    tracing::debug!(
-                        count = stale,
-                        "Cleared stale attempt counts on pending assets"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to reset assets for retry");
-            }
-        }
-    }
-
-    let result = match &config.sync_mode {
+    let mut result = match &config.sync_mode {
         SyncMode::Incremental { zone_sync_token } if config.inventory_reconciliation => {
             reconcile_inventory(
                 download_client,
@@ -794,12 +767,57 @@ async fn download_photos_with_sync_inner(
         })
     })?;
 
+    if matches!(result.outcome, DownloadOutcome::SessionExpired { .. })
+        && controls.run_mode.downloads_files()
+        && let Some(db) = &config.state_db
+    {
+        // Discovery and retained replay can return session expiry without
+        // starting a streaming run. Persist the final invocation outcome even
+        // when an earlier empty pipeline recorded a successful subpass.
+        result.checkpoint.enumeration_errors = result.checkpoint.enumeration_errors.max(1);
+        result.checkpoint.enumeration_incomplete = true;
+        result.checkpoint.project(&mut result.stats);
+        let recorded = async {
+            let run = db.start_sync_run().await?;
+            db.complete_sync_run(
+                run,
+                &crate::state::SyncRunStats {
+                    assets_seen: result.stats.assets_seen,
+                    assets_downloaded: u64::try_from(result.stats.downloaded).unwrap_or(u64::MAX),
+                    assets_failed: u64::try_from(result.stats.failed).unwrap_or(u64::MAX),
+                    enumeration_errors: u64::try_from(result.stats.enumeration_errors)
+                        .unwrap_or(u64::MAX),
+                    interrupted: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = recorded {
+            tracing::warn!(%error, "Failed to retain provider session failure status");
+            result.checkpoint.state_write_failures += 1;
+            result.stats.state_write_failures += 1;
+        }
+    }
+
     // Current selection already owns admission, replay and completion of every
     // selected destination. Aggregate rendition retry cannot add authority here.
-    let mut result = if config.selection_context.is_some() {
+    // Authenticated previews use the same selection boundary without creating
+    // durable work; a historical retry tail would count selected media twice.
+    let mut current_selection_preview = !controls.run_mode.downloads_files();
+    if current_selection_preview {
+        for pass in passes {
+            if pass.album.current_selection_scope()?.is_none() {
+                current_selection_preview = false;
+                break;
+            }
+        }
+    }
+    let mut result = if controls.run_mode.downloads_files() || current_selection_preview {
         result
     } else {
-        append_targeted_recovery_to_sync_result(
+        super::recovery::append_targeted_recovery_to_sync_result(
             download_client,
             passes,
             &config,
@@ -811,7 +829,8 @@ async fn download_photos_with_sync_inner(
     };
 
     let repair_outcome = if metadata_capture_repair.failures > 0
-        || metadata_capture_repair.stats.metadata_capture_unresolved > 0
+        || ((config.refresh_metadata || config.selection_context.is_none())
+            && metadata_capture_repair.stats.metadata_capture_unresolved > 0)
     {
         DownloadOutcome::PartialFailure {
             failed_count: metadata_capture_repair.failures.max(1),
@@ -838,27 +857,6 @@ async fn download_photos_with_sync_inner(
     }
 
     super::generation::hold_retained_debt(passes, &config, controls, &mut result).await?;
-
-    // Legacy rendition retry uses failed rows as its next-cycle schedule.
-    // Destination-owned and read-only runs must not rewrite that historical state.
-    if controls.run_mode.downloads_files()
-        && config.selection_context.is_none()
-        && let Some(db) = &config.state_db
-        && !shutdown_token.is_cancelled()
-    {
-        match db.promote_pending_to_failed(sync_started_at).await {
-            Ok(promoted) if promoted > 0 => {
-                tracing::warn!(
-                    count = promoted,
-                    "Promoted unresolved pending assets to failed"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to promote pending assets");
-            }
-            _ => {}
-        }
-    }
 
     Ok(result)
 }

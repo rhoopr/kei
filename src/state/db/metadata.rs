@@ -279,6 +279,11 @@ fn query_selection_and_legacy_metadata(
     let scope = libraries
         .map(|values| format!(" AND library IN ({})", sqlite_placeholders(values.len())))
         .unwrap_or_default();
+    // A frozen native writer must still match the durable metadata snapshot.
+    // Unfinished metadata-enabled native receipts exclude legacy fallback on
+    // their exact path. Completed publications and metadata-disabled generations
+    // must still allow later local metadata and membership rewrites. A completed
+    // exact current receipt also supersedes an older unfinished writer there.
     let sql = format!(
         r"WITH active AS (
         SELECT w.*, min(g.created_at) OVER writer AS ready_at, g.scope,
@@ -287,6 +292,10 @@ fn query_selection_and_legacy_metadata(
         FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation
         WHERE w.admitted=1 AND w.verified_media=1 AND w.verified_metadata=0
             AND w.grouping_hash IS NOT NULL AND g.metadata_enabled=1 {generation_filter}
+            AND EXISTS(SELECT 1 FROM assets a WHERE a.library=w.library AND a.id=w.asset_id
+                AND a.version_size=w.version_size AND a.checksum=w.checksum
+                AND a.metadata_hash IS w.metadata_hash AND a.created_at IS w.created_at
+                AND a.added_at IS w.added_at AND a.is_deleted=0)
         WINDOW writer AS (PARTITION BY g.scope,w.library,w.asset_id,w.master,
             w.version_size,w.path,w.checksum,w.size_bytes,w.created_at,w.added_at,
             w.metadata_hash,w.local_checksum,w.source_checksum,w.grouping_hash,
@@ -297,10 +306,22 @@ fn query_selection_and_legacy_metadata(
         FROM ({source}) rewrite_source WHERE metadata_write_failed_at IS NOT NULL AND status='downloaded'
             AND is_deleted=0 AND local_path IS NOT NULL {legacy_filter}
             AND NOT EXISTS(SELECT 1 FROM unattributed_legacy u WHERE u.library=rewrite_source.library AND u.asset_id=rewrite_source.id)
-            AND NOT EXISTS(SELECT 1 FROM active w WHERE w.library=rewrite_source.library AND w.asset_id=rewrite_source.id
-                AND w.version_size=rewrite_source.version_size AND w.metadata_hash IS rewrite_source.metadata_hash
-                AND w.checksum=rewrite_source.checksum AND w.compat_path=rewrite_source.local_path
-                AND json_extract(w.path,'$.encoding')='utf8' AND json_extract(w.path,'$.path')=rewrite_source.local_path)
+            AND NOT EXISTS(SELECT 1 FROM provider_active_destinations w
+                JOIN provider_active_generations g ON g.id=w.generation
+                WHERE w.library=rewrite_source.library AND w.asset_id=rewrite_source.id
+                AND w.version_size=rewrite_source.version_size AND w.admitted=1 AND w.verified_media=1
+                AND w.verified_metadata=0 AND g.metadata_enabled=1
+                AND w.compat_path=rewrite_source.local_path
+                AND json_extract(w.path,'$.encoding')='utf8' AND json_extract(w.path,'$.path')=rewrite_source.local_path
+                AND NOT EXISTS(SELECT 1 FROM provider_active_destinations done
+                    WHERE done.library=w.library AND done.asset_id=w.asset_id
+                    AND done.version_size=w.version_size AND done.path=w.path
+                    AND done.admitted=1 AND done.verified_media=1 AND done.verified_metadata=1
+                    AND done.checksum=rewrite_source.checksum
+                    AND done.local_checksum IS rewrite_source.local_checksum
+                    AND done.metadata_hash IS rewrite_source.metadata_hash
+                    AND done.created_at IS rewrite_source.created_at
+                    AND done.added_at IS rewrite_source.added_at))
             AND {UNAMBIGUOUS_LEGACY_PATH}
         UNION ALL SELECT 1,generation,pass_key,child,library,asset_id,version_size,path,ready_at
             FROM active WHERE representative=1

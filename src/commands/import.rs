@@ -2664,6 +2664,11 @@ mod wiremock_tests {
                 assert_eq!(db.get_summary().await.unwrap().total_assets, 1);
                 assert!(db.get_asset_master_mappings().await.unwrap().is_empty());
             }
+            let changed_identity = if persisted_owner {
+                "master-913"
+            } else {
+                "child-913"
+            };
             assert_eq!(
                 preflight
                     .candidates
@@ -2676,7 +2681,7 @@ mod wiremock_tests {
                         "master-913",
                         "other-child",
                         "master-913",
-                        "child-913",
+                        changed_identity,
                     ]
                 } else {
                     [
@@ -2684,7 +2689,7 @@ mod wiremock_tests {
                         "master-913",
                         "master-913",
                         "other-child",
-                        "child-913",
+                        changed_identity,
                     ]
                 }
             );
@@ -2692,13 +2697,28 @@ mod wiremock_tests {
                 .adopt(db.as_ref(), ImportRunOptions::default())
                 .await
                 .unwrap();
-            assert_eq!((stats.matched, stats.unmatched), (3, 2));
+            assert_eq!(
+                (stats.matched, stats.unmatched),
+                if persisted_owner { (4, 1) } else { (3, 2) }
+            );
             drop(db);
             let db = open_db(&tmp).await;
             let rows = all_downloaded(db.as_ref()).await;
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].id.as_ref(), "master-913");
-            assert_eq!(rows[0].local_path.as_ref(), Some(&files[2]));
+            assert_eq!(
+                rows[0].local_path.as_ref(),
+                Some(&files[if persisted_owner { 3 } else { 2 }])
+            );
+            assert_eq!(
+                rows[0].checksum.as_ref(),
+                if persisted_owner {
+                    "changed-provider-generation"
+                } else {
+                    "legacy-checksum"
+                }
+            );
+            assert!(rows[0].download_checksum.is_none());
             assert_eq!(db.get_asset_master_mappings().await.unwrap().len(), 1);
             assert_eq!(
                 db.get_legacy_master_state_owners().await.unwrap(),

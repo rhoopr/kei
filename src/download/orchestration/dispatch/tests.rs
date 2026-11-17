@@ -179,6 +179,93 @@ async fn writable_dispatch_requires_state_before_provider_or_file_work() {
 }
 
 #[tokio::test]
+async fn writable_dispatch_requires_authenticated_selection_before_any_mutation() {
+    for incremental in [false, true] {
+        let root = TempDir::new().unwrap();
+        let media = root.path().join("existing.jpg");
+        std::fs::write(&media, b"retained media").unwrap();
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        db.set_metadata("sync_token:PrimarySync", "retained-token")
+            .await
+            .unwrap();
+        let before = db
+            .acquire_lock("before ownership refusal")
+            .unwrap()
+            .total_changes();
+        let session = CountingQuerySession::new(json!({"records": []}), 0);
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: super::super::test_support::album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(session.clone()),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(root.path());
+        config.state_db = Some(db.clone());
+        config.sync_mode = if incremental {
+            SyncMode::Incremental {
+                zone_sync_token: "retained-token".into(),
+            }
+        } else {
+            SyncMode::Full
+        };
+        let config = Arc::new(config);
+        let empty = download_photos_with_sync(
+            &Client::new(),
+            &[],
+            config.clone(),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(empty.outcome, DownloadOutcome::Success));
+        assert_eq!(empty.stats.downloaded, 0);
+        assert!(empty.sync_token.is_none());
+        assert_eq!(
+            db.acquire_lock("empty selection preserves state")
+                .unwrap()
+                .total_changes(),
+            before
+        );
+        let error = download_photos_with_sync(
+            &Client::new(),
+            &[pass],
+            config,
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires authenticated destination ownership")
+        );
+        assert_eq!(session.count_query_count(), 0);
+        assert_eq!(session.records_query_count(), 0);
+        assert_eq!(
+            db.acquire_lock("after ownership refusal")
+                .unwrap()
+                .total_changes(),
+            before
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("retained-token")
+        );
+        assert_eq!(std::fs::read(&media).unwrap(), b"retained media");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+}
+
+#[tokio::test]
 async fn state_free_previews_still_enumerate_without_local_writes() {
     for mode in [DownloadRunMode::DryRun, DownloadRunMode::PrintFilenames] {
         let root = TempDir::new().unwrap();
@@ -314,6 +401,31 @@ impl PhotosSession for BackfillAndChangesSession {
     }
 }
 
+#[derive(Clone)]
+struct QueryAndDeltaSession(
+    CountingQuerySession,
+    super::super::test_support::CountingChangesZoneSession,
+);
+
+#[async_trait::async_trait]
+impl PhotosSession for QueryAndDeltaSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        if url.contains("/changes/zone?") {
+            self.1.post(url, body, headers).await
+        } else {
+            self.0.post(url, body, headers).await
+        }
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
 fn smart_folder_unfiled_passes(
     changes_calls: Arc<AtomicUsize>,
     unfiled_records: Vec<Value>,
@@ -435,7 +547,7 @@ async fn smart_folder_incremental_with_unfiled_refreshes_smart_without_library_a
 }
 
 #[tokio::test]
-async fn smart_folder_refresh_blank_query_token_does_not_block_incremental_zone_token() {
+async fn smart_folder_refresh_blank_query_token_preserves_current_selection_hold() {
     let changes_calls = Arc::new(AtomicUsize::new(0));
     let smart_session = CountingQuerySession::new(
         json!({
@@ -444,14 +556,47 @@ async fn smart_folder_refresh_blank_query_token_does_not_block_incremental_zone_
         }),
         0,
     );
-    let passes = smart_folder_unfiled_passes(
-        Arc::clone(&changes_calls),
-        Vec::new(),
-        smart_session.clone(),
-    );
     let dir = TempDir::new().expect("temp dir");
     let mut config = incremental_test_config(&dir);
-    config.state_db = Some(Arc::new(SqliteStateDb::open_in_memory().unwrap()));
+    let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
+    config.state_db = Some(db.clone());
+    let initial_passes = [
+        super::super::test_support::selected_smart_pass_with_session(
+            &db,
+            "Favorites",
+            Box::new(super::super::test_support::SelectedMediaSession(Arc::new(
+                Vec::new(),
+            ))),
+        ),
+        super::super::test_support::selected_pass_with_session(
+            &db,
+            "",
+            Box::new(super::super::test_support::SelectedMediaSession(Arc::new(
+                Vec::new(),
+            ))),
+        ),
+    ];
+    let mut initial = config.clone();
+    initial.sync_mode = SyncMode::Full;
+    let initialized = download_photos_with_sync(
+        &Client::new(),
+        &initial_passes,
+        Arc::new(initial),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(initialized.sync_token.as_deref(), Some("fixture-token"));
+    let delta = changes_zone_session(Arc::clone(&changes_calls), Vec::new());
+    let passes = vec![
+        super::super::test_support::selected_smart_pass_with_session(
+            &db,
+            "Favorites",
+            Box::new(QueryAndDeltaSession(smart_session.clone(), delta.clone())),
+        ),
+        super::super::test_support::selected_pass_with_session(&db, "", Box::new(delta)),
+    ];
 
     let result = download_photos_with_sync(
         &Client::new(),
@@ -471,15 +616,17 @@ async fn smart_folder_refresh_blank_query_token_does_not_block_incremental_zone_
     );
     assert_eq!(
         smart_session.records_query_count(),
-        crate::icloud::photos::MAX_EMPTY_PAGE_PROBES as usize
+        2 * crate::icloud::photos::MAX_EMPTY_PAGE_PROBES as usize,
+        "initial query and one bounded recovery must both retain the missing token"
     );
-    assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+    assert_eq!(result.sync_token, None, "{result:?}");
     assert!(result.checkpoint.completed_delta_replay);
     assert!(!result.checkpoint.retained_token_rejected);
     assert!(
-        !result.stats.sync_token_blocked,
-        "blank smart-folder query token is telemetry for the refresh, not a reason to block the incremental zone token"
+        result.stats.sync_token_blocked,
+        "the delta successor cannot certify a selected query whose recovery still has no token"
     );
+    assert_eq!(result.stats.same_cycle_recovery_attempts, 1);
 }
 
 #[tokio::test]
@@ -601,38 +748,57 @@ async fn album_incremental_with_complete_snapshot_uses_changes_zone() {
 }
 
 #[tokio::test]
-async fn album_incremental_missing_snapshot_runs_targeted_backfill() {
+async fn album_incremental_current_selection_does_not_require_legacy_snapshot() {
+    let dir = TempDir::new().expect("temp dir");
+    let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
     let changes_zone_calls = Arc::new(AtomicUsize::new(0));
     let album_session = BackfillAndChangesSession {
         changes_zone_calls: Arc::clone(&changes_zone_calls),
     };
     let unfiled_session =
         CountingQuerySession::new(json!({"records": [], "syncToken": "unfiled-token"}), 0);
-    let passes = vec![
-        AlbumPass {
-            kind: PassKind::Album,
-            album: changes_album_with_container(
-                "Vacation",
-                Some("container-vacation"),
-                album_session,
-            ),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        },
-        AlbumPass {
-            kind: PassKind::Unfiled,
-            album: changes_album("", unfiled_session.clone()),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        },
-    ];
-
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+    let make_passes = |album: Box<dyn PhotosSession>, unfiled: Box<dyn PhotosSession>| {
+        let mut pass = super::super::test_support::selected_pass_with_session(
+            &db,
+            "container-vacation",
+            album,
+        );
+        pass.album.name = Arc::from("Vacation");
+        vec![
+            pass,
+            super::super::test_support::selected_pass_with_session(&db, "", unfiled),
+        ]
+    };
+    let passes = make_passes(Box::new(album_session), Box::new(unfiled_session.clone()));
     let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
     config.directory = Arc::from(dir.path());
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-prev".to_string(),
     };
+    let initial_passes = make_passes(
+        Box::new(super::super::test_support::SelectedMediaSession(Arc::new(
+            Vec::new(),
+        ))),
+        Box::new(super::super::test_support::SelectedMediaSession(Arc::new(
+            Vec::new(),
+        ))),
+    );
+    let mut initial = config.clone();
+    initial.sync_mode = SyncMode::Full;
+    let initialized = download_photos_with_sync(
+        &Client::new(),
+        &initial_passes,
+        Arc::new(initial),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(initialized.sync_token.as_deref(), Some("fixture-token"));
+    db.acquire_lock("simulate missing selected album snapshot").unwrap().execute(
+        "DELETE FROM album_membership_snapshots WHERE library='PrimarySync' AND container_id='container-vacation'", [],
+    ).unwrap();
 
     let result = download_photos_with_sync(
         &Client::new(),
@@ -642,32 +808,29 @@ async fn album_incremental_missing_snapshot_runs_targeted_backfill() {
         CancellationToken::new(),
     )
     .await
-    .expect("missing snapshot should run targeted backfill");
+    .expect("current selected coverage should survive a missing legacy snapshot");
 
-    assert!(result.full_enumeration_ran);
-    assert_eq!(
-        result.stats.full_enumeration_reason,
-        Some(FullEnumerationReason::AlbumRelationHydrationIncomplete)
-    );
+    assert!(!result.full_enumeration_ran);
+    assert_eq!(result.stats.full_enumeration_reason, None);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
     assert_eq!(
         changes_zone_calls.load(Ordering::SeqCst),
         1,
-        "targeted backfill should still drain the zone delta once"
+        "current coverage should drain the zone delta once"
     );
     assert_eq!(
         unfiled_session.records_query_count(),
         0,
-        "targeted backfill must not enumerate the library-wide unfiled pass"
+        "a missing legacy snapshot must not enumerate the library-wide unfiled pass"
     );
     assert!(
-        db.selected_album_containers_have_complete_snapshots(
+        !db.selected_album_containers_have_complete_snapshots(
             "PrimarySync",
             &["container-vacation"],
         )
         .await
         .unwrap(),
-        "targeted backfill should complete the missing album snapshot"
+        "current selection proof must not invent completion for the missing legacy snapshot"
     );
 }
 
@@ -675,15 +838,19 @@ async fn album_incremental_missing_snapshot_runs_targeted_backfill() {
 async fn targeted_album_backfill_failure_blocks_incremental_token() {
     let album_session =
         CountingQuerySession::failing(json!({"records": [], "syncToken": "album-token"}), 1);
-    let passes = vec![AlbumPass {
-        kind: PassKind::Album,
-        album: changes_album_with_container("Vacation", Some("container-vacation"), album_session),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
     let mut config = test_config();
     let dir = TempDir::new().expect("temp dir");
+    let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
+    let mut pass = super::super::test_support::selected_pass_with_session(
+        &db,
+        "container-vacation",
+        Box::new(QueryAndDeltaSession(
+            album_session.clone(),
+            changes_zone_session(Arc::new(AtomicUsize::new(0)), Vec::new()),
+        )),
+    );
+    pass.album.name = Arc::from("Vacation");
+    let passes = vec![pass];
     config.directory = Arc::from(dir.path());
     config.state_db = Some(db);
     config.sync_mode = SyncMode::Incremental {
@@ -700,6 +867,10 @@ async fn targeted_album_backfill_failure_blocks_incremental_token() {
     .await
     .expect("targeted backfill failure should return a token-blocked result");
 
+    assert!(
+        album_session.records_query_count() > 0,
+        "exercise the failed selected query, not the ownership refusal"
+    );
     assert_eq!(result.sync_token, None);
     assert!(result.stats.sync_token_blocked);
 }
@@ -709,6 +880,7 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
     #[derive(Clone)]
     struct FallbackSession {
         expired: bool,
+        deltas: Arc<AtomicUsize>,
     }
     #[async_trait::async_trait]
     impl PhotosSession for FallbackSession {
@@ -719,6 +891,7 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
             if url.contains("/changes/zone?") {
+                self.deltas.fetch_add(1, Ordering::SeqCst);
                 let mut zone = json!({
                     "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
                     "moreComing": false,
@@ -743,12 +916,31 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
     for expired in [false, true] {
         let directory = TempDir::new().unwrap();
         let mut config = incremental_test_config(&directory);
-        config.state_db = Some(Arc::new(SqliteStateDb::open_in_memory().unwrap()));
-        let passes = vec![AlbumPass {
-            kind: PassKind::Unfiled,
-            album: changes_album("", FallbackSession { expired }),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        }];
+        let db =
+            super::super::test_support::open_fixture_db(&directory.path().join("state.db")).await;
+        config.state_db = Some(db.clone());
+        let deltas = Arc::new(AtomicUsize::new(0));
+        let passes = vec![super::super::test_support::selected_pass_with_session(
+            &db,
+            "",
+            Box::new(FallbackSession {
+                expired,
+                deltas: deltas.clone(),
+            }),
+        )];
+        let mut initial = config.clone();
+        initial.sync_mode = SyncMode::Full;
+        let first = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(initial),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(first.outcome, DownloadOutcome::Success));
+        assert_eq!(deltas.load(Ordering::SeqCst), 0);
         let result = download_photos_with_sync(
             &Client::new(),
             &passes,
@@ -756,12 +948,25 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
             DownloadControls::download_hidden(),
             CancellationToken::new(),
         )
-        .await
-        .unwrap();
+        .await;
+        if !expired {
+            // Original-page capture must reject a malformed successor rather
+            // than infer token expiry from missing protocol evidence.
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Invalid changes/zone page shape")
+            );
+            assert_eq!(deltas.load(Ordering::SeqCst), 1);
+            continue;
+        }
+        let result = result.unwrap();
         assert!(result.full_enumeration_ran);
         assert!(!result.checkpoint.completed_delta_replay);
         assert_eq!(result.checkpoint.retained_token_rejected, expired);
         assert_eq!(result.sync_token.as_deref(), Some("healthy-query-eof"));
+        assert_eq!(deltas.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -778,14 +983,18 @@ async fn smart_only_delta_replays_source_without_admitting_unselected_media() {
         json!({"records":[],"syncToken":"selected-query-token"}),
         0,
     );
-    let passes = vec![AlbumPass {
-        kind: PassKind::SmartFolder,
-        album: changes_album("Hidden", session.clone()),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
     let dir = TempDir::new().unwrap();
     let mut config = incremental_test_config(&dir);
-    config.state_db = Some(Arc::new(SqliteStateDb::open_in_memory().unwrap()));
+    let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
+    config.state_db = Some(db.clone());
+    initialize_hidden_selection(&db, &config).await;
+    let passes = vec![
+        super::super::test_support::selected_smart_pass_with_session(
+            &db,
+            "Hidden",
+            Box::new(session.clone()),
+        ),
+    ];
     let config = Arc::new(config);
     let expected_scope = crate::download::inventory_scope(&passes, &config);
     let result = download_photos_with_sync(
@@ -827,14 +1036,18 @@ async fn smart_only_delta_successor_retains_missing_query_token_hold() {
             query_page,
             0,
         );
-        let passes = vec![AlbumPass {
-            kind: PassKind::SmartFolder,
-            album: changes_album("Hidden", session.clone()),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        }];
         let dir = TempDir::new().unwrap();
         let mut config = incremental_test_config(&dir);
-        config.state_db = Some(Arc::new(SqliteStateDb::open_in_memory().unwrap()));
+        let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
+        config.state_db = Some(db.clone());
+        initialize_hidden_selection(&db, &config).await;
+        let passes = vec![
+            super::super::test_support::selected_smart_pass_with_session(
+                &db,
+                "Hidden",
+                Box::new(session.clone()),
+            ),
+        ];
         let result = download_photos_with_sync(
             &Client::new(),
             &passes,
@@ -851,4 +1064,33 @@ async fn smart_only_delta_successor_retains_missing_query_token_hold() {
         assert!(result.sync_token.is_none());
         assert_eq!(result.stats.downloaded, 0);
     }
+}
+
+async fn initialize_hidden_selection(
+    db: &Arc<SqliteStateDb>,
+    config: &crate::download::DownloadConfig,
+) {
+    let pass = super::super::test_support::selected_smart_pass_with_session(
+        db,
+        "Hidden",
+        Box::new(super::super::test_support::SelectedMediaSession(Arc::new(
+            Vec::new(),
+        ))),
+    );
+    let mut initial = config.clone();
+    initial.sync_mode = SyncMode::Full;
+    let result = download_photos_with_sync(
+        &Client::new(),
+        &[pass],
+        Arc::new(initial),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result.outcome, DownloadOutcome::Success),
+        "{result:?}"
+    );
+    assert_eq!(result.sync_token.as_deref(), Some("fixture-token"));
 }

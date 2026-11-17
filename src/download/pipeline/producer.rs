@@ -358,10 +358,17 @@ where
             }
         };
         tokio::pin!(combined);
-        'assets: while let Some(result) = combined.next().await {
-            if producer_shutdown.is_cancelled() {
-                break;
-            }
+        'assets: loop {
+            // User/pipeline cancellation must interrupt a pending provider tail.
+            // HTTP 410 cancels the consumer's transfer-only child, not this token.
+            let result = tokio::select! {
+                biased;
+                () = producer_shutdown.cancelled() => break,
+                result = combined.next() => match result {
+                    Some(result) => result,
+                    None => break,
+                },
+            };
             match result {
                 Ok(mut asset) => {
                     if !seen_asset_record_names.insert(asset.asset_record_name_arc()) {
@@ -435,11 +442,13 @@ where
                             }
                         };
                         asset = current;
-                        if let Some(db) = &producer_state_db {
+                        if producer_state_db.is_some() {
                             let library = effective_asset_library(&asset, config).to_owned();
+                            // Preserve exact recorded retry ownership without
+                            // attributing unrelated historical master rows.
                             match download_ctx
-                                .select_asset_state_record_name_for_download(
-                                    Some(db.as_ref()),
+                                .select_current_asset_state_record_name_for_download(
+                                    producer_state_db.as_deref(),
                                     &library,
                                     &asset,
                                     &mut claimed_legacy_master_states,
@@ -454,7 +463,7 @@ where
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     run.held.store(true, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(target: "kei::download::pipeline", %error,
-                                        "Selection could not preserve legacy state ownership");
+                                        "Selection could not validate existing state ownership");
                                     producer_pb.inc(1);
                                     continue;
                                 }
@@ -481,7 +490,62 @@ where
                                 }
                             }
                         }
-                        let mut plan = match task_planner.plan_download_asset(&asset, config).await
+                        if let Some(db) = &producer_state_db {
+                            match super::adoption::recover_selected_reserved_publication(
+                                db.as_ref(),
+                                config,
+                                &asset,
+                                &download_ctx,
+                                &task_planner,
+                            )
+                            .await
+                            {
+                                Ok(true) => {}
+                                result => {
+                                    if let Err(error) = result {
+                                        tracing::warn!(%error, "Selected reserved publication proof was refused");
+                                    }
+                                    state_write_failures_producer
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    producer_pb.inc(1);
+                                    continue 'assets;
+                                }
+                            }
+                            for derived in crate::download::filter::derive_expected_paths(
+                                &asset,
+                                config.as_ref(),
+                            ) {
+                                match super::recover_confirmed_publication(
+                                    db.as_ref(),
+                                    config,
+                                    &asset,
+                                    &mut task_planner,
+                                    derived.version_size,
+                                    &producer_shutdown,
+                                )
+                                .await
+                                {
+                                    Ok(Some(super::PendingOnDiskAdoption::StateWriteFailed(_))) => {
+                                        state_write_failures_producer
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        producer_pb.inc(1);
+                                        continue 'assets;
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        enum_errors_producer
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        tracing::warn!(%error, "Selected publication recovery refused unsafe local evidence");
+                                        producer_pb.inc(1);
+                                        continue 'assets;
+                                    }
+                                }
+                            }
+                        }
+                        let mut plan = match task_planner.plan_selected_asset(&asset, config).await
                         {
                             Ok(plan) => plan,
                             Err(error) => {
@@ -492,11 +556,52 @@ where
                                 return skips;
                             }
                         };
+                        let mut selected_tasks = Vec::with_capacity(plan.tasks.len());
+                        for task in std::mem::take(&mut plan.tasks) {
+                            match download_ctx
+                                .plan_selected_truncation_repair(task, config, &mut task_planner)
+                                .await
+                            {
+                                Ok(Some(task)) => selected_tasks.push(task),
+                                Ok(None) => {
+                                    run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    producer_pb.inc(1);
+                                    continue 'assets;
+                                }
+                                Err(error) => {
+                                    enum_errors_producer
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!(%error, "Selected truncation repair could not retain its destination");
+                                    producer_pb.inc(1);
+                                    continue 'assets;
+                                }
+                            }
+                        }
+                        plan.tasks = selected_tasks;
                         match run
                             .project(key, &asset, body, &mut plan, &mut task_planner, config)
                             .await
                         {
-                            Ok(true) => selected_plan = Some(plan),
+                            Ok(true) => {
+                                for task in &mut plan.tasks {
+                                    if task_planner.managed_layout_session().is_some() {
+                                        continue;
+                                    }
+                                    if let Err(error) = download_ctx
+                                        .bind_selected_truncation_repair(task, config)
+                                        .await
+                                    {
+                                        enum_errors_producer
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        tracing::warn!(%error, "Selected truncation repair refused unsafe local evidence");
+                                        producer_pb.inc(1);
+                                        continue 'assets;
+                                    }
+                                }
+                                selected_plan = Some(plan);
+                            }
                             Ok(false) => {
                                 producer_pb.inc(1);
                                 continue;
@@ -692,6 +797,16 @@ where
                         }
                     };
                     if let Some(session) = task_planner.managed_layout_session() {
+                        if config.selection_run.as_ref().is_some_and(|run| {
+                            run.phase
+                                == crate::download::orchestration::generation::SelectionPhase::Inventory
+                        }) {
+                            // Projection above owns admission and membership. The
+                            // selected replay runs this same journal owner only
+                            // after all observed memberships have been frozen.
+                            producer_pb.inc(1);
+                            continue 'assets;
+                        }
                         match crate::download::orchestration::primary_layout::process_asset(
                             &client,
                             asset.clone(),

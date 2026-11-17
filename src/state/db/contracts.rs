@@ -413,6 +413,7 @@ impl AssetVerificationState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum RetryErrorRetention {
     Clear,
     Preserve(&'static str),
@@ -524,6 +525,7 @@ pub trait DownloadStateStore: Send + Sync {
         &self,
         library: &str,
     ) -> Result<Vec<String>, StateError>;
+    #[cfg(test)]
     async fn prepare_for_retry(
         &self,
         library: Option<&str>,

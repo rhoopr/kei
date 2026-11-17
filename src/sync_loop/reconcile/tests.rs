@@ -138,23 +138,49 @@ async fn bounded_local_drift_probe_marks_missing_file_failed() {
 }
 
 #[tokio::test]
-async fn bounded_local_drift_probe_marks_truncated_file_failed() {
+async fn bounded_local_drift_probe_preserves_shorter_local_edits_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
-    let db = state::SqliteStateDb::open_in_memory().unwrap();
+    let database = dir.path().join("state.db");
+    let db = state::SqliteStateDb::open(&database).await.unwrap();
     let path = dir.path().join("truncated.jpg");
     std::fs::write(&path, b"short").unwrap();
     seed_downloaded_for_local_drift_probe(&db, "TRUNCATED_PROBE", &path, 100).await;
+    let before = db.get_downloaded_page(0, 10).await.unwrap();
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    drop(db);
 
-    let outcome = run_bounded_local_drift_probe(&db, 1).await;
+    for cycle in 1..=3 {
+        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        let outcome = run_bounded_local_drift_probe(&db, cycle).await;
+        assert_eq!(outcome.scanned, 1);
+        assert_eq!(outcome.drifted, 0);
+        assert_eq!(outcome.marked_failed, 0);
+        assert!(db.get_failed().await.unwrap().is_empty());
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(downloaded.len(), 1);
+        assert_eq!(downloaded[0].local_path, before[0].local_path);
+        assert_eq!(downloaded[0].local_checksum, before[0].local_checksum);
+        assert_eq!(downloaded[0].download_checksum, before[0].download_checksum);
+        assert_eq!(std::fs::read(&path).unwrap(), b"short");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
 
-    assert_eq!(outcome.scanned, 1);
-    assert_eq!(outcome.drifted, 1);
-    assert_eq!(outcome.marked_failed, 1);
-    let failed = db.get_failed().await.unwrap();
-    assert_eq!(failed.len(), 1);
-    assert_eq!(&*failed[0].id, "TRUNCATED_PROBE");
-    assert_eq!(
-        failed[0].last_error.as_deref(),
-        Some(crate::commands::reconcile::FILE_TRUNCATED_REASON)
-    );
+        // Explicit integrity inspection still sees the difference. The ordinary
+        // sync probe neither repairs it nor grants permission to overwrite it.
+        let (drift, no_path) = crate::commands::reconcile::classify_local_drift(
+            downloaded.into_iter().next().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(!no_path);
+        assert!(matches!(
+            drift.unwrap().kind,
+            crate::commands::reconcile::LocalDriftKind::Truncated {
+                actual_size: 5,
+                expected_size: 100,
+            }
+        ));
+    }
 }

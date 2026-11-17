@@ -54,7 +54,7 @@ pub(crate) use contracts::{
     AssetGroupingRows, AssetVerificationState, CheckpointTransition, DownloadContextStateStore,
     DownloadedFileRecord, ManifestAssetRow, OwnedTempFile, PendingPublicationRecord,
     ReconciliationCatalogPath, ReconciliationContent, ReconciliationPathKey,
-    ReconciliationReservation, ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken,
+    ReconciliationReservation, ReconciliationStateStore, ScopedDbSyncToken,
     SelectionMetadataReceipt, TempFileOwnershipStore,
 };
 
@@ -406,3 +406,5 @@ impl SqliteStateDb {
         .await?
     }
 }
+#[cfg(test)]
+pub(crate) use contracts::RetryErrorRetention;

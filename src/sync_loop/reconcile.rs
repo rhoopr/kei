@@ -85,10 +85,12 @@ pub(super) struct LocalDriftProbeOutcome {
     mark_errors: u64,
 }
 
-/// Probe a bounded page of downloaded rows for local drift before each sync
+/// Probe a bounded page of downloaded rows for missing files before each sync
 /// cycle. Unlike the opt-in full reconciliation walk, this runs by default
 /// and advances a cursor so watch mode eventually covers the catalog without
 /// turning every quiet incremental cycle into a full filesystem crawl.
+/// A present shorter file may be an intentional local edit. Only explicit
+/// integrity reconciliation may turn that observation into repair work.
 pub(super) async fn run_bounded_local_drift_probe(
     db: &dyn download::DownloadStore,
     cycle_index: u64,
@@ -172,28 +174,20 @@ pub(super) async fn run_bounded_local_drift_probe(
         let Some(drift) = drift else {
             continue;
         };
-        outcome.drifted = outcome.drifted.saturating_add(1);
-        match drift.kind {
-            crate::commands::reconcile::LocalDriftKind::Missing => tracing::warn!(
-                cycle_index,
-                asset_id = %drift.id,
-                version_size = drift.version_size.as_str(),
-                path = %drift.local_path.display(),
-                "Local drift probe found a missing downloaded file"
-            ),
-            crate::commands::reconcile::LocalDriftKind::Truncated {
-                actual_size,
-                expected_size,
-            } => tracing::warn!(
-                cycle_index,
-                asset_id = %drift.id,
-                version_size = drift.version_size.as_str(),
-                path = %drift.local_path.display(),
-                actual_size,
-                expected_size,
-                "Local drift probe found a truncated downloaded file"
-            ),
+        if !matches!(
+            drift.kind,
+            crate::commands::reconcile::LocalDriftKind::Missing
+        ) {
+            continue;
         }
+        outcome.drifted = outcome.drifted.saturating_add(1);
+        tracing::warn!(
+            cycle_index,
+            asset_id = %drift.id,
+            version_size = drift.version_size.as_str(),
+            path = %drift.local_path.display(),
+            "Local drift probe found a missing downloaded file"
+        );
         match db
             .mark_failed(
                 &drift.library,

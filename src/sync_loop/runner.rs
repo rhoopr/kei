@@ -662,7 +662,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             if drift.marked_failed > 0 {
                 tracing::warn!(
                     marked_failed = drift.marked_failed,
-                    "Local drift probe found missing or damaged files; forcing this cycle to retry them"
+                    "Local drift probe found missing files; forcing this cycle to retry them"
                 );
                 watch_precheck = WatchPrecheck::proceed_all();
             }

@@ -235,6 +235,12 @@ async fn validate_pending_write(
             detail: error.to_string(),
         })?;
     }
+    crate::fs_util::fsync_parent_dir_async(&write.download_path)
+        .await
+        .map_err(|error| crate::state::error::StateError::Invariant {
+            operation: "download publication durability",
+            detail: error.to_string(),
+        })?;
     Ok(())
 }
 
@@ -251,7 +257,7 @@ where
     for attempt in 1..=STATE_WRITE_MAX_RETRIES {
         if let Err(error) = validate_pending_write(write).await {
             tracing::warn!(asset_id = %write.asset_id, %error,
-                "Reserved pending publication proof changed; retaining media and pending debt");
+                "Publication validation or durability failed; retaining media and pending debt");
             return false;
         }
         match db
@@ -450,6 +456,74 @@ mod tests {
 
     async fn write_file(path: &Path) {
         tokio::fs::write(path, b"finalized").await.unwrap();
+    }
+
+    /// Invoked by the exclusive preload matrix; ordinary suite execution is inert.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn actual_parent_durability_fault_child() {
+        let Some(root) = std::env::var_os("KEI_TEST_LATE_IO_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let path = root.join("landed.jpg");
+        let part = root.join("landed.jpg.part");
+        write_file(&path).await;
+        write_file(&part).await;
+        let checksum = super::super::file::compute_sha256(&path).await.unwrap();
+        let original = std::fs::metadata(&path).unwrap();
+        std::fs::write(root.join("reconcile-target"), path.to_str().unwrap()).unwrap();
+        std::fs::write(root.join("fault-enabled"), b"enabled").unwrap();
+
+        // Identical collision handling can remove the redundant part, but cannot
+        // turn unsynced directory entries into a durable downloaded receipt.
+        super::super::file::rename_part_to_final(&part, &path)
+            .await
+            .unwrap();
+        assert!(!part.exists());
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        seed_pending(&db, "PARENT", "landed.jpg").await;
+        let result = finalize_downloaded(
+            &db,
+            &Arc::from(LIBRARY),
+            &task("PARENT", path.clone()),
+            checksum.clone(),
+            Some(checksum.clone()),
+            true,
+            false,
+        )
+        .await;
+        let DownloadedFinalization::Deferred { write, error } = result else {
+            panic!("parent EIO must refuse the downloaded receipt");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("download publication durability")
+        );
+        let mut pending = vec![write];
+        for _ in 0..2 {
+            std::fs::remove_file(root.join("fault-reached")).unwrap();
+            let flush = flush_pending_state_writes_retaining_failures(&db, &mut pending).await;
+            assert_eq!((flush.attempted, flush.failures, pending.len()), (1, 1, 1));
+            let marker = std::fs::read_to_string(root.join("fault-reached")).unwrap();
+            assert!(marker.contains("fsync errno=5 progress=9"), "{marker}");
+            assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
+            assert_eq!(db.get_pending().await.unwrap().len(), 1);
+        }
+        std::fs::remove_file(root.join("fault-enabled")).unwrap();
+        let flush = flush_pending_state_writes_retaining_failures(&db, &mut pending).await;
+        assert_eq!((flush.attempted, flush.failures), (1, 0));
+        assert!(pending.is_empty());
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(downloaded.len(), 1);
+        assert_eq!(
+            downloaded[0].local_checksum.as_deref(),
+            Some(checksum.as_str())
+        );
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), original.ino());
+        assert_eq!(std::fs::read(&path).unwrap(), b"finalized");
     }
 
     async fn reserved_deferred_boundary(mutation: &str) {

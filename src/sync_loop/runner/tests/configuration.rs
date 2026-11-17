@@ -10,14 +10,79 @@ use crate::sync_cycle::{
 };
 use crate::sync_loop::test_support::{
     FailingMetadataSetDb, MetadataSetFailure, RunCycleDownloadConfigOptions, album_count_response,
-    full_album_page_with_download, make_empty_full_album, make_full_album_with_boxed_session,
-    make_incremental_album, make_named_empty_full_album,
-    make_recording_run_cycle_download_config_builder, make_run_cycle_config,
-    make_run_cycle_download_config_builder, make_run_cycle_download_config_builder_with_options,
-    make_run_cycle_library_state_with_album, make_run_cycle_library_state_with_passes,
-    make_shared_session_for_run_cycle, make_state_db,
+    full_album_page_with_download, make_recording_run_cycle_download_config_builder,
+    make_run_cycle_config, make_run_cycle_download_config_builder,
+    make_run_cycle_download_config_builder_with_options, make_run_cycle_library_state_with_album,
+    make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle, make_state_db,
 };
 use crate::{config, download, state};
+
+fn fixture_owner() -> state::db::account::AccountOwner {
+    state::db::account::AccountOwner::authenticated(
+        "configuration@example.invalid",
+        "com",
+        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"configuration-fixture"}}))
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+async fn open_fixture_db(path: &std::path::Path) -> Arc<state::SqliteStateDb> {
+    Arc::new(
+        state::SqliteStateDb::open_owned(path, &fixture_owner())
+            .await
+            .unwrap(),
+    )
+}
+
+async fn fixture_db() -> (tempfile::TempDir, Arc<state::SqliteStateDb>) {
+    let directory = tempfile::tempdir().unwrap();
+    let db = open_fixture_db(&directory.path().join("state.db")).await;
+    (directory, db)
+}
+
+fn fixture_album(
+    db: &Arc<state::SqliteStateDb>,
+    zone: &str,
+    name: &str,
+    session: Box<dyn crate::icloud::photos::PhotosSession>,
+) -> crate::icloud::photos::PhotoAlbum {
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: Arc::from("https://example.invalid"),
+            name: Arc::from(name),
+            list_type: Arc::from(if name.is_empty() { "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted" } else { "CPLContainerRelationLiveByAssetDate" }),
+            obj_type: if name.is_empty() { Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted") } else { Arc::from(format!("CPLContainerRelationNotDeletedByAssetDate:{name}")) },
+            query_filter: (!name.is_empty()).then(|| Arc::new(serde_json::json!([{"fieldName":"parentId","comparator":"EQUALS","fieldValue":{"type":"STRING","value":name}}]))),
+            page_size: 100,
+            zone_id: Arc::new(serde_json::json!({"zoneName":zone,"ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: (!name.is_empty()).then(|| Arc::from(name)),
+            cross_zone_sources: Vec::new(),
+        },
+        session,
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), fixture_owner(), "com"),
+        Arc::from("private"),
+    );
+    album
+}
+
+fn empty_fixture_album(
+    db: &Arc<state::SqliteStateDb>,
+    zone: &str,
+    name: &str,
+    token: &str,
+) -> crate::icloud::photos::PhotoAlbum {
+    fixture_album(
+        db,
+        zone,
+        name,
+        Box::new(ConfigBridgeSession::new(zone, token, token)),
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BridgeWait {
@@ -92,7 +157,7 @@ impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
                 .unwrap_or(0);
             if active && scan && page < self.hydration_pages {
                 return Ok(
-                    serde_json::json!({"zones":[{"zoneID":{"zoneName":self.zone.as_ref()},
+                    serde_json::json!({"zones":[{"zoneID":{"zoneName":self.zone.as_ref(),"ownerRecordName":"_defaultOwner"},
                     "syncToken":format!("synthetic-hydration-{}",page+1), "moreComing":true,
                     "records":(0..200).map(|i|serde_json::json!({"recordName":format!("synthetic-master-{page}-{i}"),"recordType":"CPLMaster","fields":{}})).collect::<Vec<_>>()}]}),
                 );
@@ -110,7 +175,7 @@ impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
                     BridgeWait::AssetIdentity | BridgeWait::PairedAsset => {
                         let mut asset = serde_json::json!({
                             "recordName": "WAIT_CHILD", "recordType": "CPLAsset",
-                            "fields": {"masterRef": {"value": {"recordName": "WAIT_MASTER"}}}
+                            "fields": {"masterRef": {"value": {"recordName": "WAIT_MASTER", "zoneID":{"zoneName":self.zone.as_ref(),"ownerRecordName":"_defaultOwner"}}}}
                         });
                         if self.wait == BridgeWait::AssetIdentity {
                             asset["fields"].as_object_mut().unwrap().remove("masterRef");
@@ -221,7 +286,7 @@ async fn cancelled_bridge_fixture_with_pages(
     std::fs::create_dir(&media).unwrap();
     let sentinel = media.join("existing.jpg");
     std::fs::write(&sentinel, b"existing synthetic media").unwrap();
-    let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+    let db = open_fixture_db(&database).await;
     let marker = state::unresolved_identity_key("PrimarySync");
     db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
         .await
@@ -238,21 +303,11 @@ async fn cancelled_bridge_fixture_with_pages(
     session.hydration_pages = hydration_pages;
     let gate_active = session.gate_active.clone();
     let calls = session.calls.clone();
-    let album = crate::icloud::photos::PhotoAlbum::new(
-        crate::icloud::photos::PhotoAlbumConfig {
-            params: Arc::new(std::collections::HashMap::new()),
-            service_endpoint: Arc::from("https://example.invalid"),
-            name: Arc::from("Synthetic album"),
-            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
-            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
-            query_filter: None,
-            page_size: 100,
-            zone_id: Arc::new(serde_json::json!({"zoneName":"PrimarySync"})),
-            retry_config: crate::retry::RetryConfig::default(),
-            container_id: (!streaming).then(|| Arc::from("synthetic-album")),
-            cross_zone_sources: Vec::new(),
-        },
-        Box::new(session),
+    let album = fixture_album(
+        &db,
+        "PrimarySync",
+        if streaming { "" } else { "synthetic-album" },
+        Box::new(session.clone()),
     );
     let library = make_run_cycle_library_state_with_passes(
         "PrimarySync",
@@ -351,8 +406,9 @@ async fn cancelled_bridge_fixture_with_pages(
     );
     drop(cycle);
     drop(builder);
+    drop(library);
     drop(db);
-    let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+    let db = open_fixture_db(&database).await;
     for (key, expected) in [
         ("sync_token:PrimarySync", "prior-token"),
         (ENUM_CONFIG_HASH_KEY, "old-enum-hash"),
@@ -425,7 +481,25 @@ async fn cancelled_bridge_fixture_with_pages(
     drop(db);
     let mut replay_queries = 0;
     for replay in 0..2 {
-        let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        let db = open_fixture_db(&database).await;
+        let library = make_run_cycle_library_state_with_passes(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            vec![crate::commands::AlbumPass {
+                kind: if streaming {
+                    crate::commands::PassKind::Unfiled
+                } else {
+                    crate::commands::PassKind::Album
+                },
+                album: fixture_album(
+                    &db,
+                    "PrimarySync",
+                    if streaming { "" } else { "synthetic-album" },
+                    Box::new(session.clone()),
+                ),
+                exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+            }],
+        );
         let builder = make_run_cycle_download_config_builder(&media, db.clone());
         // Reuse the exact Album/container route, releasing its synthetic gate.
         release.notify_one();
@@ -519,7 +593,7 @@ async fn run_cycle_config_hash_stage_failure_forces_full_without_replacing_check
     let current_hash = download::compute_config_hash(&config);
     assert_ne!(current_hash, "old-hash");
 
-    let inner = make_state_db();
+    let (_database_dir, inner) = fixture_db().await;
     inner
         .set_metadata(ENUM_CONFIG_HASH_KEY, "old-hash")
         .await
@@ -528,24 +602,23 @@ async fn run_cycle_config_hash_stage_failure_forces_full_without_replacing_check
         .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
         .expect("seed zone token");
-    let db: Arc<dyn download::DownloadStore> = Arc::new(FailingMetadataSetDb::new(
-        Arc::clone(&inner),
-        MetadataSetFailure::Exact(PENDING_ENUM_CONFIG_HASH_KEY),
-        "simulated pending hash write failure",
-    ));
+    inner.acquire_lock("pending configuration stage fault").unwrap().execute_batch(
+        "CREATE TRIGGER fail_pending_enum BEFORE INSERT ON metadata WHEN NEW.key='pending_enum_config_hash' BEGIN SELECT RAISE(ABORT,'simulated pending hash write failure'); END;"
+    ).unwrap();
+    let db = inner.clone();
     let download_dir = tempfile::tempdir().expect("download tempdir");
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
     let lib_state = make_run_cycle_library_state_with_album(
         "PrimarySync",
         "sync_token:PrimarySync",
-        make_empty_full_album("zone-tok-new"),
+        empty_fixture_album(&db, "PrimarySync", "", "zone-tok-new"),
     );
     let states = vec![&lib_state];
     let observed_modes = Arc::new(std::sync::Mutex::new(Vec::<download::SyncMode>::new()));
     let build_download_config = make_recording_run_cycle_download_config_builder(
         download_dir.path(),
-        Arc::clone(&db),
+        db.clone(),
         Arc::clone(&observed_modes),
     );
 
@@ -567,6 +640,10 @@ async fn run_cycle_config_hash_stage_failure_forces_full_without_replacing_check
         Some(download::FullEnumerationReason::EnumConfigHashDrift)
     );
     let observed_modes = observed_modes.lock().expect("recorded modes lock").clone();
+    assert!(
+        !observed_modes.is_empty(),
+        "staging failure must still reach source execution"
+    );
     assert!(
         observed_modes
             .iter()
@@ -600,7 +677,7 @@ async fn run_cycle_config_hash_stage_failure_forces_full_without_replacing_check
 #[tokio::test]
 async fn run_cycle_enum_config_drift_atomically_promotes_bridged_checkpoint() {
     let config = make_run_cycle_config();
-    let db = make_state_db();
+    let (_database_dir, db) = fixture_db().await;
     db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
         .await
         .expect("seed active enum hash");
@@ -609,8 +686,10 @@ async fn run_cycle_enum_config_drift_atomically_promotes_bridged_checkpoint() {
         .expect("seed prior token");
     let download_dir = tempfile::tempdir().expect("download tempdir");
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-    let album = make_full_album_with_boxed_session(
+    let album = fixture_album(
+        &db,
         "PrimarySync",
+        "",
         Box::new(ConfigBridgeSession::new(
             "PrimarySync",
             "inventory-token",
@@ -620,7 +699,7 @@ async fn run_cycle_enum_config_drift_atomically_promotes_bridged_checkpoint() {
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
     let build_download_config =
-        make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+        make_run_cycle_download_config_builder(download_dir.path(), db.clone());
 
     let result = run_cycle(
         &[&lib_state],
@@ -662,7 +741,7 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
     use tracing_subscriber::layer::SubscriberExt;
 
     let config = make_run_cycle_config();
-    let db = make_state_db();
+    let (_database_dir, db) = fixture_db().await;
     db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
         .await
         .unwrap();
@@ -674,7 +753,7 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
     let history_path = history_dir.path().join("history.json");
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
     let build_download_config =
-        make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+        make_run_cycle_download_config_builder(download_dir.path(), db.clone());
 
     // Actual cycle orchestration: failed inventory token repair, then complete
     // inventory with a failed bridge, then successful bridge after reopening.
@@ -683,10 +762,8 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
         ("PRIVATE_INVENTORY_TOKEN", "", false),
         ("PRIVATE_INVENTORY_TOKEN", "PRIVATE_BRIDGE_TOKEN", true),
     ] {
-        let album = make_full_album_with_boxed_session(
-            "PrimarySync",
-            Box::new(ConfigBridgeSession::new("PrimarySync", inventory, bridge)),
-        );
+        let provider = ConfigBridgeSession::new("PrimarySync", inventory, bridge);
+        let album = fixture_album(&db, "PrimarySync", "", Box::new(provider.clone()));
         let lib_state =
             make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
         let (recorder, guard) =
@@ -711,9 +788,53 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
             &shared_session,
             &CancellationToken::new(),
         )
-        .await
-        .unwrap();
-        assert_eq!(result.db_sync_token_advance_safe, advance);
+        .await;
+        if bridge.is_empty() {
+            let error = result.expect_err("blank bridge successor must remain a provider refusal");
+            assert!(format!("{error:#}").contains("Missing changes/zone successor"));
+            let calls = provider.calls.lock().unwrap();
+            let query = calls.iter().position(|(kind, _)| *kind == "query").unwrap();
+            let bridge = calls
+                .iter()
+                .position(|(kind, cursor)| *kind == "changes" && cursor == "PRIVATE_PRIOR_TOKEN")
+                .unwrap();
+            assert!(
+                query < bridge,
+                "the real bridge must fail after current query coverage: {calls:?}"
+            );
+        } else {
+            assert_eq!(result.unwrap().db_sync_token_advance_safe, advance);
+        }
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(if advance {
+                "PRIVATE_BRIDGE_TOKEN"
+            } else {
+                "PRIVATE_PRIOR_TOKEN"
+            })
+        );
+        assert_eq!(
+            db.get_metadata(ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(if advance {
+                download::compute_config_hash(&config)
+            } else {
+                "old-enum-hash".to_owned()
+            })
+            .as_deref()
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .is_some(),
+            !advance
+        );
         guard.finish().await;
     }
     let history: serde_json::Value =
@@ -739,17 +860,19 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
         "{}",
         cycles[1]
     );
-    assert_eq!(component(1, "delta_bridge")["token_present"], true);
-    assert_eq!(component(1, "delta_bridge")["token_usable"], true);
-    assert_eq!(
-        component(1, "delta_bridge")["completed_delta_replay"],
-        false
-    );
-    assert_eq!(component(1, "delta_bridge")["phase"], "full");
-    assert_eq!(component(1, "combined")["sync_token_blocked"], true);
-    assert_eq!(
-        component(1, "combined")["sync_token_blocked_reason"],
-        "inventory_delta_bridge_failed"
+    // Strict source parsing returns an error before bridge/combined completion
+    // diagnostics. Initial query coverage is still visible, never reported as
+    // a completed source replay. The durable hold is checked above.
+    assert!(
+        !cycles[1]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| {
+                diagnostic["kind"] == "support_pass_completion_v1"
+                    && (diagnostic["fields"]["component"] == "combined"
+                        || diagnostic["fields"]["completed_delta_replay"] == true)
+            })
     );
     assert_eq!(component(2, "delta_bridge")["token_present"], true);
     assert_eq!(component(2, "combined")["sync_token_blocked"], false);
@@ -768,7 +891,7 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
 #[tokio::test]
 async fn run_cycle_multi_zone_reconciliation_preserves_all_active_tokens_on_partial_failure() {
     let config = make_run_cycle_config();
-    let db = make_state_db();
+    let (_database_dir, db) = fixture_db().await;
     db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
         .await
         .unwrap();
@@ -783,8 +906,10 @@ async fn run_cycle_multi_zone_reconciliation_preserves_all_active_tokens_on_part
     let primary = make_run_cycle_library_state_with_album(
         "PrimarySync",
         "sync_token:PrimarySync",
-        make_full_album_with_boxed_session(
+        fixture_album(
+            &db,
             "PrimarySync",
+            "",
             Box::new(ConfigBridgeSession::new(
                 "PrimarySync",
                 "primary-inventory",
@@ -795,13 +920,15 @@ async fn run_cycle_multi_zone_reconciliation_preserves_all_active_tokens_on_part
     let shared = make_run_cycle_library_state_with_album(
         "SharedSync-TEST",
         "sync_token:SharedSync-TEST",
-        make_full_album_with_boxed_session(
+        fixture_album(
+            &db,
             "SharedSync-TEST",
+            "",
             Box::new(ConfigBridgeSession::new("SharedSync-TEST", "", "unused")),
         ),
     );
     let build_download_config =
-        make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+        make_run_cycle_download_config_builder(download_dir.path(), db.clone());
 
     let result = run_cycle(
         &[&primary, &shared],
@@ -856,8 +983,10 @@ async fn run_cycle_multi_zone_reconciliation_preserves_all_active_tokens_on_part
     let primary_resume = make_run_cycle_library_state_with_album(
         "PrimarySync",
         "sync_token:PrimarySync",
-        make_full_album_with_boxed_session(
+        fixture_album(
+            &db,
             "PrimarySync",
+            "",
             Box::new(ConfigBridgeSession::new(
                 "PrimarySync",
                 "unused-inventory",
@@ -868,8 +997,10 @@ async fn run_cycle_multi_zone_reconciliation_preserves_all_active_tokens_on_part
     let shared_retry = make_run_cycle_library_state_with_album(
         "SharedSync-TEST",
         "sync_token:SharedSync-TEST",
-        make_full_album_with_boxed_session(
+        fixture_album(
+            &db,
             "SharedSync-TEST",
+            "",
             Box::new(ConfigBridgeSession::new(
                 "SharedSync-TEST",
                 "shared-inventory",
@@ -968,6 +1099,7 @@ enum ExternalReconciliationEntry {
 #[cfg(unix)]
 async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
     use crate::state::{DownloadContextStateStore, ReconciliationStateStore};
+    use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, UNIX_EPOCH};
     #[derive(Clone, Debug)]
@@ -981,23 +1113,44 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
         async fn post(
             &self,
             url: &str,
-            _body: String,
+            body: String,
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<serde_json::Value> {
+            let request: serde_json::Value = serde_json::from_str(&body)?;
             if url.contains("/records/lookup?") {
                 self.lookup_calls.fetch_add(1, Ordering::SeqCst);
-                return Ok(self.records.clone());
+                let records: Vec<_> = request["records"].as_array().unwrap().iter().map(|wanted| {
+                    self.records["records"].as_array().unwrap().iter()
+                        .find(|record| record["recordName"] == wanted["recordName"])
+                        .cloned().unwrap_or_else(|| serde_json::json!({"recordName":wanted["recordName"],"serverErrorCode":"UNKNOWN_ITEM"}))
+                }).collect();
+                return Ok(serde_json::json!({"records":records}));
             }
             self.source_calls.fetch_add(1, Ordering::SeqCst);
             if url.contains("/changes/zone?") {
+                let records = if request["zones"][0]["syncToken"].is_null() {
+                    self.records["records"].clone()
+                } else {
+                    serde_json::json!([])
+                };
                 return Ok(
-                    serde_json::json!({"zones": [{"zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"}, "syncToken": "zone-after", "moreComing": false, "records": []}]}),
+                    serde_json::json!({"zones": [{"zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"}, "syncToken": "zone-after", "moreComing": false, "records": records}]}),
                 );
             }
             if url.contains("/internal/records/query/batch") {
-                return Ok(album_count_response(0));
+                return Ok(album_count_response(1));
             }
-            Ok(serde_json::json!({"records": [], "syncToken": "zone-after"}))
+            assert!(url.contains("/records/query?"));
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                .unwrap_or(0);
+            Ok(
+                serde_json::json!({"records": if offset == 0 { self.records["records"].clone() } else { serde_json::json!([]) }, "syncToken": "zone-after"}),
+            )
         }
         fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
             Box::new(self.clone())
@@ -1008,12 +1161,16 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
     let new_dir = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let db_path = old_dir.path().join("state.db");
-    let db = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
+    let db = open_fixture_db(&db_path).await;
     let old_path = old_dir.path().join("photo.jpg");
     let external = outside.path().join("photo.jpg");
-    std::fs::write(&old_path, vec![0u8; 1024]).unwrap();
+    // This is now a real selected transfer, so its advertised JPEG must pass
+    // the same media-signature validation as a provider download.
+    let mut original_bytes = vec![0u8; 1024];
+    original_bytes[..8].copy_from_slice(&[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46]);
+    original_bytes[1022..].copy_from_slice(&[0xff, 0xd9]);
+    std::fs::write(&old_path, &original_bytes).unwrap();
     std::fs::write(&external, vec![0u8; 1024]).unwrap();
-    let original_bytes = std::fs::read(&old_path).unwrap();
     let old_time = UNIX_EPOCH + Duration::from_secs(12345);
     std::fs::File::options()
         .write(true)
@@ -1024,21 +1181,21 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
     let unrelated = new_dir.path().join("unrelated.xmp");
     std::fs::write(&unrelated, b"external user metadata").unwrap();
     let checksum = download::file::compute_sha256(&old_path).await.unwrap();
-    let provider_checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-    let record = crate::test_helpers::TestAssetRecord::new("BLOCKED")
+    let provider_checksum = data_encoding::BASE64.encode(&Sha256::digest(&original_bytes));
+    let record = crate::test_helpers::TestAssetRecord::new("asset-BLOCKED")
         .filename("photo.jpg")
         .created_at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap())
         .size(1024)
-        .checksum(provider_checksum)
+        .checksum(&provider_checksum)
         .build();
     db.upsert_seen(&record).await.unwrap();
     db.mark_downloaded(
         "PrimarySync",
-        "BLOCKED",
+        "asset-BLOCKED",
         "original",
         &old_path,
         &checksum,
-        None,
+        Some(&checksum),
     )
     .await
     .unwrap();
@@ -1073,14 +1230,23 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
     db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, &old_hash)
         .await
         .unwrap();
-    let records = full_album_page_with_download(
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(original_bytes.clone()))
+        .mount(&server)
+        .await;
+    let mut records = full_album_page_with_download(
         "PrimarySync",
         "BLOCKED",
         "unused",
-        "https://p01.icloud-content.com/photo.jpg",
+        &format!("{}/photo.jpg", server.uri()),
         1024,
-        provider_checksum,
+        &provider_checksum,
     );
+    records["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+        serde_json::json!("_defaultOwner");
+    records["records"][0]["fields"]["filenameEnc"]["value"] =
+        serde_json::json!(data_encoding::BASE64.encode(b"photo.jpg"));
     let asset = crate::icloud::photos::PhotoAsset::new(
         records["records"][0].clone(),
         records["records"][1].clone(),
@@ -1102,8 +1268,6 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
             std::fs::write(&expected, &conflicting_bytes).unwrap();
         }
     }
-    let capture_time =
-        UNIX_EPOCH + Duration::from_secs(asset.created_local().timestamp().unsigned_abs());
     drop(old_config);
     drop(new_config);
     drop(old_builder);
@@ -1111,26 +1275,33 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
     drop(db);
     let source_calls = Arc::new(AtomicUsize::new(0));
     let lookup_calls = Arc::new(AtomicUsize::new(0));
-    let album = make_full_album_with_boxed_session(
-        "PrimarySync",
-        Box::new(ReconciliationSession {
-            records,
-            source_calls: Arc::clone(&source_calls),
-            lookup_calls: Arc::clone(&lookup_calls),
-        }),
-    );
-    let lib =
-        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+    let provider = ReconciliationSession {
+        records,
+        source_calls: Arc::clone(&source_calls),
+        lookup_calls: Arc::clone(&lookup_calls),
+    };
     let (_session_dir, session) = make_shared_session_for_run_cycle().await;
     let moved = new_dir.path().join("externally-moved");
     let moved_photo = moved.join(expected.file_name().unwrap());
-    let mut reserved = None;
+    let mut selected_path = None;
+    let mut moved_selected = None;
+    let mut completed_receipts = None;
     for cycle in 0..4 {
         // Release every production SQLite handle before each restart.
-        let db = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
-        let new_builder = make_run_cycle_download_config_builder(new_dir.path(), db.clone());
-        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+        let db = open_fixture_db(&db_path).await;
+        let lib = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            fixture_album(&db, "PrimarySync", "", Box::new(provider.clone())),
+        );
+        let base = make_run_cycle_download_config_builder(new_dir.path(), db.clone());
+        let new_builder = |mode, excludes, groupings, library| {
+            let mut config = (*base(mode, excludes, groupings, library)).clone();
+            config.retry.max_retries = 0;
+            Arc::new(config)
+        };
         let lookups_before = lookup_calls.load(Ordering::SeqCst);
+        let requests_before = server.received_requests().await.unwrap().len();
         let result = run_cycle(
             &[&lib],
             &config,
@@ -1143,55 +1314,63 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
         .await
         .unwrap();
         assert_eq!(
-            result.failed_count,
-            usize::from(cycle < 2),
+            result.failed_count, 0,
+            "{entry:?}, cycle {cycle}: {result:?}"
+        );
+        assert!(
+            result.db_sync_token_advance_safe,
+            "{entry:?}, cycle {cycle}: {result:?}"
+        );
+        assert!(source_calls.load(Ordering::SeqCst) > 0);
+        let transfers = usize::from(
+            cycle == 0
+                || (cycle == 1 && matches!(entry, ExternalReconciliationEntry::MovedDirectory)),
+        );
+        assert_eq!(
+            result.stats.downloaded, transfers,
             "{entry:?}, cycle {cycle}: {result:?}"
         );
         assert_eq!(
-            result.db_sync_token_advance_safe,
-            cycle >= 2,
-            "{entry:?}, cycle {cycle}"
+            server.received_requests().await.unwrap().len() - requests_before,
+            transfers
         );
-        if cycle < 2 {
-            assert_eq!(source_calls.load(Ordering::SeqCst), 0);
-            let diagnostic = match entry {
-                ExternalReconciliationEntry::Symlink => {
-                    "Path reconciliation rejected an unsafe destination"
-                }
-                ExternalReconciliationEntry::Hardlink => {
-                    "Could not restore reconciled capture mtime"
-                }
-                ExternalReconciliationEntry::SameSizeReplacement
-                | ExternalReconciliationEntry::MovedDirectory => {
-                    "Path reconciliation found conflicting destination bytes"
-                }
-            };
-            assert!(
-                capture.contains_event(|event| event.message() == Some(diagnostic)),
-                "missing {diagnostic}: {:?}",
-                capture.events()
-            );
-        }
-        drop(new_builder);
+        drop(base);
+        drop(lib);
         drop(db);
-        let reopened = state::SqliteStateDb::open(&db_path).await.unwrap();
+        let reopened = open_fixture_db(&db_path).await;
         let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id.as_ref(), "BLOCKED");
+        assert_eq!(rows[0].id.as_ref(), "asset-BLOCKED");
         assert_eq!(rows[0].library.as_ref(), "PrimarySync");
         assert_eq!(rows[0].version_size, state::VersionSizeKey::Original);
         assert_eq!(
             rows[0].created_at.timestamp_millis(),
             record.created_at.timestamp_millis()
         );
-        assert_eq!(
-            rows[0].local_path.as_deref(),
-            Some(if cycle < 2 {
-                old_path.as_path()
-            } else {
-                expected.as_path()
-            })
+        let published = rows[0].local_path.as_ref().unwrap();
+        assert!(published.starts_with(new_dir.path()));
+        assert_ne!(
+            published, &expected,
+            "foreign requested path is never adopted or overwritten"
         );
+        assert_eq!(std::fs::read(published).unwrap(), original_bytes);
+        if let Some(selected) = &selected_path {
+            assert_eq!(
+                published, selected,
+                "missing selected peer must recover at its recorded path"
+            );
+        } else {
+            selected_path = Some(published.clone());
+        }
+        {
+            use std::os::unix::fs::MetadataExt;
+            let published_metadata = std::fs::metadata(published).unwrap();
+            assert_eq!(published_metadata.nlink(), 1);
+            assert_ne!(
+                published_metadata.ino(),
+                std::fs::metadata(&old_path).unwrap().ino()
+            );
+        }
         assert_eq!(rows[0].local_checksum.as_deref(), Some(checksum.as_str()));
         assert_eq!(
             reopened
@@ -1199,11 +1378,7 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some(if cycle < 2 {
-                "zone-before"
-            } else {
-                "zone-after"
-            })
+            Some("zone-after")
         );
         assert_eq!(
             reopened
@@ -1211,11 +1386,7 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some(if cycle < 2 {
-                old_hash.as_str()
-            } else {
-                new_hash.as_str()
-            })
+            Some(new_hash.as_str())
         );
         assert_eq!(
             reopened
@@ -1223,21 +1394,42 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
                 .await
                 .unwrap()
                 .as_deref(),
-            if cycle < 2 {
-                Some(new_hash.as_str())
-            } else {
-                None
-            }
+            None
         );
         let reservations = reopened.get_reconciliation_reservations().await.unwrap();
-        assert_eq!(
-            reservations.len(),
-            usize::from(cycle >= 2 || !matches!(entry, ExternalReconciliationEntry::Symlink))
-        );
-        if cycle == 0 || (cycle == 2 && matches!(entry, ExternalReconciliationEntry::Symlink)) {
-            reserved = Some(reservations.clone());
-        } else {
-            assert_eq!(reservations, *reserved.as_ref().unwrap());
+        let receipts = reopened.get_downloaded_path_records().await.unwrap();
+        assert_eq!(receipts.len(), 2);
+        for path in [&old_path, published] {
+            let receipt = receipts
+                .iter()
+                .find(|receipt| receipt.local_path.as_ref() == Some(path))
+                .unwrap();
+            assert_eq!(receipt.id, "asset-BLOCKED");
+            assert_eq!(receipt.local_checksum.as_deref(), Some(checksum.as_str()));
+        }
+        let receipts: Vec<_> = receipts
+            .iter()
+            .map(|receipt| {
+                (
+                    receipt.id.clone(),
+                    receipt.library.clone(),
+                    receipt.local_path.clone(),
+                    receipt.local_checksum.clone(),
+                )
+            })
+            .collect();
+        if cycle == 1 {
+            completed_receipts = Some((receipts, reservations));
+        } else if cycle > 1 {
+            assert_eq!(
+                (receipts, reservations),
+                *completed_receipts.as_ref().unwrap()
+            );
+            assert_eq!(
+                lookup_calls.load(Ordering::SeqCst),
+                lookups_before,
+                "quiet reopen must not reconfirm or relocate media"
+            );
         }
         assert_eq!(
             std::fs::read(&unrelated).unwrap(),
@@ -1270,44 +1462,21 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
                 }
             }
         } else {
-            assert_eq!(std::fs::read(&expected).unwrap(), original_bytes);
-            assert_eq!(
-                std::fs::metadata(&expected).unwrap().modified().unwrap(),
-                capture_time
+            assert!(
+                !expected.exists(),
+                "removing the foreign path does not authorize another copy"
             );
-            let receipts = reopened.get_downloaded_path_records().await.unwrap();
-            assert_eq!(receipts.len(), 2);
-            for path in [&old_path, &expected] {
-                let receipt = receipts
-                    .iter()
-                    .find(|receipt| receipt.local_path.as_ref() == Some(path))
-                    .unwrap();
-                assert_eq!(receipt.id, "BLOCKED");
-                assert_eq!(receipt.library, "PrimarySync");
-                assert_eq!(receipt.local_checksum.as_deref(), Some(checksum.as_str()));
-            }
-            if cycle == 3 {
-                assert_eq!(result.stats.downloaded, 0);
-                assert_eq!(
-                    lookup_calls.load(Ordering::SeqCst),
-                    lookups_before,
-                    "quiet cycle must not hydrate or reconcile again"
-                );
-                assert!(!capture.contains_event(|event| event.message()
-                    == Some("Path reconciliation found conflicting destination bytes")));
-                assert_eq!(
-                    std::fs::read_dir(expected.parent().unwrap())
-                        .unwrap()
-                        .count(),
-                    1
-                );
-            }
         }
         if matches!(entry, ExternalReconciliationEntry::MovedDirectory) && cycle >= 1 {
             assert_eq!(std::fs::read(&moved_photo).unwrap(), conflicting_bytes);
+            assert_eq!(
+                std::fs::read(moved_selected.as_ref().unwrap()).unwrap(),
+                original_bytes
+            );
         }
         drop(reopened);
         if cycle == 0 && matches!(entry, ExternalReconciliationEntry::MovedDirectory) {
+            moved_selected = Some(moved.join(selected_path.as_ref().unwrap().file_name().unwrap()));
             std::fs::rename(expected.parent().unwrap(), &moved).unwrap();
             std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
             std::fs::write(&expected, &conflicting_bytes).unwrap();
@@ -1329,19 +1498,19 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
             std::fs::rename(&replacement, &old_path).unwrap();
         }
         assert_eq!(std::fs::read(&external).unwrap(), vec![0u8; 1024]);
-        assert_eq!(std::fs::read(&old_path).unwrap(), vec![0u8; 1024]);
+        assert_eq!(std::fs::read(&old_path).unwrap(), original_bytes);
     }
 }
 
 #[tokio::test]
 async fn run_cycle_download_config_hash_drift_keeps_source_incremental() {
     let config = make_run_cycle_config();
-    let db = make_state_db();
+    let (_database_dir, db) = fixture_db().await;
     let old_download_dir = tempfile::tempdir().expect("old download tempdir");
     let new_download_dir = tempfile::tempdir().expect("new download tempdir");
 
     let old_build_download_config =
-        make_run_cycle_download_config_builder(old_download_dir.path(), Arc::clone(&db));
+        make_run_cycle_download_config_builder(old_download_dir.path(), db.clone());
     let old_download_config = old_build_download_config(
         download::SyncMode::Full,
         Arc::new(rustc_hash::FxHashSet::default()),
@@ -1360,13 +1529,13 @@ async fn run_cycle_download_config_hash_drift_keeps_source_incremental() {
     let lib_state = make_run_cycle_library_state_with_album(
         "PrimarySync",
         &format!("{SYNC_TOKEN_PREFIX}PrimarySync"),
-        make_incremental_album("zone-tok-new"),
+        empty_fixture_album(&db, "PrimarySync", "", "zone-tok-new"),
     );
     let states = vec![&lib_state];
     let observed_modes = Arc::new(std::sync::Mutex::new(Vec::<download::SyncMode>::new()));
     let build_download_config = make_recording_run_cycle_download_config_builder(
         new_download_dir.path(),
-        Arc::clone(&db),
+        db.clone(),
         Arc::clone(&observed_modes),
     );
     let new_hash = download::hash_download_config(&build_download_config(
@@ -1447,7 +1616,19 @@ async fn run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_ste
                 return Ok(album_count_response((self.records.len() / 2) as u64));
             }
             if url.contains("/records/lookup?") {
-                return Ok(serde_json::json!({"records": self.records.as_ref()}));
+                let request: serde_json::Value = serde_json::from_str(&body)?;
+                let records: Vec<_> = self
+                    .records
+                    .iter()
+                    .filter(|record| {
+                        request["records"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|wanted| wanted["recordName"] == record["recordName"])
+                    })
+                    .collect();
+                return Ok(serde_json::json!({"records": records}));
             }
             if url.contains("/records/query?") {
                 let request: serde_json::Value = serde_json::from_str(&body)?;
@@ -1518,6 +1699,8 @@ async fn run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_ste
             serde_json::json!(created.timestamp_millis());
         page["records"][1]["fields"]["addedDate"]["value"] =
             serde_json::json!(created.timestamp_millis());
+        page["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+            serde_json::json!("_defaultOwner");
         page["records"].as_array().expect("asset records").clone()
     }
 
@@ -1604,15 +1787,17 @@ async fn run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_ste
         &format!("{}/january.jpg", server.uri()),
         january_body,
     ));
-    let album = make_full_album_with_boxed_session(
+    let (_database_dir, db) = fixture_db().await;
+    let album = fixture_album(
+        &db,
         "PrimarySync",
+        "",
         Box::new(DateBoundSession {
             records: Arc::new(records),
         }),
     );
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
-    let db = make_state_db();
     let download_dir = tempfile::tempdir().expect("download tempdir");
     let old_lower_bound = config::CreatedDateFilter::CaptureDate(
         chrono::NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
@@ -1631,7 +1816,7 @@ async fn run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_ste
     let old_enum_hash = download::compute_config_hash(&config);
     let old_builder = make_run_cycle_download_config_builder_with_options(
         download_dir.path(),
-        Arc::clone(&db),
+        db.clone(),
         RunCycleDownloadConfigOptions {
             skip_created_before: Some(old_lower_bound),
             skip_created_after: Some(upper_bound),
@@ -1706,7 +1891,7 @@ async fn run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_ste
     let current_enum_hash = download::compute_config_hash(&config);
     let current_builder = make_run_cycle_download_config_builder_with_options(
         download_dir.path(),
-        Arc::clone(&db),
+        db.clone(),
         RunCycleDownloadConfigOptions {
             skip_created_before: Some(new_lower_bound),
             skip_created_after: Some(upper_bound),
@@ -1851,23 +2036,23 @@ async fn run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_ste
 #[tokio::test]
 async fn run_cycle_multi_pass_persists_base_download_config_hash() {
     let config = make_run_cycle_config();
-    let db = make_state_db();
+    let (_database_dir, db) = fixture_db().await;
     let download_dir = tempfile::tempdir().expect("download tempdir");
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
     let passes = vec![
         crate::commands::AlbumPass {
             kind: crate::commands::PassKind::Album,
-            album: make_named_empty_full_album("PrimarySync", "Vacation", "zone-tok"),
+            album: empty_fixture_album(&db, "PrimarySync", "Vacation", "zone-tok"),
             exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
         },
         crate::commands::AlbumPass {
             kind: crate::commands::PassKind::Album,
-            album: make_named_empty_full_album("PrimarySync", "Family", "zone-tok"),
+            album: empty_fixture_album(&db, "PrimarySync", "Family", "zone-tok"),
             exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
         },
         crate::commands::AlbumPass {
             kind: crate::commands::PassKind::Unfiled,
-            album: make_named_empty_full_album("PrimarySync", "", "zone-tok"),
+            album: empty_fixture_album(&db, "PrimarySync", "", "zone-tok"),
             exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
         },
     ];
@@ -1882,7 +2067,7 @@ async fn run_cycle_multi_pass_persists_base_download_config_hash() {
     };
     let build_download_config = make_run_cycle_download_config_builder_with_options(
         download_dir.path(),
-        Arc::clone(&db),
+        db.clone(),
         options,
     );
     let base_config = build_download_config(
@@ -1928,7 +2113,7 @@ async fn run_cycle_multi_pass_persists_base_download_config_hash() {
 #[tokio::test]
 async fn unchanged_multi_pass_second_cycle_is_not_download_config_hash_drift() {
     let config = make_run_cycle_config();
-    let db = make_state_db();
+    let (_database_dir, db) = fixture_db().await;
     let download_dir = tempfile::tempdir().expect("download tempdir");
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
     let options = RunCycleDownloadConfigOptions {
@@ -1941,19 +2126,19 @@ async fn unchanged_multi_pass_second_cycle_is_not_download_config_hash_drift() {
         vec![
             crate::commands::AlbumPass {
                 kind: crate::commands::PassKind::Album,
-                album: make_named_empty_full_album("PrimarySync", "Vacation", "zone-tok-1"),
+                album: empty_fixture_album(&db, "PrimarySync", "Vacation", "zone-tok-1"),
                 exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
             },
             crate::commands::AlbumPass {
                 kind: crate::commands::PassKind::Unfiled,
-                album: make_named_empty_full_album("PrimarySync", "", "zone-tok-1"),
+                album: empty_fixture_album(&db, "PrimarySync", "", "zone-tok-1"),
                 exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
             },
         ],
     );
     let first_builder = make_run_cycle_download_config_builder_with_options(
         download_dir.path(),
-        Arc::clone(&db),
+        db.clone(),
         options,
     );
     let first_result = run_cycle(
@@ -1974,14 +2159,14 @@ async fn unchanged_multi_pass_second_cycle_is_not_download_config_hash_drift() {
         &format!("{SYNC_TOKEN_PREFIX}PrimarySync"),
         vec![crate::commands::AlbumPass {
             kind: crate::commands::PassKind::Unfiled,
-            album: make_empty_full_album("zone-tok-2"),
+            album: empty_fixture_album(&db, "PrimarySync", "", "zone-tok-2"),
             exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
         }],
     );
     let observed_modes = Arc::new(std::sync::Mutex::new(Vec::<download::SyncMode>::new()));
     let base_builder = make_run_cycle_download_config_builder_with_options(
         download_dir.path(),
-        Arc::clone(&db),
+        db.clone(),
         options,
     );
     let second_builder = {
@@ -2366,12 +2551,12 @@ async fn download_config_legacy_hash_migrates_without_reconciliation() {
 
 #[tokio::test]
 async fn unresolved_identity_inventory_requires_a_delta_bridge() {
-    use crate::state::{SparseAttemptOutcome, SparseEvidence, SparseSourceId};
+    use crate::state::{SparseAttemptOutcome, SparseEvidence, SparseIdentityStore, SparseSourceId};
     for (prior_token, sparse) in [None, Some("retained-before")]
         .into_iter()
         .flat_map(|token| [false, true].map(|sparse| (token, sparse)))
     {
-        let inner = make_state_db();
+        let (_database_dir, inner) = fixture_db().await;
         let marker = state::unresolved_identity_key("PrimarySync");
         if sparse {
             let key = SparseEvidence::new(
@@ -2408,8 +2593,10 @@ async fn unresolved_identity_inventory_requires_a_delta_bridge() {
                 .unwrap();
         }
         let dir = tempfile::tempdir().unwrap();
-        let album = make_full_album_with_boxed_session(
+        let album = fixture_album(
+            &inner,
             "PrimarySync",
+            "",
             Box::new(ConfigBridgeSession::new(
                 "PrimarySync",
                 "inventory-only",
@@ -2511,7 +2698,7 @@ async fn inventory_coverage_survives_failed_cursor_commit_and_quiet_reopen() {
         .unwrap();
         let previous_bytes = std::fs::read(&kept).unwrap();
         {
-            let db = state::SqliteStateDb::open(&database).await.unwrap();
+            let db = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
             let record = crate::test_helpers::TestAssetRecord::new("asset-PREVIOUS")
                 .filename("previous.jpg")
                 .size(previous_bytes.len() as u64)
@@ -2554,7 +2741,7 @@ async fn inventory_coverage_survives_failed_cursor_commit_and_quiet_reopen() {
         }
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
         for cycle in 0..3 {
-            let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+            let db = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
             if cycle == 0 {
                 db.acquire_lock("recent bridge cursor commit fault")
                     .unwrap()
@@ -2566,8 +2753,10 @@ async fn inventory_coverage_survives_failed_cursor_commit_and_quiet_reopen() {
                     .unwrap();
             }
             let queries = Arc::new(AtomicUsize::new(0));
-            let album = make_full_album_with_boxed_session(
+            let album = crate::sync_loop::test_support::make_owned_cycle_album(
+                &db,
                 "PrimarySync",
+                "private",
                 Box::new(CountedBridge {
                     inner: ConfigBridgeSession::new(
                         "PrimarySync",
@@ -2600,6 +2789,10 @@ async fn inventory_coverage_survives_failed_cursor_commit_and_quiet_reopen() {
             )
             .await;
             if cycle == 0 {
+                assert!(
+                    queries.load(Ordering::SeqCst) > 0,
+                    "fault case must reach current inventory: {result:#?}"
+                );
                 assert!(
                     result.is_err()
                         || result
@@ -2674,7 +2867,7 @@ async fn inventory_coverage_survives_failed_cursor_commit_and_quiet_reopen() {
 #[tokio::test]
 async fn retained_checkpoint_candidate_changed_at_promotion_preserves_concurrent_state() {
     let config = make_run_cycle_config();
-    let inner = make_state_db();
+    let (_database_dir, inner) = fixture_db().await;
     inner
         .set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
         .await
@@ -2697,8 +2890,10 @@ async fn retained_checkpoint_candidate_changed_at_promotion_preserves_concurrent
     let library = make_run_cycle_library_state_with_album(
         "PrimarySync",
         "sync_token:PrimarySync",
-        make_full_album_with_boxed_session(
+        fixture_album(
+            &inner,
             "PrimarySync",
+            "",
             Box::new(ConfigBridgeSession::new(
                 "PrimarySync",
                 "inventory-token",
@@ -2706,7 +2901,9 @@ async fn retained_checkpoint_candidate_changed_at_promotion_preserves_concurrent
             )),
         ),
     );
-    let builder = make_run_cycle_download_config_builder(dir.path(), db.clone());
+    // Only the cycle's candidate read is intercepted. Selection and execution
+    // retain the exact native database captured by the authenticated album.
+    let builder = make_run_cycle_download_config_builder(dir.path(), inner.clone());
     let result = run_cycle(
         &[&library],
         &config,
@@ -2770,12 +2967,14 @@ async fn issue956_missing_old_master_confirms_current_pair_then_commits_and_reop
 async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Option<&'static str>) {
     use crate::icloud::photos::{PhotoAsset, PhotosSession};
     use serde_json::{Value, json};
+    use sha2::Digest;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone)]
     struct CurrentPair {
         records: Vec<Value>,
         lookups: Arc<AtomicUsize>,
+        requested: Arc<Mutex<Vec<String>>>,
         queries: Arc<AtomicUsize>,
         old_master_error: Option<&'static str>,
     }
@@ -2784,8 +2983,13 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
         async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
             let request: Value = serde_json::from_str(&body)?;
             if url.contains("/records/lookup?") {
-                assert!(self.lookups.fetch_add(1, Ordering::SeqCst) < 2);
+                self.lookups.fetch_add(1, Ordering::SeqCst);
                 let wanted = request["records"].as_array().unwrap();
+                self.requested.lock().unwrap().extend(
+                    wanted
+                        .iter()
+                        .map(|item| item["recordName"].as_str().unwrap().to_owned()),
+                );
                 let mut records: Vec<_> = self
                     .records
                     .iter()
@@ -2821,7 +3025,16 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
             }
             assert!(url.contains("/records/query?"));
             self.queries.fetch_add(1, Ordering::SeqCst);
-            Ok(json!({"records":[],"syncToken":"inventory-token"}))
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                .unwrap_or(0);
+            Ok(
+                json!({"records": if offset == 0 { self.records.clone() } else { Vec::new() }, "syncToken":"inventory-token"}),
+            )
         }
         fn clone_box(&self) -> Box<dyn PhotosSession> {
             Box::new(self.clone())
@@ -2834,6 +3047,7 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
     let kept = media.join("2023/11/14/photo.JPG");
     std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
     let original = vec![0u8; 1024];
+    let provider_checksum = data_encoding::BASE64.encode(&sha2::Sha256::digest(&original));
     std::fs::write(&kept, &original).unwrap();
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -2848,22 +3062,25 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
         "inventory-token",
         &download_url,
         original.len() as u64,
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        &provider_checksum,
     )["records"]
         .as_array()
         .unwrap()
         .clone();
-    records[0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+    records[0]["fields"]["filenameEnc"]["value"] =
+        json!(data_encoding::BASE64.encode(b"photo.JPG"));
+    records[1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+        json!("_defaultOwner");
     let photo = PhotoAsset::new(records[0].clone(), records[1].clone());
     let config = make_run_cycle_config();
     let hash = download::compute_config_hash(&config);
     let marker = state::unresolved_identity_key("PrimarySync");
     {
-        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        let db = open_fixture_db(&database).await;
         let record = crate::test_helpers::TestAssetRecord::new("asset-CURRENT")
             .filename("photo.JPG")
             .size(1024)
-            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .checksum(&provider_checksum)
             .created_at(photo.created())
             .added_at(photo.added_date())
             .metadata(photo.metadata().clone())
@@ -2880,31 +3097,70 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
         )
         .await
         .unwrap();
-        db.upsert_asset_master_mapping("PrimarySync", "asset-CURRENT", "PREVIOUS")
+        db.upsert_asset_master_mapping("PrimarySync", "asset-CURRENT", "CURRENT")
             .await
             .unwrap();
         db.set_metadata(ENUM_CONFIG_HASH_KEY, &hash).await.unwrap();
+        db.set_metadata("sync_token:PrimarySync", "current-token")
+            .await
+            .unwrap();
+    }
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let queries = Arc::new(AtomicUsize::new(0));
+    let provider = CurrentPair {
+        records,
+        lookups: lookups.clone(),
+        requested: Arc::new(Mutex::new(Vec::new())),
+        queries: queries.clone(),
+        old_master_error,
+    };
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    // A cursor and catalog row are not current-selection coverage. Establish
+    // the native inventory anchor through a real cycle before making the
+    // durable mapping stale and exercising sparse delta identity recovery.
+    {
+        let db = open_fixture_db(&database).await;
+        let library = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            fixture_album(&db, "PrimarySync", "", Box::new(provider.clone())),
+        );
+        let builder = make_run_cycle_download_config_builder(&media, db.clone());
+        let result = run_cycle(
+            &[&library],
+            &config,
+            Some(db.as_ref()),
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(result.can_advance_database_checkpoint(), "{result:?}");
+        assert_eq!(result.stats.downloaded, 0);
+        assert!(queries.load(Ordering::SeqCst) > 0);
+        assert_eq!(std::fs::read(&kept).unwrap(), original);
+        db.upsert_asset_master_mapping("PrimarySync", "asset-CURRENT", "PREVIOUS")
+            .await
+            .unwrap();
         db.set_metadata("sync_token:PrimarySync", "prior-token")
             .await
             .unwrap();
         db.set_metadata(&marker, "1").await.unwrap();
     }
-    let lookups = Arc::new(AtomicUsize::new(0));
-    let queries = Arc::new(AtomicUsize::new(0));
-    let album = make_full_album_with_boxed_session(
-        "PrimarySync",
-        Box::new(CurrentPair {
-            records,
-            lookups: lookups.clone(),
-            queries: queries.clone(),
-            old_master_error,
-        }),
-    );
-    let library =
-        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
-    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    lookups.store(0, Ordering::SeqCst);
+    queries.store(0, Ordering::SeqCst);
+    provider.requested.lock().unwrap().clear();
+    let mut recovered_lookups = None;
+    let mut recovered_queries = None;
     for cycle in 0..2 {
-        let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        let db = open_fixture_db(&database).await;
+        let library = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            fixture_album(&db, "PrimarySync", "", Box::new(provider.clone())),
+        );
         let builder = make_run_cycle_download_config_builder(&media, db.clone());
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -2928,16 +3184,34 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
             queries.load(Ordering::SeqCst)
         );
         assert_eq!(outcome.stats.downloaded, 0, "existing media must be reused");
-        assert_eq!(
-            lookups.load(Ordering::SeqCst),
-            2,
-            "quiet reopen must not repeat identity work"
-        );
-        assert_eq!(
-            queries.load(Ordering::SeqCst),
-            0,
-            "recovery must not require inventory"
-        );
+        if cycle == 0 {
+            let requested = provider.requested.lock().unwrap();
+            assert!(
+                requested.iter().any(|name| name == "PREVIOUS"),
+                "stale mapping must exercise the old-master lookup: {requested:?}"
+            );
+            assert!(
+                requested.iter().any(|name| name == "CURRENT"),
+                "recovery must confirm the current master: {requested:?}"
+            );
+            recovered_lookups = Some(lookups.load(Ordering::SeqCst));
+            assert!(
+                queries.load(Ordering::SeqCst) > 0,
+                "stale identity recovery must refresh current selection coverage"
+            );
+            recovered_queries = Some(queries.load(Ordering::SeqCst));
+        } else {
+            assert_eq!(
+                Some(lookups.load(Ordering::SeqCst)),
+                recovered_lookups,
+                "quiet reopen must not repeat identity work"
+            );
+            assert_eq!(
+                Some(queries.load(Ordering::SeqCst)),
+                recovered_queries,
+                "quiet reopen must reuse recovered current-selection coverage"
+            );
+        }
         assert_eq!(
             db.get_master_record_name_for_asset("PrimarySync", "asset-CURRENT")
                 .await

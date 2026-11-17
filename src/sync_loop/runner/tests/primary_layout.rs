@@ -39,6 +39,14 @@ struct IndexingOptions {
 fn provider_hash(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes))
 }
+fn fixture_owner() -> state::db::account::AccountOwner {
+    state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap()
+}
 fn records(server: &MockServer, edit: Option<(&str, &[u8])>) -> Vec<Value> {
     records_at(&server.uri(), edit)
 }
@@ -52,6 +60,8 @@ fn records_at(uri: &str, edit: Option<(&str, &[u8])>) -> Vec<Value> {
         &provider_hash(ORIGINAL),
     );
     page["records"][0]["fields"]["filenameEnc"]["value"] = json!("IMG_0501.JPG");
+    page["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+        json!("_defaultOwner");
     if let Some((name, bytes)) = edit {
         page["records"][1]["fields"]["resJPEGFullRes"] = json!({"value":{"size":bytes.len(),"downloadURL":format!("{uri}/{name}"),"fileChecksum":provider_hash(bytes)}});
         page["records"][1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
@@ -67,6 +77,20 @@ struct Session {
     current: Option<Arc<std::sync::Mutex<Vec<Value>>>>,
     indexing: Option<IndexingOptions>,
 }
+fn versioned_records(records: &[Value]) -> Vec<Value> {
+    records
+        .iter()
+        .cloned()
+        .map(|mut record| {
+            // Provider revisions identify the actual emitted fields, including edits
+            // applied by scenario builders after the base fixture was constructed.
+            record["recordChangeTag"] = json!(provider_hash(
+                &serde_json::to_vec(&record["fields"]).unwrap()
+            ));
+            record
+        })
+        .collect()
+}
 #[async_trait::async_trait]
 impl PhotosSession for Session {
     async fn post(
@@ -76,6 +100,7 @@ impl PhotosSession for Session {
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
         let request: Value = serde_json::from_str(&body)?;
+        let source = versioned_records(&self.records);
         if request["query"]["recordType"] == "CheckIndexingState" {
             return Ok(
                 json!({"records":[{"fields":{"state":{"value":*self.indexing.as_ref().unwrap().readiness.lock().unwrap()}}}]}),
@@ -90,8 +115,16 @@ impl PhotosSession for Session {
                         .to_owned(),
                 );
             }
+            let token = if self.indexing.is_some() {
+                "cycle-token".to_owned()
+            } else {
+                format!(
+                    "cycle-token-{}",
+                    provider_hash(&serde_json::to_vec(&source)?)
+                )
+            };
             return Ok(
-                json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"cycle-token","moreComing":false,"records":if self.quiet {vec![]} else {self.records.clone()}}]}),
+                json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":token,"moreComing":false,"records":if self.quiet {vec![]} else {source}}]}),
             );
         }
         if url.contains("/records/lookup?") {
@@ -102,6 +135,7 @@ impl PhotosSession for Session {
                 .as_ref()
                 .map(|current| current.lock().unwrap().clone())
                 .unwrap_or_else(|| self.records.clone());
+            let current = versioned_records(&current);
             let records: Vec<_> = request["records"]
                 .as_array()
                 .unwrap()
@@ -139,7 +173,7 @@ impl PhotosSession for Session {
                 .and_then(|i| i["fieldValue"]["value"].as_u64())
                 .unwrap_or(0);
             return Ok(
-                json!({"records":if offset==0 {self.records.clone()} else {vec![]},"syncToken":self.indexing.as_ref().map_or(Some("query-token"), |indexing| indexing.token)}),
+                json!({"records":if offset==0 {source} else {vec![]},"syncToken":self.indexing.as_ref().map_or(Some("query-token"), |indexing| indexing.token)}),
             );
         }
         anyhow::bail!("unexpected synthetic provider endpoint: {url}")
@@ -190,7 +224,6 @@ struct CycleOptions {
     folder_structure: &'static str,
     pass_kind: PassKind,
     resolution: crate::types::PhotoResolution,
-    private: bool,
     #[cfg(feature = "xmp")]
     sidecar: bool,
     controls: download::DownloadControls,
@@ -208,7 +241,6 @@ impl Default for CycleOptions {
             folder_structure: "",
             pass_kind: PassKind::Unfiled,
             resolution: crate::types::PhotoResolution::Original,
-            private: false,
             #[cfg(feature = "xmp")]
             sidecar: false,
             controls: download::DownloadControls::download_hidden(),
@@ -246,49 +278,54 @@ async fn try_cycle_options(
         current: options.current.clone(),
         indexing: options.indexing.clone(),
     };
-    let owner = state::db::account::AccountOwner::authenticated(
-        "synthetic@example.invalid",
-        "com",
-        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
-    )
-    .unwrap();
-    let inner = Arc::new(if options.private {
+    let owner = fixture_owner();
+    let inner = Arc::new(
         state::SqliteStateDb::open_owned(&root.join("state.db"), &owner)
             .await
-            .unwrap()
-    } else {
-        state::SqliteStateDb::open(&root.join("state.db"))
-            .await
-            .unwrap()
-    });
-    let mut album = make_full_album_with_boxed_session("PrimarySync", Box::new(provider.clone()));
-    if options.private || options.pass_kind == PassKind::Album {
-        album = crate::icloud::photos::PhotoAlbum::new(
-            crate::icloud::photos::PhotoAlbumConfig {
-                params: Arc::default(),
-                service_endpoint: Arc::from("https://example.com"),
-                name: Arc::from("TestAlbum"),
-                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
-                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
-                query_filter: None,
-                page_size: 100,
-                zone_id: Arc::new(
-                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
-                ),
-                retry_config: crate::retry::RetryConfig::default(),
-                container_id: (options.pass_kind == PassKind::Album)
-                    .then(|| Arc::from("album-501")),
-                cross_zone_sources: Vec::new(),
-            },
-            Box::new(provider.clone()),
-        );
-        if options.private {
-            album.set_shadow_capture(
-                crate::icloud::photos::inbox::ShadowCapture::new(inner.clone(), owner, "com"),
-                Arc::from("private"),
-            );
-        }
-    }
+            .unwrap(),
+    );
+    let (name, list_type, obj_type, query_filter) = match options.pass_kind {
+        PassKind::Album => (
+            "TestAlbum",
+            "CPLContainerRelationLiveByAssetDate",
+            "CPLContainerRelationNotDeletedByAssetDate:album-501",
+            Some(Arc::new(
+                json!([{"fieldName":"parentId","comparator":"EQUALS","fieldValue":{"type":"STRING","value":"album-501"}}]),
+            )),
+        ),
+        PassKind::SmartFolder => (
+            "Hidden",
+            "CPLAssetAndMasterHiddenByAssetDate",
+            "CPLAssetHiddenByAssetDate",
+            None,
+        ),
+        PassKind::Unfiled => (
+            "TestAlbum",
+            "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
+            "CPLAssetByAssetDateWithoutHiddenOrDeleted",
+            None,
+        ),
+    };
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::default(),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from(name),
+            list_type: Arc::from(list_type),
+            obj_type: Arc::from(obj_type),
+            query_filter,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: (options.pass_kind == PassKind::Album).then(|| Arc::from("album-501")),
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(provider.clone()),
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(inner.clone(), owner, "com"),
+        Arc::from("private"),
+    );
     let pass = AlbumPass {
         kind: options.pass_kind,
         album,
@@ -438,7 +475,7 @@ async fn startup_archive_adoption_flows_into_managed_sync_without_downloads() {
         exclude_ids: Arc::default(),
     }];
     let db = Arc::new(
-        state::SqliteStateDb::open(&root.path().join("state.db"))
+        state::SqliteStateDb::open_owned(&root.path().join("state.db"), &fixture_owner())
             .await
             .unwrap(),
     );
@@ -482,7 +519,6 @@ async fn recorded_generation_destinations_survive_template_changes() {
         false,
         EditedNaming::Suffix,
         CycleOptions {
-            private: true,
             folder_structure: "before",
             ..CycleOptions::default()
         },
@@ -521,7 +557,6 @@ async fn recorded_generation_destinations_survive_template_changes() {
             quiet,
             EditedNaming::Suffix,
             CycleOptions {
-                private: true,
                 folder_structure: "after",
                 ..CycleOptions::default()
             },
@@ -548,7 +583,6 @@ async fn recorded_generation_destinations_survive_template_changes() {
             EditedNaming::Suffix,
             CycleOptions {
                 expected_due_selection: Some(cycle_index == 0),
-                private: true,
                 folder_structure: "after",
                 ..CycleOptions::default()
             },
@@ -575,7 +609,6 @@ async fn established_primary_layout_keeps_its_directory_after_template_change() 
         false,
         EditedNaming::Primary,
         CycleOptions {
-            private: true,
             folder_structure: "before",
             ..CycleOptions::default()
         },
@@ -601,7 +634,6 @@ async fn established_primary_layout_keeps_its_directory_after_template_change() 
             false,
             EditedNaming::Suffix,
             CycleOptions {
-                private: true,
                 folder_structure: "after",
                 controls: download::DownloadControls::dry_run_hidden(),
                 ..CycleOptions::default()
@@ -629,7 +661,6 @@ async fn established_primary_layout_keeps_its_directory_after_template_change() 
             quiet,
             EditedNaming::Suffix,
             CycleOptions {
-                private: true,
                 folder_structure: "after",
                 ..CycleOptions::default()
             },
@@ -658,7 +689,6 @@ async fn established_primary_layout_keeps_its_directory_after_template_change() 
         false,
         EditedNaming::Suffix,
         CycleOptions {
-            private: true,
             folder_structure: "after",
             ..CycleOptions::default()
         },
@@ -683,7 +713,6 @@ async fn established_primary_layout_keeps_its_directory_after_template_change() 
         false,
         EditedNaming::Suffix,
         CycleOptions {
-            private: true,
             folder_structure: "final",
             ..CycleOptions::default()
         },
@@ -709,7 +738,6 @@ async fn quiet_missing_file_requeue_failure_rolls_back_and_recovers_after_reopen
     let root = tempfile::tempdir().unwrap();
     let current = records(&server, Some(("edit-one", EDIT_ONE)));
     let options = || CycleOptions {
-        private: true,
         ..CycleOptions::default()
     };
     let (initial, _) = cycle_options(
@@ -1620,7 +1648,6 @@ async fn primary_layout_private_generations_remain_complete_across_edits() {
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
     let options = || CycleOptions {
-        private: true,
         ..CycleOptions::default()
     };
     for (edit, bytes) in [
@@ -1864,7 +1891,11 @@ async fn primary_layout_real_live_photo_pair_edits_reverts_and_reopens() {
         };
         let original = live_records(&server.uri(), original_still, original_motion, None);
         let db_path = root.path().join("state.db");
-        drop(state::SqliteStateDb::open(&db_path).await.unwrap());
+        drop(
+            state::SqliteStateDb::open_owned(&db_path, &fixture_owner())
+                .await
+                .unwrap(),
+        );
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute_batch("CREATE TRIGGER fail_float_commit BEFORE INSERT ON primary_layout_bindings BEGIN SELECT RAISE(FAIL,'injected float journal interruption'); END").unwrap();
         let (blocked, _) = cycle_options(
@@ -1993,8 +2024,52 @@ async fn primary_layout_real_live_photo_pair_edits_reverts_and_reopens() {
     }
 }
 
-#[tokio::test]
-async fn primary_layout_source_change_during_preparation_retains_work_then_replans() {
+type RetainedSelectionEvidence = Vec<(String, String, String, Vec<u8>, String)>;
+
+fn destination_evidence(
+    conn: &rusqlite::Connection,
+    generation: &str,
+    pass: &str,
+    child: &str,
+) -> String {
+    conn.query_row("SELECT json_group_array(json_array(version_size,path,checksum,size_bytes,metadata_hash,created_at,added_at,verified_media,verified_metadata,local_checksum,source_checksum,grouping_hash,intent_hash,progress_hash,prepared_checksum,prepared_size,prepared_hash)) FROM (SELECT * FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 ORDER BY version_size,path)", rusqlite::params![generation,pass,child], |row| row.get(0)).unwrap()
+}
+
+fn retained_selection_evidence(root: &std::path::Path) -> RetainedSelectionEvidence {
+    let conn = rusqlite::Connection::open(root.join("state.db")).unwrap();
+    let rows: Vec<(String,String,String,Vec<u8>)> = conn.prepare("SELECT generation,pass_key,child,manifest FROM provider_active_decisions d WHERE admission='admitted' AND EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.verified_media=0) ORDER BY generation,pass_key,child").unwrap().query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap().collect::<Result<_,_>>().unwrap();
+    rows.into_iter()
+        .map(|(generation, pass, child, manifest)| {
+            let evidence = destination_evidence(&conn, &generation, &pass, &child);
+            (generation, pass, child, manifest, evidence)
+        })
+        .collect()
+}
+
+fn assert_retained_selection_evidence(root: &std::path::Path, before: &RetainedSelectionEvidence) {
+    assert!(!before.is_empty());
+    let conn = rusqlite::Connection::open(root.join("state.db")).unwrap();
+    for (generation, pass, child, manifest, evidence) in before {
+        let after: Vec<u8> = conn.query_row("SELECT manifest FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3", rusqlite::params![generation,pass,child], |row| row.get(0)).unwrap();
+        assert_eq!(
+            &after, manifest,
+            "successor changed historical manifest bytes"
+        );
+        assert_eq!(
+            &destination_evidence(&conn, generation, pass, child),
+            evidence,
+            "successor changed historical paths or receipts"
+        );
+    }
+}
+
+async fn interrupted_managed_source_change() -> (tempfile::TempDir, MockServer, Vec<Value>) {
+    interrupted_managed_source_change_with_peer(false).await
+}
+
+async fn interrupted_managed_source_change_with_peer(
+    include_peer: bool,
+) -> (tempfile::TempDir, MockServer, Vec<Value>) {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
@@ -2005,8 +2080,23 @@ async fn primary_layout_source_change_during_preparation_retains_work_then_repla
         EditedNaming::Primary,
     )
     .await;
-    let first = records(&server, Some(("edit-changing", EDIT_ONE)));
-    let second = records(&server, Some(("edit-two", EDIT_TWO)));
+    let mut first = records(&server, Some(("edit-changing", EDIT_ONE)));
+    let mut second = records(&server, Some(("edit-two", EDIT_TWO)));
+    if include_peer {
+        let mut peer = full_album_page_with_download(
+            "PrimarySync",
+            "502",
+            "peer-token",
+            &format!("{}/missing-peer", server.uri()),
+            ORIGINAL.len() as u64,
+            &provider_hash(ORIGINAL),
+        );
+        peer["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+            json!("_defaultOwner");
+        let records = peer["records"].as_array().unwrap();
+        first.extend(records.iter().cloned());
+        second.extend(records.iter().cloned());
+    }
     let current = Arc::new(std::sync::Mutex::new(first.clone()));
     let update = current.clone();
     let next = second.clone();
@@ -2042,11 +2132,35 @@ async fn primary_layout_source_change_during_preparation_retains_work_then_repla
         ),
         1
     );
+    (root, server, second)
+}
+
+#[tokio::test]
+async fn primary_layout_source_change_during_preparation_retains_work_then_replans() {
+    let (root, server, second) = interrupted_managed_source_change().await;
+    let media = root.path().join("media");
+    let before = retained_selection_evidence(root.path());
     let (replanned, _) = cycle(root.path(), second.clone(), true, EditedNaming::Primary).await;
     assert_eq!(replanned.failed_count, 0, "{:?}", replanned.stats);
     assert!(replanned.db_sync_token_advance_safe);
     assert_bytes(&media.join("IMG_0501.JPG"), EDIT_TWO);
     assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+    assert_retained_selection_evidence(root.path(), &before);
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM provider_active_decisions WHERE admission='excluded' AND reason LIKE 'managed_successor:%'"
+        ),
+        1
+    );
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM provider_active_destinations w JOIN provider_active_decisions d USING(generation,pass_key,child) WHERE d.reason LIKE 'managed_successor:%' AND (w.admitted<>0 OR w.verified_media<>0 OR w.verified_metadata<>0)"
+        ),
+        0,
+        "successor invented old publication progress"
+    );
     let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
     let members:Vec<Vec<u8>>=conn.prepare("SELECT m.evidence FROM primary_layout_members m JOIN primary_layout_operations o ON o.operation=m.operation WHERE o.phase='cancelled'").unwrap().query_map([],|row|row.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
     assert!(
@@ -2068,6 +2182,191 @@ async fn primary_layout_source_change_during_preparation_retains_work_then_repla
         assert!(quiet.db_sync_token_advance_safe);
         assert_eq!(lookups, 0);
         assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    }
+}
+
+#[tokio::test]
+async fn managed_successor_admission_rollback_preserves_old_authority_and_recovers() {
+    let (root, server, second) = interrupted_managed_source_change().await;
+    let before = retained_selection_evidence(root.path());
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_managed_successor_admission BEFORE INSERT ON assets WHEN EXISTS(SELECT 1 FROM provider_active_decisions WHERE reason LIKE 'managed_successor:%') BEGIN SELECT RAISE(FAIL,'injected successor admission failure'); END").unwrap();
+    drop(conn);
+    let held = try_cycle_options(
+        root.path(),
+        second.clone(),
+        true,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert!(
+        held.is_err()
+            || held
+                .as_ref()
+                .is_ok_and(|(result, _)| !result.db_sync_token_advance_safe)
+    );
+    assert_retained_selection_evidence(root.path(), &before);
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM provider_active_decisions WHERE reason LIKE 'managed_successor:%'"
+        ),
+        0
+    );
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    for (generation, pass, child, _, _) in &before {
+        let admission: String = conn.query_row("SELECT admission FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3", rusqlite::params![generation,pass,child], |row| row.get(0)).unwrap();
+        assert_eq!(admission, "admitted");
+    }
+    conn.execute_batch("DROP TRIGGER fail_managed_successor_admission")
+        .unwrap();
+    drop(conn);
+    assert_bytes(&root.path().join("media/IMG_0501.JPG"), ORIGINAL);
+    for _ in 0..3 {
+        let (result, _) = cycle(root.path(), second.clone(), true, EditedNaming::Primary).await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+        assert_bytes(&root.path().join("media/IMG_0501.JPG"), EDIT_TWO);
+        assert_retained_selection_evidence(root.path(), &before);
+    }
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/edit-two")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn managed_successor_preserves_unrelated_unfinished_identity() {
+    let (root, _server, current) = interrupted_managed_source_change_with_peer(true).await;
+    let before = retained_selection_evidence(root.path());
+    assert_eq!(before.len(), 2);
+    for _ in 0..2 {
+        let held = try_cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Primary,
+            CycleOptions::default(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(
+            !held.db_sync_token_advance_safe,
+            "unfinished peer released checkpoint"
+        );
+        assert_bytes(&root.path().join("media/IMG_0501.JPG"), EDIT_TWO);
+        assert_retained_selection_evidence(root.path(), &before);
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let remaining: i64 = conn.query_row("SELECT COUNT(*) FROM provider_active_destinations w JOIN provider_active_decisions d USING(generation,pass_key,child) WHERE w.generation=?1 AND d.admission='admitted' AND w.admitted=1 AND w.verified_media=0", [&before[0].0], |row| row.get(0)).unwrap();
+        assert!(
+            remaining > 0,
+            "unrelated unfinished destination lost authority"
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM provider_active_decisions WHERE reason LIKE 'managed_successor:%'"
+            ),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn managed_successor_refuses_unknown_mismatched_publishing_and_damaged_evidence() {
+    for fault in [
+        "unknown_identity",
+        "mismatched_master",
+        "publishing",
+        "damaged_prepared",
+        "unknown_source",
+    ] {
+        let (root, _server, mut current) = interrupted_managed_source_change().await;
+        let before = retained_selection_evidence(root.path());
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let members: Vec<(String,i64,Vec<u8>)> = conn.prepare("SELECT m.operation,m.member,m.evidence FROM primary_layout_members m JOIN primary_layout_operations o USING(operation) WHERE o.phase='prepared'").unwrap().query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        let (operation, index, bytes) = members
+            .into_iter()
+            .find(|(_, _, bytes)| {
+                let member: state::db::primary_layout::LayoutMember =
+                    serde_json::from_slice(bytes).unwrap();
+                member
+                    .record
+                    .is_some_and(|record| record.version_size.as_str() == "adjusted")
+            })
+            .unwrap();
+        let mut member: state::db::primary_layout::LayoutMember =
+            serde_json::from_slice(&bytes).unwrap();
+        let prepared = member.prepared.as_ref().unwrap().path.to_path();
+        match fault {
+            "unknown_identity" => {
+                current[1]["fields"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("masterRef");
+            }
+            "mismatched_master" => {
+                let old_master = current[0].clone();
+                current[0]["recordName"] = json!("different-master-501");
+                current[1]["fields"]["masterRef"]["value"]["recordName"] =
+                    json!("different-master-501");
+                current.push(old_master);
+            }
+            "publishing" => {
+                conn.execute("UPDATE primary_layout_operations SET phase='publishing',header=CAST(json_set(CAST(header AS TEXT),'$.phase','publishing') AS BLOB) WHERE operation=?1", [&operation]).unwrap();
+                conn.execute_batch("CREATE TRIGGER hold_publishing_journal BEFORE UPDATE ON primary_layout_operations BEGIN SELECT RAISE(FAIL,'publishing journal must recover first'); END").unwrap();
+            }
+            "damaged_prepared" => std::fs::write(&prepared, b"changed prepared evidence").unwrap(),
+            "unknown_source" => {
+                member.prepared.as_mut().unwrap().source_checksum = None;
+                conn.execute("UPDATE primary_layout_members SET evidence=?3 WHERE operation=?1 AND member=?2", rusqlite::params![operation,index,serde_json::to_vec(&member).unwrap()]).unwrap();
+            }
+            other => panic!("unknown managed successor fault: {other}"),
+        }
+        drop(conn);
+        for _ in 0..2 {
+            let held = try_cycle_options(
+                root.path(),
+                current.clone(),
+                true,
+                EditedNaming::Primary,
+                CycleOptions::default(),
+            )
+            .await;
+            assert!(
+                held.is_err()
+                    || held
+                        .as_ref()
+                        .is_ok_and(|(result, _)| !result.db_sync_token_advance_safe),
+                "{fault}: unexpectedly released checkpoint"
+            );
+            assert_bytes(&root.path().join("media/IMG_0501.JPG"), ORIGINAL);
+            assert_retained_selection_evidence(root.path(), &before);
+            assert_eq!(
+                db_count(
+                    root.path(),
+                    "SELECT COUNT(*) FROM provider_active_decisions WHERE reason LIKE 'managed_successor:%'"
+                ),
+                0,
+                "{fault}: withdrew old authority"
+            );
+            assert_bytes(
+                &prepared,
+                if fault == "damaged_prepared" {
+                    b"changed prepared evidence"
+                } else {
+                    EDIT_ONE
+                },
+            );
+        }
     }
 }
 
@@ -2203,7 +2502,17 @@ async fn primary_layout_root_template_transitions_cover_all_pass_kinds() {
             .await;
             assert_eq!(quiet.failed_count, 0);
             assert!(quiet.db_sync_token_advance_safe);
-            assert_eq!(lookups, 0, "{pass_kind:?}: unexpected quiet lookup");
+            // The zone delta cannot establish smart-folder membership. Current
+            // selection refreshes and confirms it even when media is unchanged.
+            let expected_lookups = if pass_kind == PassKind::SmartFolder {
+                2
+            } else {
+                0
+            };
+            assert_eq!(
+                lookups, expected_lookups,
+                "{pass_kind:?}: unexpected quiet lookup"
+            );
             assert_eq!(server.received_requests().await.unwrap().len(), requests);
             assert_eq!(
                 db_count(
@@ -3330,7 +3639,6 @@ async fn review501_suffix_album_collecting_delta_uses_managed_metadata_owner() {
         pass_kind: PassKind::Album,
         sidecar: true,
         // No private capture context: selected album deltas use collecting routing.
-        private: false,
         ..CycleOptions::default()
     };
     let current = records_with_original(&server, VALID_ORIGINAL, Some(("edit-one", VALID_EDIT)));
@@ -3585,7 +3893,6 @@ async fn review501_suffix_album_collecting_edit_recovers_without_redownload() {
     let media = root.path().join("media");
     let options = || CycleOptions {
         pass_kind: PassKind::Album,
-        private: false,
         ..CycleOptions::default()
     };
     let first = records(&server, Some(("edit-one", EDIT_ONE)));

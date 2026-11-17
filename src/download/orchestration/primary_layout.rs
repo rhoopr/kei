@@ -83,6 +83,41 @@ fn sidecar(path: &Path) -> PathBuf {
     path.push(".xmp");
     path.into()
 }
+
+/// Root changes must not turn a journal-owned source into ordinary copy input.
+/// Inspect exact recorded targets before provider planning or new layout claims.
+pub(super) async fn validate_recorded_sources(config: &DownloadConfig) -> Result<()> {
+    let Some(db) = config.state_db.as_deref() else {
+        return Ok(());
+    };
+    for record in db.get_primary_layout_receipts().await? {
+        let Some(path) = record.local_path else {
+            continue;
+        };
+        if !matches!(
+            db.source_metadata_recovery(&path).await?,
+            crate::state::db::SourceMetadataRecovery::ManagedPrimary
+        ) {
+            continue;
+        }
+        let parent = path
+            .parent()
+            .context("Recorded managed source has no parent")?;
+        for target in [&path, &sidecar(&path)] {
+            match file::has_replacement_journal(parent, target).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    anyhow::bail!("Recorded managed source has unfinished replacement evidence")
+                }
+                Err(error)
+                    if super::reconciliation::classify_reconciliation_io_error(&error)
+                        == Some(std::io::ErrorKind::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
 fn policy(config: &DownloadConfig) -> &'static str {
     if config.edited_naming == EditedNaming::Primary {
         "primary"
@@ -289,6 +324,41 @@ async fn validate_file(root: &Path, file: &LayoutFile) -> Result<()> {
     Ok(())
 }
 
+pub(super) async fn validate_cancelled_selection_layouts(
+    operations: &[LayoutOperation],
+) -> Result<()> {
+    for op in operations {
+        anyhow::ensure!(
+            matches!(op.phase.as_str(), "planned" | "prepared" | "preserved"),
+            "Successor cannot retire a publishing journal"
+        );
+        for member in &op.members {
+            anyhow::ensure!(
+                member.installed.is_none(),
+                "Successor cannot retire installed journal members"
+            );
+            for file in [
+                &member.old,
+                &member.prepared,
+                &member.preserved,
+                &member.archive_source,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                validate_file(&op.root.to_path(), file).await?;
+                for target in [file.path.to_path(), sidecar(&file.path.to_path())] {
+                    anyhow::ensure!(
+                        !file::has_replacement_journal(&op.root.to_path(), &target).await?,
+                        "Cancelled layout retains unfinished replacement evidence"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn qualified_path(path: &Path, qualifier: &str, role: filter::NamingRole) -> Result<PathBuf> {
     let name = path
         .file_name()
@@ -400,8 +470,47 @@ pub(in crate::download) async fn process_asset(
     session: &LayoutSession,
     cancel: &CancellationToken,
 ) -> Result<Option<(PhotoAsset, LayoutOutcome)>> {
+    let mut current_config;
+    let config = if config.selection_run.is_some() {
+        let db = config
+            .state_db
+            .as_deref()
+            .context("Managed layout requires a database")?;
+        let rows = db
+            .get_asset_groupings(
+                observed.source_zone().unwrap_or(&config.library),
+                &[observed.state_id()],
+            )
+            .await?;
+        let mut groupings = crate::download::AssetGroupings::default();
+        for (asset, album) in rows.albums {
+            groupings.albums.entry(asset).or_default().push(album);
+        }
+        for (asset, person) in rows.people {
+            groupings.people.entry(asset).or_default().push(person);
+        }
+        current_config = config.clone();
+        current_config.asset_groupings = Arc::new(groupings);
+        &current_config
+    } else {
+        config
+    };
     let key = recorded_family(&observed, config, session).await?;
-    let result = process_asset_inner(client, observed, config, session, cancel).await;
+    let result = async {
+        let result = process_asset_inner(client, observed, config, session, cancel).await?;
+        if config.selection_run.is_some()
+            && let Some((asset, _)) = &result
+            && let Some(db) = config.state_db.as_deref()
+            && let Some(binding) = db.primary_layout_binding(key.clone()).await?
+        {
+            anyhow::ensure!(
+                acknowledge_binding(asset, config, &binding, cancel).await?,
+                "Managed layout has not completed the selected metadata recipe"
+            );
+        }
+        Ok(result)
+    }
+    .await;
     if result.is_err()
         && let Some(db) = config.state_db.as_deref()
     {
@@ -415,6 +524,66 @@ pub(in crate::download) async fn process_asset(
         }
     }
     result
+}
+
+async fn acknowledge_binding(
+    asset: &PhotoAsset,
+    config: &DownloadConfig,
+    binding: &LayoutBinding,
+    cancel: &CancellationToken,
+) -> Result<bool> {
+    let mut paths: Vec<_> = binding
+        .files
+        .iter()
+        .map(|file| file.path.to_path())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    let mut guards = Vec::new();
+    for path in &paths {
+        guards.push(file::lock_download_destination(path, cancel).await?);
+    }
+    for file in &binding.files {
+        validate_file(&config.directory, file).await?;
+        if config.selection_run.is_some()
+            && filter::derive_expected_paths(asset, config)
+                .iter()
+                .any(|selected| selected.version_size.as_str() == file.version)
+            && file.metadata_decision.as_deref()
+                != Some(
+                    metadata_decision(
+                        asset,
+                        config,
+                        VersionSizeKey::from_str(&file.version)
+                            .context("Invalid managed rendition")?,
+                        &file.provider_checksum,
+                    )?
+                    .as_str(),
+                )
+        {
+            return Ok(false);
+        }
+    }
+    anyhow::ensure!(
+        !cancel.is_cancelled(),
+        "Primary layout interrupted before acknowledgement"
+    );
+    if let Some(run) = &config.selection_run {
+        anyhow::ensure!(
+            run.root.spec.metadata_flags
+                == crate::download::pipeline::MetadataFlags::from(config).bits(),
+            "Managed metadata flags differ from selected intent"
+        );
+        run.capture
+            .db
+            .reuse_layout_selection_publication(
+                run.capture.owner.clone(),
+                run.root.id.clone(),
+                binding.clone(),
+            )
+            .await?;
+    }
+    Ok(true)
 }
 
 async fn process_asset_inner(
@@ -466,10 +635,14 @@ async fn process_asset_inner(
             b.decision == decision(&observed, config).unwrap_or_default()
                 && b.policy == policy(config)
         })
+        && acknowledge_binding(
+            &observed,
+            config,
+            binding.as_ref().context("Missing committed binding")?,
+            cancel,
+        )
+        .await?
     {
-        for file in &binding.as_ref().context("Missing committed binding")?.files {
-            validate_file(&config.directory, file).await?;
-        }
         return Ok(Some((observed, LayoutOutcome::default())));
     }
     let asset = confirm(&observed, config).await?;
@@ -487,10 +660,8 @@ async fn process_asset_inner(
         && !config.refresh_metadata
         && binding.decision == desired
         && binding.policy == policy(config)
+        && acknowledge_binding(&asset, config, binding, cancel).await?
     {
-        for file in &binding.files {
-            validate_file(&config.directory, file).await?;
-        }
         return Ok(Some((asset, LayoutOutcome::default())));
     }
     let mut op = if let Some(op) = pending.into_iter().find(|op| op.family == family) {
@@ -1700,6 +1871,32 @@ pub(super) async fn recover(
         file::recover_conditional_replacements(&op.root.to_path(), &protected).await?;
         if op.phase == "publishing" {
             finish(db, &mut op, cancel, &mut LayoutOutcome::default()).await?;
+            continue;
+        }
+        let mut selected = false;
+        for pass in passes {
+            if let Some((capture, _, _)) = pass.album.owned_selection_scope()? {
+                let concrete = Arc::clone(&capture.db) as Arc<dyn DownloadStore>;
+                anyhow::ensure!(
+                    config
+                        .state_db
+                        .as_ref()
+                        .is_some_and(|store| Arc::ptr_eq(store, &concrete)),
+                    "Managed selection store mismatch"
+                );
+                selected |= capture
+                    .db
+                    .has_selected_layout_obligation(
+                        capture.owner,
+                        op.library.clone(),
+                        op.child.clone(),
+                    )
+                    .await?;
+            }
+        }
+        if selected {
+            // Fresh current selection must bind a replacement resource before
+            // this journal can stop owning the old native obligation.
             continue;
         }
         let mut matched = false;

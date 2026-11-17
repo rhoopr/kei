@@ -377,9 +377,12 @@ async fn indexing_managed_pending_journal_is_held_even_under_suffix_then_recover
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     drop(
-        crate::state::SqliteStateDb::open(&root.path().join("state.db"))
-            .await
-            .unwrap(),
+        crate::state::SqliteStateDb::open_owned(
+            &root.path().join("state.db"),
+            &super::fixture_owner(),
+        )
+        .await
+        .unwrap(),
     );
     let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
     conn.execute(

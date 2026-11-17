@@ -16,6 +16,7 @@ use std::sync::{
 #[derive(Clone, Debug)]
 struct Session {
     source: bool,
+    owner: &'static str,
     quiet: bool,
     unrelated: bool,
     records: Vec<Value>,
@@ -41,10 +42,29 @@ impl PhotosSession for Session {
     async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
         let request: Value = serde_json::from_str(&body)?;
         if url.contains("/internal/records/query/batch?") {
-            return Ok(album_count_response(0));
+            return Ok(album_count_response(u64::from(
+                !self.source && self.owner == "owner-test" && !self.records.is_empty(),
+            )));
         }
         if url.contains("/records/query?") {
-            return Ok(json!({"records":[],"syncToken":"inventory-only"}));
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                .unwrap_or(0);
+            // The targeted identity lookup is evidence, not a work admission.
+            // Only the exact currently selected target scope supplies media work.
+            let records = if !self.source
+                && offset == 0
+                && request["zoneID"]["ownerRecordName"] == "owner-test"
+            {
+                self.records.clone()
+            } else {
+                Vec::new()
+            };
+            return Ok(json!({"records":records,"syncToken":"inventory-only"}));
         }
         if url.contains("/records/lookup?") {
             if self.source {
@@ -99,7 +119,7 @@ impl PhotosSession for Session {
             Vec::new()
         };
         Ok(
-            json!({"zones":[{"zoneID":{"zoneName":zone,"ownerRecordName":if self.source {"_defaultOwner"} else {"owner-test"}},
+            json!({"zones":[{"zoneID":{"zoneName":zone,"ownerRecordName":self.owner},
             "syncToken":if self.source {"source-after"} else {"target-after"},
             "moreComing":false,"records":records}]}),
         )
@@ -108,8 +128,14 @@ impl PhotosSession for Session {
         Box::new(self.clone())
     }
 }
-fn album(zone: &str, owner: &str, session: Session) -> PhotoAlbum {
-    PhotoAlbum::new(
+fn album(db: &Arc<state::SqliteStateDb>, zone: &str, owner: &str, session: Session) -> PhotoAlbum {
+    let account = state::db::account::AccountOwner::authenticated(
+        "runner@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"runner-fixture"}})).unwrap(),
+    )
+    .unwrap();
+    let mut album = PhotoAlbum::new(
         PhotoAlbumConfig {
             params: Arc::new(std::collections::HashMap::new()),
             service_endpoint: Arc::from("https://example.com"),
@@ -124,7 +150,12 @@ fn album(zone: &str, owner: &str, session: Session) -> PhotoAlbum {
             cross_zone_sources: Vec::new(),
         },
         Box::new(session),
-    )
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), account, "com"),
+        Arc::from("private"),
+    );
+    album
 }
 
 #[tokio::test]
@@ -190,7 +221,7 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
         for cycle in 0..cycles {
             let source_calls_at_start = source_calls.lock().unwrap().len();
-            let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+            let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
             let db: Arc<dyn download::DownloadStore> = inner.clone();
             let builder = make_run_cycle_download_config_builder(&media, db.clone());
             if cycle == 0 {
@@ -230,10 +261,12 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                 "PrimarySync",
                 "sync_token:PrimarySync",
                 album(
+                    &inner,
                     "PrimarySync",
                     "_defaultOwner",
                     Session {
                         source: true,
+                        owner: "_defaultOwner",
                         quiet: cycle > 0,
                         unrelated,
                         records: Vec::new(),
@@ -246,6 +279,7 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                 "SharedSync-test",
                 "sync_token:SharedSync-test",
                 album(
+                    &inner,
                     "SharedSync-test",
                     if owner_matches {
                         "owner-test"
@@ -254,6 +288,11 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                     },
                     Session {
                         source: false,
+                        owner: if owner_matches {
+                            "owner-test"
+                        } else {
+                            "wrong-owner"
+                        },
                         quiet: true,
                         unrelated: false,
                         records: records.clone(),
@@ -292,7 +331,13 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                     "sufficient target proof must finish: {result:?}, target calls {}",
                     calls.load(Ordering::SeqCst)
                 );
-                assert_eq!(result.stats.downloaded, usize::from(cycle == 0));
+                assert_eq!(
+                    result.stats.downloaded,
+                    usize::from(cycle == 0),
+                    "selected={selected} owner_matches={owner_matches} pending={pending} cycle={cycle}: {result:?}; source={:?}; target_calls={}",
+                    source_calls.lock().unwrap(),
+                    calls.load(Ordering::SeqCst)
+                );
                 assert_eq!(
                     inner
                         .get_metadata("sync_token:PrimarySync")
@@ -325,8 +370,8 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                 );
                 assert_eq!(
                     calls.load(Ordering::SeqCst),
-                    2,
-                    "quiet reopened cycle must not lookup target again"
+                    4,
+                    "two targeted identity reads plus two current-selection confirmation reads; quiet reopen must not repeat either"
                 );
             } else {
                 assert!(result.stats.identity_incomplete);
@@ -386,8 +431,8 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                 if cycle == 0 {
                     assert_eq!(
                         observed_calls,
-                        if selected && owner_matches { 2 } else { 0 },
-                        "unselected or wrong scope must not be requested"
+                        if selected && owner_matches { 4 } else { 0 },
+                        "identity and current-selection confirmation require the exact selected owner"
                     );
                 } else {
                     assert_eq!(

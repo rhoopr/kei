@@ -602,7 +602,12 @@ async fn incremental_hard_delete_uses_library_scoped_asset_master_mapping() {
 
 #[tokio::test]
 async fn incremental_hard_delete_recovers_mapping_from_album_history() {
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+    let dir = TempDir::new().unwrap();
+    let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
+    let mut config = test_config();
+    config.directory = Arc::from(dir.path().join("media"));
+    config.state_db = Some(db.clone());
+    super::super::test_support::initialize_empty_selection(&db, &config).await;
     db.upsert_seen(
         &TestAssetRecord::new("TRACKED_MASTER")
             .library("PrimarySync")
@@ -639,19 +644,41 @@ async fn incremental_hard_delete_recovers_mapping_from_album_history() {
         None
     );
 
-    let session = MockPhotosFlow::new()
-        .changes_zone_page(
-            vec![hard_deleted_change_record("asset-TRACKED_MASTER")],
-            "zone-token-after",
-            false,
-        )
-        .build();
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: mock_album("Library", session),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-    let mut config = test_config();
+    #[derive(Clone)]
+    struct DeletedHistorySession;
+    #[async_trait::async_trait]
+    impl PhotosSession for DeletedHistorySession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/changes/zone?") {
+                return Ok(super::super::test_support::changes_zone_response(
+                    vec![hard_deleted_change_record("asset-TRACKED_MASTER")],
+                    "zone-token-after",
+                ));
+            }
+            if url.contains("/internal/records/query/batch?") {
+                return Ok(json!({"batch":[{"records":[{"fields":{"itemCount":{"value":0}}}]}]}));
+            }
+            anyhow::ensure!(
+                url.contains("/records/query?"),
+                "unexpected history fixture route"
+            );
+            Ok(json!({"records":[],"syncToken":"zone-token-after"}))
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+    let session = DeletedHistorySession;
+    let passes = vec![super::super::test_support::selected_pass_with_session(
+        &db,
+        "",
+        Box::new(session),
+    )];
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-before".to_string(),
     };
@@ -667,7 +694,10 @@ async fn incremental_hard_delete_recovers_mapping_from_album_history() {
     .await
     .unwrap();
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert!(
+        matches!(result.outcome, DownloadOutcome::Success),
+        "{result:?}"
+    );
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
     assert_eq!(result.stats.state_write_failures, 0);
     assert!(!result.stats.sync_token_blocked);

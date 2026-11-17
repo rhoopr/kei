@@ -15,7 +15,48 @@ use crate::state::VersionSizeKey;
 
 use super::{PendingOnDiskAdoption, asset_record_for_derived_path, effective_asset_library};
 
+/// Reuse the existing exact cross-folder proof only for a currently selected
+/// asset. Selection still has to acknowledge its destination independently.
+pub(in crate::download) async fn recover_selected_reserved_publication(
+    db: &dyn DownloadStore,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    ctx: &crate::download::orchestration::context::DownloadContext,
+    planner: &TaskPlanner,
+) -> Result<bool> {
+    if planner.managed_layout_session().is_some() || is_asset_filtered(asset, config).is_some() {
+        return Ok(true);
+    }
+    for derived in derive_expected_paths(asset, config) {
+        if matches!(
+            super::enumerated_reserved_pending(db, config, asset, ctx, planner, &derived, true)
+                .await?,
+            Some(super::PendingRetryAdoption::StateWriteFailed)
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(in crate::download) async fn recover_current_pending_publication(
+    db: &dyn DownloadStore,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    planner: &mut TaskPlanner,
+    version: VersionSizeKey,
+    shutdown: &CancellationToken,
+) -> Result<Option<PendingOnDiskAdoption>> {
+    if config.selection_run.is_some() {
+        return Ok(None);
+    }
+    recover_confirmed_publication(db, config, asset, planner, version, shutdown).await
+}
+
+/// Called only after current selection confirmation, before destination binding.
+/// Recovery proves the old exact publication; selection projection must still
+/// independently acknowledge the chosen destination before checkpoint release.
+pub(in crate::download) async fn recover_confirmed_publication(
     db: &dyn DownloadStore,
     config: &DownloadConfig,
     asset: &PhotoAsset,
@@ -27,11 +68,8 @@ pub(in crate::download) async fn recover_current_pending_publication(
         !shutdown.is_cancelled(),
         "Current publication recovery cancelled"
     );
-    // Managed selection and layout journals keep their publication owner.
-    if config.selection_run.is_some()
-        || planner.managed_layout_session().is_some()
-        || is_asset_filtered(asset, config).is_some()
-    {
+    // Managed layout journals keep their publication owner.
+    if planner.managed_layout_session().is_some() || is_asset_filtered(asset, config).is_some() {
         return Ok(None);
     }
     let derived_paths = derive_expected_paths(asset, config);
@@ -65,6 +103,12 @@ pub(in crate::download) async fn recover_current_pending_publication(
     let Some(proof) = candidate else {
         return Ok(None);
     };
+    if config.selection_run.is_some() && proof.status == "downloaded" {
+        // Healthy native destinations and interrupted peers retain their own
+        // replay owner. Only an aggregate failure needs this prior-publication
+        // repair before selection planning.
+        return Ok(None);
+    }
     if proof.checksum != derived.checksum.as_ref()
         || proof.size != derived.size
         || !stored_path_matches_download_family(
@@ -116,6 +160,7 @@ pub(in crate::download) async fn recover_current_pending_publication(
     );
     // Await the real DB outcome even if cancellation arrives while its blocking
     // worker runs. Dropping this future would not cancel that transaction.
+    crate::fs_util::fsync_parent_dir_async(&proof.local_path).await?;
     let finalized = db
         .recover_pending_publication(
             &proof,

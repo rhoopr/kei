@@ -595,6 +595,20 @@ impl TaskPlanner {
             .await
     }
 
+    /// Current selection may reuse an exact reserved destination across folders.
+    /// Reservation ownership, content and root confinement remain mandatory.
+    pub(super) async fn plan_selected_asset(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+    ) -> Result<AssetTaskPlan> {
+        let mut plan = self.plan_pending_retry_asset(asset, config).await?;
+        if matches!(self.path_mode, PathPlanningMode::Download) && !self.managed_plan {
+            self.relocate_protected_tasks(&mut plan, config).await?;
+        }
+        Ok(plan)
+    }
+
     async fn plan_download_asset_with_replay(
         &mut self,
         asset: &PhotoAsset,

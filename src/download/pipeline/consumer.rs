@@ -63,6 +63,14 @@ pub(super) async fn consume_stream_download_tasks(
     let mark_capture_repair_after_download = capture_repair_requested(config);
     let pb = &shared.pb;
     let pipeline_shutdown = shared.pipeline_shutdown;
+    // A stale URL stops transfers, but destination-owned selection must still
+    // finish projecting current membership, including deferred unfiled work.
+    // Parent cancellation continues to stop both enumeration and transfers.
+    let transfer_shutdown = if config.selection_run.is_some() {
+        pipeline_shutdown.child_token()
+    } else {
+        pipeline_shutdown.clone()
+    };
     let state_db = shared.state_db;
     let temp_suffix: Arc<str> = Arc::clone(&config.temp_suffix);
     let bandwidth_limiter = config.bandwidth_limiter.clone();
@@ -74,7 +82,7 @@ pub(super) async fn consume_stream_download_tasks(
             let temp_suffix = Arc::clone(&temp_suffix);
             let rate_limit_counter = Arc::clone(&rate_limit_counter);
             let bandwidth_limiter = bandwidth_limiter.clone();
-            let shutdown_token = pipeline_shutdown.clone();
+            let shutdown_token = transfer_shutdown.clone();
             async move {
                 let result = Box::pin(download_single_task(
                     &client,
@@ -208,9 +216,9 @@ pub(super) async fn consume_stream_download_tasks(
                 match classify_download_task_error(&e) {
                     DownloadTaskErrorClass::Interrupted => {
                         log_interrupted_download(pb, &task, &e);
-                        // URL expiry cancels the whole bounded queue, not just
-                        // the task that saw 410. Keep its unstarted work for
-                        // the same cleanup attempt. User shutdown still gates
+                        // URL expiry cancels transfers, including work queued
+                        // after the task that saw 410. Keep that work for the
+                        // same cleanup attempt. User shutdown still gates
                         // cleanup lookup and dispatch through the parent token.
                         if url_expired_abort {
                             failed.push(task);
@@ -250,7 +258,7 @@ pub(super) async fn consume_stream_download_tasks(
                             );
                         });
                         failed.push(task);
-                        pipeline_shutdown.cancel();
+                        transfer_shutdown.cancel();
                         continue;
                     }
                     DownloadTaskErrorClass::Other => {

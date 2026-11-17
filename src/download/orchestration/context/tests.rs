@@ -11,6 +11,74 @@ use super::super::test_support::{
 use super::retain_legacy_added_date;
 use super::{DownloadContext, count_value_map_entries, count_version_set_entries};
 
+#[tokio::test]
+async fn selected_truncation_repair_requires_exact_version_path_and_option() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("owned.jpg");
+    std::fs::write(&path, b"complete media").unwrap();
+    let db = crate::state::SqliteStateDb::open_in_memory().unwrap();
+    let record = crate::test_helpers::TestAssetRecord::new("owned")
+        .checksum("provider-version")
+        .size(14)
+        .build();
+    db.upsert_seen(&record).await.unwrap();
+    let local = crate::download::file::compute_sha256(&path).await.unwrap();
+    db.mark_downloaded(
+        "PrimarySync",
+        "owned",
+        "original",
+        &path,
+        &local,
+        Some(&local),
+    )
+    .await
+    .unwrap();
+    std::fs::write(&path, b"cut").unwrap();
+    db.mark_failed(
+        "PrimarySync",
+        "owned",
+        "original",
+        crate::commands::reconcile::FILE_TRUNCATED_REASON,
+    )
+    .await
+    .unwrap();
+    let context = DownloadContext::load(&db).await;
+    let mut config = super::super::test_support::test_config();
+    config.directory = Arc::from(dir.path());
+    let mut task = super::super::test_support::retry_test_task(
+        "owned",
+        VersionSizeKey::Original,
+        path.to_str().unwrap(),
+    );
+    task.checksum = "provider-version".into();
+    task.size = 14;
+    for case in ["disabled", "provider-change", "different-path", "exact"] {
+        let mut candidate = task.clone();
+        config.repair_truncated = case != "disabled";
+        if case == "provider-change" {
+            candidate.checksum = "new-version".into();
+        }
+        if case == "different-path" {
+            candidate.download_path = dir.path().join("sibling.jpg");
+        }
+        context
+            .bind_selected_truncation_repair(&mut candidate, &config)
+            .await
+            .unwrap();
+        assert_eq!(
+            candidate.replacement_fingerprint.is_some(),
+            case == "exact",
+            "{case}"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), b"cut");
+    assert_eq!(
+        db.get_failed().await.unwrap().len(),
+        1,
+        "loading repair proof must not reset durable failure"
+    );
+}
+
 #[test]
 fn test_should_download_fast_trust_state_returns_false() {
     let mut ctx = DownloadContext::default();

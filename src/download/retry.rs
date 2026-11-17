@@ -53,7 +53,7 @@ pub(super) struct PendingRetryEvidence {
 }
 
 impl PendingRetryEvidence {
-    fn from_record(record: &crate::state::AssetRecord) -> Self {
+    pub(super) fn from_record(record: &crate::state::AssetRecord) -> Self {
         Self {
             added_at: record.added_at,
             checksum: Arc::from(record.checksum.as_ref()),

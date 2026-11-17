@@ -17,7 +17,7 @@ use crate::state::{MetadataRewriteStore, SqliteStateDb, VersionSizeKey};
 use crate::sync_cycle::{CycleResult, ENUM_CONFIG_HASH_KEY, run_cycle};
 use crate::sync_loop::test_support::{
     RunCycleDownloadConfigOptions, album_count_response, full_album_page_with_download,
-    make_full_album_with_boxed_session, make_run_cycle_config,
+    make_captured_cycle_album, make_run_cycle_config,
     make_run_cycle_download_config_builder_with_options, make_run_cycle_library_state_with_album,
     make_shared_session_for_run_cycle,
 };
@@ -105,8 +105,7 @@ static EMPTY: Vec<Value> = Vec::new();
 
 #[tokio::test]
 async fn fresh_start_current_sync_survives_invalid_historical_plans() {
-    let mut fixture = Fixture::new("missing").await;
-    fixture.native_scope = true;
+    let fixture = Fixture::new("missing").await;
     fixture.responses(true).await;
     let first = fixture.cycle(CancellationToken::new(), false, false).await;
     assert!(first.failed_count > 0, "{first:?}");
@@ -271,7 +270,6 @@ async fn fresh_start_restart_worker() {
         server: MockServer::start().await,
         second_zone: false,
         collecting: false,
-        native_scope: true,
         history,
     };
     fixture.quiet_twice().await;
@@ -320,7 +318,6 @@ struct Fixture {
     server: MockServer,
     second_zone: bool,
     collecting: bool,
-    native_scope: bool,
     history: Vec<Vec<Vec<rusqlite::types::Value>>>,
 }
 
@@ -332,6 +329,7 @@ const HISTORY: &[&str] = &[
     "SELECT * FROM asset_metadata_paths WHERE id='historical-master'",
     "SELECT * FROM asset_metadata_capture_revisions WHERE asset_id='historical-master'",
     "SELECT * FROM metadata_capture_retries WHERE asset_id='historical-master'",
+    "SELECT library,active_revision,pending_revision,failed_assets,last_error FROM metadata_capture_state WHERE library='PrimarySync'",
 ];
 
 impl Fixture {
@@ -453,6 +451,8 @@ impl Fixture {
             );
             page["records"][0]["fields"]["filenameEnc"] =
                 json!({"value":if master == "current" {"photo.jpg"} else {"healthy.jpg"}});
+            page["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+                json!("_defaultOwner");
             if master == "current" {
                 page["records"][0]["fields"]["resOriginalVidComplRes"] = json!({"value":{"downloadURL":format!("{}/motion.mov",server.uri()),"size":MOTION.len(),"fileChecksum":base64::engine::general_purpose::STANDARD.encode(Sha256::digest(MOTION))}});
                 page["records"][0]["fields"]["resOriginalVidComplFileType"] =
@@ -476,7 +476,6 @@ impl Fixture {
             server,
             second_zone: false,
             collecting: false,
-            native_scope: false,
             history,
         };
         fixture.responses(false).await;
@@ -519,6 +518,19 @@ impl Fixture {
                 .collect::<Vec<_>>(),
             self.history
         );
+        // The shared progress counter also records newly captured current
+        // identities. It must reflect exactly those per-asset revisions, without
+        // completing or changing the retained historical revision above.
+        assert_eq!(
+            rows(
+                &self.database,
+                "SELECT processed_assets FROM metadata_capture_state WHERE library='PrimarySync'"
+            ),
+            rows(
+                &self.database,
+                "SELECT count(*) FROM asset_metadata_capture_revisions WHERE library='PrimarySync' AND asset_id IN ('asset-current','asset-healthy') AND revision=1"
+            )
+        );
         assert_eq!(
             std::fs::read(&self.sidecar).unwrap(),
             b"private user sidecar, not Kei metadata"
@@ -540,56 +552,45 @@ impl Fixture {
     ) -> anyhow::Result<CycleResult> {
         let db = self.open().await;
         let capture = ShadowCapture::new(db.clone(), self.owner.clone(), "com");
-        let mut album = make_full_album_with_boxed_session(ZONE, Box::new(self.session.clone()));
-        if self.native_scope {
-            album = crate::icloud::photos::PhotoAlbum::new(
-                crate::icloud::photos::PhotoAlbumConfig {
-                    params: Arc::new(std::collections::HashMap::new()),
-                    service_endpoint: Arc::from("https://example.invalid"),
-                    name: Arc::from("All Photos"),
-                    list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
-                    obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
-                    query_filter: None,
-                    page_size: 100,
-                    zone_id: Arc::new(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})),
-                    retry_config: crate::retry::RetryConfig::default(),
-                    container_id: None,
-                    cross_zone_sources: Vec::new(),
-                },
-                Box::new(self.session.clone()),
-            );
-        }
-        album.set_shadow_capture(capture.clone(), Arc::from("private"));
+        let album =
+            make_captured_cycle_album(ZONE, capture.clone(), Box::new(self.session.clone()));
         let mut selected = make_run_cycle_library_state_with_album(ZONE, CURSOR, album);
         if self.collecting {
             // The empty named album selects collecting; current records remain
             // unfiled and retain their existing destination.
+            let mut album = crate::icloud::photos::PhotoAlbum::new(
+                crate::icloud::photos::PhotoAlbumConfig {
+                    params: Arc::new(std::collections::HashMap::new()),
+                    service_endpoint: Arc::from("https://example.invalid"),
+                    name: Arc::from("Empty"),
+                    list_type: Arc::from("CPLContainerRelationLiveByAssetDate"),
+                    obj_type: Arc::from("CPLContainerRelationNotDeletedByAssetDate:empty"),
+                    query_filter: Some(Arc::new(
+                        json!([{"fieldName":"parentId","comparator":"EQUALS","fieldValue":{"type":"STRING","value":"empty"}}]),
+                    )),
+                    page_size: 100,
+                    zone_id: Arc::new(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})),
+                    retry_config: crate::retry::RetryConfig::default(),
+                    container_id: Some(Arc::from("empty")),
+                    cross_zone_sources: Vec::new(),
+                },
+                Box::new(Session {
+                    records: Vec::new(),
+                    ..self.session.clone()
+                }),
+            );
+            album.set_shadow_capture(capture.clone(), Arc::from("private"));
             selected.plan.passes.push(crate::commands::AlbumPass {
                 kind: crate::commands::PassKind::Album,
-                album: crate::icloud::photos::PhotoAlbum::new(
-                    crate::icloud::photos::PhotoAlbumConfig {
-                        params: Arc::new(std::collections::HashMap::new()),
-                        service_endpoint: Arc::from("https://example.invalid"),
-                        name: Arc::from("Empty"),
-                        list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
-                        obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
-                        query_filter: None,
-                        page_size: 100,
-                        zone_id: Arc::new(json!({"zoneName":ZONE})),
-                        retry_config: crate::retry::RetryConfig::default(),
-                        container_id: Some(Arc::from("empty")),
-                        cross_zone_sources: Vec::new(),
-                    },
-                    Box::new(self.session.clone()),
-                ),
+                album,
                 exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
             });
             selected.pass_scope.include_albums = true;
         }
         selected.library = PhotoLibrary::new_stub_with_zone(Box::new(self.session.clone()), ZONE);
-        selected.library.shadow_capture = Some(capture);
+        selected.library.shadow_capture = Some(capture.clone());
         selected.plan_is_stale = stale;
-        let second_records = full_album_page_with_download(
+        let mut second_records = full_album_page_with_download(
             "SharedSync-HISTORY",
             "second-current",
             "after",
@@ -600,6 +601,8 @@ impl Fixture {
             .as_array()
             .unwrap()
             .clone();
+        second_records[1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+            json!("_defaultOwner");
         let other_session = Session {
             zone: "SharedSync-HISTORY".into(),
             records: second_records,
@@ -608,13 +611,15 @@ impl Fixture {
         let mut other = make_run_cycle_library_state_with_album(
             "SharedSync-HISTORY",
             "sync_token:SharedSync-HISTORY",
-            make_full_album_with_boxed_session(
+            make_captured_cycle_album(
                 "SharedSync-HISTORY",
+                capture.clone(),
                 Box::new(other_session.clone()),
             ),
         );
         other.library =
             PhotoLibrary::new_stub_with_zone(Box::new(other_session), "SharedSync-HISTORY");
+        other.library.shadow_capture = Some(capture);
         let libraries = if second_zone {
             vec![&selected, &other]
         } else {
@@ -668,13 +673,10 @@ impl Fixture {
             .into_iter()
             .find(|capture| capture.library == ZONE)
             .unwrap();
-        assert_eq!(capture.pending_revision, None);
         assert_eq!(capture.remaining_assets, 0);
-        assert!(
-            !db.has_metadata_capture_work(&[ZONE], state::METADATA_CAPTURE_REVISION)
-                .await
-                .unwrap()
-        );
+        // Current completion does not clear or activate the historical capture
+        // revision. Its exact state and retry evidence must survive unchanged.
+        self.assert_history();
         assert_eq!(
             db.get_metadata(CURSOR).await.unwrap().as_deref(),
             Some("after")
@@ -892,12 +894,22 @@ async fn historical_records_do_not_hide_explicit_child_or_master_family_deletion
             .unwrap()
             .into_iter()
             .filter(|row| row.id.as_ref() == "asset-current")
-            .map(|row| row.local_path.unwrap())
+            .map(|row| {
+                let path = row.local_path.unwrap();
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
             .collect();
         drop(db);
+        // The tombstone and the current selection describe the same provider
+        // state. A still-live query/lookup would instead describe restoration.
+        f.session.records.retain(|record| {
+            record["recordName"] != "current" && record["recordName"] != "asset-current"
+        });
         f.session.delta = Some(vec![
             json!({"recordName":if master {"current"} else {"asset-current"},"recordType":if master {"CPLMaster"} else {"CPLAsset"},"deleted":true}),
         ]);
+        let requests = f.server.received_requests().await.unwrap().len();
         let result = f.cycle(CancellationToken::new(), false, false).await;
         assert_eq!(result.failed_count, 0, "{result:?}");
         assert_eq!(
@@ -915,9 +927,10 @@ async fn historical_records_do_not_hide_explicit_child_or_master_family_deletion
             "master={master}; trace={:?}; {result:?}",
             f.session.trace.lock().unwrap()
         );
-        for file in files {
-            assert!(!std::fs::read(file).unwrap().is_empty());
+        for (file, bytes) in files {
+            assert_eq!(std::fs::read(file).unwrap(), bytes);
         }
+        assert_eq!(f.server.received_requests().await.unwrap().len(), requests);
         f.session.delta = None;
         f.quiet_twice().await;
     }
@@ -1006,7 +1019,7 @@ async fn historical_records_retain_current_transfer_finalization_and_missing_fil
         if fault != "missing" {
             assert!(
                 result.stats.full_enumeration_reason.is_none(),
-                "duplicate failure must use collecting incremental: {result:?}"
+                "the duplicate source delta must not introduce configuration drift: {result:?}"
             );
             let current_gets = f
                 .server
@@ -1017,12 +1030,68 @@ async fn historical_records_retain_current_transfer_finalization_and_missing_fil
                 .filter(|request| request.url.path() == "/current.jpg")
                 .count();
             assert_eq!(
-                current_gets, 1,
-                "{fault}: duplicate input must not create a second transfer"
+                current_gets,
+                if fault == "transfer" { 2 } else { 1 },
+                "{fault}: one selected transfer, plus one targeted cleanup retry for HTTP failure; duplicate input must not add attempts"
             );
+            let requests = f.server.received_requests().await.unwrap();
+            for route in ["/healthy.jpg", "/motion.mov"] {
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|request| request.url.path() == route)
+                        .count(),
+                    1,
+                    "{fault}: successful peer and companion must not be transferred again"
+                );
+            }
         }
         let db = f.open().await;
-        assert!(db.get_summary().await.unwrap().failed > 0, "{fault}");
+        assert!(
+            !result.can_advance_database_checkpoint(),
+            "{fault}: {result:?}"
+        );
+        assert_eq!(
+            db.get_metadata(CURSOR).await.unwrap().as_deref(),
+            Some(if fault == "missing" {
+                "after"
+            } else {
+                "before"
+            }),
+            "{fault}: current failure retains the prior source cursor"
+        );
+        if fault == "transfer" {
+            assert_eq!(
+                rows(
+                    &f.database,
+                    "SELECT download_attempts FROM assets WHERE id='asset-current' AND version_size='original'"
+                ),
+                vec![vec![rusqlite::types::Value::Integer(2)]],
+                "one initial attempt and one bounded cleanup retry are durable"
+            );
+        }
+        if fault == "finalization" {
+            assert!(result.stats.state_write_failures > 0, "{result:?}");
+            assert_eq!(
+                rows(
+                    &f.database,
+                    "SELECT status FROM assets WHERE id='asset-current' AND version_size='original'"
+                ),
+                vec![vec![rusqlite::types::Value::Text("pending".into())]],
+                "failed receipt transaction retains current publication debt"
+            );
+            let conn = db
+                .acquire_lock("unacknowledged current finalization")
+                .unwrap();
+            let (destinations, verified): (i64, i64) = conn.query_row(
+                "SELECT count(*),COALESCE(sum(verified_media),0) FROM provider_active_destinations WHERE child='asset-current' AND version_size='original' AND admitted=1",
+                [], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            assert!(destinations > 0, "current destination must remain admitted");
+            assert_eq!(verified, 0, "failed finalization cannot certify media");
+        } else {
+            assert!(db.get_summary().await.unwrap().failed > 0, "{fault}");
+        }
         assert!(
             db.get_downloaded_page(0, 100)
                 .await

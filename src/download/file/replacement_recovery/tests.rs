@@ -506,6 +506,73 @@ fn recovery_preserves_user_directories_that_only_share_the_prefix() {
     );
 }
 
+fn recovery_owner() -> crate::state::db::account::AccountOwner {
+    crate::state::db::account::AccountOwner::authenticated(
+        "replacement-recovery@example.invalid",
+        "com",
+        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"replacement-recovery"}}))
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn recovery_pass(db: &std::sync::Arc<crate::state::SqliteStateDb>) -> crate::commands::AlbumPass {
+    use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct EmptySelection;
+    #[async_trait::async_trait]
+    impl PhotosSession for EmptySelection {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/internal/records/query/batch?") {
+                return Ok(json!({"batch":[{"records":[{"fields":{"itemCount":{"value":0}}}]}]}));
+            }
+            anyhow::ensure!(
+                url.contains("/records/query?"),
+                "unexpected recovery fixture request"
+            );
+            Ok(json!({"records":[],"syncToken":"recovery-selection-token"}))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    let mut album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: Arc::from("https://fixture.invalid"),
+            name: Arc::from(""),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(EmptySelection),
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), recovery_owner(), "com"),
+        Arc::from("private"),
+    );
+    crate::commands::AlbumPass {
+        kind: crate::commands::PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+    }
+}
+
 #[tokio::test]
 async fn production_download_recovers_before_work_but_dry_run_does_not_mutate() {
     use crate::download::{DownloadConfig, DownloadControls, download_photos_with_sync};
@@ -513,7 +580,7 @@ async fn production_download_recovers_before_work_but_dry_run_does_not_mutate() 
     use tokio_util::sync::CancellationToken;
 
     let dir = TempDir::new().unwrap();
-    let (target, _, journal) = prepare(dir.path());
+    let (target, part, journal) = prepare(dir.path());
     assert!(
         publish_journal(&journal, |stage| {
             anyhow::ensure!(stage != Stage::Displaced, "simulated interruption");
@@ -522,12 +589,19 @@ async fn production_download_recovers_before_work_but_dry_run_does_not_mutate() 
         .is_err()
     );
     drop(journal);
+    let db_path = dir.path().join("state.db");
+    let db = Arc::new(
+        crate::state::SqliteStateDb::open_owned(&db_path, &recovery_owner())
+            .await
+            .unwrap(),
+    );
     let mut config = DownloadConfig::test_default();
     config.directory = Arc::from(dir.path());
+    config.state_db = Some(db.clone());
     let config = Arc::new(config);
     download_photos_with_sync(
         &reqwest::Client::new(),
-        &[],
+        &[recovery_pass(&db)],
         Arc::clone(&config),
         DownloadControls::dry_run_hidden(),
         CancellationToken::new(),
@@ -536,33 +610,51 @@ async fn production_download_recovers_before_work_but_dry_run_does_not_mutate() 
     .unwrap();
     assert!(!target.exists());
     assert!(directory_path(&target).unwrap().exists());
-    let config = Arc::new(DownloadConfig {
-        state_db: Some(Arc::new(
-            crate::state::SqliteStateDb::open_in_memory().unwrap(),
-        )),
-        ..config.as_ref().clone()
-    });
-    download_photos_with_sync(
+    assert_eq!(
+        fs::read(directory_path(&target).unwrap().join("original")).unwrap(),
+        b"original"
+    );
+    assert_eq!(fs::read(&part).unwrap(), b"replacement");
+    let result = download_photos_with_sync(
         &reqwest::Client::new(),
-        &[],
+        &[recovery_pass(&db)],
         Arc::clone(&config),
         DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
     .await
     .unwrap();
+    assert_eq!(
+        result.sync_token.as_deref(),
+        Some("recovery-selection-token")
+    );
     assert_eq!(fs::read(&target).unwrap(), b"original");
     assert!(!directory_path(&target).unwrap().exists());
-    download_photos_with_sync(
+    let mut reopened_config = config.as_ref().clone();
+    reopened_config.state_db = None;
+    drop(config);
+    drop(db);
+    let db = Arc::new(
+        crate::state::SqliteStateDb::open_owned(&db_path, &recovery_owner())
+            .await
+            .unwrap(),
+    );
+    reopened_config.state_db = Some(db.clone());
+    let result = download_photos_with_sync(
         &reqwest::Client::new(),
-        &[],
-        config,
+        &[recovery_pass(&db)],
+        Arc::new(reopened_config),
         DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
     .await
     .unwrap();
+    assert_eq!(
+        result.sync_token.as_deref(),
+        Some("recovery-selection-token")
+    );
     assert_eq!(fs::read(&target).unwrap(), b"original");
+    assert!(!directory_path(&target).unwrap().exists());
 }
 
 #[tokio::test]
@@ -573,7 +665,7 @@ async fn production_download_keeps_checkpoint_when_recovery_is_unresolved() {
     use tokio_util::sync::CancellationToken;
 
     let dir = TempDir::new().unwrap();
-    let (target, _, journal) = prepare(dir.path());
+    let (target, part, journal) = prepare(dir.path());
     assert!(
         publish_journal(&journal, |stage| {
             if stage == Stage::Displaced {
@@ -585,7 +677,11 @@ async fn production_download_keeps_checkpoint_when_recovery_is_unresolved() {
     );
     drop(journal);
     let db_path = dir.path().join("state.db");
-    let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &recovery_owner())
+            .await
+            .unwrap(),
+    );
     let checkpoint = ScopedDbSyncToken {
         provider: "icloud".into(),
         account: "test-account".into(),
@@ -601,15 +697,21 @@ async fn production_download_keeps_checkpoint_when_recovery_is_unresolved() {
     config.state_db = Some(db.clone());
     let result = download_photos_with_sync(
         &reqwest::Client::new(),
-        &[],
+        &[recovery_pass(&db)],
         Arc::new(config),
         DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
     .await;
-    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Concurrent replacement target preserved"),
+        "{error:#}"
+    );
     drop(db);
-    let db = SqliteStateDb::open(&db_path).await.unwrap();
+    let db = SqliteStateDb::open_owned(&db_path, &recovery_owner())
+        .await
+        .unwrap();
     assert_eq!(
         db.get_scoped_db_sync_token("icloud", "test-account", 1, "test-scope")
             .await
@@ -619,6 +721,7 @@ async fn production_download_keeps_checkpoint_when_recovery_is_unresolved() {
         "previous-checkpoint"
     );
     assert_eq!(fs::read(&target).unwrap(), b"concurrent user file");
+    assert_eq!(fs::read(&part).unwrap(), b"replacement");
     assert_eq!(
         fs::read(directory_path(&target).unwrap().join("original")).unwrap(),
         b"original"

@@ -19,7 +19,7 @@ use super::rows::decode_asset_date;
 use super::rows::{ASSET_COLUMNS, row_to_asset_record};
 use super::{
     AssetVerificationState, DownloadContextStateStore, DownloadStateStore, DownloadedFileRecord,
-    ReportStateStore, RetryErrorRetention, SqliteStateDb,
+    ReportStateStore, SqliteStateDb,
 };
 use crate::state::error::StateError;
 #[cfg(test)]
@@ -357,6 +357,7 @@ impl SqliteStateDb {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn prepare_for_retry(
         &self,
         library: Option<&str>,
@@ -1211,6 +1212,7 @@ impl DownloadStateStore for SqliteStateDb {
         SqliteStateDb::get_policy_excluded_ids_for_revalidation(self, library).await
     }
 
+    #[cfg(test)]
     async fn prepare_for_retry(
         &self,
         library: Option<&str>,
@@ -1579,3 +1581,5 @@ impl DownloadContextStateStore for SqliteStateDb {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+use super::RetryErrorRetention;

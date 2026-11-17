@@ -15,10 +15,9 @@ use wiremock::{Mock, ResponseTemplate};
 use crate::icloud::photos::{PhotoLibrary, PhotosSession};
 use crate::sync_loop::test_support::{
     RunCycleDownloadConfigOptions, album_count_response, full_album_page_with_download,
-    make_full_album_with_boxed_session, make_run_cycle_config,
-    make_run_cycle_download_config_builder, make_run_cycle_download_config_builder_with_options,
-    make_run_cycle_library_state_with_album, make_shared_session_for_run_cycle,
-    run_cycle_expected_date_dir,
+    make_run_cycle_config, make_run_cycle_download_config_builder,
+    make_run_cycle_download_config_builder_with_options, make_run_cycle_library_state_with_album,
+    make_shared_session_for_run_cycle, run_cycle_expected_date_dir,
 };
 use crate::{download, state};
 
@@ -117,6 +116,8 @@ fn page_records(
     child_record["recordName"] = json!(child);
     child_record["fields"]["masterRef"]["value"]["recordName"] = json!(master);
     child_record["fields"]["masterRef"]["value"]["zoneID"]["zoneName"] = json!(zone);
+    child_record["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+        json!("shared-owner");
     vec![master_record, child_record]
 }
 
@@ -264,7 +265,28 @@ fn seed_genuine_v28(
 }
 
 async fn open_current(database: &Path) -> Arc<state::SqliteStateDb> {
-    let db = Arc::new(state::SqliteStateDb::open(database).await.unwrap());
+    let owned: bool = Connection::open(database)
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='account_owner')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if !owned {
+        let legacy = database.with_extension("legacy.db");
+        std::fs::rename(database, &legacy).unwrap();
+        state::db::account::adopt_legacy(
+            &legacy,
+            database,
+            &fixture_owner(),
+            "runner@example.invalid",
+            "com",
+        )
+        .await
+        .unwrap();
+    }
+    let db = crate::sync_loop::test_support::open_owned_cycle_db(database).await;
     {
         let conn = db.acquire_lock("schema proof").unwrap();
         assert_eq!(
@@ -274,6 +296,42 @@ async fn open_current(database: &Path) -> Arc<state::SqliteStateDb> {
         );
     }
     db
+}
+
+fn fixture_owner() -> state::db::account::AccountOwner {
+    state::db::account::AccountOwner::authenticated(
+        "runner@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"runner-fixture"}})).unwrap(),
+    )
+    .unwrap()
+}
+
+fn owned_album(
+    db: &Arc<state::SqliteStateDb>,
+    provider: Provider,
+) -> crate::icloud::photos::PhotoAlbum {
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::new(Default::default()),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from("All Photos"),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":SHARED,"ownerRecordName":"shared-owner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(provider),
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), fixture_owner(), "com"),
+        Arc::from("private"),
+    );
+    album
 }
 
 #[tokio::test]
@@ -363,7 +421,7 @@ async fn selected_shared_cycle_from_genuine_v28_adds_exact_child_keys_without_co
         let mut shared = make_run_cycle_library_state_with_album(
             SHARED,
             SHARED_TOKEN,
-            make_full_album_with_boxed_session(SHARED, Box::new(provider.clone())),
+            owned_album(&inner, provider.clone()),
         );
         shared.library = PhotoLibrary::new_stub_with_zone(Box::new(provider), SHARED);
         let builder = make_run_cycle_download_config_builder_with_options(
@@ -724,7 +782,7 @@ async fn existing_exact_selected_shared_child_is_not_redownloaded() {
         let mut shared = make_run_cycle_library_state_with_album(
             SHARED,
             SHARED_TOKEN,
-            make_full_album_with_boxed_session(SHARED, Box::new(provider.clone())),
+            owned_album(&inner, provider.clone()),
         );
         shared.library = PhotoLibrary::new_stub_with_zone(Box::new(provider), SHARED);
         let builder = make_run_cycle_download_config_builder(&media, store.clone());

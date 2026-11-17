@@ -176,10 +176,11 @@ async fn contract_temp_file_delete_requires_durable_ownership() {
     let mut config = test_config();
     config.directory = Arc::from(root.path());
     config.state_db = Some(db.clone());
+    let config = Arc::new(config);
     let result = download_photos_with_sync(
         &Client::new(),
         &[],
-        Arc::new(config),
+        config.clone(),
         DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
@@ -187,6 +188,17 @@ async fn contract_temp_file_delete_requires_durable_ownership() {
     .unwrap();
 
     assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(std::fs::read(&owned_path).unwrap(), b"owned");
+    assert_eq!(
+        db.get_owned_temp_files_before(i64::MAX)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "empty selection must not run cleanup or retire ownership"
+    );
+    // Exercise the cleanup owner's safety contract independently of selection.
+    super::cleanup_orphan_part_files(&config).await;
     assert!(!owned_path.exists(), "owned stale path must be removed");
     assert_eq!(std::fs::read(&bystander_path).unwrap(), b"bystander");
     assert_eq!(std::fs::read(&outside_path).unwrap(), b"external");

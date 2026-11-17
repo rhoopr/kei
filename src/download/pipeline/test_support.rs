@@ -314,7 +314,7 @@ impl TempFileOwnershipStore for FailingDownloadStore {
 impl ReportStateStore for FailingDownloadStore {
     #[cfg(test)]
     async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
-        unimplemented!()
+        Ok(Vec::new())
     }
 
     async fn get_failed_sample(&self, _limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError> {

@@ -19,7 +19,9 @@ use crate::state::{AssetRecord, VersionSizeKey};
 use super::task::capture_repair_requested;
 
 mod current_publication;
+pub(in crate::download) use current_publication::recover_confirmed_publication;
 pub(in crate::download) use current_publication::recover_current_pending_publication;
+pub(in crate::download) use current_publication::recover_selected_reserved_publication;
 
 pub(super) fn effective_asset_library<'a>(
     asset: &'a PhotoAsset,
@@ -535,6 +537,13 @@ async fn adopt_cross_parent_pending_file(
     for saved_destination in destinations {
         let destination =
             crate::fs_util::reserved_path_under_root(&config.directory, saved_destination)?;
+        // Selection paths use component-normalized spellings. Keep the receipt
+        // on that same exact path when an equivalent root contains `.`.
+        let destination = if config.selection_run.is_some() {
+            destination.components().collect::<PathBuf>()
+        } else {
+            destination
+        };
         let destination = &destination;
         anyhow::ensure!(
             crate::download::legacy_preservation::current_path_is_independent(db, destination)

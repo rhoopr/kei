@@ -6,7 +6,7 @@ use crate::config::MetadataConfig;
 use crate::download::DownloadOutcome;
 
 use super::support::{Harness, files};
-use super::{cycle, fixture, sha256};
+use super::{fixture, sha256};
 
 fn provider_metadata(records: &mut [Value]) {
     let fields = &mut records[1]["fields"];
@@ -69,7 +69,7 @@ async fn bundled_metadata_roundtrips() {
             records[1]["fields"]["isFavorite"] = json!({"value": 0});
             records[1]["fields"]["timeZoneOffset"] = json!({"value": 0});
         }
-        let result = cycle(&h.config, records.clone()).await;
+        let result = h.cycle(records.clone()).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{result:?}"
@@ -152,7 +152,7 @@ async fn bundled_metadata_roundtrips() {
         assert_eq!(row.local_checksum.as_deref(), Some(sha256(&bytes).as_str()));
         assert_ne!(row.local_checksum, row.download_checksum);
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-        let result = cycle(&h.config, records).await;
+        let result = h.cycle(records).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{result:?}"
@@ -186,7 +186,7 @@ async fn bundled_sidecar_roundtrip() {
             .asset("xmp", "Packet.jpg", "public.jpeg", "media/pattern.jpg", 1)
             .await;
         provider_metadata(&mut records);
-        let result = cycle(&h.config, records.clone()).await;
+        let result = h.cycle(records.clone()).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{result:?}"
@@ -238,7 +238,7 @@ async fn bundled_sidecar_roundtrip() {
             .collect();
         assert_eq!(snapshots.len(), if sidecar { 2 } else { 1 });
         h.reopen().await;
-        let result = cycle(&h.config, records).await;
+        let result = h.cycle(records).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{result:?}"
@@ -273,7 +273,7 @@ async fn bundled_existing_metadata_survives_rating_update() {
     let source_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/media/metadata.jpg");
     let before = Metadata::new_from_path(&source_path).unwrap();
-    let result = cycle(&h.config, records.clone()).await;
+    let result = h.cycle(records.clone()).await;
     assert!(
         matches!(result.outcome, DownloadOutcome::Success),
         "{result:?}"
@@ -298,7 +298,7 @@ async fn bundled_existing_metadata_survives_rating_update() {
         Some(sha256(&original).as_str())
     );
     assert_eq!(row.local_checksum.as_deref(), Some(sha256(&bytes).as_str()));
-    let result = cycle(&h.config, records).await;
+    let result = h.cycle(records).await;
     assert!(
         matches!(result.outcome, DownloadOutcome::Success),
         "{result:?}"

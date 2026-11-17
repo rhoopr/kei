@@ -6,7 +6,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use base64::Engine as _;
-use rustc_hash::FxHashSet;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -14,13 +13,15 @@ use tokio_util::sync::CancellationToken;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::{mock_album, mock_asset_record_for, mock_master_record_with_filename};
-use crate::commands::{AlbumPass, PassKind};
+use super::super::super::test_support::{
+    SelectedMediaSession, open_fixture_db, selected_pass_with_session,
+};
+use super::{mock_asset_record_for, mock_master_record_with_filename};
 use crate::download::filter::derive_expected_paths;
 use crate::download::{DownloadConfig, DownloadControls, download_photos_with_sync};
 use crate::icloud::photos::PhotoAsset;
+use crate::state::DownloadStateStore;
 use crate::state::{AssetRecord, RetryErrorRetention, SqliteStateDb, VersionSizeKey};
-use crate::test_helpers::MockPhotosFlow;
 
 const ID: &str = "SYNTHETIC_L1";
 const MOVIE: &[u8] = b"\0\0\0\x14ftypqt  \0\0\0\0qt  ";
@@ -86,13 +87,16 @@ async fn publish(
     ));
     db.upsert_seen(&record).await.unwrap();
     let local = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
-    db.mark_downloaded(
+    // Model a prior verified transfer, including its independent path source
+    // receipt. Later failed/pending observations must not erase that proof.
+    db.mark_verified_download(
         "PrimarySync",
         ID,
         version.as_str(),
         file,
         &local,
         Some(&local),
+        false,
     )
     .await
     .unwrap();
@@ -146,7 +150,8 @@ async fn run_l1_cases(cases: &[(&str, bool)]) {
             "size":MOVIE.len(),"fileChecksum":provider}});
         master["fields"]["resOriginalVidComplFileType"] =
             json!({"value":"com.apple.quicktime-movie"});
-        let child = mock_asset_record_for(&format!("asset-{ID}"), ID);
+        let mut child = mock_asset_record_for(&format!("asset-{ID}"), ID);
+        child["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] = json!("_defaultOwner");
         let asset = PhotoAsset::new(master.clone(), child.clone());
         let mut config = DownloadConfig::test_default();
         config.directory = Arc::from(media.as_path());
@@ -163,7 +168,15 @@ async fn run_l1_cases(cases: &[(&str, bool)]) {
         for file in &old {
             fs::write(file, MOVIE).unwrap();
         }
-        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let db = open_fixture_db(&db_path).await;
+        db.upsert_asset_master_mapping("PrimarySync", &format!("asset-{ID}"), ID)
+            .await
+            .unwrap();
+        assert!(
+            db.claim_legacy_master_state_owner("PrimarySync", ID, &format!("asset-{ID}"))
+                .await
+                .unwrap()
+        );
         publish(
             &db,
             &asset,
@@ -263,7 +276,7 @@ async fn run_l1_cases(cases: &[(&str, bool)]) {
         }
         drop(db);
         for cycle in 0..4 {
-            let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+            let db = open_fixture_db(&db_path).await;
             if cycle == 1 {
                 db.mark_failed(
                     "PrimarySync",
@@ -278,26 +291,27 @@ async fn run_l1_cases(cases: &[(&str, bool)]) {
                 || start == "mixed-state-write-failure")
                 && cycle == 0;
             let own_destination = start == "own-destination";
+            let movie_attempts = rendition(&db, VersionSizeKey::LiveOriginal)["attempts"].clone();
+            let still_attempts = rendition(&db, VersionSizeKey::Original)["attempts"].clone();
             if state_write_failure {
                 db.acquire_lock("L1 forced finalization failure")
                     .unwrap()
                     .execute_batch(
                         "CREATE TRIGGER reject_l1_recovery BEFORE UPDATE ON assets \
                      WHEN NEW.id='SYNTHETIC_L1' AND NEW.version_size='live_original' \
-                     AND OLD.status='pending' AND NEW.status='downloaded' \
+                     AND OLD.status IN ('pending','failed') AND NEW.status='downloaded' \
                      BEGIN SELECT RAISE(ABORT,'synthetic recovery write failure'); END;",
                     )
                     .unwrap();
             }
-            let flow = MockPhotosFlow::new()
-                .album_count(1)
-                .query_page(vec![master.clone(), child.clone()], Some("synthetic-token"))
-                .build();
-            let passes = vec![AlbumPass {
-                kind: PassKind::Album,
-                album: mock_album("SyntheticAlbum", flow),
-                exclude_ids: Arc::new(FxHashSet::default()),
-            }];
+            let passes = vec![selected_pass_with_session(
+                &db,
+                "SyntheticAlbum",
+                Box::new(SelectedMediaSession(Arc::new(vec![
+                    master.clone(),
+                    child.clone(),
+                ]))),
+            )];
             config.state_db = Some(db.clone());
             let result = download_photos_with_sync(
                 &reqwest::Client::new(),
@@ -308,7 +322,13 @@ async fn run_l1_cases(cases: &[(&str, bool)]) {
             )
             .await
             .unwrap();
-            assert_eq!(result.stats.downloaded, 0, "start={start} cycle={cycle}");
+            let destinations: Vec<String> = db.acquire_lock("L1 destination evidence").unwrap()
+                .prepare("SELECT json_array(asset_id,version_size,compat_path,verified_media,verified_metadata,checksum) FROM provider_active_destinations").unwrap()
+                .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+            assert_eq!(
+                result.stats.downloaded, 0,
+                "start={start} cycle={cycle}: {destinations:?}"
+            );
             if state_write_failure {
                 assert!(result.stats.state_write_failures > 0);
                 // source_checkpoint_decision consumes this execution evidence,
@@ -325,8 +345,11 @@ async fn run_l1_cases(cases: &[(&str, bool)]) {
             assert_eq!(result.stats.assets_seen, 1);
             assert!(result.full_enumeration_ran);
             if !state_write_failure && !own_destination {
-                assert!(!result.stats.sync_token_blocked);
-                assert_eq!(result.sync_token.as_deref(), Some("synthetic-token"));
+                assert!(
+                    !result.stats.sync_token_blocked,
+                    "start={start} cycle={cycle}: {result:?} {destinations:?}"
+                );
+                assert_eq!(result.sync_token.as_deref(), Some("fixture-token"));
             }
             let after = rendition(&db, VersionSizeKey::LiveOriginal);
             if state_write_failure || own_destination {
@@ -348,7 +371,9 @@ async fn run_l1_cases(cases: &[(&str, bool)]) {
                         .unwrap();
                 }
             } else {
-                assert_eq!(after, initial, "start={start} cycle={cycle}");
+                let mut expected = initial.clone();
+                expected["attempts"] = movie_attempts;
+                assert_eq!(after, expected, "start={start} cycle={cycle}");
             }
             assert_eq!(receipts(&db), baseline);
             let actual_reservations = reservations(&db);
@@ -380,9 +405,11 @@ async fn run_l1_cases(cases: &[(&str, bool)]) {
                 actual_reservations, expected_reservations,
                 "start={start} cycle={cycle}"
             );
+            let mut expected_still = initial_still.clone();
+            expected_still["attempts"] = still_attempts;
             assert_eq!(
                 rendition(&db, VersionSizeKey::Original),
-                initial_still,
+                expected_still,
                 "start={start} cycle={cycle}"
             );
             if unrelated_reservation {
@@ -401,6 +428,7 @@ async fn run_l1_cases(cases: &[(&str, bool)]) {
             }
             assert_eq!(fs::read_dir(&parent).unwrap().count(), 56);
             config.state_db = None;
+            drop(passes);
             drop(db);
         }
         assert!(server.received_requests().await.unwrap().is_empty());

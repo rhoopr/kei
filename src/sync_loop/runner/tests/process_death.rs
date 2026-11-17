@@ -18,14 +18,14 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use crate::commands::{AlbumPass, PassKind};
+use crate::download;
 use crate::icloud::photos::PhotosSession;
 use crate::sync_loop::test_support::{
     RUN_CYCLE_ASSET_DATE_MS, RunCycleDownloadConfigOptions, album_count_response,
-    full_album_page_with_download, make_full_album_with_boxed_session, make_run_cycle_config,
+    full_album_page_with_download, make_owned_cycle_album, make_run_cycle_config,
     make_run_cycle_download_config_builder_with_options, make_run_cycle_library_state_with_passes,
     make_shared_session_for_run_cycle,
 };
-use crate::{download, state};
 
 const POINTS: [&str; 6] = [
     "journal-displaced",
@@ -196,6 +196,10 @@ impl PhotosSession for Provider {
     }
 }
 async fn cycle(root: &Path, url: &str, quiet: bool) -> (usize, usize) {
+    // The repair opt-in is enabled only after the initial verified publication.
+    // Its changed current configuration must select the damaged rendition;
+    // a historical failed asset row alone is not a work scheduler.
+    let repair_truncated = root.join("repair-requested").exists();
     let mut page = full_album_page_with_download(
         ZONE,
         "death",
@@ -212,20 +216,17 @@ async fn cycle(root: &Path, url: &str, quiet: bool) -> (usize, usize) {
         requests: Arc::new(AtomicUsize::new(0)),
         quiet,
     };
+    let inner = crate::sync_loop::test_support::open_owned_cycle_db(&root.join("state.db")).await;
     let pass = AlbumPass {
         kind: PassKind::Unfiled,
-        album: make_full_album_with_boxed_session(ZONE, Box::new(provider.clone())),
+        album: make_owned_cycle_album(&inner, ZONE, "private", Box::new(provider.clone())),
         exclude_ids: Arc::default(),
     };
     let mut library =
         make_run_cycle_library_state_with_passes(ZONE, "sync_token:PrimarySync", vec![pass]);
     library.library =
         crate::icloud::photos::PhotoLibrary::new_stub_with_zone(Box::new(provider), ZONE);
-    let db: Arc<dyn download::DownloadStore> = Arc::new(
-        state::SqliteStateDb::open(&root.join("state.db"))
-            .await
-            .unwrap(),
-    );
+    let db: Arc<dyn download::DownloadStore> = inner;
     let media = root.join("media");
     let base = make_run_cycle_download_config_builder_with_options(
         &media,
@@ -239,12 +240,12 @@ async fn cycle(root: &Path, url: &str, quiet: bool) -> (usize, usize) {
     );
     let build = |mode, excluded, groups, zone| {
         let mut built = base(mode, excluded, groups, zone);
-        Arc::make_mut(&mut built).repair_truncated = true;
+        Arc::make_mut(&mut built).repair_truncated = repair_truncated;
         built
     };
     let (_session_dir, session) = make_shared_session_for_run_cycle().await;
     let mut config = make_run_cycle_config();
-    config.runtime.repair_truncated = true;
+    config.runtime.repair_truncated = repair_truncated;
     let result = Box::pin(crate::sync_cycle::run_cycle(
         &[&library],
         &config,
@@ -275,9 +276,7 @@ async fn cycle(root: &Path, url: &str, quiet: bool) -> (usize, usize) {
 async fn seed(root: &Path) {
     std::fs::create_dir_all(root.join("media")).unwrap();
     std::fs::write(root.join("fixture-owner"), b"kei-synthetic-process-death").unwrap();
-    let db = state::SqliteStateDb::open(&root.join("state.db"))
-        .await
-        .unwrap();
+    let db = crate::sync_loop::test_support::open_owned_cycle_db(&root.join("state.db")).await;
     let date = chrono::DateTime::from_timestamp_millis(RUN_CYCLE_ASSET_DATE_MS).unwrap();
     let path = root.join("media/foreign.jpg");
     std::fs::write(&path, PRIVATE).unwrap();
@@ -357,9 +356,14 @@ async fn process_death_recovery_matrix() {
             );
             assert_eq!(std::fs::read(target(root.path())).unwrap(), MEDIA);
             std::fs::write(target(root.path()), OLD).unwrap();
-            let db = state::SqliteStateDb::open(&root.path().join("state.db"))
-                .await
-                .unwrap();
+            std::fs::write(
+                root.path().join("repair-requested"),
+                b"explicit repair opt-in",
+            )
+            .unwrap();
+            let db =
+                crate::sync_loop::test_support::open_owned_cycle_db(&root.path().join("state.db"))
+                    .await;
             db.mark_failed(
                 ZONE,
                 ID,
@@ -494,9 +498,10 @@ async fn process_death_recovery_matrix() {
             i64::from(repair || persisted == 1),
             "publication receipt boundary"
         );
-        // The repair runs in the retry pass after enumeration has completed
-        // its tracked run. Initial-download finalization remains inside it.
-        let interrupted = matches!(point, "published" | "state-persisted");
+        // Both initial publication and explicitly selected repair execute in
+        // the current enumeration's tracked run. Only the checkpoint hook is
+        // reached after that run has completed.
+        let interrupted = point != "checkpoint-persisted";
         let orphaned = u64::from(interrupted);
         assert_eq!(
             count(
@@ -508,9 +513,9 @@ async fn process_death_recovery_matrix() {
         );
         {
             // Reuse the production runner's one-time startup recovery owner.
-            let db = state::SqliteStateDb::open(&root.path().join("state.db"))
-                .await
-                .unwrap();
+            let db =
+                crate::sync_loop::test_support::open_owned_cycle_db(&root.path().join("state.db"))
+                    .await;
             assert_eq!(db.promote_orphaned_sync_runs().await.unwrap(), orphaned);
         }
         let downloads_before = server.received_requests().await.unwrap().len();
@@ -550,9 +555,9 @@ async fn process_death_recovery_matrix() {
             "only committed adoption can retain a recent part"
         );
         if claims == 1 {
-            let db = state::SqliteStateDb::open(&root.path().join("state.db"))
-                .await
-                .unwrap();
+            let db =
+                crate::sync_loop::test_support::open_owned_cycle_db(&root.path().join("state.db"))
+                    .await;
             let owned = db.get_owned_temp_files_before(i64::MAX).await.unwrap();
             assert_eq!(owned.len(), 1);
             let part = &owned[0].path;

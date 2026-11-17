@@ -926,6 +926,29 @@ pub(crate) async fn run_cycle(
     shared_session: &auth::SharedSession,
     shutdown_token: &CancellationToken,
 ) -> anyhow::Result<CycleResult> {
+    // Bound the cycle's state machine once here rather than growing every
+    // runner, service and test future that awaits a complete sync cycle.
+    Box::pin(run_cycle_inner(
+        library_states,
+        config,
+        state_db,
+        build_download_config,
+        download_controls,
+        shared_session,
+        shutdown_token,
+    ))
+    .await
+}
+
+async fn run_cycle_inner(
+    library_states: &[&LibraryState],
+    config: &config::Config,
+    state_db: Option<&dyn download::DownloadStore>,
+    build_download_config: &BuildDownloadConfigFn<'_>,
+    download_controls: download::DownloadControls,
+    shared_session: &auth::SharedSession,
+    shutdown_token: &CancellationToken,
+) -> anyhow::Result<CycleResult> {
     let mut cycle_failed_count = 0usize;
     let mut cycle_session_expired = false;
     let mut cycle_stats = download::SyncStats::default();
@@ -1090,6 +1113,11 @@ pub(crate) async fn run_cycle(
     };
     let mut active_cursor_fences = Vec::new();
     let mut qualified_inventory_requests = Vec::new();
+    let mut capture_authority_libraries: rustc_hash::FxHashSet<_> = library_states
+        .iter()
+        .filter(|library| has_active_passes(library))
+        .map(|library| library.zone_name.clone())
+        .collect();
 
     for lib_state in library_states.iter().copied() {
         if shutdown_token.is_cancelled() {
@@ -1103,6 +1131,20 @@ pub(crate) async fn run_cycle(
         if !has_active_passes(lib_state) {
             db_sync_token_advance_safe &= !indexing_reconciliation;
             continue;
+        }
+        let mut legacy_probe = build_download_config(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from(lib_state.zone_name.as_str()),
+        );
+        Arc::make_mut(&mut legacy_probe).provisional =
+            indexing_reconciliation || !indexing_finished;
+        let historical_capture_authoritative = legacy_probe
+            .historical_capture_has_checkpoint_authority(&lib_state.plan.passes, download_controls)
+            .await?;
+        if !historical_capture_authoritative {
+            capture_authority_libraries.remove(&lib_state.zone_name);
         }
         if !indexing_finished {
             db_sync_token_advance_safe = false;
@@ -1259,6 +1301,7 @@ pub(crate) async fn run_cycle(
 
         if indexing_finished
             && !indexing_reconciliation
+            && historical_capture_authoritative
             && download_controls.run_mode.downloads_files()
             && !lib_state.plan_is_stale
             && let Some(db) = state_db
@@ -1271,12 +1314,6 @@ pub(crate) async fn run_cycle(
                     capture.library == lib_state.zone_name && capture.unresolved_assets > 0
                 })
         {
-            let legacy_probe = build_download_config(
-                download::SyncMode::Full,
-                Arc::new(rustc_hash::FxHashSet::default()),
-                Arc::new(download::AssetGroupings::default()),
-                Arc::from(lib_state.zone_name.as_str()),
-            );
             download::legacy_preservation::prepare(
                 db,
                 &legacy_probe,
@@ -1424,7 +1461,9 @@ pub(crate) async fn run_cycle(
                 });
         Arc::make_mut(&mut download_config).indexing_inventory_only =
             managed_indexing_recovery && indexing_finished;
-        if pending_download_config_hash.is_some() && path_reconciliation_has_smart_folders {
+        if pending_download_config_hash.is_some()
+            && (path_reconciliation_has_smart_folders || !historical_capture_authoritative)
+        {
             Arc::make_mut(&mut download_config).complete_path_selection = true;
         }
         let download_client = shared_session.read().await.download_client().clone();
@@ -1511,13 +1550,13 @@ pub(crate) async fn run_cycle(
                 continue;
             }
         }
-        let mut sync_result = download::download_photos_with_sync(
+        let mut sync_result = Box::pin(download::download_photos_with_sync(
             &download_client,
             &lib_state.plan.passes,
             Arc::clone(&download_config),
             download_controls,
             shutdown_token.clone(),
-        )
+        ))
         .await?;
 
         // Capture only the initial complete selected scope, before a bridge
@@ -1610,13 +1649,13 @@ pub(crate) async fn run_cycle(
                     );
                     Arc::make_mut(&mut bridge_config).sparse_targets =
                         Arc::clone(&download_config.sparse_targets);
-                    let bridge_result = download::download_photos_with_sync(
+                    let bridge_result = Box::pin(download::download_photos_with_sync(
                         &download_client,
                         &lib_state.plan.passes,
                         bridge_config,
                         download_controls,
                         shutdown_token.clone(),
-                    )
+                    ))
                     .await?;
                     observe_sync_component(
                         &lib_state.zone_name,
@@ -1734,7 +1773,7 @@ pub(crate) async fn run_cycle(
             sync_result.stats.metadata_capture_remaining = capture.remaining_assets;
             sync_result.stats.metadata_capture_unresolved = capture.unresolved_assets;
             sync_result.stats.metadata_capture_deferred = capture.deferred_assets;
-            if capture.unresolved_assets > 0 {
+            if historical_capture_authoritative && capture.unresolved_assets > 0 {
                 sync_result.block_for_metadata_capture();
             }
         }
@@ -1756,6 +1795,20 @@ pub(crate) async fn run_cycle(
             && !lib_state.plan_is_stale
             && !lib_state.plan_needs_refresh
             && download_controls.run_mode.downloads_files();
+        if pending_download_config_hash.is_some() && !historical_capture_authoritative {
+            // Native reconciliation defers publication to current selection.
+            // Its local scan alone cannot activate a path configuration. Prove
+            // current work completion independently of historical cursor debt.
+            path_reconciliation_complete &= library_completed_without_errors
+                && sync_result.stats.failed == 0
+                && sync_result.stats.exif_failures == 0
+                && sync_result.checkpoint.state_write_failures == 0
+                && !sync_result.checkpoint.enumeration_incomplete
+                && checkpoint_transition_state_safe
+                && !lib_state.plan_is_stale
+                && !lib_state.plan_needs_refresh
+                && download_controls.run_mode.downloads_files();
+        }
         if path_reconciliation_requires_smart_query {
             // Historical smart membership cannot certify the current selection.
             // Full query proof is separate from a bounded source cursor hold.
@@ -2170,6 +2223,15 @@ pub(crate) async fn run_cycle(
             }
         }
 
+        if checkpoint_persistence == "failed" {
+            sync_result.checkpoint.state_write_failures = sync_result
+                .checkpoint
+                .state_write_failures
+                .saturating_add(1);
+            sync_result.stats.state_write_failures =
+                sync_result.stats.state_write_failures.saturating_add(1);
+            cycle_failed_count += 1;
+        }
         if let Some(fields) = checkpoint_evidence.as_object_mut() {
             fields.insert(
                 "persistence".into(),
@@ -2306,6 +2368,9 @@ pub(crate) async fn run_cycle(
                 db_sync_token_advance_safe = false;
                 path_reconciliation_cycle_safe = false;
                 tracing::warn!(error = %e, "Failed to atomically promote checkpoint reconciliation");
+                cycle_stats.state_write_failures =
+                    cycle_stats.state_write_failures.saturating_add(1);
+                cycle_failed_count = cycle_failed_count.saturating_add(1);
             }
         }
     }
@@ -2330,6 +2395,9 @@ pub(crate) async fn run_cycle(
             .await
     {
         tracing::warn!(error = %e, "Failed to promote completed local path reconciliation");
+        cycle_stats.state_write_failures = cycle_stats.state_write_failures.saturating_add(1);
+        cycle_failed_count = cycle_failed_count.saturating_add(1);
+        db_sync_token_advance_safe = false;
     }
 
     // Inventory coverage is not historical checkpoint certification. Retire its
@@ -2383,11 +2451,9 @@ pub(crate) async fn run_cycle(
             cycle_failed_count = cycle_failed_count.max(1);
             db_sync_token_advance_safe = false;
         }
-        if summary
-            .metadata_capture
-            .iter()
-            .any(|capture| capture.unresolved_assets > 0)
-        {
+        if summary.metadata_capture.iter().any(|capture| {
+            capture_authority_libraries.contains(&capture.library) && capture.unresolved_assets > 0
+        }) {
             download::block_sync_token_for_metadata_capture(&mut cycle_stats);
             cycle_failed_count = cycle_failed_count.max(1);
             db_sync_token_advance_safe = false;

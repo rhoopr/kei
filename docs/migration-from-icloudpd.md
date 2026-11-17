@@ -8,7 +8,7 @@ Import is not automatic deduplication. Kei must match a local file to the file i
 
 The v0.26.0 instructions below describe that release. The current development branch removes sync/service `--recent` and `--recent-scope`, `[filters].recent` / `recent_scope`, and relative `Nd` values in either date bound. Before using that branch, remove both retired saved keys and flags. To keep sync bounded, choose fixed `skip_created_before` / `skip_created_after` dates instead. For example, `kei sync --skip-created-before 2025-01-01 --skip-created-after 2025-01-07` selects an inclusive capture-local calendar-date range; replace both dates with your own range.
 
-Kei rejects retired settings before authentication or sync-state/media changes, even if a CLI override supplies a fixed date. Errors explain removal and supported fixed-date selection. Kei does not rewrite your config, silently expand it or guess a boundary from the current date. Only `import-existing --recent 100` retains positive-count sampling; import does not gain date filtering. The development schema is 37, so keep a matched pre-upgrade backup rather than trying to reopen upgraded state with v0.26.0.
+Kei rejects retired settings before authentication or sync-state/media changes, even if a CLI override supplies a fixed date. Errors explain removal and supported fixed-date selection. Kei does not rewrite your config, silently expand it or guess a boundary from the current date. Only `import-existing --recent 100` retains positive-count sampling; import does not gain date filtering. The development schema is 38, so keep a matched pre-upgrade backup rather than trying to reopen upgraded state with v0.26.0.
 
 ## Before you start
 

@@ -298,7 +298,7 @@ impl Respond for OfflinePhotos {
         let path = request.url.path();
         let label = path.split('/').nth(1).unwrap();
         let value = if path.ends_with("/zones/list") {
-            json!({"zones":[]})
+            json!({"zones":if path.contains("/private/") { vec![json!({"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}})] } else { vec![] }})
         } else if path.ends_with("/changes/database") {
             json!({"syncToken":"offline-database-cursor","moreComing":false,"zones":[]})
         } else if body
@@ -309,13 +309,13 @@ impl Respond for OfflinePhotos {
         {
             json!({"records":[{"fields":{"state":{"value":"FINISHED"}}}]})
         } else if path.ends_with("/changes/zone") {
-            json!({"zones":[{"zoneID":{"zoneName":"PrimarySync"},"syncToken":format!("{label}-cursor"),"moreComing":false,"records":[]}]})
+            json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":format!("{label}-cursor"),"moreComing":false,"records":[]}]})
         } else if path.ends_with("/records/lookup") {
-            json!({"records":[{"recordName":"retry","serverErrorCode":"UNKNOWN_ITEM"}]})
+            json!({"records":body.get("records").unwrap().as_array().unwrap().iter().map(|wanted| json!({"recordName":wanted["recordName"],"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"serverErrorCode":"UNKNOWN_ITEM"})).collect::<Vec<_>>()})
         } else if path.ends_with("/internal/records/query/batch") {
-            json!({"batch":[{"records":[{"fields":{"itemCount":{"value":1}}}]}]})
+            json!({"batch":[{"records":[{"fields":{"itemCount":{"value":0}}}]}]})
         } else if path.ends_with("/records/query") {
-            json!({"records":[]})
+            json!({"records":[],"syncToken":format!("{label}-cursor")})
         } else {
             panic!("unexpected offline Photos request: {path}");
         };
@@ -839,6 +839,51 @@ impl Respond for ShadowHoldProvider {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quietly() {
+    fn selected_ranks(requests: &[Request]) -> Vec<Value> {
+        requests
+            .iter()
+            .filter_map(|request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                (request.url.path().ends_with("/records/query")
+                    && body["query"]["recordType"]
+                        .as_str()
+                        .is_some_and(|kind| kind.starts_with("CPLAsset")))
+                .then_some(body)
+            })
+            .collect()
+    }
+
+    fn assert_empty_inventory(ranks: &[Value], phase: &str) {
+        // The rank API has no EOF flag: one empty page plus four forward
+        // probes proves an empty inventory, not five inventory retries.
+        assert_eq!(ranks.len(), 5, "{phase}: complete empty-tail proof");
+        let first = &ranks[0];
+        assert_eq!(
+            first["query"]["recordType"],
+            "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"
+        );
+        assert_eq!(
+            first["zoneID"],
+            json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})
+        );
+        let limit = first["resultsLimit"].as_u64().unwrap();
+        assert!(limit > 0 && limit.is_multiple_of(2));
+        for (index, rank) in ranks.iter().enumerate() {
+            let mut expected = first.clone();
+            let start = expected["query"]["filterBy"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .unwrap();
+            start["fieldValue"]["value"] = json!(index as u64 * (limit / 2));
+            assert_eq!(
+                *rank, expected,
+                "{phase}: only the rank advances between EOF probes"
+            );
+        }
+    }
+
     for (kind, expected) in [
         ("write", "synthetic CLI receipt failure"),
         ("capacity", "inbox is full"),
@@ -889,7 +934,16 @@ async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quie
         };
         let before = state(&account.path);
         let initial_pages = i64::from(kind == "capacity");
+        let raw_before = rows(
+            &account.path,
+            "SELECT body_hash,body FROM provider_shadow_pages ORDER BY id",
+        );
         for _ in 0..2 {
+            let requests_before = server.received_requests().await.unwrap().len();
+            let ranks_before = rows(
+                &account.path,
+                "SELECT id FROM provider_selection_rank_pages",
+            );
             let out = command(root, &account, &["sync", "--no-progress-bar"]);
             let diagnostics = String::from_utf8_lossy(&out.stderr);
             assert!(diagnostics.contains(expected), "{kind}: {diagnostics}");
@@ -898,10 +952,39 @@ async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quie
                 "{kind}: {diagnostics}"
             );
             assert!(!diagnostics.contains("private-other"));
+            let requests = server.received_requests().await.unwrap();
+            let ranks = selected_ranks(&requests[requests_before..]);
+            // A newly qualified selection may need its initial empty rank
+            // page. Capture refusal cannot retry it as a substitute source
+            // checkpoint, or rescan an already captured current selection.
+            if !ranks.is_empty() {
+                assert!(
+                    ranks_before.is_empty(),
+                    "{kind}: capture refusal must not repeat a retained inventory; {diagnostics}"
+                );
+                assert_empty_inventory(&ranks, kind);
+                assert_eq!(
+                    rows(
+                        &account.path,
+                        "SELECT id FROM provider_selection_rank_pages"
+                    )
+                    .len(),
+                    5,
+                    "{kind}: initial rank must belong to the captured native selection"
+                );
+            }
             assert_eq!(
                 state(&account.path),
                 before,
                 "{kind}: retained owned history/checkpoint"
+            );
+            assert_eq!(
+                rows(
+                    &account.path,
+                    "SELECT body_hash,body FROM provider_shadow_pages ORDER BY id"
+                ),
+                raw_before,
+                "{kind}: refusal must preserve exact captured source bytes"
             );
             let conn = Connection::open(&account.path).unwrap();
             assert_eq!(
@@ -942,11 +1025,33 @@ async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quie
             }
         }
         failure.store(false, std::sync::atomic::Ordering::SeqCst);
+        let recovery_requests = server.received_requests().await.unwrap().len();
+        let selection_missing = rows(
+            &account.path,
+            "SELECT id FROM provider_selection_rank_pages",
+        )
+        .is_empty();
         success(&command(root, &account, &["sync", "--no-progress-bar"]));
+        let requests = server.received_requests().await.unwrap();
+        let recovery_ranks = selected_ranks(&requests[recovery_requests..]);
+        if selection_missing {
+            assert_empty_inventory(&recovery_ranks, kind);
+        } else {
+            assert!(
+                recovery_ranks.is_empty(),
+                "{kind}: recovery must reuse the captured inventory"
+            );
+        }
         for _ in 0..2 {
             // Actual CLI processes reopen independently; the second empty
             // page replay must not grow observations or repeat publication.
+            let requests_before = server.received_requests().await.unwrap().len();
             success(&command(root, &account, &["sync", "--no-progress-bar"]));
+            let requests = server.received_requests().await.unwrap();
+            assert!(
+                selected_ranks(&requests[requests_before..]).is_empty(),
+                "{kind}: quiet reopen must reuse the completed selected rank"
+            );
             let conn = Connection::open(&account.path).unwrap();
             assert_eq!(
                 conn.query_row::<String, _, _>(
@@ -982,16 +1087,6 @@ async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quie
                     .unwrap()
                     .count(),
                 1
-            );
-        }
-        for request in server.received_requests().await.unwrap() {
-            let body: Value = serde_json::from_slice(&request.body).unwrap();
-            assert!(
-                !(request.url.path().ends_with("/records/query")
-                    && body["query"]["recordType"]
-                        .as_str()
-                        .is_some_and(|kind| kind.starts_with("CPLAsset"))),
-                "{kind}: rank fallback must never run"
             );
         }
     }
@@ -1239,6 +1334,7 @@ const QUIET_MEDIA: &[u8] = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\
 #[derive(Clone)]
 struct QuietCatalogPhotos {
     capture_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tail_available: std::sync::Arc<std::sync::atomic::AtomicBool>,
     lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     checks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -1248,7 +1344,7 @@ impl QuietCatalogPhotos {
         let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
         vec![
             json!({"recordName":master,"recordType":"CPLMaster","zoneID":zone,"fields":{
-            "filenameEnc":{"value":format!("quiet-{number}.jpg"),"type":"STRING"},
+            "filenameEnc":{"value":base64::engine::general_purpose::STANDARD.encode(format!("quiet-{number}.jpg")),"type":"STRING"},
             "resOriginalRes":{"value":{"downloadURL":"https://p01.icloud-content.com/synthetic-never-fetch","size":QUIET_MEDIA.len(),
                 "fileChecksum":base64::engine::general_purpose::STANDARD.encode(Sha256::digest(QUIET_MEDIA))}},
             "resOriginalWidth":{"value":1,"type":"INT64"},"resOriginalHeight":{"value":1,"type":"INT64"},
@@ -1300,6 +1396,10 @@ impl Respond for QuietCatalogPhotos {
                 if let Some(number) = master
                     .strip_prefix("quiet-")
                     .and_then(|n| n.parse::<usize>().ok())
+                    .filter(|number| {
+                        *number < 66
+                            || (*number == 66 && self.tail_available.load(Ordering::SeqCst))
+                    })
                 {
                     records.extend(
                         self.pair(number)
@@ -1314,9 +1414,37 @@ impl Respond for QuietCatalogPhotos {
             }
             json!({"records":records})
         } else if path.ends_with("/internal/records/query/batch") {
-            json!({"batch":[{"records":[{"fields":{"itemCount":{"value":0}}}]}]})
-        } else if path.ends_with("/records/query") {
+            json!({"batch":[{"records":[{"fields":{"itemCount":{"value":67}}}]}]})
+        } else if body.pointer("/query/recordType").and_then(Value::as_str)
+            == Some("CPLAlbumByPositionLive")
+        {
             json!({"records":[]})
+        } else if path.ends_with("/records/query") {
+            assert_eq!(
+                body.pointer("/query/recordType").unwrap(),
+                "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"
+            );
+            assert_eq!(body.get("zoneID").unwrap(), &zone);
+            let offset = body
+                .pointer("/query/filterBy")
+                .unwrap()
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter.pointer("/fieldValue/value").and_then(Value::as_u64))
+                .unwrap_or(0) as usize;
+            let limit = body
+                .get("resultsLimit")
+                .and_then(Value::as_u64)
+                .unwrap_or(200) as usize
+                / 2;
+            let records: Vec<_> = (0..67)
+                .skip(offset)
+                .take(limit)
+                .flat_map(|number| self.pair(number))
+                .collect();
+            json!({"records":records,"syncToken":"A-rank-cursor"})
         } else {
             panic!("unexpected quiet catalog request: {path}")
         };
@@ -1331,6 +1459,7 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
     let server = MockServer::start().await;
     let photos = QuietCatalogPhotos {
         capture_once: Arc::new(AtomicBool::new(true)),
+        tail_available: Arc::new(AtomicBool::new(false)),
         lookups: Arc::new(AtomicUsize::new(0)),
         checks: Arc::new(AtomicUsize::new(0)),
     };
@@ -1341,10 +1470,11 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let account = seed(root, ACCOUNTS[0], "A", &server.uri());
-    // Current fixed-date selection is intentionally filtered; its source work
-    // must still be durably classified without being discarded or downloaded.
+    // An upper date bound filters after native confirmation. A lower bound
+    // ends enumeration before these older identities reach the scheduler.
+    // Query all 67 identities, then independently classify their current work.
     let config = format!(
-        "{}[filters]\nskip_created_before=\"2099-01-01\"\n",
+        "{}[filters]\nskip_created_after=\"2000-01-01\"\n",
         std::fs::read_to_string(&account.config).unwrap()
     );
     std::fs::write(&account.config, &config).unwrap();
@@ -1371,6 +1501,18 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
     assert_eq!(count("SELECT count(*) FROM provider_shadow_pages"), 1);
     assert_eq!(count("SELECT count(*) FROM provider_catalog_records"), 0);
     assert_eq!(count("SELECT count(*) FROM provider_work_receipts"), 0);
+    assert_eq!(
+        count("SELECT count(*) FROM provider_active_decisions"),
+        0,
+        "catalog replay refusal precedes native selected admission: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM provider_selection_rank_pages"),
+        0,
+        "capture interruption must precede selected rank capture: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let captured = rows(
         &account.path,
         "SELECT * FROM provider_shadow_pages ORDER BY id",
@@ -1379,8 +1521,9 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
         .unwrap()
         .execute_batch("DROP TRIGGER interrupt_after_capture")
         .unwrap();
-    // First restart admits at most 64 sources. A second quiet watch cycle must
-    // wake retained work instead of depending on a new provider change.
+    // Native scheduling classifies the exact current query, not a 64-row slice
+    // of historical catalog pages. Its one unresolved identity must retain a
+    // retry deadline while the 66 filtered peers remain independently settled.
     let mut config = std::fs::read_to_string(&account.config).unwrap();
     config.push_str("[watch]\ninterval=60\n[server]\nport=0\n");
     std::fs::write(&account.config, &config).unwrap();
@@ -1427,15 +1570,21 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
                 .contains("Waiting before next cycle")
         {
             assert_eq!(
-                count("SELECT count(*) FROM provider_work_receipts"),
-                64,
-                "64-attempt bound"
+                count("SELECT count(*) FROM provider_active_decisions"),
+                67,
+                "only the exact queried identities acquire native decisions; generations={:?}; rank_pages={:?}; service={}",
+                rows(&account.path, "SELECT * FROM provider_active_generations"),
+                rows(
+                    &account.path,
+                    "SELECT generation,pass_key FROM provider_selection_rank_pages"
+                ),
+                std::fs::read_to_string(&log).unwrap()
             );
             first_wave = true;
         }
         if classified_lookups.is_none()
             && photos.checks.load(Ordering::SeqCst) >= 2
-            && count("SELECT count(*) FROM provider_work_receipts") == 67
+            && count("SELECT count(*) FROM provider_active_decisions") == 67
         {
             classified_lookups = Some(photos.lookups.load(Ordering::SeqCst));
         }
@@ -1456,9 +1605,9 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
         "no due work means no repeated provider lookup"
     );
     assert_eq!(
-        count("SELECT count(*) FROM provider_work_receipts"),
+        count("SELECT count(*) FROM provider_active_decisions"),
         67,
-        "quiet provider must not strand retained tail: {diagnostics}"
+        "quiet provider retains exact current decisions: {diagnostics}"
     );
     assert_eq!(
         count(
@@ -1494,13 +1643,13 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
     assert!(count("SELECT count(*) FROM provider_catalog_debt") >= 3);
     assert_eq!(
         count(
-            "SELECT count(*) FROM provider_work_receipts WHERE state='deferred' AND reason='currently_filtered'"
+            "SELECT count(*) FROM provider_active_decisions WHERE admission='excluded' AND reason='currently_filtered'"
         ),
         66
     );
     assert_eq!(
         count(
-            "SELECT count(*) FROM provider_work_receipts WHERE reason='current_lookup_unresolved'"
+            "SELECT count(*) FROM provider_active_decisions WHERE admission='deferred' AND child='asset-quiet-66' AND reason='current_lookup_unresolved'"
         ),
         1
     );
@@ -1509,14 +1658,35 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
         0,
         "filtered evidence is not materialized work"
     );
+    assert_eq!(
+        count("SELECT count(*) FROM provider_work_receipts"),
+        0,
+        "historical catalog does not schedule current work"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| {
+                request.url.path().ends_with("/records/lookup")
+                    && serde_json::from_slice::<Value>(&request.body).unwrap()["records"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|record| record["recordName"] == "asset-quiet-66")
+            }),
+        "the unresolved selected identity must reach the real provider fault"
+    );
     // Plain sync honors a configured watch interval; remove only scheduling
     // before the independent one-cycle restarts. Admission configuration stays
-    // identical, including the filename filter and source/config retry key.
+    // identical, including the date filter and source/config retry key.
     std::fs::write(&account.config, config.replace("interval=60\n", "")).unwrap();
     let frozen = state(&account.path);
     let work = rows(
         &account.path,
-        "SELECT * FROM provider_work_receipts ORDER BY page_id,ordinal,config_hash,confirmation_hash",
+        "SELECT * FROM provider_active_decisions ORDER BY generation,pass_key,child",
     );
     let debt = rows(
         &account.path,
@@ -1531,7 +1701,7 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
         assert_eq!(
             rows(
                 &account.path,
-                "SELECT * FROM provider_work_receipts ORDER BY page_id,ordinal,config_hash,confirmation_hash"
+                "SELECT * FROM provider_active_decisions ORDER BY generation,pass_key,child"
             ),
             work
         );
@@ -1544,20 +1714,64 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
         );
         assert_eq!(quiet_media_snapshot(account.media.parent().unwrap()), media);
     }
-    let retry:(i64,i64,i64)=Connection::open(&account.path).unwrap().query_row("SELECT attempts,last_attempt_at,next_retry_at FROM provider_work_retries WHERE ordinal=0",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    let retry:(i64,i64)=Connection::open(&account.path).unwrap().query_row("SELECT attempts,next_retry_at FROM provider_active_decisions WHERE child='asset-quiet-66' AND admission='deferred'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
     assert_eq!(retry.0, 1);
-    assert_eq!(retry.2 - retry.1, 3600);
-    Connection::open(&account.path)
-        .unwrap()
-        .execute_batch(
-            "UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1 WHERE ordinal=0",
-        )
-        .unwrap();
-    success(&command(root, &account, &["sync", "--no-progress-bar"]));
+    assert!(retry.1 > chrono::Utc::now().timestamp());
+    // Advance only the clock on a real provider-failed native decision. Its
+    // admission hash covers the deadline; retain every source and manifest.
+    let make_retry_due = || {
+        let mut conn = Connection::open(&account.path).unwrap();
+        let tx = conn.transaction().unwrap();
+        let (generation,key,child,manifest,admission,reason,attempts):(String,String,String,String,String,String,i64) = tx.query_row(
+            "SELECT generation,pass_key,child,manifest_hash,admission,reason,attempts FROM provider_active_decisions WHERE child='asset-quiet-66' AND admission='deferred'", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+        ).unwrap();
+        let hash = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    &generation,
+                    &key,
+                    &child,
+                    &manifest,
+                    &admission,
+                    &reason,
+                    attempts,
+                    1_i64
+                ))
+                .unwrap()
+            )
+        );
+        tx.execute("UPDATE provider_active_decisions SET next_retry_at=1,admission_hash=?4 WHERE generation=?1 AND pass_key=?2 AND child=?3", params![generation,key,child,hash]).unwrap();
+        tx.commit().unwrap();
+    };
+    make_retry_due();
+    let retry_started = chrono::Utc::now().timestamp();
+    let held = command(root, &account, &["sync", "--no-progress-bar"]);
+    let held_diagnostics = String::from_utf8_lossy(&held.stderr);
+    assert!(
+        !held.status.success(),
+        "the due current confirmation still fails: {held_diagnostics}"
+    );
+    assert!(
+        held_diagnostics.contains("UNKNOWN_ITEM"),
+        "{held_diagnostics}"
+    );
+    assert!(
+        held_diagnostics.contains("Selected identity retry is not due"),
+        "the immediate tail retry must honor the newly durable deadline: {held_diagnostics}"
+    );
+    let retry_finished = chrono::Utc::now().timestamp();
     assert_eq!(photos.lookups.load(Ordering::SeqCst), calls + 1);
-    let retry:(i64,i64,i64)=Connection::open(&account.path).unwrap().query_row("SELECT attempts,last_attempt_at,next_retry_at FROM provider_work_retries WHERE ordinal=0",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    let retry:(i64,i64)=Connection::open(&account.path).unwrap().query_row("SELECT attempts,next_retry_at FROM provider_active_decisions WHERE child='asset-quiet-66' AND admission='deferred'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
     assert_eq!(retry.0, 2);
-    assert_eq!(retry.2 - retry.1, 7200);
+    assert!((retry_started + 7200..=retry_finished + 7200).contains(&retry.1));
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM provider_active_decisions WHERE child='asset-quiet-66' AND admission='deferred' AND reason='current_lookup_unresolved'"
+        ),
+        1
+    );
     assert_eq!(state(&account.path), frozen);
     assert_eq!(quiet_media_snapshot(account.media.parent().unwrap()), media);
     assert_eq!(
@@ -1567,6 +1781,97 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
         ),
         debt
     );
+    // Recover the same selected identity through real paired confirmation.
+    // Changing provider availability alone cannot bypass its durable deadline.
+    photos.tail_available.store(true, Ordering::SeqCst);
+    let retained_retry = rows(
+        &account.path,
+        "SELECT * FROM provider_active_decisions ORDER BY generation,pass_key,child",
+    );
+    success(&command(root, &account, &["sync", "--no-progress-bar"]));
+    assert_eq!(photos.lookups.load(Ordering::SeqCst), calls + 1);
+    assert_eq!(
+        rows(
+            &account.path,
+            "SELECT * FROM provider_active_decisions ORDER BY generation,pass_key,child"
+        ),
+        retained_retry
+    );
+    make_retry_due();
+    let recovery_requests = server.received_requests().await.unwrap().len();
+    success(&command(root, &account, &["sync", "--no-progress-bar"]));
+    assert_eq!(
+        photos.lookups.load(Ordering::SeqCst),
+        calls + 3,
+        "recovery requires the child lookup and its exact child/master pair"
+    );
+    let requests = server.received_requests().await.unwrap();
+    let lookups: Vec<Value> = requests[recovery_requests..]
+        .iter()
+        .filter(|request| request.url.path().ends_with("/records/lookup"))
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect();
+    for (lookup, names) in lookups
+        .iter()
+        .zip([vec!["asset-quiet-66"], vec!["asset-quiet-66", "quiet-66"]])
+    {
+        assert_eq!(
+            lookup["zoneID"],
+            json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})
+        );
+        let actual: Vec<_> = lookup["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["recordName"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            actual, names,
+            "only the deferred current identity is reconfirmed"
+        );
+    }
+    assert_eq!(lookups.len(), 2);
+    assert_eq!(
+        count("SELECT count(*) FROM provider_active_decisions WHERE admission='deferred'"),
+        0
+    );
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM provider_active_decisions WHERE admission='excluded' AND reason='currently_filtered'"
+        ),
+        67
+    );
+    let completed = rows(
+        &account.path,
+        "SELECT * FROM provider_active_decisions ORDER BY generation,pass_key,child",
+    );
+    for _ in 0..2 {
+        success(&command(root, &account, &["sync", "--no-progress-bar"]));
+        assert_eq!(photos.lookups.load(Ordering::SeqCst), calls + 3);
+        assert_eq!(
+            rows(
+                &account.path,
+                "SELECT * FROM provider_active_decisions ORDER BY generation,pass_key,child"
+            ),
+            completed
+        );
+        assert_eq!(state(&account.path), frozen);
+        assert_eq!(quiet_media_snapshot(account.media.parent().unwrap()), media);
+        assert_eq!(
+            rows(
+                &account.path,
+                "SELECT * FROM provider_catalog_debt ORDER BY page_id,ordinal,reason"
+            ),
+            debt
+        );
+        assert_eq!(
+            rows(
+                &account.path,
+                "SELECT * FROM provider_shadow_pages ORDER BY id LIMIT 1"
+            ),
+            captured
+        );
+    }
 }
 
 struct QuietServiceChild(std::process::Child);

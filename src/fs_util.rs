@@ -1194,6 +1194,15 @@ pub(crate) fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Require parent-directory durability without blocking an async worker.
+/// Preserves the platform policy of [`fsync_parent_dir`].
+pub(crate) async fn fsync_parent_dir_async(path: &Path) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || fsync_parent_dir(&path))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 /// Async wrapper around [`fsync_parent_dir`] that runs the blocking
 /// syscall on the blocking pool and swallows every error class with a
 /// warn. Use when the caller has already committed to the rename

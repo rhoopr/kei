@@ -15,6 +15,7 @@ use crate::{auth, cli, config, download, retry, state};
 #[derive(Clone, Debug)]
 pub(super) struct MutableCaptureSession {
     pub(super) zone: &'static str,
+    pub(super) token: &'static str,
     pub(super) cancel_after_lookup: Option<CancellationToken>,
     pub(super) records: Arc<std::sync::Mutex<Vec<Value>>>,
     pub(super) repair_requests: Arc<AtomicUsize>,
@@ -55,7 +56,7 @@ impl PhotosSession for MutableCaptureSession {
             };
             return Ok(json!({"zones": [{
                 "zoneID": {"zoneName": self.zone, "ownerRecordName": "_defaultOwner"},
-                "syncToken": "zone-tok-new", "moreComing": false, "records": records
+                "syncToken": self.token, "moreComing": false, "records": records
             }]}));
         }
         if url.contains("/internal/records/query/batch") {
@@ -74,7 +75,7 @@ impl PhotosSession for MutableCaptureSession {
         } else {
             Vec::new()
         };
-        Ok(json!({"records": records, "syncToken": "zone-tok-new"}))
+        Ok(json!({"records": records, "syncToken": self.token}))
     }
     fn clone_box(&self) -> Box<dyn PhotosSession> {
         Box::new(self.clone())
@@ -208,8 +209,73 @@ pub(super) fn make_named_full_album_with_boxed_session(
     name: &str,
     session: Box<dyn crate::icloud::photos::PhotosSession>,
 ) -> crate::icloud::photos::PhotoAlbum {
+    make_cycle_album(zone, name, session, None)
+}
+
+fn cycle_fixture_owner() -> state::db::account::AccountOwner {
+    state::db::account::AccountOwner::authenticated(
+        "runner@example.invalid",
+        "com",
+        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"runner-fixture"}})).unwrap(),
+    )
+    .unwrap()
+}
+
+pub(super) async fn open_owned_cycle_db(path: &std::path::Path) -> Arc<state::SqliteStateDb> {
+    Arc::new(
+        state::SqliteStateDb::open_owned(path, &cycle_fixture_owner())
+            .await
+            .unwrap(),
+    )
+}
+
+pub(super) fn make_owned_cycle_album(
+    db: &Arc<state::SqliteStateDb>,
+    zone: &str,
+    database: &str,
+    session: Box<dyn crate::icloud::photos::PhotosSession>,
+) -> crate::icloud::photos::PhotoAlbum {
+    make_cycle_album(
+        zone,
+        "TestAlbum",
+        session,
+        Some((
+            crate::icloud::photos::inbox::ShadowCapture::new(
+                db.clone(),
+                cycle_fixture_owner(),
+                "com",
+            ),
+            Arc::from(database),
+        )),
+    )
+}
+
+pub(super) fn make_captured_cycle_album(
+    zone: &str,
+    capture: crate::icloud::photos::inbox::ShadowCapture,
+    session: Box<dyn crate::icloud::photos::PhotosSession>,
+) -> crate::icloud::photos::PhotoAlbum {
+    make_cycle_album(
+        zone,
+        "TestAlbum",
+        session,
+        Some((capture, Arc::from("private"))),
+    )
+}
+
+fn make_cycle_album(
+    zone: &str,
+    name: &str,
+    session: Box<dyn crate::icloud::photos::PhotosSession>,
+    capture: Option<(crate::icloud::photos::inbox::ShadowCapture, Arc<str>)>,
+) -> crate::icloud::photos::PhotoAlbum {
     use serde_json::json;
-    crate::icloud::photos::PhotoAlbum::new(
+    let zone_id = if capture.is_some() {
+        json!({"zoneName":zone,"ownerRecordName":"_defaultOwner"})
+    } else {
+        json!({"zoneName":zone})
+    };
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
         crate::icloud::photos::PhotoAlbumConfig {
             params: Arc::new(std::collections::HashMap::new()),
             service_endpoint: Arc::from("https://example.com"),
@@ -218,40 +284,17 @@ pub(super) fn make_named_full_album_with_boxed_session(
             obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
             query_filter: None,
             page_size: 100,
-            zone_id: Arc::new(json!({"zoneName": zone})),
+            zone_id: Arc::new(zone_id),
             retry_config: retry::RetryConfig::default(),
             container_id: None,
             cross_zone_sources: Vec::new(),
         },
         session,
-    )
-}
-
-pub(super) fn make_named_empty_full_album(
-    zone: &str,
-    name: &str,
-    zone_sync_token: &str,
-) -> crate::icloud::photos::PhotoAlbum {
-    make_named_full_album_with_boxed_session(
-        zone,
-        name,
-        Box::new(
-            crate::test_helpers::MockPhotosSession::new()
-                .ok(album_count_response(0))
-                .ok(serde_json::json!({"records": [], "syncToken": zone_sync_token})),
-        ),
-    )
-}
-
-pub(super) fn make_empty_full_album(zone_sync_token: &str) -> crate::icloud::photos::PhotoAlbum {
-    make_empty_full_album_for_zone("PrimarySync", zone_sync_token)
-}
-
-pub(super) fn make_empty_full_album_for_zone(
-    zone: &str,
-    zone_sync_token: &str,
-) -> crate::icloud::photos::PhotoAlbum {
-    make_named_empty_full_album(zone, "TestAlbum", zone_sync_token)
+    );
+    if let Some((capture, database)) = capture {
+        album.set_shadow_capture(capture, database);
+    }
+    album
 }
 
 pub(super) fn make_run_cycle_library_state(
@@ -485,14 +528,12 @@ pub(super) const SCOPED_DB_SYNC_TOKEN_FAILURE_KEY: &str = "scoped_db_sync_token"
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MetadataSetFailure {
     Exact(&'static str),
-    Prefix(&'static str),
 }
 
 impl MetadataSetFailure {
     pub(super) fn matches(self, key: &str) -> bool {
         match self {
             Self::Exact(expected) => key == expected,
-            Self::Prefix(prefix) => key.starts_with(prefix),
         }
     }
 }
@@ -536,16 +577,6 @@ impl std::fmt::Debug for FailingMetadataSetDb {
 }
 
 impl FailingMetadataSetDb {
-    pub(super) fn with_historical_current_replacement(mut self) -> Self {
-        self.replace_historical_current = true;
-        self
-    }
-
-    pub(super) fn with_unknown_download_source(mut self) -> Self {
-        self.omit_verified_source = true;
-        self
-    }
-
     async fn prepare_downloaded_write(
         &self,
         library: &str,
@@ -624,11 +655,6 @@ impl FailingMetadataSetDb {
         self
     }
 
-    #[cfg(feature = "xmp")]
-    pub(super) fn drain_counter(&self) -> Arc<std::sync::atomic::AtomicUsize> {
-        Arc::clone(&self.drains)
-    }
-
     pub(super) fn without_set_failure(
         inner: Arc<dyn download::DownloadStore>,
         message: &'static str,
@@ -640,42 +666,8 @@ impl FailingMetadataSetDb {
         )
     }
 
-    pub(super) fn with_refresh_downloaded_metadata_failure(mut self) -> Self {
-        self.fail_refresh_downloaded_metadata = true;
-        self
-    }
-
     pub(super) fn with_get_failure(mut self, failure: MetadataSetFailure) -> Self {
         self.get_failure = Some(failure);
-        self
-    }
-
-    pub(super) fn with_cancel_on_upsert(mut self, token: CancellationToken) -> Self {
-        self.cancel_on_upsert = Some(token);
-        self
-    }
-
-    pub(super) fn with_download_dir_replaced_on_upsert(mut self, path: std::path::PathBuf) -> Self {
-        self.replace_download_dir_on_upsert = Some(path);
-        self
-    }
-
-    pub(super) fn with_mark_downloaded_failure(mut self) -> Self {
-        self.fail_mark_downloaded = true;
-        self
-    }
-
-    #[cfg(feature = "xmp")]
-    pub(super) fn with_refresh_on_mark_downloaded(
-        mut self,
-        metadata: state::AssetMetadata,
-    ) -> Self {
-        self.refresh_on_mark_downloaded = Some(metadata);
-        self
-    }
-
-    pub(super) fn with_upsert_seen_failure(mut self) -> Self {
-        self.fail_upsert_seen = true;
         self
     }
 }

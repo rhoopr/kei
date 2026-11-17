@@ -22,9 +22,9 @@ use super::super::models::{
     FullEnumerationReason, METADATA_CAPTURE_REPAIR_FAILED_REASON, SyncMode,
 };
 use super::super::test_support::{
-    PendingLookupSession, album_with_session, album_with_session_and_retry_config,
-    changes_zone_response, incremental_photo_records, incremental_photo_records_with_favorite,
-    mock_album, seed_downloaded_metadata_asset, test_config,
+    PendingLookupSession, album_with_session, changes_zone_response, incremental_photo_records,
+    incremental_photo_records_with_favorite, mock_album, seed_downloaded_metadata_asset,
+    test_config,
 };
 use super::run_metadata_capture_repair;
 
@@ -190,30 +190,27 @@ async fn completed_legacy_capture_does_not_infer_historical_recovery_after_resta
 
 #[tokio::test]
 async fn contract_metadata_capture_revision_repair_is_durable() {
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
     let dir = TempDir::new().expect("temp dir");
+    let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
     let stored_records = incremental_photo_records_with_favorite("CAPTURE_REVISION", false);
     let stored_asset = PhotoAsset::new(stored_records[0].clone(), stored_records[1].clone());
     let mut changed_records = incremental_photo_records_with_favorite("CAPTURE_REVISION", true);
     changed_records[1]["fields"]["assetDate"]["value"] = json!(1_700_000_000_123_i64);
     changed_records[1]["fields"]["addedDate"]["value"] = json!(1_700_000_000_789_i64);
-    let pass = AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session(
-            "PrimarySync",
-            "",
-            Box::new(PendingLookupSession {
-                records: Arc::new(changed_records),
-            }),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    };
+    let pass = super::super::test_support::selected_pass_with_session(
+        &db,
+        "",
+        Box::new(PendingLookupSession {
+            records: Arc::new(changed_records),
+        }),
+    );
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-prev".to_string(),
     };
+    super::super::test_support::initialize_empty_selection(&db, &config).await;
     let media_path =
         seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored_asset).await;
     db.upsert_asset_master_mapping("PrimarySync", "asset-CAPTURE_REVISION", "CAPTURE_REVISION")
@@ -233,28 +230,31 @@ async fn contract_metadata_capture_revision_repair_is_durable() {
         .await
         .expect("read seeded media");
 
-    let result = download_photos_with_sync(
-        &Client::new(),
+    config.selection_context = Some(Arc::new(
+        super::super::generation::context(
+            std::slice::from_ref(&pass),
+            &config,
+            DownloadControls::download_hidden(),
+        )
+        .await
+        .unwrap()
+        .expect("authenticated selection"),
+    ));
+    let result = run_metadata_capture_repair(
         std::slice::from_ref(&pass),
-        Arc::new(config),
+        &config,
         DownloadControls::download_hidden(),
-        CancellationToken::new(),
+        &CancellationToken::new(),
     )
-    .await
-    .expect("normal sync should repair stale capture metadata");
+    .await;
 
-    assert!(
-        matches!(result.outcome, DownloadOutcome::Success),
-        "unexpected outcome: {:?}, stats: {:?}",
-        result.outcome,
-        result.stats
-    );
+    assert_eq!(result.failures, 0);
     assert_eq!(result.stats.downloaded, 0);
     assert_eq!(result.stats.metadata_capture_revision, Some(1));
     assert_eq!(result.stats.metadata_capture_refreshed, 1);
     assert_eq!(result.stats.metadata_capture_failures, 0);
     assert_eq!(result.stats.metadata_capture_remaining, 0);
-    assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+    assert!(!result.stats.sync_token_blocked);
     let refreshed = db
         .get_downloaded_page(0, 1)
         .await
@@ -283,6 +283,18 @@ async fn contract_metadata_capture_revision_repair_is_durable() {
     assert_eq!(capture.active_revision, 1);
     assert_eq!(capture.pending_revision, None);
     assert_eq!(capture.remaining_assets, 0);
+    let synced = download_photos_with_sync(
+        &Client::new(),
+        &[pass],
+        Arc::new(config),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(synced.outcome, DownloadOutcome::Success));
+    assert_eq!(synced.sync_token.as_deref(), Some("zone-token-next"));
+    assert_eq!(synced.stats.metadata_capture_refreshed, 0);
 }
 
 #[tokio::test]
@@ -335,7 +347,12 @@ async fn metadata_capture_revision_repair_progresses_across_bounded_cycles() {
 
     const STALE_ASSETS: usize = 1_201;
     let stale_assets = u64::try_from(STALE_ASSETS).expect("asset count fits u64");
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+    let dir = TempDir::new().expect("temp dir");
+    let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
+    let mut config = test_config();
+    config.directory = Arc::from(dir.path().join("media"));
+    config.state_db = Some(db.clone());
+    super::super::test_support::initialize_empty_selection(&db, &config).await;
     let mut provider_records = HashMap::with_capacity(STALE_ASSETS * 2);
     for index in 0..STALE_ASSETS {
         let master_id = format!("CAPTURE_SCALE_{index:04}");
@@ -371,31 +388,25 @@ async fn metadata_capture_revision_repair_progresses_across_bounded_cycles() {
     }
     db.acquire_lock("test_metadata_capture_scale_stale")
         .expect("state lock")
-        .execute("DELETE FROM asset_metadata_capture_revisions", [])
+        .execute_batch(
+            "DELETE FROM asset_metadata_capture_revisions;
+            UPDATE metadata_capture_state SET active_revision=0 WHERE library='PrimarySync';",
+        )
         .expect("mark every asset stale");
 
-    let pass = AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session_and_retry_config(
-            "PrimarySync",
-            "",
-            None,
-            RetryConfig {
-                max_retries: 1,
-                base_delay_secs: 0,
-                max_delay_secs: 0,
-            },
-            Box::new(CaptureScaleSession {
-                records: Arc::new(provider_records),
-                rate_limited_once: Arc::new(AtomicBool::new(false)),
-            }),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    };
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+    let pass = super::super::test_support::selected_pass_with_retry_config(
+        &db,
+        "",
+        RetryConfig {
+            max_retries: 1,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        },
+        Box::new(CaptureScaleSession {
+            records: Arc::new(provider_records),
+            rate_limited_once: Arc::new(AtomicBool::new(false)),
+        }),
+    );
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-prev".to_string(),
     };
@@ -405,21 +416,15 @@ async fn metadata_capture_revision_repair_progresses_across_bounded_cycles() {
         (2, 500, 201, 0, 0),
         (3, 201, 0, crate::state::METADATA_CAPTURE_REVISION, 0),
     ] {
-        let result = download_photos_with_sync(
-            &Client::new(),
+        let result = run_metadata_capture_repair(
             std::slice::from_ref(&pass),
-            Arc::new(config.clone()),
+            &config,
             DownloadControls::download_hidden(),
-            CancellationToken::new(),
+            &CancellationToken::new(),
         )
-        .await
-        .expect("metadata-capture cycle");
+        .await;
 
-        assert!(
-            matches!(result.outcome, DownloadOutcome::Success),
-            "cycle {cycle}: {:?}",
-            result.stats
-        );
+        assert_eq!(result.failures, 0, "cycle {cycle}: {:?}", result.stats);
         assert_eq!(
             result.stats.metadata_capture_refreshed, refreshed,
             "cycle {cycle}"
@@ -460,7 +465,12 @@ async fn metadata_capture_source_deletions_count_as_clean_progress() {
     const DELETED_ASSETS: usize = 500;
     const STALE_ASSETS: usize = DELETED_ASSETS + 1;
 
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+    let dir = TempDir::new().expect("temp dir");
+    let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
+    let mut config = test_config();
+    config.directory = Arc::from(dir.path().join("media"));
+    config.state_db = Some(db.clone());
+    super::super::test_support::initialize_empty_selection(&db, &config).await;
     let mut provider_records = Vec::with_capacity(DELETED_ASSETS * 2);
     for index in 0..STALE_ASSETS {
         let master_id = format!("CAPTURE_DELETED_{index:04}");
@@ -503,36 +513,26 @@ async fn metadata_capture_source_deletions_count_as_clean_progress() {
         .execute("DELETE FROM asset_metadata_capture_revisions", [])
         .expect("mark every asset stale");
 
-    let pass = AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session(
-            "PrimarySync",
-            "",
-            Box::new(PendingLookupSession {
-                records: Arc::new(provider_records),
-            }),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    };
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+    let pass = super::super::test_support::selected_pass_with_session(
+        &db,
+        "",
+        Box::new(PendingLookupSession {
+            records: Arc::new(provider_records),
+        }),
+    );
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-prev".to_string(),
     };
 
-    let result = download_photos_with_sync(
-        &Client::new(),
+    let result = run_metadata_capture_repair(
         std::slice::from_ref(&pass),
-        Arc::new(config),
+        &config,
         DownloadControls::download_hidden(),
-        CancellationToken::new(),
+        &CancellationToken::new(),
     )
-    .await
-    .expect("source-deleted capture batch");
+    .await;
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.failures, 0);
     assert_eq!(result.stats.metadata_capture_refreshed, 0);
     assert_eq!(result.stats.metadata_capture_failures, 0);
     assert_eq!(result.stats.metadata_capture_remaining, 1);
@@ -575,30 +575,27 @@ async fn current_capture_revision_adds_no_provider_lookup_requests() {
         }
     }
 
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
     let dir = TempDir::new().expect("temp dir");
+    let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
     let records = incremental_photo_records("CAPTURE_CURRENT");
     let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
     let lookups = Arc::new(AtomicUsize::new(0));
     let changes = Arc::new(AtomicUsize::new(0));
-    let pass = AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session(
-            "PrimarySync",
-            "",
-            Box::new(CountingCaptureSession {
-                lookups: Arc::clone(&lookups),
-                changes: Arc::clone(&changes),
-            }),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    };
+    let pass = super::super::test_support::selected_pass_with_session(
+        &db,
+        "",
+        Box::new(CountingCaptureSession {
+            lookups: Arc::clone(&lookups),
+            changes: Arc::clone(&changes),
+        }),
+    );
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-prev".to_string(),
     };
+    super::super::test_support::initialize_empty_selection(&db, &config).await;
     seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &asset).await;
 
     let result = download_photos_with_sync(
@@ -621,22 +618,18 @@ async fn current_capture_revision_adds_no_provider_lookup_requests() {
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn normal_sync_writes_configured_xmp_after_capture_revision_repair() {
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
     let dir = TempDir::new().expect("temp dir");
+    let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
     let stored_records = incremental_photo_records_with_favorite("CAPTURE_XMP", false);
     let stored_asset = PhotoAsset::new(stored_records[0].clone(), stored_records[1].clone());
     let changed_records = incremental_photo_records_with_favorite("CAPTURE_XMP", true);
-    let pass = AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session(
-            "PrimarySync",
-            "",
-            Box::new(PendingLookupSession {
-                records: Arc::new(changed_records),
-            }),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    };
+    let pass = super::super::test_support::selected_pass_with_session(
+        &db,
+        "",
+        Box::new(PendingLookupSession {
+            records: Arc::new(changed_records),
+        }),
+    );
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
     config.metadata.xmp_sidecar = true;
@@ -644,6 +637,7 @@ async fn normal_sync_writes_configured_xmp_after_capture_revision_repair() {
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-prev".to_string(),
     };
+    super::super::test_support::initialize_empty_selection(&db, &config).await;
     let media_path =
         seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored_asset).await;
     db.upsert_asset_master_mapping("PrimarySync", "asset-CAPTURE_XMP", "CAPTURE_XMP")
@@ -656,6 +650,15 @@ async fn normal_sync_writes_configured_xmp_after_capture_revision_repair() {
     );
     db.set_metadata_capture_revision_for_test("PrimarySync", "CAPTURE_XMP", 0);
 
+    let repair = run_metadata_capture_repair(
+        std::slice::from_ref(&pass),
+        &config,
+        DownloadControls::download_hidden(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(repair.failures, 0);
+    assert_eq!(repair.stats.metadata_capture_refreshed, 1);
     let result = download_photos_with_sync(
         &Client::new(),
         &[pass],
@@ -664,11 +667,11 @@ async fn normal_sync_writes_configured_xmp_after_capture_revision_repair() {
         CancellationToken::new(),
     )
     .await
-    .expect("normal sync should repair metadata and drain the configured XMP write");
+    .expect("normal sync drains the explicitly admitted XMP write");
 
     assert!(matches!(result.outcome, DownloadOutcome::Success));
     assert_eq!(result.stats.downloaded, 0);
-    assert_eq!(result.stats.metadata_capture_refreshed, 1);
+    assert_eq!(result.stats.metadata_capture_refreshed, 0);
     let sidecar_name = format!(
         "{}.xmp",
         media_path
@@ -751,34 +754,36 @@ async fn ambiguous_capture_repair_keeps_identity_and_checkpoint_without_full_bac
         for record in records.iter_mut().skip(1).take(hidden_count) {
             record["fields"]["isHidden"] = json!({"value": 1, "type": "INT64"});
         }
-        let pass = AlbumPass {
-            kind: PassKind::Unfiled,
-            album: album_with_session(
-                "PrimarySync",
-                "",
-                Box::new(AmbiguousCaptureSession(
-                    Arc::new(records),
-                    Arc::clone(&calls),
-                )),
-            ),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        };
+        let session = AmbiguousCaptureSession(Arc::new(records), Arc::clone(&calls));
         let mut config = test_config();
         config.directory = Arc::from(dir.path().join("media"));
         config.sync_mode = SyncMode::Incremental {
             zone_sync_token: "zone-token-prev".into(),
         };
         let media_path = {
-            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            let db = super::super::test_support::open_fixture_db(&db_path).await;
+            config.state_db = Some(db.clone());
+            super::super::test_support::initialize_empty_selection(&db, &config).await;
+            let pass = super::super::test_support::selected_pass_with_session(
+                &db,
+                "",
+                Box::new(session.clone()),
+            );
             let path = seed_downloaded_metadata_asset(&db, &config, &pass, &asset).await;
             db.set_metadata_capture_revision_for_test("PrimarySync", "CAPTURE_AMBIGUOUS", 0);
             db.clear_metadata_hash_for_test("PrimarySync", "CAPTURE_AMBIGUOUS", "original");
+            config.state_db = None;
             path
         };
         let original_bytes = std::fs::read(&media_path).unwrap();
         for cycle in 1..=3 {
             let (capture, _guard) = TracingCapture::install();
-            let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+            let db = super::super::test_support::open_fixture_db(&db_path).await;
+            let pass = super::super::test_support::selected_pass_with_session(
+                &db,
+                "",
+                Box::new(session.clone()),
+            );
             if cycle == 3 {
                 db.acquire_lock("test_retry_due")
                     .unwrap()
@@ -788,21 +793,14 @@ async fn ambiguous_capture_repair_keeps_identity_and_checkpoint_without_full_bac
             calls.lock().unwrap().clear();
             let mut config = config.clone();
             config.state_db = Some(db.clone());
-            let result = download_photos_with_sync(
-                &Client::new(),
+            let result = run_metadata_capture_repair(
                 std::slice::from_ref(&pass),
-                Arc::new(config),
+                &config,
                 DownloadControls::download_hidden(),
-                CancellationToken::new(),
+                &CancellationToken::new(),
             )
-            .await
-            .unwrap();
-            assert!(!result.full_enumeration_ran);
-            assert!(matches!(
-                result.outcome,
-                DownloadOutcome::PartialFailure { .. }
-            ));
-            assert_eq!(result.sync_token, None);
+            .await;
+            assert!(result.stats.sync_token_blocked);
             assert_eq!(result.stats.metadata_capture_remaining, 1);
             assert_eq!(
                 result.stats.metadata_capture_failures,
@@ -865,6 +863,41 @@ async fn ambiguous_capture_repair_keeps_identity_and_checkpoint_without_full_bac
                 })
                 .collect();
             assert_eq!(diagnostics.len(), usize::from(cycle != 2));
+            let calls_before = calls.lock().unwrap().clone();
+            let synced = download_photos_with_sync(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                Arc::new(config),
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(synced.outcome, DownloadOutcome::Success));
+            assert_eq!(synced.sync_token.as_deref(), Some("zone-token-next"));
+            assert!(
+                !synced.stats.sync_token_blocked,
+                "historical ambiguity is not current checkpoint authority"
+            );
+            assert_eq!(synced.stats.metadata_capture_refreshed, 0);
+            assert_eq!(
+                calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|&&call| call == "lookup")
+                    .count(),
+                calls_before
+                    .iter()
+                    .filter(|&&call| call == "lookup")
+                    .count()
+            );
+            let reopened = SqliteStateDb::open(&db_path).await.unwrap();
+            assert_eq!(
+                reopened.get_summary().await.unwrap().metadata_capture[0].pending_revision,
+                Some(crate::state::METADATA_CAPTURE_REVISION)
+            );
+            assert_eq!(std::fs::read(&media_path).unwrap(), original_bytes);
             if cycle == 2 {
                 continue;
             }
@@ -901,20 +934,23 @@ async fn ambiguous_capture_repair_keeps_identity_and_checkpoint_without_full_bac
         );
         drop(db);
         for recovered_cycle in 0..2 {
-            let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+            let db = super::super::test_support::open_fixture_db(&db_path).await;
+            let pass = super::super::test_support::selected_pass_with_session(
+                &db,
+                "",
+                Box::new(session.clone()),
+            );
             calls.lock().unwrap().clear();
             let mut recovered_config = config.clone();
             recovered_config.state_db = Some(db.clone());
-            let result = download_photos_with_sync(
-                &Client::new(),
+            let result = run_metadata_capture_repair(
                 std::slice::from_ref(&pass),
-                Arc::new(recovered_config),
+                &recovered_config,
                 DownloadControls::download_hidden(),
-                CancellationToken::new(),
+                &CancellationToken::new(),
             )
-            .await
-            .unwrap();
-            assert!(matches!(result.outcome, DownloadOutcome::Success));
+            .await;
+            assert_eq!(result.failures, 0);
             assert!(!result.stats.identity_incomplete);
             assert_eq!(result.stats.metadata_capture_unresolved, 0);
             assert_eq!(
@@ -930,7 +966,7 @@ async fn ambiguous_capture_repair_keeps_identity_and_checkpoint_without_full_bac
                     .count(),
                 usize::from(recovered_cycle == 0)
             );
-            assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+            assert!(!result.stats.sync_token_blocked);
             assert_eq!(
                 db.get_summary().await.unwrap().metadata_capture[0].pending_revision,
                 None
@@ -967,21 +1003,22 @@ async fn failed_capture_lookup_preserves_incremental_checkpoint_and_retries() {
         }
     }
 
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
     let dir = TempDir::new().expect("temp dir");
+    let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
     let records = incremental_photo_records("CAPTURE_RETRY");
     let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
-    let pass = AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session("PrimarySync", "", Box::new(FailingCaptureLookupSession)),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    };
+    let pass = super::super::test_support::selected_pass_with_session(
+        &db,
+        "",
+        Box::new(FailingCaptureLookupSession),
+    );
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-prev".to_string(),
     };
+    super::super::test_support::initialize_empty_selection(&db, &config).await;
     seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &asset).await;
     db.upsert_asset_master_mapping("PrimarySync", "asset-CAPTURE_RETRY", "CAPTURE_RETRY")
         .await
@@ -990,25 +1027,15 @@ async fn failed_capture_lookup_preserves_incremental_checkpoint_and_retries() {
     db.clear_metadata_hash_for_test("PrimarySync", "CAPTURE_RETRY", "original");
 
     for _ in 0..2 {
-        let result = download_photos_with_sync(
-            &Client::new(),
+        let result = run_metadata_capture_repair(
             std::slice::from_ref(&pass),
-            Arc::new(config.clone()),
+            &config,
             DownloadControls::download_hidden(),
-            CancellationToken::new(),
+            &CancellationToken::new(),
         )
-        .await
-        .expect("lookup failure should remain a reported durable repair");
+        .await;
 
-        assert!(matches!(
-            result.outcome,
-            DownloadOutcome::PartialFailure { failed_count: 1 }
-        ));
-        assert!(
-            !result.full_enumeration_ran,
-            "stalled capture repair must not enumerate the library"
-        );
-        assert_eq!(result.sync_token, None);
+        assert_eq!(result.failures, 1);
         assert!(result.stats.sync_token_blocked);
         assert_eq!(
             result.stats.sync_token_blocked_reason,

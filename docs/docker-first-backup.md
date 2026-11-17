@@ -6,6 +6,8 @@ instead. These steps use Docker Compose on the Docker host and a fresh empty
 photo directory. NAS users can create the same mounts and settings in their
 container manager; see [Synology](https://github.com/rhoopr/kei/wiki/Synology).
 
+The `latest` image and config below describe released v0.26 builds. When testing the v0.30 development branch, use your locally built candidate image instead and add `config_version = 1` before the first config table. Do not add that marker to a v0.26 config: the released parser rejects it. Review the [rendition-policy migration](rendition-policy-migration.md) before using existing settings with the candidate.
+
 ## Prepare persistent storage
 
 In a new working directory, create `config` and `photos` directories:

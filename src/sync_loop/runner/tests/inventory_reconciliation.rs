@@ -267,9 +267,9 @@ impl Fixture {
                 params: Arc::new(HashMap::new()),
                 service_endpoint: Arc::from("https://fixture.invalid/shared"),
                 name: Arc::from(if named { "Trip" } else { "" }),
-                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
-                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
-                query_filter: None,
+                list_type: Arc::from(if named { "CPLContainerRelationLiveByAssetDate" } else { "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted" }),
+                obj_type: Arc::from(if named { "CPLContainerRelationNotDeletedByAssetDate:trip" } else { "CPLAssetByAssetDateWithoutHiddenOrDeleted" }),
+                query_filter: named.then(|| Arc::new(json!([{"fieldName":"parentId","comparator":"EQUALS","fieldValue":{"type":"STRING","value":"trip"}}]))),
                 page_size: 2,
                 zone_id: Arc::new(
                     json!({"zoneName":ZONE,"ownerRecordName":self.session.provider_owner}),
@@ -1003,7 +1003,7 @@ async fn inventory_fixed_date_coverage_retires_without_claiming_unbounded_checkp
         Arc::make_mut(&mut config).skip_created_before = fixture.config.filters.skip_created_before;
         config
     };
-    let album = PhotoAlbum::new(
+    let mut album = PhotoAlbum::new(
         PhotoAlbumConfig {
             params: Arc::new(HashMap::new()),
             service_endpoint: Arc::from("https://fixture.invalid/shared"),
@@ -1018,6 +1018,10 @@ async fn inventory_fixed_date_coverage_retires_without_claiming_unbounded_checkp
             cross_zone_sources: Vec::new(),
         },
         Box::new(fixture.session.clone()),
+    );
+    album.set_shadow_capture(
+        ShadowCapture::new(db.clone(), fixture.owner.clone(), "com"),
+        Arc::from("shared"),
     );
     let lib = make_run_cycle_library_state_with_passes(
         ZONE,

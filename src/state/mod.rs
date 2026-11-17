@@ -22,7 +22,7 @@ pub(crate) use db::{
     AssetVerificationState, CheckpointTransition, DownloadContextStateStore, DownloadedFileRecord,
     LegacyFileEvidence, OwnedTempFile, PendingPublicationRecord, ReconciliationCatalogPath,
     ReconciliationContent, ReconciliationPathKey, ReconciliationReservation,
-    ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken, TempFileOwnershipStore,
+    ReconciliationStateStore, ScopedDbSyncToken, TempFileOwnershipStore,
 };
 pub use db::{
     DownloadStateStore, ImportStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore,
@@ -46,3 +46,5 @@ pub(crate) fn unresolved_identity_key(zone: &str) -> String {
 
 #[cfg(test)]
 pub(crate) use db::LegacyPreparationSnapshot;
+#[cfg(test)]
+pub(crate) use db::RetryErrorRetention;
