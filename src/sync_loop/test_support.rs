@@ -235,9 +235,19 @@ pub(super) fn make_owned_cycle_album(
     database: &str,
     session: Box<dyn crate::icloud::photos::PhotosSession>,
 ) -> crate::icloud::photos::PhotoAlbum {
+    make_named_owned_cycle_album(db, zone, "TestAlbum", database, session)
+}
+
+pub(super) fn make_named_owned_cycle_album(
+    db: &Arc<state::SqliteStateDb>,
+    zone: &str,
+    name: &str,
+    database: &str,
+    session: Box<dyn crate::icloud::photos::PhotosSession>,
+) -> crate::icloud::photos::PhotoAlbum {
     make_cycle_album(
         zone,
-        "TestAlbum",
+        name,
         session,
         Some((
             crate::icloud::photos::inbox::ShadowCapture::new(
@@ -366,7 +376,7 @@ pub(super) async fn make_shared_session_for_run_cycle() -> (tempfile::TempDir, a
     (dir, Arc::new(tokio::sync::RwLock::new(session)))
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy)]
 pub(super) struct RunCycleDownloadConfigOptions {
     pub(super) media: config::MediaSelection,
     pub(super) per_pass_paths: bool,
@@ -378,6 +388,7 @@ pub(super) struct RunCycleDownloadConfigOptions {
     /// Passes run through `buffer_unordered(pass_parallelism)`, which is
     /// capped by this, so it must exceed one for passes to overlap.
     pub(super) concurrent_downloads: Option<usize>,
+    pub(super) retry: Option<retry::RetryConfig>,
 }
 
 pub(super) fn media_without_photo_downloads() -> config::MediaSelection {
@@ -437,6 +448,9 @@ pub(super) fn make_run_cycle_download_config_builder_with_options(
         config.skip_created_after = options.skip_created_after;
         if let Some(concurrent_downloads) = options.concurrent_downloads {
             config.concurrent_downloads = concurrent_downloads;
+        }
+        if let Some(retry) = options.retry {
+            config.retry = retry;
         }
         config.state_db = Some(Arc::clone(&db));
         config.sync_mode = sync_mode;
