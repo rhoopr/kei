@@ -3126,25 +3126,20 @@ async fn run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_res
         if phase == 3 {
             assert!(result.stats.full_enumeration_reason.is_none());
             assert_eq!(*requests.lock().unwrap(), ["recovered"]);
-            let conn = inner
-                .acquire_lock("capture does not clear historical debt")
-                .unwrap();
-            let receipt: String = conn
-                .query_row(
-                    "SELECT successor FROM provider_shadow_pages WHERE request_cursor='recovered'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(receipt, "recovered");
+            // Only the page carrying the DEBT deletion survives the restart.
+            // Both empty terminal pages are reclaimed after capture.
+            let conn = inner.acquire_lock("retained recovery page").unwrap();
             assert_eq!(
-                conn.query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_shadow_pages",
-                    [],
-                    |r| r.get(0)
-                )
-                .unwrap(),
-                3
+                conn.prepare("SELECT request_cursor, successor FROM provider_shadow_pages")
+                    .unwrap()
+                    .query_map([], |row| Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?
+                    )))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap(),
+                [("saved".to_owned(), "recovered".to_owned())]
             );
         }
     }
