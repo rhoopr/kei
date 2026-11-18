@@ -66,6 +66,21 @@ fn manifest_joined_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Man
 }
 
 impl SqliteStateDb {
+    /// Count references preserved by the v0.30 upgrade for display in `kei status`.
+    pub(crate) async fn archived_sparse_reference_count(&self) -> Result<i64, StateError> {
+        self.with_conn("archived_sparse_reference_count", |conn| {
+            // Fresh databases and upgrades from before sparse tracking have no snapshot.
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='historical_v030_unresolved_sparse_identities')",
+                [], |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(0);
+            }
+            Ok(conn.query_row("SELECT count(*) FROM historical_v030_unresolved_sparse_identities", [], |row| row.get(0))?)
+        }).await
+    }
+
     #[cfg(test)]
     pub(crate) async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
         self.with_conn("get_failed", move |conn| {

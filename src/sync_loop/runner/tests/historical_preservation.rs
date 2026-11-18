@@ -33,6 +33,7 @@ struct Session {
     zone: String,
     records: Vec<Value>,
     delta: Option<Vec<Value>>,
+    successor: Option<&'static str>,
     reject: bool,
     cancel: Option<CancellationToken>,
     trace: Arc<Mutex<Vec<String>>>,
@@ -53,7 +54,7 @@ impl PhotosSession for Session {
             }
             return Ok(
                 json!({"zones":[{"zoneID":{"zoneName":self.zone,"ownerRecordName":"_defaultOwner"},
-                "syncToken":"after", "moreComing": if self.reject {Value::Null} else {json!(false)},
+                "syncToken":self.successor.unwrap_or("after"), "moreComing": if self.reject {Value::Null} else {json!(false)},
                 "records": self.delta.as_ref().unwrap_or_else(|| if cursor == Some("before") {&self.records} else {&EMPTY})}]}),
             );
         }
@@ -102,6 +103,58 @@ impl PhotosSession for Session {
     }
 }
 static EMPTY: Vec<Value> = Vec::new();
+
+#[tokio::test]
+async fn fresh_start_sparse_history_and_current_primary_hold_survive_reopen() {
+    let mut f = Fixture::new("missing").await;
+    let evidence = r#"[1,"old-target","SharedSync-unselected","old-owner"]"#;
+    {
+        let conn = rusqlite::Connection::open(&f.database).unwrap();
+        conn.execute("INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at) VALUES ('PrimarySync','old-only',?1,?1,1,1)", [evidence]).unwrap();
+        conn.pragma_update(None, "user_version", 37).unwrap();
+    }
+    let baseline = f.cycle(CancellationToken::new(), false, false).await;
+    assert!(baseline.can_advance_database_checkpoint(), "{baseline:?}");
+    let db = f.open().await;
+    let cursor = db.get_metadata(CURSOR).await.unwrap().unwrap();
+    let before = db.get_summary().await.unwrap();
+    assert_eq!(before.unresolved_sparse_records, 0);
+    drop(db);
+
+    let sparse = crate::test_helpers::sparse_shared_asset_record();
+    f.session.delta = Some(vec![sparse.clone()]);
+    f.session.records.push(sparse.clone()); // exact source lookup
+    f.session.successor = Some("after-sparse");
+    assert_ne!(cursor, "after-sparse");
+    let media = files(&f.media);
+    for _ in 0..2 {
+        let held = f.cycle(CancellationToken::new(), false, false).await;
+        assert!(!held.can_advance_database_checkpoint(), "{held:?}");
+        assert_eq!(held.stats.downloaded, 0);
+        let db = f.open().await;
+        assert_eq!(db.get_metadata(CURSOR).await.unwrap(), Some(cursor.clone()));
+        let status = db.get_summary().await.unwrap();
+        assert_eq!(status.unresolved_sparse_records, 1);
+        assert_eq!(status.downloaded, before.downloaded);
+        assert_eq!(files(&f.media), media);
+        assert_eq!(
+            rows(
+                &f.database,
+                "SELECT source_record_name FROM unresolved_sparse_identities"
+            ),
+            vec![vec![rusqlite::types::Value::Text(
+                sparse["recordName"].as_str().unwrap().into()
+            )]]
+        );
+        assert_eq!(
+            rows(
+                &f.database,
+                "SELECT original_evidence FROM historical_v030_unresolved_sparse_identities WHERE library='PrimarySync' AND source_record_name='old-only'"
+            ),
+            vec![vec![rusqlite::types::Value::Text(evidence.into())]]
+        );
+    }
+}
 
 #[tokio::test]
 async fn fresh_start_current_sync_survives_invalid_historical_plans() {

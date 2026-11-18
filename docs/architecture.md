@@ -355,6 +355,8 @@ for operator steps and compatibility limits.
 
 ### Owned-schema upgrade backups
 
+`kei status` counts sparse references preserved in the v0.30 upgrade snapshot separately from current unresolved references. The archived count is informational: it does not schedule retries, hold a checkpoint or certify recovery of an original.
+
 Schema 38 establishes the v0.30 fresh-start boundary in the existing database. Before older migration steps interpret provider payloads, `state/schema.rs` copies historical provider inbox, catalog, selection, work, active-generation and sparse-identity rows into `historical_v030_*` tables and clears their active counterparts. It preserves zone and scoped database cursors, configuration checkpoints and historical identity holds in those snapshots, then removes their active authority. Preservation, retirement and schema advancement share one transaction. A failed upgrade restores the prior active state.
 
 The next selected-library sync uses the existing full-enumeration path to establish current work and a new checkpoint. Current provider failures, unresolved identities and unfinished current work retain their retry and checkpoint guards. Subsequent opens do not repeat retirement. Historical snapshots have no runtime writers or replay consumers. Current inbox capture remains active; removing that subsystem is a later simplification boundary.

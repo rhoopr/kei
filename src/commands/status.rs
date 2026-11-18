@@ -93,6 +93,12 @@ pub(crate) async fn run_status(
             summary.unresolved_sparse_records, summary.deferred_sparse_records
         );
     }
+    let archived = db.archived_sparse_reference_count().await?;
+    if archived > 0 {
+        println!(
+            "Archived sparse references: {archived} (preserved at upgrade; not active retries)"
+        );
+    }
     if !summary.metadata_capture.is_empty() {
         println!("Metadata capture:");
         for capture in &summary.metadata_capture {

@@ -259,6 +259,54 @@ fn status_reports_metadata_capture_retry_without_private_evidence() {
 }
 
 #[test]
+fn status_distinguishes_archived_sparse_evidence_from_current_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    conn.execute("INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at) VALUES ('PrimarySync','old-only',?1,?1,1,1)", [r#"[1,"private-target","SharedSync-private","private-owner"]"#]).unwrap();
+    conn.pragma_update(None, "user_version", 37).unwrap();
+    let status = || {
+        let out = clean_cmd()
+            .env("ICLOUD_USERNAME", username)
+            .env("KEI_DATA_DIR", dir.path())
+            .arg("status")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(out).unwrap()
+    };
+    // First open migrates the row; the second process must still report it.
+    status();
+    let output = status();
+    assert_eq!(conn.query_row("SELECT count(*) FROM historical_v030_unresolved_sparse_identities WHERE source_record_name='old-only'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    assert!(
+        !output.contains("Sparse identity recovery: 1 unresolved"),
+        "{output}"
+    );
+    let archived = "Archived sparse references: 1 (preserved at upgrade; not active retries)";
+    assert!(output.lines().any(|line| line == archived), "{output}");
+    conn.execute("INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at) VALUES ('PrimarySync','fresh-source','fresh-evidence','fresh-evidence',2,2)", []).unwrap();
+    let both = status();
+    assert!(both.lines().any(|line| line == archived), "{both}");
+    assert!(
+        both.contains("Sparse identity recovery: 1 unresolved"),
+        "{both}"
+    );
+    for private in [
+        "old-only",
+        "private-target",
+        "SharedSync-private",
+        "private-owner",
+        "fresh-source",
+        "fresh-evidence",
+    ] {
+        assert!(!both.contains(private), "{both}");
+    }
+}
+
+#[test]
 fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
@@ -327,6 +375,7 @@ fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Backup status: safe"));
     assert!(!stdout.contains("Sparse identity recovery:"));
+    assert!(!stdout.contains("Archived sparse references:"));
 }
 
 #[test]
