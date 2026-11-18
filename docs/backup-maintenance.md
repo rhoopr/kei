@@ -157,6 +157,8 @@ Schema 37 preserves old recent-selection receipts and records a one-time invento
 
 This proves current selected coverage, not an atomic provider snapshot, complete historical deletions or permission to delete local files. Completing it can retire the inventory request while a separate sparse-identity, expired-cursor or retained provider-work hold remains. Historical legacy certification is no longer a checkpoint requirement. Preserve the state and investigate any remaining hold rather than resetting it.
 
+After upgrading, let normal sync or watch continue to check previously downloaded records. Each successful or quiet cycle can check up to 32 historical identities after current work finishes. A record missing from a folder or lookup stays live unless iCloud explicitly confirms deletion. `kei manifest` reports `is_deleted` and `deleted_at` in JSON and CSV; a row can be both `downloaded` locally and deleted upstream. A null or empty deletion time means the provider supplied no known time. Local copies are kept.
+
 ### Historical legacy evidence
 
 Run normal `kei sync`; there is no certificate repair step. Preserved legacy records and old coverage certificates remain in the database, but sync no longer revalidates or writes those certificates. For already prepared records, a missing certificate or changed historical file alone does not force another inventory, fail the current cycle or make the process unhealthy. This retirement adds no schema migration and rewrites no files.

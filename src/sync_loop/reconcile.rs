@@ -2,6 +2,47 @@
 
 use crate::{download, state};
 
+/// Spend at most one provider request after current work across all selected
+/// libraries. This tail owns no checkpoint, transfer or watch wake decision.
+pub(super) async fn recover_historical_sources(
+    db: &state::SqliteStateDb,
+    libraries: &[crate::sync_cycle::LibraryState],
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(), state::error::StateError> {
+    let now = chrono::Utc::now().timestamp();
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
+    let zones = libraries
+        .iter()
+        .filter(|l| !l.plan_is_stale && l.library.last_indexing_finished())
+        .map(|l| l.zone_name.clone())
+        .collect();
+    if let Some((zone, ids)) = db.reserve_historical_sources(zones, now).await?
+        && let Some(library) = libraries.iter().find(|l| l.zone_name == zone)
+    {
+        let confirmed = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(()),
+            result = tokio::time::timeout(std::time::Duration::from_secs(5),library.library.historical_sources(&ids)) => result.unwrap_or_default(),
+        };
+        if ids.len() != confirmed.len() {
+            tracing::debug!(
+                deferred = ids.len() - confirmed.len(),
+                "Historical source checks deferred"
+            );
+        }
+        for (id, source) in confirmed {
+            if cancel.is_cancelled() {
+                break;
+            }
+            db.finish_historical_source(&library.zone_name, id, now, source)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Walk every `downloaded` row in the state DB and warn when the
 /// recorded `local_path` is missing. Read-only - no
 /// rows are mutated by this periodic full-catalog walk. Triggered on a fixed

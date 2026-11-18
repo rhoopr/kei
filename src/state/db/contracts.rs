@@ -1241,5 +1241,7 @@ pub(crate) struct ManifestAssetRow {
     pub(crate) media_type: String,
     pub(crate) status: String,
     pub(crate) albums: Vec<String>,
+    pub(crate) is_deleted: bool,
+    pub(crate) deleted_at: Option<DateTime<Utc>>,
     pub(crate) preserved_files: Vec<super::primary_layout::PreservedManifestFile>,
 }

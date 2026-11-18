@@ -700,7 +700,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             .await;
         }
 
+        let current_work_complete;
         if matches!(watch_precheck, WatchPrecheck::SkipAll) {
+            current_work_complete = true;
             cycle_reporter.report_skipped_watch_cycle(&mut health).await;
         } else {
             refresh_needed_library_plans(
@@ -802,16 +804,15 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 }
             }
 
+            let facts = crate::cycle_reporter::CycleFacts::new(
+                &cycle_result.stats,
+                cycle_result.failed_count,
+                cycle_result.session_expired,
+                cycle_started_at.elapsed(),
+            );
+            current_work_complete = facts.status == crate::cycle_reporter::CycleStatus::Success;
             cycle_reporter
-                .report_completed_cycle(
-                    &mut health,
-                    crate::cycle_reporter::CycleFacts::new(
-                        &cycle_result.stats,
-                        cycle_result.failed_count,
-                        cycle_result.session_expired,
-                        cycle_started_at.elapsed(),
-                    ),
-                )
+                .report_completed_cycle(&mut health, facts)
                 .await;
 
             // Handle aggregate outcome across all libraries
@@ -841,6 +842,16 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             } else {
                 reauth_attempts = 0;
             }
+        }
+
+        if current_work_complete
+            && !shutdown_token.is_cancelled()
+            && let Some(db) = startup_db.as_deref()
+            && super::reconcile::recover_historical_sources(db, &library_states, &shutdown_token)
+                .await
+                .is_err()
+        {
+            tracing::warn!("Historical source checks deferred after a state error");
         }
 
         // Periodic local-vs-state reconciliation. This full-catalog walk is

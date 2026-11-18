@@ -15,6 +15,85 @@ use crate::state::types::{AssetMetadata, AssetStatus, MediaType, VersionSizeKey}
 use crate::test_helpers::TestAssetRecord;
 
 #[tokio::test]
+async fn historical_deletion_check_limits_interrupted_work_and_rejects_stale_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let db = SqliteStateDb::open(&path).await.unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<33)
+        INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at)
+        SELECT 'PrimarySync',printf('%02d',i),'original','abc','still',1,10,'photo','downloaded',1 FROM n;
+        INSERT INTO historical_deletion_checks(library,id) SELECT library,id FROM assets;
+        INSERT INTO historical_deletion_checks(library,id) VALUES ('unselected','01');").unwrap();
+    let zones = || vec!["PrimarySync".to_owned()];
+    let (_, ids) = db
+        .reserve_historical_sources(zones(), 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ids.len(), 32);
+    drop(db); // interrupted between reservation and lookup
+    let db = SqliteStateDb::open(&path).await.unwrap();
+    assert_eq!(
+        db.reserve_historical_sources(zones(), 101)
+            .await
+            .unwrap()
+            .unwrap()
+            .1,
+        ["33"]
+    );
+    assert!(
+        db.reserve_historical_sources(zones(), 102)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (_, retry) = db
+        .reserve_historical_sources(zones(), 3700)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.len(), 32);
+    db.finish_historical_source(
+        "PrimarySync",
+        "01".into(),
+        100,
+        super::HistoricalSourceState::Deleted(None),
+    )
+    .await
+    .unwrap();
+    // A fresh observation wins even if its timestamp matches the old one.
+    conn.execute(
+        "UPDATE assets SET last_seen_at=last_seen_at WHERE id='02'",
+        [],
+    )
+    .unwrap();
+    db.finish_historical_source(
+        "PrimarySync",
+        "02".into(),
+        3700,
+        super::HistoricalSourceState::Deleted(None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT sum(is_deleted) FROM assets", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT retry_at FROM historical_deletion_checks WHERE library='unselected'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn verified_source_checksum_round_trip_is_path_and_rendition_scoped() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("state.db");

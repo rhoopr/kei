@@ -13,6 +13,7 @@ use super::queries::encode_params;
 use super::session::PhotosSession;
 use super::smart_folders::smart_folders;
 use crate::icloud::error::ICloudError;
+use crate::state::types::HistoricalSourceState;
 
 const ALBUM_TREE_DEPTH_LIMIT: usize = 64;
 const ALBUM_TREE_RECORD_LIMIT: usize = 12_800;
@@ -244,6 +245,93 @@ impl PhotoLibrary {
 
     pub(crate) fn selection_database(&self) -> &str {
         &self.library_type
+    }
+
+    /// One exact lookup scoped to this authenticated library. Errors, duplicate
+    /// members and missing scope are inconclusive, never absence evidence.
+    pub(crate) async fn historical_sources(
+        &self,
+        ids: &[String],
+    ) -> Vec<(String, HistoricalSourceState)> {
+        if !super::has_explicit_owner(self.zone_id.get("ownerRecordName"))
+            || self
+                .zone_id
+                .get("zoneName")
+                .and_then(Value::as_str)
+                .is_none()
+        {
+            return Vec::new();
+        }
+        let url = format!(
+            "{}/records/lookup?{}",
+            self.service_endpoint,
+            encode_params(&self.params)
+        );
+        let records: Vec<_> = ids.iter().map(|id| json!({"recordName":id})).collect();
+        let body = json!({"zoneID": self.zone_id.as_ref(), "records":records, "desiredKeys":["isDeleted","isExpunged","dateExpunged"]});
+        let Ok(response) = self
+            .session
+            .post(&url, body.to_string(), &[("Content-type", "text/plain")])
+            .await
+        else {
+            return Vec::new();
+        };
+        let Some(records) = response.get("records").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        if response.get("serverErrorCode").is_some()
+            || records.len() > ids.len()
+            || records.iter().any(|r| {
+                !ids.iter()
+                    .any(|id| Some(id.as_str()) == r["recordName"].as_str())
+            })
+        {
+            return Vec::new();
+        }
+        ids.iter()
+            .filter_map(|id| {
+                let mut matching = records
+                    .iter()
+                    .filter(|r| r["recordName"].as_str() == Some(id));
+                let record = matching.next()?;
+                if matching.next().is_some()
+                    || record.get("serverErrorCode").is_some()
+                    || !matches!(
+                        record["recordType"].as_str(),
+                        Some("CPLAsset" | "CPLMaster")
+                    )
+                    || record.pointer("/zoneID/zoneName") != self.zone_id.get("zoneName")
+                    || record.pointer("/zoneID/ownerRecordName")
+                        != self.zone_id.get("ownerRecordName")
+                {
+                    return None;
+                }
+                let flag = |v: Option<&Value>| match v {
+                    None => Some(false),
+                    Some(Value::Bool(b)) => Some(*b),
+                    Some(n) if n.as_i64() == Some(1) => Some(true),
+                    Some(n) if n.as_i64() == Some(0) => Some(false),
+                    _ => None,
+                };
+                let fields = &record["fields"];
+                let deleted = flag(record.get("deleted"))?
+                    | flag(fields.get("isDeleted").map(|f| &f["value"]))?
+                    | flag(fields.get("isExpunged").map(|f| &f["value"]))?;
+                let state = if deleted {
+                    HistoricalSourceState::Deleted(
+                        fields
+                            .pointer("/dateExpunged/value")
+                            .and_then(Value::as_f64)
+                            .and_then(super::asset::f64_to_millis_datetime),
+                    )
+                } else if fields.is_object() {
+                    HistoricalSourceState::Live
+                } else {
+                    return None;
+                };
+                Some((id.clone(), state))
+            })
+            .collect()
     }
 
     /// Only an explicit, exact, same-zone tombstone confirms album deletion.
@@ -1349,6 +1437,47 @@ mod tests {
             record["fields"]["parentId"] = json!({"type":"STRING","value":parent});
         }
         record
+    }
+
+    #[tokio::test]
+    async fn historical_deletion_check_requires_exact_scoped_evidence() {
+        let zone = json!({"zoneName":"PrimarySync", "ownerRecordName":"owner"});
+        let exact =
+            json!({"recordType":"CPLMaster","recordName":"old","deleted":true,"zoneID":zone});
+        for response in [
+            json!({"records":[exact.clone(), exact.clone()]}),
+            json!({"serverErrorCode":"BAD_REQUEST", "records":[exact.clone()]}),
+            json!({"records":[{"recordName":"old","serverErrorCode":"UNKNOWN_ITEM"}]}),
+            json!({"records":[{"recordName":"old","recordType":"CPLAsset","deleted":true}]}),
+            json!({"records":[{"recordName":"old","recordType":"CPLAsset","deleted":true,"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"foreign"}}]}),
+            json!({"records":[{"recordName":"old","recordType":"CPLAlbum","deleted":true,"zoneID":zone}]}),
+            json!({"records":[{"recordName":"old","recordType":"CPLAsset","zoneID":zone,"fields":{"isDeleted":{"value":"unknown"}}}]}),
+        ] {
+            let mut library =
+                make_library_with_session(Box::new(PaginatingFolderSession::new(vec![response])));
+            library.zone_id = Arc::new(zone.clone());
+            assert!(
+                library
+                    .historical_sources(&["old".into(), "omitted".into()])
+                    .await
+                    .is_empty()
+            );
+        }
+        let session = PaginatingFolderSession::new(vec![
+            json!({"records":[exact,{"recordName":"live","recordType":"CPLAsset","zoneID":zone,"fields":{}}]}),
+        ]);
+        let mut library = make_library_with_session(Box::new(session));
+        library.zone_id = Arc::new(zone);
+        let confirmed = library
+            .historical_sources(&["old".into(), "live".into()])
+            .await;
+        assert!(matches!(
+            confirmed.as_slice(),
+            [
+                (_, HistoricalSourceState::Deleted(None)),
+                (_, HistoricalSourceState::Live)
+            ]
+        ));
     }
 
     #[tokio::test]

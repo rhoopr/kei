@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 43;
+pub(crate) const SCHEMA_VERSION: i32 = 44;
 const FRESH_START_VERSION: i32 = 38;
 
 /// Retire provider planning authority once, without interpreting historical
@@ -1549,6 +1549,11 @@ pub(crate) fn migrate_to_version(
                 receipt TEXT NOT NULL
             );",
             )?;
+        }
+        44 => {
+            if !column_exists(conn, "historical_deletion_checks", "id")? {
+                conn.execute_batch(include_str!("historical_deletion.sql"))?;
+            }
         }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {

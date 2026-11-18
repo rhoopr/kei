@@ -43,6 +43,9 @@ struct Session {
 impl PhotosSession for Session {
     async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
         let body: Value = serde_json::from_str(&body)?;
+        if body["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(json!({"records":[{"fields":{"state":{"value":"FINISHED"}}}]}));
+        }
         if url.contains("/changes/zone?") {
             let cursor = body["zones"][0]["syncToken"].as_str();
             self.trace
@@ -103,6 +106,96 @@ impl PhotosSession for Session {
     }
 }
 static EMPTY: Vec<Value> = Vec::new();
+
+#[tokio::test]
+async fn historical_deletion_check_recovers_lookup_only_expunge_after_upgrade() {
+    let f = Fixture::new("missing").await;
+    let conn = rusqlite::Connection::open(&f.database).unwrap();
+    // Recreate the pre-baseline migration boundary. Neither the selected
+    // inventory nor its delta contains these previously downloaded rows.
+    conn.execute_batch("DROP TRIGGER historical_deletion_observed; DROP TRIGGER historical_deletion_inserted; DROP TABLE historical_deletion_checks; PRAGMA user_version=37;").unwrap();
+    for version in ["original", "live_original"] {
+        let path = f.media.join(version);
+        std::fs::write(&path, version.as_bytes()).unwrap();
+        conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,local_path) VALUES ('PrimarySync','expunged',?1,'hash','historical',1,8,'photo','downloaded',1,?2)",rusqlite::params![version,path.to_str().unwrap()]).unwrap();
+    }
+    drop(conn);
+    assert!(
+        f.cycle(CancellationToken::new(), false, false)
+            .await
+            .can_advance_database_checkpoint()
+    );
+    let db = f.open().await;
+    let cursor = db.get_metadata(CURSOR).await.unwrap().unwrap();
+    let zone = json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"});
+    let make_selected = |records: Vec<Value>| {
+        let zone = zone.clone();
+        async move {
+            let mut selected =
+                crate::sync_loop::test_support::make_run_cycle_library_state(ZONE, CURSOR, "after");
+            selected.library = PhotoLibrary::new(
+                "https://example.invalid".into(),
+                Arc::default(),
+                Box::new(Session {
+                    records,
+                    ..Default::default()
+                }),
+                Arc::new(zone),
+                "private".into(),
+                crate::retry::RetryConfig::default(),
+            )
+            .await
+            .unwrap();
+            selected
+        }
+    };
+    let tail = crate::sync_loop::reconcile::recover_historical_sources;
+    // An omitted lookup member remains live and retryable across reopen.
+    tail(
+        &db,
+        &[make_selected(Vec::new()).await],
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        db.reserve_historical_sources(vec![ZONE.to_owned()], chrono::Utc::now().timestamp())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop(db);
+    let db = f.open().await;
+    let conn = rusqlite::Connection::open(&f.database).unwrap();
+    assert_eq!(
+        conn.execute(
+            "UPDATE historical_deletion_checks SET retry_at=0 WHERE id='expunged' AND retry_at>0",
+            []
+        )
+        .unwrap(),
+        1
+    );
+    let exact = json!({"recordName":"expunged","recordType":"CPLAsset","zoneID":zone,"fields":{"isExpunged":{"value":1},"dateExpunged":{"value":1792537432000_i64}}});
+    let before = files(&f.media);
+    tail(
+        &db,
+        &[make_selected(vec![exact]).await],
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let manifest = db.get_manifest_assets().await.unwrap();
+    let recovered: Vec<_> = manifest
+        .iter()
+        .filter(|r| r.asset_id == "expunged")
+        .collect();
+    assert_eq!(recovered.len(), 2);
+    assert!(recovered.iter().all(|r| r.is_deleted
+        && r.status == "downloaded"
+        && r.deleted_at.unwrap().timestamp() == 1792537432));
+    assert_eq!(files(&f.media), before);
+    assert_eq!(db.get_metadata(CURSOR).await.unwrap().unwrap(), cursor);
+}
 
 #[tokio::test]
 async fn fresh_start_sparse_history_and_current_primary_hold_survive_reopen() {

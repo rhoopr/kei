@@ -40,6 +40,8 @@ fn manifest_joined_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Man
     let media_type: String = row.get(13)?;
     let status: String = row.get(14)?;
     let album_name: Option<String> = row.get(15)?;
+    let is_deleted: bool = row.get(16)?;
+    let deleted_at_ts: Option<i64> = row.get(17)?;
 
     Ok(ManifestJoinedRow {
         asset: ManifestAssetRow {
@@ -59,6 +61,8 @@ fn manifest_joined_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Man
             media_type,
             status,
             albums: Vec::new(),
+            is_deleted,
+            deleted_at: optional_ts_to_utc(deleted_at_ts),
             preserved_files: Vec::new(),
         },
         album_name,
@@ -565,7 +569,9 @@ impl SqliteStateDb {
                         a.last_seen_at,
                         a.media_type,
                         a.status,
-                        aa.album_name
+                        aa.album_name,
+                        a.is_deleted,
+                        a.deleted_at
                     FROM assets a
                     LEFT JOIN asset_albums aa
                         ON aa.library = a.library

@@ -7,6 +7,13 @@ use chrono::{DateTime, FixedOffset, Local, Utc};
 
 use crate::types::AssetVersionSize;
 
+/// Exact provider evidence for a previously downloaded identity. Omitted or
+/// ambiguous lookup members produce no confirmation.
+pub(crate) enum HistoricalSourceState {
+    Live,
+    Deleted(Option<DateTime<Utc>>),
+}
+
 pub(crate) mod embedded_absence {
     pub(crate) const RATING: u8 = 1;
     pub(crate) const DESCRIPTION: u8 = 2;

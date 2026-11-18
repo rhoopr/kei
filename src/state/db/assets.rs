@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-#[cfg(test)]
 use rusqlite::OptionalExtension;
 
 use super::asset_writes::{
@@ -24,9 +23,62 @@ use super::{
 use crate::state::error::StateError;
 #[cfg(test)]
 use crate::state::types::AssetStatus;
-use crate::state::types::{AssetRecord, METADATA_CAPTURE_REVISION, VersionSizeKey};
+use crate::state::types::{
+    AssetRecord, HistoricalSourceState, METADATA_CAPTURE_REVISION, VersionSizeKey,
+};
+
+const HISTORICAL_RETRY_SECONDS: i64 = 3600;
 
 impl SqliteStateDb {
+    /// Reserve one bounded batch. An interrupted or inconclusive lookup becomes
+    /// eligible again without blocking never-attempted identities.
+    pub(crate) async fn reserve_historical_sources(
+        &self,
+        libraries: Vec<String>,
+        now: i64,
+    ) -> Result<Option<(String, Vec<String>)>, StateError> {
+        self.with_conn("reserve_historical_sources", move |conn| {
+            // One indexed read per selected zone; an empty queue takes no write lock.
+            let mut due = conn.prepare("SELECT retry_at FROM historical_deletion_checks WHERE library=?1 AND retry_at<=?2 ORDER BY retry_at LIMIT 1")?;
+            let mut oldest = None;
+            for zone in libraries {
+                let at:Option<i64> = due.query_row(rusqlite::params![zone,now], |row| row.get(0)).optional()?;
+                if let Some(at) = at && oldest.as_ref().is_none_or(|(prior,_)| at < *prior) { oldest=Some((at,zone)); }
+            }
+            let Some((_, library)) = oldest else { return Ok(None) };
+            let mut statement = conn.prepare("UPDATE historical_deletion_checks SET retry_at=?3
+                WHERE library=?1 AND id IN (SELECT id FROM historical_deletion_checks
+                    WHERE library=?1 AND retry_at<=?2 ORDER BY retry_at,id LIMIT 32) RETURNING id")?;
+            let ids:Vec<String> = statement.query_map(rusqlite::params![library, now, now + HISTORICAL_RETRY_SECONDS], |row| row.get(0))?.collect::<Result<_,_>>()?;
+            Ok((!ids.is_empty()).then_some((library,ids)))
+        }).await
+    }
+
+    pub(crate) async fn finish_historical_source(
+        &self,
+        library: &str,
+        id: String,
+        reserved_at: i64,
+        source: HistoricalSourceState,
+    ) -> Result<(), StateError> {
+        let library = library.to_owned();
+        self.with_conn_mut("finish_historical_source", move |conn| {
+            let tx = conn.transaction()?;
+            // Claim before applying so a superseding observation, reservation
+            // or another finisher always wins. Any guard failure rolls back.
+            if tx.execute("DELETE FROM historical_deletion_checks WHERE library=?1 AND id=?2 AND retry_at=?3", rusqlite::params![library,id,reserved_at + HISTORICAL_RETRY_SECONDS])? != 0
+                && let HistoricalSourceState::Deleted(at) = source {
+                ensure_asset_has_no_prepared_capture_repair(&tx,&library,&id,"finish_historical_source")?;
+                tx.execute("UPDATE assets SET is_deleted=1, deleted_at=COALESCE(?3,deleted_at)
+                    WHERE library=?1 AND id=?2 AND status='downloaded' AND is_deleted=0 AND source='icloud'
+                      AND NOT EXISTS (SELECT 1 FROM unattributed_legacy p WHERE p.library=assets.library AND p.asset_id=assets.id)",
+                    rusqlite::params![library,id,at.map(|d|d.timestamp())])?;
+            }
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
     #[cfg(test)]
     pub(crate) async fn should_download(
         &self,
