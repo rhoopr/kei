@@ -1775,6 +1775,18 @@ async fn prepare(
                 metadata_ok,
                 "Primary layout metadata preparation is incomplete"
             );
+            // Only a replacement of an owned path needs to read as changed; a first
+            // publication keeps the capture mtime written by the download.
+            if member.old.is_some()
+                && let Some(edited_at) = asset.media_modified_at(expected.version_size)
+            {
+                file::primary_layout::keep_provider_modified(
+                    &config.directory,
+                    &stage,
+                    edited_at.into(),
+                )
+                .await?;
+            }
             let mut prepared = file_receipt(
                 &config.directory,
                 &stage,
