@@ -17,7 +17,7 @@ use super::collisions::{
 };
 use super::eligibility::determine_media_type;
 use super::expected_paths::{DerivedPath, raw_filename};
-use super::metadata::{MetadataPayload, build_payload};
+use super::metadata::{MetadataPayload, build_selected_payload};
 use super::{
     DerivationContext, derive_alternative_extra, derive_edited_extra, derive_live_edited_extra,
     derive_mov_companion, derive_primary,
@@ -144,7 +144,6 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
     }
 
     if config.edited_naming == crate::types::EditedNaming::Primary {
-        let metadata = build_payload(asset, config);
         return Ok(super::derive_expected_paths(asset, config)
             .into_iter()
             .map(|d| DownloadTask {
@@ -156,7 +155,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),
                 library: Arc::from(asset.source_zone().unwrap_or(&config.library)),
-                metadata: Arc::clone(&metadata),
+                metadata: build_selected_payload(asset, config, d.version_size),
                 size: d.size,
                 created_local: asset.created_local(),
                 version_size: d.version_size,
@@ -165,7 +164,6 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
             .collect());
     }
     let ctx = DerivationContext::build(asset, config);
-    let payload = build_payload(asset, config);
     let mut tasks = Vec::with_capacity(5);
     let mut effective_primary_filename: Option<String> = None;
     let mut seen_urls = Vec::<Box<str>>::with_capacity(4);
@@ -232,7 +230,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),
                 library: Arc::clone(&task_library),
-                metadata: Arc::clone(&payload),
+                metadata: build_selected_payload(asset, config, version_size),
                 size,
                 created_local: ctx.created_local,
                 version_size,
@@ -302,7 +300,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),
                 library: Arc::clone(&task_library),
-                metadata: Arc::clone(&payload),
+                metadata: build_selected_payload(asset, config, version_size),
                 size,
                 created_local: ctx.created_local,
                 version_size,
@@ -367,7 +365,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),
                 library: task_library,
-                metadata: Arc::clone(&payload),
+                metadata: build_selected_payload(asset, config, version_size),
                 size,
                 created_local: ctx.created_local,
                 version_size,

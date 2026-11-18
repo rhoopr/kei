@@ -19,6 +19,7 @@ impl<T> DownloadFinalizationStore for T where T: DownloadStateStore + MetadataRe
 /// Accumulated during download loops and retried in a final flush.
 #[derive(Debug)]
 pub(super) struct PendingStateWrite {
+    pub(super) embedded_fields: Box<crate::state::types::EmbeddedMetadataFields>,
     pub(super) library: Arc<str>,
     pub(super) asset_id: Arc<str>,
     pub(super) version_size: VersionSizeKey,
@@ -82,10 +83,15 @@ where
         exif_ok,
         mark_capture_repair,
         None,
+        Default::default(),
     )
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "field ownership and retained media are independent finalization evidence"
+)]
 pub(super) async fn finalize_downloaded_with_proof<D>(
     db: &D,
     library: &Arc<str>,
@@ -95,6 +101,7 @@ pub(super) async fn finalize_downloaded_with_proof<D>(
     exif_ok: bool,
     mark_capture_repair: bool,
     retained: Option<Arc<super::file::RetainedPendingFile>>,
+    embedded_fields: Box<crate::state::types::EmbeddedMetadataFields>,
 ) -> DownloadedFinalization
 where
     D: DownloadFinalizationStore + ?Sized,
@@ -102,6 +109,7 @@ where
     #[cfg(all(test, target_os = "linux"))]
     crate::test_helpers::process_death_point("published");
     let write = PendingStateWrite {
+        embedded_fields,
         library: Arc::clone(library),
         asset_id: task.asset_id.clone(),
         version_size: task.version_size,
@@ -127,10 +135,13 @@ where
             &write.local_checksum,
             write.download_checksum.as_deref(),
             mark_capture_repair,
+            &write.embedded_fields,
         )
         .await
     {
         Ok(()) => {
+            #[cfg(all(test, target_os = "linux"))]
+            crate::test_helpers::process_death_point("download-state-committed");
             update_metadata_marker(
                 db,
                 library,
@@ -251,7 +262,7 @@ async fn retry_pending_state_write<D>(
     pending_count: usize,
 ) -> bool
 where
-    D: DownloadStateStore + ?Sized,
+    D: DownloadFinalizationStore + ?Sized,
 {
     use rand::RngExt;
 
@@ -261,7 +272,7 @@ where
                 "Publication validation or durability failed; retaining media and pending debt");
             return false;
         }
-        match db
+        let result = db
             .mark_verified_download(
                 &write.library,
                 &write.asset_id,
@@ -270,9 +281,10 @@ where
                 &write.local_checksum,
                 write.download_checksum.as_deref(),
                 write.mark_capture_repair,
+                &write.embedded_fields,
             )
-            .await
-        {
+            .await;
+        match result {
             Ok(()) => {
                 if attempt > 1 {
                     tracing::info!(
@@ -317,7 +329,7 @@ pub(super) async fn flush_pending_state_writes_retaining_failures<D>(
     pending: &mut Vec<PendingStateWrite>,
 ) -> StateWriteFlush
 where
-    D: DownloadStateStore + ?Sized,
+    D: DownloadFinalizationStore + ?Sized,
 {
     if pending.is_empty() {
         return StateWriteFlush::default();
@@ -358,7 +370,7 @@ where
 /// Returns the number of writes that still failed after all retries.
 pub(super) async fn flush_pending_state_writes<D>(db: &D, pending: &[PendingStateWrite]) -> usize
 where
-    D: DownloadStateStore + ?Sized,
+    D: DownloadFinalizationStore + ?Sized,
 {
     if pending.is_empty() {
         return 0;
@@ -400,7 +412,7 @@ pub(super) async fn check_state_write_circuit_breaker<D>(
     pending: &mut Vec<PendingStateWrite>,
 ) -> Option<anyhow::Error>
 where
-    D: DownloadStateStore + ?Sized,
+    D: DownloadFinalizationStore + ?Sized,
 {
     if pending.len() < STATE_DB_UNWRITABLE_THRESHOLD {
         return None;
@@ -549,6 +561,7 @@ mod tests {
             true,
             false,
             Some(proof),
+            Default::default(),
         )
         .await;
         let DownloadedFinalization::Deferred { write, .. } = result else {
@@ -660,6 +673,7 @@ mod tests {
                 true,
                 false,
                 if missing { None } else { Some(proof) },
+                Default::default(),
             )
             .await;
             let DownloadedFinalization::Deferred { write, .. } = result else {

@@ -271,6 +271,7 @@ fn decision(asset: &PhotoAsset, config: &DownloadConfig) -> Result<String> {
         1,
         super::config::hash_download_config(config),
         crate::download::pipeline::MetadataFlags::from(config).bits(),
+        crate::download::pipeline::MetadataFlags::POLICY_REVISION,
         format!("{:?}", config.capture_timestamp_repair),
         asset.asset_record_name(),
         asset.created(),
@@ -289,10 +290,31 @@ fn metadata_decision(
         version.as_str(),
         checksum,
         crate::download::pipeline::MetadataFlags::from(config).bits(),
+        crate::download::pipeline::MetadataFlags::POLICY_REVISION,
         format!("{:?}", config.capture_timestamp_repair),
         asset.created(),
         filter::build_selected_payload(asset, config, version)
     ]))?))
+}
+
+async fn load_source_fields(
+    db: &dyn DownloadStore,
+    library: &str,
+    id: &str,
+    file: &mut LayoutFile,
+) -> Result<()> {
+    if let Some(receipt) = db
+        .embedded_metadata_receipt(library, id, &file.version, &file.path.to_path(), None)
+        .await?
+    {
+        let checksum = data_encoding::HEXLOWER.encode(&file.fingerprint.sha256);
+        if checksum == receipt.output_checksum {
+            *file.embedded_fields = receipt.written;
+        } else if !receipt.published && checksum == receipt.input_checksum {
+            *file.embedded_fields = receipt.previous;
+        }
+    }
+    Ok(())
 }
 
 async fn file_receipt(
@@ -305,6 +327,7 @@ async fn file_receipt(
     Ok(LayoutFile {
         local_preserved: false,
         local_modified: None,
+        embedded_fields: Default::default(),
         path: SelectionPath::from_path(path),
         version: version.to_owned(),
         provider_checksum: checksum.to_owned(),
@@ -832,6 +855,9 @@ async fn plan(
                     file.fingerprint == actual,
                     "Legacy layout media changed during ownership verification"
                 );
+                if let Some(db) = db {
+                    load_source_fields(db, &record.library, &record.id, &mut file).await?;
+                }
                 oldfiles.push(file);
             }
         }
@@ -858,6 +884,9 @@ async fn plan(
             observed.local_preserved = true;
             observed.local_modified = current.modified.map(chrono::DateTime::<chrono::Utc>::from);
             observed.archive_original = old.archive_original;
+            if !changed {
+                observed.embedded_fields = old.embedded_fields;
+            }
             old = observed;
         } else {
             old.local_modified = None;
@@ -1341,7 +1370,7 @@ async fn prepare(
                 if data_encoding::HEXLOWER.encode(&actual.sha256) == *checksum {
                     #[cfg(test)]
                     crate::test_helpers::primary_source_snapshot_point(path).await?;
-                    let candidate = file_receipt(
+                    let mut candidate = file_receipt(
                         &config.directory,
                         path,
                         record.version_size.as_str(),
@@ -1353,6 +1382,7 @@ async fn prepare(
                         candidate.fingerprint == actual,
                         "Retained primary source changed while proving its receipt"
                     );
+                    load_source_fields(db, &op.library, &op.child, &mut candidate).await?;
                     found = Some(candidate);
                     break;
                 }
@@ -1361,6 +1391,7 @@ async fn prepare(
         };
         let transform = metadata_decision(asset, config, record.version_size, &record.checksum)?;
         let prepared = if let Some(source) = source {
+            let mut embedded_fields = source.embedded_fields.clone();
             let media = copy_verified(
                 &config.directory,
                 &source.path.to_path(),
@@ -1396,6 +1427,11 @@ async fn prepare(
                     size: media.size,
                     sha256: media.sha256,
                 };
+                let mut payload =
+                    filter::build_selected_payload(asset, config, record.version_size);
+                Arc::make_mut(&mut payload)
+                    .prior_embedded
+                    .clone_from(&source.embedded_fields);
                 let written = crate::download::metadata_rewrite::write_download_metadata(
                     crate::download::metadata_rewrite::MetadataWriteRequest {
                         final_path: &stage,
@@ -1403,7 +1439,7 @@ async fn prepare(
                         expected_embed_fingerprint: Some(fingerprint),
                         source_checksum: source.source_checksum.as_deref(),
                         sidecar_path: Some(&stage),
-                        payload: filter::build_selected_payload(asset, config, record.version_size),
+                        payload,
                         created_local: asset.created_local(),
                         flags,
                         capture_timestamp_repair: config.capture_timestamp_repair,
@@ -1415,6 +1451,7 @@ async fn prepare(
                     !written.any_failed() && !written.embed_input_changed,
                     "Prepared primary metadata remains incomplete"
                 );
+                embedded_fields = written.embedded_fields;
             }
             let mut prepared = file_receipt(
                 &config.directory,
@@ -1429,6 +1466,7 @@ async fn prepare(
                 .local_preserved
                 .then_some(source.local_modified)
                 .flatten();
+            prepared.embedded_fields = embedded_fields;
             prepared
         } else {
             anyhow::ensure!(
@@ -1452,7 +1490,7 @@ async fn prepare(
                 shutdown_token: cancel,
                 mode: crate::personality::Mode::Off,
             };
-            let (metadata_ok, checksum, source_checksum, bytes, disk, _) =
+            let (metadata_ok, checksum, source_checksum, bytes, disk, _, embedded_fields) =
                 crate::download::pipeline::download_single_task(
                     client,
                     &task,
@@ -1465,7 +1503,7 @@ async fn prepare(
                 metadata_ok,
                 "Primary layout metadata preparation is incomplete"
             );
-            let prepared = file_receipt(
+            let mut prepared = file_receipt(
                 &config.directory,
                 &stage,
                 record.version_size.as_str(),
@@ -1473,6 +1511,7 @@ async fn prepare(
                 source_checksum,
             )
             .await?;
+            prepared.embedded_fields = embedded_fields;
             anyhow::ensure!(
                 data_encoding::HEXLOWER.encode(&prepared.fingerprint.sha256) == checksum,
                 "Prepared primary checksum changed"

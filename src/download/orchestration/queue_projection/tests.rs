@@ -4326,14 +4326,14 @@ async fn destination_reopen_fixture_with_signature(
         assert_eq!(std::fs::read(&b).unwrap(), media);
         if backlog {
             assert!(
-                std::fs::read_to_string(backlog_tail.with_file_name("backlog-tail.JPG.xmp"))
-                    .unwrap()
-                    .contains("current")
+                !backlog_tail.with_file_name("backlog-tail.JPG.xmp").exists(),
+                "unselected historical markers cannot authorize metadata writes"
             );
+            assert_eq!(std::fs::read(&backlog_tail).unwrap(), media);
             let conn =
-                f.db.acquire_lock("failed prefix survives healthy tail")
+                f.db.acquire_lock("historical evidence survives current completion")
                     .unwrap();
-            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM assets WHERE library='MetadataBacklog' AND metadata_write_failed_at IS NOT NULL",[],|r|r.get(0)).unwrap(),501);
+            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM assets WHERE library='MetadataBacklog' AND metadata_write_failed_at IS NOT NULL",[],|r|r.get(0)).unwrap(),502);
         }
         f.preserved().await;
     }
@@ -4709,7 +4709,8 @@ async fn private_metadata_recovery_fixture_with_signature(
     .unwrap();
     assert!(
         matches!(recovered.outcome, crate::download::DownloadOutcome::Success),
-        "{recovered:?}; warnings: {:?}",
+        "{recovered:?}; receipts: {:?}; warnings: {:?}",
+        f.db.acquire_lock("failed recovery evidence").unwrap().prepare("SELECT generation,path,local_checksum,prepared_checksum,embedded_metadata_receipt FROM provider_active_destinations ORDER BY generation,path").unwrap().query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,Option<String>>(4)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap(),
         trace
             .events()
             .iter()
@@ -4868,6 +4869,8 @@ async fn private_unresolved_recovery_fixture(drift: bool, native: bool, incompat
     assert!(!native);
     f.config.folder_structure_albums = Arc::from("{album}");
     f.config.metadata.xmp_sidecar = true;
+    f.config.metadata.include_people = true;
+    f.config.metadata.include_albums = true;
     let mut observed = records("m", CURRENT, "healthy-title");
     observed.extend(records("c", CURRENT, "later-title"));
     for pair in observed.chunks_mut(2) {
@@ -6928,7 +6931,7 @@ async fn unsupported_smart_selector_refuses_before_work_and_preserves_retained_d
 
 #[cfg(feature = "xmp")]
 #[tokio::test]
-async fn private_current_destination_and_retained_tail_progress_past_501_failed_writers() {
+async fn private_current_destination_ignores_502_unselected_metadata_markers() {
     Box::pin(destination_reopen_fixture(false, true, true)).await;
 }
 
@@ -7202,6 +7205,8 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
         (std::time::SystemTime, std::time::SystemTime, bool),
     );
     let mut stable: Option<Vec<WriterSnapshot>> = None;
+    let mut known_generations = std::collections::BTreeSet::new();
+    let mut current_generation = None;
     for cycle in 0..cycles {
         if cycle > 0 {
             f = reopen_destination_fixture(f).await;
@@ -7229,11 +7234,27 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
             let conn =
                 f.db.acquire_lock("physical writer versus pass obligation oracle")
                     .unwrap();
+            let generations = conn
+                .prepare("SELECT id FROM provider_active_generations")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()
+                .unwrap();
+            let added: Vec<_> = generations
+                .difference(&known_generations)
+                .cloned()
+                .collect();
+            assert_eq!(added.len(), usize::from(cycle < 3));
+            if let Some(generation) = added.into_iter().next() {
+                current_generation = Some(generation);
+            }
+            known_generations = generations;
             assert_eq!(conn.query_row::<(i64,i64),_,_>("SELECT count(DISTINCT path),count(*) FROM provider_active_destinations WHERE verified_media=1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap(),(i64::try_from(2*writers).unwrap(),i64::try_from(2*writers*(cycle.min(2)+1)).unwrap()));
             assert_eq!(
                 conn.query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_active_destinations WHERE verified_metadata=0",
-                    [],
+                    "SELECT count(*) FROM provider_active_destinations WHERE verified_metadata=0 AND generation=?1",
+                    [&current_generation],
                     |r| r.get(0)
                 )
                 .unwrap(),
@@ -7242,7 +7263,7 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
                 } else {
                     0
                 },
-                "cycle {cycle}: each reseed revalidates exact metadata receipts within the writer budget; the first unchanged cycle drains the remainder"
+                "cycle {cycle}: current destinations respect the writer budget and finish after an unchanged cycle; historical rows are not replayed"
             );
         }
         let paths: Vec<_> = {
@@ -7291,7 +7312,7 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
                 .iter()
                 .filter(|(_, (_, _, complete))| *complete)
                 .count(),
-            if cycle == 0 {
+            if cycle < 3 {
                 (2 * writers).min(budget)
             } else {
                 2 * writers
@@ -7915,7 +7936,7 @@ async fn selected_destination_retry_fixture(
         .mount(&server)
         .await;
     let mut f = Fixture::new().await;
-    f.config.folder_structure_albums = Arc::from("{album}");
+    f.config.folder_structure_albums = Arc::from("{album}/copies");
     f.config.retry.max_retries = 0;
     f.config.capture_timestamp_repair = capture_timestamp_repair;
     if !captured {
@@ -7923,10 +7944,6 @@ async fn selected_destination_retry_fixture(
         f.config.library = Arc::clone(&f.session.zone_name);
         f.session.records.lock().unwrap()[1]["fields"]["masterRef"]["value"]["zoneID"]["zoneName"] =
             json!(f.session.zone_name.as_ref());
-    }
-    for album in failed_album.into_iter().flatten() {
-        std::fs::create_dir_all(&f.config.directory).unwrap();
-        std::fs::write(f.config.directory.join(album), b"blocked parent").unwrap();
     }
     f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/media",server.uri()),"size":bytes.len(),"fileChecksum":checksum});
     let historical = f.config.directory.join("historical/never-recreate.JPG");
@@ -7956,7 +7973,7 @@ async fn selected_destination_retry_fixture(
         if round > 0 {
             if round == 1 {
                 for album in failed_album.into_iter().flatten() {
-                    std::fs::remove_file(f.config.directory.join(album)).unwrap();
+                    std::fs::remove_file(f.config.directory.join(album).join("copies")).unwrap();
                 }
             }
             f = reopen_destination_fixture(f).await;
@@ -7973,6 +7990,24 @@ async fn selected_destination_retry_fixture(
                 pass
             })
         };
+        if round == 0 && failed_album.is_some() {
+            // A preexisting album root is a valid collision and selects a
+            // sibling. Block the required parent *inside* the bound root.
+            crate::download::orchestration::album_directory::prepare(
+                &passes,
+                &f.config,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            for album in failed_album.into_iter().flatten() {
+                std::fs::write(
+                    f.config.directory.join(album).join("copies"),
+                    b"blocked parent",
+                )
+                .unwrap();
+            }
+        }
         let result = crate::download::download_photos_with_sync(
             &reqwest::Client::new(),
             &passes,
@@ -7993,8 +8028,8 @@ async fn selected_destination_retry_fixture(
             trace.events()
         );
         let paths = [
-            f.config.directory.join("A/changed.JPG"),
-            f.config.directory.join("B/changed.JPG"),
+            f.config.directory.join("A/copies/changed.JPG"),
+            f.config.directory.join("B/copies/changed.JPG"),
         ];
         if round == 0 {
             assert!(matches!(
@@ -8228,7 +8263,7 @@ async fn private_multi_destination_raw_edited_alternative_and_companion_failure_
 
 #[cfg(unix)]
 #[tokio::test]
-async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflicts_then_recover() {
+async fn private_selected_paths_qualify_around_regular_leaf_and_parent_symlink_conflicts() {
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::symlink;
     use wiremock::matchers::{method, path};
@@ -8277,11 +8312,7 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
         )
         .await
         .unwrap();
-        assert_eq!(
-            first.stats.downloaded,
-            if kind == "parent" { 1 } else { 2 },
-            "{kind}: {first:?}"
-        );
+        assert_eq!(first.stats.downloaded, 2, "{kind}: {first:?}");
         assert_eq!(
             std::fs::read(&outside_media).unwrap(),
             b"outside-owned-media"
@@ -8300,8 +8331,9 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
             assert!(std::fs::symlink_metadata(&conflict).unwrap().is_symlink());
         }
         if kind == "parent" {
-            assert!(first.checkpoint.sync_token_blocked);
-            assert!(first.sync_token.is_none());
+            assert!(std::fs::symlink_metadata(&album).unwrap().is_symlink());
+            assert!(!first.checkpoint.sync_token_blocked);
+            assert!(first.sync_token.is_some());
             assert_eq!(
                 f.db.acquire_lock("parent symlink cannot receive proof")
                     .unwrap()
@@ -8311,26 +8343,10 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
                         |r| r.get(0)
                     )
                     .unwrap(),
-                1
+                0
             );
-            // Remove only the owned fixture link. No existing target is changed.
-            std::fs::remove_file(&album).unwrap();
-            std::fs::create_dir(&album).unwrap();
-            drop(passes);
-            f = reopen_destination_fixture(f).await;
-            let recovered = crate::download::download_photos_with_sync(
-                &reqwest::Client::new(),
-                &[destination_pass(&f, "A"), destination_pass(&f, "B")],
-                Arc::new(f.config.clone()),
-                controls(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-            assert_eq!(recovered.stats.downloaded, 1, "{recovered:?}");
-        } else {
-            drop(passes);
         }
+        drop(passes);
         let verified: Vec<(String, String)> = {
             let conn =
                 f.db.acquire_lock("every destination has actual confined bytes")
@@ -8353,12 +8369,10 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
             );
             assert!(!std::fs::symlink_metadata(&path).unwrap().is_symlink());
             assert!(path.starts_with(&f.config.directory));
-            if kind != "parent" {
-                assert_ne!(
-                    path, conflict,
-                    "ordinary collision cannot overwrite the conflicting entry"
-                );
-            }
+            assert_ne!(
+                path, conflict,
+                "collision qualification cannot use the conflicting entry"
+            );
         }
         let lookups = f.session.calls.load(Ordering::SeqCst);
         let ranks = f.session.rank_calls.load(Ordering::SeqCst);
@@ -8386,6 +8400,9 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
             std::fs::read(&outside_sidecar).unwrap(),
             b"outside-owned-sidecar"
         );
+        if kind == "parent" {
+            assert!(std::fs::symlink_metadata(&album).unwrap().is_symlink());
+        }
     }
 }
 

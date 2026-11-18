@@ -327,15 +327,23 @@ pub struct UiConfig {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MetadataConfig {
     pub set_exif_datetime: bool,
+    /// Fill absent orientation only for checksum-qualified, untransformed originals.
+    pub set_exif_orientation: bool,
     pub set_exif_rating: bool,
     pub set_exif_gps: bool,
     pub set_exif_description: bool,
-    /// Embed the full XMP packet into the file bytes on supported formats.
+    /// Embed standard title and keyword fields on supported formats.
     #[cfg(feature = "xmp")]
     pub embed_xmp: bool,
     /// Write a `.xmp` sidecar file next to each downloaded media file.
     #[cfg(feature = "xmp")]
     pub xmp_sidecar: bool,
+    /// Include album names in embedded or sidecar keywords.
+    #[cfg(feature = "xmp")]
+    pub include_albums: bool,
+    /// Include named people in embedded or sidecar metadata.
+    #[cfg(feature = "xmp")]
+    pub include_people: bool,
 }
 
 #[derive(Debug)]

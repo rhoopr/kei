@@ -126,7 +126,7 @@ pub(crate) struct SelectionMetadataReceipt {
     pub(crate) pass_key: String,
     pub(crate) child: String,
     pub(crate) grouping_hash: String,
-    pub(crate) metadata_flags: u8,
+    pub(crate) metadata_flags: u16,
     pub(crate) prepared: Option<(String, u64)>,
     pub(crate) preserved_local: Option<PreservedLocal>,
 }
@@ -495,9 +495,16 @@ pub trait DownloadStateStore: Send + Sync {
     /// any kei metadata write. Adoption and local reconciliation must instead
     /// use `mark_downloaded` or `mark_downloaded_with_capture_repair`.
     /// Stores without source-provenance support retain unknown evidence.
+    /// `embedded_fields` contains only measured changes in an installed output;
+    /// identical-existing deduplication must pass empty evidence. Implementations
+    /// commit these fields atomically with downloaded status and native authority.
     ///
     /// # Errors
     /// Returns a state error if downloaded-state finalization fails.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "installed field evidence must commit with existing download and capture-repair evidence"
+    )]
     async fn mark_verified_download(
         &self,
         library: &str,
@@ -507,7 +514,15 @@ pub trait DownloadStateStore: Send + Sync {
         local_checksum: &str,
         download_checksum: Option<&str>,
         mark_capture_repair: bool,
+        embedded_fields: &crate::state::types::EmbeddedMetadataFields,
     ) -> Result<(), StateError> {
+        if *embedded_fields != Default::default() {
+            return Err(StateError::Invariant {
+                operation: "mark_verified_download",
+                detail: "atomic embedded metadata publication is not implemented by this store"
+                    .into(),
+            });
+        }
         self.mark_downloaded_with_capture_repair(
             library,
             id,
@@ -978,6 +993,32 @@ pub enum SourceMetadataRecovery {
 /// Metadata rewrite markers and hashes.
 #[async_trait]
 pub trait MetadataRewriteStore: Send + Sync {
+    /// Accept an exact previously prepared output without completing current intent.
+    async fn recover_embedded_metadata_receipt(
+        &self,
+        _pending: &PendingMetadataRewrite,
+        _receipt: &crate::state::types::EmbeddedMetadataReceipt,
+        _output_size: u64,
+    ) -> Result<(), StateError> {
+        Err(StateError::ProviderSelectionInvalid)
+    }
+    async fn embedded_metadata_receipt(
+        &self,
+        _library: &str,
+        _id: &str,
+        _version: &str,
+        _path: &Path,
+        _pending: Option<&PendingMetadataRewrite>,
+    ) -> Result<Option<crate::state::types::EmbeddedMetadataReceipt>, StateError> {
+        Ok(None)
+    }
+    async fn record_embedded_metadata_receipt(
+        &self,
+        _pending: &PendingMetadataRewrite,
+        _receipt: &crate::state::types::EmbeddedMetadataReceipt,
+    ) -> Result<(), StateError> {
+        Err(StateError::ProviderSelectionInvalid)
+    }
     /// Original media and exact sidecars protected before or after preparation.
     async fn protected_legacy_paths(&self) -> Result<Vec<PathBuf>, StateError> {
         Ok(Vec::new())

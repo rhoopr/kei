@@ -84,6 +84,8 @@ offline tests run in `just test offline` and `just gate` without credentials.
 
 ## Album directory transition checks
 
+`cargo test --lib initial_download_embedded_description_ownership -- --test-threads=1` kills a real sync worker after downloaded-state commit, reopens the database, and delivers an explicit provider description clear. It checks durable field ownership, preservation of unmanaged native metadata, zero recovery downloads, and two quiet reopens. Run with `--no-default-features` for both UTF-8 and non-UTF-8 roots; the default XMP toolkit supports only the UTF-8 fixture. `ordinary_metadata_ownership_survives_managed_adoption_and_clear` covers the same ownership handoff through managed layout adoption, and `identical_existing_publication_does_not_acquire_temporary_field_ownership` checks that discarded temporary metadata cannot authorize clearing an existing file.
+
 `cargo test --lib album_directory_ -- --test-threads=1` covers exclusive initial binding, normal-sync rename with foreign-target collisions, current source ownership, retained historical receipts, current-path missing-file repair, failed state finalization, and Linux SIGKILL recovery before movement, after movement, and after parent durability. Run the same filter with `--no-default-features` for the native build. Successful transitions reopen for two quiet cycles. The schema test checks migration from schema 39 with native authority, preserved-local evidence and pending layout bytes retained across two reopens. The subprocess parent owns the ignored `album_directory_process_death_child` test and its private fixture environment; do not run that child directly. Directory tests use synthetic provider responses and local media. `cargo test --lib album_discovery_` and `cargo test --lib album_delta_` check usable provider names, duplicate leaves, tombstones, and checkpoint refusal for malformed live names.
 
 ## HEIF streaming allocation regression
@@ -1376,7 +1378,7 @@ mutations before unchanged success.
 
 `behavioral::released_upgrade::released_v0240_history_preserves_durable_evidence_through_upgrade`
 starts from the SQL schema emitted by the official v0.24.0 Linux x86_64
-binary (schema 25), then executes the current production CLI through schema 40.
+binary (schema 25), then executes the current production CLI through schema 41.
 The fixture contains no captured user data. SQL explicitly reconstructs a
 synthetic history with original and edited renditions, repeated IDs in two
 libraries, a local removal, metadata debt, an unfinished sync ledger row,

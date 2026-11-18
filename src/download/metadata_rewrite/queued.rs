@@ -174,14 +174,14 @@ where
             };
         }
     };
-    run_pending_rows(
+    Box::pin(run_pending_rows(
         db,
         metadata_flags,
         capture_timestamp_repair,
         temp_suffix,
         shutdown_token,
         pending,
-    )
+    ))
     .await
 }
 
@@ -212,9 +212,8 @@ where
     let needs_groupings = metadata_flags.uses_xmp_groupings()
         || pending.iter().any(|row| {
             row.selection_receipt.as_ref().is_some_and(|receipt| {
-                receipt.metadata_flags
-                    & (MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR).bits()
-                    != 0
+                MetadataFlags::from_bits(receipt.metadata_flags)
+                    .is_some_and(MetadataFlags::uses_xmp_groupings)
             })
         });
     let (groupings_by_library, grouping_read_failures) = if needs_groupings {
@@ -258,7 +257,9 @@ where
                 deferred += 1;
                 continue;
             }
-            if !cfg!(feature = "xmp") && flags.uses_xmp_groupings() {
+            if !cfg!(feature = "xmp")
+                && flags.intersects(MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR)
+            {
                 deferred += 1;
                 continue;
             }
@@ -341,14 +342,93 @@ where
             continue;
         }
 
-        let payload = Arc::new(
-            groupings_by_library
-                .get(record.library.as_ref())
-                .map_or_else(
-                    || MetadataPayload::from_metadata(&record.metadata),
-                    |groupings| groupings.metadata_payload(&record.id, &record.metadata),
-                ),
-        );
+        let mut payload = groupings_by_library
+            .get(record.library.as_ref())
+            .map_or_else(
+                || MetadataPayload::from_metadata(&record.metadata),
+                |groupings| {
+                    groupings.metadata_payload(&record.id, &record.metadata, metadata_flags)
+                },
+            );
+        if metadata_flags.contains(MetadataFlags::ORIENTATION) {
+            payload.original_orientation = crate::icloud::photos::metadata::original_orientation(
+                &record.metadata,
+                record.version_size,
+                &record.checksum,
+            );
+        }
+        let ownership = match db
+            .embedded_metadata_receipt(
+                &record.library,
+                &record.id,
+                record.version_size.as_str(),
+                &path,
+                Some(&pending_rewrite),
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                tracing::warn!(%error, "Could not read embedded field ownership");
+                errored += 1;
+                continue;
+            }
+        };
+        let mut field_recovery_checksum = None;
+        let mut field_recovery_size = None;
+        if let Some(receipt) = ownership {
+            let measured = if !receipt.published {
+                crate::download::file::fingerprint_regular_file(&path)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            let measured_checksum = measured.map(fingerprint_checksum);
+            let current = measured_checksum
+                .as_deref()
+                .or(record.local_checksum.as_deref());
+            if !receipt.published
+                && current == Some(receipt.output_checksum.as_str())
+                && pending_rewrite.capture_repair_receipt.is_none()
+            {
+                if let Some(preserved) = pending_rewrite
+                    .selection_receipt
+                    .as_ref()
+                    .and_then(|r| r.preserved_local.as_ref())
+                {
+                    let modified = tokio::fs::metadata(&path)
+                        .await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .map(chrono::DateTime::<chrono::Utc>::from);
+                    if modified != preserved.modified {
+                        skipped_drifted += 1;
+                        continue;
+                    }
+                }
+                let Some(measured) = measured else {
+                    errored += 1;
+                    continue;
+                };
+                if let Err(error) = db
+                    .recover_embedded_metadata_receipt(&pending_rewrite, &receipt, measured.size)
+                    .await
+                {
+                    tracing::warn!(%error, "Could not finalize previous embedded field output");
+                    errored += 1;
+                    continue;
+                }
+                field_recovery_checksum = Some(receipt.output_checksum.clone());
+                field_recovery_size = Some(measured.size);
+            }
+            if current == Some(&receipt.output_checksum) {
+                payload.prior_embedded = receipt.written;
+            } else if !receipt.published && current == Some(&receipt.input_checksum) {
+                payload.prior_embedded = receipt.previous;
+            }
+        }
+        let payload = Arc::new(payload);
         let created_local = record.metadata.capture_local(record.created_at);
 
         let embed_writable =
@@ -458,7 +538,10 @@ where
             (&pre_rewrite_checksum, &record.local_checksum),
             (Some(actual), Some(recorded)) if actual != recorded
         ) && !recovered_prepared_output
-            && !recovered_selection_output;
+            && !recovered_selection_output
+            && field_recovery_checksum
+                .as_ref()
+                .is_none_or(|checksum| Some(checksum) != pre_rewrite_checksum.as_ref());
         if drifted {
             tracing::warn!(
                 target: "kei::download::metadata_rewrite",
@@ -472,6 +555,24 @@ where
 
         let mut outcome = MetadataWriteOutcome::default();
         let mut pending_for_finish = pending_rewrite.clone();
+        if let Some(checksum) = &field_recovery_checksum {
+            // Recovery advanced only the previous output fingerprint. Complete
+            // today's intent against that recovered input, not the stale snapshot.
+            pending_for_finish.asset.local_checksum = Some(checksum.clone());
+            if let Some(selection) = pending_for_finish.selection_receipt.as_mut() {
+                selection.prepared = None;
+            }
+            if let Some(preserved) = pending_for_finish
+                .selection_receipt
+                .as_mut()
+                .and_then(|r| r.preserved_local.as_mut())
+            {
+                preserved.checksum = checksum.clone();
+                if let Some(size) = field_recovery_size {
+                    preserved.size = size;
+                }
+            }
+        }
         let mut final_fingerprint = pre_rewrite_fingerprint;
         let mut capture_embed_complete = false;
         let mut recovered_capture_only = false;
@@ -496,6 +597,7 @@ where
             match prepare_embed_metadata(
                 &path,
                 pre_rewrite_fingerprint,
+                pending_rewrite.source_checksum.as_deref(),
                 Arc::clone(&payload),
                 created_local,
                 metadata_flags,
@@ -517,6 +619,23 @@ where
                         } else {
                             prepared
                         };
+                    let fields = crate::state::types::EmbeddedMetadataReceipt {
+                        published: false,
+                        input_checksum: pre_rewrite_fingerprint
+                            .map(fingerprint_checksum)
+                            .unwrap_or_default(),
+                        output_checksum: fingerprint_checksum(prepared.output_fingerprint()),
+                        previous: payload.prior_embedded.clone(),
+                        written: (*prepared.embedded_fields).clone(),
+                    };
+                    if let Err(error) = db
+                        .record_embedded_metadata_receipt(&pending_for_finish, &fields)
+                        .await
+                    {
+                        tracing::warn!(%error, "Could not retain prepared embedded field ownership");
+                        errored += 1;
+                        continue;
+                    }
                     if selected_queue == MetadataRewriteQueue::Ordinary
                         && pending_rewrite.capture_repair_receipt.is_some()
                     {
@@ -581,7 +700,8 @@ where
                             pending_for_finish.capture_repair_receipt = Some(prepared_receipt);
                         }
                         match publish_embed_metadata(&path, prepared).await {
-                            EmbedWriteResult::Applied(output) => {
+                            EmbedWriteResult::Applied(output, fields) => {
+                                outcome.embedded_fields = fields;
                                 final_fingerprint = output;
                                 capture_embed_complete =
                                     selected_queue == MetadataRewriteQueue::CaptureRepair;
@@ -693,11 +813,15 @@ where
 
         let final_checksum = final_fingerprint
             .map(fingerprint_checksum)
-            .or_else(|| record.local_checksum.clone());
-        let media_checksum_changed = final_checksum != record.local_checksum;
+            .or_else(|| pending_for_finish.asset.local_checksum.clone());
+        let media_checksum_changed = final_checksum != pending_for_finish.asset.local_checksum;
         let input_checksum_for_download = final_checksum
             .as_deref()
-            .zip(record.local_checksum.as_deref())
+            // Recovered metadata output is the current writer input, but is
+            // not evidence of the original downloaded bytes.
+            .zip(record.local_checksum.as_deref().filter(|before| {
+                Some(*before) == pending_for_finish.asset.local_checksum.as_deref()
+            }))
             .and_then(|(after, before)| (after != before).then_some(before));
         if completion != MetadataRewriteCompletion::None || media_checksum_changed {
             match db

@@ -18,6 +18,12 @@ pub(super) fn prepare_metadata_native(
     temp_suffix: &str,
     expected_fingerprint: Option<crate::download::file::ExistingFileFingerprint>,
 ) -> Result<PreparedMetadataFile> {
+    if write.orientation.is_some() {
+        anyhow::ensure!(
+            super::probe::original_orientation_missing(path)?,
+            "Orientation omission is no longer proven"
+        );
+    }
     // Unsupported HEIF must not reach the native JPEG/TIFF whole-file reader,
     // including when an approved fingerprint bypassed early format routing.
     use std::io::Read;
@@ -76,6 +82,45 @@ pub(super) fn prepare_metadata_native(
             return Err(e).with_context(|| format!("Could not read EXIF from {}", path.display()));
         }
     };
+    let before = embedded_fields(&metadata);
+    for ((tag, prior), actual) in gps_tags()
+        .into_iter()
+        .zip(&write.clear_embedded.gps)
+        .zip(&before.gps)
+    {
+        if prior.is_some() && prior == actual {
+            metadata.remove_tag(tag);
+        }
+    }
+    if write.clear_embedded.description.is_some()
+        && write.clear_embedded.description == before.description
+    {
+        metadata.remove_tag(ExifTag::ImageDescription(String::new()));
+    }
+    if write.clear_embedded.rating.is_some() && write.clear_embedded.rating == before.rating {
+        metadata.remove_tag(ExifTag::UnknownINT16U(
+            vec![],
+            WINDOWS_RATING_TAG,
+            ExifTagGroup::GENERIC,
+        ));
+    }
+    if write.clear_embedded.rating_percent.is_some()
+        && write.clear_embedded.rating_percent == before.rating_percent
+    {
+        metadata.remove_tag(ExifTag::UnknownINT16U(
+            vec![],
+            WINDOWS_RATING_PERCENT_TAG,
+            ExifTagGroup::GENERIC,
+        ));
+    }
+    if let Some(orientation) = write.orientation {
+        anyhow::ensure!(
+            (1..=8).contains(&orientation)
+                && !(&metadata).into_iter().any(|tag| tag.as_u16() == 0x0112),
+            "Cannot replace existing or invalid orientation"
+        );
+        metadata.set_tag(ExifTag::Orientation(vec![u16::from(orientation)]));
+    }
     if let Some(dt) = &write.datetime {
         metadata.set_tag(ExifTag::DateTimeOriginal(dt.clone()));
         metadata.set_tag(ExifTag::CreateDate(dt.clone()));
@@ -168,10 +213,52 @@ pub(super) fn prepare_metadata_native(
     drop(file);
     Ok(PreparedMetadataFile {
         required_mtime: None,
+        embedded_fields: Box::new(write.ownership_after(&before, &embedded_fields(&metadata))),
         guard,
         expected_input: expected,
         expected_output: output_fingerprint,
     })
+}
+
+fn embedded_fields(metadata: &Metadata) -> crate::state::types::EmbeddedMetadataFields {
+    let rating = |tag| {
+        metadata
+            .get_tag(&ExifTag::UnknownINT16U(vec![], tag, ExifTagGroup::GENERIC))
+            .find_map(|tag| match tag {
+                ExifTag::UnknownINT16U(values, _, _) => Some(values.clone()),
+                _ => None,
+            })
+    };
+    crate::state::types::EmbeddedMetadataFields {
+        gps: gps_tags().map(|tag| {
+            metadata.get_tag(&tag).next().map(|value| {
+                data_encoding::HEXLOWER
+                    .encode(&value.value_as_u8_vec(&little_exif::endian::Endian::Little))
+            })
+        }),
+        rating: rating(WINDOWS_RATING_TAG)
+            .map(|values| serde_json::to_string(&values).expect("integer vectors serialize")),
+        rating_percent: rating(WINDOWS_RATING_PERCENT_TAG)
+            .map(|values| serde_json::to_string(&values).expect("integer vectors serialize")),
+        description: metadata
+            .get_tag(&ExifTag::ImageDescription(String::new()))
+            .find_map(|tag| match tag {
+                ExifTag::ImageDescription(value) => Some(value.clone()),
+                _ => None,
+            }),
+        ..Default::default()
+    }
+}
+
+fn gps_tags() -> [ExifTag; 6] {
+    [
+        ExifTag::GPSLatitude(vec![]),
+        ExifTag::GPSLongitude(vec![]),
+        ExifTag::GPSAltitude(vec![]),
+        ExifTag::GPSLatitudeRef(String::new()),
+        ExifTag::GPSLongitudeRef(String::new()),
+        ExifTag::GPSAltitudeRef(vec![]),
+    ]
 }
 
 fn dms_rational(decimal: f64) -> Vec<uR64> {

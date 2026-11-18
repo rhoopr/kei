@@ -706,6 +706,7 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
         config.directory = Arc::from(dir.path().join("media"));
         config.metadata.xmp_sidecar = true;
         config.metadata.embed_xmp = embed_xmp;
+        config.metadata.include_albums = true;
         config.state_db = Some(db.clone());
         let initial = download_photos_with_sync(
             &Client::new(),
@@ -970,6 +971,7 @@ async fn album_membership_first_xmp_and_tracked_path_removal() {
     config.directory = Arc::from(dir.path().join("media"));
     config.album_name = Some(Arc::from("Trip"));
     config.metadata.xmp_sidecar = true;
+    config.metadata.include_albums = true;
     config.state_db = Some(db.clone());
     assert!(
         db.get_all_asset_albums("PrimarySync")

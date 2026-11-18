@@ -755,6 +755,7 @@ impl state::DownloadStateStore for FailingMetadataSetDb {
         local_checksum: &str,
         download_checksum: Option<&str>,
         mark_capture_repair: bool,
+        embedded_fields: &state::types::EmbeddedMetadataFields,
     ) -> Result<(), state::error::StateError> {
         self.prepare_downloaded_write(library, id, version_size)
             .await?;
@@ -780,6 +781,7 @@ impl state::DownloadStateStore for FailingMetadataSetDb {
                     local_checksum,
                     download_checksum,
                     mark_capture_repair,
+                    embedded_fields,
                 )
                 .await
         }

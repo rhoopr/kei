@@ -1459,7 +1459,9 @@ async fn run_cycle_inner(
 
         // Skip the DB scan entirely when nothing downstream will read it.
         #[cfg(feature = "xmp")]
-        let asset_groupings = if config.metadata.embed_xmp || config.metadata.xmp_sidecar {
+        let asset_groupings = if (config.metadata.embed_xmp || config.metadata.xmp_sidecar)
+            && (config.metadata.include_albums || config.metadata.include_people)
+        {
             preload_asset_groupings(state_db, &lib_state.zone_name).await
         } else {
             Arc::new(download::AssetGroupings::default())
@@ -1512,7 +1514,9 @@ async fn run_cycle_inner(
                     continue;
                 }
                 #[cfg(feature = "xmp")]
-                let target_groupings = if config.metadata.embed_xmp || config.metadata.xmp_sidecar {
+                let target_groupings = if (config.metadata.embed_xmp || config.metadata.xmp_sidecar)
+                    && (config.metadata.include_albums || config.metadata.include_people)
+                {
                     preload_asset_groupings(state_db, &target.zone_name).await
                 } else {
                     Arc::new(download::AssetGroupings::default())

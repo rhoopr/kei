@@ -18,6 +18,13 @@ pub(in crate::download) struct FinalPathCollision {
     final_path: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "only installed output can acquire measured metadata field ownership"]
+pub(in crate::download) enum PublicationOutcome {
+    Installed,
+    IdenticalExisting,
+}
+
 /// Rename a `.part` file to its final destination, handling the case where
 /// a concurrent download already placed identical bytes at the final path.
 #[cfg(test)]
@@ -25,7 +32,9 @@ pub(in crate::download) async fn rename_part_to_final(
     part_path: &Path,
     final_path: &Path,
 ) -> anyhow::Result<()> {
-    publish_part_to_final(part_path, final_path, FinalPublication::NoReplace).await
+    publish_part_to_final(part_path, final_path, FinalPublication::NoReplace)
+        .await
+        .map(|_| ())
 }
 
 /// Publish a verified `.part` file according to the task's explicit policy.
@@ -33,9 +42,11 @@ pub(in crate::download) async fn publish_part_to_final(
     part_path: &Path,
     final_path: &Path,
     publication: FinalPublication,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PublicationOutcome> {
     if let FinalPublication::ReplaceTruncated(expected) = publication {
-        return replace_file_if_unchanged(part_path, final_path, expected).await;
+        return replace_file_if_unchanged(part_path, final_path, expected)
+            .await
+            .map(|()| PublicationOutcome::Installed);
     }
     if let FinalPublication::ReplaceLocal {
         fingerprint,
@@ -48,7 +59,8 @@ pub(in crate::download) async fn publish_part_to_final(
             fingerprint,
             modified,
         )
-        .await;
+        .await
+        .map(|()| PublicationOutcome::Installed);
     }
 
     match publish_part_no_replace(part_path, final_path).await {
@@ -60,7 +72,7 @@ pub(in crate::download) async fn publish_part_to_final(
             // fsync the parent so the worst case is one redundant
             // re-download next sync, not silent loss.
             crate::fs_util::fsync_parent_dir_async_best_effort(final_path).await;
-            Ok(())
+            Ok(PublicationOutcome::Installed)
         }
         Ok(PublishResult::DestinationExists) => {
             // CONTRACT: FILE_PUBLISH_NO_OVERWRITE
@@ -88,7 +100,7 @@ pub(in crate::download) async fn publish_part_to_final(
                     part_path.display()
                 )
             })?;
-            Ok(())
+            Ok(PublicationOutcome::IdenticalExisting)
         }
         Err(e) => Err(e).with_context(|| {
             format!(
@@ -105,7 +117,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::rename_part_to_final;
-    use super::FinalPathCollision;
+    use super::{FinalPathCollision, FinalPublication, PublicationOutcome, publish_part_to_final};
 
     #[tokio::test]
     async fn rename_part_to_final_happy_path() {
@@ -114,7 +126,12 @@ mod tests {
         let final_path = dir.path().join("photo.jpg");
         tokio::fs::write(&part, b"image data").await.unwrap();
 
-        rename_part_to_final(&part, &final_path).await.unwrap();
+        assert_eq!(
+            publish_part_to_final(&part, &final_path, FinalPublication::NoReplace)
+                .await
+                .unwrap(),
+            PublicationOutcome::Installed
+        );
 
         assert!(!part.exists());
         assert!(final_path.exists());
@@ -132,7 +149,12 @@ mod tests {
         // Should succeed without replacing the existing final file. On Linux,
         // plain rename(old, new) would overwrite `photo.jpg`; the publish path
         // must use no-overwrite semantics before cleaning the redundant .part.
-        rename_part_to_final(&part, &final_path).await.unwrap();
+        assert_eq!(
+            publish_part_to_final(&part, &final_path, FinalPublication::NoReplace)
+                .await
+                .unwrap(),
+            PublicationOutcome::IdenticalExisting
+        );
 
         assert!(!part.exists(), ".part should not remain");
         assert!(final_path.exists(), "final file should exist");

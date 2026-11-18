@@ -97,6 +97,7 @@ async fn publish(
         &local,
         Some(&local),
         false,
+        &Default::default(),
     )
     .await
     .unwrap();

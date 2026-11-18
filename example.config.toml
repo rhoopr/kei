@@ -179,11 +179,20 @@ file_match_policy = "name-size-dedup-with-suffix"
 keep_unicode_in_filenames = false
 
 [metadata]
+# Omitted settings remain false in config_version 1. Setup explicitly enables
+# the standard embedded fields below; this reference keeps outputs disabled.
+# Enabling a field authorizes later updates to that field in kei-managed files.
 # Option: metadata.set_exif_datetime
 # Default value: false
 # Valid values: true, false
 # Description: Writes missing capture dates in supported embedded formats, including HEIF XMP with the xmp feature. Ordinary writes preserve native timestamps; explicit capture repair can replace them.
 set_exif_datetime = false
+
+# Option: metadata.set_exif_orientation
+# Default value: false; setup writes true explicitly
+# Valid values: true, false
+# Description: Fills absent orientation on checksum-qualified, untransformed original JPEG/TIFF files. Existing orientation and ambiguous renderings are preserved.
+set_exif_orientation = false
 
 # Option: metadata.set_exif_rating
 # Default value: false
@@ -206,7 +215,7 @@ set_exif_description = false
 # Option: metadata.embed_xmp
 # Default value: false
 # Valid values: true, false; available in default builds with the xmp feature
-# Description: Embeds XMP metadata in supported media files.
+# Description: Embeds standard title and source keywords. Rating, GPS and description use their own settings. Provider-internal fields are excluded.
 embed_xmp = false
 
 # Option: metadata.xmp_sidecar
@@ -214,6 +223,18 @@ embed_xmp = false
 # Valid values: true, false; available in default builds with the xmp feature
 # Description: Writes XMP sidecar files next to downloaded media.
 xmp_sidecar = false
+
+# Option: metadata.include_albums
+# Default value: false
+# Valid values: true, false; available in default builds with the xmp feature
+# Description: Adds album names to keywords when embed_xmp or xmp_sidecar is enabled.
+include_albums = false
+
+# Option: metadata.include_people
+# Default value: false
+# Valid values: true, false; available in default builds with the xmp feature
+# Description: Adds named people when embed_xmp or xmp_sidecar is enabled.
+include_people = false
 
 [watch]
 # Option: watch.interval

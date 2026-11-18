@@ -457,6 +457,8 @@ async fn try_cycle_options(
         {
             config.metadata.xmp_sidecar = options.sidecar;
             config.metadata.embed_xmp = options.embed_xmp;
+            // These fixtures assert album-labelled sidecars explicitly.
+            config.metadata.include_albums = options.sidecar;
         }
         config.live_photo_mov_filename_policy = options.mov_policy;
         config.live_photo_mode = options.live_mode;
@@ -492,6 +494,7 @@ async fn try_cycle_options(
     {
         config.metadata.xmp_sidecar = options.sidecar;
         config.metadata.embed_xmp = options.embed_xmp;
+        config.metadata.include_albums = options.sidecar;
     }
     config.photos.live_photo_mov_filename_policy = options.mov_policy;
     config.photos.live_photo_mode = options.live_mode;
@@ -681,6 +684,7 @@ async fn local_policy_metadata_keeps_preserved_disposition_and_mtime() {
             folder_structure: if shared_path { "" } else { "{album}" },
             sidecar: metadata,
             embed_xmp: metadata,
+            exif_description: metadata,
             ..CycleOptions::default()
         };
         let initial =
@@ -761,6 +765,14 @@ async fn local_policy_metadata_keeps_preserved_disposition_and_mtime() {
             ),
             0
         );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT count(*) FROM provider_active_destinations WHERE preserved_local IS NOT NULL AND verified_metadata=1 AND (embedded_metadata_receipt IS NULL OR json_extract(embedded_metadata_receipt,'$.published')<>1 OR json_extract(embedded_metadata_receipt,'$.output_checksum')<>local_checksum)"
+            ),
+            0,
+            "completed preserved copies must retain published field ownership"
+        );
         for _ in 0..2 {
             let (quiet, _) = cycle_options(
                 root.path(),
@@ -784,6 +796,32 @@ async fn local_policy_metadata_keeps_preserved_disposition_and_mtime() {
             );
             assert!(quiet.db_sync_token_advance_safe);
             assert_bytes(&preserved, &bytes);
+            assert_eq!(
+                std::fs::metadata(&preserved).unwrap().modified().unwrap(),
+                modified
+            );
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        current[1]["fields"]["captionEnc"] = json!({"type":"STRING","value":""});
+        current[1]["fields"]["extendedDescEnc"] = json!({"type":"STRING","value":""});
+        for quiet in [false, true, true] {
+            let (cleared, _) = cycle_options(
+                root.path(),
+                current.clone(),
+                quiet,
+                EditedNaming::Suffix,
+                options(true),
+            )
+            .await;
+            assert_eq!(cleared.failed_count, 0, "{naming:?}: {:?}", cleared.stats);
+            let mut packet = xmp_toolkit::XmpFile::new().unwrap();
+            packet
+                .open_file(
+                    &preserved,
+                    xmp_toolkit::OpenFileOptions::default().use_packet_scanning(),
+                )
+                .unwrap();
+            assert!(!packet.xmp().unwrap().contains_property(xmp_toolkit::xmp_ns::DC, "description"), "{naming:?}/{shared_path}: unchanged preserved-local bindings retain field ownership; receipts: {:?}", rusqlite::Connection::open(root.path().join("state.db")).unwrap().prepare("SELECT 'native',embedded_metadata_receipt FROM provider_active_destinations WHERE preserved_local IS NOT NULL UNION ALL SELECT local_path,embedded_metadata_receipt FROM asset_metadata_paths").unwrap().query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap());
             assert_eq!(
                 std::fs::metadata(&preserved).unwrap().modified().unwrap(),
                 modified
@@ -1184,6 +1222,80 @@ async fn restored_historical_publication(prefix: &std::ffi::OsStr) {
 
 #[cfg(feature = "xmp")]
 #[tokio::test]
+async fn historical_selected_metadata_receipt_cannot_override_current_unknown_ownership() {
+    use crate::state::db::{
+        MetadataRewriteStore, PendingMetadataRewrite, SelectionMetadataReceipt,
+    };
+
+    let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, VALID_EDIT).await;
+    let root = tempfile::tempdir().unwrap();
+    let options = || CycleOptions {
+        embed_xmp: true,
+        ..Default::default()
+    };
+    let mut provider =
+        records_with_original(&server, VALID_ORIGINAL, Some(("edit-one", VALID_EDIT)));
+    for caption in ["first owned title", "second owned title"] {
+        provider[1]["fields"]["captionEnc"] = json!({"type":"STRING","value":caption});
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            false,
+            EditedNaming::Suffix,
+            options(),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+    }
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let (generation, pass_key, child, library, id, version, path): (String,String,String,String,String,String,String) = conn.query_row(
+        "SELECT generation,pass_key,child,library,asset_id,version_size,path FROM provider_active_destinations WHERE current_publication=0 AND embedded_metadata_receipt IS NOT NULL AND json_extract(embedded_metadata_receipt,'$.published')=1 LIMIT 1", [],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+    ).unwrap();
+    assert_eq!(conn.execute("UPDATE provider_active_destinations SET embedded_metadata_receipt=NULL WHERE library=?1 AND path=?2 AND current_publication=1", rusqlite::params![library,path]).unwrap(), 1);
+    drop(conn);
+    let path: crate::state::db::provider_selection::SelectionPath =
+        serde_json::from_str(&path).unwrap();
+    let path = path.to_path();
+    let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &fixture_owner())
+        .await
+        .unwrap();
+    let asset = db
+        .get_downloaded_page(0, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|asset| {
+            asset.library.as_ref() == library
+                && asset.id.as_ref() == id
+                && asset.version_size.as_str() == version
+        })
+        .unwrap();
+    let pending = PendingMetadataRewrite {
+        asset,
+        selection_receipt: Some(SelectionMetadataReceipt {
+            generation,
+            pass_key,
+            child,
+            grouping_hash: String::new(),
+            metadata_flags: 0,
+            prepared: None,
+            preserved_local: None,
+        }),
+        capture_repair_receipt: None,
+        source_checksum: None,
+    };
+    assert!(
+        db.embedded_metadata_receipt(&library, &id, &version, &path, Some(&pending))
+            .await
+            .unwrap()
+            .is_none(),
+        "current unknown ownership must fence historical selected and legacy field receipts"
+    );
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
 async fn local_policy_restored_old_metadata_output_is_not_current_publication() {
     restored_metadata_publication(std::ffi::OsStr::new("utf8")).await;
 }
@@ -1235,7 +1347,7 @@ async fn restored_metadata_publication(prefix: &std::ffi::OsStr) {
     current[1]["fields"]["captionEnc"] = json!({"type":"STRING","value":"second metadata output"});
     let (second, _) = cycle_options(
         root.path(),
-        current,
+        current.clone(),
         false,
         EditedNaming::Suffix,
         options(true),
@@ -1262,6 +1374,34 @@ async fn restored_metadata_publication(prefix: &std::ffi::OsStr) {
         data_encoding::HEXLOWER.encode(&Sha256::digest(&latest)),
         "checked metadata output must advance native publication authority"
     );
+    let fields: String = conn.query_row("SELECT embedded_metadata_receipt FROM provider_active_destinations WHERE version_size='adjusted' AND current_publication=1", [], |row| row.get(0)).unwrap();
+    let fields: crate::state::types::EmbeddedMetadataReceipt =
+        serde_json::from_str(&fields).unwrap();
+    assert!(fields.published);
+    assert_eq!(fields.output_checksum, authority);
+    #[cfg(feature = "xmp")]
+    {
+        let mut sidecar_options = options(false);
+        sidecar_options.sidecar = true;
+        let (sidecar, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            false,
+            EditedNaming::Suffix,
+            sidecar_options,
+        )
+        .await;
+        assert_eq!(sidecar.failed_count, 0, "{:?}", sidecar.stats);
+        assert_bytes(&target, &latest);
+        let retained: String = conn.query_row("SELECT embedded_metadata_receipt FROM provider_active_destinations WHERE version_size='adjusted' AND current_publication=1", [], |row| row.get(0)).unwrap();
+        let retained: crate::state::types::EmbeddedMetadataReceipt =
+            serde_json::from_str(&retained).unwrap();
+        assert_eq!(
+            retained.written, fields.written,
+            "a sidecar-only completion retains embedded ownership"
+        );
+        assert_eq!(retained.output_checksum, authority);
+    }
     std::fs::write(&target, &historical).unwrap();
     let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_750_000_000);
     std::fs::File::options()
@@ -3133,6 +3273,22 @@ async fn recorded_generation_destinations_survive_template_changes() {
 
 #[tokio::test]
 async fn established_primary_layout_keeps_its_directory_after_template_change() {
+    // Isolate process-global tracing state from concurrent tests while keeping
+    // the production path/event assertion intact.
+    const CHILD: &str = "KEI_LAYOUT_DIRECTORY_TRACE_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "sync_loop::runner::tests::primary_layout::established_primary_layout_keeps_its_directory_after_template_change", "--nocapture"])
+            .env(CHILD,"1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let (initial, _) = cycle_options(

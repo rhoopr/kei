@@ -21,6 +21,7 @@ fn config_hash(config: &DownloadConfig, zone: &serde_json::Value) -> String {
         "before":config.skip_created_before.map(crate::config::CreatedDateFilter::fingerprint),
         "after":config.skip_created_after.map(crate::config::CreatedDateFilter::fingerprint),
         "metadata_flags":crate::download::pipeline::MetadataFlags::from(config).bits(),
+        "metadata_policy":crate::download::pipeline::MetadataFlags::POLICY_REVISION,
         "capture_timestamp_repair":config.capture_timestamp_repair==crate::download::CaptureTimestampRepair::ReplaceWithCaptureLocal,
         "repair_truncated":config.repair_truncated,
     });

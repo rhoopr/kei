@@ -141,7 +141,7 @@ Historical legacy coverage certificates are no longer required for current sync 
 - Runs once or on a schedule, in Docker or as a background service on Linux, macOS or Windows.
 - Provides progress reports, troubleshooting tools, file lists, backup checks, repair commands and import of existing files.
 
-Kei automatically saves photo information in its own database. Writing that information into media files or separate XMP files requires you to enable it. See [Metadata output](docs/metadata.md) for supported formats, cases where kei won't write, and options for repairing timestamps.
+Kei automatically saves photo information in its own database. Setup enables standard embedded metadata through explicit saved settings. Existing omitted settings and runs without a config keep metadata output disabled. Sidecars, album names and people remain optional. See [Metadata output](docs/metadata.md) for supported formats, update permissions and timestamp repair.
 
 ## Docs
 

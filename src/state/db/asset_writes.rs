@@ -295,6 +295,7 @@ pub(super) struct DownloadChecksums<'a> {
     pub(super) local: &'a str,
     pub(super) downloaded: Option<&'a str>,
     pub(super) source: Option<&'a str>,
+    pub(super) embedded_fields: Option<&'a crate::state::types::EmbeddedMetadataFields>,
 }
 
 /// Copy the catalogue path's exact publication evidence in the same transaction.
@@ -330,7 +331,8 @@ pub(super) fn record_metadata_path(
          FROM assets WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
              AND status = 'downloaded' AND local_path IS NOT NULL \
          ON CONFLICT(library, id, version_size, local_path) DO UPDATE SET \
-             provider_checksum = excluded.provider_checksum, \
+              provider_checksum = excluded.provider_checksum, \
+              embedded_metadata_receipt = CASE WHEN asset_metadata_paths.provider_checksum = excluded.provider_checksum THEN asset_metadata_paths.embedded_metadata_receipt ELSE NULL END, \
              local_checksum = excluded.local_checksum, \
              download_checksum = excluded.download_checksum, \
              source_checksum = CASE WHEN asset_metadata_paths.provider_checksum = excluded.provider_checksum \

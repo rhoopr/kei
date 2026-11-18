@@ -279,6 +279,7 @@ pub(crate) async fn context(
         "paths":hash_download_config(config),"anchored_root":SelectionPath::from_path(&std::path::absolute(&config.directory)?),
         "before":config.skip_created_before.map(crate::config::CreatedDateFilter::fingerprint),"after":config.skip_created_after.map(crate::config::CreatedDateFilter::fingerprint),
         "enum_hash":config.enum_config_hash.as_deref(),"metadata_flags":crate::download::pipeline::MetadataFlags::from(config).bits(),
+        "metadata_policy":crate::download::pipeline::MetadataFlags::POLICY_REVISION,
         "capture_revision":crate::state::METADATA_CAPTURE_REVISION,"capture_repair":format!("{:?}",config.capture_timestamp_repair),
         // Retain the historical fingerprint key; lifetime admission is retired.
         "repair_truncated":config.repair_truncated,"attempt_limit":0,
@@ -1753,7 +1754,7 @@ fn metadata_writer_default_limits_reserve_250_within_500() {
     assert_eq!(metadata_writer_limits(), (250, 500));
 }
 
-/// Keep the existing 500-row writer budget while rotating past retained failed
+/// Keep the existing 500-row writer budget while rotating past current failed
 /// or option-disabled physical writers. This cursor schedules retries only;
 /// debt/progress remain in the exact publication and metadata receipts.
 async fn metadata_tail(
@@ -1775,8 +1776,8 @@ async fn metadata_tail(
         .selection_metadata_retry_offset(context.capture.owner.clone())
         .await?;
     // Reserve at most half the existing 500-row budget for current exact
-    // destinations. Older failed work cannot occupy this lane, and repeated
-    // inventory never resets the independent retained/legacy continuation.
+    // destinations. The remaining budget rotates through the same current
+    // selection, or the explicit capture-repair queue when requested.
     let (current_reserve, budget) = metadata_writer_limits();
     let current = context
         .capture
@@ -1791,14 +1792,14 @@ async fn metadata_tail(
         .iter()
         .filter_map(|pending| pending.asset.local_path.clone())
         .collect();
-    let priority = crate::download::metadata_rewrite::run_pending_rows(
+    let priority = Box::pin(crate::download::metadata_rewrite::run_pending_rows(
         db.as_ref(),
         flags,
         config.capture_timestamp_repair,
         config.temp_suffix.clone(),
         cancel,
         current,
-    )
+    ))
     .await;
     let remaining = budget.saturating_sub(priority.fetched);
     let original = offset;
@@ -1809,8 +1810,8 @@ async fn metadata_tail(
     )
     .then_some(library_scope.as_slice());
     let attempted_paths = &attempted_paths;
-    let retained_page = |offset| async move {
-        if attempted_paths.is_empty() {
+    let remaining_page = |offset| async move {
+        if attempted_paths.is_empty() && repair_scope.is_some() {
             return crate::download::metadata_rewrite::run_pending_budget(
                 db.as_ref(),
                 flags,
@@ -1827,13 +1828,25 @@ async fn metadata_tail(
         } else {
             crate::state::db::MetadataRewriteQueue::Ordinary
         };
-        let mut pending = match db
-            .get_pending_metadata_rewrites_page_for_queue(queue, repair_scope, offset, remaining)
-            .await
-        {
+        let pending = if repair_scope.is_some() {
+            db.get_pending_metadata_rewrites_page_for_queue(queue, repair_scope, offset, remaining)
+                .await
+        } else {
+            context
+                .capture
+                .db
+                .pending_selection_metadata_page(
+                    context.capture.owner.clone(),
+                    generation.to_owned(),
+                    offset,
+                    remaining,
+                )
+                .await
+        };
+        let mut pending = match pending {
             Ok(pending) => pending,
             Err(error) => {
-                tracing::warn!(%error, "Failed to load retained metadata rewrites");
+                tracing::warn!(%error, "Failed to load current metadata rewrites");
                 return crate::download::metadata_rewrite::RewritePass {
                     failed: 1,
                     ..Default::default()
@@ -1849,22 +1862,22 @@ async fn metadata_tail(
                 .as_ref()
                 .is_none_or(|path| !attempted_paths.contains(path))
         });
-        let mut result = crate::download::metadata_rewrite::run_pending_rows(
+        let mut result = Box::pin(crate::download::metadata_rewrite::run_pending_rows(
             db.as_ref(),
             flags,
             config.capture_timestamp_repair,
             config.temp_suffix.clone(),
             cancel,
             pending,
-        )
+        ))
         .await;
         result.fetched = fetched;
         result
     };
-    let mut result = retained_page(offset).await;
+    let mut result = remaining_page(offset).await;
     if result.fetched == 0 && offset > 0 && !cancel.is_cancelled() {
         offset = 0;
-        result = retained_page(0).await;
+        result = remaining_page(0).await;
     }
     let next = offset
         .saturating_add(result.fetched)

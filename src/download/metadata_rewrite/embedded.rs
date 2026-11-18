@@ -8,9 +8,12 @@ use chrono::{DateTime, FixedOffset};
 use std::path::Path;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum EmbedWriteResult {
-    Applied(Option<crate::download::file::ExistingFileFingerprint>),
+    Applied(
+        Option<crate::download::file::ExistingFileFingerprint>,
+        Box<crate::state::types::EmbeddedMetadataFields>,
+    ),
     NoWrite,
     Failed,
     InputChanged,
@@ -23,9 +26,14 @@ pub(super) enum EmbedPrepareResult {
     InputChanged,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "source checksum is independent provenance from the approved current fingerprint"
+)]
 pub(super) async fn prepare_embed_metadata(
     path: &Path,
     expected_fingerprint: Option<crate::download::file::ExistingFileFingerprint>,
+    source_checksum: Option<&str>,
     payload: Arc<MetadataPayload>,
     created_local: DateTime<FixedOffset>,
     flags: MetadataFlags,
@@ -34,6 +42,7 @@ pub(super) async fn prepare_embed_metadata(
 ) -> EmbedPrepareResult {
     let embed_path = path.to_path_buf();
     let metadata_temp_suffix = temp_suffix.to_string();
+    let source_checksum = source_checksum.map(str::to_owned);
     let dispatcher = tracing::dispatcher::get_default(Clone::clone);
     match tokio::task::spawn_blocking(move || tracing::dispatcher::with_default(&dispatcher, || {
         let repair_requested = matches!(
@@ -67,6 +76,16 @@ pub(super) async fn prepare_embed_metadata(
                 crate::download::metadata::ExifProbe::default()
             }
         };
+        let mut probe = probe;
+        if flags.contains(MetadataFlags::ORIENTATION) && payload.original_orientation.is_some() {
+            // A catalogue checksum or filename alone does not prove imported or
+            // subsequently rendered local pixels are the original resource.
+            // Require exact original-download bytes, then prove the omission.
+            let original_bytes = expected_fingerprint.zip(source_checksum.as_deref())
+                .is_some_and(|(fingerprint, source)| super::capture::fingerprint_checksum(fingerprint) == source);
+            probe.orientation_missing = original_bytes
+                && crate::download::metadata::original_orientation_missing(&embed_path).unwrap_or(false);
+        }
         let mut write = plan_metadata_write_with_repair(
             flags,
             &payload,
@@ -156,6 +175,7 @@ pub(super) async fn publish_embed_metadata(
     path: &Path,
     prepared: crate::download::metadata::PreparedMetadataFile,
 ) -> EmbedWriteResult {
+    let fields = prepared.embedded_fields.clone();
     let embed_path = path.to_path_buf();
     match tokio::task::spawn_blocking(move || {
         #[cfg(all(test, feature = "xmp"))]
@@ -164,7 +184,7 @@ pub(super) async fn publish_embed_metadata(
     })
     .await
     {
-        Ok(Ok(output_fingerprint)) => EmbedWriteResult::Applied(Some(output_fingerprint)),
+        Ok(Ok(output_fingerprint)) => EmbedWriteResult::Applied(Some(output_fingerprint), fields),
         Ok(Err(error)) => {
             crate::support::metadata_error(path, "metadata_publish", &error, None);
             let disposition = crate::download::file::classify_conditional_publish_error(&error);
@@ -191,9 +211,14 @@ pub(super) async fn publish_embed_metadata(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "source checksum is independent provenance from the approved current fingerprint"
+)]
 pub(super) async fn write_embed_metadata(
     path: &Path,
     expected_fingerprint: Option<crate::download::file::ExistingFileFingerprint>,
+    source_checksum: Option<&str>,
     payload: Arc<MetadataPayload>,
     created_local: DateTime<FixedOffset>,
     flags: MetadataFlags,
@@ -203,6 +228,7 @@ pub(super) async fn write_embed_metadata(
     match prepare_embed_metadata(
         path,
         expected_fingerprint,
+        source_checksum,
         payload,
         created_local,
         flags,

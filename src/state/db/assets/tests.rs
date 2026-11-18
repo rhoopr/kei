@@ -37,6 +37,7 @@ async fn verified_source_checksum_round_trip_is_path_and_rendition_scoped() {
         "local-first",
         Some("source-first"),
         false,
+        &Default::default(),
     )
     .await
     .unwrap();
@@ -110,6 +111,7 @@ async fn verified_source_checksum_round_trip_is_path_and_rendition_scoped() {
         "local-second",
         Some("source-second"),
         false,
+        &Default::default(),
     )
     .await
     .unwrap();
@@ -168,7 +170,8 @@ async fn verified_source_checksum_failure_rolls_back_download_finalization() {
             &media,
             "local",
             Some("source"),
-            false
+            false,
+            &Default::default()
         )
         .await
         .is_err()
@@ -193,6 +196,7 @@ async fn verified_source_checksum_failure_rolls_back_download_finalization() {
         "local",
         Some("source"),
         false,
+        &Default::default(),
     )
     .await
     .unwrap();

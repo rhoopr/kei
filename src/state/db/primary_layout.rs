@@ -65,6 +65,8 @@ pub(crate) struct LayoutFile {
     pub(crate) local_preserved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) local_modified: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "embedded_fields_empty")]
+    pub(crate) embedded_fields: Box<crate::state::types::EmbeddedMetadataFields>,
     pub(crate) path: SelectionPath,
     pub(crate) version: String,
     pub(crate) provider_checksum: String,
@@ -73,6 +75,10 @@ pub(crate) struct LayoutFile {
     pub(crate) sidecar: Option<LayoutFingerprint>,
     pub(crate) archive_original: bool,
     pub(crate) metadata_decision: Option<String>,
+}
+
+fn embedded_fields_empty(fields: &crate::state::types::EmbeddedMetadataFields) -> bool {
+    *fields == Default::default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,7 +124,7 @@ pub(crate) struct LayoutOperation {
     pub(crate) child: String,
     pub(crate) asset_record_name: String,
     pub(crate) pass: String,
-    pub(crate) metadata_flags: u8,
+    pub(crate) metadata_flags: u16,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) refresh_metadata: bool,
     pub(crate) root: SelectionPath,
@@ -574,6 +580,13 @@ impl SqliteStateDb {
                     tx.execute("UPDATE assets SET metadata_write_failed_at=NULL WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND checksum=?5 AND metadata_hash IS ?6",params![op.library,op.child,record.version_size.as_str(),path.to_string_lossy(),record.checksum.as_ref(),record.metadata.metadata_hash])?;
                     tx.execute("UPDATE asset_metadata_paths SET metadata_write_failed_at=NULL,source_checksum=?7 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND provider_checksum=?5 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND a.metadata_hash IS ?6)",params![op.library,op.child,record.version_size.as_str(),path.to_string_lossy(),record.checksum.as_ref(),record.metadata.metadata_hash,installed.source_checksum])?;
                     super::provider_generations::record_layout_destination(&tx,record,installed,op.metadata_flags)?;
+                    let checksum = data_encoding::HEXLOWER.encode(&installed.fingerprint.sha256);
+                    let evidence = serde_json::to_string(&crate::state::types::EmbeddedMetadataReceipt {
+                        published: true,
+                        input_checksum: checksum.clone(), output_checksum: checksum.clone(),
+                        previous: (*installed.embedded_fields).clone(), written: (*installed.embedded_fields).clone(),
+                    }).map_err(|_invalid| invalid("invalid embedded field evidence"))?;
+                    tx.execute("UPDATE asset_metadata_paths SET embedded_metadata_receipt=?5 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND local_checksum=?6",params![op.library,op.child,record.version_size.as_str(),path.to_str(),evidence,checksum])?;
                     files.push(installed.clone());
                 }
             }
@@ -694,6 +707,7 @@ mod tests {
         let old = LayoutFile {
             local_preserved: false,
             local_modified: None,
+            embedded_fields: Default::default(),
             path: SelectionPath::from_path(&destination),
             version: "original".into(),
             provider_checksum: "old-provider-checksum".into(),

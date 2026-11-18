@@ -234,16 +234,12 @@ fn plan_sidecar_from_gps(
         preserve_source_gps: source_error.is_some(),
         rating: payload.rating,
         gps: gps_from_payload(payload),
-        is_hidden: payload.is_hidden,
-        is_archived: payload.is_archived,
         ..crate::download::metadata::MetadataWrite::default()
     };
     write.title.clone_from(&payload.title);
     write.description.clone_from(&payload.description);
     write.keywords.clone_from(&payload.keywords);
     write.people.clone_from(&payload.people);
-    write.media_subtype.clone_from(&payload.media_subtype);
-    write.burst_id.clone_from(&payload.burst_id);
     write
 }
 

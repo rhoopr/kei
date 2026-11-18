@@ -172,6 +172,7 @@ impl SqliteStateDb {
                 local: local_checksum,
                 downloaded: download_checksum,
                 source: None,
+                embedded_fields: None,
             },
             mark_capture_repair,
         )
@@ -195,6 +196,7 @@ impl SqliteStateDb {
         let local_checksum = checksums.local.to_owned();
         let download_checksum = checksums.downloaded.map(str::to_owned);
         let source_checksum = checksums.source.map(str::to_owned);
+        let embedded_fields = checksums.embedded_fields.cloned();
 
         self.with_conn_mut("mark_downloaded", move |conn| {
             let tx = conn
@@ -247,6 +249,33 @@ impl SqliteStateDb {
                     &local_checksum,
                     source,
                 )?;
+            }
+
+            if let Some(fields) = embedded_fields.filter(|fields| *fields != Default::default()) {
+                let receipt = crate::state::types::EmbeddedMetadataReceipt {
+                    input_checksum: local_checksum.clone(),
+                    output_checksum: local_checksum.clone(),
+                    written: fields,
+                    previous: Default::default(),
+                    published: true,
+                };
+                let raw = serde_json::to_string(&receipt)
+                    .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+                // Publication, native authority and measured field ownership
+                // commit together. Identical-existing outcomes supply no fields.
+                let key = super::provider_selection::SelectionPath::from_path(&local_path).key()?;
+                let native = tx.execute(
+                    "UPDATE provider_active_destinations SET embedded_metadata_receipt=?5
+                     WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4
+                     AND current_publication=1 AND preserved_local IS NULL AND local_checksum=?6",
+                    rusqlite::params![library,id,version_size,key,raw,local_checksum],
+                )?;
+                let legacy = tx.execute(
+                    "UPDATE asset_metadata_paths SET embedded_metadata_receipt=?5
+                     WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND local_checksum=?6",
+                    rusqlite::params![library,id,version_size,local_path.to_str(),raw,local_checksum],
+                )?;
+                if native + legacy == 0 { return Err(StateError::ProviderWorkConflict); }
             }
 
             record_metadata_capture_revision(
@@ -1175,6 +1204,7 @@ impl DownloadStateStore for SqliteStateDb {
         local_checksum: &str,
         download_checksum: Option<&str>,
         mark_capture_repair: bool,
+        embedded_fields: &crate::state::types::EmbeddedMetadataFields,
     ) -> Result<(), StateError> {
         self.mark_downloaded_with_checksums(
             library,
@@ -1185,6 +1215,7 @@ impl DownloadStateStore for SqliteStateDb {
                 local: local_checksum,
                 downloaded: download_checksum,
                 source: download_checksum,
+                embedded_fields: Some(embedded_fields),
             },
             mark_capture_repair,
         )

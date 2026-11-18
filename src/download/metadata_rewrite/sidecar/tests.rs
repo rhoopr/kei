@@ -185,7 +185,7 @@ async fn reconciled_sidecar_rejects_unsafe_metadata_entries() {
 
 #[cfg(feature = "xmp")]
 #[test]
-fn plan_sidecar_write_is_comprehensive_regardless_of_flags() {
+fn plan_sidecar_write_includes_standard_fields_and_authorized_groupings() {
     let payload = rich_payload();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("photo.jpg");
@@ -193,7 +193,7 @@ fn plan_sidecar_write_is_comprehensive_regardless_of_flags() {
     let created_local = now_local() + chrono::Duration::milliseconds(629);
     let (w, source_error) = plan_sidecar_write(&path, &payload, &created_local, None);
     assert!(source_error.is_none());
-    // Every payload field should land in the sidecar write, no flag gating.
+    // Groupings have already been authorized when constructing the payload.
     assert_eq!(w.datetime.as_deref(), Some("2024-06-15T10:00:00.629"));
     assert_eq!(w.offset_time_original.as_deref(), Some("+11:00"));
     assert_eq!(w.rating, Some(4));
@@ -202,10 +202,10 @@ fn plan_sidecar_write_is_comprehensive_regardless_of_flags() {
     assert_eq!(w.description.as_deref(), Some("D"));
     assert_eq!(w.keywords.len(), 2);
     assert_eq!(w.people, vec!["Alice"]);
-    assert!(w.is_hidden);
-    assert!(w.is_archived);
-    assert_eq!(w.media_subtype.as_deref(), Some("portrait"));
-    assert_eq!(w.burst_id.as_deref(), Some("b1"));
+    assert!(!w.is_hidden);
+    assert!(!w.is_archived);
+    assert!(w.media_subtype.is_none());
+    assert!(w.burst_id.is_none());
 }
 
 #[cfg(feature = "xmp")]

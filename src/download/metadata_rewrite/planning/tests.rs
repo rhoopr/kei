@@ -6,6 +6,34 @@ use crate::download::metadata_rewrite::test_support::now_local;
 #[cfg(feature = "xmp")]
 use crate::download::metadata_rewrite::test_support::rich_payload;
 
+#[test]
+fn enrichment_bits_refine_writers_without_enabling_them() {
+    // These bits are persisted in selection specifications and rewrite receipts.
+    assert_eq!(MetadataFlags::EMBED_XMP.bits(), 1 << 4);
+    assert_eq!(MetadataFlags::XMP_SIDECAR.bits(), 1 << 5);
+    assert_eq!(MetadataFlags::INCLUDE_ALBUMS.bits(), 1 << 6);
+    assert_eq!(MetadataFlags::INCLUDE_PEOPLE.bits(), 1 << 7);
+    let enrichment = MetadataFlags::INCLUDE_ALBUMS | MetadataFlags::INCLUDE_PEOPLE;
+    assert!(!enrichment.any_embed());
+    assert!(!enrichment.has_any_write());
+    assert!(!enrichment.uses_xmp_groupings());
+    let sidecar = enrichment | MetadataFlags::XMP_SIDECAR;
+    assert!(sidecar.has_any_write());
+    assert!(sidecar.uses_xmp_groupings());
+    assert!(!sidecar.any_embed());
+    #[cfg(feature = "xmp")]
+    {
+        let mut config = crate::config::MetadataConfig {
+            include_albums: true,
+            include_people: true,
+            ..crate::config::MetadataConfig::default()
+        };
+        assert!(MetadataFlags::from(&config).is_empty());
+        config.xmp_sidecar = true;
+        assert_eq!(MetadataFlags::from(&config), sidecar);
+    }
+}
+
 #[cfg(feature = "xmp")]
 #[test]
 fn plan_metadata_write_gates_xmp_fields_on_embed_xmp() {
@@ -35,11 +63,11 @@ fn plan_metadata_write_gates_xmp_fields_on_embed_xmp() {
     );
     assert_eq!(w.title.as_deref(), Some("T"));
     assert_eq!(w.keywords, vec!["vacation", "beach"]);
-    assert_eq!(w.people, vec!["Alice"]);
-    assert!(w.is_hidden);
-    assert!(w.is_archived);
-    assert_eq!(w.media_subtype.as_deref(), Some("portrait"));
-    assert_eq!(w.burst_id.as_deref(), Some("b1"));
+    assert!(w.people.is_empty());
+    assert!(!w.is_hidden);
+    assert!(!w.is_archived);
+    assert!(w.media_subtype.is_none());
+    assert!(w.burst_id.is_none());
     assert_eq!(w.offset_time_original.as_deref(), Some("+11:00"));
 }
 

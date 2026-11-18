@@ -92,6 +92,7 @@ pub(super) type DownloadSingleResult = (
     u64,
     u64,
     Option<Arc<crate::download::file::RetainedPendingFile>>,
+    Box<crate::state::types::EmbeddedMetadataFields>,
 );
 
 pub(in crate::download) async fn download_single_task<C: crate::download::file::DownloadClient>(
@@ -196,6 +197,7 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
         let download_checksum = downloaded_fingerprint.map(|fingerprint| data_encoding::HEXLOWER.encode(&fingerprint.sha256));
 
         let mut exif_ok = true;
+        let mut embedded_fields = Box::<crate::state::types::EmbeddedMetadataFields>::default();
         if let Some(part) = &part_path {
             let outcome = metadata_rewrite::write_download_metadata(
                 metadata_rewrite::MetadataWriteRequest {
@@ -217,6 +219,7 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
                 downloaded.accept_metadata_output(expected).await?;
             }
             exif_ok = !outcome.any_failed();
+            embedded_fields = outcome.embedded_fields;
         }
 
         // Set mtime on .part (before rename) or final path directly.
@@ -226,9 +229,13 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
                 path = %task.download_path.display(), error = %e, "Could not set mtime");
         }
 
-        if part_path.is_some() {
-            downloaded.publish(&task.download_path, task.publication()).await?;
-        }
+        if part_path.is_some()
+            && downloaded.publish(&task.download_path, task.publication()).await?
+                == crate::download::file::PublicationOutcome::IdenticalExisting
+            {
+                // Discarded temporary output cannot authorize later clearing.
+                embedded_fields = Default::default();
+            }
 
         // Embed work already captured the original checksum. Otherwise take
         // a baseline for the unchanged download before sidecar planning.
@@ -295,6 +302,7 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
             downloaded.bytes_written,
             disk_bytes,
             retained,
+            embedded_fields,
         ))
     }
     .await;

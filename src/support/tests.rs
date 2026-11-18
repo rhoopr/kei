@@ -268,6 +268,50 @@ fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
         Some(&toml),
     )
     .unwrap();
+    assert_eq!(
+        super::runtime_configuration(&config)["include_albums"],
+        false
+    );
+    assert_eq!(
+        super::runtime_configuration(&config)["include_people"],
+        false
+    );
+    assert_eq!(
+        super::runtime_configuration(&config)["set_exif_orientation"],
+        false
+    );
+    config.metadata.set_exif_orientation = true;
+    assert_eq!(
+        super::runtime_configuration(&config)["set_exif_orientation"],
+        true
+    );
+    let orientation_input = config.to_toml();
+    assert_eq!(
+        super::configuration(Some(&orientation_input), true)["set_exif_orientation"],
+        true
+    );
+    #[cfg(feature = "xmp")]
+    {
+        config.metadata.include_albums = true;
+        config.metadata.include_people = true;
+        assert_eq!(
+            super::runtime_configuration(&config)["include_albums"],
+            true
+        );
+        assert_eq!(
+            super::runtime_configuration(&config)["include_people"],
+            true
+        );
+        let input = config.to_toml();
+        assert_eq!(
+            super::configuration(Some(&input), true)["include_albums"],
+            true
+        );
+        assert_eq!(
+            super::configuration(Some(&input), true)["include_people"],
+            true
+        );
+    }
     for (variant, label) in [
         (
             FileMatchPolicy::NameSizeDedupWithSuffix,

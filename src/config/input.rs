@@ -90,6 +90,7 @@ pub(crate) struct TomlRetry {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlMetadata {
     pub set_exif_datetime: Option<bool>,
+    pub set_exif_orientation: Option<bool>,
     pub set_exif_rating: Option<bool>,
     pub set_exif_gps: Option<bool>,
     pub set_exif_description: Option<bool>,
@@ -97,6 +98,10 @@ pub(crate) struct TomlMetadata {
     pub embed_xmp: Option<bool>,
     #[cfg(feature = "xmp")]
     pub xmp_sidecar: Option<bool>,
+    #[cfg(feature = "xmp")]
+    pub include_albums: Option<bool>,
+    #[cfg(feature = "xmp")]
+    pub include_people: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -295,11 +300,14 @@ mod tests {
             "photos.file_match_policy",
             "photos.keep_unicode_in_filenames",
             "metadata.set_exif_datetime",
+            "metadata.set_exif_orientation",
             "metadata.set_exif_rating",
             "metadata.set_exif_gps",
             "metadata.set_exif_description",
             "metadata.embed_xmp",
             "metadata.xmp_sidecar",
+            "metadata.include_albums",
+            "metadata.include_people",
             "watch.interval",
             "watch.notify_systemd",
             "watch.pid_file",
@@ -331,7 +339,14 @@ mod tests {
             .lines()
             .filter(|line| {
                 let trimmed = line.trim_start();
-                !trimmed.starts_with("embed_xmp") && !trimmed.starts_with("xmp_sidecar")
+                ![
+                    "embed_xmp",
+                    "xmp_sidecar",
+                    "include_albums",
+                    "include_people",
+                ]
+                .iter()
+                .any(|key| trimmed.starts_with(key))
             })
             .collect::<Vec<_>>()
             .join("\n");

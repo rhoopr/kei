@@ -7,6 +7,104 @@ use chrono::{DateTime, FixedOffset, Local, Utc};
 
 use crate::types::AssetVersionSize;
 
+pub(crate) mod embedded_absence {
+    pub(crate) const RATING: u8 = 1;
+    pub(crate) const DESCRIPTION: u8 = 2;
+    pub(crate) const TITLE: u8 = 4;
+    pub(crate) const KEYWORDS: u8 = 8;
+    pub(crate) const PEOPLE: u8 = 16;
+    pub(crate) const GPS: u8 = 32;
+}
+
+/// Exact embedded values established by a measured field change. A missing
+/// member grants no ownership, including when a recipe completed without writes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmbeddedMetadataFields {
+    /// Latitude, longitude, altitude, latitude ref, longitude ref, altitude ref.
+    /// Each property has independent write proof; existing companion tags are
+    /// never adopted merely because another coordinate component changed.
+    pub gps: [Option<String>; 6],
+    /// Native companions reconciled by the XMP JPEG/TIFF/PNG handler.
+    pub native_gps: [Option<String>; 6],
+    /// Native TIFF description is independent of the XMP default-language text.
+    pub native_description: Option<String>,
+    pub rating: Option<String>,
+    pub rating_percent: Option<String>,
+    pub description: Option<String>,
+    pub title: Option<String>,
+    pub keywords: Option<Vec<String>>,
+    pub people: Option<Vec<String>>,
+}
+
+/// Measured field ownership tied to exact input/output bytes. Rewrites freeze
+/// it before publication; initial downloads commit it with downloaded state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddedMetadataReceipt {
+    pub published: bool,
+    pub input_checksum: String,
+    pub output_checksum: String,
+    pub previous: EmbeddedMetadataFields,
+    pub written: EmbeddedMetadataFields,
+}
+
+impl EmbeddedMetadataFields {
+    /// Retain previous ownership only while its value survives unchanged, and
+    /// acquire ownership only when this writer actually changed the field.
+    #[must_use]
+    pub(crate) fn after_write(&self, before: &Self, after: &Self) -> Self {
+        fn owned<T: Clone + PartialEq>(
+            prior: &Option<T>,
+            before: &Option<T>,
+            after: &Option<T>,
+        ) -> Option<T> {
+            if before != after || (prior.is_some() && prior == before) {
+                after.clone()
+            } else {
+                None
+            }
+        }
+        let mut gps: [Option<String>; 6] = Default::default();
+        let mut native_gps: [Option<String>; 6] = Default::default();
+        for (((out, prior), before), after) in native_gps
+            .iter_mut()
+            .zip(&self.native_gps)
+            .zip(&before.native_gps)
+            .zip(&after.native_gps)
+        {
+            *out = owned(prior, before, after);
+        }
+        for (((out, prior), before), after) in gps
+            .iter_mut()
+            .zip(&self.gps)
+            .zip(&before.gps)
+            .zip(&after.gps)
+        {
+            *out = owned(prior, before, after);
+        }
+        Self {
+            gps,
+            native_gps,
+            native_description: owned(
+                &self.native_description,
+                &before.native_description,
+                &after.native_description,
+            ),
+            rating: owned(&self.rating, &before.rating, &after.rating),
+            rating_percent: owned(
+                &self.rating_percent,
+                &before.rating_percent,
+                &after.rating_percent,
+            ),
+            description: owned(&self.description, &before.description, &after.description),
+            title: owned(&self.title, &before.title, &after.title),
+            keywords: owned(&self.keywords, &before.keywords, &after.keywords),
+            people: owned(&self.people, &before.people, &after.people),
+        }
+    }
+}
+
 /// Revision of the catalogue metadata semantics produced by the current
 /// binary. Bump this when decoder or capture behavior changes in a way that
 /// requires existing catalogue rows to be hydrated again.

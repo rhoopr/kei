@@ -45,6 +45,7 @@ async fn bundled_metadata_roundtrips() {
     for populated in [true, false] {
         let mut h = Harness::new().await;
         h.config.metadata = MetadataConfig {
+            set_exif_orientation: false,
             set_exif_datetime: true,
             set_exif_rating: true,
             set_exif_gps: true,
@@ -53,6 +54,10 @@ async fn bundled_metadata_roundtrips() {
             embed_xmp: false,
             #[cfg(feature = "xmp")]
             xmp_sidecar: false,
+            #[cfg(feature = "xmp")]
+            include_albums: false,
+            #[cfg(feature = "xmp")]
+            include_people: false,
         };
         let mut records = h
             .asset(

@@ -86,6 +86,10 @@ struct SetupAnswers {
     bandwidth_limit: Option<String>,
     keep_unicode_in_filenames: bool,
     set_exif_datetime: bool,
+    set_exif_orientation: bool,
+    set_exif_rating: bool,
+    set_exif_gps: bool,
+    set_exif_description: bool,
     #[cfg(feature = "xmp")]
     embed_xmp: bool,
     #[cfg(feature = "xmp")]
@@ -128,9 +132,13 @@ impl Default for SetupAnswers {
             max_retries: None,
             bandwidth_limit: None,
             keep_unicode_in_filenames: false,
-            set_exif_datetime: false,
+            set_exif_datetime: true,
+            set_exif_orientation: true,
+            set_exif_rating: true,
+            set_exif_gps: true,
+            set_exif_description: true,
             #[cfg(feature = "xmp")]
-            embed_xmp: false,
+            embed_xmp: true,
             #[cfg(feature = "xmp")]
             xmp_sidecar: false,
             file_match_policy: None,
@@ -1148,14 +1156,31 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
 
     answers.set_exif_datetime = Confirm::new()
         .with_prompt("Write EXIF date tag if missing from photo?")
-        .default(false)
+        .default(true)
+        .interact()?;
+
+    answers.set_exif_orientation = Confirm::new()
+        .with_prompt("Fill missing orientation on proven untransformed JPEG/TIFF originals?")
+        .default(true)
+        .interact()?;
+    answers.set_exif_rating = Confirm::new()
+        .with_prompt("Write favourite/rating metadata?")
+        .default(true)
+        .interact()?;
+    answers.set_exif_gps = Confirm::new()
+        .with_prompt("Write location metadata if missing?")
+        .default(true)
+        .interact()?;
+    answers.set_exif_description = Confirm::new()
+        .with_prompt("Write description/caption metadata?")
+        .default(true)
         .interact()?;
 
     #[cfg(feature = "xmp")]
     {
         answers.embed_xmp = Confirm::new()
-            .with_prompt("Embed XMP metadata (rating, GPS, description) into photos?")
-            .default(false)
+            .with_prompt("Embed standard XMP title and keywords into supported files?")
+            .default(true)
             .interact()?;
 
         answers.xmp_sidecar = Confirm::new()
@@ -1328,26 +1353,29 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         // [metadata]
         writeln!(out)?;
         writeln!(out, "[metadata]")?;
-        if answers.set_exif_datetime {
-            writeln!(out, "set_exif_datetime = true")?;
-        } else {
-            writeln!(out, "# set_exif_datetime = false")?;
-        }
-        writeln!(out, "# set_exif_rating = false")?;
-        writeln!(out, "# set_exif_gps = false")?;
-        writeln!(out, "# set_exif_description = false")?;
+        writeln!(
+            out,
+            "# Enabled fields authorize updates to kei-managed files on later syncs."
+        )?;
+        writeln!(out, "set_exif_datetime = {}", answers.set_exif_datetime)?;
+        writeln!(
+            out,
+            "set_exif_orientation = {}",
+            answers.set_exif_orientation
+        )?;
+        writeln!(out, "set_exif_rating = {}", answers.set_exif_rating)?;
+        writeln!(out, "set_exif_gps = {}", answers.set_exif_gps)?;
+        writeln!(
+            out,
+            "set_exif_description = {}",
+            answers.set_exif_description
+        )?;
         #[cfg(feature = "xmp")]
         {
-            if answers.embed_xmp {
-                writeln!(out, "embed_xmp = true")?;
-            } else {
-                writeln!(out, "# embed_xmp = false")?;
-            }
-            if answers.xmp_sidecar {
-                writeln!(out, "xmp_sidecar = true")?;
-            } else {
-                writeln!(out, "# xmp_sidecar = false")?;
-            }
+            writeln!(out, "embed_xmp = {}", answers.embed_xmp)?;
+            writeln!(out, "xmp_sidecar = {}", answers.xmp_sidecar)?;
+            writeln!(out, "include_albums = false")?;
+            writeln!(out, "include_people = false")?;
         }
 
         // [filters]
@@ -1510,6 +1538,48 @@ fn file_match_str(policy: FileMatchPolicy) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn setup_standard_metadata_defaults_are_explicit_and_opt_outs_stay_false() {
+        for enabled in [true, false] {
+            let answers = super::SetupAnswers {
+                set_exif_datetime: enabled,
+                set_exif_orientation: enabled,
+                set_exif_rating: enabled,
+                set_exif_gps: enabled,
+                set_exif_description: enabled,
+                #[cfg(feature = "xmp")]
+                embed_xmp: enabled,
+                ..super::SetupAnswers::default()
+            };
+            let parsed: crate::config::TomlConfig =
+                toml::from_str(&super::generate_toml(&answers)).unwrap();
+            assert_eq!(parsed.config_version, Some(1));
+            let metadata = parsed.metadata.unwrap();
+            assert_eq!(metadata.set_exif_datetime, Some(enabled));
+            assert_eq!(metadata.set_exif_orientation, Some(enabled));
+            assert_eq!(metadata.set_exif_rating, Some(enabled));
+            assert_eq!(metadata.set_exif_gps, Some(enabled));
+            assert_eq!(metadata.set_exif_description, Some(enabled));
+            #[cfg(feature = "xmp")]
+            {
+                assert_eq!(metadata.embed_xmp, Some(enabled));
+                assert_eq!(metadata.xmp_sidecar, Some(false));
+                assert_eq!(metadata.include_albums, Some(false));
+                assert_eq!(metadata.include_people, Some(false));
+            }
+        }
+        let defaults = super::SetupAnswers::default();
+        assert!(defaults.set_exif_orientation);
+        assert!(
+            defaults.set_exif_datetime
+                && defaults.set_exif_rating
+                && defaults.set_exif_gps
+                && defaults.set_exif_description
+        );
+        #[cfg(feature = "xmp")]
+        assert!(defaults.embed_xmp);
+    }
+
     use super::*;
     use crate::config::TomlConfig;
 
@@ -1618,6 +1688,7 @@ mod tests {
         let answers = SetupAnswers {
             username: "user@example.com".to_string(),
             password: secrecy::SecretString::from("secret"),
+            set_exif_orientation: true,
             directory: "~/Photos/iCloud".to_string(),
             ..Default::default()
         };
@@ -1928,6 +1999,7 @@ mod tests {
     #[test]
     fn test_generate_toml_full() {
         let answers = SetupAnswers {
+            set_exif_orientation: true,
             username: "user@example.com".to_string(),
             password: secrecy::SecretString::from("secret"),
             domain: Some(Domain::Cn),
@@ -1956,6 +2028,9 @@ mod tests {
             set_exif_datetime: true,
             #[cfg(feature = "xmp")]
             embed_xmp: true,
+            set_exif_rating: true,
+            set_exif_gps: true,
+            set_exif_description: true,
             #[cfg(feature = "xmp")]
             xmp_sidecar: false,
             file_match_policy: Some(FileMatchPolicy::NameId7),
@@ -1988,8 +2063,7 @@ mod tests {
         #[cfg(feature = "xmp")]
         {
             assert!(toml_str.contains("embed_xmp = true"));
-            // `xmp_sidecar = false` here means it's commented out, not active.
-            assert!(toml_str.contains("# xmp_sidecar = false"));
+            assert!(toml_str.contains("\nxmp_sidecar = false"));
         }
         assert!(toml_str.contains("keep_unicode_in_filenames = true"));
         assert!(toml_str.contains("data_dir = \"~/.kei\""));
@@ -2005,6 +2079,7 @@ mod tests {
         let answers = SetupAnswers {
             username: "test@icloud.com".to_string(),
             password: secrecy::SecretString::from("pw"),
+            set_exif_orientation: true,
             domain: Some(Domain::Cn),
             secret_source: SetupSecretSource::CredentialStore,
             directory: "/data/photos".to_string(),
@@ -2035,6 +2110,9 @@ mod tests {
             set_exif_datetime: true,
             #[cfg(feature = "xmp")]
             embed_xmp: true,
+            set_exif_rating: true,
+            set_exif_gps: true,
+            set_exif_description: true,
             #[cfg(feature = "xmp")]
             xmp_sidecar: true,
             file_match_policy: Some(FileMatchPolicy::NameId7),

@@ -2157,6 +2157,96 @@ async fn run_full_enumeration_metadata_cycle(
     .expect("run cycle")
 }
 
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn current_metadata_selection_ignores_deselected_and_foreign_markers() {
+    let server = crate::start_wiremock_or_skip!();
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let inner = open_owned_cycle_db(&database).await;
+    let (page, selected) = admit_metadata_child(&inner, directory.path(), &server).await;
+    let mut historical = Vec::new();
+    for library in ["PrimarySync", "ForeignLibrary"] {
+        let path = directory.path().join(format!("unselected-{library}.jpg"));
+        let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::create_dir(format!("{}.xmp", path.display())).unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("unselected")
+            .library(library)
+            .filename("unselected.jpg")
+            .metadata(state::AssetMetadata {
+                rating: Some(5),
+                ..Default::default()
+            })
+            .build();
+        inner.upsert_seen(&record).await.unwrap();
+        inner
+            .mark_downloaded(
+                library,
+                "unselected",
+                "original",
+                &path,
+                "historical-checksum",
+                None,
+            )
+            .await
+            .unwrap();
+        inner
+            .record_metadata_write_failure(library, "unselected", "original")
+            .await
+            .unwrap();
+        historical.push((
+            path.clone(),
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+        ));
+    }
+    let markers = inner.get_metadata_retry_markers().await.unwrap();
+    drop(inner);
+    let mut prior_sidecar = None;
+    for _ in 0..3 {
+        let inner = open_owned_cycle_db(&database).await;
+        let result = run_full_enumeration_metadata_cycle(
+            &inner,
+            directory.path(),
+            page.clone(),
+            false,
+            download::DownloadControls::download_hidden(),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0);
+        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("metadata-edited")
+        );
+        assert_eq!(inner.get_metadata_retry_markers().await.unwrap(), markers);
+        for (path, modified) in &historical {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                include_bytes!("../../../../tests/data/media/pattern.jpg")
+            );
+            assert_eq!(
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+                *modified
+            );
+            assert!(std::path::Path::new(&format!("{}.xmp", path.display())).is_dir());
+        }
+        let sidecar = std::path::PathBuf::from(format!("{}.xmp", selected.display()));
+        let current = (
+            std::fs::read(&sidecar).unwrap(),
+            std::fs::metadata(sidecar).unwrap().modified().unwrap(),
+        );
+        if let Some(prior) = prior_sidecar {
+            assert_eq!(current, prior);
+        }
+        prior_sidecar = Some(current);
+    }
+}
+
 /// #707 review: both enumeration branches defer their queue, so a full
 /// enumeration drains once. A second drain in the same cycle would retry a
 /// failed rewrite immediately and report it twice.
@@ -4498,6 +4588,7 @@ async fn exercise_legacy_child_cycles_with_provenance(
                         &hash,
                         Some(&hash),
                         false,
+                        &Default::default(),
                     )
                     .await
                     .unwrap();

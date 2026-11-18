@@ -1771,22 +1771,34 @@ async fn assert_reserved_download_transition(
 
 #[tokio::test]
 async fn pending_retry_preserves_reconciliation_reservations_across_restart() {
-    assert_pending_retry_reservations(PendingReservationEntry::Absent).await;
+    Box::pin(assert_pending_retry_reservations(
+        PendingReservationEntry::Absent,
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn pending_retry_reservations_reject_foreign_adoption() {
-    assert_pending_retry_reservations(PendingReservationEntry::ForeignIdentical).await;
+    Box::pin(assert_pending_retry_reservations(
+        PendingReservationEntry::ForeignIdentical,
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn pending_retry_reservations_reuse_owned_file() {
-    assert_pending_retry_reservations(PendingReservationEntry::Owned).await;
+    Box::pin(assert_pending_retry_reservations(
+        PendingReservationEntry::Owned,
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn pending_retry_reservations_allow_owned_truncation_repair() {
-    assert_pending_retry_reservations(PendingReservationEntry::OwnedTruncated).await;
+    Box::pin(assert_pending_retry_reservations(
+        PendingReservationEntry::OwnedTruncated,
+    ))
+    .await;
 }
 
 #[derive(Clone, Copy)]
@@ -1976,6 +1988,7 @@ async fn assert_pending_retry_reservations(entry: PendingReservationEntry) {
                 &local,
                 Some(&local),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -2236,18 +2249,24 @@ async fn path_reconciliation_cross_library_reservations() {
         ReservationScenario::CrossLibraryIdenticalBytes,
         ReservationScenario::CrossLibrarySameIdentity,
     ] {
-        assert_reconciliation_reservations(scenario).await;
+        Box::pin(assert_reconciliation_reservations(scenario)).await;
     }
 }
 
 #[tokio::test]
 async fn path_reconciliation_reservations_survive_lookup_and_state_failure() {
-    assert_reconciliation_reservations(ReservationScenario::Interrupted).await;
+    Box::pin(assert_reconciliation_reservations(
+        ReservationScenario::Interrupted,
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn reconciliation_reservations_write_failure_prevents_publication() {
-    assert_reconciliation_reservations(ReservationScenario::ReservationWriteFailure).await;
+    Box::pin(assert_reconciliation_reservations(
+        ReservationScenario::ReservationWriteFailure,
+    ))
+    .await;
 }
 
 #[derive(Clone, Copy)]

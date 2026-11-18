@@ -22,6 +22,286 @@ use chrono::{FixedOffset, TimeZone};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+#[tokio::test]
+async fn retained_prepared_description_recovers_before_replanning_current_intent() {
+    use crate::state::MetadataRewriteStore;
+    for next in ["B", "C"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.jpg");
+        std::fs::write(
+            &path,
+            include_bytes!("../../../../tests/data/media/pattern.jpg"),
+        )
+        .unwrap();
+        let dbpath = dir.path().join("state.db");
+        let db = crate::state::SqliteStateDb::open(&dbpath).await.unwrap();
+        let metadata = |text: &str| {
+            crate::icloud::photos::metadata::extract(
+                &serde_json::json!({}),
+                &serde_json::json!({"extendedDescEnc":{"value":text,"type":"STRING"},"captionEnc":{"value":"","type":"STRING"}}),
+            )
+        };
+        let mut record = crate::test_helpers::TestAssetRecord::new("recover-fields")
+            .filename("photo.jpg")
+            .metadata(metadata("B"))
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "recover-fields",
+            "original",
+            &path,
+            &checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "recover-fields", "original")
+            .await
+            .unwrap();
+        db.acquire_lock("fail field finalization").unwrap().execute_batch("CREATE TEMP TRIGGER fail_field_finalization BEFORE UPDATE OF local_checksum ON assets WHEN NEW.local_checksum IS NOT NULL BEGIN SELECT RAISE(ABORT,'field finalization failure'); END;").unwrap();
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            run_pending(&db, MetadataFlags::DESCRIPTION, ".test".into(), &cancel)
+                .await
+                .failed,
+            1
+        );
+        let prepared = db
+            .embedded_metadata_receipt("PrimarySync", "recover-fields", "original", &path, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!prepared.published);
+        assert_eq!(prepared.written.description.as_deref(), Some("B"));
+        assert_eq!(
+            crate::download::file::compute_sha256(&path).await.unwrap(),
+            prepared.output_checksum
+        );
+        drop(db);
+        let db = crate::state::SqliteStateDb::open(&dbpath).await.unwrap();
+        record.metadata = Arc::new(metadata(next));
+        db.upsert_seen(&record).await.unwrap();
+        db.record_metadata_write_failure("PrimarySync", "recover-fields", "original")
+            .await
+            .unwrap();
+        let result = run_pending(&db, MetadataFlags::DESCRIPTION, ".test".into(), &cancel).await;
+        assert_eq!(result.failed, 0, "{next}");
+        let owned = db
+            .embedded_metadata_receipt("PrimarySync", "recover-fields", "original", &path, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(owned.published);
+        assert_eq!(owned.written.description.as_deref(), Some(next));
+        assert_eq!(
+            owned.output_checksum,
+            crate::download::file::compute_sha256(&path).await.unwrap()
+        );
+        assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
+        record.metadata = Arc::new(metadata(""));
+        db.upsert_seen(&record).await.unwrap();
+        db.record_metadata_write_failure("PrimarySync", "recover-fields", "original")
+            .await
+            .unwrap();
+        assert_eq!(
+            run_pending(&db, MetadataFlags::DESCRIPTION, ".test".into(), &cancel)
+                .await
+                .failed,
+            0
+        );
+        let native = little_exif::metadata::Metadata::new_from_path(&path).unwrap();
+        assert!(
+            native
+                .get_tag(&little_exif::exif_tag::ExifTag::ImageDescription(
+                    String::new()
+                ))
+                .next()
+                .is_none()
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        drop(db);
+        for _ in 0..2 {
+            let db = crate::state::SqliteStateDb::open(&dbpath).await.unwrap();
+            assert_eq!(
+                run_pending(&db, MetadataFlags::DESCRIPTION, ".test".into(), &cancel)
+                    .await
+                    .failed,
+                0
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn embedded_clear_requires_actual_write_and_current_value_match_across_reopen() {
+    use crate::state::MetadataRewriteStore;
+    use little_exif::{exif_tag::ExifTag, metadata::Metadata};
+    for case in [
+        "owned",
+        "identical",
+        "user-edited",
+        "disabled",
+        "unobserved",
+        "failure",
+        "finalize-failure",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.jpg");
+        std::fs::write(
+            &path,
+            include_bytes!("../../../../tests/data/media/pattern.jpg"),
+        )
+        .unwrap();
+        let mut original = Metadata::new_from_path(&path).unwrap_or_else(|_| Metadata::new());
+        original.set_tag(ExifTag::Artist("camera artist".into()));
+        original.write_to_file(&path).unwrap();
+        if case == "identical" {
+            crate::download::metadata::apply_metadata(
+                &path,
+                &crate::download::metadata::MetadataWrite {
+                    description: Some("cloud caption".into()),
+                    ..Default::default()
+                },
+                ".test",
+            )
+            .unwrap();
+        }
+        let dbpath = dir.path().join("state.db");
+        let db = crate::state::SqliteStateDb::open(&dbpath).await.unwrap();
+        let metadata = crate::icloud::photos::metadata::extract(
+            &serde_json::json!({}),
+            &serde_json::json!({
+                "extendedDescEnc":{"value":"cloud caption","type":"STRING"},
+                "captionEnc":{"value":"","type":"STRING"}
+            }),
+        );
+        let mut record = crate::test_helpers::TestAssetRecord::new("clear-owned")
+            .filename("photo.jpg")
+            .metadata(metadata)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "clear-owned",
+            "original",
+            &path,
+            &checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "clear-owned", "original")
+            .await
+            .unwrap();
+        let flags = MetadataFlags::DESCRIPTION;
+        let cancel = CancellationToken::new();
+        run_pending(&db, flags, ".test".into(), &cancel).await;
+        let receipt = db
+            .embedded_metadata_receipt("PrimarySync", "clear-owned", "original", &path, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipt.written.description.as_deref(),
+            if case == "identical" {
+                None
+            } else {
+                Some("cloud caption")
+            }
+        );
+        if case == "user-edited" {
+            crate::download::metadata::apply_metadata(
+                &path,
+                &crate::download::metadata::MetadataWrite {
+                    description: Some("user caption".into()),
+                    ..Default::default()
+                },
+                ".test",
+            )
+            .unwrap();
+            let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                "clear-owned",
+                "original",
+                &path,
+                &checksum,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        record.metadata = Arc::new(crate::icloud::photos::metadata::extract(
+            &serde_json::json!({}),
+            &if case == "unobserved" {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({"extendedDescEnc":{"value":"","type":"STRING"},"captionEnc":{"value":"","type":"STRING"}})
+            },
+        ));
+        db.upsert_seen(&record).await.unwrap();
+        db.record_metadata_write_failure("PrimarySync", "clear-owned", "original")
+            .await
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        if case == "failure" {
+            db.acquire_lock("inject ownership receipt failure").unwrap().execute_batch("CREATE TEMP TRIGGER fail_field_evidence BEFORE UPDATE OF embedded_metadata_receipt ON asset_metadata_paths BEGIN SELECT RAISE(ABORT,'field proof failure'); END;").unwrap();
+            run_pending(&db, flags, ".test".into(), &cancel).await;
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(!db.get_metadata_retry_markers().await.unwrap().is_empty());
+        }
+        if case == "finalize-failure" {
+            db.acquire_lock("inject field finalization failure").unwrap().execute_batch("CREATE TEMP TRIGGER fail_field_finalization BEFORE UPDATE OF local_checksum ON assets WHEN NEW.local_checksum IS NOT NULL BEGIN SELECT RAISE(ABORT,'field finalization failure'); END;").unwrap();
+            let result = run_pending(&db, flags, ".test".into(), &cancel).await;
+            assert_eq!(result.failed, 1);
+            assert_ne!(std::fs::read(&path).unwrap(), before);
+            assert!(!db.get_metadata_retry_markers().await.unwrap().is_empty());
+        }
+        drop(db);
+        let mut quiet = None;
+        for attempt in 0..3 {
+            let db = crate::state::SqliteStateDb::open(&dbpath).await.unwrap();
+            let selected = if case == "disabled" {
+                MetadataFlags::empty()
+            } else {
+                flags
+            };
+            run_pending(&db, selected, ".test".into(), &cancel).await;
+            let native = Metadata::new_from_path(&path).unwrap();
+            let description = native
+                .get_tag(&ExifTag::ImageDescription(String::new()))
+                .find_map(|tag| match tag {
+                    ExifTag::ImageDescription(value) => Some(value.as_str()),
+                    _ => None,
+                });
+            assert_eq!(
+                description,
+                match case {
+                    "owned" | "failure" | "finalize-failure" => None,
+                    "user-edited" => Some("user caption"),
+                    _ => Some("cloud caption"),
+                },
+                "{case}/{attempt}"
+            );
+            assert!(
+                matches!(native.get_tag(&ExifTag::Artist(String::new())).next(), Some(ExifTag::Artist(value)) if value == "camera artist")
+            );
+            assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+            let bytes = std::fs::read(&path).unwrap();
+            if let Some(prior) = &quiet {
+                assert_eq!(&bytes, prior);
+            }
+            quiet = Some(bytes);
+        }
+    }
+}
 #[cfg(feature = "xmp")]
 use xmp_toolkit::{XmpMeta, xmp_ns};
 
@@ -1501,6 +1781,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_rewrite_and_retry(
             &checksum,
             Some(&checksum),
             false,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -2130,7 +2411,11 @@ async fn run_pending_matches_normal_grouped_xmp_payload() {
             .or_default()
             .push(person);
     }
-    let normal_payload = normal_groupings.metadata_payload("GROUPED", &record.metadata);
+    let flags = MetadataFlags::EMBED_XMP
+        | MetadataFlags::XMP_SIDECAR
+        | MetadataFlags::INCLUDE_ALBUMS
+        | MetadataFlags::INCLUDE_PEOPLE;
+    let normal_payload = normal_groupings.metadata_payload("GROUPED", &record.metadata, flags);
     assert_eq!(normal_payload.keywords, vec!["beach", "Vacation"]);
     assert_eq!(normal_payload.people, vec!["Alice"]);
 
@@ -2144,7 +2429,7 @@ async fn run_pending_matches_normal_grouped_xmp_payload() {
         sidecar_path: Some(&normal_path),
         payload: Arc::new(normal_payload),
         created_local: record.metadata.capture_local(record.created_at),
-        flags: MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR,
+        flags,
         capture_timestamp_repair: CaptureTimestampRepair::Preserve,
         temp_suffix: ".meta-tmp",
     })
@@ -2163,7 +2448,7 @@ async fn run_pending_matches_normal_grouped_xmp_payload() {
 
     let pass = run_pending(
         &db,
-        MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR,
+        flags,
         Arc::from(".meta-tmp"),
         &CancellationToken::new(),
     )

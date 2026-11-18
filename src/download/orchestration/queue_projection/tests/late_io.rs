@@ -126,7 +126,7 @@ async fn run_case(root: &Path, case: &str) {
     let media = large_body.as_deref().unwrap_or(MEDIA);
     let mut fixture = Fixture::new().await;
     let media_root = root.join("media");
-    std::fs::create_dir_all(media_root.join("A")).unwrap();
+    std::fs::create_dir_all(&media_root).unwrap();
     std::fs::write(media_root.join("existing.jpg"), b"existing-media").unwrap();
     std::fs::write(media_root.join("existing.xmp"), b"retained-sidecar").unwrap();
     fixture.config.directory = Arc::from(media_root.as_path());
@@ -134,6 +134,15 @@ async fn run_case(root: &Path, case: &str) {
     fixture.config.retry.max_retries = 0;
     fixture.config.temp_suffix = Arc::from(".part");
     fixture.pass = destination_pass(&fixture, "A");
+    // Establish the production album binding before fault injection. A manually
+    // precreated foreign directory would correctly select a qualified sibling.
+    crate::download::orchestration::album_directory::prepare(
+        std::slice::from_ref(&fixture.pass),
+        &fixture.config,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/recovered"))

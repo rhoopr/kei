@@ -3,6 +3,207 @@ use super::{
     cycle_options, db_count, records, server,
 };
 
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn ordinary_metadata_ownership_survives_managed_adoption_and_clear() {
+    use crate::download::metadata::{MetadataWrite, apply_metadata};
+    use little_exif::{exif_tag::ExifTag, metadata::Metadata};
+    use xmp_toolkit::{OpenFileOptions, XmpFile, xmp_ns};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("source.jpg");
+    std::fs::write(
+        &source,
+        include_bytes!("../../../../../tests/data/media/pattern.jpg"),
+    )
+    .unwrap();
+    apply_metadata(
+        &source,
+        &MetadataWrite {
+            description: Some("A".into()),
+            ..Default::default()
+        },
+        ".fixture",
+    )
+    .unwrap();
+    let mut native = Metadata::new_from_path(&source).unwrap();
+    native.set_tag(ExifTag::ImageDescription("B".into()));
+    native.set_tag(ExifTag::Artist("camera artist".into()));
+    native.write_to_file(&source).unwrap();
+    let bytes = std::fs::read(&source).unwrap();
+    let server = super::server_with_media(&bytes, super::VALID_EDIT, super::VALID_EDIT).await;
+    let root = tempfile::tempdir().unwrap();
+    let options = || super::CycleOptions {
+        embed_xmp: true,
+        exif_description: true,
+        ..Default::default()
+    };
+    let mut provider = super::records_with_original(&server, &bytes, None);
+    provider[1]["fields"]["extendedDescEnc"] = serde_json::json!({"type":"STRING","value":"B"});
+    let (first, _) = cycle_options(
+        root.path(),
+        provider,
+        false,
+        EditedNaming::Suffix,
+        options(),
+    )
+    .await;
+    assert_eq!(first.failed_count, 0, "{:?}", first.stats);
+    assert!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM asset_metadata_paths WHERE json_extract(embedded_metadata_receipt,'$.written.description')='B'"
+        ) > 0,
+        "ordinary publication must record its changed XMP description"
+    );
+    let mut provider =
+        super::records_with_original(&server, &bytes, Some(("edit-one", super::VALID_EDIT)));
+    provider[1]["fields"]["extendedDescEnc"] = serde_json::json!({"type":"STRING","value":"B"});
+    let (adopted, _) = cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        options(),
+    )
+    .await;
+    assert_eq!(adopted.failed_count, 0, "{:?}", adopted.stats);
+    let original = root.path().join("media/IMG_0501_original.JPG");
+    assert!(
+        original.exists(),
+        "adopted original must retain its archive path"
+    );
+    assert!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM asset_metadata_paths WHERE local_path LIKE '%IMG_0501_original.JPG' AND json_extract(embedded_metadata_receipt,'$.written.description')='B'"
+        ) > 0,
+        "managed adoption must transfer original field evidence"
+    );
+    provider[1]["fields"]["extendedDescEnc"] = serde_json::json!({"type":"STRING","value":""});
+    provider[1]["fields"]["captionEnc"] = serde_json::json!({"type":"STRING","value":""});
+    let requests = server.received_requests().await.unwrap().len();
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            quiet,
+            EditedNaming::Primary,
+            options(),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+        let native = Metadata::new_from_path(&original).unwrap();
+        assert!(
+            matches!(native.get_tag(&ExifTag::ImageDescription(String::new())).next(), Some(ExifTag::ImageDescription(value)) if value == "B")
+        );
+        assert!(
+            matches!(native.get_tag(&ExifTag::Artist(String::new())).next(), Some(ExifTag::Artist(value)) if value == "camera artist")
+        );
+        let mut packet = XmpFile::new().unwrap();
+        packet
+            .open_file(&original, OpenFileOptions::default().use_packet_scanning())
+            .unwrap();
+        assert!(
+            !packet
+                .xmp()
+                .unwrap()
+                .contains_property(xmp_ns::DC, "description")
+        );
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn album_directory_move_retains_embedded_ownership_on_native_paths() {
+    use little_exif::{exif_tag::ExifTag, metadata::Metadata};
+    use std::os::unix::ffi::OsStringExt;
+    // The toolkit backend cannot open non-UTF-8 paths; the native build exercises them.
+    let native_roots: &[bool] = if cfg!(feature = "xmp") {
+        &[false]
+    } else {
+        &[false, true]
+    };
+    for &native in native_roots {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(if native {
+            std::ffi::OsString::from_vec(b"native-\xff".to_vec())
+        } else {
+            "utf8".into()
+        });
+        std::fs::create_dir(&root).unwrap();
+        let server =
+            super::server_with_media(super::VALID_ORIGINAL, super::VALID_EDIT, super::VALID_EDIT)
+                .await;
+        let mut provider = super::records_with_original(&server, super::VALID_ORIGINAL, None);
+        provider[1]["fields"]["extendedDescEnc"] =
+            serde_json::json!({"type":"STRING","value":"managed caption"});
+        let options = |name| {
+            let mut options = album_directory_options(name);
+            options.exif_description = true;
+            options
+        };
+        for name in ["Old", "New"] {
+            let (result, _) = cycle_options(
+                &root,
+                provider.clone(),
+                false,
+                EditedNaming::Suffix,
+                options(name),
+            )
+            .await;
+            assert_eq!(
+                result.failed_count, 0,
+                "{native}/{name}: {:?}",
+                result.stats
+            );
+            assert!(result.db_sync_token_advance_safe);
+        }
+        let media = root.join("media/New/IMG_0501.JPG");
+        let metadata = Metadata::new_from_path(&media).unwrap();
+        assert!(
+            matches!(metadata.get_tag(&ExifTag::ImageDescription(String::new())).next(), Some(ExifTag::ImageDescription(value)) if value == "managed caption")
+        );
+        assert_eq!(
+            db_count(
+                &root,
+                "SELECT count(*) FROM provider_active_destinations WHERE current_publication=1 AND (embedded_metadata_receipt IS NULL OR json_extract(embedded_metadata_receipt,'$.output_checksum')<>local_checksum)"
+            ),
+            0
+        );
+        provider[1]["fields"]["extendedDescEnc"] = serde_json::json!({"type":"STRING","value":""});
+        provider[1]["fields"]["captionEnc"] = serde_json::json!({"type":"STRING","value":""});
+        let requests = server.received_requests().await.unwrap().len();
+        for quiet in [false, true, true] {
+            let (result, _) = cycle_options(
+                &root,
+                provider.clone(),
+                quiet,
+                EditedNaming::Suffix,
+                options("New"),
+            )
+            .await;
+            assert_eq!(
+                result.failed_count, 0,
+                "{native}/{quiet}: {:?}",
+                result.stats
+            );
+            assert!(result.db_sync_token_advance_safe);
+            let metadata = Metadata::new_from_path(&media).unwrap();
+            assert!(
+                metadata
+                    .get_tag(&ExifTag::ImageDescription(String::new()))
+                    .next()
+                    .is_none(),
+                "managed field must clear after directory move"
+            );
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    }
+}
+
 #[tokio::test]
 async fn album_directory_exclusive_binding_renames_future_template_copies() {
     for (template, prefix) in [("{album}", "media"), ("archive/{album}", "media/archive")] {

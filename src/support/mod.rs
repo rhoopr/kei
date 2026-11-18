@@ -142,6 +142,7 @@ pub(crate) fn runtime_configuration(config: &crate::config::Config) -> Value {
 }
 
 fn configuration(toml: Option<&crate::config::TomlConfig>, explicit: bool) -> Value {
+    let metadata = toml.and_then(|t| t.metadata.as_ref());
     let filters = toml.and_then(|t| t.filters.as_ref());
     let download = toml.and_then(|t| t.download.as_ref());
     let auth = toml.and_then(|t| t.auth.as_ref());
@@ -180,7 +181,23 @@ fn configuration(toml: Option<&crate::config::TomlConfig>, explicit: bool) -> Va
         "album_template_custom": download.is_some_and(|d| d.folder_structure_albums.is_some()),
         "smart_template_custom": download.is_some_and(|d| d.folder_structure_smart_folders.is_some()),
         "xmp_feature": cfg!(feature = "xmp"),
+        "set_exif_datetime": metadata.and_then(|m| m.set_exif_datetime).unwrap_or(false),
+        "set_exif_orientation": metadata.and_then(|m| m.set_exif_orientation).unwrap_or(false),
+        "set_exif_rating": metadata.and_then(|m| m.set_exif_rating).unwrap_or(false),
+        "set_exif_gps": metadata.and_then(|m| m.set_exif_gps).unwrap_or(false),
+        "set_exif_description": metadata.and_then(|m| m.set_exif_description).unwrap_or(false),
     });
+    #[cfg(feature = "xmp")]
+    if let Some(map) = value.as_object_mut() {
+        for (key, enabled) in [
+            ("embed_xmp", metadata.and_then(|m| m.embed_xmp)),
+            ("xmp_sidecar", metadata.and_then(|m| m.xmp_sidecar)),
+            ("include_albums", metadata.and_then(|m| m.include_albums)),
+            ("include_people", metadata.and_then(|m| m.include_people)),
+        ] {
+            map.insert(key.into(), json!(enabled.unwrap_or(false)));
+        }
+    }
     // Input enums are already parsed into typed values, but the wire contract
     // remains an explicit projection rather than serializing the TOML object.
     if let Some(photos) = toml.and_then(|t| t.photos.as_ref())

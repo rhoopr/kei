@@ -601,14 +601,14 @@ async fn download_photos_with_sync_inner(
 
     let mut result = match &config.sync_mode {
         SyncMode::Incremental { zone_sync_token } if config.inventory_reconciliation => {
-            reconcile_inventory(
+            Box::pin(reconcile_inventory(
                 download_client,
                 passes,
                 &config,
                 zone_sync_token,
                 controls,
                 shutdown_token.clone(),
-            )
+            ))
             .await
         }
         SyncMode::Full if config.selection_context.is_some() => {

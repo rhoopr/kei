@@ -33,6 +33,7 @@ match their headings, so searching a label finds the section.
 - User media and metadata must not be lost, corrupted, truncated, overwritten,
   or silently discarded.
 - Local file and metadata rewrites are opt-in.
+- An enabled metadata setting authorizes later updates to its managed fields. Setup writes enabled standard fields and disabled album/people enrichment explicitly. Version-1 omissions and no-config runs keep metadata writers disabled; capture-timestamp replacement requires its separate repair option.
 - Provider-specific parsing and identity rules stay in the iCloud adapter.
 - Sync policy stays in the sync and download orchestration layers.
 - Path rendering does not decide whether an asset should sync.
@@ -136,6 +137,8 @@ match their headings, so searching a label finds the section.
 | HEIF preservation checks | `src/download/heif/stream.rs`, `src/download/heif/preservation.rs` | Streams production checks of non-XMP payloads and opaque metadata; the in-memory validator remains a test and fuzz oracle. |
 | Metadata rewrite facade and immediate execution | `src/download/metadata_rewrite.rs`, `src/download/metadata_rewrite/immediate.rs` | Preserves rewrite entry points and coordinates download-time metadata writes. The pipeline retains media publication and state finalization. |
 | Metadata write planning | `src/download/metadata_rewrite/planning.rs` | Owns opt-in flags and embedded field decisions shared by immediate and queued execution. |
+| Original orientation | `src/icloud/photos/metadata.rs`, `src/download/metadata_rewrite/embedded.rs` | The provider adapter binds master orientation to the original JPEG/TIFF resource. The writer requires unchanged verified-download bytes and a proven orientation omission. The independent orientation flag and policy revision participate in frozen recipes. |
+| Metadata enrichment policy | `src/download/filter/metadata.rs` | Adds album names and people only under their independent metadata options, including queued rewrites. Standard XMP excludes provider-internal fields. Policy revision and enrichment bits participate in selection and destination fingerprints. |
 | Metadata write execution | `src/download/metadata_rewrite/embedded.rs`, `src/download/metadata_rewrite/sidecar.rs` | Coordinates fingerprint-guarded embedded writes and source-aware sidecar writes through the metadata owners. |
 | Queued metadata retries | `src/download/metadata_rewrite/queued.rs` | Tags durable rewrite work, executes bounded retry pages, and retires completed markers. |
 | Rewrite evidence and groupings | `src/download/metadata_rewrite/capture.rs`, `src/download/metadata_rewrite/grouping.rs` | Verifies capture-repair fingerprints and timestamps; loads current library-scoped groupings for queued work. |
@@ -155,6 +158,9 @@ match their headings, so searching a label finds the section.
 | Durable membership | `src/state/db/membership.rs` | Stores album snapshots, provider relations, and grouping projections. |
 | Membership departure | `src/download/orchestration/primary_layout/membership.rs` | Retires unchanged owned album copies through the existing layout journal after current selected destinations complete and exact photo lookup confirms identity. Native copies require current publication authority; preserved-local copies and unowned sidecars stay in place. |
 | Durable metadata work | `src/state/db/metadata.rs` | Stores capture revisions, path-specific rewrite work, and repair receipts. It does not write media files. |
+| Embedded field ownership | `src/state/types.rs`, `src/download/metadata/`, `src/state/db/metadata.rs` | Writers measure changed properties and preserve exact prior values. Existing path and active-destination receipts retain prepared input/output checksums and field evidence; layout journals carry the same evidence through publication. Explicit source absence plus matching prior write proof authorizes clearing. Recipe completion alone never adopts a preexisting field. |
+| Download field publication | `src/download/file/publication.rs`, `src/download/finalize.rs`, `src/state/db/assets.rs` | The file owner distinguishes installed output from identical-existing deduplication. Only installed output supplies measured field ownership to the downloaded-state transaction. Deferred writes carry the same evidence. An identical preexisting file cannot acquire ownership from discarded temporary output. |
+| Current-selection metadata authority | `src/state/db/metadata.rs`, `src/download/orchestration/generation.rs` | Ordinary generation tails page through current exact destinations. Historical catalogue markers and older-generation writers cannot authorize a write or a checkpoint hold. Explicit capture repair keeps its library-scoped queue. |
 | Durable checkpoints | `src/state/db/checkpoints.rs` | Stores provider checkpoints, scoped database tokens, and enumeration progress. Its fenced transition also commits deferred album snapshots with inventory-request retirement; sync policy decides when proof permits either operation. |
 | Temporary-file ownership | `src/state/db/temp_files.rs` | Stores losslessly encoded paths and durable temporary-file ownership. Filesystem cleanup stays in download orchestration. |
 | Durable reconciliation | `src/state/db/reconciliation.rs` | Stores destination reservations and reads catalog evidence for reconciliation. |
@@ -660,6 +666,8 @@ Schema 39 adds nullable typed `preserved_local` evidence to the existing native 
 Timestamp-authorized publication validates displaced bytes and mtime before accepting replacement. On Linux filesystems without atomic exchange, the existing replacement journal checks both from the same confined handle after displacement and before its commit marker. Interrupted uncommitted journals restore the displaced file and its actual timestamps. The clock belongs to the active attempt; recovery never infers timestamp authorization. Windows uses its existing replacement backup and the common displaced-file mtime check. Metadata writes remain retryable if the original local mtime cannot be retained.
 
 The unchanged-output exemption requires `current_publication` authority on the existing native destination row, including checked metadata output. Schema 39 adds this marker with an unknown-by-default migration and a unique partial index per library and lossless path. The destination owner retires prior authority and assigns the checked output in the publication transaction. Historical verification remains intact. Receipt reuse and generation creation time cannot establish authority. Raw SHA-256 recovery can finalize an unfinished exact destination after publication lost its state transaction. Restoring an older published file counts as a local edit. Managed copies also retain their current layout binding, and independent peers cannot borrow a catalogue-wide receipt. Legacy metadata completion without a validated native receipt invalidates obsolete native authority.
+
+Schema 41 adds nullable embedded-field receipts to existing path and native-destination rows. Migration grants no field ownership. Initial downloads commit measured fields with installed-output finalization; identical-existing publication retains only independently valid current ownership. Metadata rewrites freeze input/output evidence before publication and complete it in the existing metadata transaction. Directory members and managed bindings carry that evidence through checked moves and copies. Checked preserved-local metadata completion uses the same current-publication marker to retain the latest physical output and field ownership across selection changes. It retains `verified_media=0`, no source checksum and its preserved-local disposition. Provider-source reuse, unchanged-provider replacement exemptions, directory handoffs and retirement require non-preserved verified media. Selection alone cannot promote a preserved copy; changed local bytes revoke its previous metadata authority.
 
 Downloaded-state completion requires parent-directory durability. `download/finalize.rs` calls the strict async wrapper around `fs_util::fsync_parent_dir` before both immediate receipt writes and deferred retries. Native destination reuse and pending-publication adoption apply the same boundary after their existing confined-file checks and before state acknowledgement. A parent sync failure retains landed bytes and unfinished debt. Exact-byte recovery retries the sync before acknowledging those bytes, without another media transfer when existing provenance guards permit reuse. Identical `.part` collisions do not bypass this boundary. The wrapper runs on the blocking pool and preserves the synchronous helper's platform policy, including its non-Unix no-op.
 
@@ -2069,12 +2077,12 @@ deciding whether unchanged media needs downloading. A failed commit preserves
 the provider checkpoint. Queued rewrites drain once per cycle, after every
 producer has finished, so a single writer owns each file. Read-only runs never
 drain. Only that drain retires a marker on success, because it writes the file
-from the same row it then clears. Each bounded rewrite batch loads current
-album and people rows for its library-scoped asset IDs. A grouping-read failure
+from the same row it then clears. Bounded rewrite batches with enabled optional enrichment load current
+album and people rows for their library-scoped asset IDs. A grouping-read failure
 leaves the affected markers pending. A completed download writes the snapshot
 it was planned from, so it records a marker on failure but never retires one.
 
-The first task payload includes its concrete pass album, even when the cycle's
+With `metadata.include_albums` enabled, the first task payload includes its concrete pass album, even when the cycle's
 grouping preload is empty. Provider membership changes update the
 `asset_albums` read model and metadata retry markers in one transaction. The
 projection uses child identity or the recorded legacy state owner, never a
@@ -2471,7 +2479,7 @@ pre-admission logical charges. Historical selection and compaction fields remain
 URL or arbitrary error text, and remain subject to queue loss and bounded
 history retention. Unknown observations stay explicitly unavailable.
 
-History and export schema version 1 are separate from report version 3 and state schema 40. Raw reports and databases are never packaged. Interrupted writes preserve the previous history; read errors and limits appear as partial evidence. See [the operator guide](support-export.md) for limits and unavailable evidence.
+History and export schema version 1 are separate from report version 3 and state schema 41. Raw reports and databases are never packaged. Interrupted writes preserve the previous history; read errors and limits appear as partial evidence. See [the operator guide](support-export.md) for limits and unavailable evidence.
 
 ### Explicit missing-reference inventory diagnostic
 

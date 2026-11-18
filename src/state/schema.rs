@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 40;
+pub(crate) const SCHEMA_VERSION: i32 = 41;
 const FRESH_START_VERSION: i32 = 38;
 
 /// Retire provider planning authority once, without interpreting historical
@@ -1521,6 +1521,15 @@ pub(crate) fn migrate_to_version(
                 )?;
             }
         }
+        41 => {
+            for table in ["asset_metadata_paths", "provider_active_destinations"] {
+                if !column_exists(conn, table, "embedded_metadata_receipt")? {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN embedded_metadata_receipt TEXT;"
+                    ))?;
+                }
+            }
+        }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1545,6 +1554,19 @@ pub(crate) fn migrate_genuine_v28(conn: &Connection) -> Result<(), StateError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn embedded_receipt_migration_from_38_never_adopts_legacy_metadata() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for version in 1..=38 {
+            super::migrate_to_version(&conn, 0, version).unwrap();
+        }
+        conn.execute("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum) VALUES ('PrimarySync','old','original','/media/original.jpg','provider','unchanged')",[]).unwrap();
+        super::migrate(&conn).unwrap();
+        super::migrate(&conn).unwrap();
+        let receipt: (String,Option<String>) = conn.query_row("SELECT local_checksum,embedded_metadata_receipt FROM asset_metadata_paths WHERE id='old'",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(receipt, ("unchanged".into(), None));
+        assert_eq!(super::get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
     fn assert_retired_checkpoint(conn: &Connection, key: &str, expected: &str) {
         assert_eq!(
             conn.query_row("SELECT count(*) FROM metadata WHERE key=?1", [key], |r| r
@@ -1965,6 +1987,194 @@ mod tests {
                 )
                 .unwrap(),
                 1,
+                "reopen {reopen}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_receipt_upgrade_preserves_native_evidence_and_layout_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schema40.db");
+        let binding = b"album-binding\0\xff";
+        let other_binding = b"other-album-binding\0\xfe";
+        let preserved = b"preserved-local\0\xff";
+        let header = b"retained-layout-header\0\xff";
+        let metadata_receipt = ("path-provider", "path-local", "path-download");
+        {
+            let conn = Connection::open(&path).unwrap();
+            seed_historical_provider_fixture(&conn, 40);
+            assert_eq!(get_schema_version(&conn).unwrap(), 40);
+            assert!(
+                column_exists(&conn, "album_containers", "directory_binding").unwrap(),
+                "schema 40 must carry the directory binding"
+            );
+            for table in ["asset_metadata_paths", "provider_active_destinations"] {
+                assert!(
+                    !column_exists(&conn, table, "embedded_metadata_receipt").unwrap(),
+                    "schema 40 must not carry the embedded receipt"
+                );
+            }
+            conn.execute(
+                "INSERT INTO album_containers
+                    (library,container_id,album_name,pass_kind,is_deleted,updated_at,directory_binding)
+                 VALUES ('PrimarySync','album','Old','album',0,123,?1)",
+                [binding.as_slice()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO album_containers
+                    (library,container_id,album_name,pass_kind,is_deleted,updated_at,directory_binding)
+                 VALUES ('SharedSync-OTHER','album-2','Other','album',1,456,?1)",
+                [other_binding.as_slice()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO asset_metadata_paths
+                    (library,id,version_size,local_path,provider_checksum,local_checksum,
+                     download_checksum,metadata_write_failed_at)
+                 VALUES ('PrimarySync','old','original','/media/original.jpg',?1,?2,?3,7)",
+                rusqlite::params![metadata_receipt.0, metadata_receipt.1, metadata_receipt.2],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO primary_layout_operations
+                    (operation,family,library,source_library,prior_generation,decision,policy,phase,header)
+                 VALUES ('old','family','PrimarySync','PrimarySync',1,'decision','primary','publishing',?1)",
+                [header.as_slice()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE provider_active_destinations
+                    SET current_publication=1,preserved_local=?1,local_checksum=?2
+                  WHERE generation='old'",
+                rusqlite::params![preserved.as_slice(), "native-local-checksum"],
+            )
+            .unwrap();
+        }
+
+        for reopen in 0..2 {
+            let conn = Connection::open(&path).unwrap();
+            migrate(&conn).unwrap();
+            assert_eq!(
+                get_schema_version(&conn).unwrap(),
+                SCHEMA_VERSION,
+                "reopen {reopen}"
+            );
+            for table in ["asset_metadata_paths", "provider_active_destinations"] {
+                assert!(
+                    column_exists(&conn, table, "embedded_metadata_receipt").unwrap(),
+                    "reopen {reopen}"
+                );
+                let receipt_type: String = conn
+                    .query_row(
+                        &format!(
+                            "SELECT type FROM pragma_table_info('{table}')
+                              WHERE name='embedded_metadata_receipt'"
+                        ),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(receipt_type, "TEXT", "reopen {reopen}");
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        &format!(
+                            "SELECT count(*) FROM {table}
+                              WHERE embedded_metadata_receipt IS NOT NULL"
+                        ),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                    0,
+                    "reopen {reopen}"
+                );
+            }
+            let bindings: Vec<(String, Option<Vec<u8>>)> = conn
+                .prepare(
+                    "SELECT container_id,directory_binding
+                       FROM album_containers ORDER BY container_id",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                bindings,
+                vec![
+                    ("album".into(), Some(binding.to_vec())),
+                    ("album-2".into(), Some(other_binding.to_vec())),
+                ],
+                "reopen {reopen}"
+            );
+            let native: (String, i64, Option<Vec<u8>>, String, Option<String>) = conn
+                .query_row(
+                    "SELECT path,current_publication,preserved_local,checksum,local_checksum
+                       FROM provider_active_destinations WHERE generation='old'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                native,
+                (
+                    "retained-native-path".into(),
+                    1,
+                    Some(preserved.to_vec()),
+                    "old-resource".into(),
+                    Some("native-local-checksum".into()),
+                ),
+                "reopen {reopen}"
+            );
+            let receipt: (String, Option<String>, Option<String>, i64, Option<String>) = conn
+                .query_row(
+                    "SELECT provider_checksum,local_checksum,download_checksum,
+                            metadata_write_failed_at,embedded_metadata_receipt
+                       FROM asset_metadata_paths WHERE id='old'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                receipt,
+                (
+                    metadata_receipt.0.into(),
+                    Some(metadata_receipt.1.into()),
+                    Some(metadata_receipt.2.into()),
+                    7,
+                    None,
+                ),
+                "reopen {reopen}"
+            );
+            let layout: (Option<Vec<u8>>, String) = conn
+                .query_row(
+                    "SELECT header,phase FROM primary_layout_operations
+                      WHERE operation='old'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                layout,
+                (Some(header.to_vec()), "publishing".into()),
                 "reopen {reopen}"
             );
         }

@@ -33,6 +33,7 @@ pub(super) use fingerprint::fingerprint_open_file_snapshot_blocking;
 pub(crate) use fingerprint::imported_path_matches_receipt;
 pub(super) use fingerprint::{RetainedPendingFile, retain_pending_file};
 pub(super) use fingerprint::{fingerprint_downloaded_path, fingerprint_regular_file};
+pub(super) use publication::PublicationOutcome;
 #[cfg(test)]
 pub(super) use publication::rename_part_to_final;
 #[cfg_attr(

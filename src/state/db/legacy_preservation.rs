@@ -552,6 +552,7 @@ mod tests {
                 &hash,
                 Some(&hash),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -695,6 +696,7 @@ mod tests {
                     &hash,
                     Some(&hash),
                     false,
+                    &Default::default(),
                 )
                 .await
                 .unwrap();
@@ -843,6 +845,7 @@ mod tests {
                 &hash,
                 Some(&hash),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -991,6 +994,7 @@ mod tests {
                 &hash,
                 Some(&hash),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();

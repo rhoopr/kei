@@ -99,6 +99,7 @@ pub(in crate::download::orchestration) async fn reconcile(
                     metadata_decision: None,
                     local_preserved: false,
                     local_modified: None,
+                    embedded_fields: Default::default(),
                 }],
             };
             let previous = LayoutOperation {

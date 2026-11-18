@@ -142,57 +142,21 @@ impl Config {
             } else {
                 None
             },
-            metadata: if self.metadata.set_exif_datetime
-                || self.metadata.set_exif_rating
-                || self.metadata.set_exif_gps
-                || self.metadata.set_exif_description
-                || {
-                    #[cfg(feature = "xmp")]
-                    {
-                        self.metadata.embed_xmp || self.metadata.xmp_sidecar
-                    }
-                    #[cfg(not(feature = "xmp"))]
-                    {
-                        false
-                    }
-                } {
-                Some(TomlMetadata {
-                    set_exif_datetime: if self.metadata.set_exif_datetime {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                    set_exif_rating: if self.metadata.set_exif_rating {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                    set_exif_gps: if self.metadata.set_exif_gps {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                    set_exif_description: if self.metadata.set_exif_description {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                    #[cfg(feature = "xmp")]
-                    embed_xmp: if self.metadata.embed_xmp {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                    #[cfg(feature = "xmp")]
-                    xmp_sidecar: if self.metadata.xmp_sidecar {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                })
-            } else {
-                None
-            },
+            metadata: Some(TomlMetadata {
+                set_exif_datetime: Some(self.metadata.set_exif_datetime),
+                set_exif_orientation: Some(self.metadata.set_exif_orientation),
+                set_exif_rating: Some(self.metadata.set_exif_rating),
+                set_exif_gps: Some(self.metadata.set_exif_gps),
+                set_exif_description: Some(self.metadata.set_exif_description),
+                #[cfg(feature = "xmp")]
+                embed_xmp: Some(self.metadata.embed_xmp),
+                #[cfg(feature = "xmp")]
+                xmp_sidecar: Some(self.metadata.xmp_sidecar),
+                #[cfg(feature = "xmp")]
+                include_albums: Some(self.metadata.include_albums),
+                #[cfg(feature = "xmp")]
+                include_people: Some(self.metadata.include_people),
+            }),
             watch: if self.watch.interval.is_some()
                 || self.watch.notify_systemd
                 || self.watch.pid_file.is_some()
@@ -260,8 +224,8 @@ impl Config {
 /// Persist a minimal config file on first run.
 ///
 /// Converts the resolved [`Config`] to TOML via [`Config::to_toml()`], then
-/// strips it down to only the essential no-default fields (username, directory,
-/// data-dir, domain, password-file, password-command). Passwords are never
+/// retains the resolved metadata choices and essential connection/path fields.
+/// Explicit false metadata choices remain false on subsequent runs. Passwords are never
 /// included. No-ops if a config file already exists, the parent directory
 /// doesn't exist, or `KEI_NO_AUTO_CONFIG=1` is set.
 pub(crate) fn persist_first_run_config(
@@ -323,7 +287,7 @@ pub(crate) fn persist_first_run_config(
         filters: None,
         photos: None,
         import: None,
-        metadata: None,
+        metadata: full.metadata,
         watch: None,
         notifications: None,
         server: None,
@@ -368,6 +332,50 @@ pub(crate) fn persist_first_run_config(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn metadata_omissions_and_explicit_opt_outs_survive_roundtrip() {
+        for input in [
+            "config_version = 1",
+            "config_version = 1\n[metadata]\nset_exif_datetime = true\nset_exif_rating = false",
+        ] {
+            let parsed: super::TomlConfig = toml::from_str(input).unwrap();
+            let resolved = super::Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&parsed),
+            )
+            .unwrap();
+            let emitted = resolved.to_toml();
+            let metadata = emitted.metadata.as_ref().unwrap();
+            assert_eq!(metadata.set_exif_rating, Some(false));
+            assert_eq!(metadata.set_exif_orientation, Some(false));
+            assert_eq!(metadata.set_exif_gps, Some(false));
+            assert_eq!(metadata.set_exif_description, Some(false));
+            let serialized = toml::to_string(&emitted).unwrap();
+            let parsed = toml::from_str(&serialized).unwrap();
+            let reopened = super::Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&parsed),
+            )
+            .unwrap();
+            assert_eq!(
+                reopened.metadata.set_exif_datetime,
+                resolved.metadata.set_exif_datetime
+            );
+            assert!(!reopened.metadata.set_exif_rating);
+            #[cfg(feature = "xmp")]
+            {
+                assert!(!reopened.metadata.embed_xmp);
+                assert!(!reopened.metadata.xmp_sidecar);
+                assert!(!reopened.metadata.include_albums);
+                assert!(!reopened.metadata.include_people);
+            }
+        }
+    }
+
     use super::persist_first_run_config;
     use crate::config::input::TomlConfig;
     use crate::config::runtime::Config;
@@ -778,6 +786,47 @@ mod tests {
         assert!(content.contains("test@example.com"));
         assert!(content.contains("/photos"));
         assert!(content.contains("Generated by kei"));
+        let parsed: TomlConfig = toml::from_str(&content).unwrap();
+        let metadata = parsed.metadata.unwrap();
+        assert_eq!(metadata.set_exif_datetime, Some(false));
+        assert_eq!(metadata.set_exif_orientation, Some(false));
+        assert_eq!(metadata.set_exif_rating, Some(false));
+        assert_eq!(metadata.set_exif_gps, Some(false));
+        assert_eq!(metadata.set_exif_description, Some(false));
+        #[cfg(feature = "xmp")]
+        {
+            assert_eq!(metadata.embed_xmp, Some(false));
+            assert_eq!(metadata.include_albums, Some(false));
+            assert_eq!(metadata.include_people, Some(false));
+        }
+    }
+    #[cfg(feature = "xmp")]
+    #[test]
+    fn first_run_and_config_show_projection_preserve_independent_metadata_choices() {
+        let (_td, path) = persist_test_dir("metadata_choices");
+        let mut config = build_config_for_persist("test@example.com", Some("/photos"), None);
+        config.metadata.embed_xmp = true;
+        config.metadata.set_exif_description = true;
+        config.metadata.include_people = true;
+        persist_first_run_config(&path, &config, None).unwrap();
+        for input in [
+            std::fs::read_to_string(path).unwrap(),
+            toml::to_string(&config.to_toml()).unwrap(),
+        ] {
+            let parsed = toml::from_str(&input).unwrap();
+            let reopened = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&parsed),
+            )
+            .unwrap();
+            assert!(reopened.metadata.embed_xmp);
+            assert!(reopened.metadata.set_exif_description);
+            assert!(reopened.metadata.include_people);
+            assert!(!reopened.metadata.include_albums);
+            assert!(!reopened.metadata.set_exif_datetime);
+        }
     }
     #[test]
     fn test_persist_first_run_never_writes_password() {

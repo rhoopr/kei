@@ -298,6 +298,7 @@ async fn seed_file(
                 &hash,
                 Some(&hash),
                 false,
+                &Default::default(),
             )
             .await
         }

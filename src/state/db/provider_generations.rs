@@ -450,7 +450,7 @@ pub(crate) struct GenerationSpec {
     pub(crate) basis: String,
     pub(crate) profile: Value,
     pub(crate) metadata_enabled: bool,
-    pub(crate) metadata_flags: u8,
+    pub(crate) metadata_flags: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -648,11 +648,18 @@ fn dependency_basis(
 }
 
 fn validate_spec(spec: &GenerationSpec) -> Result<(), StateError> {
+    // Durable MetadataFlags encoding: the upper bits refine XMP writers only.
+    const ENRICHMENT_FLAGS: u16 = 0b1100_0000;
+    const XMP_WRITER_FLAGS: u16 = 0b0011_0000;
+    const KNOWN_FLAGS: u16 = 0x01ff;
     let scope: Value = serde_json::from_str(&spec.scope)
         .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
     if spec.format != 1
         || spec.metadata_enabled != (spec.metadata_flags != 0)
-        || spec.metadata_flags & !0b0011_1111 != 0
+        || spec.metadata_flags & !KNOWN_FLAGS != 0
+        // Enrichment bits require an embedded-XMP or sidecar writer.
+        || (spec.metadata_flags & ENRICHMENT_FLAGS != 0
+            && spec.metadata_flags & XMP_WRITER_FLAGS == 0)
         || !matches!(
             scope.get("database").and_then(Value::as_str),
             Some("private" | "shared")
@@ -694,6 +701,51 @@ fn validate_spec(spec: &GenerationSpec) -> Result<(), StateError> {
         return invalid();
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn metadata_enrichment_flags_roundtrip_and_require_an_xmp_writer() {
+    let zone = serde_json::json!({"zoneName":"PrimarySync", "ownerRecordName":"_defaultOwner"});
+    let scope = serde_json::json!({"database":"private", "zone":zone});
+    let mut spec = GenerationSpec {
+        format: 1,
+        scope: scope.to_string(),
+        zone: zone.clone(),
+        config_hash: "a".repeat(64),
+        basis: "b".repeat(64),
+        profile: serde_json::json!({"coverage":"observed_selection_window", "passes":[{"key":"primary", "scope":{"zone":zone}}]}),
+        metadata_enabled: true,
+        metadata_flags: 0,
+    };
+    const EMBED_XMP: u16 = 1 << 4;
+    const XMP_SIDECAR: u16 = 1 << 5;
+    const INCLUDE_ALBUMS: u16 = 1 << 6;
+    const INCLUDE_PEOPLE: u16 = 1 << 7;
+    for flags in [1, 255, 256, 511] {
+        spec.metadata_flags = flags;
+        let reopened: GenerationSpec =
+            serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
+        assert_eq!(reopened, spec);
+        validate_spec(&reopened).unwrap();
+    }
+    spec.metadata_flags = 512;
+    assert!(validate_spec(&spec).is_err());
+    for enrichment in [
+        INCLUDE_ALBUMS,
+        INCLUDE_PEOPLE,
+        INCLUDE_ALBUMS | INCLUDE_PEOPLE,
+    ] {
+        spec.metadata_flags = enrichment;
+        assert!(validate_spec(&spec).is_err());
+        for writer in [EMBED_XMP, XMP_SIDECAR] {
+            spec.metadata_flags = writer | enrichment;
+            let reopened: GenerationSpec =
+                serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
+            assert_eq!(reopened, spec);
+            validate_spec(&reopened).unwrap();
+        }
+    }
 }
 
 type DestinationProofRow = (
@@ -2502,6 +2554,8 @@ pub(crate) struct DirectoryPublicationSource {
     child: String,
     source: String,
     settled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedded: Option<Box<crate::state::types::EmbeddedMetadataReceipt>>,
 }
 
 pub(super) fn land_directory_publication(
@@ -2614,7 +2668,7 @@ fn directory_publication_source(
     library: &str,
     path: &super::provider_selection::SelectionPath,
     fingerprint: (&str, u64),
-) -> Result<Option<(SelectionDestination, String)>, StateError> {
+) -> Result<Option<(SelectionDestination, DirectoryPublicationSource)>, StateError> {
     let mut source = None;
     for (operation, _, file) in pending_directory_publications(conn, Some((library, path)))? {
         let native = file
@@ -2654,7 +2708,7 @@ fn directory_publication_source(
         if !valid || source.is_some() {
             return invalid();
         }
-        source = Some((destination.clone(), native.source.clone()));
+        source = Some((destination.clone(), native.clone()));
     }
     Ok(source)
 }
@@ -2665,7 +2719,7 @@ pub(super) fn album_directory_native_sources(
     pass_key: Option<&str>,
     prefix: &Path,
 ) -> Result<Vec<super::primary_layout::directory::AlbumDirectorySource>, StateError> {
-    let mut statement = conn.prepare("SELECT generation,pass_key,child,version_size,path,local_checksum,source_checksum FROM provider_active_destinations WHERE current_publication=1 AND verified_media=1 AND preserved_local IS NULL AND (?1 IS NULL OR pass_key=?1)")?;
+    let mut statement = conn.prepare("SELECT generation,pass_key,child,version_size,path,local_checksum,source_checksum,embedded_metadata_receipt FROM provider_active_destinations WHERE current_publication=1 AND verified_media=1 AND preserved_local IS NULL AND (?1 IS NULL OR pass_key=?1)")?;
     let rows = statement.query_map([pass_key], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -2675,11 +2729,30 @@ pub(super) fn album_directory_native_sources(
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
+            row.get::<_, Option<String>>(7)?,
         ))
     })?;
     let mut sources = Vec::new();
     for row in rows {
-        let (generation, key, child, version, path, local_checksum, source) = row?;
+        let (generation, key, child, version, path, local_checksum, source, embedded) = row?;
+        let embedded = embedded
+            .map(|raw| {
+                serde_json::from_str::<crate::state::types::EmbeddedMetadataReceipt>(&raw)
+                    .map_err(|_invalid| StateError::ProviderSelectionInvalid)
+            })
+            .transpose()?
+            .and_then(|mut receipt| {
+                if !receipt.published
+                    && receipt.input_checksum == local_checksum
+                    && receipt.output_checksum != local_checksum
+                {
+                    receipt.written.clone_from(&receipt.previous);
+                    receipt.output_checksum.clone_from(&local_checksum);
+                }
+                receipt.published = true;
+                (receipt.output_checksum == local_checksum).then_some(receipt)
+            })
+            .map(Box::new);
         let path: super::provider_selection::SelectionPath =
             serde_json::from_str(&path).map_err(|_error| StateError::ProviderSelectionInvalid)?;
         if !path.to_path().starts_with(prefix) {
@@ -2717,6 +2790,7 @@ pub(super) fn album_directory_native_sources(
             expected_sidecar: None,
             created: None,
             native: Some(DirectoryPublicationSource {
+                embedded,
                 generation,
                 pass: key,
                 child,
@@ -3187,7 +3261,7 @@ pub(super) fn record_layout_destination(
     conn: &Connection,
     record: &AssetRecord,
     file: &super::primary_layout::LayoutFile,
-    flags: u8,
+    flags: u16,
 ) -> Result<(), StateError> {
     record_layout_destination_for_generation(conn, record, file, flags, None)?;
     let path = file.path.key()?;
@@ -3211,14 +3285,26 @@ pub(super) fn record_layout_destination(
                 record.version_size.as_str(),
             )
         }),
-    )
+    )?;
+    if let Some((generation, key, child)) = current {
+        let fields = serde_json::to_string(&crate::state::types::EmbeddedMetadataReceipt {
+            published: true,
+            input_checksum: local.clone(),
+            output_checksum: local,
+            previous: Default::default(),
+            written: (*file.embedded_fields).clone(),
+        })
+        .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+        conn.execute("UPDATE provider_active_destinations SET embedded_metadata_receipt=?6 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND current_publication=1",params![generation,key,child,record.version_size.as_str(),path,fields])?;
+    }
+    Ok(())
 }
 
 fn record_layout_destination_for_generation(
     conn: &Connection,
     record: &AssetRecord,
     file: &super::primary_layout::LayoutFile,
-    flags: u8,
+    flags: u16,
     selected_generation: Option<&str>,
 ) -> Result<(), StateError> {
     validate_identity_decisions(conn, &record.library, &record.id)?;
@@ -3275,7 +3361,29 @@ fn record_layout_destination_for_generation(
         } else {
             conn.execute("UPDATE provider_active_destinations SET current_publication=CASE WHEN local_checksum IS ?6 AND source_checksum IS ?7 THEN current_publication ELSE 0 END,preserved_local=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,verified_media=1,verified_metadata=?8,local_checksum=?6,source_checksum=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,record.version_size.as_str(),path,local,file.source_checksum,metadata_complete])?;
         }
+        let fields = serde_json::to_string(&crate::state::types::EmbeddedMetadataReceipt {
+            published: true,
+            input_checksum: local.clone(),
+            output_checksum: local.clone(),
+            previous: Default::default(),
+            written: (*file.embedded_fields).clone(),
+        })
+        .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
         refresh_progress_hash(conn, &root, &manifest, destination)?;
+        if selected_generation.is_some()
+            && file.local_preserved
+            && metadata_complete
+            && ((root.spec.metadata_enabled && file.metadata_decision.is_some())
+                || *file.embedded_fields != Default::default())
+        {
+            replace_current_publication(
+                conn,
+                &record.library,
+                &path,
+                Some((&generation, &key, &child, record.version_size.as_str())),
+            )?;
+        }
+        conn.execute("UPDATE provider_active_destinations SET embedded_metadata_receipt=?6 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,record.version_size.as_str(),path,fields])?;
         validate_decision_rows(conn, &root, &manifest)?;
     }
     Ok(())
@@ -3359,11 +3467,24 @@ pub(super) fn replace_current_publication(
     let native_path =
         serde_json::from_str(path).map_err(|_error| StateError::ProviderSelectionInvalid)?;
     settle_directory_publications(conn, library, &native_path)?;
+    if let Some((generation, key, child, version)) = current {
+        // Only the current physical publication can lend unchanged-byte field
+        // ownership to its successor. Historical generations are not sources.
+        conn.execute("UPDATE provider_active_destinations AS next SET embedded_metadata_receipt=
+            (SELECT CASE
+                WHEN json_extract(old.embedded_metadata_receipt,'$.output_checksum')=next.local_checksum
+                    THEN json_set(old.embedded_metadata_receipt,'$.published',json('true'))
+                WHEN json_extract(old.embedded_metadata_receipt,'$.published')=0 AND json_extract(old.embedded_metadata_receipt,'$.input_checksum')=next.local_checksum
+                    THEN json_set(old.embedded_metadata_receipt,'$.published',json('true'),'$.output_checksum',next.local_checksum,'$.written',json_extract(old.embedded_metadata_receipt,'$.previous'))
+                END FROM provider_active_destinations old WHERE old.library=?6 AND old.path=?5 AND old.current_publication=1 AND old.local_checksum=next.local_checksum)
+            WHERE next.generation=?1 AND next.pass_key=?2 AND next.child=?3 AND next.version_size=?4 AND next.path=?5 AND next.library=?6",
+            params![generation,key,child,version,path,library])?;
+    }
     conn.execute("UPDATE provider_active_destinations SET current_publication=0 WHERE library=?1 AND path=?2 AND current_publication=1", params![library,path])?;
     if let Some((generation, key, child, version)) = current {
         let root = load_generation(conn, generation)?;
         load_decision(conn, &root, key, child)?;
-        let changed = conn.execute("UPDATE provider_active_destinations SET current_publication=1 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND library=?6 AND admitted=1 AND verified_media=1 AND preserved_local IS NULL AND length(local_checksum)=64 AND length(source_checksum)=64 AND EXISTS(SELECT 1 FROM provider_active_generations g JOIN account_owner a ON a.account_key=g.account_key AND a.provider_key=g.provider_key WHERE g.id=?1)", params![generation,key,child,version,path,library])?;
+        let changed = conn.execute("UPDATE provider_active_destinations SET current_publication=1 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND library=?6 AND admitted=1 AND length(local_checksum)=64 AND ((verified_media=1 AND preserved_local IS NULL AND length(source_checksum)=64) OR (verified_media=0 AND preserved_local IS NOT NULL AND source_checksum IS NULL)) AND EXISTS(SELECT 1 FROM provider_active_generations g JOIN account_owner a ON a.account_key=g.account_key AND a.provider_key=g.provider_key WHERE g.id=?1)", params![generation,key,child,version,path,library])?;
         if changed != 1 {
             return invalid();
         }
@@ -3484,10 +3605,16 @@ impl SqliteStateDb {
             let native=path.to_path();
             let selected=manifest.decision.destinations.iter().find(|d|d.path==path).ok_or(StateError::ProviderSelectionInvalid)?;
             let library=manifest.media_zone(&root).get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?;
-            if let Some((moved, source)) = directory_publication_source(&tx,&root.spec.scope,&key,&child,library,&path,(&local,size))?
+            if let Some((moved, handoff)) = directory_publication_source(&tx,&root.spec.scope,&key,&child,library,&path,(&local,size))?
                 && moved.version_size == selected.version_size && moved.checksum == selected.checksum && moved.size == selected.size {
+                let source = handoff.source;
                 super::asset_writes::update_status_to_downloaded(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,Some(&source),false,chrono::Utc::now().timestamp())?;
                 record_destination_source(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::DirectoryPublication(&source))?;
+                if let Some(embedded) = handoff.embedded.filter(|receipt| receipt.published && receipt.output_checksum == local) {
+                    let raw = serde_json::to_string(&embedded).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+                    let installed = tx.execute("UPDATE provider_active_destinations SET embedded_metadata_receipt=?4 WHERE library=?1 AND path=?2 AND local_checksum=?3 AND current_publication=1 AND preserved_local IS NULL",params![library,path.key()?,local,raw])?;
+                    if installed != 1 { return invalid(); }
+                }
                 let completed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND path=?4 AND version_size=?5 AND verified_media=1 AND preserved_local IS NULL AND local_checksum=?6 AND source_checksum=?7)",params![generation,key,child,path.key()?,selected.version_size,local,source],|row|row.get(0))?;
                 if !completed { return invalid(); }
                 tx.commit()?;
@@ -3497,6 +3624,7 @@ impl SqliteStateDb {
             if let Some((previous,source,previous_key))=previous {
                 let previous_root=load_generation(&tx,&previous)?;load_decision(&tx,&previous_root,&previous_key,&child)?;
                 let prepared:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND prepared_checksum=?6 AND prepared_size=?7)",params![previous,previous_key,child,selected.version_size,path.key()?,local,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|r.get(0))?;
+                let recovered_fields: Option<String> = tx.query_row("SELECT embedded_metadata_receipt FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND json_extract(embedded_metadata_receipt,'$.output_checksum')=?6 AND (?7 OR json_extract(embedded_metadata_receipt,'$.published')=0)",params![previous,previous_key,child,selected.version_size,path.key()?,local,prepared],|r|r.get(0)).optional()?.flatten();
                 if prepared {
                     let pending=metadata_receipt(&tx,&previous,&previous_key,&child,&selected.version_size,&path.key()?)?;
                     super::metadata::settle_selection_prepared_input(&tx,&pending,&(local.clone(),size))?;
@@ -3511,6 +3639,11 @@ impl SqliteStateDb {
                     super::asset_writes::update_status_to_downloaded(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,Some(&source),false,chrono::Utc::now().timestamp())?;
                 }
                 record_destination_source(&tx,manifest.media_zone(&root).get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::RetainedNative(&source))?;
+                if let Some(fields) = recovered_fields {
+                    // The validated prepared writer and measured output prove this
+                    // field handoff. They do not complete today's metadata intent.
+                    tx.execute("UPDATE provider_active_destinations SET embedded_metadata_receipt=?6 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND local_checksum=?7 AND verified_media=1",params![generation,key,child,selected.version_size,path.key()?,fields,local])?;
+                }
                 tx.commit()?;return Ok(true)
             }
             let text=native.to_str();
@@ -3635,6 +3768,77 @@ pub(super) fn metadata_receipt(
     })
 }
 
+/// Recover measured prior writer output without completing the current intent.
+pub(super) fn recover_metadata_field_output(
+    conn: &Connection,
+    pending: &super::PendingMetadataRewrite,
+    fields: &crate::state::types::EmbeddedMetadataReceipt,
+    output_size: u64,
+) -> Result<usize, StateError> {
+    let Some(receipt) = &pending.selection_receipt else {
+        return Ok(0);
+    };
+    let path = super::provider_selection::SelectionPath::from_path(
+        pending
+            .asset
+            .local_path
+            .as_deref()
+            .ok_or(StateError::ProviderSelectionInvalid)?,
+    )
+    .key()?;
+    let current = metadata_receipt(
+        conn,
+        &receipt.generation,
+        &receipt.pass_key,
+        &receipt.child,
+        pending.asset.version_size.as_str(),
+        &path,
+    )?;
+    if current.asset.local_checksum != pending.asset.local_checksum
+        || current.source_checksum != pending.source_checksum
+        || current.selection_receipt.as_ref().is_none_or(|r| {
+            r.preserved_local != receipt.preserved_local
+                || r.grouping_hash != receipt.grouping_hash
+                || r.metadata_flags != receipt.metadata_flags
+        })
+    {
+        return Err(StateError::ProviderWorkConflict);
+    }
+    let preserved = receipt
+        .preserved_local
+        .as_ref()
+        .map(|prior| {
+            let mut evidence = prior.clone();
+            evidence.checksum = fields.output_checksum.clone();
+            evidence.size = output_size;
+            encode(&evidence)
+        })
+        .transpose()?;
+    let raw =
+        serde_json::to_string(fields).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+    let root = load_generation(conn, &receipt.generation)?;
+    let manifest = load_decision(conn, &root, &receipt.pass_key, &receipt.child)?;
+    let changed = conn.execute("UPDATE provider_active_destinations SET local_checksum=?7,preserved_local=?11,embedded_metadata_receipt=?5,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL
+        WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND admitted=1
+        AND (embedded_metadata_receipt=?5 OR EXISTS(SELECT 1 FROM provider_active_destinations old WHERE old.library=?1 AND old.asset_id=?2 AND old.version_size=?3 AND old.path=?4 AND old.current_publication=1 AND old.embedded_metadata_receipt=?5))
+        AND generation=?8 AND pass_key=?9 AND child=?10 AND (preserved_local IS NULL)=(?11 IS NULL)
+        AND local_checksum IN (?6,?7)", params![pending.asset.library,pending.asset.id,pending.asset.version_size.as_str(),path,raw,fields.input_checksum,fields.output_checksum,receipt.generation,receipt.pass_key,receipt.child,preserved])?;
+    if changed != 1 {
+        return Err(StateError::ProviderWorkConflict);
+    }
+    let destination = manifest
+        .decision
+        .destinations
+        .iter()
+        .find(|d| {
+            d.version_size == pending.asset.version_size.as_str()
+                && d.path.key().ok().as_deref() == Some(path.as_str())
+        })
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    refresh_progress_hash(conn, &root, &manifest, destination)?;
+    Ok(changed)
+}
+
 /// Actual writer completion compares immutable selection, current grouping
 /// dependencies, exact native path and independently selected input checksum.
 /// Completion of A cannot acknowledge another destination B.
@@ -3724,6 +3928,23 @@ pub(super) fn finish_metadata_receipt(
             .ok_or(StateError::ProviderSelectionInvalid)?;
         refresh_progress_hash(conn, &root, &manifest, destination)?;
     }
+    let embedded: Option<String> = if changed > 0 && local.is_some() {
+        let raw: Option<String> = conn.query_row("SELECT embedded_metadata_receipt FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND json_extract(embedded_metadata_receipt,'$.output_checksum')=?6 AND (json_extract(embedded_metadata_receipt,'$.published')=0 OR current_publication=1)",params![receipt.generation,receipt.pass_key,receipt.child,pending.asset.version_size.as_str(),path,local],|r|r.get(0)).optional()?.flatten();
+        if let Some(raw) = raw {
+            let mut evidence: crate::state::types::EmbeddedMetadataReceipt =
+                serde_json::from_str(&raw)
+                    .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+            evidence.published = true;
+            let published = serde_json::to_string(&evidence)
+                .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+            conn.execute("UPDATE provider_active_destinations SET embedded_metadata_receipt=?6 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![receipt.generation,receipt.pass_key,receipt.child,pending.asset.version_size.as_str(),path,published])?;
+            Some(published)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if changed > 0 && (complete || local != pending.asset.local_checksum.as_deref()) {
         // A single physical write can satisfy multiple passes only when every
         // frozen input and writer dependency is exactly compatible. Different
@@ -3796,6 +4017,9 @@ pub(super) fn finish_metadata_receipt(
                 }
                 _ => continue,
             }
+            if let Some(embedded) = &embedded {
+                conn.execute("UPDATE provider_active_destinations SET embedded_metadata_receipt=?6 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND local_checksum=?7",params![generation,key,child,destination.version_size,path,embedded,local])?;
+            }
             refresh_progress_hash(conn, &alias_root, &alias, destination)?;
         }
     }
@@ -3804,13 +4028,18 @@ pub(super) fn finish_metadata_receipt(
             conn,
             &pending.asset.library,
             &path,
-            receipt.preserved_local.is_none().then_some((
+            Some((
                 receipt.generation.as_str(),
                 receipt.pass_key.as_str(),
                 receipt.child.as_str(),
                 pending.asset.version_size.as_str(),
             )),
         )?;
+        if let Some(embedded) = &embedded {
+            // This receipt was measured by this completion, not borrowed from
+            // the selected row's historical verification.
+            conn.execute("UPDATE provider_active_destinations SET embedded_metadata_receipt=?6 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND local_checksum=?7",params![receipt.generation,receipt.pass_key,receipt.child,pending.asset.version_size.as_str(),path,embedded,local])?;
+        }
     }
     Ok(Some(changed > 0 && complete))
 }
@@ -4086,7 +4315,13 @@ impl SqliteStateDb {
                 .ok_or(StateError::ProviderSelectionInvalid)?;
             let zone = manifest.media_zone(&root);
             let library = zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?;
-            replace_current_publication(&tx, library, &path.key()?, None)?;
+            // Re-observing unchanged preserved bytes keeps their latest checked
+            // metadata owner. A changed file revokes that authority; selection
+            // itself never creates a new current publication.
+            let unchanged_preserved: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE library=?1 AND path=?2 AND current_publication=1 AND preserved_local IS NOT NULL AND local_checksum=?3)", params![library,path.key()?,observation.0], |row| row.get(0))?;
+            if !unchanged_preserved {
+                replace_current_publication(&tx, library, &path.key()?, None)?;
+            }
             let evidence = PreservedLocal {
                 intent: preservation_intent(&root, &manifest, destination)?,
                 checksum: observation.0, size: observation.1, modified: observation.2,

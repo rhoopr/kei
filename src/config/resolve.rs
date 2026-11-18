@@ -807,6 +807,9 @@ impl Config {
             },
             metadata: MetadataConfig {
                 set_exif_datetime,
+                set_exif_orientation: toml_metadata
+                    .and_then(|m| m.set_exif_orientation)
+                    .unwrap_or(false),
                 set_exif_rating,
                 set_exif_gps,
                 set_exif_description,
@@ -814,6 +817,14 @@ impl Config {
                 embed_xmp,
                 #[cfg(feature = "xmp")]
                 xmp_sidecar,
+                #[cfg(feature = "xmp")]
+                include_albums: toml_metadata
+                    .and_then(|m| m.include_albums)
+                    .unwrap_or(false),
+                #[cfg(feature = "xmp")]
+                include_people: toml_metadata
+                    .and_then(|m| m.include_people)
+                    .unwrap_or(false),
             },
             import: ImportConfig {
                 strict: toml_import.and_then(|i| i.strict).unwrap_or(false),
@@ -2425,6 +2436,36 @@ mod tests {
         assert!(cfg.photos.force_resolution);
         assert!(cfg.photos.keep_unicode_in_filenames);
         assert!(cfg.watch.notify_systemd);
+    }
+    #[test]
+    fn orientation_is_an_independent_explicit_opt_in() {
+        for (text, expected) in [
+            ("", false),
+            (
+                "[metadata]\nset_exif_datetime=true\nset_exif_gps=true",
+                false,
+            ),
+            ("[metadata]\nset_exif_orientation=false", false),
+            ("[metadata]\nset_exif_orientation=true", true),
+        ] {
+            let input: TomlConfig = toml::from_str(text).unwrap();
+            let config = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&input),
+            )
+            .unwrap();
+            assert_eq!(config.metadata.set_exif_orientation, expected);
+        }
+        let config = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert!(!config.metadata.set_exif_orientation);
     }
     #[test]
     fn test_build_all_boolean_flags_cli_overrides() {

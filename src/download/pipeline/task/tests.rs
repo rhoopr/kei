@@ -46,6 +46,88 @@ struct StaticDownloadClient {
     body: Vec<u8>,
 }
 
+#[tokio::test]
+#[cfg(any(unix, feature = "xmp"))]
+async fn identical_existing_publication_does_not_acquire_temporary_field_ownership() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    let body = crate::download::pipeline::test_support::MINIMAL_JPEG.to_vec();
+    let client = StaticDownloadClient { body: body.clone() };
+    let root = TempDir::new().unwrap();
+    let task = DownloadTask {
+        url: "https://example.invalid/photo.jpg".into(),
+        download_path: root.path().join("written.jpg"),
+        replacement_fingerprint: None,
+        pending_cross_parent_root: None,
+        checksum: base64::engine::general_purpose::STANDARD
+            .encode(Sha256::digest(&body))
+            .into(),
+        asset_id: "ownership".into(),
+        asset_record_name: "ownership".into(),
+        library: "PrimarySync".into(),
+        metadata: Arc::new(MetadataPayload {
+            description: Some("provider caption".into()),
+            ..Default::default()
+        }),
+        size: body.len() as u64,
+        created_local: chrono::Local::now().fixed_offset(),
+        version_size: VersionSizeKey::Original,
+        media_type: crate::state::MediaType::Photo,
+    };
+    let retry = RetryConfig {
+        max_retries: 0,
+        base_delay_secs: 0,
+        max_delay_secs: 0,
+    };
+    let running = CancellationToken::new();
+    let context = || DownloadSingleContext {
+        temp_suffix: ".ownership",
+        state_db: None,
+        rate_limit_counter: None,
+        bandwidth_limiter: None,
+        shutdown_token: &running,
+        mode: crate::personality::Mode::Off,
+    };
+    let first = download_single_task(
+        &client,
+        &task,
+        &retry,
+        MetadataFlags::DESCRIPTION,
+        context(),
+    )
+    .await
+    .unwrap();
+    assert!(first.0);
+    assert_ne!(*first.6, Default::default());
+    let output = fs::read(&task.download_path).unwrap();
+    let existing = root.path().join("existing.jpg");
+    fs::write(&existing, &output).unwrap();
+    let before = fs::metadata(&existing).unwrap().modified().unwrap();
+    let task = DownloadTask {
+        download_path: existing.clone(),
+        ..task
+    };
+    let duplicate = download_single_task(
+        &client,
+        &task,
+        &retry,
+        MetadataFlags::DESCRIPTION,
+        context(),
+    )
+    .await
+    .unwrap();
+    assert!(duplicate.0);
+    assert_eq!(duplicate.1, first.1);
+    assert_eq!(
+        *duplicate.6,
+        Default::default(),
+        "discarded metadata output cannot own preexisting fields"
+    );
+    assert_eq!(fs::read(&existing).unwrap(), output);
+    assert_eq!(fs::metadata(&existing).unwrap().modified().unwrap(), before);
+}
+
 #[async_trait::async_trait]
 impl crate::download::file::DownloadClient for StaticDownloadClient {
     async fn fetch(
