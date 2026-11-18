@@ -1245,10 +1245,9 @@ async fn catalog_projection_actual_cli_replays_current_backlog_after_fault_and_s
         let out = command(root, &account, &["sync", "--no-progress-bar"]);
         let diagnostics = String::from_utf8_lossy(&out.stderr);
         assert!(
-            !out.status.success(),
-            "retained sparse debt must keep the overall cycle incomplete"
+            out.status.success(),
+            "unselected OldUnknownScope must not fail this sync: {diagnostics}"
         );
-        assert!(diagnostics.contains("1 sync failures"), "{diagnostics}");
         assert!(
             !diagnostics.contains("synthetic CLI catalog receipt failure"),
             "{diagnostics}"

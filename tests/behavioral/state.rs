@@ -219,17 +219,13 @@ fn verify_checksums_mismatch() {
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("CORRUPTED"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Different or unreadable: 1"),
+        "stdout: {stdout}"
+    );
 }
 
-/// CG-1 (2026-05-03 test review): if a future refactor of the
-/// `CORRUPTED:` line in `run_verify` drops the asset id from the
-/// printed output, operators can see "1 corrupted" without any way
-/// to find which asset. This test pins the contract that the asset
-/// id reaches stdout for every corrupted entry. Sibling to
-/// `verify_checksums_mismatch` so the existing test stays focused
-/// on exit-code + summary text and this one stays focused on the
-/// per-asset trace.
+/// Identify the changed copy without claiming that a local edit is damage.
 #[test]
 fn verify_checksums_mismatch_emits_asset_id_in_output() {
     use std::io::Write;
@@ -266,12 +262,10 @@ fn verify_checksums_mismatch_emits_asset_id_in_output() {
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("CORRUPTED"),
-        "expected CORRUPTED line, stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains(asset_id),
-        "expected asset id {asset_id} in CORRUPTED line, stdout: {stdout}"
+        stdout
+            .lines()
+            .any(|line| line.starts_with("DIFFERENT:") && line.contains(asset_id)),
+        "expected asset id {asset_id} on the DIFFERENT line, stdout: {stdout}"
     );
 }
 
@@ -896,7 +890,7 @@ fn reconcile_subcommand_marks_missing_and_preserves_present() {
 }
 
 #[test]
-fn reconcile_marks_truncated_file_failed() {
+fn reconcile_reports_shorter_file_without_authorizing_replacement() {
     let data_dir = tempfile::tempdir().unwrap();
     let photos_dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
@@ -924,24 +918,22 @@ fn reconcile_marks_truncated_file_failed() {
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("TRUNCATED:"), "stdout: {stdout}");
-    assert!(stdout.contains("Damaged:  1"), "stdout: {stdout}");
-    assert!(
-        stdout.contains("Marked failed: 1"),
-        "one drifted row must be re-queued: {stdout}"
-    );
+    assert!(stdout.contains("SHORTER:"), "stdout: {stdout}");
+    assert!(stdout.contains("Shorter:  1"), "stdout: {stdout}");
+    assert!(stdout.contains("Marked failed: 0"), "stdout: {stdout}");
+    assert_eq!(std::fs::read(truncated_path).unwrap(), b"short");
 
     let db_name = format!("{}.db", sanitize_username(username));
     let conn = rusqlite::Connection::open(data_dir.path().join(db_name)).unwrap();
-    let (status, error): (String, String) = conn
+    let (status, error): (String, Option<String>) = conn
         .query_row(
             "SELECT status, last_error FROM assets WHERE id = 'TRUNCATED'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!(status, "failed");
-    assert_eq!(error, "FILE_TRUNCATED_AT_STARTUP");
+    assert_eq!(status, "downloaded");
+    assert_eq!(error, None);
 }
 
 #[test]

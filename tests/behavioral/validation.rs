@@ -11,12 +11,13 @@ fn repair_help_explains_one_shot_scope_and_datetime_requirement() {
         let output = clean_cmd().args(command).output().expect("run help");
         assert!(output.status.success());
         let help = String::from_utf8(output.stdout).expect("UTF-8 help");
-        assert_eq!(help.matches("Use with sync, not service run.").count(), 2);
+        assert_eq!(help.matches("Use with sync, not service run.").count(), 1);
         assert_eq!(
             help.matches("A configured watch interval is ignored")
                 .count(),
-            2
+            1
         );
+        assert!(help.contains("reconcile --inspect-path and --confirm-damage"));
         assert!(help.contains("metadata.set_exif_datetime = true"));
     }
 }
