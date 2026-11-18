@@ -216,6 +216,7 @@ pub(crate) struct CheckpointEvidence {
     /// excluded a tail. This certifies local work only, never a source cursor.
     pub(crate) bounded_path_selection_complete: bool,
     pub(crate) state_write_failures: usize,
+    pub(crate) storage_failed: bool,
     pub(crate) enumeration_errors: usize,
     pub(crate) enumeration_incomplete: bool,
     pub(crate) interrupted: bool,
@@ -244,6 +245,7 @@ impl CheckpointEvidence {
     fn from_execution_stats(stats: &SyncStats) -> Self {
         Self {
             state_write_failures: stats.state_write_failures,
+            storage_failed: stats.storage_failed,
             enumeration_errors: stats.enumeration_errors,
             enumeration_incomplete: stats.enumeration_incomplete,
             interrupted: stats.interrupted,
@@ -262,6 +264,7 @@ impl CheckpointEvidence {
             && other.enumeration_errors == 0
             && other.state_write_failures == 0;
         self.state_write_failures += other.state_write_failures;
+        self.storage_failed |= other.storage_failed;
         self.enumeration_errors += other.enumeration_errors;
         self.enumeration_incomplete |= other.enumeration_incomplete;
         self.interrupted |= other.interrupted;
@@ -288,6 +291,7 @@ impl CheckpointEvidence {
 
     pub(crate) fn project(&self, stats: &mut SyncStats) {
         stats.state_write_failures = self.state_write_failures;
+        stats.storage_failed = self.storage_failed;
         stats.enumeration_errors = self.enumeration_errors;
         stats.enumeration_incomplete = self.enumeration_incomplete;
         stats.interrupted = self.interrupted;
@@ -424,6 +428,12 @@ pub struct SyncStats {
     #[serde(skip)]
     pub(crate) metadata_capture_progressed: bool,
     pub state_write_failures: usize,
+    /// A file operation failed because local storage could not serve it.
+    #[serde(skip)]
+    pub(crate) storage_failed: bool,
+    /// Current selected destinations or provider references remain unfinished.
+    #[serde(skip)]
+    pub(crate) selected_work_remaining: bool,
     pub enumeration_errors: usize,
     /// Best-effort count-probe failures observed before full enumeration.
     /// These are reported separately from producer enumeration errors because
@@ -585,6 +595,8 @@ impl SyncStats {
     // Per-zone composition folds safety fields only in CheckpointEvidence.
     // Cycle reports separately aggregate their projected counters above.
     fn accumulate_report_counters(&mut self, other: &SyncStats) {
+        self.storage_failed |= other.storage_failed;
+        self.selected_work_remaining |= other.selected_work_remaining;
         // primary_layout is a database-wide inventory assigned by the report
         // owner after the cycle. Summing it across passes would duplicate history.
         self.assets_seen += other.assets_seen;
@@ -989,6 +1001,7 @@ pub(super) fn merge_streaming_result(combined: &mut StreamingResult, result: Str
     combined.auth_errors += result.auth_errors;
     combined.provider_auth_errors += result.provider_auth_errors;
     combined.state_write_failures += result.state_write_failures;
+    combined.storage_failed |= result.storage_failed;
     combined.enumeration_errors += result.enumeration_errors;
     combined.assets_seen += result.assets_seen;
     combined.skip_summary += result.skip_summary;
@@ -1012,6 +1025,7 @@ pub(super) fn merge_token_recovery_result(combined: &mut StreamingResult, result
     combined.auth_errors += result.auth_errors;
     combined.provider_auth_errors += result.provider_auth_errors;
     combined.state_write_failures += result.state_write_failures;
+    combined.storage_failed |= result.storage_failed;
     combined.enumeration_errors += result.enumeration_errors;
     combined.bytes_downloaded += result.bytes_downloaded;
     combined.disk_bytes_written += result.disk_bytes_written;

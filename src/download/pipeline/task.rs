@@ -46,6 +46,7 @@ pub(super) enum DownloadTaskErrorClass {
     Interrupted,
     SessionExpired,
     ExpiredUrl,
+    Storage,
     Other,
 }
 
@@ -57,7 +58,11 @@ pub(super) enum DownloadTaskErrorClass {
 /// original error reaches state and logging unchanged.
 pub(super) fn classify_download_task_error(error: &anyhow::Error) -> DownloadTaskErrorClass {
     let Some(download_err) = error.downcast_ref::<DownloadError>() else {
-        return DownloadTaskErrorClass::Other;
+        return if error.downcast_ref::<std::io::Error>().is_some() {
+            DownloadTaskErrorClass::Storage
+        } else {
+            DownloadTaskErrorClass::Other
+        };
     };
     if download_err.is_interrupted() {
         DownloadTaskErrorClass::Interrupted
@@ -65,6 +70,8 @@ pub(super) fn classify_download_task_error(error: &anyhow::Error) -> DownloadTas
         DownloadTaskErrorClass::SessionExpired
     } else if download_err.is_expired_url() {
         DownloadTaskErrorClass::ExpiredUrl
+    } else if matches!(download_err, DownloadError::Disk(_)) {
+        DownloadTaskErrorClass::Storage
     } else {
         DownloadTaskErrorClass::Other
     }
@@ -85,6 +92,8 @@ pub(super) fn log_interrupted_download(
     });
 }
 
+/// Successful download evidence. The trailing bool marks metadata-only
+/// storage failure; the state row still records the download and retry marker.
 pub(super) type DownloadSingleResult = (
     bool,
     String,
@@ -93,6 +102,7 @@ pub(super) type DownloadSingleResult = (
     u64,
     Option<Arc<crate::download::file::RetainedPendingFile>>,
     Box<crate::state::types::EmbeddedMetadataFields>,
+    bool,
 );
 
 pub(in crate::download) async fn download_single_task<C: crate::download::file::DownloadClient>(
@@ -197,6 +207,7 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
         let download_checksum = downloaded_fingerprint.map(|fingerprint| data_encoding::HEXLOWER.encode(&fingerprint.sha256));
 
         let mut exif_ok = true;
+        let mut metadata_storage_failed = false;
         let mut embedded_fields = Box::<crate::state::types::EmbeddedMetadataFields>::default();
         if let Some(part) = &part_path {
             let outcome = metadata_rewrite::write_download_metadata(
@@ -214,6 +225,7 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
                 },
             )
             .await;
+            metadata_storage_failed |= outcome.storage_failed;
             anyhow::ensure!(!outcome.embed_input_changed, "Temporary download changed before metadata write");
             if let Some(expected) = outcome.embed_output_fingerprint {
                 downloaded.accept_metadata_output(expected).await?;
@@ -261,6 +273,7 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
                 temp_suffix: context.temp_suffix,
             })
             .await;
+        metadata_storage_failed |= outcome.storage_failed;
         exif_ok &= !outcome.any_failed();
 
         let disk_bytes = match tokio::fs::metadata(&task.download_path).await {
@@ -303,6 +316,7 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
             disk_bytes,
             retained,
             embedded_fields,
+            metadata_storage_failed,
         ))
     }
     .await;

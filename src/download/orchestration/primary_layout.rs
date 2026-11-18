@@ -1664,6 +1664,12 @@ async fn prepare(
                     },
                 )
                 .await;
+                if written.storage_failed {
+                    return Err(std::io::Error::other(
+                        "Primary layout metadata storage unavailable",
+                    )
+                    .into());
+                }
                 anyhow::ensure!(
                     !written.any_failed() && !written.embed_input_changed,
                     "Prepared primary metadata remains incomplete"
@@ -1707,15 +1713,28 @@ async fn prepare(
                 shutdown_token: cancel,
                 mode: crate::personality::Mode::Off,
             };
-            let (metadata_ok, checksum, source_checksum, bytes, disk, _, embedded_fields) =
-                crate::download::pipeline::download_single_task(
-                    client,
-                    &task,
-                    &config.retry,
-                    crate::download::pipeline::MetadataFlags::from(config),
-                    context,
-                )
-                .await?;
+            let (
+                metadata_ok,
+                checksum,
+                source_checksum,
+                bytes,
+                disk,
+                _,
+                embedded_fields,
+                metadata_storage_failed,
+            ) = crate::download::pipeline::download_single_task(
+                client,
+                &task,
+                &config.retry,
+                crate::download::pipeline::MetadataFlags::from(config),
+                context,
+            )
+            .await?;
+            if metadata_storage_failed {
+                return Err(
+                    std::io::Error::other("Primary layout metadata storage unavailable").into(),
+                );
+            }
             anyhow::ensure!(
                 metadata_ok,
                 "Primary layout metadata preparation is incomplete"

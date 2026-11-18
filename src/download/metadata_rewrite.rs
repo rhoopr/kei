@@ -36,3 +36,26 @@ pub(super) use sidecar::write_reconciled_sidecar;
 
 #[cfg(all(test, feature = "xmp"))]
 pub(in crate::download) use embedded::publication_pause;
+
+/// Operational storage failures that make the local destination unusable for
+/// metadata work. Capacity, read-only mounts, and access denial are distinct
+/// from provider data, unsupported formats, and ordinary retryable metadata
+/// errors: only the former become cycle health evidence.
+pub(in crate::download) fn is_operational_storage_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(is_operational_storage_io)
+}
+
+pub(in crate::download) fn is_operational_storage_io(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::StorageFull
+            | std::io::ErrorKind::ReadOnlyFilesystem
+            | std::io::ErrorKind::PermissionDenied
+    )
+}
+
+#[cfg(test)]
+mod tests;

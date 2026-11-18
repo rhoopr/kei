@@ -8,13 +8,30 @@ use std::path::Path;
 use std::sync::Arc;
 
 #[cfg(feature = "xmp")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct SidecarWriteOutcome {
+    pub(super) failed: bool,
+    pub(super) storage_failed: bool,
+}
+
+#[cfg(feature = "xmp")]
+impl SidecarWriteOutcome {
+    fn failure(error: &anyhow::Error) -> Self {
+        Self {
+            failed: true,
+            storage_failed: super::is_operational_storage_error(error),
+        }
+    }
+}
+
+#[cfg(feature = "xmp")]
 pub(super) async fn write_sidecar_metadata(
     path: &Path,
     payload: Arc<MetadataPayload>,
     created_local: DateTime<FixedOffset>,
     source_checksum: Option<&str>,
     temp_suffix: &str,
-) -> bool {
+) -> SidecarWriteOutcome {
     let source_checksum = source_checksum.map(str::to_owned);
     let sidecar_path = path.to_path_buf();
     let log_path = sidecar_path.clone();
@@ -33,7 +50,10 @@ pub(super) async fn write_sidecar_metadata(
             tracing::warn!(
                 target: "kei::download::metadata_rewrite",
                 error = %error, "XMP sidecar planning task panicked");
-            return false;
+            return SidecarWriteOutcome {
+                failed: true,
+                storage_failed: false,
+            };
         }
     };
     if let Some(error) = source_error.as_ref() {
@@ -49,7 +69,9 @@ pub(super) async fn write_sidecar_metadata(
         }),
     );
     if write.is_empty() {
-        return source_error.is_none();
+        return source_error
+            .as_ref()
+            .map_or_else(SidecarWriteOutcome::default, SidecarWriteOutcome::failure);
     }
     match Box::pin(crate::download::metadata::write_sidecar(
         path,
@@ -65,7 +87,7 @@ pub(super) async fn write_sidecar_metadata(
                 serde_json::json!({"operation":"sidecar","applied":true}),
             );
             let Some(error) = source_error else {
-                return true;
+                return SidecarWriteOutcome::default();
             };
             crate::support::metadata_error(path, "source_gps", &error, Some(true));
             tracing::warn!(
@@ -74,14 +96,14 @@ pub(super) async fn write_sidecar_metadata(
                 error = %error,
                 "Source GPS read failed after sidecar publication; leaving marker for retry"
             );
-            false
+            SidecarWriteOutcome::failure(&error)
         }
         Err(e) => {
             crate::support::metadata_error(path, "sidecar_write", &e, None);
             tracing::warn!(
                 target: "kei::download::metadata_rewrite",
                 path = %log_path.display(), error = %format!("{e:#}"), "Failed to write XMP sidecar");
-            false
+            SidecarWriteOutcome::failure(&e)
         }
     }
 }

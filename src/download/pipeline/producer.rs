@@ -207,6 +207,7 @@ pub(super) struct StreamProducerMetrics {
     pub(super) enum_errors: Arc<std::sync::atomic::AtomicUsize>,
     pub(super) provider_auth_errors: Arc<std::sync::atomic::AtomicUsize>,
     pub(super) state_write_failures: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) storage_failed: Arc<std::sync::atomic::AtomicBool>,
     pub(super) enumeration_complete: Arc<std::sync::atomic::AtomicBool>,
     pub(super) layout_downloaded: Arc<std::sync::atomic::AtomicUsize>,
     pub(super) layout_photos: Arc<std::sync::atomic::AtomicUsize>,
@@ -243,6 +244,7 @@ where
     let enum_errors_producer = Arc::clone(&metrics.enum_errors);
     let provider_auth_errors = Arc::clone(&metrics.provider_auth_errors);
     let state_write_failures_producer = Arc::clone(&metrics.state_write_failures);
+    let storage_failed = Arc::clone(&metrics.storage_failed);
     let enumeration_complete_producer = Arc::clone(&metrics.enumeration_complete);
     let layout_downloaded = Arc::clone(&metrics.layout_downloaded);
     let layout_photos = Arc::clone(&metrics.layout_photos);
@@ -872,6 +874,17 @@ where
                                 // A confirmed copy's unavailable source leaves
                                 // its journal pending. It is not failed provider
                                 // enumeration and must not reseed healthy peers.
+                                if matches!(
+                                    super::task::classify_download_task_error(&error),
+                                    super::task::DownloadTaskErrorClass::Storage
+                                ) {
+                                    storage_failed
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    shared.cycle_shutdown.cancel();
+                                    producer_shutdown.cancel();
+                                    tracing::error!(%error,"Storage unavailable during managed publication; stopping this cycle");
+                                    break 'assets;
+                                }
                                 let repair = crate::download::orchestration::primary_layout::has_confirmed_repair(
                                     &asset, config, &plan.tasks,
                                 ).await.unwrap_or(false);

@@ -937,6 +937,31 @@ async fn historical_records_do_not_hide_explicit_child_or_master_family_deletion
 }
 
 #[tokio::test]
+async fn clean_selected_zone_succeeds_while_foreign_identity_holds_database_cursor() {
+    let f = Fixture::new("missing").await;
+    f.healthy().await;
+    let foreign_key = state::unresolved_identity_key("SharedSync-unselected");
+    f.open()
+        .await
+        .set_metadata(&foreign_key, "1")
+        .await
+        .unwrap();
+    let result = f.cycle(CancellationToken::new(), false, false).await;
+    assert_eq!(result.failed_count, 0, "{result:?}");
+    assert!(!result.stats.identity_incomplete);
+    assert!(!result.can_advance_database_checkpoint());
+    assert_eq!(
+        f.open()
+            .await
+            .get_metadata(&foreign_key)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1")
+    );
+}
+
+#[tokio::test]
 async fn historical_records_retain_current_transfer_finalization_and_missing_file_failures() {
     for fault in ["transfer", "finalization", "missing"] {
         let mut f = Fixture::new("missing").await;
@@ -1016,6 +1041,37 @@ async fn historical_records_retain_current_transfer_finalization_and_missing_fil
         }
         let result = f.cycle(CancellationToken::new(), false, false).await;
         assert!(result.failed_count > 0, "{fault}: {result:?}");
+        let reporting = tempfile::tempdir().unwrap();
+        let notifier = crate::notifications::Notifier::new(None);
+        let reporter = crate::cycle_reporter::CycleReporter::<state::SqliteStateDb>::new(
+            crate::cycle_reporter::CycleReporterConfig {
+                watch_mode: true,
+                report_path: None,
+                run_options: crate::report::RunOptions::from_config(&f.config),
+                health_dir: reporting.path(),
+                personality_mode: crate::personality::Mode::Off,
+                state_db: None,
+                metrics_handle: None,
+                notifier: &notifier,
+            },
+        );
+        let mut health = crate::health::HealthStatus::new();
+        reporter
+            .report_completed_cycle(
+                &mut health,
+                crate::cycle_reporter::CycleFacts::new(
+                    &result.stats,
+                    result.failed_count,
+                    result.session_expired,
+                    std::time::Duration::ZERO,
+                ),
+            )
+            .await;
+        assert_eq!(
+            health.consecutive_failures,
+            u32::from(fault == "finalization"),
+            "{fault}: {result:?}"
+        );
         if fault != "missing" {
             assert!(
                 result.stats.full_enumeration_reason.is_none(),

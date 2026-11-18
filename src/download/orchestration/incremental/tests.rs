@@ -2291,7 +2291,8 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
                     config.temp_suffix.clone(),
                     &CancellationToken::new(),
                 )
-                .await,
+                .await
+                .failed,
                 0
             );
         }

@@ -55,4 +55,5 @@ struct StreamPipelineShared {
     state_db: Option<Arc<dyn DownloadStore>>,
     pb: ProgressBar,
     pipeline_shutdown: CancellationToken,
+    cycle_shutdown: CancellationToken,
 }

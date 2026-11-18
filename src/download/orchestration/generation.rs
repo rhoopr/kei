@@ -160,6 +160,7 @@ pub(super) async fn hold_retained_debt(
         .await?
     {
         result.block_incremental_token(DEFERRED_REASON);
+        result.stats.selected_work_remaining = true;
         result.sync_token = None;
     }
     Ok(())
@@ -1762,7 +1763,7 @@ pub(super) async fn inventory(
         ))
         .await?
     };
-    if retained.provider_auth_errors > 0 {
+    if retained.provider_auth_errors > 0 || retained.storage_failed {
         return crate::download::pipeline::build_download_result(
             client,
             passes,
@@ -1783,6 +1784,7 @@ pub(super) async fn inventory(
     ))
     .await?;
     if config.primary_layout_active
+        && !result.stats.storage_failed
         && !cancel.is_cancelled()
         && !run.session_expired.load(Ordering::Relaxed)
     {
@@ -1843,6 +1845,7 @@ pub(super) async fn inventory(
     if config.primary_layout_active
         && !cancel.is_cancelled()
         && !run.session_expired.load(Ordering::Relaxed)
+        && !result.stats.storage_failed
     {
         let execution = context.replay_run(run.root.clone(), passes, false);
         let mut completed = crate::download::pipeline::StreamingResult {
@@ -1875,13 +1878,23 @@ pub(super) async fn inventory(
             run.held.store(true, Ordering::Relaxed);
         }
     }
-    let metadata_failures = metadata_tail(config, &cancel, context, &run.root.id).await?;
-    result.stats.exif_failures += metadata_failures;
-    if metadata_failures > 0 {
+    let metadata = if result.stats.storage_failed {
+        MetadataTailOutcome::default()
+    } else {
+        metadata_tail(config, &cancel, context, &run.root.id).await?
+    };
+    result.stats.exif_failures += metadata.failed;
+    if metadata.storage_failed {
+        // The checkpoint projection below owns the reported flag, so record
+        // the metadata drain's storage evidence before it runs.
+        result.checkpoint.storage_failed = true;
+        result.stats.storage_failed = true;
+    }
+    if metadata.failed > 0 {
         result.outcome = merge_download_outcomes(
             &result.outcome,
             &DownloadOutcome::PartialFailure {
-                failed_count: metadata_failures,
+                failed_count: metadata.failed,
             },
         );
     }
@@ -1894,7 +1907,7 @@ pub(super) async fn inventory(
         result.checkpoint.identity_incomplete = true;
         result.block_incremental_token(DEFERRED_REASON)
     }
-    if context
+    result.stats.selected_work_remaining = context
         .capture
         .db
         .unfinished_selection_debt(
@@ -1902,8 +1915,8 @@ pub(super) async fn inventory(
             context.scope.clone(),
             context.config_hash.clone(),
         )
-        .await?
-    {
+        .await?;
+    if result.stats.selected_work_remaining {
         result.block_incremental_token(DEFERRED_REASON)
     }
     result.checkpoint.project(&mut result.stats);
@@ -1918,6 +1931,7 @@ pub(super) async fn inventory(
         .await?;
     if !result.checkpoint.sync_token_blocked
         && !result.checkpoint.identity_incomplete
+        && !result.checkpoint.storage_failed
         && covered
         && !context
             .reconcile_membership(passes, config, &membership_delta, &cancel)
@@ -1952,6 +1966,13 @@ fn metadata_writer_default_limits_reserve_250_within_500() {
     assert_eq!(metadata_writer_limits(), (250, 500));
 }
 
+#[derive(Debug, Default)]
+struct MetadataTailOutcome {
+    failed: usize,
+    /// At least one metadata-only write hit operational storage failure.
+    storage_failed: bool,
+}
+
 /// Keep the existing 500-row writer budget while rotating past current failed
 /// or option-disabled physical writers. This cursor schedules retries only;
 /// debt/progress remain in the exact publication and metadata receipts.
@@ -1960,13 +1981,13 @@ async fn metadata_tail(
     cancel: &CancellationToken,
     context: &SelectionContext,
     generation: &str,
-) -> Result<usize> {
+) -> Result<MetadataTailOutcome> {
     let Some(db) = &config.state_db else {
-        return Ok(0);
+        return Ok(MetadataTailOutcome::default());
     };
     let flags = crate::download::pipeline::MetadataFlags::from(config);
     if !flags.has_any_write() {
-        return Ok(0);
+        return Ok(MetadataTailOutcome::default());
     }
     let mut offset = context
         .capture
@@ -2087,7 +2108,10 @@ async fn metadata_tail(
             .set_selection_metadata_retry_offset(context.capture.owner.clone(), next)
             .await?;
     }
-    Ok(priority.failed.saturating_add(result.failed))
+    Ok(MetadataTailOutcome {
+        failed: priority.failed.saturating_add(result.failed),
+        storage_failed: priority.storage_failed || result.storage_failed,
+    })
 }
 
 async fn recover_retained(
@@ -2291,7 +2315,11 @@ async fn replay(
         &mut combined,
     )
     .await?;
-    combined.exif_failures += metadata_tail(config, &cancel, context, &run.root.id).await?;
+    if !combined.storage_failed {
+        let metadata = metadata_tail(config, &cancel, context, &run.root.id).await?;
+        combined.exif_failures += metadata.failed;
+        combined.storage_failed |= metadata.storage_failed;
+    }
     let mut result = crate::download::pipeline::build_download_result(
         client, passes, config, controls, combined, started, cancel,
     )
@@ -2309,7 +2337,7 @@ async fn replay(
             _ => DEFERRED_REASON,
         });
     }
-    if context
+    result.stats.selected_work_remaining = context
         .capture
         .db
         .unfinished_selection_debt(
@@ -2317,8 +2345,8 @@ async fn replay(
             context.scope.clone(),
             context.config_hash.clone(),
         )
-        .await?
-    {
+        .await?;
+    if result.stats.selected_work_remaining {
         result.block_incremental_token(DEFERRED_REASON)
     }
     Ok(result)
@@ -2335,14 +2363,15 @@ async fn replay_destinations(
 ) -> Result<()> {
     let root = &run.root;
     for pass in passes {
-        if cancel.is_cancelled() || combined.provider_auth_errors > 0 {
+        if cancel.is_cancelled() || combined.provider_auth_errors > 0 || combined.storage_failed {
             combined.enumeration_complete = false;
             break;
         }
         let key = pass_key(pass);
         let mut after = None;
         loop {
-            if cancel.is_cancelled() || combined.provider_auth_errors > 0 {
+            if cancel.is_cancelled() || combined.provider_auth_errors > 0 || combined.storage_failed
+            {
                 combined.enumeration_complete = false;
                 break;
             }

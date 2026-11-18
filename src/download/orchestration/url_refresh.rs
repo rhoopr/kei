@@ -424,6 +424,7 @@ pub(super) fn merge_expired_url_retry_result(
     pass_result.auth_errors += retry_result.auth_errors;
     pass_result.exif_failures += retry_result.exif_failures;
     pass_result.state_write_failures += retry_result.state_write_failures;
+    pass_result.storage_failed |= retry_result.storage_failed;
     pass_result.bytes_downloaded += retry_result.bytes_downloaded;
     pass_result.disk_bytes_written += retry_result.disk_bytes_written;
     pass_result.rate_limit_observations += retry_result.rate_limit_observations;

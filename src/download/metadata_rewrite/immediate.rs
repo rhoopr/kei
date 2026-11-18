@@ -19,6 +19,9 @@ pub(crate) struct MetadataWriteOutcome {
     pub(in crate::download) embed_output_fingerprint:
         Option<crate::download::file::ExistingFileFingerprint>,
     pub(super) sidecar_failed: bool,
+    /// A metadata write failed for operational storage reasons (capacity,
+    /// read-only destination, or access denial), not ordinary metadata error.
+    pub(in crate::download) storage_failed: bool,
 }
 
 impl MetadataWriteOutcome {
@@ -96,6 +99,10 @@ pub(in crate::download) async fn write_download_metadata(
             }
             EmbedWriteResult::NoWrite => outcome.embed_no_write = true,
             EmbedWriteResult::Failed => outcome.embed_failed = true,
+            EmbedWriteResult::Storage => {
+                outcome.embed_failed = true;
+                outcome.storage_failed = true;
+            }
             EmbedWriteResult::InputChanged => {
                 outcome.embed_failed = true;
                 outcome.embed_input_changed = true;
@@ -107,7 +114,7 @@ pub(in crate::download) async fn write_download_metadata(
     if request.flags.contains(MetadataFlags::XMP_SIDECAR)
         && let Some(sidecar_path) = request.sidecar_path
     {
-        outcome.sidecar_failed = !write_sidecar_metadata(
+        let sidecar = write_sidecar_metadata(
             sidecar_path,
             Arc::clone(&request.payload),
             request.created_local,
@@ -115,6 +122,8 @@ pub(in crate::download) async fn write_download_metadata(
             request.temp_suffix,
         )
         .await;
+        outcome.sidecar_failed = sidecar.failed;
+        outcome.storage_failed |= sidecar.storage_failed;
     }
 
     if request.flags.any_embed() && request.embed_path.is_some() {

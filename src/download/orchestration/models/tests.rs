@@ -63,6 +63,8 @@ fn test_sync_result_session_expired() {
 #[test]
 fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
     let lib_a = SyncStats {
+        storage_failed: true,
+        selected_work_remaining: false,
         primary_layout: None,
         unattributed_legacy_assets: 2,
         unattributed_legacy_pending: 1,
@@ -135,6 +137,8 @@ fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
     };
 
     let lib_b = SyncStats {
+        storage_failed: false,
+        selected_work_remaining: true,
         primary_layout: None,
         unattributed_legacy_assets: 3,
         unattributed_legacy_pending: 2,

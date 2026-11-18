@@ -84,6 +84,10 @@ pub(in crate::download) struct RewritePass {
     pub(in crate::download) fetched: usize,
     pub(in crate::download) applied: usize,
     pub(in crate::download) failed: usize,
+    /// At least one local destination rejected metadata work for operational
+    /// storage reasons (capacity, read-only mount, or access denial). Ordinary
+    /// retryable metadata failures do not set this flag.
+    pub(in crate::download) storage_failed: bool,
     pub(in crate::download) retired_from_selected_queue: usize,
 }
 
@@ -233,8 +237,18 @@ where
     let mut skipped_unverified = 0usize;
     let mut errored = 0usize;
     let mut deferred = 0usize;
+    let mut storage_failed = false;
     let mut retired_from_selected_queue = 0usize;
     for (idx, pending_rewrite) in pending.into_iter().enumerate() {
+        if storage_failed {
+            deferred += pending_count - idx;
+            tracing::warn!(
+                target: "kei::download::metadata_rewrite",
+                remaining = pending_count - idx,
+                "Operational storage failure; deferring remaining metadata rewrites"
+            );
+            break;
+        }
         // Selected destinations already carry an exact prepared-output receipt.
         // Use that publication owner for an explicitly requested timestamp
         // rewrite rather than requiring a second legacy repair receipt.
@@ -304,6 +318,7 @@ where
         if let Err(error) = crate::download::file::recover_metadata_replacements(&path).await {
             tracing::warn!(path = %path.display(), error = %format!("{error:#}"),
                 "Could not recover metadata replacement; leaving marker for retry");
+            storage_failed |= super::is_operational_storage_error(&error);
             errored += 1;
             continue;
         }
@@ -324,6 +339,7 @@ where
                     error = %e,
                     "Could not stat file for metadata rewrite; skipping"
                 );
+                storage_failed |= super::is_operational_storage_io(&e);
                 skipped_missing += 1;
                 continue;
             }
@@ -503,6 +519,7 @@ where
                         error = %e,
                         "Could not hash file before metadata rewrite; leaving marker for future retry"
                     );
+                    storage_failed |= super::is_operational_storage_error(&e);
                     errored += 1;
                     continue;
                 }
@@ -611,7 +628,8 @@ where
                         if let Some(modified) = preserved_local.and_then(|local| local.modified) {
                             match prepared.require_mtime(modified.into()).await {
                                 Ok(prepared) => prepared,
-                                Err(_) => {
+                                Err(error) => {
+                                    storage_failed |= super::is_operational_storage_error(&error);
                                     errored += 1;
                                     continue;
                                 }
@@ -712,6 +730,10 @@ where
                                 outcome.embed_input_changed = true;
                             }
                             EmbedWriteResult::Failed => outcome.embed_failed = true,
+                            EmbedWriteResult::Storage => {
+                                outcome.embed_failed = true;
+                                storage_failed = true;
+                            }
                             EmbedWriteResult::NoWrite => outcome.embed_no_write = true,
                         }
                     }
@@ -721,6 +743,10 @@ where
                     capture_embed_complete = selected_queue == MetadataRewriteQueue::CaptureRepair;
                 }
                 EmbedPrepareResult::Failed => outcome.embed_failed = true,
+                EmbedPrepareResult::Storage => {
+                    outcome.embed_failed = true;
+                    storage_failed = true;
+                }
                 EmbedPrepareResult::InputChanged => {
                     outcome.embed_failed = true;
                     outcome.embed_input_changed = true;
@@ -730,7 +756,7 @@ where
 
         #[cfg(feature = "xmp")]
         if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
-            outcome.sidecar_failed = !write_sidecar_metadata(
+            let sidecar = write_sidecar_metadata(
                 &path,
                 Arc::clone(&payload),
                 created_local,
@@ -738,6 +764,8 @@ where
                 &temp_suffix,
             )
             .await;
+            outcome.sidecar_failed = sidecar.failed;
+            storage_failed |= sidecar.storage_failed;
         }
 
         if drifted {
@@ -772,6 +800,7 @@ where
                 (_, Err(e)) => {
                     outcome.embed_failed = true;
                     outcome.embed_input_changed = true;
+                    storage_failed |= super::is_operational_storage_error(&e);
                     tracing::warn!(
                         target: "kei::download::metadata_rewrite",
                         asset_id = %record.id,
@@ -911,6 +940,7 @@ where
         fetched: pending_count,
         applied,
         failed: errored + deferred + skipped_drifted + skipped_unverified,
+        storage_failed,
         retired_from_selected_queue,
     }
 }

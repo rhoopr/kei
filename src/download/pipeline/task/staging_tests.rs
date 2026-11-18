@@ -781,6 +781,7 @@ async fn streaming_auth_abort_drains_peer_claim_and_lease() {
                 config: config.clone(),
                 state_db: config.state_db.clone(),
                 pb: indicatif::ProgressBar::hidden(),
+                cycle_shutdown: pipeline_shutdown.clone(),
                 pipeline_shutdown,
             },
             StreamConsumerSettings {
@@ -920,6 +921,7 @@ async fn auth_abort_waits_for_detached_metadata_publication_before_unlock() {
                 config: config.clone(),
                 state_db: config.state_db.clone(),
                 pb: indicatif::ProgressBar::hidden(),
+                cycle_shutdown: pipeline_shutdown.clone(),
                 pipeline_shutdown,
             },
             StreamConsumerSettings {

@@ -398,7 +398,8 @@ async fn released_v0240_metadata_policy_selection_restart_preserves_siblings() {
                     Arc::from(".metadata-tmp"),
                     &CancellationToken::new(),
                 )
-                .await,
+                .await
+                .failed,
                 0,
                 "cycle {cycle}"
             );

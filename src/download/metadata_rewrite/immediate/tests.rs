@@ -512,6 +512,67 @@ async fn contract_metadata_writes_require_opt_in_leaves_files_untouched() {
     assert_eq!(files, 1, "disabled metadata options created another file");
 }
 
+/// Download-time metadata writes carry storage-only evidence separately from
+/// ordinary metadata failure so the transfer loop can stop the cycle.
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn immediate_metadata_permission_denied_sets_storage_evidence() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestorePermissions {
+        path: std::path::PathBuf,
+        permissions: std::fs::Permissions,
+    }
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.path, self.permissions.clone());
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let media_dir = dir.path().join("media");
+    std::fs::create_dir(&media_dir).unwrap();
+    let path = media_dir.join("photo.jpg");
+    std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
+
+    let original = std::fs::metadata(&media_dir).unwrap().permissions();
+    let mut read_only = original.clone();
+    read_only.set_mode(0o555);
+    std::fs::set_permissions(&media_dir, read_only).unwrap();
+    let _restore = RestorePermissions {
+        path: media_dir.clone(),
+        permissions: original,
+    };
+    let probe = media_dir.join("write-probe");
+    if std::fs::File::create(&probe).is_ok() {
+        std::fs::remove_file(&probe).unwrap();
+        return;
+    }
+
+    let outcome = write_download_metadata(MetadataWriteRequest {
+        final_path: &path,
+        embed_path: Some(&path),
+        expected_embed_fingerprint: None,
+        source_checksum: None,
+        sidecar_path: None,
+        payload: Arc::new(MetadataPayload {
+            rating: Some(3),
+            ..MetadataPayload::default()
+        }),
+        created_local: now_local(),
+        flags: MetadataFlags::RATING | MetadataFlags::EMBED_XMP,
+        capture_timestamp_repair: CaptureTimestampRepair::Preserve,
+        temp_suffix: ".metadata-storage-test",
+    })
+    .await;
+
+    assert!(outcome.embed_failed);
+    assert!(
+        outcome.storage_failed,
+        "permission denied on the metadata destination must surface as storage"
+    );
+}
+
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn approved_heif_fingerprint_bypasses_changed_format_routing_gate() {
@@ -586,7 +647,9 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
         });
         let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
         assert!(
-            write_sidecar_metadata(&path, payload, now_local(), Some(&checksum), ".gps-test").await
+            !write_sidecar_metadata(&path, payload, now_local(), Some(&checksum), ".gps-test")
+                .await
+                .failed
         );
         let xmp: XmpMeta = std::fs::read_to_string(path.with_extension("jpg.xmp"))
             .unwrap()
@@ -614,7 +677,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
     std::fs::write(&path, &source).unwrap();
     for checksum in [None, Some("different-source-checksum")] {
         assert!(
-            write_sidecar_metadata(
+            !write_sidecar_metadata(
                 &path,
                 Arc::new(MetadataPayload {
                     latitude: Some(1.5),
@@ -626,6 +689,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
                 ".gps-test"
             )
             .await
+            .failed
         );
         let xmp: XmpMeta = std::fs::read_to_string(path.with_extension("jpg.xmp"))
             .unwrap()
@@ -735,7 +799,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
             _ => (1.5, 2.5, "1,30.0000N"),
         };
         assert!(
-            write_sidecar_metadata(
+            !write_sidecar_metadata(
                 &path,
                 Arc::new(MetadataPayload {
                     latitude: Some(latitude),
@@ -746,7 +810,8 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
                 Some(&checksum),
                 ".gps-test"
             )
-            .await,
+            .await
+            .failed,
             "{name}"
         );
         let xmp: XmpMeta = std::fs::read_to_string(path.with_extension("jpg.xmp"))

@@ -1,32 +1,10 @@
-//! Watch cadence, metadata follow-ups, and one-shot recovery policy.
+//! Watch cadence and one-shot recovery policy.
 
 use crate::{config, download};
 
 /// Default watch interval applied when `kei service run` enters with no TOML
 /// value set. 24 hours, matching the Docker image's always-on service shape.
 pub(crate) const SERVICE_MODE_DEFAULT_WATCH_INTERVAL: u64 = 86400;
-
-/// Maximum idle delay between clean metadata-capture repair batches.
-pub(super) const METADATA_CAPTURE_FOLLOW_UP_INTERVAL_SECS: u64 = 60;
-
-#[must_use]
-pub(super) fn metadata_capture_watch_interval(
-    configured_interval: Option<u64>,
-    stats: &download::SyncStats,
-    cycle_failed_count: usize,
-) -> Option<u64> {
-    configured_interval.map(|interval| {
-        if cycle_failed_count == 0
-            && stats.metadata_capture_remaining > 0
-            && stats.metadata_capture_progressed
-            && !stats.has_rate_limit_pressure()
-        {
-            interval.min(METADATA_CAPTURE_FOLLOW_UP_INTERVAL_SECS)
-        } else {
-            interval
-        }
-    })
-}
 
 /// Decide whether to apply the service-mode watch-interval fallback.
 ///

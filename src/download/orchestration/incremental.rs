@@ -489,16 +489,16 @@ async fn run_collecting_metadata_rewrite_batch(
     config: &DownloadConfig,
     run_mode: DownloadRunMode,
     shutdown_token: &CancellationToken,
-) -> usize {
+) -> metadata_rewrite::RewritePass {
     if !run_mode.downloads_files() {
-        return 0;
+        return metadata_rewrite::RewritePass::default();
     }
     let Some(db) = &config.state_db else {
-        return 0;
+        return metadata_rewrite::RewritePass::default();
     };
     let metadata = MetadataFlags::from(config);
     if !metadata.has_any_write() {
-        return 0;
+        return metadata_rewrite::RewritePass::default();
     }
     metadata_rewrite::run_pending(
         db.as_ref(),
@@ -507,7 +507,6 @@ async fn run_collecting_metadata_rewrite_batch(
         shutdown_token,
     )
     .await
-    .failed
 }
 
 /// Keep later equivalent URLs without suppressing intervening distinct observations.
@@ -815,12 +814,14 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     }
 
     if downloadable_assets.is_empty() {
-        let rewrite_failures =
+        let rewrite =
             run_collecting_metadata_rewrite_batch(config, controls.run_mode, &shutdown_token).await;
+        let rewrite_failures = rewrite.failed;
         let mut stats = SyncStats {
             elapsed_secs: started.elapsed().as_secs_f64(),
             state_write_failures: delta_summary.state_transition_failures,
             exif_failures: rewrite_failures,
+            storage_failed: rewrite.storage_failed,
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
@@ -1103,8 +1104,9 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     }
 
     if tasks.is_empty() {
-        let rewrite_failures =
+        let rewrite =
             run_collecting_metadata_rewrite_batch(config, controls.run_mode, &shutdown_token).await;
+        let rewrite_failures = rewrite.failed;
         let mut stats = SyncStats {
             skipped: skip_breakdown,
             enumeration_errors,
@@ -1112,6 +1114,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 .state_transition_failures
                 .saturating_add(planning_state_write_failures),
             exif_failures: rewrite_failures,
+            storage_failed: rewrite.storage_failed,
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
@@ -1274,9 +1277,13 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 .await;
     }
 
-    pass_result.exif_failures = pass_result.exif_failures.saturating_add(
-        run_collecting_metadata_rewrite_batch(config, controls.run_mode, &shutdown_token).await,
-    );
+    let rewrite = if pass_result.storage_failed {
+        metadata_rewrite::RewritePass::default()
+    } else {
+        run_collecting_metadata_rewrite_batch(config, controls.run_mode, &shutdown_token).await
+    };
+    pass_result.exif_failures = pass_result.exif_failures.saturating_add(rewrite.failed);
+    pass_result.storage_failed |= rewrite.storage_failed;
 
     let failed = pass_result.failed.len();
     let succeeded = pass_result.downloaded;
@@ -1290,6 +1297,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
 
     let mut stats = SyncStats {
         assets_seen: 0, // incremental doesn't have total library count
+        storage_failed: pass_result.storage_failed,
         downloaded: succeeded,
         failed,
         skipped: skip_breakdown,

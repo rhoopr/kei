@@ -4742,7 +4742,7 @@ async fn private_metadata_recovery_fixture_with_signature(
     if refresh {
         // The existing explicit command deliberately queues during enumeration
         // and owns this separate bounded refresh tail after all passes finish.
-        let failed = crate::download::orchestration::maintenance::drain_pending_metadata_rewrites(
+        let drain = crate::download::orchestration::maintenance::drain_pending_metadata_rewrites(
             f.db.as_ref(),
             &f.config.metadata,
             crate::download::metadata_rewrite::CaptureTimestampRepair::Preserve,
@@ -4751,7 +4751,8 @@ async fn private_metadata_recovery_fixture_with_signature(
             &CancellationToken::new(),
         )
         .await;
-        assert_eq!(failed, 0);
+        assert_eq!(drain.failed, 0);
+        assert!(!drain.storage_failed);
         for media_path in &media_paths {
             let sidecar = media_path.with_file_name(format!(
                 "{}.xmp",

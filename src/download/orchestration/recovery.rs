@@ -130,6 +130,7 @@ async fn run_targeted_recovery_pass(
         .collect();
 
     let checkpoint = CheckpointEvidence {
+        storage_failed: pass_result.storage_failed,
         identity_incomplete,
         state_write_failures: pass_result.state_write_failures,
         interrupted: shutdown_token.is_cancelled()

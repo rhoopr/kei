@@ -930,6 +930,8 @@ pub(crate) async fn run_cycle(
 ) -> anyhow::Result<CycleResult> {
     // Bound the cycle's state machine once here rather than growing every
     // runner, service and test future that awaits a complete sync cycle.
+    // A storage circuit stops this cycle without shutting down interval mode.
+    let cycle_shutdown = shutdown_token.child_token();
     Box::pin(run_cycle_inner(
         library_states,
         config,
@@ -937,7 +939,7 @@ pub(crate) async fn run_cycle(
         build_download_config,
         download_controls,
         shared_session,
-        shutdown_token,
+        &cycle_shutdown,
     ))
     .await
 }
@@ -2337,8 +2339,15 @@ async fn run_cycle_inner(
                 cycle_failed_count += failed_count;
             }
         }
+        if cycle_stats.storage_failed {
+            db_sync_token_advance_safe = false;
+            break;
+        }
     }
 
+    if cycle_stats.selected_work_remaining {
+        cycle_failed_count = cycle_failed_count.max(1);
+    }
     let reconciliation_active = force_full_for_config_hash;
     if reconciliation_active
         && db_sync_token_advance_safe
@@ -2480,9 +2489,18 @@ async fn run_cycle_inner(
     if let Some(db) = state_db {
         let summary = db.get_summary().await?;
         if summary.unresolved_identity_zones > 0 {
-            download::block_sync_token_for_unresolved_identity(&mut cycle_stats);
-            cycle_failed_count = cycle_failed_count.max(1);
             db_sync_token_advance_safe = false;
+            for library in library_states {
+                if db
+                    .get_metadata(&state::unresolved_identity_key(&library.zone_name))
+                    .await?
+                    .is_some()
+                {
+                    download::block_sync_token_for_unresolved_identity(&mut cycle_stats);
+                    cycle_failed_count = cycle_failed_count.max(1);
+                    break;
+                }
+            }
         }
         if summary.metadata_capture.iter().any(|capture| {
             capture_authority_libraries.contains(&capture.library) && capture.unresolved_assets > 0

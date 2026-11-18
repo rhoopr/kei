@@ -497,6 +497,7 @@ async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() 
                 state_db: config.state_db.clone(),
                 pb: ProgressBar::hidden(),
                 pipeline_shutdown: shutdown.child_token(),
+                cycle_shutdown: shutdown.clone(),
             },
             StreamConsumerSettings {
                 retry_config: config.retry,

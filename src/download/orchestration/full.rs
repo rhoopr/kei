@@ -1699,20 +1699,22 @@ pub(super) async fn download_photos_full_with_token_policy(
     // wins whether or not it holds the newer metadata.
     let metadata_flags = MetadataFlags::from(config.as_ref());
     if controls.run_mode.downloads_files()
+        && !streaming_result.storage_failed
         && !config.indexing_inventory_only
         && !config.refresh_metadata
         && config.selection_run.is_none()
         && metadata_flags.has_any_write()
         && let Some(db) = &config.state_db
     {
-        streaming_result.exif_failures += metadata_rewrite::run_pending(
+        let pass = metadata_rewrite::run_pending(
             db.as_ref(),
             metadata_flags,
             Arc::clone(&config.temp_suffix),
             &shutdown_token,
         )
-        .await
-        .failed;
+        .await;
+        streaming_result.exif_failures += pass.failed;
+        streaming_result.storage_failed |= pass.storage_failed;
     }
 
     // Build the outcome using the same logic as download_photos

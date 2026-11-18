@@ -38,6 +38,7 @@ pub(in crate::download) struct StreamingResult {
     /// CloudKit session failures require recovery even without failed CDN transfers.
     pub(in crate::download) provider_auth_errors: usize,
     pub(in crate::download) state_write_failures: usize,
+    pub(in crate::download) storage_failed: bool,
     pub(in crate::download) enumeration_errors: usize,
     pub(in crate::download) assets_seen: u64,
     pub(in crate::download) skip_summary: ProducerSkipSummary,
@@ -186,6 +187,7 @@ pub(super) async fn finalize_streaming_download(
         .state_write_failures
         .load(std::sync::atomic::Ordering::Relaxed);
     let state_write_failures = final_state_flush.failures
+        + consumer.failure_state_writes
         + producer_state_write_failures
         + usize::from(complete_sync_failed);
     if consumer.state_write_circuit_error.is_none()
@@ -200,20 +202,22 @@ pub(super) async fn finalize_streaming_download(
     // without re-downloading bytes; the alternative was to leave markers
     // accumulating in the DB forever.
     if consumer.state_write_circuit_error.is_none()
+        && !consumer.storage_failed
         && !defer_metadata_drain
         && !config.refresh_metadata
         && let Some(db) = &state_db
     {
         let metadata_flags = MetadataFlags::from(config.as_ref());
         if metadata_flags.has_any_write() {
-            consumer.exif_failures += metadata_rewrite::run_pending(
+            let pass = metadata_rewrite::run_pending(
                 db.as_ref(),
                 metadata_flags,
                 Arc::clone(&config.temp_suffix),
                 &pipeline_shutdown,
             )
-            .await
-            .failed;
+            .await;
+            consumer.exif_failures += pass.failed;
+            consumer.storage_failed |= pass.storage_failed;
         }
     }
 
@@ -239,6 +243,10 @@ pub(super) async fn finalize_streaming_download(
             .load(std::sync::atomic::Ordering::Relaxed);
 
     Ok(StreamingResult {
+        storage_failed: consumer.storage_failed
+            || metrics
+                .storage_failed
+                .load(std::sync::atomic::Ordering::Relaxed),
         downloaded: consumer.downloaded,
         exif_failures: consumer.exif_failures,
         failed: consumer.failed,
@@ -349,6 +357,7 @@ pub(in crate::download) async fn build_download_result(
     let enumeration_incomplete =
         producer_enumeration_incomplete(&streaming_result, &shutdown_token);
     let mut checkpoint = CheckpointEvidence {
+        storage_failed: streaming_result.storage_failed,
         state_write_failures,
         enumeration_errors,
         interrupted: shutdown_token.is_cancelled(),
@@ -471,7 +480,9 @@ pub(in crate::download) async fn build_download_result(
         ));
     }
 
-    if streaming_result.url_expired_abort && failed_tasks.is_empty() {
+    if streaming_result.storage_failed
+        || (streaming_result.url_expired_abort && failed_tasks.is_empty())
+    {
         let retry_exhausted = skip_breakdown.retry_exhausted;
         let mut stats = crate::download::SyncStats {
             assets_seen: streaming_result.assets_seen,
@@ -619,6 +630,7 @@ pub(in crate::download) async fn build_download_result(
     let phase2_auth_errors = pass_result.auth_errors;
     exif_failures += pass_result.exif_failures;
     state_write_failures += pass_result.state_write_failures;
+    checkpoint.storage_failed |= pass_result.storage_failed;
     checkpoint.state_write_failures = state_write_failures;
     checkpoint.interrupted = shutdown_token.is_cancelled();
     let total_auth_errors = auth_errors + phase2_auth_errors + retry_provider_auth_errors;

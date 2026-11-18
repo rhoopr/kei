@@ -311,7 +311,7 @@ impl Respond for OfflinePhotos {
         } else if path.ends_with("/changes/zone") {
             json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":format!("{label}-cursor"),"moreComing":false,"records":[]}]})
         } else if path.ends_with("/records/lookup") {
-            json!({"records":body.get("records").unwrap().as_array().unwrap().iter().map(|wanted| json!({"recordName":wanted["recordName"],"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"serverErrorCode":"UNKNOWN_ITEM"})).collect::<Vec<_>>()})
+            json!({"records":body.get("records").unwrap().as_array().unwrap().iter().map(|wanted| json!({"recordName":wanted.get("recordName").unwrap(),"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"serverErrorCode":"UNKNOWN_ITEM"})).collect::<Vec<_>>()})
         } else if path.ends_with("/internal/records/query/batch") {
             json!({"batch":[{"records":[{"fields":{"itemCount":{"value":0}}}]}]})
         } else if path.ends_with("/records/query") {
@@ -1421,17 +1421,16 @@ impl Respond for QuietCatalogPhotos {
             json!({"records":[]})
         } else if path.ends_with("/records/query") {
             assert_eq!(
-                body.pointer("/query/recordType").unwrap(),
-                "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"
+                body.pointer("/query/recordType").and_then(Value::as_str),
+                Some("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted")
             );
-            assert_eq!(body.get("zoneID").unwrap(), &zone);
+            assert_eq!(body.get("zoneID"), Some(&zone));
             let offset = body
                 .pointer("/query/filterBy")
-                .unwrap()
-                .as_array()
+                .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .find(|filter| filter["fieldName"] == "startRank")
+                .find(|filter| filter.get("fieldName").and_then(Value::as_str) == Some("startRank"))
                 .and_then(|filter| filter.pointer("/fieldValue/value").and_then(Value::as_u64))
                 .unwrap_or(0) as usize;
             let limit = body
@@ -1595,6 +1594,13 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
     let diagnostics = std::fs::read_to_string(&log).unwrap();
     assert!(photos.checks.load(Ordering::SeqCst) >= 3, "{diagnostics}");
     assert!(first_wave, "{diagnostics}");
+    let health: Value =
+        serde_json::from_slice(&std::fs::read(root.join("health.json")).unwrap()).unwrap();
+    assert_eq!(
+        health["consecutive_failures"], 0,
+        "pending selected work is not a service failure: {health}"
+    );
+    assert!(health["last_error"].is_null());
     assert!(
         started.elapsed() >= Duration::from_secs(119),
         "production watch cadence must not hot-loop"
@@ -1695,7 +1701,11 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
     let media = quiet_media_snapshot(account.media.parent().unwrap());
     let calls = photos.lookups.load(Ordering::SeqCst);
     for _ in 0..2 {
-        success(&command(root, &account, &["sync", "--no-progress-bar"]));
+        let unfinished = command(root, &account, &["sync", "--no-progress-bar"]);
+        assert!(
+            !unfinished.status.success(),
+            "selected retry debt must fail one-shot even before its retry deadline"
+        );
         assert_eq!(photos.lookups.load(Ordering::SeqCst), calls);
         assert_eq!(state(&account.path), frozen);
         assert_eq!(
@@ -1749,6 +1759,12 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
     let retry_started = chrono::Utc::now().timestamp();
     let held = command(root, &account, &["sync", "--no-progress-bar"]);
     let held_diagnostics = String::from_utf8_lossy(&held.stderr);
+    let held_health: Value =
+        serde_json::from_slice(&std::fs::read(root.join("health.json")).unwrap()).unwrap();
+    assert_eq!(
+        held_health["consecutive_failures"], 0,
+        "provider retry debt stays healthy: {held_health}"
+    );
     assert!(
         !held.status.success(),
         "the due current confirmation still fails: {held_diagnostics}"
@@ -1788,7 +1804,11 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
         &account.path,
         "SELECT * FROM provider_active_decisions ORDER BY generation,pass_key,child",
     );
-    success(&command(root, &account, &["sync", "--no-progress-bar"]));
+    assert!(
+        !command(root, &account, &["sync", "--no-progress-bar"])
+            .status
+            .success()
+    );
     assert_eq!(photos.lookups.load(Ordering::SeqCst), calls + 1);
     assert_eq!(
         rows(
@@ -2807,6 +2827,10 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
     assert!(
         diagnostics.contains("synthetic private B receipt interruption"),
         "{diagnostics}"
+    );
+    assert!(
+        !out.status.success(),
+        "unfinished B must fail the one-shot: {diagnostics}"
     );
     let count = |sql: &str| {
         Connection::open(&account.path)

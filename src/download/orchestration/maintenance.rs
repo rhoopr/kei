@@ -19,9 +19,18 @@ use super::models::{
     SyncStats, block_sync_token_for_incremental_delta, block_sync_token_for_metadata_capture,
 };
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MetadataDrainOutcome {
+    /// Markers left unfinished when the drain stopped.
+    pub(crate) failed: usize,
+    /// At least one destination rejected metadata work for operational
+    /// storage reasons. Remaining retry markers are preserved.
+    pub(crate) storage_failed: bool,
+}
+
 /// Drain pending metadata-rewrite markers in bounded batches so a
 /// `--refresh-metadata` migration finishes in its own run. Returns the number
-/// of markers left failing when the drain stops.
+/// of markers left failing and whether operational storage stopped the drain.
 pub(crate) async fn drain_pending_metadata_rewrites(
     db: &dyn DownloadStore,
     metadata: &crate::config::MetadataConfig,
@@ -29,10 +38,10 @@ pub(crate) async fn drain_pending_metadata_rewrites(
     library_scope: &[&str],
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
-) -> usize {
+) -> MetadataDrainOutcome {
     let flags = MetadataFlags::from(metadata);
     if !flags.has_any_write() {
-        return 0;
+        return MetadataDrainOutcome::default();
     }
     let mut offset = 0usize;
     let mut failed = 0usize;
@@ -48,8 +57,17 @@ pub(crate) async fn drain_pending_metadata_rewrites(
         )
         .await;
         failed = failed.saturating_add(pass.failed);
+        if pass.storage_failed {
+            return MetadataDrainOutcome {
+                failed: failed.max(1),
+                storage_failed: true,
+            };
+        }
         if pass.fetched == 0 {
-            return failed;
+            return MetadataDrainOutcome {
+                failed,
+                storage_failed: false,
+            };
         }
         tracing::debug!(
             applied = pass.applied,
@@ -58,7 +76,10 @@ pub(crate) async fn drain_pending_metadata_rewrites(
             "Metadata rewrite batch completed"
         );
         if shutdown_token.is_cancelled() {
-            return failed.max(1);
+            return MetadataDrainOutcome {
+                failed: failed.max(1),
+                storage_failed: false,
+            };
         }
         offset = offset.saturating_add(
             pass.fetched

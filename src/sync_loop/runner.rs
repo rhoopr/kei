@@ -18,8 +18,8 @@ use crate::sync_loop::reporting::maybe_write_offline_fake_sync_report;
 use crate::sync_loop::reporting::merge_refresh_tail_outcome;
 use crate::sync_loop::session::reacquire_session;
 use crate::sync_loop::watch::{
-    metadata_capture_watch_interval, refresh_metadata_forces_one_shot,
-    repair_truncated_forces_one_shot, validate_capture_timestamp_repair,
+    refresh_metadata_forces_one_shot, repair_truncated_forces_one_shot,
+    validate_capture_timestamp_repair,
 };
 use crate::sync_loop::{SyncArgs, service_mode_default_interval, should_reconcile_this_cycle};
 use crate::systemd::SystemdNotifier;
@@ -635,7 +635,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             break;
         }
         cycle_index = cycle_index.saturating_add(1);
-        let mut next_watch_interval = config.watch.interval;
 
         // Readiness may change without changes/database events. Persist holds
         // before any shortcut and rebuild collection/pass scope while held so
@@ -742,37 +741,40 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             )
             .await?;
             // Drain tagged rewrites now so the one-shot --refresh-metadata repair finishes in this run.
-            let refresh_tail_failures = if config.runtime.refresh_metadata {
-                if let Some(db) = state_db.as_deref() {
-                    let library_scope: Vec<&str> = libraries
-                        .iter()
-                        .map(|library| library.zone_name())
-                        .collect();
-                    download::drain_pending_metadata_rewrites(
-                        db,
-                        &config.metadata,
-                        capture_timestamp_repair,
-                        &library_scope,
-                        Arc::clone(&cfg_temp_suffix),
-                        &shutdown_token,
-                    )
-                    .await
+            let refresh_tail =
+                if config.runtime.refresh_metadata && !cycle_result.stats.storage_failed {
+                    if let Some(db) = state_db.as_deref() {
+                        let library_scope: Vec<&str> = libraries
+                            .iter()
+                            .map(|library| library.zone_name())
+                            .collect();
+                        download::drain_pending_metadata_rewrites(
+                            db,
+                            &config.metadata,
+                            capture_timestamp_repair,
+                            &library_scope,
+                            Arc::clone(&cfg_temp_suffix),
+                            &shutdown_token,
+                        )
+                        .await
+                    } else {
+                        download::MetadataDrainOutcome::default()
+                    }
                 } else {
-                    0
-                }
-            } else {
-                0
-            };
+                    download::MetadataDrainOutcome::default()
+                };
             if config.runtime.refresh_metadata {
                 merge_refresh_tail_outcome(
                     &mut cycle_result,
-                    refresh_tail_failures,
+                    refresh_tail.failed,
+                    refresh_tail.storage_failed,
                     shutdown_token.is_cancelled(),
                 );
             }
-            if refresh_tail_failures > 0 {
+            if refresh_tail.failed > 0 {
                 tracing::warn!(
-                    failed = refresh_tail_failures,
+                    failed = refresh_tail.failed,
+                    storage_failed = refresh_tail.storage_failed,
                     "Some --refresh-metadata rewrites did not complete; sync will exit non-zero"
                 );
             }
@@ -811,23 +813,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     ),
                 )
                 .await;
-
-            next_watch_interval = metadata_capture_watch_interval(
-                config.watch.interval,
-                &cycle_result.stats,
-                cycle_result.failed_count,
-            );
-            if let (Some(configured_interval), Some(follow_up_interval)) =
-                (config.watch.interval, next_watch_interval)
-                && follow_up_interval < configured_interval
-            {
-                tracing::info!(
-                    refreshed = cycle_result.stats.metadata_capture_refreshed,
-                    remaining = cycle_result.stats.metadata_capture_remaining,
-                    interval_secs = follow_up_interval,
-                    "Metadata-capture repair scheduled a bounded follow-up cycle"
-                );
-            }
 
             // Handle aggregate outcome across all libraries
             if cycle_result.session_expired {
@@ -870,7 +855,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             run_periodic_reconcile(db.as_ref() as &dyn state::ReportStateStore, cycle_index).await;
         }
 
-        if let Some(interval) = next_watch_interval {
+        if let Some(interval) = config.watch.interval {
             if shutdown_token.is_cancelled() {
                 tracing::info!("Shutdown requested, exiting...");
                 break;

@@ -35,6 +35,8 @@ pub(super) struct StreamConsumerResult {
     pub(super) exif_failures: usize,
     pub(super) failed: Vec<DownloadTask>,
     pub(super) auth_errors: usize,
+    pub(super) storage_failed: bool,
+    pub(super) failure_state_writes: usize,
     pub(super) pending_state_writes: Vec<PendingStateWrite>,
     pub(super) bytes_downloaded_total: u64,
     pub(super) disk_bytes_total: u64,
@@ -115,6 +117,8 @@ pub(super) async fn consume_stream_download_tasks(
     let mut exif_failures = 0usize;
     let mut failed: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
+    let mut storage_failed = false;
+    let mut failure_state_writes = 0;
     let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
     let mut bytes_downloaded_total: u64 = 0;
     let mut disk_bytes_total: u64 = 0;
@@ -146,6 +150,7 @@ pub(super) async fn consume_stream_download_tasks(
                 disk_bytes,
                 retained,
                 embedded_fields,
+                metadata_storage_failed,
             )) => {
                 downloaded += 1;
                 bytes_downloaded_total += bytes_dl;
@@ -220,6 +225,17 @@ pub(super) async fn consume_stream_download_tasks(
                         }
                     }
                 }
+                if metadata_storage_failed {
+                    storage_failed = true;
+                    shared.cycle_shutdown.cancel();
+                    pipeline_shutdown.cancel();
+                    tracing::error!(
+                        target: "kei::download::pipeline",
+                        asset_id = %task.asset_id,
+                        path = %task.download_path.display(),
+                        "Metadata storage unavailable; stopping file work for this cycle"
+                    );
+                }
             }
             Err(e) => {
                 match classify_download_task_error(&e) {
@@ -275,11 +291,18 @@ pub(super) async fn consume_stream_download_tasks(
                             tracing::error!(target: "kei::download::pipeline", asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
                         });
                     }
+                    DownloadTaskErrorClass::Storage => {
+                        storage_failed = true;
+                        shared.cycle_shutdown.cancel();
+                        pipeline_shutdown.cancel();
+                        tracing::error!(error = %e, "Storage unavailable; stopping file work for this cycle");
+                    }
                 }
                 if let Some(db) = &state_db
                     && let Err(e) =
                         finalize_failed(db.as_ref(), &task.library, &task, &e.to_string()).await
                 {
+                    failure_state_writes += 1;
                     tracing::warn!(target: "kei::download::pipeline",
                         asset_id = %task.asset_id,
                         error = %e,
@@ -296,6 +319,8 @@ pub(super) async fn consume_stream_download_tasks(
         exif_failures,
         failed,
         auth_errors,
+        storage_failed,
+        failure_state_writes,
         pending_state_writes,
         bytes_downloaded_total,
         disk_bytes_total,

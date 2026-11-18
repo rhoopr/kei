@@ -16,6 +16,9 @@ pub(super) enum EmbedWriteResult {
     ),
     NoWrite,
     Failed,
+    /// The local destination could not serve the write: full, read-only, or
+    /// access-denied storage. Ordinary writer failures stay [`Self::Failed`].
+    Storage,
     InputChanged,
 }
 
@@ -23,6 +26,9 @@ pub(super) enum EmbedPrepareResult {
     Prepared(crate::download::metadata::PreparedMetadataFile),
     NoWrite,
     Failed,
+    /// The local destination could not serve the write: full, read-only, or
+    /// access-denied storage. Ordinary writer failures stay [`Self::Failed`].
+    Storage,
     InputChanged,
 }
 
@@ -144,6 +150,8 @@ pub(super) async fn prepare_embed_metadata(
                 let disposition = crate::download::file::classify_conditional_publish_error(&e);
                 let result = if disposition.target_changed {
                     EmbedPrepareResult::InputChanged
+                } else if super::is_operational_storage_error(&e) {
+                    EmbedPrepareResult::Storage
                 } else {
                     EmbedPrepareResult::Failed
                 };
@@ -190,6 +198,8 @@ pub(super) async fn publish_embed_metadata(
             let disposition = crate::download::file::classify_conditional_publish_error(&error);
             let result = if disposition.target_changed {
                 EmbedWriteResult::InputChanged
+            } else if super::is_operational_storage_error(&error) {
+                EmbedWriteResult::Storage
             } else {
                 EmbedWriteResult::Failed
             };
@@ -240,6 +250,7 @@ pub(super) async fn write_embed_metadata(
         EmbedPrepareResult::Prepared(prepared) => publish_embed_metadata(path, prepared).await,
         EmbedPrepareResult::NoWrite => EmbedWriteResult::NoWrite,
         EmbedPrepareResult::Failed => EmbedWriteResult::Failed,
+        EmbedPrepareResult::Storage => EmbedWriteResult::Storage,
         EmbedPrepareResult::InputChanged => EmbedWriteResult::InputChanged,
     }
 }
