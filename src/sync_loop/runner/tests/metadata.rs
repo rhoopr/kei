@@ -1056,12 +1056,17 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             )
             .await
             .unwrap();
+            // Phase 1 selects only the healthy shared zone. The primary
+            // marker still fences the database cursor, not cycle completion.
+            let selected_identity_debt = phase != 1 && phase < recovery_phase;
+            if phase == 1 && !fail_marker {
+                assert!(!result.can_advance_database_checkpoint());
+            }
             assert_eq!(
-                result.stats.identity_incomplete,
-                phase < recovery_phase,
+                result.stats.identity_incomplete, selected_identity_debt,
                 "evidence={evidence:?} cycle={cycle}"
             );
-            assert_eq!(result.failed_count > 0, phase < recovery_phase);
+            assert_eq!(result.failed_count > 0, selected_identity_debt);
             let deferred = phase == 2
                 && matches!(
                     evidence,
@@ -1097,7 +1102,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                     result.failed_count,
                     result.session_expired
                 ),
-                if phase < recovery_phase {
+                if selected_identity_debt {
                     crate::cycle_reporter::CycleStatus::Failed
                 } else {
                     crate::cycle_reporter::CycleStatus::Success

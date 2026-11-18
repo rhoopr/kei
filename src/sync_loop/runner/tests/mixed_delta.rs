@@ -693,7 +693,7 @@ async fn inventory_cycle(
 
     let db = mixed_db(&root.join("state.db")).await;
     let mut config = make_run_cycle_config();
-    config.runtime.dry_run = step.mode == download::DownloadRunMode::DryRun;
+    config.runtime.dry_run = !step.mode.downloads_files();
     config.runtime.refresh_metadata = step.full;
     config.filters.skip_created_before = step.options.skip_created_before;
     config.filters.skip_created_after = step.options.skip_created_after;
@@ -826,9 +826,16 @@ async fn inventory_cycle(
         ).unwrap();
         assert_eq!(inventory_anchors(root).await, before);
     }
-    crate::sync_loop::reporting::record_cycle_run(Some(db.as_ref()), &result, chrono::Utc::now())
+    if step.mode.downloads_files() {
+        crate::sync_loop::reporting::record_cycle_run(
+            Some(db.as_ref()),
+            &result,
+            chrono::Utc::now(),
+        )
         .await;
+    }
     let report_path = root.join("inventory-report.json");
+    let prior_report = std::fs::read(&report_path).ok();
     let notifier = crate::notifications::Notifier::new(None);
     let reporter = CycleReporter::new(CycleReporterConfig {
         watch_mode: false,
@@ -851,6 +858,10 @@ async fn inventory_cycle(
             ),
         )
         .await;
+    if !step.mode.downloads_files() {
+        assert_eq!(std::fs::read(&report_path).ok(), prior_report);
+        return result;
+    }
     let report: Value = serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
     let projected = serde_json::to_value(&result.stats).unwrap();
     for field in [
@@ -1077,7 +1088,7 @@ async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
     // Count-only and retry-only vetoes were retired; date vetoes still run.
     for case in [0, 1, 2, 3, 4, 6, 7, 8, 9, 11, 12] {
         let root = inventory_root();
-        inventory_cycle(root.path(), &InventoryStep::mixed(90, 10)).await;
+        let baseline = inventory_cycle(root.path(), &InventoryStep::mixed(90, 10)).await;
         let before = inventory_anchors(root.path()).await;
         let mut step = InventoryStep::mixed(9, 1);
         match case {
@@ -1114,7 +1125,15 @@ async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
             "case {case}: {result:?}"
         );
         assert_eq!(inventory_anchors(root.path()).await, before, "case {case}");
-        assert_inventory_ledger(root.path(), &result).await;
+        assert_inventory_ledger(
+            root.path(),
+            if step.mode.downloads_files() {
+                &result
+            } else {
+                &baseline
+            },
+        )
+        .await;
         let recovered = inventory_cycle(root.path(), &InventoryStep::mixed(90, 10)).await;
         assert_eq!(recovered.failed_count, 0, "case {case}: {recovered:?}");
         assert_eq!(recovered.stats.inventory_drop_warnings, 0, "case {case}");

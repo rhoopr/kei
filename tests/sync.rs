@@ -992,11 +992,8 @@ fn sync_recovers_deleted_file() {
     });
 }
 
-/// Data-sacred invariant: a truncated file left on disk (e.g. from a crashed
-/// write) must not mask the real photo during full reconciliation. The default
-/// `name-size-dedup-with-suffix` policy preserves the existing file untouched
-/// and downloads the real photo alongside with a size suffix in the filename.
-/// Either way, the correctly-sized photo bytes must end up on disk.
+/// A shorter copy may be a local edit. Ordinary sync preserves it; explicit
+/// fingerprint confirmation repairs the selected path with its original bytes.
 #[test]
 #[ignore]
 fn sync_truncated_file_does_not_cause_data_loss() {
@@ -1012,9 +1009,8 @@ fn sync_truncated_file_does_not_cause_data_loss() {
 
         let files = common::walkdir(download_dir.path());
         let victim = files.first().expect("media file").clone();
-        let expected_size = std::fs::metadata(&victim).unwrap().len();
         let original_bytes = std::fs::read(&victim).unwrap();
-        let parent = victim.parent().unwrap().to_path_buf();
+        assert!(!original_bytes.is_empty());
 
         // Truncate to zero bytes -- simulates a crashed write leaving an empty file.
         std::fs::File::create(&victim)
@@ -1028,33 +1024,38 @@ fn sync_truncated_file_does_not_cause_data_loss() {
         // incremental sync only receives new iCloud deltas.
         reset_sync_tokens(&cookie_dir);
 
-        // Captured output is included in the assertion below so an
-        // intermittent skip-where-recovery-was-expected leaves a usable
-        // trail (data-sacred invariant: zero-byte file must not mask the
-        // real photo).
-        let assert = library_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .env("RUST_LOG", "kei=debug")
+        library_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
-        let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
-
-        // The correctly-sized photo must exist somewhere under the same folder
-        // (either overwriting the zero-byte file or as a size-suffixed sibling).
-        let candidates: Vec<_> = common::walkdir(&parent)
-            .into_iter()
-            .filter(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) == expected_size)
-            .collect();
-        assert!(
-            !candidates.is_empty(),
-            "after re-sync, the correctly-sized photo must be on disk somewhere in {parent:?} (expected {expected_size} bytes)\n--- post-sync walkdir ---\n{:#?}\n--- kei stderr ---\n{stderr}",
-            common::walkdir(&parent),
-        );
-        let recovered = std::fs::read(&candidates[0]).unwrap();
-        assert_eq!(
-            recovered, original_bytes,
-            "recovered photo content must match the original"
-        );
+        assert_eq!(std::fs::metadata(&victim).unwrap().len(), 0);
+        let config = library_config(&cookie_dir, download_dir.path(), SyncToml::default());
+        let inspect = || {
+            let mut cmd = common::cmd();
+            cmd.env("ICLOUD_USERNAME", &username)
+                .env("KEI_DATA_DIR", &cookie_dir)
+                .arg("reconcile")
+                .arg("--config")
+                .arg(&config)
+                .arg("--inspect-path")
+                .arg(&victim);
+            cmd
+        };
+        let output = inspect().assert().success();
+        let token = std::str::from_utf8(&output.get_output().stdout)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("Fingerprint: "))
+            .expect("inspection prints a fingerprint");
+        inspect()
+            .args(["--confirm-damage", token])
+            .assert()
+            .success();
+        library_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
+        assert_eq!(std::fs::read(&victim).unwrap(), original_bytes);
     });
 }
 

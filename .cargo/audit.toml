@@ -6,6 +6,11 @@
 
 [advisories]
 ignore = [
+    # chrono has an unmaintained-only advisory with no patched release.
+    # Remove this exception when the timestamp-compatible migration in
+    # https://github.com/rhoopr/kei/issues/1066 removes chrono from the tree.
+    "RUSTSEC-2026-0543",
+
     # `paste 1.0.15` is pulled in by little_exif, which backs JPEG/TIFF
     # EXIF writes when kei is built without the default `xmp` feature.
     # The advisory is unmaintained-only, not a known vulnerability.

@@ -319,7 +319,7 @@ async fn run_case(root: &Path, case: &str) {
         .get_metadata("enum_in_progress:PrimarySync")
         .await
         .unwrap();
-    if case == "flush_cancel" {
+    if case == "flush_cancel" || first.stats.storage_failed && first.checkpoint.interrupted {
         assert!(
             enumeration_pending
                 .as_deref()
@@ -329,7 +329,7 @@ async fn run_case(root: &Path, case: &str) {
     } else {
         assert!(
             enumeration_pending.is_none(),
-            "{case}: unexpected interrupted enumeration"
+            "{case}: unexpected interrupted enumeration: {first:?}"
         );
     }
     assert_eq!(

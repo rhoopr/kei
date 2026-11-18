@@ -159,8 +159,27 @@ async fn run_l1_cases(cases: &[(&str, bool)]) {
         config.folder_structure = "{album}".to_owned();
         config.album_name = Some(Arc::from("SyntheticAlbum"));
         config.concurrent_downloads = 1;
+        let db = open_fixture_db(&db_path).await;
+        // Establish the production album binding before seeding. A manually
+        // precreated foreign directory would correctly select a qualified
+        // sibling.
+        let binding_pass = selected_pass_with_session(
+            &db,
+            "SyntheticAlbum",
+            Box::new(SelectedMediaSession(Arc::new(vec![
+                master.clone(),
+                child.clone(),
+            ]))),
+        );
+        crate::download::orchestration::album_directory::prepare(
+            std::slice::from_ref(&binding_pass),
+            &config,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        drop(binding_pass);
         let parent = media.join("SyntheticAlbum");
-        fs::create_dir_all(&parent).unwrap();
         let still = parent.join(format!("IMG_0001-{ID}-27.HEIC"));
         fs::write(&still, &still_bytes).unwrap();
         let old: Vec<_> = (635..=689)
@@ -169,7 +188,6 @@ async fn run_l1_cases(cases: &[(&str, bool)]) {
         for file in &old {
             fs::write(file, MOVIE).unwrap();
         }
-        let db = open_fixture_db(&db_path).await;
         db.upsert_asset_master_mapping("PrimarySync", &format!("asset-{ID}"), ID)
             .await
             .unwrap();
