@@ -4407,6 +4407,133 @@ async fn primary_layout_private_generations_remain_complete_across_edits() {
     }
 }
 
+#[tokio::test]
+async fn primary_layout_edit_changes_primary_mtime() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("media").join("IMG_0501.JPG");
+    let mut mtimes = Vec::new();
+    for (edit, bytes) in [
+        (None, ORIGINAL),
+        (Some(("edit-one", EDIT_ONE)), EDIT_ONE),
+        (None, ORIGINAL),
+    ] {
+        let (result, _) = cycle_options(
+            root.path(),
+            records(&server, edit),
+            false,
+            EditedNaming::Primary,
+            CycleOptions::default(),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert_bytes(&primary, bytes);
+        mtimes.push(std::fs::metadata(&primary).unwrap().modified().unwrap());
+    }
+    let capture = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    assert_eq!(
+        mtimes[0], capture,
+        "first publication keeps the capture mtime"
+    );
+    assert!(
+        mtimes[1] > capture,
+        "an edit must change the primary mtime so mtime-based consumers notice it"
+    );
+    assert!(
+        mtimes[2] > mtimes[1],
+        "a confirmed revert replaces the primary and must change its mtime again"
+    );
+    let unchanged = std::fs::metadata(&primary).unwrap().modified().unwrap();
+    let (quiet, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        true,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(
+        std::fs::metadata(&primary).unwrap().modified().unwrap(),
+        unchanged,
+        "a cycle that replaces nothing leaves the mtime alone"
+    );
+}
+
+#[tokio::test]
+async fn primary_layout_edit_takes_the_provider_edit_time_as_mtime() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("media").join("IMG_0501.JPG");
+    let edited_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_500_000);
+    let mut bplist = Vec::new();
+    plist::to_writer_binary(&mut bplist, &plist::Value::Date(edited_at.into())).unwrap();
+    let mut mtimes = Vec::new();
+    for (edit, bytes) in [
+        (None, ORIGINAL),
+        (Some(("edit-one", EDIT_ONE)), EDIT_ONE),
+        (None, ORIGINAL),
+    ] {
+        let mut page = records(&server, edit);
+        if edit.is_some() {
+            page[1]["fields"]["adjustmentTimestampEnc"] = json!({
+                "type": "ENCRYPTED_BYTES",
+                "value": base64::engine::general_purpose::STANDARD.encode(&bplist)
+            });
+        }
+        let (result, _) = cycle_options(
+            root.path(),
+            page,
+            false,
+            EditedNaming::Primary,
+            CycleOptions::default(),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert_bytes(&primary, bytes);
+        mtimes.push(std::fs::metadata(&primary).unwrap().modified().unwrap());
+    }
+    assert_eq!(
+        mtimes[1], edited_at,
+        "an edited primary takes the time Apple recorded for the edit"
+    );
+    assert!(
+        mtimes[2] > mtimes[1],
+        "a revert replaces the edited primary and must read as changed again"
+    );
+}
+
+#[tokio::test]
+async fn primary_layout_edit_first_download_keeps_capture_mtime() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("media").join("IMG_0501.JPG");
+    let edited_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_500_000);
+    let mut bplist = Vec::new();
+    plist::to_writer_binary(&mut bplist, &plist::Value::Date(edited_at.into())).unwrap();
+    let mut page = records(&server, Some(("edit-one", EDIT_ONE)));
+    page[1]["fields"]["adjustmentTimestampEnc"] = json!({
+        "type": "ENCRYPTED_BYTES",
+        "value": base64::engine::general_purpose::STANDARD.encode(&bplist)
+    });
+    let (result, _) = cycle_options(
+        root.path(),
+        page,
+        false,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+    assert_bytes(&primary, EDIT_ONE);
+    let capture = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    assert_eq!(
+        std::fs::metadata(&primary).unwrap().modified().unwrap(),
+        capture,
+        "a first download keeps the capture mtime even when the asset already carries an edit time"
+    );
+}
+
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn primary_layout_preserves_sidecar_bytes_and_fences_old_metadata_queue() {
