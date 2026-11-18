@@ -1,5 +1,13 @@
 # kei tests
 
+## Explicit integrity repair
+
+`cargo test --lib explicit_integrity_` exercises per-destination confirmation through the command parser and reconciliation owner, then real selected sync and database reopens. It covers shorter and same-size damage, stale confirmation, concurrent edits, unavailable media, interrupted finalization, and managed-layout publication. Peer byte, modification-time and inode assertions catch accidental republishing. Managed repairs also check retained damaged bytes without cloud-source provenance.
+
+`private_selection_actual_cli_and_watch_reopen_independent_destination_debt` exercises executable inspection, confirmation and unavailable-source sync. When `KEI_INTEGRITY_TLS_PROXY` and `KEI_INTEGRITY_TLS_CA` point to an isolated HTTPS fixture serving its synthetic media, it also checks executable successful repair and a quiet reopened sync. Production certificate and provider-URL validation remain enabled.
+
+## Test workflow
+
 Local iteration uses focused tests. Hosted PR CI owns complete offline and
 platform validation; do not repeat those suites locally by default. Run live
 provider and real host-service checks only when relevant and authorized.
@@ -1378,7 +1386,7 @@ mutations before unchanged success.
 
 `behavioral::released_upgrade::released_v0240_history_preserves_durable_evidence_through_upgrade`
 starts from the SQL schema emitted by the official v0.24.0 Linux x86_64
-binary (schema 25), then executes the current production CLI through schema 41.
+binary (schema 25), then executes the current production CLI through schema 42.
 The fixture contains no captured user data. SQL explicitly reconstructs a
 synthetic history with original and edited renditions, repeated IDs in two
 libraries, a local removal, metadata debt, an unfinished sync ledger row,

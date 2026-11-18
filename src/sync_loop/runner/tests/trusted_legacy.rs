@@ -1599,6 +1599,8 @@ async fn run_trust_command(
 ) -> anyhow::Result<()> {
     crate::commands::run_reconcile(
         crate::cli::ReconcileArgs {
+            inspect_path: None,
+            confirm_damage: None,
             dry_run: false,
             action: Some(crate::cli::ReconcileAction::TrustLegacyFiles(args)),
         },

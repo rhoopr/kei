@@ -2226,11 +2226,16 @@ impl Respond for PrivateSelectionCliPhotos {
         } else if body.pointer("/query/recordType").and_then(Value::as_str)
             == Some("CPLAlbumByPositionLive")
         {
-            let folders: Vec<_> = ["A", "B"].into_iter().map(|name| json!({
-                "recordName": name, "recordType": "CPLAlbum", "fields": {
-                    "albumNameEnc": {"value": base64::engine::general_purpose::STANDARD.encode(name), "type": "STRING"}
-                }
-            })).collect();
+            let folders: Vec<_> = ["A", "B"]
+                .into_iter()
+                .map(|name| {
+                    json!({
+                        "recordName": name, "recordType": "CPLAlbum", "fields": {
+                            "albumNameEnc": {"value": name, "type": "STRING"}
+                        }
+                    })
+                })
+                .collect();
             json!({"records": folders})
         } else if path.ends_with("/records/lookup") {
             self.lookups.fetch_add(1, Ordering::SeqCst);
@@ -2731,6 +2736,32 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
     let mut seeded = Vec::new();
     let conn = Connection::open(&account.path).unwrap();
     conn.execute_batch("UPDATE assets SET library='OldUnknownScope' WHERE id='retry'; DELETE FROM metadata WHERE key='pending_sync_token:old:PrimarySync';").unwrap();
+    drop(conn);
+    // Migrate the schema-33 synthetic seed before binding the album roots.
+    Connection::open(&account.path).unwrap().execute_batch("DROP TABLE provider_active_sources; DROP TABLE provider_active_destinations; DROP TABLE provider_active_decisions; DROP TABLE provider_selection_rank_records; DROP TABLE provider_selection_rank_pages; DROP TABLE provider_active_generations; PRAGMA user_version=33;").unwrap();
+    success(&command(root, &account, &["status"]));
+    let config=std::fs::read_to_string(&account.config).unwrap().replace("[ui]","folder_structure=\"\"\nfolder_structure_albums=\"{album}\"\n[filters]\nalbums=[\"A\",\"B\"]\nunfiled=true\n[ui]");
+    // Start with a selection that binds the two directories but selects no
+    // media. Precreating A and B would deliberately reserve external trees.
+    std::fs::write(
+        &account.config,
+        config.replace(
+            "unfiled=true",
+            "unfiled=false\nskip_created_after=\"2000-01-01\"",
+        ),
+    )
+    .unwrap();
+    success(&command(root, &account, &["sync", "--no-progress-bar"]));
+    let conn = Connection::open(&account.path).unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>(
+            "SELECT count(*) FROM album_containers WHERE directory_binding IS NOT NULL",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        2
+    );
     for (album, number) in [("A", 0), ("A", 1), ("B", 0), ("B", 2), ("", 3)] {
         let folder = media_root.join(album);
         std::fs::create_dir_all(&folder).unwrap();
@@ -2761,15 +2792,15 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
         ));
     }
     drop(conn);
-    // Deliberately turn the current-shape synthetic seed into an owned schema33
-    // fixture, then let the actual binary run the fresh-start migration.
-    // The independent released-upgrade history covers schema25 preservation.
-    Connection::open(&account.path).unwrap().execute_batch("DROP TABLE provider_active_sources; DROP TABLE provider_active_destinations; DROP TABLE provider_active_decisions; DROP TABLE provider_selection_rank_records; DROP TABLE provider_selection_rank_pages; DROP TABLE provider_active_generations; PRAGMA user_version=33;").unwrap();
-    success(&command(root, &account, &["status"]));
     let conn = Connection::open(&account.path).unwrap();
     conn.execute_batch("CREATE TRIGGER private_cli_destination_fault BEFORE UPDATE OF verified_media ON provider_active_destinations WHEN NEW.verified_media=1 AND replace(NEW.compat_path,char(92),'/') LIKE '%/B/%' BEGIN SELECT RAISE(ABORT,'synthetic private B receipt interruption'); END;").unwrap();
+    // Start the faulted cycle without a provider cursor, as on first sync.
+    conn.execute(
+        "DELETE FROM metadata WHERE key='sync_token:PrimarySync'",
+        [],
+    )
+    .unwrap();
     drop(conn);
-    let config=std::fs::read_to_string(&account.config).unwrap().replace("[ui]","folder_structure=\"\"\nfolder_structure_albums=\"{album}\"\n[filters]\nalbums=[\"A\",\"B\"]\nunfiled=true\n[ui]");
     std::fs::write(&account.config, &config).unwrap();
     let out = command(root, &account, &["sync", "--no-progress-bar"]);
     let diagnostics = String::from_utf8_lossy(&out.stderr);
@@ -2954,4 +2985,72 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
         );
     }
     assert_eq!(std::fs::read(&account.media).unwrap(), old_bytes);
+    let target = media_root.join("B/private-0.JPG");
+    let peer = media_root.join("A/private-0.JPG");
+    // The service portion used watch mode. Repair commands below are one-shot.
+    std::fs::write(&account.config, &config).unwrap();
+    std::fs::write(&target, b"confirmed damaged bytes").unwrap();
+    let inspected = command(
+        root,
+        &account,
+        &["reconcile", "--inspect-path", target.to_str().unwrap()],
+    );
+    success(&inspected);
+    let text = String::from_utf8(inspected.stdout).unwrap();
+    let token = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Fingerprint: "))
+        .unwrap();
+    success(&command(
+        root,
+        &account,
+        &[
+            "reconcile",
+            "--inspect-path",
+            target.to_str().unwrap(),
+            "--confirm-damage",
+            token,
+        ],
+    ));
+    let retried = command(root, &account, &["sync", "--no-progress-bar"]);
+    assert!(
+        !retried.status.success(),
+        "unavailable source must retain incomplete repair"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"confirmed damaged bytes");
+    assert_eq!(std::fs::read(&peer).unwrap(), QUIET_MEDIA);
+    let conn = Connection::open(&account.path).unwrap();
+    let pending: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE confirmed_repair IS NOT NULL AND verified_media=0 AND source_checksum IS NULL", [], |r| r.get(0)).unwrap();
+    assert!(
+        pending > 0,
+        "confirmation must survive actual CLI restart without cloud provenance"
+    );
+    if let (Ok(proxy), Ok(ca)) = (
+        std::env::var("KEI_INTEGRITY_TLS_PROXY"),
+        std::env::var("KEI_INTEGRITY_TLS_CA"),
+    ) {
+        conn.execute("UPDATE provider_active_decisions SET next_retry_at=0", [])
+            .unwrap();
+        drop(conn);
+        let repaired = clean_cmd()
+            .env("KEI_DATA_DIR", root)
+            .env("ICLOUD_USERNAME", account.username)
+            .env("HTTPS_PROXY", proxy)
+            .env("SSL_CERT_FILE", ca)
+            .args([
+                "--config",
+                account.config.to_str().unwrap(),
+                "sync",
+                "--no-progress-bar",
+            ])
+            .timeout(Duration::from_secs(30))
+            .output()
+            .unwrap();
+        success(&repaired);
+        assert_eq!(std::fs::read(&target).unwrap(), QUIET_MEDIA);
+        assert_eq!(std::fs::read(&peer).unwrap(), QUIET_MEDIA);
+        success(&command(root, &account, &["sync", "--no-progress-bar"]));
+        let conn = Connection::open(&account.path).unwrap();
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE confirmed_repair IS NOT NULL", [], |row| row.get(0)).unwrap(), 0);
+    }
 }

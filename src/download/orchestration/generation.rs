@@ -23,6 +23,7 @@ use crate::download::planner::{AssetTaskPlan, SelectionPathEvidence, TaskPlanner
 use crate::icloud::photos::{
     PhotoAlbum, PhotoAsset, current_asset, inbox::ShadowCapture, same_selected_facts,
 };
+use crate::state::ReconciliationStateStore;
 use crate::state::db::provider_generations::{
     ActiveDecision, ActiveGeneration, GenerationSpec, INDEPENDENT_ALBUM_COPIES,
     MAX_GENERATION_BYTES,
@@ -1254,6 +1255,78 @@ impl SelectionRun {
             return Ok(false);
         }
         for destination in &manifest.decision.destinations {
+            if let Some(confirmed) = self
+                .capture
+                .db
+                .selection_confirmed_repair(
+                    self.capture.owner.clone(),
+                    self.root.id.clone(),
+                    key.to_owned(),
+                    asset.asset_record_name().to_owned(),
+                    destination.path.clone(),
+                )
+                .await?
+            {
+                // A retained catalog lookup proves the asset still exists, not
+                // that it belongs to this pass today. Only the current pass
+                // may act on a destination's explicit replacement authority.
+                if self.fresh_confirmation {
+                    return Ok(false);
+                }
+                if planner.managed_layout_session().is_none()
+                    && let Ok(actual) = crate::download::file::inspect_integrity_fingerprint(
+                        &config.directory,
+                        &destination.path.to_path(),
+                    )
+                    .await
+                    && actual != confirmed
+                    && actual.1 == destination.size
+                    && data_encoding::BASE64
+                        .decode(destination.checksum.as_bytes())
+                        .is_ok_and(|source| {
+                            source.len() == 32
+                                && data_encoding::HEXLOWER.encode(&source) == actual.0
+                        })
+                {
+                    crate::fs_util::fsync_parent_dir_async(&destination.path.to_path()).await?;
+                    // Recovery still requires the existing owner's independent
+                    // source/publication proof. A changed fingerprint alone
+                    // cannot discharge confirmed repair.
+                    self.capture
+                        .db
+                        .reuse_selection_publication(
+                            self.capture.owner.clone(),
+                            self.root.id.clone(),
+                            key.to_owned(),
+                            asset.asset_record_name().to_owned(),
+                            destination.path.clone(),
+                            actual,
+                        )
+                        .await?;
+                }
+                if !plan
+                    .tasks
+                    .iter()
+                    .any(|task| task.version_size.as_str() == destination.version_size)
+                {
+                    let mut task = filter::selected_resource_tasks(asset, config)
+                        .into_iter()
+                        .find(|task| {
+                            task.checksum.as_ref() == destination.checksum
+                                && task.size == destination.size
+                                && task.version_size.as_str() == destination.version_size
+                        })
+                        .context("Confirmed repair has no current selected resource")?;
+                    anyhow::ensure!(
+                        planner
+                            .bind_reserved_destination(&mut task, &destination.path.to_path())
+                            .await,
+                        "Confirmed repair destination ownership changed"
+                    );
+                    plan.tasks.push(task);
+                }
+                continue;
+            }
             if planner.managed_layout_session().is_some() {
                 // A matching file is not completion of a managed transition:
                 // preservation, alias retirement and explicit refresh belong
@@ -1388,10 +1461,135 @@ impl SelectionRun {
                 self.held.store(true, Ordering::Relaxed);
                 continue;
             }
+            if let Some((checksum, size)) = self
+                .capture
+                .db
+                .selection_confirmed_repair(
+                    self.capture.owner.clone(),
+                    self.root.id.clone(),
+                    key.to_owned(),
+                    asset.asset_record_name().to_owned(),
+                    destination.path.clone(),
+                )
+                .await?
+            {
+                if planner.managed_layout_session().is_some() {
+                    // The layout journal owns its pinned input, preservation,
+                    // publication and interrupted-publication recovery.
+                    retained_tasks.push(task);
+                    continue;
+                }
+                let fingerprint =
+                    crate::download::file::fingerprint_downloaded_path(&config.directory, &frozen)
+                        .await?;
+                anyhow::ensure!(
+                    fingerprint.size == size
+                        && data_encoding::HEXLOWER.encode(&fingerprint.sha256) == checksum,
+                    "Confirmed damaged destination changed; replacement refused"
+                );
+                task.replacement_fingerprint = Some(Arc::new(
+                    crate::download::file::FinalPublication::ReplaceTruncated(fingerprint),
+                ));
+            }
             retained_tasks.push(task);
         }
         plan.tasks = retained_tasks;
         Ok(true)
+    }
+}
+
+impl SelectionRun {
+    /// Explicit per-copy repair uses the ordinary conditional-publication queue.
+    /// Managed destinations remain with their layout journal owner.
+    pub(in crate::download) async fn confirmed_repair_plan(
+        &self,
+        key: &str,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        planner: &mut TaskPlanner,
+    ) -> Result<Option<AssetTaskPlan>> {
+        if config.primary_layout_active
+            || config.edited_naming == crate::types::EditedNaming::Primary
+            || planner.managed_layout_session().is_some()
+            || filter::is_asset_filtered(asset, config).is_some()
+        {
+            return Ok(None);
+        }
+        let Some(previous) = self
+            .capture
+            .db
+            .selection_decision(
+                self.capture.owner.clone(),
+                self.root.id.clone(),
+                key.to_owned(),
+                asset.asset_record_name().to_owned(),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut tasks = Vec::new();
+        for destination in &previous.decision.destinations {
+            if self
+                .capture
+                .db
+                .selection_confirmed_repair(
+                    self.capture.owner.clone(),
+                    self.root.id.clone(),
+                    key.to_owned(),
+                    asset.asset_record_name().to_owned(),
+                    destination.path.clone(),
+                )
+                .await?
+                .is_none()
+            {
+                continue;
+            }
+            let mut task = filter::selected_resource_tasks(asset, config)
+                .into_iter()
+                .find(|task| {
+                    task.version_size.as_str() == destination.version_size
+                        && task.checksum.as_ref() == destination.checksum
+                        && task.size == destination.size
+                })
+                .context(
+                    "Confirmed repair provider resource changed; inspect again before replacement",
+                )?;
+            task.download_path = destination.path.to_path();
+            self.capture
+                .db
+                .guard_primary_slot(
+                    &task.library,
+                    &task.asset_id,
+                    task.version_size.as_str(),
+                    &task.checksum,
+                    &task.download_path,
+                )
+                .await?;
+            anyhow::ensure!(
+                super::super::legacy_preservation::current_path_is_independent(
+                    self.capture.db.as_ref(),
+                    &task.download_path,
+                )
+                .await?,
+                "Confirmed repair path is protected historical media"
+            );
+            anyhow::ensure!(
+                planner
+                    .bind_reserved_destination(&mut task, &destination.path.to_path())
+                    .await,
+                "Confirmed repair destination ownership changed"
+            );
+            tasks.push(task);
+        }
+        if tasks.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(AssetTaskPlan {
+            tasks,
+            filter_reason: None,
+            malformed_resource: None,
+        }))
     }
 }
 
@@ -1947,10 +2145,30 @@ async fn recover_retained(
         }
         let key = pass_key(pass);
         let mut assets = Vec::new();
-        for decision in decisions
+        'decision: for decision in decisions
             .iter()
             .filter(|decision| decision.decision.pass_key == key)
         {
+            // A managed planner can persist its journal before projection. A
+            // catalog lookup cannot establish today's album membership, so
+            // leave confirmed repair to the current pass before planning.
+            for destination in &decision.decision.destinations {
+                if context
+                    .capture
+                    .db
+                    .selection_confirmed_repair(
+                        context.capture.owner.clone(),
+                        root.id.clone(),
+                        key.clone(),
+                        decision.decision.child.clone(),
+                        destination.path.clone(),
+                    )
+                    .await?
+                    .is_some()
+                {
+                    continue 'decision;
+                }
+            }
             let mut asset = match (&decision.decision.confirmation, &decision.decision.master) {
                 (Some(body), Some(master)) => Some(current_asset(
                     body,

@@ -120,6 +120,32 @@ pub(in crate::download) fn filter_asset_to_tasks(
     filter_asset_to_tasks_with_primary(asset, config, claimed_paths, dir_cache, planning_mode, None)
 }
 
+/// Build selected resource tasks before any presence-only skipping. Callers must
+/// bind an owned destination and explicit publication authority before queueing.
+pub(in crate::download) fn selected_resource_tasks(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> Vec<DownloadTask> {
+    super::derive_expected_paths(asset, config)
+        .into_iter()
+        .map(|d| DownloadTask {
+            url: d.url,
+            download_path: d.path,
+            replacement_fingerprint: None,
+            pending_cross_parent_root: None,
+            checksum: d.checksum,
+            asset_id: asset.state_id_arc(),
+            asset_record_name: asset.asset_record_name_arc(),
+            library: Arc::from(asset.source_zone().unwrap_or(&config.library)),
+            metadata: build_selected_payload(asset, config, d.version_size),
+            size: d.size,
+            created_local: asset.created_local(),
+            version_size: d.version_size,
+            media_type: determine_media_type(d.version_size, asset),
+        })
+        .collect()
+}
+
 /// Use an ownership-verified still filename when deriving its companion.
 pub(in crate::download) fn filter_asset_to_tasks_with_primary(
     asset: &crate::icloud::photos::PhotoAsset,
@@ -144,24 +170,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
     }
 
     if config.edited_naming == crate::types::EditedNaming::Primary {
-        return Ok(super::derive_expected_paths(asset, config)
-            .into_iter()
-            .map(|d| DownloadTask {
-                url: d.url,
-                download_path: d.path,
-                replacement_fingerprint: None,
-                pending_cross_parent_root: None,
-                checksum: d.checksum,
-                asset_id: asset.state_id_arc(),
-                asset_record_name: asset.asset_record_name_arc(),
-                library: Arc::from(asset.source_zone().unwrap_or(&config.library)),
-                metadata: build_selected_payload(asset, config, d.version_size),
-                size: d.size,
-                created_local: asset.created_local(),
-                version_size: d.version_size,
-                media_type: determine_media_type(d.version_size, asset),
-            })
-            .collect());
+        return Ok(selected_resource_tasks(asset, config));
     }
     let ctx = DerivationContext::build(asset, config);
     let mut tasks = Vec::with_capacity(5);

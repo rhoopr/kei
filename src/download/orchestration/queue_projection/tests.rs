@@ -9467,3 +9467,925 @@ async fn queue_projection_actual_diagnostics_record_work_limits() {
     assert_eq!(capacity["work"]["last_reason"], "capacity");
     assert_eq!(capacity["work"]["last_observed_limit"], 0);
 }
+
+#[tokio::test]
+async fn explicit_integrity_confirmation_repairs_only_target_after_reopen() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::Confirmed)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_unavailable_source_keeps_damaged_bytes_and_retries() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::Unavailable)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_concurrent_edit_refuses_replacement_after_reopen() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::ConcurrentEdit)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_same_size_corruption_requires_confirmation() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::SameSize)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_landed_repair_recovers_after_finalization_failure() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::Interrupted)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_managed_copy_uses_existing_publication_owner() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::Managed)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_managed_copy_refuses_concurrent_edit() {
+    Box::pin(completed_copy_recovery(
+        IntegrityRecovery::ManagedConcurrentEdit,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_managed_copy_preserves_unavailable_damage() {
+    Box::pin(completed_copy_recovery(
+        IntegrityRecovery::ManagedUnavailable,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_managed_copy_recovers_interrupted_publication() {
+    Box::pin(completed_copy_recovery(
+        IntegrityRecovery::ManagedInterrupted,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_stale_cli_confirmation_refuses_changed_fingerprint() {
+    Box::pin(completed_copy_recovery(
+        IntegrityRecovery::StaleConfirmation,
+    ))
+    .await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IntegrityRecovery {
+    Preserved,
+    Reconfirmed,
+    ManagedReconfirmed,
+    ManagedInterrupted,
+    ManagedConcurrentEdit,
+    ManagedUnavailable,
+    Interrupted,
+    Missing,
+    Confirmed,
+    Unavailable,
+    ConcurrentEdit,
+    SameSize,
+    Managed,
+    StaleConfirmation,
+}
+
+#[tokio::test]
+async fn explicit_integrity_confirmed_preserved_copy_repairs_only_target() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::Preserved)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_reconfirms_edited_bytes_and_repairs_only_target() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::Reconfirmed)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_managed_copy_reconfirms_edited_bytes_and_repairs_only_target() {
+    Box::pin(completed_copy_recovery(
+        IntegrityRecovery::ManagedReconfirmed,
+    ))
+    .await;
+}
+
+async fn completed_copy_recovery(scenario: IntegrityRecovery) {
+    let managed = matches!(
+        scenario,
+        IntegrityRecovery::Managed
+            | IntegrityRecovery::ManagedReconfirmed
+            | IntegrityRecovery::ManagedConcurrentEdit
+            | IntegrityRecovery::ManagedUnavailable
+            | IntegrityRecovery::ManagedInterrupted
+    );
+    let reconfirmed = matches!(
+        scenario,
+        IntegrityRecovery::Reconfirmed | IntegrityRecovery::ManagedReconfirmed
+    );
+    let interrupted_repair = matches!(
+        scenario,
+        IntegrityRecovery::Interrupted | IntegrityRecovery::ManagedInterrupted
+    );
+    let unavailable_source = matches!(
+        scenario,
+        IntegrityRecovery::Unavailable | IntegrityRecovery::ManagedUnavailable
+    );
+    let concurrent_edit = matches!(
+        scenario,
+        IntegrityRecovery::ConcurrentEdit | IntegrityRecovery::ManagedConcurrentEdit
+    );
+    let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let media = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\0\xff\xd9";
+    let checksum = format!("{:x}", Sha256::digest(media));
+    let unavailable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let media_unavailable = Arc::clone(&unavailable);
+    Mock::given(method("GET"))
+        .and(path("/completed-copy"))
+        .respond_with(move |_request: &wiremock::Request| {
+            if media_unavailable.load(Ordering::SeqCst) {
+                ResponseTemplate::new(404)
+            } else {
+                ResponseTemplate::new(200).set_body_bytes(media)
+            }
+        })
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    if managed {
+        f.config.primary_layout_active = true;
+        f.config.edited_naming = crate::types::EditedNaming::Primary;
+    }
+    f.config.folder_structure_albums = Arc::from("{album}");
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL": format!("{}/completed-copy", server.uri()),
+        "size": media.len(),
+        "fileChecksum": data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    f.capture(records("m", OLD, "historical"), "old").await;
+    let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+    for pass in &passes {
+        crate::download::orchestration::test_support::seed_complete_album_snapshot(
+            f.db.as_ref(),
+            pass.album.container_id().unwrap(),
+            pass.album.name.as_ref(),
+            &[("asset-m", "m")],
+        )
+        .await;
+    }
+    let a = f.config.directory.join("A/changed.JPG");
+    let b = f.config.directory.join("B/changed.JPG");
+    let mut expected = passes
+        .iter()
+        .zip([&a, &b])
+        .map(|(pass, path)| {
+            (
+                crate::download::orchestration::generation::pass_key(pass),
+                path.clone(),
+                checksum.clone(),
+                checksum.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
+    let receipts = |db: &SqliteStateDb| {
+        let conn = db
+            .acquire_lock("independent completed album receipts")
+            .unwrap();
+        conn.prepare("SELECT DISTINCT pass_key,path,source_checksum,local_checksum FROM provider_active_destinations WHERE child='asset-m' AND version_size='original' AND admitted=1 AND verified_media=1 ORDER BY pass_key,path")
+            .unwrap()
+            .query_map([], |row| {
+                let path: String = row.get(1)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    serde_json::from_str::<SelectionPath>(&path)
+                        .unwrap()
+                        .to_path(),
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let initial = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes,
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let initial_requests = if managed { 1 } else { 2 };
+    assert_eq!(initial.stats.downloaded, initial_requests, "{initial:?}");
+    assert!(initial.stats.sync_token_blocked_reason.is_none());
+    assert_eq!(receipts(&f.db), expected);
+    assert_eq!(std::fs::read(&a).unwrap(), media);
+    assert_eq!(std::fs::read(&b).unwrap(), media);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        initial_requests
+    );
+    let mut requests_before_repair = initial_requests;
+    let original_metadata = std::fs::metadata(&a).unwrap();
+    drop(passes);
+    if scenario != IntegrityRecovery::Missing {
+        let mut damaged = if scenario == IntegrityRecovery::SameSize {
+            media.to_vec()
+        } else {
+            b"damaged bytes".to_vec()
+        };
+        if scenario == IntegrityRecovery::SameSize {
+            *damaged.last_mut().unwrap() ^= 1;
+        }
+        std::fs::write(&b, &damaged).unwrap();
+        f = reopen_destination_fixture(f).await;
+        let quiet_passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+        let quiet = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &quiet_passes,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            quiet.stats.downloaded, 0,
+            "ordinary sync must preserve uncertain bytes: {quiet:?}"
+        );
+        assert_eq!(std::fs::read(&b).unwrap(), damaged);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            initial_requests
+        );
+        drop(quiet_passes);
+        if scenario == IntegrityRecovery::Preserved {
+            let path = SelectionPath::from_path(&b);
+            let (generation, pass_key, child) = f.db.acquire_lock("selected copy for local preservation").unwrap().query_row("SELECT generation,pass_key,child FROM provider_active_destinations WHERE path=?1 AND current_publication=1",[path.key().unwrap()],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+            f.db.preserve_selection_local(
+                owner(),
+                generation,
+                pass_key,
+                child,
+                path,
+                (
+                    format!("{:x}", Sha256::digest(&damaged)),
+                    damaged.len() as u64,
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(
+                f.db.inspect_integrity_destination(b.clone())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .preserved
+            );
+        }
+        let token = format!("{:x}:{}", Sha256::digest(&damaged), damaged.len());
+        f = confirm_damage_through_cli(
+            f,
+            &b,
+            &token,
+            scenario == IntegrityRecovery::StaleConfirmation,
+        )
+        .await;
+        assert_eq!(std::fs::read(&b).unwrap(), damaged);
+        assert_eq!(std::fs::read(&a).unwrap(), media);
+        if reconfirmed {
+            let replacement = b"re-edited bytes";
+            let previous = (
+                format!("{:x}", Sha256::digest(&damaged)),
+                damaged.len() as u64,
+            );
+            let current = (
+                format!("{:x}", Sha256::digest(replacement)),
+                replacement.len() as u64,
+            );
+            if scenario == IntegrityRecovery::ManagedReconfirmed {
+                // Attempt the explicit repair while its cloud source is
+                // unavailable. Execution after projection persists the planned
+                // journal pinned to the confirmed damaged bytes.
+                unavailable.store(true, Ordering::SeqCst);
+                f = reopen_destination_fixture(f).await;
+                let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+                let blocked = crate::download::download_photos_with_sync(
+                    &reqwest::Client::new(),
+                    &passes,
+                    Arc::new(f.config.clone()),
+                    controls(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(blocked.stats.downloaded, 0, "{blocked:?}");
+                assert!(
+                    blocked.stats.sync_token_blocked_reason.is_some(),
+                    "{blocked:?}"
+                );
+                assert_eq!(std::fs::read(&b).unwrap(), damaged);
+                assert_eq!(std::fs::read(&a).unwrap(), media);
+                assert!(
+                    server.received_requests().await.unwrap().len() > initial_requests,
+                    "the unavailable repair source must actually be attempted"
+                );
+                let planned =
+                    f.db.primary_layout_operations("PrimarySync".into())
+                        .await
+                        .unwrap();
+                assert_eq!(planned.len(), 1);
+                let planned = &planned[0];
+                assert_eq!(planned.phase, "planned");
+                assert!(
+                    planned
+                        .members
+                        .iter()
+                        .filter_map(|member| member.old.as_ref())
+                        .any(|old| {
+                            old.path.to_path() == b
+                                && old.fingerprint.size == damaged.len() as u64
+                                && data_encoding::HEXLOWER.encode(&old.fingerprint.sha256)
+                                    == previous.0
+                        }),
+                    "planned repair journal must pin the confirmed damaged bytes"
+                );
+                drop(passes);
+                f.db.make_selection_retry_due(owner(), "asset-m".into())
+                    .await
+                    .unwrap();
+                // Change the local copy after the journal was planned. A fresh
+                // generation with the same selected copy must bind the inherited
+                // confirmation without overwriting bytes it never confirmed.
+                std::fs::write(&b, replacement).unwrap();
+                let generations_before: i64 =
+                    f.db.acquire_lock("generations before fresh copy")
+                        .unwrap()
+                        .query_row(
+                            "SELECT count(*) FROM provider_active_generations",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                let inherited_before: i64 = f
+                    .db
+                    .acquire_lock("inherited confirmations before fresh copy")
+                    .unwrap()
+                    .query_row(
+                        "SELECT count(DISTINCT generation) FROM provider_active_destinations WHERE path=?1 AND confirmed_repair IS NOT NULL",
+                        [SelectionPath::from_path(&b).key().unwrap()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                f.capture(records("m", OLD, "historical"), "fresh").await;
+                f = reopen_destination_fixture(f).await;
+                let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+                let refused = crate::download::download_photos_with_sync(
+                    &reqwest::Client::new(),
+                    &passes,
+                    Arc::new(f.config.clone()),
+                    controls(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(refused.stats.downloaded, 0, "{refused:?}");
+                assert!(
+                    refused.stats.sync_token_blocked_reason.is_some(),
+                    "{refused:?}"
+                );
+                assert_eq!(std::fs::read(&b).unwrap(), replacement);
+                assert_eq!(std::fs::read(&a).unwrap(), media);
+                let generations_after: i64 =
+                    f.db.acquire_lock("generations after fresh copy")
+                        .unwrap()
+                        .query_row(
+                            "SELECT count(*) FROM provider_active_generations",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                assert!(
+                    generations_after > generations_before,
+                    "the same selected copy under a fresh basis must start a new generation"
+                );
+                let inherited_after: i64 = f
+                    .db
+                    .acquire_lock("inherited confirmations after fresh copy")
+                    .unwrap()
+                    .query_row(
+                        "SELECT count(DISTINCT generation) FROM provider_active_destinations WHERE path=?1 AND confirmed_repair IS NOT NULL",
+                        [SelectionPath::from_path(&b).key().unwrap()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(
+                    inherited_after > inherited_before,
+                    "the fresh generation must bind the inherited confirmation for this selected copy"
+                );
+                let retained =
+                    f.db.primary_layout_operations("PrimarySync".into())
+                        .await
+                        .unwrap();
+                assert_eq!(retained.len(), 1);
+                assert_eq!(retained[0].operation, planned.operation);
+                assert_eq!(retained[0].phase, "planned");
+                requests_before_repair = server.received_requests().await.unwrap().len();
+                drop(passes);
+            } else {
+                std::fs::write(&b, replacement).unwrap();
+            }
+            let stale =
+                f.db.inspect_integrity_destination(b.clone())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(stale.confirmed, Some(previous.clone()));
+            assert!(stale.local_checksum.is_none());
+            let token = format!("{}:{}", current.0, current.1);
+            f = confirm_damage_through_cli(f, &b, &token, false).await;
+            if scenario == IntegrityRecovery::ManagedReconfirmed {
+                unavailable.store(false, Ordering::SeqCst);
+            }
+            assert_eq!(std::fs::read(&b).unwrap(), replacement);
+            assert_eq!(std::fs::read(&a).unwrap(), media);
+            let replaced =
+                f.db.inspect_integrity_destination(b.clone())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(replaced.confirmed, Some(current));
+            assert!(replaced.local_checksum.is_none());
+            assert!(
+                f.db.confirm_integrity_damage(stale, previous)
+                    .await
+                    .is_err(),
+                "a stale inspected confirmation must not replace the current one"
+            );
+            assert_eq!(std::fs::read(&b).unwrap(), replacement);
+        }
+        if unavailable_source || concurrent_edit {
+            if unavailable_source {
+                unavailable.store(true, Ordering::SeqCst);
+                if !managed {
+                    *f.session.corrupt.lock().unwrap() = Some("missing");
+                }
+            } else {
+                std::fs::write(&b, b"new intentional edit").unwrap();
+            }
+            f = reopen_destination_fixture(f).await;
+            let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+            let blocked = crate::download::download_photos_with_sync(
+                &reqwest::Client::new(),
+                &passes,
+                Arc::new(f.config.clone()),
+                controls(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                blocked.stats.sync_token_blocked_reason.is_some(),
+                "{blocked:?}"
+            );
+            assert_eq!(
+                std::fs::read(&b).unwrap(),
+                if unavailable_source {
+                    b"damaged bytes".as_slice()
+                } else {
+                    b"new intentional edit".as_slice()
+                }
+            );
+            assert_eq!(std::fs::read(&a).unwrap(), media);
+            assert_eq!(
+                std::fs::metadata(&a).unwrap().modified().unwrap(),
+                original_metadata.modified().unwrap(),
+                "failed repair rewrote healthy peer"
+            );
+            requests_before_repair = server.received_requests().await.unwrap().len();
+            if unavailable_source {
+                assert!(
+                    requests_before_repair > initial_requests,
+                    "the unavailable media endpoint must actually be attempted"
+                );
+                unavailable.store(false, Ordering::SeqCst);
+            } else {
+                assert_eq!(requests_before_repair, initial_requests);
+            }
+            let confirmed: i64 = f.db.acquire_lock("retained explicit repair after refusal").unwrap()
+                .query_row("SELECT count(*) FROM provider_active_destinations WHERE confirmed_repair IS NOT NULL AND verified_media=0 AND source_checksum IS NULL", [], |row| row.get(0)).unwrap();
+            assert_eq!(confirmed, 1);
+            drop(passes);
+            *f.session.corrupt.lock().unwrap() = None;
+            if concurrent_edit {
+                // Restore the exact explicitly confirmed damaged bytes. The
+                // refused user edit was never overwritten by sync.
+                std::fs::write(&b, b"damaged bytes").unwrap();
+            }
+            f.db.make_selection_retry_due(owner(), "asset-m".into())
+                .await
+                .unwrap();
+        }
+    } else {
+        std::fs::remove_file(&b).unwrap();
+    }
+    if interrupted_repair {
+        f.db.acquire_lock("interrupt repair finalization").unwrap().execute_batch(
+            "CREATE TRIGGER integrity_finalization_fault BEFORE UPDATE OF verified_media ON provider_active_destinations WHEN NEW.verified_media=1 AND OLD.confirmed_repair IS NOT NULL BEGIN SELECT RAISE(ABORT,'repair finalization interrupted'); END;"
+        ).unwrap();
+        let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+        let interrupted = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &passes,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            interrupted.stats.sync_token_blocked_reason.is_some(),
+            "{interrupted:?}"
+        );
+        assert_eq!(
+            std::fs::read(&b).unwrap(),
+            media,
+            "verified bytes must have landed before the injected failure"
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), media);
+        f.db.acquire_lock("release repair finalization fault")
+            .unwrap()
+            .execute_batch("DROP TRIGGER integrity_finalization_fault;")
+            .unwrap();
+        f.db.make_selection_retry_due(owner(), "asset-m".into())
+            .await
+            .unwrap();
+    }
+    let mut settled_lookups = None;
+    for cycle in 0..3 {
+        f = reopen_destination_fixture(f).await;
+        let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+        assert_eq!(
+            crate::download::has_due_selection_work(&passes, &f.config, controls())
+                .await
+                .unwrap(),
+            Some(cycle == 0),
+        );
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &passes,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.stats.downloaded,
+            usize::from(cycle == 0 && !interrupted_repair),
+            "{result:?}; {:?}",
+            trace
+                .events()
+                .into_iter()
+                .filter(|event| event.level == tracing::Level::ERROR)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(result.outcome, crate::download::DownloadOutcome::Success),
+            "{result:?}; {:?}",
+            trace
+                .events()
+                .into_iter()
+                .filter(|event| event.level == tracing::Level::ERROR)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            result.stats.sync_token_blocked_reason.is_none(),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), media);
+        assert_eq!(std::fs::read(&b).unwrap(), media);
+        if managed {
+            let preserved: Vec<Vec<u8>> =
+                f.db.acquire_lock("managed damaged input preservation")
+                    .unwrap()
+                    .prepare("SELECT evidence FROM primary_layout_preserved")
+                    .unwrap()
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+            assert!(
+                preserved.into_iter().any(|bytes| {
+                    let file: crate::state::db::primary_layout::LayoutFile =
+                        serde_json::from_slice(&bytes).unwrap();
+                    std::fs::read(file.path.to_path()).unwrap()
+                        == if reconfirmed {
+                            b"re-edited bytes".as_slice()
+                        } else {
+                            b"damaged bytes".as_slice()
+                        }
+                        && file.source_checksum.is_none()
+                }),
+                "managed repair must durably preserve damaged input without cloud-source provenance"
+            );
+        }
+        assert_eq!(f.db.acquire_lock("completed repair consumes authority").unwrap()
+            .query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND confirmed_repair IS NOT NULL", [], |row| row.get(0)).unwrap(), 0);
+        let unchanged = std::fs::metadata(&a).unwrap();
+        assert_eq!(
+            unchanged.modified().unwrap(),
+            original_metadata.modified().unwrap(),
+            "{result:?}; {:?}",
+            trace
+                .events()
+                .into_iter()
+                .filter(|event| event.level == tracing::Level::INFO)
+                .collect::<Vec<_>>()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                (unchanged.dev(), unchanged.ino()),
+                (original_metadata.dev(), original_metadata.ino())
+            );
+            assert_ne!(unchanged.ino(), std::fs::metadata(&b).unwrap().ino());
+        }
+        assert_eq!(receipts(&f.db), expected);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            requests_before_repair + 1
+        );
+        let lookups = f.session.calls.load(Ordering::SeqCst);
+        if let Some(settled) = settled_lookups {
+            assert_eq!(lookups, settled, "quiet reopen repeated provider lookup");
+        }
+        settled_lookups = Some(lookups);
+    }
+}
+
+async fn confirm_damage_through_cli(
+    mut f: Fixture,
+    path: &std::path::Path,
+    token: &str,
+    stale_confirmation: bool,
+) -> Fixture {
+    use clap::Parser;
+    let globals = crate::config::GlobalArgs {
+        config_source: crate::config::ConfigSource::Unavailable,
+        username: Some("queue-stage@example.invalid".into()),
+        domain: None,
+        data_dir: Some(f.dir.path().to_str().unwrap().to_owned()),
+    };
+    let cli_path = crate::get_db_path(&globals, None).await.unwrap();
+    f.config.state_db = None;
+    drop(f.capture);
+    drop(f.pass);
+    drop(f.db);
+    std::fs::rename(f.dir.path().join("state.db"), &cli_path).unwrap();
+    for confirmation in [None, Some(token)] {
+        let mut argv = vec!["kei", "reconcile", "--inspect-path", path.to_str().unwrap()];
+        if let Some(token) = confirmation {
+            argv.extend(["--confirm-damage", token]);
+        }
+        if stale_confirmation && confirmation.is_some() {
+            let before = std::fs::read(path).unwrap();
+            let cli = crate::cli::Cli::try_parse_from([
+                "kei",
+                "reconcile",
+                "--inspect-path",
+                path.to_str().unwrap(),
+                "--confirm-damage",
+                "stale-fingerprint",
+            ])
+            .unwrap();
+            let crate::cli::Command::Reconcile(args) = cli.command else {
+                panic!("reconcile command")
+            };
+            let error = crate::commands::reconcile::run_reconcile(args, &globals, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("File changed since inspection"));
+            assert_eq!(std::fs::read(path).unwrap(), before);
+        }
+        let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+        let crate::cli::Command::Reconcile(args) = cli.command else {
+            panic!("reconcile command")
+        };
+        crate::commands::reconcile::run_reconcile(args, &globals, None)
+            .await
+            .unwrap();
+    }
+    std::fs::rename(&cli_path, f.dir.path().join("state.db")).unwrap();
+    f.db = Arc::new(
+        SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    f.capture = ShadowCapture::new(f.db.clone(), owner(), "com");
+    f.config.state_db = Some(f.db.clone() as Arc<dyn DownloadStore>);
+    f.pass = destination_pass_with(&f.session, &f.capture, "A");
+    f
+}
+
+/// A selected album whose provider enumeration is empty. Exact lookups still
+/// reach the unchanged provider resource, so membership removal cannot be
+/// mistaken for source unavailability.
+#[derive(Clone)]
+struct RemovedAlbumMembershipSession(CurrentSession);
+
+#[async_trait::async_trait]
+impl PhotosSession for RemovedAlbumMembershipSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        if url.contains("/internal/records/query/batch?") {
+            let request: Value = serde_json::from_str(&body)?;
+            let batch = request["batch"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|_| json!({"records":[{"fields":{"itemCount":{"value":1}}}]}))
+                .collect::<Vec<_>>();
+            return Ok(json!({"batch":batch}));
+        }
+        if url.contains("/records/query?") {
+            // A complete empty page still carries the zone token, as an empty
+            // provider album does. The count probe remains deliberately stale.
+            return Ok(json!({"records":[],"syncToken":"destination-rank-proof"}));
+        }
+        self.0.post(url, body, headers).await
+    }
+    async fn post_changes_body(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Vec<u8>> {
+        if url.contains("/records/query?") {
+            return Ok(serde_json::to_vec(
+                &json!({"records":[],"syncToken":"destination-rank-proof"}),
+            )?);
+        }
+        self.0.post_changes_body(url, body, headers).await
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn confirmed_damage_removed_from_one_selected_album_stays_stable_without_completion() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let media = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\0\xff\xd9";
+    Mock::given(method("GET"))
+        .and(path("/membership-removal"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("{album}");
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL": format!("{}/membership-removal", server.uri()),
+        "size": media.len(),
+        "fileChecksum": data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    f.capture(records("m", OLD, "historical"), "old").await;
+    let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+    for pass in &passes {
+        crate::download::orchestration::test_support::seed_complete_album_snapshot(
+            f.db.as_ref(),
+            pass.album.container_id().unwrap(),
+            pass.album.name.as_ref(),
+            &[("asset-m", "m")],
+        )
+        .await;
+    }
+    let a = f.config.directory.join("A/changed.JPG");
+    let b = f.config.directory.join("B/changed.JPG");
+    let initial = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes,
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(initial.stats.downloaded, 2, "{initial:?}");
+    assert!(initial.stats.sync_token_blocked_reason.is_none());
+    assert_eq!(std::fs::read(&a).unwrap(), media);
+    assert_eq!(std::fs::read(&b).unwrap(), media);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    drop(passes);
+    let damaged = b"confirmed damaged bytes";
+    std::fs::write(&b, damaged).unwrap();
+    let token = format!("{:x}:{}", Sha256::digest(damaged), damaged.len());
+    f = confirm_damage_through_cli(f, &b, &token, false).await;
+    assert_eq!(std::fs::read(&b).unwrap(), damaged);
+    assert_eq!(std::fs::read(&a).unwrap(), media);
+    assert!(
+        f.db.inspect_integrity_destination(b.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .confirmed
+            .is_some()
+    );
+    // Reseed the same selected albums under the same configuration. A retains
+    // the provider membership; B no longer enumerates the asset. The provider
+    // resource and both album passes stay unchanged.
+    crate::download::orchestration::test_support::seed_complete_album_snapshot(
+        f.db.as_ref(),
+        "A",
+        "A",
+        &[("asset-m", "m")],
+    )
+    .await;
+    crate::download::orchestration::test_support::seed_complete_album_snapshot(
+        f.db.as_ref(),
+        "B",
+        "B",
+        &[],
+    )
+    .await;
+    let a_pass = destination_pass(&f, "A");
+    let mut b_pass = destination_pass_with_session(
+        &f.session,
+        "B",
+        Box::new(RemovedAlbumMembershipSession(f.session.clone())),
+    );
+    b_pass
+        .album
+        .set_shadow_capture(f.capture.clone(), Arc::from("private"));
+    let b_key = crate::download::orchestration::generation::pass_key(&b_pass);
+    let result = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &[a_pass, b_pass],
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.stats.downloaded, 0, "{result:?}");
+    assert!(
+        matches!(result.outcome, crate::download::DownloadOutcome::Success),
+        "{result:?}"
+    );
+    assert_eq!(std::fs::read(&b).unwrap(), damaged);
+    assert_eq!(std::fs::read(&a).unwrap(), media);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    let path = SelectionPath::from_path(&b);
+    let conn =
+        f.db.acquire_lock("removed membership repair state")
+            .unwrap();
+    let (pending, verified): (i64, i64) = conn
+        .query_row(
+            "SELECT COALESCE(SUM(confirmed_repair IS NOT NULL),0),COALESCE(SUM(verified_media),0) FROM provider_active_destinations WHERE pass_key=?1 AND path=?2",
+            rusqlite::params![&b_key, path.key().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(pending, 1, "confirmed damage intent must survive");
+    assert_eq!(verified, 0, "removed membership must not complete repair");
+    let (local, source): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT local_checksum,source_checksum FROM provider_active_destinations WHERE pass_key=?1 AND path=?2 AND confirmed_repair IS NOT NULL",
+            rusqlite::params![&b_key, path.key().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(local.is_none(), "completion must not claim damaged bytes");
+    assert!(
+        source.is_none(),
+        "completion must not claim cloud provenance"
+    );
+    drop(conn);
+    assert_eq!(
+        f.db.acquire_lock("no spurious completed repair").unwrap().query_row::<i64, _, _>(
+            "SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND confirmed_repair IS NOT NULL",
+            [],
+            |row| row.get(0)
+        ).unwrap(),
+        0
+    );
+    assert!(
+        result.stats.sync_token_blocked_reason.is_none(),
+        "removed membership must not block the current checkpoint: {result:?}"
+    );
+    assert!(!result.checkpoint.sync_token_blocked, "{result:?}");
+}

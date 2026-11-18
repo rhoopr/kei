@@ -3359,7 +3359,7 @@ fn record_layout_destination_for_generation(
             };
             conn.execute("UPDATE provider_active_destinations SET preserved_local=?8,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,verified_media=0,verified_metadata=?7,local_checksum=?6,source_checksum=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,record.version_size.as_str(),path,local,metadata_complete,encode(&preserved)?])?;
         } else {
-            conn.execute("UPDATE provider_active_destinations SET current_publication=CASE WHEN local_checksum IS ?6 AND source_checksum IS ?7 THEN current_publication ELSE 0 END,preserved_local=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,verified_media=1,verified_metadata=?8,local_checksum=?6,source_checksum=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,record.version_size.as_str(),path,local,file.source_checksum,metadata_complete])?;
+            conn.execute("UPDATE provider_active_destinations SET current_publication=CASE WHEN local_checksum IS ?6 AND source_checksum IS ?7 THEN current_publication ELSE 0 END,confirmed_repair=NULL,preserved_local=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,verified_media=1,verified_metadata=?8,local_checksum=?6,source_checksum=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,record.version_size.as_str(),path,local,file.source_checksum,metadata_complete])?;
         }
         let fields = serde_json::to_string(&crate::state::types::EmbeddedMetadataReceipt {
             published: true,
@@ -3568,7 +3568,7 @@ fn record_destination_source(
                 d.version_size == version && d.path.key().ok().as_deref() == Some(path.as_str())
             })
             .ok_or(StateError::ProviderSelectionInvalid)?;
-        conn.execute("UPDATE provider_active_destinations SET current_publication=CASE WHEN local_checksum IS ?6 AND source_checksum IS ?7 THEN current_publication ELSE 0 END,preserved_local=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,verified_media=1,local_checksum=?6,source_checksum=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,version,path,local,source])?;
+        conn.execute("UPDATE provider_active_destinations SET current_publication=CASE WHEN local_checksum IS ?6 AND source_checksum IS ?7 THEN current_publication ELSE 0 END,confirmed_repair=NULL,preserved_local=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,verified_media=1,local_checksum=?6,source_checksum=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,version,path,local,source])?;
         refresh_progress_hash(conn, &root, &manifest, destination)?;
     }
     if published {
@@ -4202,7 +4202,7 @@ impl SqliteStateDb {
             replace_current_publication(&tx, library, &file.path.key()?, None)?;
             // Keep catalog/path receipts and provider retry timing. Only the
             // active completion proof for the absent copy becomes unfinished.
-            tx.execute("UPDATE provider_active_destinations SET preserved_local=NULL,verified_media=0,verified_metadata=0,local_checksum=NULL,source_checksum=NULL,progress_hash=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL)", params![generation, file.pass_key, file.child, file.version, file.path.key()?])?;
+            tx.execute("UPDATE provider_active_destinations SET confirmed_repair=NULL,preserved_local=NULL,verified_media=0,verified_metadata=0,local_checksum=NULL,source_checksum=NULL,progress_hash=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL)", params![generation, file.pass_key, file.child, file.version, file.path.key()?])?;
             tx.commit()?;
             Ok(())
         }).await
@@ -4252,7 +4252,11 @@ impl SqliteStateDb {
             // unfinished. Preserve its fence at an overlapping selected path,
             // even if current writer options differ. Historical planned paths
             // without such an artifact do not create current selection.
-            Ok(conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE {CURRENT_SELECTION_CONFIGURATION} AND d.admission='deferred') OR EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND (g.config_hash=?2 OR (w.prepared_hash IS NOT NULL AND EXISTS(SELECT 1 FROM provider_active_destinations selected JOIN provider_active_generations current ON current.id=selected.generation WHERE current.scope=?1 AND current.config_hash=?2 AND selected.admitted=1 AND selected.path=w.path))) AND {UNFINISHED})"),params![scope,config_hash],|r|r.get(0))?)
+            // A later complete inventory accounts for its own selected repair
+            // destinations. Keep historical confirmations for future matching
+            // selections without charging them to the current checkpoint.
+            Ok(conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE {CURRENT_SELECTION_CONFIGURATION} AND d.admission='deferred') OR EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND (g.config_hash=?2 OR (w.prepared_hash IS NOT NULL AND EXISTS(SELECT 1 FROM provider_active_destinations selected JOIN provider_active_generations current ON current.id=selected.generation WHERE current.scope=?1 AND current.config_hash=?2 AND selected.admitted=1 AND selected.path=w.path))) AND {UNFINISHED}
+                AND NOT (w.confirmed_repair IS NOT NULL AND w.prepared_hash IS NULL AND EXISTS(SELECT 1 FROM provider_active_generations newer WHERE newer.scope=g.scope AND newer.config_hash=g.config_hash AND newer.created_at>g.created_at AND newer.sealed=1 AND newer.checkpoint_ready=1)))"),params![scope,config_hash],|r|r.get(0))?)
         }).await
     }
 }
@@ -4355,6 +4359,256 @@ impl SqliteStateDb {
         self.with_conn("checking independent destination completion",move|conn|{
             account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;load_decision(conn,&root,&key,&child)?;
             Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL))",params![generation,key,child,version],|r|r.get(0))?)
+        }).await
+    }
+}
+
+/// A single admitted physical destination selected by explicit integrity inspection.
+#[derive(Clone, Debug)]
+pub(crate) struct IntegrityDestination {
+    generation: String,
+    pass_key: String,
+    child: String,
+    destination: SelectionDestination,
+    pub(crate) local_checksum: Option<String>,
+    pub(crate) preserved: bool,
+    verified_media: bool,
+    /// The currently bound explicit confirmation for these bytes, if any.
+    pub(crate) confirmed: Option<(String, u64)>,
+    /// Exact stored confirmation used to compare-and-swap an explicit replacement.
+    previous_confirmation: Option<Vec<u8>>,
+}
+
+type IntegrityInspectionRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    bool,
+    bool,
+    Option<Vec<u8>>,
+);
+
+type StoredConfirmation = (Vec<u8>, String, u64);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ConfirmedRepair {
+    checksum: String,
+    size: u64,
+    binding: String,
+}
+
+fn repair_binding(
+    root: &ActiveGeneration,
+    manifest: &ActiveDecision,
+    destination: &SelectionDestination,
+    checksum: &str,
+    size: u64,
+) -> Result<String, StateError> {
+    Ok(digest(&encode(&(
+        "confirmed_integrity_repair_v1",
+        &root.id,
+        &root.spec,
+        manifest,
+        destination,
+        checksum,
+        size,
+    ))?))
+}
+
+fn parse_confirmed_repair(
+    bytes: &[u8],
+    root: &ActiveGeneration,
+    manifest: &ActiveDecision,
+    destination: &SelectionDestination,
+) -> Result<(String, u64), StateError> {
+    if bytes.len() > 1024 {
+        return invalid();
+    }
+    let repair: ConfirmedRepair =
+        serde_json::from_slice(bytes).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+    if repair.checksum.len() != 64
+        || !repair.checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || repair.binding
+            != repair_binding(root, manifest, destination, &repair.checksum, repair.size)?
+    {
+        return invalid();
+    }
+    Ok((repair.checksum, repair.size))
+}
+
+fn loaded_confirmed_repair(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    manifest: &ActiveDecision,
+    destination: &SelectionDestination,
+) -> Result<Option<StoredConfirmation>, StateError> {
+    let bytes: Option<Vec<u8>> = conn.query_row(
+        "SELECT confirmed_repair FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND (confirmed_repair IS NULL OR length(confirmed_repair)<=1024)",
+        params![root.id, manifest.decision.pass_key, manifest.decision.child, destination.version_size, destination.path.key()?],
+        |row| row.get(0),
+    )?;
+    let Some(bytes) = bytes else { return Ok(None) };
+    let (checksum, size) = parse_confirmed_repair(&bytes, root, manifest, destination)?;
+    Ok(Some((bytes, checksum, size)))
+}
+
+fn confirmed_repair(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    manifest: &ActiveDecision,
+    destination: &SelectionDestination,
+) -> Result<Option<(String, u64)>, StateError> {
+    Ok(loaded_confirmed_repair(conn, root, manifest, destination)?
+        .map(|(_, checksum, size)| (checksum, size)))
+}
+
+impl SqliteStateDb {
+    /// Resolve a current, independently owned path without mutating its receipts.
+    pub(crate) async fn inspect_integrity_destination(
+        &self,
+        path: std::path::PathBuf,
+    ) -> Result<Option<IntegrityDestination>, StateError> {
+        self.with_conn("inspecting explicit integrity destination", move |conn| {
+            let path = super::provider_selection::SelectionPath::from_path(&path).key()?;
+            let row: Option<IntegrityInspectionRow> = conn.query_row(
+                "SELECT w.generation,w.pass_key,w.child,w.version_size,w.local_checksum,w.preserved_local IS NOT NULL,w.verified_media,w.confirmed_repair FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.path=?1 AND w.admitted=1 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL OR w.confirmed_repair IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM provider_active_generations newer WHERE newer.scope=g.scope AND newer.created_at>g.created_at) ORDER BY g.created_at DESC,w.current_publication DESC,w.generation,w.pass_key LIMIT 1",
+                [&path], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
+            ).optional()?;
+            let Some((generation, pass_key, child, version, local_checksum, preserved, verified_media, previous_confirmation)) = row else { return Ok(None) };
+            let root = load_generation(conn, &generation)?;
+            let manifest = load_decision(conn, &root, &pass_key, &child)?;
+            let destination = manifest.decision.destinations.iter()
+                .find(|destination| destination.version_size == version && destination.path.key().ok().as_deref() == Some(path.as_str()))
+                .ok_or(StateError::ProviderSelectionInvalid)?.clone();
+            let confirmed = previous_confirmation.as_deref()
+                .map(|bytes| parse_confirmed_repair(bytes, &root, &manifest, &destination))
+                .transpose()?;
+            Ok(Some(IntegrityDestination { generation, pass_key, child, destination, local_checksum, preserved, verified_media, confirmed, previous_confirmation }))
+        }).await
+    }
+
+    /// Planning may precede a reseeded manifest. Retain explicit intent only
+    /// for the same selected provider resource and exact independently owned copy.
+    pub(crate) async fn retained_integrity_confirmation(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        key: String,
+        identity: (String, String),
+        resource: (
+            super::provider_selection::SelectionPath,
+            String,
+            String,
+            u64,
+        ),
+    ) -> Result<Option<(String, u64)>, StateError> {
+        self.with_conn("reading retained integrity confirmation", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            let (child, master) = identity;
+            let (path, version, checksum, size) = resource;
+            let generation: Option<String> = conn.query_row(
+                &format!("SELECT w.generation FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.pass_key=?2 AND w.child=?3 AND w.master=?4 AND w.path=?5 AND w.version_size=?6 AND w.checksum=?7 AND w.size_bytes=?8 AND w.admitted=1 AND w.verified_media=0 AND w.confirmed_repair IS NOT NULL AND {UNFINISHED} ORDER BY g.created_at DESC LIMIT 1"),
+                params![scope,key,child,master,path.key()?,version,checksum,i64::try_from(size).map_err(|_invalid| StateError::ProviderSelectionInvalid)?],
+                |row| row.get(0),
+            ).optional()?;
+            let Some(generation) = generation else { return Ok(None) };
+            let root = load_generation(conn, &generation)?;
+            let manifest = load_decision(conn, &root, &key, &child)?;
+            let destination = manifest.decision.destinations.iter().find(|destination| destination.path == path && destination.version_size == version).ok_or(StateError::ProviderSelectionInvalid)?;
+            confirmed_repair(conn, &root, &manifest, destination)
+        }).await
+    }
+
+    /// Reopen only the inspected destination. The old publication receipts remain
+    /// historical evidence; neither the fingerprint nor confirmation is cloud proof.
+    pub(crate) async fn confirm_integrity_damage(
+        &self,
+        inspected: IntegrityDestination,
+        fingerprint: (String, u64),
+    ) -> Result<(), StateError> {
+        self.with_conn_mut("confirming explicit integrity damage", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let root = load_generation(&tx, &inspected.generation)?;
+            let manifest = load_decision(&tx, &root, &inspected.pass_key, &inspected.child)?;
+            let destination = manifest.decision.destinations.iter()
+                .find(|destination| destination.version_size == inspected.destination.version_size && destination.path == inspected.destination.path)
+                .ok_or(StateError::ProviderSelectionInvalid)?;
+            // An explicit confirmation may replace an already pending one only
+            // while that exact bound confirmation is still present.
+            let existing = loaded_confirmed_repair(&tx, &root, &manifest, destination)?;
+            if existing
+                .as_ref()
+                .map(|(bytes, _, _)| bytes)
+                != inspected.previous_confirmation.as_ref()
+            {
+                return invalid();
+            }
+            let repair = ConfirmedRepair {
+                binding: repair_binding(&root, &manifest, destination, &fingerprint.0, fingerprint.1)?,
+                checksum: fingerprint.0,
+                size: fingerprint.1,
+            };
+            if !inspected.preserved
+                && inspected.local_checksum.as_deref() == Some(repair.checksum.as_str())
+            {
+                return invalid();
+            }
+            let changed = tx.execute(
+                "UPDATE provider_active_destinations SET confirmed_repair=?6,current_publication=0,preserved_local=NULL,verified_media=0,verified_metadata=0,local_checksum=NULL,source_checksum=NULL,progress_hash=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=?9 AND (preserved_local IS NOT NULL)=?8 AND local_checksum IS ?7 AND confirmed_repair IS ?10 AND prepared_hash IS NULL AND NOT EXISTS(SELECT 1 FROM provider_active_generations g JOIN provider_active_generations newer ON newer.scope=g.scope AND newer.created_at>g.created_at WHERE g.id=?1)",
+                params![root.id, inspected.pass_key, inspected.child, destination.version_size, destination.path.key()?, encode(&repair)?, inspected.local_checksum, inspected.preserved, inspected.verified_media, inspected.previous_confirmation],
+            )?;
+            if changed != 1 { return invalid() }
+            tx.execute("UPDATE provider_active_decisions SET next_retry_at=0 WHERE generation=?1 AND pass_key=?2 AND child=?3", params![root.id, inspected.pass_key, inspected.child])?;
+            refresh_admission_hash(&tx, &root, &inspected.pass_key, &inspected.child)?;
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
+    pub(crate) async fn selection_confirmed_repair(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        key: String,
+        child: String,
+        path: super::provider_selection::SelectionPath,
+    ) -> Result<Option<(String, u64)>, StateError> {
+        self.with_conn_mut("binding confirmed destination repair", move |connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let conn = &tx;
+            account::validate_authenticated(conn, &owner)?;
+            let root = load_generation(conn, &generation)?;
+            let manifest = load_decision(conn, &root, &key, &child)?;
+            let destination = manifest.decision.destinations.iter().find(|destination| destination.path == path)
+                .ok_or(StateError::ProviderSelectionInvalid)?;
+            let complete: bool = conn.query_row("SELECT verified_media FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5", params![generation,key,child,destination.version_size,path.key()?], |row| row.get(0))?;
+            if complete { return Ok(None) }
+            if let Some(repair) = confirmed_repair(conn, &root, &manifest, destination)? {
+                return Ok(Some(repair));
+            }
+            // A reseed may change enumeration/configuration evidence without
+            // changing this physical copy or provider resource. Retain its
+            // explicit intent through the existing historical destination owner.
+            let previous: Option<String> = conn.query_row(
+                &format!("SELECT w.generation FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.pass_key=?2 AND w.child=?3 AND w.master=?4 AND w.version_size=?5 AND w.path=?6 AND w.checksum=?7 AND w.size_bytes=?8 AND w.admitted=1 AND w.verified_media=0 AND w.confirmed_repair IS NOT NULL AND {UNFINISHED} ORDER BY g.created_at DESC LIMIT 1"),
+                params![root.spec.scope,key,child,manifest.decision.master,destination.version_size,path.key()?,destination.checksum,i64::try_from(destination.size).map_err(|_invalid| StateError::ProviderSelectionInvalid)?],
+                |row| row.get(0),
+            ).optional()?;
+            let Some(previous) = previous else { return Ok(None) };
+            let previous_root = load_generation(conn, &previous)?;
+            let previous_manifest = load_decision(conn, &previous_root, &key, &child)?;
+            let previous_destination = previous_manifest.decision.destinations.iter()
+                .find(|previous| previous.path == path && previous.version_size == destination.version_size)
+                .ok_or(StateError::ProviderSelectionInvalid)?;
+            let inherited = confirmed_repair(conn, &previous_root, &previous_manifest, previous_destination)?;
+            if let Some((checksum,size)) = &inherited {
+                let repair = ConfirmedRepair { checksum:checksum.clone(), size:*size, binding:repair_binding(&root,&manifest,destination,checksum,*size)? };
+                conn.execute("UPDATE provider_active_destinations SET confirmed_repair=?6 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=0 AND confirmed_repair IS NULL AND NOT EXISTS(SELECT 1 FROM provider_active_generations newer WHERE newer.scope=?7 AND newer.created_at>(SELECT created_at FROM provider_active_generations WHERE id=?1))",params![generation,key,child,destination.version_size,path.key()?,encode(&repair)?,root.spec.scope])?;
+            }
+            tx.commit()?;
+            Ok(inherited)
         }).await
     }
 }

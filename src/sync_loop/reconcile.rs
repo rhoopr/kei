@@ -3,7 +3,7 @@
 use crate::{download, state};
 
 /// Walk every `downloaded` row in the state DB and warn when the
-/// recorded `local_path` is missing or shorter than expected. Read-only - no
+/// recorded `local_path` is missing. Read-only - no
 /// rows are mutated by this periodic full-catalog walk. Triggered on a fixed
 /// cadence by the watch loop so operators can see drift outside the bounded
 /// pre-cycle probe.
@@ -12,10 +12,10 @@ use crate::{download, state};
 /// the periodic walk is a diagnostic, not a load-bearing correctness gate,
 /// and a transient SQLite hiccup must not crash the watch daemon.
 pub(super) async fn run_periodic_reconcile(db: &dyn state::ReportStateStore, cycle_index: u64) {
-    use crate::commands::reconcile::{LocalDriftAsset, LocalDriftKind, scan_local_drift};
+    use crate::commands::reconcile::{LocalDriftAsset, LocalDriftKind, scan_missing_local_files};
     tracing::info!(
         cycle_index,
-        "Periodic reconciliation: scanning state DB for missing or damaged local files"
+        "Periodic reconciliation: scanning state DB for missing local files"
     );
     let mut sample_logged = 0usize;
     const SAMPLE_LOG_CAP: usize = 25;
@@ -48,7 +48,7 @@ pub(super) async fn run_periodic_reconcile(db: &dyn state::ReportStateStore, cyc
     let report_no_path = |id: &str| {
         tracing::debug!(asset_id = %id, "Reconcile: downloaded row has no local_path recorded");
     };
-    let scan = scan_local_drift(db, report_drift, report_no_path).await;
+    let scan = scan_missing_local_files(db, report_drift, report_no_path).await;
     match scan {
         Ok((counts, drifted)) => {
             if drifted.is_empty() && counts.no_path == 0 {
@@ -161,39 +161,33 @@ pub(super) async fn run_bounded_local_drift_probe(
         ..LocalDriftProbeOutcome::default()
     };
     for asset in page {
-        let (drift, no_path) = match crate::commands::reconcile::classify_local_drift(asset).await {
-            Ok(result) => result,
+        let Some(path) = &asset.local_path else {
+            continue;
+        };
+        // Ordinary recovery checks absence only. The integrity classifier may
+        // hash shorter metadata-rewritten files, even when its result is ignored.
+        match tokio::fs::metadata(path).await {
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 tracing::warn!(error = %e, "Local drift probe failed to inspect a downloaded row");
                 continue;
             }
-        };
-        if no_path {
-            continue;
-        }
-        let Some(drift) = drift else {
-            continue;
-        };
-        if !matches!(
-            drift.kind,
-            crate::commands::reconcile::LocalDriftKind::Missing
-        ) {
-            continue;
         }
         outcome.drifted = outcome.drifted.saturating_add(1);
         tracing::warn!(
             cycle_index,
-            asset_id = %drift.id,
-            version_size = drift.version_size.as_str(),
-            path = %drift.local_path.display(),
+            asset_id = %asset.id,
+            version_size = asset.version_size.as_str(),
+            path = %path.display(),
             "Local drift probe found a missing downloaded file"
         );
         match db
             .mark_failed(
-                &drift.library,
-                &drift.id,
-                drift.version_size.as_str(),
-                drift.kind.reason(),
+                &asset.library,
+                &asset.id,
+                asset.version_size.as_str(),
+                crate::commands::reconcile::FILE_MISSING_REASON,
             )
             .await
         {
@@ -202,8 +196,8 @@ pub(super) async fn run_bounded_local_drift_probe(
                 outcome.mark_errors = outcome.mark_errors.saturating_add(1);
                 tracing::warn!(
                     error = %e,
-                    asset_id = %drift.id,
-                    version_size = drift.version_size.as_str(),
+                    asset_id = %asset.id,
+                    version_size = asset.version_size.as_str(),
                     "Local drift probe could not mark drifted file failed"
                 );
             }

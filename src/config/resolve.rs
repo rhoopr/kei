@@ -419,6 +419,10 @@ impl Config {
         friendly_request: Option<bool>,
     ) -> anyhow::Result<Self> {
         let toml_auth = toml.and_then(|t| t.auth.as_ref());
+        anyhow::ensure!(
+            !sync.repair_truncated,
+            "--repair-truncated cannot distinguish damage from local edits. Use `kei reconcile --inspect-path PATH` and confirm that destination's fingerprint with --confirm-damage, then run `kei sync`."
+        );
 
         // `[auth].password` is no longer accepted. Plaintext passwords in config
         // files are a standing security risk; kei ships a credential store

@@ -192,9 +192,7 @@ pub struct SyncArgs {
     #[arg(long, requires = "refresh_metadata")]
     pub repair_capture_timestamps: bool,
 
-    /// Replace a recorded local file only when reconcile marked it truncated.
-    /// The replacement is verified before it atomically takes the recorded path.
-    /// Use with sync, not service run. A configured watch interval is ignored.
+    /// Retired: use reconcile --inspect-path and --confirm-damage for each damaged copy.
     #[arg(
         long,
         conflicts_with_all = ["dry_run", "only_print_filenames", "refresh_metadata"]
@@ -358,6 +356,13 @@ pub struct ReconcileArgs {
     /// Show what would change without updating the state database.
     #[arg(long)]
     pub dry_run: bool,
+    /// Inspect one exact managed destination and print its repair fingerprint.
+    #[arg(long)]
+    pub inspect_path: Option<PathBuf>,
+    /// Confirm this destination is damaged, using the fingerprint printed by inspection.
+    /// Queues conditional replacement for the next sync; other copies are preserved.
+    #[arg(long, requires = "inspect_path", conflicts_with = "dry_run")]
+    pub confirm_damage: Option<String>,
 }
 
 // ── New subcommand types ─────────────────────────────────────────────
@@ -615,8 +620,8 @@ pub enum Command {
     Verify(VerifyArgs),
 
     /// Reconcile state database with files on disk: mark assets as
-    /// failed when their local file is missing or truncated, so the
-    /// next sync re-downloads them.
+    /// failed when their local file is missing. Inspect and explicitly confirm
+    /// damage to queue fingerprint-pinned repair of one destination.
     #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Reconcile")]
     Reconcile(ReconcileArgs),
 

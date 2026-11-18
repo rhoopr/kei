@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 41;
+pub(crate) const SCHEMA_VERSION: i32 = 42;
 const FRESH_START_VERSION: i32 = 38;
 
 /// Retire provider planning authority once, without interpreting historical
@@ -1530,6 +1530,16 @@ pub(crate) fn migrate_to_version(
                 }
             }
         }
+        42 => {
+            // Confirmation binds an existing native destination to an exact
+            // inspected fingerprint. Nullable and evidence-free by default:
+            // the migration cannot infer repair authority from historical rows.
+            if !column_exists(conn, "provider_active_destinations", "confirmed_repair")? {
+                conn.execute_batch(
+                    "ALTER TABLE provider_active_destinations ADD COLUMN confirmed_repair BLOB;",
+                )?;
+            }
+        }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1586,6 +1596,190 @@ mod tests {
             expected
         );
     }
+    type DestinationEvidence = (
+        String,
+        i64,
+        Option<Vec<u8>>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<Vec<u8>>,
+    );
+
+    fn normalized_sql(sql: &str) -> String {
+        sql.chars()
+            .filter(|ch| !ch.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+
+    fn table_checks(sql: &str) -> Vec<String> {
+        let lower = sql.to_ascii_lowercase();
+        let bytes = sql.as_bytes();
+        let mut checks = Vec::new();
+        let mut cursor = 0;
+        while let Some(relative) = lower.get(cursor..).unwrap_or_default().find("check") {
+            let keyword = cursor + relative;
+            let mut open = keyword + "check".len();
+            while open < bytes.len() && bytes[open].is_ascii_whitespace() {
+                open += 1;
+            }
+            if bytes.get(open) != Some(&b'(') {
+                cursor = keyword + "check".len();
+                continue;
+            }
+            let mut depth = 0usize;
+            let mut end = None;
+            for (offset, ch) in sql.get(open..).unwrap_or_default().char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(open + offset + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(end) = end else {
+                break;
+            };
+            let Some(fragment) = sql.get(open..end) else {
+                break;
+            };
+            checks.push(normalized_sql(fragment));
+            cursor = end;
+        }
+        checks
+    }
+
+    /// Canonical provider-schema shape used to compare the behavioral helper
+    /// DDL with a database produced by the real migration chain. Raw SQL text
+    /// differs after ALTER TABLE, so compare every constraint-bearing surface:
+    /// columns, primary keys, foreign keys, checks, indexes and rowid mode.
+    fn provider_schema_snapshot(conn: &Connection) -> Vec<String> {
+        use rusqlite::OptionalExtension;
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                  WHERE type='table' AND name LIKE 'provider_%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut snapshot = Vec::new();
+        for table in tables {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            snapshot.push(format!(
+                "table {table} without-rowid={}",
+                normalized_sql(&sql).ends_with("withoutrowid")
+            ));
+            let columns: Vec<String> = conn
+                .prepare(
+                    "SELECT cid,name,type,\"notnull\",dflt_value,pk,hidden
+                       FROM pragma_table_xinfo(?1) ORDER BY cid",
+                )
+                .unwrap()
+                .query_map([table.as_str()], |row| {
+                    Ok(format!(
+                        "table {table} column cid={} name={} type={} notnull={} default={:?} pk={} hidden={}",
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            snapshot.extend(columns);
+            let foreign_keys: Vec<String> = conn
+                .prepare(
+                    "SELECT id,seq,\"table\",\"from\",\"to\",on_update,on_delete,match
+                       FROM pragma_foreign_key_list(?1) ORDER BY id,seq",
+                )
+                .unwrap()
+                .query_map([table.as_str()], |row| {
+                    Ok(format!(
+                        "table {table} foreign-key id={} seq={} target={} from={} to={:?} on-update={} on-delete={} match={}",
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            snapshot.extend(foreign_keys);
+            for check in table_checks(&sql) {
+                snapshot.push(format!("table {table} check {check}"));
+            }
+            let indexes: Vec<(String, i64, String, i64)> = conn
+                .prepare(
+                    "SELECT name,\"unique\",origin,partial
+                       FROM pragma_index_list(?1) ORDER BY name",
+                )
+                .unwrap()
+                .query_map([table.as_str()], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for (index, unique, origin, partial) in indexes {
+                snapshot.push(format!(
+                    "index {index} table={table} unique={unique} origin={origin} partial={partial}"
+                ));
+                let index_columns: Vec<String> = conn
+                    .prepare("SELECT seqno,cid,name FROM pragma_index_info(?1) ORDER BY seqno")
+                    .unwrap()
+                    .query_map([index.as_str()], |row| {
+                        Ok(format!(
+                            "index {index} column seqno={} cid={} name={:?}",
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                snapshot.extend(index_columns);
+                let index_sql: Option<String> = conn
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                        [index.as_str()],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()
+                    .unwrap()
+                    .flatten();
+                if let Some(index_sql) = index_sql {
+                    snapshot.push(format!("index {index} sql {}", normalized_sql(&index_sql)));
+                }
+            }
+        }
+        snapshot
+    }
+
     fn historical_provider_fixture(version: i32) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         seed_historical_provider_fixture(&conn, version);
@@ -2176,6 +2370,255 @@ mod tests {
                 layout,
                 (Some(header.to_vec()), "publishing".into()),
                 "reopen {reopen}"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmed_repair_upgrade_from_41_preserves_native_evidence_and_reopens_cleanly() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schema41.db");
+        let binding = b"schema41-album-binding\0\xff";
+        let preserved = b"schema41-preserved-local\0\xff";
+        let header = b"schema41-layout-header\0\xff";
+        let path_receipt = (
+            "schema41-path-provider",
+            "schema41-path-local",
+            "schema41-path-download",
+        );
+        let destination_receipt = "schema41-destination-receipt";
+        {
+            let conn = Connection::open(&path).unwrap();
+            seed_historical_provider_fixture(&conn, 41);
+            assert_eq!(get_schema_version(&conn).unwrap(), 41);
+            assert!(
+                !column_exists(&conn, "provider_active_destinations", "confirmed_repair").unwrap(),
+                "schema 41 must not carry confirmed repair authority"
+            );
+            for (table, column) in [
+                ("provider_active_destinations", "current_publication"),
+                ("provider_active_destinations", "preserved_local"),
+                ("provider_active_destinations", "embedded_metadata_receipt"),
+                ("album_containers", "directory_binding"),
+                ("asset_metadata_paths", "embedded_metadata_receipt"),
+            ] {
+                assert!(
+                    column_exists(&conn, table, column).unwrap(),
+                    "schema 41 must carry {table}.{column}"
+                );
+            }
+            conn.execute(
+                "INSERT INTO album_containers
+                    (library,container_id,album_name,pass_kind,is_deleted,updated_at,directory_binding)
+                 VALUES ('PrimarySync','album','Old','album',0,123,?1)",
+                [binding.as_slice()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO asset_metadata_paths
+                    (library,id,version_size,local_path,provider_checksum,local_checksum,
+                     download_checksum,embedded_metadata_receipt)
+                 VALUES ('PrimarySync','old','original','/media/original.jpg',?1,?2,?3,?4)",
+                rusqlite::params![
+                    path_receipt.0,
+                    path_receipt.1,
+                    path_receipt.2,
+                    destination_receipt
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO primary_layout_operations
+                    (operation,family,library,source_library,prior_generation,decision,policy,phase,header)
+                 VALUES ('old','family','PrimarySync','PrimarySync',1,'decision','primary','publishing',?1)",
+                [header.as_slice()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE provider_active_destinations
+                    SET current_publication=1,preserved_local=?1,local_checksum=?2,
+                        embedded_metadata_receipt=?3
+                  WHERE generation='old'",
+                rusqlite::params![
+                    preserved.as_slice(),
+                    "schema41-local-checksum",
+                    destination_receipt
+                ],
+            )
+            .unwrap();
+        }
+
+        for reopen in 0..2 {
+            let conn = Connection::open(&path).unwrap();
+            migrate(&conn).unwrap();
+            assert_eq!(
+                get_schema_version(&conn).unwrap(),
+                SCHEMA_VERSION,
+                "reopen {reopen}"
+            );
+            let repair_type: String = conn
+                .query_row(
+                    "SELECT type FROM pragma_table_info('provider_active_destinations')
+                      WHERE name='confirmed_repair'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(repair_type, "BLOB", "reopen {reopen}");
+            let native: DestinationEvidence = conn
+                .query_row(
+                    "SELECT path,current_publication,preserved_local,checksum,local_checksum,
+                            embedded_metadata_receipt,confirmed_repair
+                       FROM provider_active_destinations WHERE generation='old'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                native,
+                (
+                    "retained-native-path".into(),
+                    1,
+                    Some(preserved.to_vec()),
+                    "old-resource".into(),
+                    Some("schema41-local-checksum".into()),
+                    Some(destination_receipt.into()),
+                    None,
+                ),
+                "reopen {reopen}"
+            );
+            let binding_row: (String, Option<Vec<u8>>) = conn
+                .query_row(
+                    "SELECT container_id,directory_binding
+                       FROM album_containers WHERE container_id='album'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                binding_row,
+                ("album".into(), Some(binding.to_vec())),
+                "reopen {reopen}"
+            );
+            let receipt: (String, Option<String>, Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT provider_checksum,local_checksum,download_checksum,
+                            embedded_metadata_receipt
+                       FROM asset_metadata_paths WHERE id='old'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                receipt,
+                (
+                    path_receipt.0.into(),
+                    Some(path_receipt.1.into()),
+                    Some(path_receipt.2.into()),
+                    Some(destination_receipt.into()),
+                ),
+                "reopen {reopen}"
+            );
+            let layout: (Option<Vec<u8>>, String) = conn
+                .query_row(
+                    "SELECT header,phase FROM primary_layout_operations
+                      WHERE operation='old'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                layout,
+                (Some(header.to_vec()), "publishing".into()),
+                "reopen {reopen}"
+            );
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        let evidence = b"confirmed-repair\0\xff";
+        conn.execute(
+            "UPDATE provider_active_destinations SET confirmed_repair=?1 WHERE generation='old'",
+            [evidence.as_slice()],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let retained: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT confirmed_repair FROM provider_active_destinations WHERE generation='old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained.as_deref(), Some(evidence.as_slice()));
+    }
+
+    #[test]
+    fn behavioral_helper_matches_real_migrated_provider_schema() {
+        let helper_source = include_str!("../../tests/behavioral/support.rs");
+        let start = helper_source
+            .find("CREATE TABLE IF NOT EXISTS provider_active_generations")
+            .unwrap();
+        let end = start
+            + helper_source
+                .get(start..)
+                .unwrap_or_default()
+                .find('"')
+                .unwrap();
+        let helper_ddl = helper_source.get(start..end).unwrap();
+        assert!(
+            helper_ddl.contains("confirmed_repair BLOB"),
+            "helper DDL must pin schema-42 confirmation evidence"
+        );
+
+        let production = Connection::open_in_memory().unwrap();
+        migrate(&production).unwrap();
+        assert_eq!(get_schema_version(&production).unwrap(), SCHEMA_VERSION);
+
+        let helper = Connection::open_in_memory().unwrap();
+        helper.execute_batch(helper_ddl).unwrap();
+        let actual = provider_schema_snapshot(&helper);
+        assert_eq!(
+            actual,
+            provider_schema_snapshot(&production),
+            "behavioral helper provider DDL must match a database built by the real migration chain"
+        );
+
+        for (before, after) in [
+            (
+                "PRIMARY KEY(generation,pass_key,child)",
+                "PRIMARY KEY(generation,child,pass_key)",
+            ),
+            (
+                "CHECK(outcome IN ('selected','excluded','deferred'))",
+                "CHECK(outcome IN ('selected','excluded'))",
+            ),
+            (
+                "WHERE current_publication=1",
+                "WHERE current_publication=1 AND 0",
+            ),
+        ] {
+            let drifted = helper_ddl.replacen(before, after, 1);
+            assert_ne!(
+                helper_ddl, drifted,
+                "negative control must change the helper DDL"
+            );
+            let drifted_db = Connection::open_in_memory().unwrap();
+            drifted_db.execute_batch(&drifted).unwrap();
+            assert_ne!(
+                actual,
+                provider_schema_snapshot(&drifted_db),
+                "canonical comparison must detect key, check or index drift"
             );
         }
     }

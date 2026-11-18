@@ -1767,15 +1767,9 @@ cannot redirect deletion. It retires the claim after deletion or when the path
 is missing or no longer the claimed stale file. A suffix and file age alone
 never authorize deletion.
 
-`kei sync --repair-truncated` is the only media-replacement path. Pending
-retry planning requires the durable reconcile truncation marker, confirms the
-recorded file is still truncated, and fingerprints its bytes. After the new
-download and configured metadata writes pass, the file owner replaces only
-that exact fingerprint. It uses atomic exchange where supported and the
-journaled fallback owned by `src/download/file/replacement_recovery.rs`
-otherwise. A changed
-target is restored or retained and the state row stays failed. All other
-downloads keep no-overwrite publication.
+Explicit integrity repair uses `reconcile --inspect-path PATH --confirm-damage SHA256:SIZE`. Inspection alone grants no replacement authority. Schema 42 stores the confirmation on the existing `provider_active_destinations` row, bound to its selection manifest and inspected bytes. It reopens only that destination's completion state and retains historical receipts. The current selected pass attaches the fingerprint to its conditional publication. If the file changes again, inspection can replace the pending confirmation after the operator confirms the new fingerprint. The transaction checks that the previous confirmation still matches. Source unavailability retains damaged bytes and retry work. The file owner uses atomic exchange or its existing replacement journal. The former `sync --repair-truncated` entry point refuses with per-destination confirmation guidance.
+
+Managed primary destinations stay with the primary-layout journal. The planner pins the confirmed damaged input, clears its source provenance, and retains healthy sibling members without rewriting them. The layout owner prepares verified replacement bytes and durably preserves the damaged input before publication. Ordinary landed-repair recovery uses existing independent publication receipts; a fingerprint change by itself cannot complete repair.
 
 When no-overwrite publication finds an existing destination, the file owner
 compares it with the verified `.part` file. Identical bytes are deduplicated.
@@ -2235,7 +2229,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 
 | Contract | Owner | Required behavior |
 |----------|-------|-------------------|
-| `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs`, `src/download/pipeline.rs` | Replacement requires exact path and fingerprint authorization from explicit truncated repair, the per-copy local replacement policy, or a journaled managed-layout handover with independent preservation evidence. Timestamp-based authorization also guards the observed local mtime through publication. A no-replace collision succeeds only when the verified `.part` and destination bytes are identical. Different or unverifiable bytes retain retry evidence and cannot reach metadata writes or downloaded finalization. |
+| `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs`, `src/download/pipeline.rs` | Replacement requires exact path and fingerprint authorization from explicit fingerprint-confirmed or truncated repair, the per-copy local replacement policy, or a journaled managed-layout handover with independent preservation evidence. Timestamp-based authorization also guards the observed local mtime through publication. A no-replace collision succeeds only when the verified `.part` and destination bytes are identical. Different or unverifiable bytes retain retry evidence and cannot reach metadata writes or downloaded finalization. |
 | `TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP` | `src/download/orchestration/cleanup.rs`, `src/download/pipeline.rs`, `src/fs_util.rs`, `src/state/db.rs` | Orphan cleanup deletes only an exact stale path claimed in durable state. It retains verified filesystem handles through removal and never follows a directory or file symlink. Normal completion and graceful interruption retire the claim. |
 | `SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE` | `src/sync_cycle.rs` | The database pre-check token advances only after a successful non-dry-run cycle with a current pass plan. |
 | `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/orchestration/` | A zone checkpoint advances only with complete token evidence and durable recovery for unfinished work. |
@@ -2479,7 +2473,7 @@ pre-admission logical charges. Historical selection and compaction fields remain
 URL or arbitrary error text, and remain subject to queue loss and bounded
 history retention. Unknown observations stay explicitly unavailable.
 
-History and export schema version 1 are separate from report version 3 and state schema 41. Raw reports and databases are never packaged. Interrupted writes preserve the previous history; read errors and limits appear as partial evidence. See [the operator guide](support-export.md) for limits and unavailable evidence.
+History and export schema version 1 are separate from report version 3 and state schema 42. Raw reports and databases are never packaged. Interrupted writes preserve the previous history; read errors and limits appear as partial evidence. See [the operator guide](support-export.md) for limits and unavailable evidence.
 
 ### Explicit missing-reference inventory diagnostic
 

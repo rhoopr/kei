@@ -387,6 +387,7 @@ where
                     // context.
                     let mut metadata_refresh_attempted = false;
                     let mut selected_plan = None;
+                    let mut selected_integrity_repair = false;
                     let mut reserved_pending = false;
                     if let Some(run) = &config.selection_run {
                         if run
@@ -545,8 +546,19 @@ where
                                 }
                             }
                         }
-                        let mut plan = match task_planner.plan_selected_asset(&asset, config).await
-                        {
+                        let planned = async {
+                            if let Some(plan) = run
+                                .confirmed_repair_plan(key, &asset, config, &mut task_planner)
+                                .await?
+                            {
+                                selected_integrity_repair = true;
+                                Ok(plan)
+                            } else {
+                                task_planner.plan_selected_asset(&asset, config).await
+                            }
+                        }
+                        .await;
+                        let mut plan = match planned {
                             Ok(plan) => plan,
                             Err(error) => {
                                 state_write_failures_producer
@@ -796,7 +808,9 @@ where
                             }
                         }
                     };
-                    if let Some(session) = task_planner.managed_layout_session() {
+                    if !selected_integrity_repair
+                        && let Some(session) = task_planner.managed_layout_session()
+                    {
                         if config.selection_run.as_ref().is_some_and(|run| {
                             run.phase
                                 == crate::download::orchestration::generation::SelectionPhase::Inventory
@@ -855,8 +869,16 @@ where
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             Err(error) => {
-                                enum_errors_producer
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                // A confirmed copy's unavailable source leaves
+                                // its journal pending. It is not failed provider
+                                // enumeration and must not reseed healthy peers.
+                                let repair = crate::download::orchestration::primary_layout::has_confirmed_repair(
+                                    &asset, config, &plan.tasks,
+                                ).await.unwrap_or(false);
+                                if !repair {
+                                    enum_errors_producer
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 if let Some(run) = &config.selection_run {
                                     run.held.store(true, std::sync::atomic::Ordering::Relaxed);
                                 }
@@ -1048,13 +1070,21 @@ where
                                     continue;
                                 }
 
-                                match download_ctx.should_download_fast(
-                                    &task.library,
-                                    &task.asset_id,
-                                    task.version_size,
-                                    &task.checksum,
-                                    false,
-                                ) {
+                                // Explicit conditional publication is per path.
+                                // A rendition-wide downloaded receipt or mere
+                                // presence cannot discharge that destination.
+                                let download = if task.replacement_fingerprint.is_some() {
+                                    Some(true)
+                                } else {
+                                    download_ctx.should_download_fast(
+                                        &task.library,
+                                        &task.asset_id,
+                                        task.version_size,
+                                        &task.checksum,
+                                        false,
+                                    )
+                                };
+                                match download {
                                     Some(true) => {
                                         disposition = disposition.max(AssetDisposition::Forwarded);
                                         if record_seen_for_forwarded_task(

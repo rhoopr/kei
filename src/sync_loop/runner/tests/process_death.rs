@@ -404,6 +404,21 @@ async fn process_death_recovery_matrix() {
             let db =
                 crate::sync_loop::test_support::open_owned_cycle_db(&root.path().join("state.db"))
                     .await;
+            let path = target(root.path());
+            let inspected = db
+                .inspect_integrity_destination(path.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            let fingerprint = crate::download::file::inspect_integrity_fingerprint(
+                &root.path().join("media"),
+                &path,
+            )
+            .await
+            .unwrap();
+            db.confirm_integrity_damage(inspected, fingerprint)
+                .await
+                .unwrap();
             db.mark_failed(
                 ZONE,
                 ID,

@@ -391,7 +391,8 @@ fn verify_checksums_detects_corruption() {
             .assert()
             .failure()
             .stdout(
-                predicate::str::contains("CORRUPTED").and(predicate::str::contains("Corrupted:")),
+                predicate::str::contains("DIFFERENT")
+                    .and(predicate::str::contains("Different or unreadable:")),
             );
     });
 }

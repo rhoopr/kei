@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 41;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 42;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -149,9 +149,9 @@ CREATE TABLE IF NOT EXISTS provider_active_destinations (
  verified_media INTEGER NOT NULL DEFAULT 0 CHECK(verified_media IN (0,1)),
  verified_metadata INTEGER NOT NULL DEFAULT 0 CHECK(verified_metadata IN (0,1)),
  local_checksum TEXT, source_checksum TEXT, grouping_hash TEXT, intent_hash TEXT, progress_hash TEXT,
-  prepared_checksum TEXT, prepared_size INTEGER, prepared_hash TEXT, preserved_local BLOB,
+  prepared_checksum TEXT, prepared_size INTEGER, prepared_hash TEXT,
   current_publication INTEGER NOT NULL DEFAULT 0 CHECK(current_publication IN (0,1)),
-  embedded_metadata_receipt TEXT,
+  preserved_local BLOB, embedded_metadata_receipt TEXT, confirmed_repair BLOB,
  CHECK((prepared_checksum IS NULL AND prepared_size IS NULL AND prepared_hash IS NULL)
     OR (prepared_checksum IS NOT NULL AND prepared_size IS NOT NULL AND prepared_hash IS NOT NULL
         AND length(prepared_checksum)=64 AND prepared_size>=0 AND length(prepared_hash)=64)),
