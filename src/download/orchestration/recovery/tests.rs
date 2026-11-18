@@ -2467,7 +2467,10 @@ async fn run_date_bounded_incremental_sync(
     )
     .await
     .expect("bounded incremental sync should complete");
-    if !result.full_enumeration_ran && matches!(result.outcome, DownloadOutcome::Success) {
+    if !result.full_enumeration_ran
+        && result.sync_token.is_some()
+        && matches!(result.outcome, DownloadOutcome::Success)
+    {
         let database = db.path().to_path_buf();
         drop(passes);
         drop(db);
@@ -2499,7 +2502,7 @@ async fn run_date_bounded_incremental_sync(
 }
 
 #[tokio::test]
-async fn empty_selection_revalidates_unknown_and_membership_tombstones() {
+async fn empty_selection_revalidates_unknown_tombstones_and_holds_malformed_relations() {
     for record_type in [Value::Null, json!("CPLContainerRelation")] {
         let state = TempDir::new().unwrap();
         let db = open_fixture_db(&state.path().join("state.db")).await;
@@ -2514,8 +2517,17 @@ async fn empty_selection_revalidates_unknown_and_membership_tombstones() {
                 .await
                 .unwrap();
         }
+        let malformed_relation = !record_type.is_null();
         record["recordType"] = record_type;
         let result = run_date_bounded_incremental_sync(db, vec![record]).await;
+        if malformed_relation {
+            assert!(result.sync_token.is_none());
+            assert_eq!(
+                result.stats.sync_token_blocked_reason,
+                Some("unparsable_relation_delta")
+            );
+            continue;
+        }
         assert!(
             result.full_enumeration_ran,
             "unknown membership must revalidate selection: {result:?}"
