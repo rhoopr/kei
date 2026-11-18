@@ -225,7 +225,9 @@ fn embedded_fields(metadata: &Metadata) -> crate::state::types::EmbeddedMetadata
         metadata
             .get_tag(&ExifTag::UnknownINT16U(vec![], tag, ExifTagGroup::GENERIC))
             .find_map(|tag| match tag {
-                ExifTag::UnknownINT16U(values, _, _) => Some(values.clone()),
+                ExifTag::UnknownINT16U(values, _, _) => {
+                    Some(serde_json::Value::from(values.clone()).to_string())
+                }
                 _ => None,
             })
     };
@@ -236,10 +238,8 @@ fn embedded_fields(metadata: &Metadata) -> crate::state::types::EmbeddedMetadata
                     .encode(&value.value_as_u8_vec(&little_exif::endian::Endian::Little))
             })
         }),
-        rating: rating(WINDOWS_RATING_TAG)
-            .map(|values| serde_json::to_string(&values).expect("integer vectors serialize")),
-        rating_percent: rating(WINDOWS_RATING_PERCENT_TAG)
-            .map(|values| serde_json::to_string(&values).expect("integer vectors serialize")),
+        rating: rating(WINDOWS_RATING_TAG),
+        rating_percent: rating(WINDOWS_RATING_PERCENT_TAG),
         description: metadata
             .get_tag(&ExifTag::ImageDescription(String::new()))
             .find_map(|tag| match tag {
