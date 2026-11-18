@@ -166,38 +166,124 @@ fn unlink(path: &ConfinedPath, flags: libc::c_int) -> std::io::Result<()> {
     Ok(())
 }
 
-// Only a manifest-less, empty directory is terminal housekeeping. Revalidate
-// through its retained parent capability so a renamed/recreated journal or an
-// unknown entry cannot be mistaken for the completed transaction.
-fn remove_empty_directory(directory: &ConfinedPath, manifest: &ConfinedPath) -> Result<()> {
-    let verify_empty = || -> Result<()> {
+/// The OS error number of the I/O error that caused a journal-directory step to fail.
+fn classify_journal_io_error(error: &anyhow::Error) -> Option<i32> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+    })
+}
+
+/// Run an idempotent journal-directory step again when an NFS client reports a
+/// stale handle for a directory this process just changed. Only `ESTALE` is
+/// retried, and a bounded number of times; the step re-verifies on each pass.
+fn retry_stale<T>(mut step: impl FnMut(bool) -> Result<T>) -> Result<T> {
+    let mut retried = false;
+    for _ in 0..RETIRE_POLLS {
+        match step(retried) {
+            Err(error) if classify_journal_io_error(&error) == Some(libc::ESTALE) => {
+                retried = true;
+                std::thread::sleep(RETIRE_POLL);
+            }
+            outcome => return outcome,
+        }
+    }
+    step(retried)
+}
+
+/// What a journal directory still holds once its manifest is unlinked.
+#[derive(Debug, PartialEq, Eq)]
+enum Remainder {
+    Empty,
+    /// Only NFS `.nfsXXXX` renames of journal entries this process unlinked.
+    RetiringEntries,
+}
+
+const RETIRE_POLLS: u32 = 40;
+const RETIRE_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Classify the entries beside `manifest`. An NFS client keeps an unlinked file
+/// that is still open (here or in another process on this client) as
+/// `.nfsXXXX` and removes it after the last close. Only an entry that is the
+/// inode of a journal entry this process just unlinked (`retired`) is accepted;
+/// any other entry refuses, retaining all bytes.
+fn journal_remainder(manifest: &ConfinedPath, retired: &[FileIdentity]) -> Result<Remainder> {
+    let mut remainder = Remainder::Empty;
+    for entry in std::fs::read_dir(format!("/proc/self/fd/{}", manifest.parent_fd()))? {
+        let name = entry?.file_name();
+        let retiring = if name.as_bytes().starts_with(b".nfs") {
+            let entry = manifest.sibling(&manifest.path().with_file_name(&name))?;
+            match identity(&entry)? {
+                Some(found) => retired.contains(&found),
+                // Retired by the NFS client between listing and inspection.
+                None => continue,
+            }
+        } else {
+            false
+        };
         anyhow::ensure!(
-            manifest.open_optional_regular()?.is_none(),
-            "Replacement manifest reappeared"
-        );
-        anyhow::ensure!(
-            std::fs::read_dir(format!("/proc/self/fd/{}", manifest.parent_fd()))?
-                .next()
-                .transpose()?
-                .is_none(),
+            retiring,
             "Unknown entry in terminal replacement journal; retaining all bytes"
         );
-        Ok(())
+        remainder = Remainder::RetiringEntries;
+    }
+    Ok(remainder)
+}
+
+// Only a manifest-less, empty directory is terminal housekeeping. Revalidate
+// through its retained parent capability so a renamed/recreated journal or an
+// unknown entry cannot be mistaken for the completed transaction. Entries
+// unlinked while a descriptor was open (`retired`) may linger as NFS
+// silly-renames: wait briefly for the client to retire them, then defer
+// directory removal to the next recovery pass if a descriptor still holds one.
+fn remove_empty_directory(
+    directory: &ConfinedPath,
+    manifest: &ConfinedPath,
+    retired: &[FileIdentity],
+) -> Result<()> {
+    let verify_empty = || -> Result<Remainder> {
+        retry_stale(|_| {
+            anyhow::ensure!(
+                manifest.open_optional_regular()?.is_none(),
+                "Replacement manifest reappeared"
+            );
+            journal_remainder(manifest, retired)
+        })
     };
-    verify_empty()?;
+    let mut remainder = verify_empty()?;
+    for _ in 0..RETIRE_POLLS {
+        if remainder == Remainder::Empty {
+            break;
+        }
+        std::thread::sleep(RETIRE_POLL);
+        remainder = verify_empty()?;
+    }
     // Persist manifest retirement before attempting optional empty-directory
     // removal. Directory and parent fsync errors still fail the operation.
     #[cfg(test)]
     tests::terminal_sync_fault(manifest)?;
-    manifest.sync_parent()?;
-    if let Err(error) = unlink(directory, libc::AT_REMOVEDIR) {
-        if error.raw_os_error() != Some(libc::ENOTEMPTY) {
-            return Err(error.into());
+    retry_stale(|_| Ok(manifest.sync_parent()?))?;
+    if remainder == Remainder::RetiringEntries {
+        tracing::warn!(
+            "Empty replacement journal directory removal deferred; a descriptor still holds a retired journal entry"
+        );
+        retry_stale(|_| Ok(directory.sync_parent()?))?;
+        return Ok(());
+    }
+    let removal = retry_stale(|retried| match unlink(directory, libc::AT_REMOVEDIR) {
+        // A stale reply can follow a removal the server completed.
+        Err(error) if retried && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        outcome => Ok(outcome?),
+    });
+    if let Err(error) = removal {
+        if classify_journal_io_error(&error) != Some(libc::ENOTEMPTY) {
+            return Err(error);
         }
         verify_empty()?;
         tracing::warn!("Empty replacement journal directory removal deferred");
     }
-    directory.sync_parent()?;
+    retry_stale(|_| Ok(directory.sync_parent()?))?;
     Ok(())
 }
 
@@ -304,7 +390,7 @@ impl Journal {
         let Some(read) = manifest.open_optional_regular()? else {
             // mkdir may have succeeded immediately before interruption. Only
             // an empty directory can be removed; unknown contents stay intact.
-            remove_empty_directory(&directory, &manifest)?;
+            remove_empty_directory(&directory, &manifest, &[])?;
             return Ok(None);
         };
         let expected_identity = file_identity(&read)?;
@@ -353,7 +439,7 @@ impl Journal {
             unlink(&manifest, 0)?;
             FileExt::unlock(&lock)?;
             drop(lock);
-            remove_empty_directory(&directory, &manifest)?;
+            remove_empty_directory(&directory, &manifest, &[expected_identity])?;
             return Ok(None);
         }
         let evidence: Manifest = serde_json::from_slice(&bytes)?;
@@ -434,13 +520,15 @@ impl Journal {
                 );
             }
         }
+        let mut retired = Vec::new();
         for path in [&self.original, &self.replacement, &self.rollback] {
             if path.entry_exists()? {
+                retired.extend(identity(path)?);
                 unlink(path, 0)?;
             }
         }
         if self.commit.entry_exists()? {
-            self.commit.open_regular()?;
+            retired.push(file_identity(&self.commit.open_regular()?)?);
             unlink(&self.commit, 0)?;
         }
         self.sync()?;
@@ -448,14 +536,16 @@ impl Journal {
             .lock
             .as_ref()
             .context("Replacement journal lock is missing")?;
-        self.manifest.validate_identity(file_identity(lock)?)?;
+        let manifest_identity = file_identity(lock)?;
+        self.manifest.validate_identity(manifest_identity)?;
         // Keep writer exclusion until every recovery entry is verified and
         // removed and the manifest is unlinked. Then close the open-unlinked
         // handle before rmdir so NFS can retire its silly-rename entry.
         unlink(&self.manifest, 0)?;
         FileExt::unlock(lock)?;
         drop(self.lock.take());
-        remove_empty_directory(&self.directory, &self.manifest)?;
+        retired.push(manifest_identity);
+        remove_empty_directory(&self.directory, &self.manifest, &retired)?;
         Ok(())
     }
 
@@ -580,12 +670,16 @@ pub(in crate::download) fn finish_owned_prepared_link(
         return Ok(());
     };
     let links = crate::fs_util::file_link_count(&file)?;
+    let opened_identity = file_identity(&file)?;
+    // Unlinking while a descriptor is open makes an NFS client keep the name as
+    // `.nfsXXXX`, so the survivor would report two links until it is retired.
+    drop(file);
     if links == 1 {
         return Ok(());
     }
     anyhow::ensure!(
         links == 2
-            && file_identity(&file)? == expected_identity
+            && opened_identity == expected_identity
             && same_entry(part, target)?
             && read_fingerprint(part)? == Some(expected.into())
             && read_fingerprint(target)? == Some(expected.into()),

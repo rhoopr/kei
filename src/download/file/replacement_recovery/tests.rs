@@ -856,8 +856,147 @@ fn completed_transaction_releases_locks_even_with_a_fork_inherited_descriptor() 
     drop(journal);
     recover_target(&target).unwrap();
     assert_eq!(fs::read(&target).unwrap(), b"original");
-    assert!(!directory_path(&target).unwrap().exists());
-    drop(inherited_descriptor);
+    let journal_directory = directory_path(&target).unwrap();
+    if journal_directory.exists() {
+        // NFS keeps the unlinked manifest as `.nfsXXXX` while a descriptor on
+        // it stays open, so directory removal is deferred, not refused.
+        drop(inherited_descriptor);
+        retry_until_journal_directory_is_gone(&target);
+    }
+    assert!(!journal_directory.exists());
+}
+
+/// The NFS client retires a silly-renamed entry asynchronously after the last
+/// descriptor closes, so a later recovery pass may need a moment.
+fn retry_until_journal_directory_is_gone(target: &std::path::Path) {
+    let journal_directory = directory_path(target).unwrap();
+    for _ in 0..100 {
+        if recover_target(target).is_ok() && !journal_directory.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    recover_target(target).unwrap();
+}
+
+#[test]
+fn journal_remainder_accepts_only_retired_journal_entries() {
+    use super::{Remainder, journal_remainder};
+
+    let dir = TempDir::new().unwrap();
+    let manifest = confined(&dir.path().join("manifest.json")).unwrap();
+    assert_eq!(journal_remainder(&manifest, &[]).unwrap(), Remainder::Empty);
+
+    let silly_renamed = dir.path().join(".nfs0000000000040a3b00000001");
+    fs::write(&silly_renamed, b"displaced original").unwrap();
+    let identity = super::identity(&confined(&silly_renamed).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        journal_remainder(&manifest, &[identity]).unwrap(),
+        Remainder::RetiringEntries
+    );
+    assert!(journal_remainder(&manifest, &[]).is_err());
+
+    let other = dir.path().join(".nfs0000000000040a3c00000001");
+    fs::write(&other, b"someone else's bytes").unwrap();
+    assert!(journal_remainder(&manifest, &[identity]).is_err());
+    fs::remove_file(&other).unwrap();
+
+    fs::write(dir.path().join("rollback"), b"recovery bytes").unwrap();
+    assert!(journal_remainder(&manifest, &[identity]).is_err());
+}
+
+#[test]
+fn stale_handle_errors_are_retried_and_other_errors_are_not() {
+    use super::retry_stale;
+
+    let stale = || anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ESTALE));
+    let mut calls = 0;
+    let outcome = retry_stale(|retried| {
+        calls += 1;
+        assert_eq!(retried, calls > 1);
+        if calls < 3 { Err(stale()) } else { Ok(calls) }
+    });
+    assert_eq!(outcome.unwrap(), 3);
+
+    let mut calls = 0;
+    let outcome = retry_stale(|_| -> anyhow::Result<()> {
+        calls += 1;
+        Err(std::io::Error::from_raw_os_error(libc::EIO).into())
+    });
+    assert!(outcome.is_err());
+    assert_eq!(calls, 1);
+
+    let mut calls = 0;
+    let outcome = retry_stale(|_| -> anyhow::Result<()> {
+        calls += 1;
+        Err(stale().context("wrapped"))
+    });
+    assert!(outcome.is_err());
+    assert_eq!(calls, super::RETIRE_POLLS + 1, "stale retries stay bounded");
+}
+
+#[test]
+fn nfs_prepared_link_cleanup_leaves_a_settled_single_link() {
+    let Some(dir) = crate::test_helpers::nfs_test_dir("nfs_prepared_link_cleanup") else {
+        return;
+    };
+    for round in 0..300 {
+        let target = dir.path().join(format!("photo-{round}.jpg"));
+        let part = dir.path().join(format!("photo-{round}.part"));
+        fs::write(&target, b"replacement").unwrap();
+        fs::hard_link(&target, &part).unwrap();
+        let expected = fingerprint_regular_file_blocking(&target).unwrap();
+        let identity = super::identity(&confined(&target).unwrap())
+            .unwrap()
+            .unwrap();
+        super::finish_owned_prepared_link(
+            &confined(&part).unwrap(),
+            &confined(&target).unwrap(),
+            expected,
+            identity,
+        )
+        .unwrap();
+        // Unlinking while a descriptor is open leaves a `.nfsXXXX` link behind
+        // until the client retires it, so the next check would see two links.
+        assert_eq!(
+            crate::fs_util::file_link_count(&fs::File::open(&target).unwrap()).unwrap(),
+            1,
+            "round {round}"
+        );
+        assert!(
+            !fs::read_dir(dir.path()).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .as_encoded_bytes()
+                .starts_with(b".nfs")),
+            "round {round}: silly-renamed leftover"
+        );
+    }
+}
+
+#[test]
+fn nfs_fallback_publication_removes_its_journal_every_time() {
+    let Some(dir) = crate::test_helpers::nfs_test_dir("nfs_fallback_publication") else {
+        return;
+    };
+    for round in 0..30 {
+        let target = dir.path().join(format!("photo-{round}.jpg"));
+        let part = dir.path().join(format!("photo-{round}.part"));
+        fs::write(&target, b"original").unwrap();
+        fs::write(&part, b"replacement").unwrap();
+        publish(
+            &part,
+            &target,
+            fingerprint_regular_file_blocking(&target).unwrap(),
+            fingerprint_regular_file_blocking(&part).unwrap(),
+        )
+        .unwrap_or_else(|error| panic!("round {round}: {error:#}"));
+        assert_eq!(fs::read(&target).unwrap(), b"replacement");
+        assert!(!part.exists());
+        assert!(!directory_path(&target).unwrap().exists());
+    }
 }
 
 #[test]

@@ -2080,6 +2080,7 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "bridge_error_reason", // Provider-owned diagnostic for wrapped changes/zone failures.
         "classify_heif_metadata_limit",
         "classify_incremental_error",
+        "classify_journal_io_error",
         "classify_legacy_file_error",
         "classify_legacy_inventory_error",
         "classify_provider_lookup_error",
