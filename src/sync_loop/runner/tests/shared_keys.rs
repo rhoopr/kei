@@ -167,6 +167,18 @@ fn existing_baseline_fields(
         .collect()
 }
 
+fn selection_decisions(conn: &Connection, child: &str) -> Vec<(String, String)> {
+    conn.prepare(
+        "SELECT admission,reason FROM provider_active_decisions \
+         WHERE child=?1 ORDER BY generation,pass_key",
+    )
+    .unwrap()
+    .query_map([child], |row| Ok((row.get(0)?, row.get(1)?)))
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
 fn mappings(conn: &Connection) -> Vec<(String, String, String)> {
     conn.prepare(
         "SELECT library,asset_record_name,master_record_name \
@@ -651,6 +663,322 @@ async fn selected_shared_cycle_from_genuine_v28_adds_exact_child_keys_without_co
             ),
         ],
         "shared children must not acquire the baseline owner mapping"
+    );
+}
+
+#[tokio::test]
+async fn migrated_primary_path_collision_retains_unproven_shared_item() {
+    let server = wiremock::MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("state.db");
+    let media = dir.path().join("media");
+    let dated = media.join(run_cycle_expected_date_dir());
+    std::fs::create_dir_all(&dated).unwrap();
+    let occupied = dated.join("collision.JPG");
+    let fresh = dated.join("fresh.JPG");
+    let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    let new_bytes = include_bytes!("../../../../tests/data/media/metadata.jpg");
+    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+    std::fs::write(&occupied, bytes).unwrap();
+    let modified = occupied.metadata().unwrap().modified().unwrap();
+    // No Shared receipt or mapping links this old Primary key to the current child.
+    let baseline = {
+        let conn = Connection::open(&database).unwrap();
+        crate::state::schema::migrate_genuine_v28(&conn).unwrap();
+        conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,added_at,size_bytes,media_type,status,downloaded_at,local_path,last_seen_at,source,local_checksum) VALUES(?1,'historical-primary','original',?2,'collision.JPG',1700000000,1690000000,?3,'photo','downloaded',1700000001,?4,1700000002,'icloud',?5)", rusqlite::params![PRIMARY, checksum, bytes.len() as i64, occupied.to_str().unwrap(), hex_sha256(bytes)]).unwrap();
+        baseline_six_fields(&conn)
+    };
+    let mut records = Vec::new();
+    for (name, body) in [
+        ("collision", bytes.as_slice()),
+        ("fresh", new_bytes.as_slice()),
+    ] {
+        let endpoint = format!("/{name}.jpg");
+        Mock::given(method("GET"))
+            .and(path(&endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+        records.extend(page_records(
+            SHARED,
+            &format!("master-{name}"),
+            &format!("asset-{name}"),
+            &format!("{name}.jpg"),
+            &format!("{}{endpoint}", server.uri()),
+            body,
+            &base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body)),
+        ));
+    }
+    let config = make_run_cycle_config();
+    let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+    for cycle in 0..2 {
+        let inner = open_current(&database).await;
+        if cycle == 1 {
+            inner
+                .make_selection_retry_due(fixture_owner(), "asset-collision".into())
+                .await
+                .unwrap();
+        }
+        let provider = Provider {
+            zone: SHARED.into(),
+            records: records.clone(),
+        };
+        let mut shared = make_run_cycle_library_state_with_album(
+            SHARED,
+            SHARED_TOKEN,
+            owned_album(&inner, provider.clone()),
+        );
+        shared.library = PhotoLibrary::new_stub_with_zone(Box::new(provider), SHARED);
+        let store: Arc<dyn download::DownloadStore> = inner.clone();
+        let builder = make_run_cycle_download_config_builder(&media, store.clone());
+        let result = crate::sync_cycle::run_cycle(
+            &[&shared],
+            &config,
+            Some(store.as_ref()),
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let gets = |endpoint| requests.iter().filter(|r| r.url.path() == endpoint).count();
+        assert_eq!(
+            gets("/fresh.jpg"),
+            1,
+            "new photo must transfer exactly once across both cycles"
+        );
+        assert_eq!(std::fs::read(&fresh).unwrap(), new_bytes);
+        assert_eq!(std::fs::read(&occupied).unwrap(), bytes);
+        assert_eq!(occupied.metadata().unwrap().modified().unwrap(), modified);
+        let conn = inner.acquire_lock("migration collision proof").unwrap();
+        assert_eq!(
+            existing_baseline_fields(&conn, &baseline),
+            baseline,
+            "cycle {cycle}: the occupied Primary baseline changed"
+        );
+        let decisions = selection_decisions(&conn, "asset-collision");
+        assert!(
+            !decisions.is_empty(),
+            "cycle {cycle}: the ambiguous Shared child must retain a durable decision"
+        );
+        for (admission, reason) in &decisions {
+            assert_eq!(
+                (admission.as_str(), reason.as_str()),
+                ("deferred", "ambiguous_primary_archive_path"),
+                "cycle {cycle}: exact durable deferral for the occupied Primary archive path"
+            );
+        }
+        let shared_keys: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM assets WHERE library=?1 AND id='asset-collision'",
+                [SHARED],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            shared_keys, 0,
+            "cycle {cycle}: a deferred Shared child must not acquire catalogue completion keys"
+        );
+        let admitted_destinations: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM provider_active_destinations \
+                 WHERE child='asset-collision' AND admitted=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            admitted_destinations, 0,
+            "cycle {cycle}: a deferred Shared decision must not admit a destination"
+        );
+        assert_eq!(
+            gets("/collision.jpg"),
+            0,
+            "cycle {cycle}: ambiguous transfer"
+        );
+        assert_eq!(media_files(&media), [occupied.clone(), fresh.clone()]);
+        assert!(
+            result.failed_count > 0,
+            "unresolved selected work must be reported"
+        );
+    }
+}
+
+#[tokio::test]
+async fn migrated_primary_path_collision_with_distinct_provider_bytes_suffixes_shared_child() {
+    let server = wiremock::MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("state.db");
+    let media = dir.path().join("media");
+    let dated = media.join(run_cycle_expected_date_dir());
+    std::fs::create_dir_all(&dated).unwrap();
+    let occupied = dated.join("collision.JPG");
+    let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    let occupied_bytes = include_bytes!("../../../../tests/data/media/metadata.jpg");
+    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+    let occupied_checksum =
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(occupied_bytes));
+    let expected_hex = hex_sha256(bytes);
+    // A different provider size selects the historical size-dedup sibling.
+    let suffixed = dated.join(format!("collision-{}.JPG", bytes.len()));
+    assert_ne!(bytes.len(), occupied_bytes.len());
+    std::fs::write(&occupied, occupied_bytes).unwrap();
+    let modified = occupied.metadata().unwrap().modified().unwrap();
+    // The occupied Primary row keeps its own provider checksum and size, so the
+    // Shared child's identical path spelling is a distinct asset, not ownership
+    // ambiguity. Both rows still share one physical path candidate.
+    let baseline = {
+        let conn = Connection::open(&database).unwrap();
+        crate::state::schema::migrate_genuine_v28(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,added_at,\
+                 size_bytes,media_type,status,downloaded_at,local_path,last_seen_at,source,\
+                 local_checksum) \
+             VALUES(?1,'historical-primary','original',?2,'collision.JPG',1700000000,1690000000,\
+                 ?3,'photo','downloaded',1700000001,?4,1700000002,'icloud',?5)",
+            rusqlite::params![
+                PRIMARY,
+                occupied_checksum,
+                occupied_bytes.len() as i64,
+                occupied.to_str().unwrap(),
+                hex_sha256(occupied_bytes)
+            ],
+        )
+        .unwrap();
+        baseline_six_fields(&conn)
+    };
+    Mock::given(method("GET"))
+        .and(path("/collision.jpg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(bytes.as_slice())
+                .insert_header("content-type", "image/jpeg"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let url = format!("{}/collision.jpg", server.uri());
+    let records = page_records(
+        SHARED,
+        "master-collision",
+        "asset-collision",
+        "collision.jpg",
+        &url,
+        bytes,
+        &checksum,
+    );
+    let config = make_run_cycle_config();
+    let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+    for cycle in 0..2 {
+        let inner = open_current(&database).await;
+        let provider = Provider {
+            zone: SHARED.into(),
+            records: records.clone(),
+        };
+        let mut shared = make_run_cycle_library_state_with_album(
+            SHARED,
+            SHARED_TOKEN,
+            owned_album(&inner, provider.clone()),
+        );
+        shared.library = PhotoLibrary::new_stub_with_zone(Box::new(provider), SHARED);
+        let store: Arc<dyn download::DownloadStore> = inner.clone();
+        let builder = make_run_cycle_download_config_builder(&media, store.clone());
+        let result = crate::sync_cycle::run_cycle(
+            &[&shared],
+            &config,
+            Some(store.as_ref()),
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.stats.downloaded,
+            if cycle == 0 { 1 } else { 0 },
+            "cycle {cycle}: the distinct Shared child must transfer once and stay complete: {result:?}"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/collision.jpg")
+                .count(),
+            1,
+            "cycle {cycle}: the Shared child transfers exactly once across both runs"
+        );
+        assert_eq!(
+            std::fs::read(&occupied).unwrap().as_slice(),
+            occupied_bytes.as_slice(),
+            "cycle {cycle}: the occupied Primary original changed"
+        );
+        assert_eq!(
+            occupied.metadata().unwrap().modified().unwrap(),
+            modified,
+            "cycle {cycle}: the occupied Primary original was rewritten"
+        );
+        assert_eq!(
+            media_files(&media),
+            vec![suffixed.clone(), occupied.clone()],
+            "cycle {cycle}: only the suffixed Shared sibling may be added"
+        );
+        let conn = inner
+            .acquire_lock("distinct primary collision proof")
+            .unwrap();
+        assert_eq!(
+            existing_baseline_fields(&conn, &baseline),
+            baseline,
+            "cycle {cycle}: the occupied Primary baseline changed"
+        );
+        let primary_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM assets WHERE library=?1",
+                [PRIMARY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            primary_rows, 1,
+            "cycle {cycle}: the Shared child must not add Primary catalogue keys"
+        );
+        let decisions = selection_decisions(&conn, "asset-collision");
+        assert!(
+            !decisions.is_empty(),
+            "cycle {cycle}: the admitted Shared child must retain a durable decision"
+        );
+        assert!(
+            decisions
+                .iter()
+                .all(|(admission, reason)| admission.as_str() == "admitted" && reason.is_empty()),
+            "cycle {cycle}: a distinct occupied Primary path must admit the Shared child without an archive-path reason: {decisions:?}"
+        );
+        let row = query(
+            &conn,
+            "SELECT a.status,a.checksum,a.size_bytes,a.local_path,p.local_checksum \
+             FROM assets a JOIN asset_metadata_paths p USING(library,id,version_size,local_path) \
+             WHERE a.library='SharedSync-SYNTHETIC-KEYS' AND a.id='asset-collision'",
+        );
+        assert_eq!(
+            row,
+            vec![vec![
+                rusqlite::types::Value::Text("downloaded".into()),
+                rusqlite::types::Value::Text(checksum.clone()),
+                rusqlite::types::Value::Integer(bytes.len() as i64),
+                rusqlite::types::Value::Text(suffixed.to_string_lossy().into_owned()),
+                rusqlite::types::Value::Text(expected_hex.clone()),
+            ]],
+            "cycle {cycle}: the admitted Shared child must reference the suffixed sibling"
+        );
+    }
+    server.verify().await;
+    let conn = Connection::open(&database).unwrap();
+    assert_eq!(
+        existing_baseline_fields(&conn, &baseline),
+        baseline,
+        "the occupied Primary baseline changed after both runs"
     );
 }
 

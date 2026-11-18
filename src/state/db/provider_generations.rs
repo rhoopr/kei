@@ -587,6 +587,47 @@ pub(crate) struct GenerationProjection {
     pub(crate) reason: String,
 }
 
+pub(crate) struct AdmissionChecks {
+    pub(crate) capacity: u64,
+    pub(crate) layouts: Vec<super::primary_layout::LayoutOperation>,
+    /// Occupied unsuffixed paths for newly proposed unfiled Shared collisions.
+    pub(crate) archive_paths: Vec<(crate::state::VersionSizeKey, std::path::PathBuf)>,
+}
+
+fn ambiguous_primary_archive_path(
+    conn: &Connection,
+    records: &[AssetRecord],
+    checks: &[(crate::state::VersionSizeKey, std::path::PathBuf)],
+) -> Result<bool, StateError> {
+    for (version, path) in checks {
+        let record = records
+            .iter()
+            .find(|r| r.version_size == *version)
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        // A scoped current destination identifies an independently owned Primary
+        // copy. A pre-baseline catalog row alone does not. Never infer a Shared
+        // owner from the provider checksum or from the occupied path.
+        let ambiguous = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM assets a WHERE a.local_path=?1
+                AND a.library='PrimarySync' AND a.version_size=?2 AND a.status='downloaded'
+                AND a.checksum=?3 AND a.size_bytes=?4
+                AND NOT EXISTS(SELECT 1 FROM provider_active_destinations w
+                    WHERE w.library=a.library AND w.asset_id=a.id AND w.version_size=a.version_size
+                    AND w.compat_path=a.local_path AND w.checksum=a.checksum AND w.size_bytes=a.size_bytes
+                    AND w.admitted=1 AND w.verified_media=1))",
+            params![
+                path.to_string_lossy(), version.as_str(), record.checksum,
+                i64::try_from(record.size_bytes).map_err(|_overflow| StateError::ProviderSelectionInvalid)?
+            ],
+            |row| row.get(0),
+        )?;
+        if ambiguous {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn invalid<T>() -> Result<T, StateError> {
     Err(StateError::ProviderSelectionInvalid)
 }
@@ -2232,7 +2273,11 @@ impl SqliteStateDb {
             manifest,
             records,
             fresh_confirmation,
-            (capacity, Vec::new()),
+            AdmissionChecks {
+                capacity,
+                layouts: Vec::new(),
+                archive_paths: Vec::new(),
+            },
         )
         .await
     }
@@ -2247,9 +2292,13 @@ impl SqliteStateDb {
         manifest: ActiveDecision,
         records: Vec<AssetRecord>,
         fresh_confirmation: Option<Vec<u8>>,
-        limits_and_layouts: (u64, Vec<super::primary_layout::LayoutOperation>),
+        checks: AdmissionChecks,
     ) -> Result<GenerationProjection, StateError> {
-        let (capacity, layouts) = limits_and_layouts;
+        let AdmissionChecks {
+            capacity,
+            layouts,
+            archive_paths,
+        } = checks;
         self.with_conn_mut("projecting selection destinations",move|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
             let root=load_generation(&tx,&generation)?;
@@ -2310,6 +2359,9 @@ impl SqliteStateDb {
                 }
             }
             let mut reason=d.reason.clone();
+            if ambiguous_primary_archive_path(&tx, &records, &archive_paths)? {
+                reason = "ambiguous_primary_archive_path".to_owned();
+            }
             let mut staged = false;
             if existing.is_none() && !layouts.is_empty() && d.outcome == SelectionOutcome::Selected && d.reason.is_empty() {
                 let fresh = fresh_confirmation.as_deref().ok_or(StateError::ProviderWorkConflict)?;

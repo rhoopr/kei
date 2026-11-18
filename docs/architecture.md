@@ -724,6 +724,14 @@ replaying a newer inventory cannot seal an interrupted old window. Configuration
 or source changes create a distinct generation or require existing validated
 reseed. They cannot acknowledge omitted eligibility or old unresolved debt.
 
+For an unfiled Shared rendition with no established destination, a collision
+suffix can conceal an ambiguous migration match. If the unsuffixed path is
+occupied, admission checks downloaded Primary catalog rows at that exact path.
+A matching rendition, provider checksum and size without a verified Primary
+destination defers the Shared decision as `ambiguous_primary_archive_path`.
+It neither claims the original nor transfers a suffixed copy. Other children
+can finish, and an eligible retry checks the collision again.
+
 Named albums and smart folders keep independent physical copies even when their templates render the same directory. Current selection qualifies colliding filenames with the stable pass key and retains that exact destination on replay. Planning keeps each selected rendition eligible until its own destination is verified; adoption cannot skip it using another selected album or smart folder's path. Same-pass template drift and managed bindings retain their established paths. The immediate admission transaction checks competing album and smart-folder ownership before every transition to admitted, including confirmed selected declarations deferred by an earlier conflict. A conflict retains the frozen declaration; a racing producer with an unfrozen decision can replan once through the existing sibling guards. Historical shared-path declarations remain unchanged and trigger a successor inventory. Their original receipts and metadata work retain their existing owners. The declaration's `independent_album_copies` marker distinguishes current destination policy from historical replay without changing the user configuration fingerprint or adding a ledger. Unfiled behavior is unchanged.
 
 Destination media completion requires an actual confined file fingerprint and

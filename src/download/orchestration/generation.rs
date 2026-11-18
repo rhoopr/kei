@@ -25,7 +25,7 @@ use crate::icloud::photos::{
 };
 use crate::state::ReconciliationStateStore;
 use crate::state::db::provider_generations::{
-    ActiveDecision, ActiveGeneration, GenerationSpec, INDEPENDENT_ALBUM_COPIES,
+    ActiveDecision, ActiveGeneration, AdmissionChecks, GenerationSpec, INDEPENDENT_ALBUM_COPIES,
     MAX_GENERATION_BYTES,
 };
 use crate::state::db::provider_selection::{
@@ -986,6 +986,7 @@ impl SelectionRun {
             .await?;
         let mut destinations = Vec::new();
         let mut records = Vec::new();
+        let mut archive_paths = Vec::new();
         // A frozen historical RAW pair may use the opposite logical keys.
         // Recover that mapping from exact resource evidence, never current policy.
         let frozen_key = |provider, checksum: &str, size| -> Result<crate::state::VersionSizeKey> {
@@ -1041,6 +1042,7 @@ impl SelectionRun {
                     )
                     .await?;
                 let has_retained = retained.is_some();
+                let mut catalog_path = false;
                 let mut path = if planner.managed_layout_session().is_some() {
                     plan.tasks
                         .iter()
@@ -1067,6 +1069,7 @@ impl SelectionRun {
                     .verified_downloaded_path(asset, config, derived.version_size)
                     .await
                 {
+                    catalog_path = true;
                     path
                 } else if let Some(task) = plan
                     .tasks
@@ -1096,6 +1099,18 @@ impl SelectionRun {
                         || (!has_retained && self.colliding_album_parent(asset, config)))
                 {
                     path = planner.independent_album_path(&path, key, config).await?;
+                }
+                if config.primary_layout_pass_kind == Some(PassKind::Unfiled)
+                    && crate::icloud::photos::is_shared_zone(
+                        asset.source_zone().unwrap_or(&config.library),
+                    )
+                    && planner.managed_layout_session().is_none()
+                    && !has_retained
+                    && !catalog_path
+                    && path != derived.path
+                    && tokio::fs::try_exists(&derived.path).await?
+                {
+                    archive_paths.push((derived.version_size, derived.path.clone()));
                 }
                 let metadata = if previous
                     .as_ref()
@@ -1211,7 +1226,11 @@ impl SelectionRun {
                     manifest.clone(),
                     records.clone(),
                     fresh.clone(),
-                    (MAX_GENERATION_BYTES, layouts.clone()),
+                    AdmissionChecks {
+                        capacity: MAX_GENERATION_BYTES,
+                        layouts: layouts.clone(),
+                        archive_paths: archive_paths.clone(),
+                    },
                 )
                 .await;
             match projected {
