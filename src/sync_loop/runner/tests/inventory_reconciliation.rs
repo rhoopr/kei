@@ -25,6 +25,7 @@ use crate::sync_loop::test_support::{
     make_run_cycle_download_config_builder, make_run_cycle_library_state_with_passes,
     make_shared_session_for_run_cycle,
 };
+use crate::types::EditedNaming;
 use crate::{config, download, retry};
 
 const ZONE: &str = "SharedSync-INVENTORY";
@@ -33,10 +34,29 @@ const REQUEST: &str = "inventory_reconciliation_required:SharedSync-INVENTORY";
 const RECEIPT: &str = "recent_selection_recovery:SharedSync-INVENTORY";
 const BYTES: &[u8] = b"\xff\xd8\xff\xe0independent shared inventory media";
 
+type ScriptedDelta = (String, Vec<Value>, String);
+
 #[derive(Clone)]
 struct InventorySession {
     provider_owner: &'static str,
     records: Arc<HashMap<&'static str, Vec<Value>>>,
+    /// Provider state advanced by already-delivered observations. Appends are
+    /// ordered, so the latest record for a provider identity wins.
+    overlay: Arc<Mutex<Vec<Value>>>,
+    /// A provider edit applied when the already-read asset is looked up.
+    lookup_change: Arc<Mutex<Option<Vec<Value>>>>,
+    /// Raw records supplied to consecutive retained-cursor replays, one entry
+    /// per attempt. An empty attempt is the quiet convergence point.
+    replay_changes: Arc<Mutex<Vec<Vec<Value>>>>,
+    /// Records delivered by the first delta after the request retires.
+    post_checkpoint_changes: Arc<Mutex<Vec<Value>>>,
+    /// A provider edit applied when a later inventory page is requested.
+    page_change: Arc<Mutex<Option<Vec<Value>>>>,
+    change_at_offset: Option<u64>,
+    /// Per-page selection tokens for an ordinary first inventory.
+    query_tokens: Option<(&'static str, &'static str)>,
+    /// Cursor-specific selected-zone pages for the ordinary first-run proof.
+    delta_script: Arc<Mutex<Vec<ScriptedDelta>>>,
     displaced: Arc<AtomicBool>,
     unstable: Arc<AtomicBool>,
     unknown: bool,
@@ -47,6 +67,28 @@ struct InventorySession {
     replay_metadata: Option<(Arc<SqliteStateDb>, &'static str, &'static str)>,
     rank_calls: Arc<AtomicUsize>,
     trace: Arc<Mutex<Vec<String>>>,
+}
+
+impl InventorySession {
+    /// Prefer the most recently appended provider observation for each record.
+    fn apply_overlay(&self, records: Vec<Value>) -> Vec<Value> {
+        let overlay = self.overlay.lock().unwrap();
+        records
+            .into_iter()
+            .map(|record| {
+                overlay
+                    .iter()
+                    .rev()
+                    .find(|current| current["recordName"] == record["recordName"])
+                    .cloned()
+                    .unwrap_or(record)
+            })
+            .collect()
+    }
+
+    fn current_records(&self) -> Vec<Value> {
+        self.apply_overlay(self.records.values().flatten().cloned().collect::<Vec<_>>())
+    }
 }
 
 #[async_trait::async_trait]
@@ -70,7 +112,29 @@ impl PhotosSession for InventorySession {
                     "syncToken":"","moreComing":false}]}),
                 );
             }
+            let scripted_delta = {
+                let mut script = self.delta_script.lock().unwrap();
+                let position = script
+                    .iter()
+                    .position(|(boundary, _, _)| boundary == cursor);
+                position.map(|position| script.remove(position))
+            };
+            if let Some((_, records, token)) = scripted_delta {
+                self.overlay.lock().unwrap().extend(records.iter().cloned());
+                return Ok(
+                    json!({"zones":[{"zoneID":{"zoneName":ZONE,"ownerRecordName":self.provider_owner},
+                    "syncToken":token,"moreComing":false,"records":records}]}),
+                );
+            }
             let replay = cursor == "S";
+            let scripted_replay = if replay {
+                let mut pending = self.replay_changes.lock().unwrap();
+                (!pending.is_empty()).then(|| pending.remove(0))
+            } else {
+                None
+            };
+            let post_checkpoint = (cursor == "E")
+                .then(|| std::mem::take(&mut *self.post_checkpoint_changes.lock().unwrap()));
             let raw = if cursor == "P" && self.unresolved_initial {
                 vec![json!({"recordName":"unresolved-child","recordType":"CPLAsset","fields":{}})]
             } else if cursor == "P" && self.initial_changes {
@@ -78,6 +142,12 @@ impl PhotosSession for InventorySession {
                     .into_iter()
                     .flat_map(|id| self.records[id].clone())
                     .collect()
+            } else if let Some(records) = scripted_replay {
+                self.overlay.lock().unwrap().extend(records.iter().cloned());
+                records
+            } else if let Some(records) = post_checkpoint {
+                self.overlay.lock().unwrap().extend(records.iter().cloned());
+                records
             } else if replay && self.unstable.load(Ordering::SeqCst) {
                 if self.unknown {
                     vec![
@@ -89,6 +159,11 @@ impl PhotosSession for InventorySession {
             } else {
                 Vec::new()
             };
+            let successor = match cursor {
+                "P" => "S",
+                "S" => "E",
+                _ => "F",
+            };
             if replay && let Some(cancel) = &self.cancel_replay {
                 cancel.cancel();
             }
@@ -97,8 +172,7 @@ impl PhotosSession for InventorySession {
             }
             return Ok(
                 json!({"zones":[{"zoneID":{"zoneName":ZONE,"ownerRecordName":self.provider_owner},
-                "syncToken": if cursor == "P" { "S" } else { "E" },
-                "moreComing":false,"records":raw}]}),
+                "syncToken":successor,"moreComing":false,"records":raw}]}),
             );
         }
         if url.contains("/internal/records/query/batch") {
@@ -111,12 +185,25 @@ impl PhotosSession for InventorySession {
                 .iter()
                 .filter_map(|record| record["recordName"].as_str())
                 .collect();
+            // Apply a pending mutation when the already-read asset is looked up.
+            let change = {
+                let mut pending = self.lookup_change.lock().unwrap();
+                let matches = pending.as_ref().is_some_and(|change| {
+                    change.iter().any(|record| {
+                        requested.contains(&record["recordName"].as_str().unwrap_or_default())
+                    })
+                });
+                matches.then(|| pending.take().unwrap())
+            };
+            if let Some(change) = change {
+                self.overlay.lock().unwrap().extend(change);
+            }
             let records: Vec<_> = self
-                .records
-                .values()
-                .flatten()
-                .filter(|record| requested.contains(&record["recordName"].as_str().unwrap()))
-                .cloned()
+                .current_records()
+                .into_iter()
+                .filter(|record| {
+                    requested.contains(&record["recordName"].as_str().unwrap_or_default())
+                })
                 .collect();
             return Ok(json!({"records":records}));
         }
@@ -130,6 +217,11 @@ impl PhotosSession for InventorySession {
                 .and_then(|filter| filter["fieldValue"]["value"].as_u64())
                 .unwrap();
             self.trace.lock().unwrap().push(format!("rank:{offset}"));
+            if self.change_at_offset == Some(offset)
+                && let Some(records) = self.page_change.lock().unwrap().take()
+            {
+                self.overlay.lock().unwrap().extend(records);
+            }
             let count = body["resultsLimit"].as_u64().unwrap() / 2;
             if offset == 2 && self.unstable.load(Ordering::SeqCst) && !self.unknown {
                 self.displaced.store(true, Ordering::SeqCst);
@@ -147,7 +239,13 @@ impl PhotosSession for InventorySession {
             {
                 records.extend(self.records[*id].clone());
             }
-            return Ok(json!({"records":records,"syncToken":"opaque-query-token"}));
+            let token = self
+                .query_tokens
+                .map_or("opaque-query-token", |(first, later)| {
+                    if offset == 0 { first } else { later }
+                });
+            let records = self.apply_overlay(records);
+            return Ok(json!({"records":records,"syncToken":token}));
         }
         anyhow::bail!("unexpected synthetic inventory endpoint")
     }
@@ -168,8 +266,87 @@ struct Fixture {
     receipt: Vec<u8>,
 }
 
+fn edit_bytes(id: &str, version: u8) -> Vec<u8> {
+    let mut bytes = b"\xff\xd8\xff\xe0independent inventory edit ".to_vec();
+    bytes.extend_from_slice(id.as_bytes());
+    bytes.extend_from_slice(format!(" v{version}").as_bytes());
+    bytes
+}
+
+async fn mount_edit(server: &MockServer, id: &str, version: u8) {
+    let bytes = edit_bytes(id, version);
+    Mock::given(method("GET"))
+        .and(path(format!("/{id}-edit-v{version}.jpg")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
 impl Fixture {
     async fn new(receipt: &[u8], hash: Option<&str>, unstable: bool, unknown: bool) -> Self {
+        Self::build(
+            receipt,
+            hash,
+            unstable,
+            unknown,
+            EditedNaming::Suffix,
+            false,
+            true,
+        )
+        .await
+    }
+
+    async fn edited_primary(receipt: &[u8], hash: Option<&str>) -> Self {
+        Self::build(
+            receipt,
+            hash,
+            false,
+            false,
+            EditedNaming::Primary,
+            true,
+            true,
+        )
+        .await
+    }
+
+    async fn ordinary_primary() -> Self {
+        let mut fixture =
+            Self::build(&[], None, false, false, EditedNaming::Primary, true, false).await;
+        let change = fixture.changed_edit_records("A", 1);
+        *fixture.session.page_change.lock().unwrap() = Some(change.clone());
+        fixture.session.change_at_offset = Some(2);
+        fixture.session.query_tokens = Some(("first-page-token", "post-change-token"));
+        *fixture.session.delta_script.lock().unwrap() = vec![
+            (
+                "first-page-token".to_owned(),
+                change,
+                "post-change-token".to_owned(),
+            ),
+            (
+                "post-change-token".to_owned(),
+                Vec::new(),
+                "quiet-token".to_owned(),
+            ),
+            (
+                "quiet-token".to_owned(),
+                Vec::new(),
+                "steady-token".to_owned(),
+            ),
+        ];
+        mount_edit(&fixture.server, "A", 1).await;
+        fixture
+    }
+
+    async fn build(
+        receipt: &[u8],
+        hash: Option<&str>,
+        unstable: bool,
+        unknown: bool,
+        naming: EditedNaming,
+        edits: bool,
+        guarded: bool,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("owned.db");
         let media = root.path().join("media");
@@ -182,19 +359,20 @@ impl Fixture {
         )
         .unwrap();
         let db = SqliteStateDb::open_owned(&path, &owner).await.unwrap();
-        db.set_metadata(CURSOR, "P").await.unwrap();
         let mut config = make_run_cycle_config();
+        config.photos.edited_naming = naming;
         config.filters.selection.libraries =
             crate::selection::parse_library_selector(&[ZONE.into()]).unwrap();
-        if let Some(hash) = hash {
-            let value = if hash == "matching" {
-                download::compute_config_hash(&config)
-            } else {
-                hash.to_owned()
-            };
-            db.set_metadata(ENUM_CONFIG_HASH_KEY, &value).await.unwrap();
-        }
-        {
+        if guarded {
+            db.set_metadata(CURSOR, "P").await.unwrap();
+            if let Some(hash) = hash {
+                let value = if hash == "matching" {
+                    download::compute_config_hash(&config)
+                } else {
+                    hash.to_owned()
+                };
+                db.set_metadata(ENUM_CONFIG_HASH_KEY, &value).await.unwrap();
+            }
             let conn = db.acquire_lock("seed count-era upgrade").unwrap();
             conn.execute(
                 "INSERT INTO metadata(key,value) VALUES(?1,?2)",
@@ -225,6 +403,21 @@ impl Fixture {
                 &checksum,
             );
             page["records"][0]["fields"]["filenameEnc"]["value"] = json!(format!("{id}.jpg"));
+            if edits {
+                mount_edit(&server, id, 0).await;
+                let edit = edit_bytes(id, 0);
+                let checksum =
+                    base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&edit));
+                page["records"][0]["fields"]["resJPEGFullRes"] = json!({"value":{
+                    "size":edit.len(),
+                    "downloadURL":format!("{}/{id}-edit-v0.jpg",server.uri()),
+                    "fileChecksum":checksum,
+                }});
+                page["records"][0]["fields"]["resJPEGFullFileType"] =
+                    json!({"value":"public.jpeg"});
+                page["records"][0]["fields"]["adjustmentRenderType"] =
+                    json!({"value":1,"type":"INT64"});
+            }
             records.insert(id, page["records"].as_array().unwrap().clone());
         }
         Self {
@@ -238,6 +431,14 @@ impl Fixture {
             session: InventorySession {
                 provider_owner: "shared-owner",
                 records: Arc::new(records),
+                overlay: Arc::new(Mutex::new(Vec::new())),
+                lookup_change: Arc::new(Mutex::new(None)),
+                replay_changes: Arc::new(Mutex::new(Vec::new())),
+                post_checkpoint_changes: Arc::new(Mutex::new(Vec::new())),
+                page_change: Arc::new(Mutex::new(None)),
+                change_at_offset: None,
+                query_tokens: None,
+                delta_script: Arc::new(Mutex::new(Vec::new())),
                 displaced: Arc::new(AtomicBool::new(false)),
                 unstable: Arc::new(AtomicBool::new(unstable)),
                 unknown,
@@ -305,10 +506,14 @@ impl Fixture {
             }],
         );
         let base = make_run_cycle_download_config_builder(&self.media, db.clone());
+        let selected_edited_naming = self.config.photos.edited_naming;
+        let selected_edited = self.config.photos.edited;
         let build = |mode, excludes, groups, zone| {
             let mut config = base(mode, excludes, groups, zone);
             let config_mut = Arc::make_mut(&mut config);
             config_mut.retry.max_retries = 0;
+            config_mut.edited = selected_edited;
+            config_mut.edited_naming = selected_edited_naming;
             config
         };
         let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
@@ -357,6 +562,70 @@ impl Fixture {
             .iter()
             .filter(|request| request.url.path() == format!("/{id}.jpg"))
             .count()
+    }
+
+    async fn edit_gets(&self, id: &str, version: u8) -> usize {
+        self.server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == format!("/{id}-edit-v{version}.jpg"))
+            .count()
+    }
+
+    fn changed_edit_records(&self, id: &'static str, version: u8) -> Vec<Value> {
+        let bytes = edit_bytes(id, version);
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes));
+        let mut records = self.session.records[id].clone();
+        records[0]["fields"]["resJPEGFullRes"] = json!({"value":{
+            "size":bytes.len(),
+            "downloadURL":format!("{}/{id}-edit-v{version}.jpg",self.server.uri()),
+            "fileChecksum":checksum,
+        }});
+        for record in &mut records {
+            record["recordChangeTag"] = json!(format!("{id}-edit-v{version}"));
+        }
+        records
+    }
+
+    fn media_file(&self, name: &str) -> PathBuf {
+        let mut pending = vec![self.media.clone()];
+        let mut matches = Vec::new();
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.file_name().is_some_and(|file| file == name) {
+                    matches.push(path);
+                }
+            }
+        }
+        // Historical `.kei-history` copies share the filename; the current
+        // publication is the shallowest match.
+        matches.sort_by_key(|path| (path.components().count(), path.clone()));
+        matches
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("media file {name} was not published"))
+    }
+
+    async fn media_names(&self) -> Vec<String> {
+        let mut pending = vec![self.media.clone()];
+        let mut names = Vec::new();
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                    names.push(name.to_owned());
+                }
+            }
+        }
+        names.sort();
+        names
     }
 
     async fn quiet_twice(&self, named: bool) {
@@ -1048,4 +1317,576 @@ async fn inventory_fixed_date_coverage_retires_without_claiming_unbounded_checkp
     fixture.preserved(false).await;
     assert_eq!(fixture.server.received_requests().await.unwrap().len(), 0);
     assert_eq!(db.get_metadata(CURSOR).await.unwrap().as_deref(), Some("P"));
+}
+
+#[tokio::test]
+async fn inventory_primary_multipage_repeated_zone_changes_converge_then_incremental_once() {
+    let fixture =
+        Fixture::edited_primary(b"multipage quiet-window receipt", Some("matching")).await;
+    // Two consecutive retained-cursor attempts observe the same selected-zone
+    // change; the third is quiet. The next delta after convergence carries a
+    // separate edit that must arrive exactly once.
+    let repeated = fixture.changed_edit_records("A", 1);
+    *fixture.session.replay_changes.lock().unwrap() = vec![repeated.clone(), repeated, Vec::new()];
+    mount_edit(&fixture.server, "A", 1).await;
+    let later = fixture.changed_edit_records("B", 2);
+    *fixture.session.post_checkpoint_changes.lock().unwrap() = later;
+    mount_edit(&fixture.server, "B", 2).await;
+
+    for attempt in 1..=2 {
+        let result = fixture.cycle(false, CancellationToken::new()).await;
+        assert_eq!(
+            result.failed_count, 0,
+            "attempt {attempt}: {:?}",
+            result.stats
+        );
+        assert!(
+            !result.db_sync_token_advance_safe,
+            "attempt {attempt}: a changed replay cannot certify the baseline: {:?}",
+            result.stats
+        );
+        fixture.preserved(true).await;
+        assert_eq!(
+            fixture
+                .open()
+                .await
+                .get_metadata(CURSOR)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("P"),
+            "attempt {attempt} must retain the trusted cursor"
+        );
+        let current = std::fs::read(fixture.media_file("A.JPG")).unwrap();
+        assert!(
+            current == edit_bytes("A", 0) || current == edit_bytes("A", 1),
+            "attempt {attempt} must publish a complete observed edit"
+        );
+        assert_eq!(
+            std::fs::read(fixture.media_file("A_original.JPG")).unwrap(),
+            BYTES,
+            "attempt {attempt} must retain the original archive"
+        );
+        assert!(
+            !fixture
+                .media_names()
+                .await
+                .iter()
+                .any(|name| name.contains("_edited")),
+            "primary naming must not add an edited suffix"
+        );
+    }
+    assert_eq!(
+        std::fs::read(fixture.media_file("A.JPG")).unwrap(),
+        edit_bytes("A", 1),
+        "the changed replay item must not be skipped across attempts"
+    );
+    assert!(
+        fixture.media_snapshot().iter().any(|(path, (bytes, _))| {
+            path.to_string_lossy().contains(".kei-history")
+                && path.file_name().is_some_and(|name| name == "A.JPG")
+                && *bytes == edit_bytes("A", 0)
+        }),
+        "the displaced primary edit must remain preserved"
+    );
+    for id in ["B", "C", "D"] {
+        assert_eq!(
+            std::fs::read(fixture.media_file(&format!("{id}.JPG"))).unwrap(),
+            edit_bytes(id, 0),
+            "{id} base edit must remain published"
+        );
+        assert_eq!(
+            std::fs::read(fixture.media_file(&format!("{id}_original.JPG"))).unwrap(),
+            BYTES,
+            "{id} original archive must remain published"
+        );
+    }
+    assert_eq!(
+        fixture.edit_gets("A", 1).await,
+        1,
+        "a repeated provider observation must not transfer the edit again"
+    );
+    assert_eq!(fixture.gets("A").await, 1);
+    let trace = fixture.session.trace.lock().unwrap().clone();
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|entry| entry.as_str() == "rank:0")
+            .count(),
+        2,
+        "both guarded attempts must traverse the first inventory page: {trace:?}"
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|entry| entry.as_str() == "rank:2")
+            .count(),
+        2,
+        "both guarded attempts must traverse the second inventory page: {trace:?}"
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|entry| entry.as_str() == "delta:S")
+            .count(),
+        2,
+        "both guarded attempts must replay the successor boundary: {trace:?}"
+    );
+
+    let quiet = fixture.cycle(false, CancellationToken::new()).await;
+    assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+    assert!(quiet.db_sync_token_advance_safe, "{:?}", quiet.stats);
+    assert_eq!(
+        quiet.stats.downloaded, 0,
+        "convergence must not repeat completed transfers: {:?}",
+        quiet.stats
+    );
+    fixture.preserved(false).await;
+    let reopened = fixture.open().await;
+    assert_eq!(
+        reopened.get_metadata(CURSOR).await.unwrap().as_deref(),
+        Some("E")
+    );
+    assert!(reopened.get_metadata(REQUEST).await.unwrap().is_none());
+    drop(reopened);
+    // The quiet attempt completed the third multi-page inventory before it
+    // qualified, and no later cycle repeats it.
+    let trace = fixture.session.trace.lock().unwrap().clone();
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|entry| entry.as_str() == "rank:0")
+            .count(),
+        3
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|entry| entry.as_str() == "rank:2")
+            .count(),
+        3
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|entry| entry.as_str() == "delta:P")
+            .count(),
+        3
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|entry| entry.as_str() == "delta:S")
+            .count(),
+        3
+    );
+
+    let changed = fixture.cycle(false, CancellationToken::new()).await;
+    assert_eq!(changed.failed_count, 0, "{:?}", changed.stats);
+    assert!(changed.db_sync_token_advance_safe, "{:?}", changed.stats);
+    assert_eq!(
+        std::fs::read(fixture.media_file("B.JPG")).unwrap(),
+        edit_bytes("B", 2),
+        "the changed item observed after convergence must not be skipped"
+    );
+    assert_eq!(
+        std::fs::read(fixture.media_file("B_original.JPG")).unwrap(),
+        BYTES
+    );
+    assert_eq!(
+        fixture.edit_gets("B", 2).await,
+        1,
+        "the post-convergence change must transfer exactly once"
+    );
+    assert_eq!(
+        fixture
+            .open()
+            .await
+            .get_metadata(CURSOR)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("F")
+    );
+    assert_eq!(
+        fixture
+            .session
+            .trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.as_str() == "delta:E")
+            .count(),
+        1,
+        "the changed cycle must read the post-qualification successor"
+    );
+    for id in ["A", "B", "C", "D"] {
+        assert_eq!(
+            fixture.gets(id).await,
+            1,
+            "{id} original must transfer once"
+        );
+        assert_eq!(
+            fixture.edit_gets(id, 0).await,
+            1,
+            "{id} initial edit must transfer once"
+        );
+    }
+    let snapshot = fixture.media_snapshot();
+    let requests = fixture.server.received_requests().await.unwrap().len();
+    let steady = fixture.cycle(false, CancellationToken::new()).await;
+    assert_eq!(steady.failed_count, 0, "{:?}", steady.stats);
+    assert!(steady.db_sync_token_advance_safe, "{:?}", steady.stats);
+    assert_eq!(steady.stats.downloaded, 0);
+    assert_eq!(
+        fixture.media_snapshot(),
+        snapshot,
+        "quiet reopen changed files"
+    );
+    assert_eq!(
+        fixture.server.received_requests().await.unwrap().len(),
+        requests
+    );
+    assert_eq!(fixture.edit_gets("A", 1).await, 1);
+    assert_eq!(fixture.edit_gets("B", 2).await, 1);
+    assert_eq!(
+        fixture
+            .open()
+            .await
+            .get_metadata(CURSOR)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("F"),
+        "the quiet cycle must retain the incremental successor"
+    );
+    assert_eq!(
+        fixture
+            .session
+            .trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.as_str() == "delta:F")
+            .count(),
+        1,
+        "the quiet cycle must not replay the baseline or an older boundary"
+    );
+}
+
+#[tokio::test]
+async fn first_sync_page_boundary_edit_is_not_skipped_then_reopened_incremental_is_quiet() {
+    let fixture = Fixture::ordinary_primary().await;
+    let first = fixture.cycle(false, CancellationToken::new()).await;
+    assert_eq!(
+        first.stats.full_enumeration_reason,
+        Some(download::FullEnumerationReason::NoStoredToken)
+    );
+    let first_names = fixture.media_names().await;
+    if first_names.iter().any(|name| name == "A.JPG") {
+        assert_eq!(
+            std::fs::read(fixture.media_file("A.JPG")).unwrap(),
+            edit_bytes("A", 1),
+            "a first-sync publication must use the post-change edit"
+        );
+        assert_eq!(
+            std::fs::read(fixture.media_file("A_original.JPG")).unwrap(),
+            BYTES
+        );
+    } else {
+        assert!(
+            !first_names.iter().any(|name| name == "A_original.JPG"),
+            "a withheld family must not publish a partial archive: {first_names:?}"
+        );
+    }
+    for id in ["B", "C", "D"] {
+        assert_eq!(
+            std::fs::read(fixture.media_file(&format!("{id}.JPG"))).unwrap(),
+            edit_bytes(id, 0),
+            "{id} must publish the stable first-page state"
+        );
+        assert_eq!(
+            std::fs::read(fixture.media_file(&format!("{id}_original.JPG"))).unwrap(),
+            BYTES
+        );
+    }
+    let db = fixture.open().await;
+    assert!(
+        db.get_metadata(REQUEST).await.unwrap().is_none(),
+        "an ordinary first sync must not seed a reconciliation request"
+    );
+    let first_checkpoint = db.get_metadata(CURSOR).await.unwrap();
+    // Model elapsed scheduling time, not a fault repair: the first refusal
+    // retains an identity retry deadline.
+    db.make_selection_retry_due(fixture.owner.clone(), "asset-A".to_owned())
+        .await
+        .unwrap();
+    drop(db);
+
+    let rank_calls = || {
+        fixture
+            .session
+            .trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.starts_with("rank:"))
+            .count()
+    };
+    let ranks_before = rank_calls();
+    let next = fixture.cycle(false, CancellationToken::new()).await;
+    assert_eq!(
+        next.failed_count, 0,
+        "first checkpoint {first_checkpoint:?}; the eligible retry must publish \
+         the changed family instead of re-deferring it: {:?}",
+        next.stats
+    );
+    assert!(next.db_sync_token_advance_safe, "{:?}", next.stats);
+    assert_eq!(
+        std::fs::read(fixture.media_file("A.JPG")).unwrap(),
+        edit_bytes("A", 1),
+        "the edit observed between inventory pages must not be skipped"
+    );
+    assert_eq!(
+        std::fs::read(fixture.media_file("A_original.JPG")).unwrap(),
+        BYTES
+    );
+    assert_eq!(
+        fixture.edit_gets("A", 1).await,
+        1,
+        "the boundary edit must transfer exactly once"
+    );
+    assert_eq!(
+        fixture.gets("A").await,
+        1,
+        "the recovered original must transfer once"
+    );
+    for id in ["B", "C", "D"] {
+        assert_eq!(
+            fixture.gets(id).await,
+            1,
+            "{id} original must not transfer again"
+        );
+        assert_eq!(
+            fixture.edit_gets(id, 0).await,
+            1,
+            "{id} edit must not transfer again"
+        );
+    }
+    let saved = fixture.open().await.get_metadata(CURSOR).await.unwrap();
+    assert!(
+        saved.is_some(),
+        "the eligible recovery must save the checkpoint it certified"
+    );
+    let ranks_after_recovery = rank_calls();
+    if first_checkpoint.is_none() {
+        assert!(
+            ranks_after_recovery > ranks_before,
+            "without a saved cursor the eligible retry must re-enumerate"
+        );
+    } else {
+        assert_eq!(
+            ranks_after_recovery, ranks_before,
+            "a saved checkpoint must resume incrementally"
+        );
+    }
+
+    let snapshot = fixture.media_snapshot();
+    let requests = fixture.server.received_requests().await.unwrap().len();
+    let quiet = fixture.cycle(false, CancellationToken::new()).await;
+    assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+    assert!(quiet.db_sync_token_advance_safe, "{:?}", quiet.stats);
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(
+        rank_calls(),
+        ranks_after_recovery,
+        "a saved checkpoint must make the reopened operation incremental"
+    );
+    assert_eq!(
+        fixture.media_snapshot(),
+        snapshot,
+        "reopened quiet sync changed files"
+    );
+    assert_eq!(
+        fixture.server.received_requests().await.unwrap().len(),
+        requests
+    );
+    assert_eq!(fixture.edit_gets("A", 1).await, 1);
+}
+
+#[tokio::test]
+async fn first_sync_second_boundary_mutation_holds_then_stable_retry_recovers_without_peers() {
+    let fixture = Fixture::ordinary_primary().await;
+    let first = fixture.cycle(false, CancellationToken::new()).await;
+    assert_eq!(
+        first.stats.full_enumeration_reason,
+        Some(download::FullEnumerationReason::NoStoredToken)
+    );
+    for id in ["B", "C", "D"] {
+        assert_eq!(
+            std::fs::read(fixture.media_file(&format!("{id}.JPG"))).unwrap(),
+            edit_bytes(id, 0),
+            "{id} must publish the stable first-page state"
+        );
+        assert_eq!(
+            std::fs::read(fixture.media_file(&format!("{id}_original.JPG"))).unwrap(),
+            BYTES
+        );
+    }
+    let first_checkpoint = fixture.open().await.get_metadata(CURSOR).await.unwrap();
+    assert!(
+        first_checkpoint.is_none(),
+        "the first-sync boundary mutation must not certify a checkpoint"
+    );
+    // The first-sync mutation is already in the provider overlay. Drop its
+    // scripted replay so a stale v1 page cannot overwrite the lookup-observed
+    // second edit.
+    fixture.session.delta_script.lock().unwrap().clear();
+    let db = fixture.open().await;
+    db.make_selection_retry_due(fixture.owner.clone(), "asset-A".to_owned())
+        .await
+        .unwrap();
+    drop(db);
+
+    // Mutate A again after the eligible retry reads it, but before its exact
+    // lookup. The lookup must observe the newest edit, not the inventory read.
+    let changed = fixture.changed_edit_records("A", 2);
+    *fixture.session.lookup_change.lock().unwrap() = Some(changed);
+    mount_edit(&fixture.server, "A", 2).await;
+
+    let held = fixture.cycle(false, CancellationToken::new()).await;
+    assert_eq!(
+        fixture.edit_gets("A", 2).await,
+        0,
+        "a mutation after the retry read must not transfer the unverified edit"
+    );
+    let held_names = fixture.media_names().await;
+    if held_names.iter().any(|name| name == "A.JPG") {
+        assert_eq!(
+            std::fs::read(fixture.media_file("A_original.JPG")).unwrap(),
+            BYTES,
+            "a published family must retain its original archive"
+        );
+        let current = std::fs::read(fixture.media_file("A.JPG")).unwrap();
+        assert!(
+            current == edit_bytes("A", 0) || current == edit_bytes("A", 1),
+            "the second mutation must not publish over complete observed evidence"
+        );
+    } else {
+        assert!(
+            !held_names.iter().any(|name| name == "A_original.JPG"),
+            "a withheld family must not publish a partial archive: {held_names:?}"
+        );
+    }
+    assert_eq!(
+        fixture.open().await.get_metadata(CURSOR).await.unwrap(),
+        first_checkpoint,
+        "a second observed mutation must not certify a checkpoint: {:?}",
+        held.stats
+    );
+    let deferred = fixture
+        .open()
+        .await
+        .acquire_lock("second mutation retains retry evidence")
+        .unwrap()
+        .query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM provider_active_decisions \
+             WHERE child='asset-A' AND admission='deferred' AND next_retry_at > 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        deferred > 0,
+        "the refused retry must remain durable and not immediately due"
+    );
+    for id in ["B", "C", "D"] {
+        assert_eq!(
+            fixture.gets(id).await,
+            1,
+            "{id} original must not transfer on the held retry"
+        );
+        assert_eq!(
+            fixture.edit_gets(id, 0).await,
+            1,
+            "{id} edit must not transfer on the held retry"
+        );
+    }
+
+    // A stable, eligible retry now observes the same edit from inventory and
+    // lookup and must recover the family without refreshing healthy peers.
+    let db = fixture.open().await;
+    db.make_selection_retry_due(fixture.owner.clone(), "asset-A".to_owned())
+        .await
+        .unwrap();
+    drop(db);
+    let recovered = fixture.cycle(false, CancellationToken::new()).await;
+    assert_eq!(recovered.failed_count, 0, "{recovered:?}");
+    assert!(
+        recovered.db_sync_token_advance_safe,
+        "{:?}",
+        recovered.stats
+    );
+    assert_eq!(
+        std::fs::read(fixture.media_file("A.JPG")).unwrap(),
+        edit_bytes("A", 2),
+        "the stable retry must publish the newest complete edit"
+    );
+    assert_eq!(
+        std::fs::read(fixture.media_file("A_original.JPG")).unwrap(),
+        BYTES
+    );
+    assert_eq!(fixture.edit_gets("A", 2).await, 1);
+    assert_eq!(fixture.gets("A").await, 1);
+    for id in ["B", "C", "D"] {
+        assert_eq!(
+            fixture.gets(id).await,
+            1,
+            "{id} original must stay shortcut"
+        );
+        assert_eq!(
+            fixture.edit_gets(id, 0).await,
+            1,
+            "{id} edit must stay shortcut"
+        );
+    }
+    assert!(
+        fixture
+            .open()
+            .await
+            .get_metadata(CURSOR)
+            .await
+            .unwrap()
+            .is_some(),
+        "the stable recovery must save the checkpoint it certified"
+    );
+
+    let rank_calls = || {
+        fixture
+            .session
+            .trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.starts_with("rank:"))
+            .count()
+    };
+    let ranks = rank_calls();
+    let snapshot = fixture.media_snapshot();
+    let requests = fixture.server.received_requests().await.unwrap().len();
+    let quiet = fixture.cycle(false, CancellationToken::new()).await;
+    assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+    assert!(quiet.db_sync_token_advance_safe, "{:?}", quiet.stats);
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(
+        rank_calls(),
+        ranks,
+        "the saved checkpoint must make the reopened operation incremental"
+    );
+    assert_eq!(fixture.media_snapshot(), snapshot);
+    assert_eq!(
+        fixture.server.received_requests().await.unwrap().len(),
+        requests
+    );
+    assert_eq!(fixture.edit_gets("A", 2).await, 1);
 }

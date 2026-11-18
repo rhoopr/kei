@@ -328,6 +328,7 @@ pub(crate) async fn context(
 pub(in crate::download) struct SelectionConfirmation {
     retained: Vec<u8>,
     fresh: Option<Vec<u8>>,
+    retry_observation: Option<Arc<PhotoAsset>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -793,7 +794,7 @@ impl SelectionRun {
         {
             return Err(SelectionRetryDeferred.into());
         }
-        if let Some(previous) = self
+        let previous = self
             .capture
             .db
             .selection_decision(
@@ -802,7 +803,9 @@ impl SelectionRun {
                 key.to_owned(),
                 observed.asset_record_name().to_owned(),
             )
-            .await?
+            .await?;
+        let retry_inventory = self.phase == SelectionPhase::Inventory && previous.is_some();
+        if let Some(previous) = previous
             && let (Some(body), Some(master)) =
                 (previous.decision.confirmation, previous.decision.master)
         {
@@ -837,6 +840,7 @@ impl SelectionRun {
                     SelectionConfirmation {
                         retained: body,
                         fresh: Some(current.body),
+                        retry_observation: None,
                     },
                 ));
             }
@@ -845,6 +849,7 @@ impl SelectionRun {
                 SelectionConfirmation {
                     retained: body,
                     fresh: None,
+                    retry_observation: None,
                 },
             ));
         }
@@ -862,6 +867,7 @@ impl SelectionRun {
             SelectionConfirmation {
                 retained: current.body.clone(),
                 fresh: Some(current.body),
+                retry_observation: retry_inventory.then(|| Arc::new(observed.clone())),
             },
         ))
     }
@@ -966,6 +972,7 @@ impl SelectionRun {
         let SelectionConfirmation {
             retained: body,
             fresh,
+            retry_observation,
         } = confirmation;
         let reason = if plan.malformed_resource.is_some() {
             "malformed_current_resource"
@@ -1227,6 +1234,13 @@ impl SelectionRun {
                     records.clone(),
                     fresh.clone(),
                     AdmissionChecks {
+                        inventory_observation: retry_observation
+                            .as_ref()
+                            .filter(|_| {
+                                matches!(config.sync_mode, crate::download::SyncMode::Full)
+                                    && !config.inventory_reconciliation
+                            })
+                            .cloned(),
                         capacity: MAX_GENERATION_BYTES,
                         layouts: layouts.clone(),
                         archive_paths: archive_paths.clone(),

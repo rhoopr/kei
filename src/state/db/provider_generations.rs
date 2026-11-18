@@ -588,6 +588,8 @@ pub(crate) struct GenerationProjection {
 }
 
 pub(crate) struct AdmissionChecks {
+    /// Live rank observation, supplied only by full inventory after a paired lookup.
+    pub(crate) inventory_observation: Option<Arc<crate::icloud::photos::PhotoAsset>>,
     pub(crate) capacity: u64,
     pub(crate) layouts: Vec<super::primary_layout::LayoutOperation>,
     /// Occupied unsuffixed paths for newly proposed unfiled Shared collisions.
@@ -2013,6 +2015,20 @@ fn observed_asset(
     root: &ActiveGeneration,
     manifest: &ActiveDecision,
 ) -> Result<Option<crate::icloud::photos::PhotoAsset>, StateError> {
+    observed_asset_matching(
+        conn,
+        root,
+        manifest,
+        crate::icloud::photos::same_selected_facts,
+    )
+}
+
+fn observed_asset_matching(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    manifest: &ActiveDecision,
+    agrees: impl Fn(&crate::icloud::photos::PhotoAsset, &crate::icloud::photos::PhotoAsset) -> bool,
+) -> Result<Option<crate::icloud::photos::PhotoAsset>, StateError> {
     let mut observed = None;
     let mut pages = RankPages::new(conn, root);
     for source in &manifest.sources {
@@ -2058,7 +2074,7 @@ fn observed_asset(
                     return Ok(None);
                 };
                 if let Some(previous) = &observed
-                    && !crate::icloud::photos::same_selected_facts(previous, &asset)
+                    && !agrees(previous, &asset)
                 {
                     return Ok(None);
                 }
@@ -2067,6 +2083,44 @@ fn observed_asset(
         }
     }
     Ok(observed)
+}
+
+/// Revisions may differ during first inventory, but all retained observations
+/// must still identify the exact child and master in the original query zone.
+fn first_inventory_identity_matches(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    old: &ActiveDecision,
+    current: &crate::icloud::photos::PhotoAsset,
+) -> Result<bool, StateError> {
+    if old.decision.media_source.is_none() || old.media_zone(root) != &root.spec.zone {
+        return Ok(false);
+    }
+    let zone = root
+        .spec
+        .zone
+        .get("zoneName")
+        .and_then(Value::as_str)
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    let blocked: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM metadata WHERE key IN (?1,?2))",
+        params![
+            crate::sync_cycle::sync_token_key(zone),
+            crate::sync_cycle::inventory_reconciliation_key(zone)
+        ],
+        |row| row.get(0),
+    )?;
+    if blocked {
+        return Ok(false);
+    }
+    let same_identity = |a: &crate::icloud::photos::PhotoAsset,
+                         b: &crate::icloud::photos::PhotoAsset| {
+        a.asset_record_name() == b.asset_record_name()
+            && a.id() == b.id()
+            && a.source_zone() == b.source_zone()
+    };
+    Ok(observed_asset_matching(conn, root, old, same_identity)?
+        .is_some_and(|prior| same_identity(&prior, current)))
 }
 
 fn validate_records(
@@ -2315,6 +2369,7 @@ impl SqliteStateDb {
             records,
             fresh_confirmation,
             AdmissionChecks {
+                inventory_observation: None,
                 capacity,
                 layouts: Vec::new(),
                 archive_paths: Vec::new(),
@@ -2336,6 +2391,7 @@ impl SqliteStateDb {
         checks: AdmissionChecks,
     ) -> Result<GenerationProjection, StateError> {
         let AdmissionChecks {
+            inventory_observation,
             capacity,
             layouts,
             archive_paths,
@@ -2373,8 +2429,14 @@ impl SqliteStateDb {
                         };
                     }
                     if !membership_only && observed.as_ref().is_none_or(|observed|!crate::icloud::photos::same_selected_facts(observed,&current)) {
-                        defer_attempt(&tx,&root,&d.pass_key,&d.child)?;tx.commit()?;
-                        return Ok(GenerationProjection {admitted:false,reason:"original_selected_facts_unresolved".to_owned()});
+                        let recovered = !changed_basis && d.outcome == SelectionOutcome::Selected
+                            && fresh_confirmation.as_deref() == d.confirmation.as_deref()
+                            && inventory_observation.as_ref().is_some_and(|rank|crate::icloud::photos::same_selected_facts(rank,&current))
+                            && first_inventory_identity_matches(&tx,&root,&old,&current)?;
+                        if !recovered {
+                            defer_attempt(&tx,&root,&d.pass_key,&d.child)?;tx.commit()?;
+                            return Ok(GenerationProjection {admitted:false,reason:"original_selected_facts_unresolved".to_owned()});
+                        }
                     }
                 }
                 if changed_basis && !resolving && admission=="deferred" && old.decision.confirmation.is_some() {
