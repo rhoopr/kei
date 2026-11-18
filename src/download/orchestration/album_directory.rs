@@ -16,6 +16,12 @@ use crate::state::db::provider_selection::SelectionPath;
 
 use super::config::DownloadConfig;
 
+fn is_directory_collision(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+}
+
 fn sidecar(path: &Path) -> PathBuf {
     let mut path = path.as_os_str().to_owned();
     path.push(".xmp");
@@ -223,11 +229,7 @@ pub(super) async fn prepare(
                             .await?;
                         break;
                     }
-                    Err(error)
-                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                            error.kind() == std::io::ErrorKind::AlreadyExists
-                        }) =>
-                    {
+                    Err(error) if is_directory_collision(&error) => {
                         ordinal = ordinal
                             .checked_add(1)
                             .context("Album directory collision budget exhausted")?;
@@ -467,11 +469,7 @@ pub(super) async fn prepare(
                 )
                 .await;
                 if let Err(error) = installed {
-                    if op.directories.is_empty()
-                        && error
-                            .downcast_ref::<std::io::Error>()
-                            .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
-                    {
+                    if op.directories.is_empty() && is_directory_collision(&error) {
                         primary_layout::verify_album_directory(
                             &root,
                             &staged.to_path(),
@@ -552,10 +550,7 @@ pub(super) async fn prepare(
         )
         .await;
         if let Err(error) = moved {
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
-            {
+            if is_directory_collision(&error) {
                 let root = root.clone();
                 let old = op.old.path.to_path();
                 let identity = tokio::task::spawn_blocking(move || {
@@ -887,10 +882,7 @@ async fn prepare_projection(
         )
         .await;
         if let Err(error) = moved {
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
-            {
+            if is_directory_collision(&error) {
                 primary_layout::verify_album_directory(
                     &root,
                     &route.staged.to_path(),

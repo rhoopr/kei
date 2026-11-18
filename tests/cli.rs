@@ -1500,12 +1500,15 @@ fn kei_reconcile_every_n_cycles_env_var_ignored_by_help() {
 }
 
 #[test]
-fn reconcile_help_mentions_truncated_files() {
+fn reconcile_help_explains_explicit_damage_confirmation() {
     common::cmd()
         .args(["reconcile", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("missing or truncated"));
+        .stdout(predicate::str::contains(
+            "fingerprint-pinned repair of one destination",
+        ))
+        .stdout(predicate::str::contains("--confirm-damage"));
 }
 
 // ── config show produces TOML ─────────────────────────────────────────

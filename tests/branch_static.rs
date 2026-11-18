@@ -1641,13 +1641,13 @@ fn copies_stress_routes_relevant_changes_and_explicit_events() {
     assert!(!ci.contains("  schedule:\n"));
     assert_eq!(
         repo_file("justfile")
-            .matches(" -- --skip download::orchestration::queue_projection::tests::private_300_")
+            .matches(" -- --skip download::orchestration::queue_projection::tests::private_600_")
             .count(),
         2
     );
     assert_eq!(
         ci.matches(
-            "--no-report -- --skip download::orchestration::queue_projection::tests::private_300_"
+            "--no-report -- --skip download::orchestration::queue_projection::tests::private_600_"
         )
         .count(),
         2
@@ -1710,7 +1710,7 @@ esac
         );
         for call in invocations {
             assert!(
-                call.starts_with("download::orchestration::queue_projection::tests::private_300_")
+                call.starts_with("download::orchestration::queue_projection::tests::private_600_")
             );
             assert!(call.contains(" --ignored --exact "));
         }
@@ -2081,6 +2081,8 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_support_error",
         "classify_sync_auth_error",
         "is_session_error",
+        "is_directory_collision",
+        "is_operational_storage_error",
         "map_library_init_error",
     ]
     .into_iter()
