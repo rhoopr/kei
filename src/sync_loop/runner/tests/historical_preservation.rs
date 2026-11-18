@@ -199,19 +199,26 @@ async fn historical_deletion_check_recovers_lookup_only_expunge_after_upgrade() 
 
 #[tokio::test]
 async fn fresh_start_sparse_history_and_current_primary_hold_survive_reopen() {
-    let mut f = Fixture::new("missing").await;
+    const SHARED_CURSOR: &str = "sync_token:SharedSync-HISTORY";
+    let mut f = Fixture::with_legacy_zone("missing", "SharedSync-HISTORY").await;
+    let preserved = files(&f.media);
     let evidence = r#"[1,"old-target","SharedSync-unselected","old-owner"]"#;
     {
         let conn = rusqlite::Connection::open(&f.database).unwrap();
         conn.execute("INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at) VALUES ('PrimarySync','old-only',?1,?1,1,1)", [evidence]).unwrap();
-        conn.pragma_update(None, "user_version", 37).unwrap();
+        conn.pragma_update(None, "user_version", 36).unwrap();
     }
-    let baseline = f.cycle(CancellationToken::new(), false, false).await;
+    let baseline = f.cycle(CancellationToken::new(), false, true).await;
     assert!(baseline.can_advance_database_checkpoint(), "{baseline:?}");
     let db = f.open().await;
     let cursor = db.get_metadata(CURSOR).await.unwrap().unwrap();
     let before = db.get_summary().await.unwrap();
     assert_eq!(before.unresolved_sparse_records, 0);
+    assert_eq!(db.archived_sparse_reference_count().await.unwrap(), 1);
+    assert_eq!(
+        db.get_metadata(SHARED_CURSOR).await.unwrap().as_deref(),
+        Some("inventory")
+    );
     drop(db);
 
     let sparse = crate::test_helpers::sparse_shared_asset_record();
@@ -220,12 +227,27 @@ async fn fresh_start_sparse_history_and_current_primary_hold_survive_reopen() {
     f.session.successor = Some("after-sparse");
     assert_ne!(cursor, "after-sparse");
     let media = files(&f.media);
+    for (path, evidence) in preserved {
+        assert_eq!(media.get(&path), Some(&evidence));
+    }
+    let requests = f.server.received_requests().await.unwrap().len();
+    f.shared_successor = Some("shared-advanced");
     for _ in 0..2 {
-        let held = f.cycle(CancellationToken::new(), false, false).await;
+        let held = f.cycle(CancellationToken::new(), false, true).await;
         assert!(!held.can_advance_database_checkpoint(), "{held:?}");
         assert_eq!(held.stats.downloaded, 0);
         let db = f.open().await;
         assert_eq!(db.get_metadata(CURSOR).await.unwrap(), Some(cursor.clone()));
+        assert_eq!(
+            db.get_metadata(SHARED_CURSOR).await.unwrap().as_deref(),
+            Some("shared-advanced"),
+            "the library with historical evidence can advance while Primary is held"
+        );
+        assert_eq!(db.archived_sparse_reference_count().await.unwrap(), 1);
+        assert_eq!(f.server.received_requests().await.unwrap().len(), requests);
+        for (sql, expected) in HISTORY[..3].iter().zip(&f.history) {
+            assert_eq!(rows(&f.database, sql), *expected);
+        }
         let status = db.get_summary().await.unwrap();
         assert_eq!(status.unresolved_sparse_records, 1);
         assert_eq!(status.downloaded, before.downloaded);
@@ -416,6 +438,7 @@ async fn fresh_start_restart_worker() {
         server: MockServer::start().await,
         second_zone: false,
         collecting: false,
+        shared_successor: None,
         history,
     };
     fixture.quiet_twice().await;
@@ -464,6 +487,7 @@ struct Fixture {
     server: MockServer,
     second_zone: bool,
     collecting: bool,
+    shared_successor: Option<&'static str>,
     history: Vec<Vec<Vec<rusqlite::types::Value>>>,
 }
 
@@ -475,11 +499,14 @@ const HISTORY: &[&str] = &[
     "SELECT * FROM asset_metadata_paths WHERE id='historical-master'",
     "SELECT * FROM asset_metadata_capture_revisions WHERE asset_id='historical-master'",
     "SELECT * FROM metadata_capture_retries WHERE asset_id='historical-master'",
-    "SELECT library,active_revision,pending_revision,failed_assets,last_error FROM metadata_capture_state WHERE library='PrimarySync'",
+    "SELECT library,active_revision,pending_revision,failed_assets,last_error FROM metadata_capture_state WHERE library IN (SELECT library FROM unattributed_legacy)",
 ];
 
 impl Fixture {
     async fn new(certificate: &str) -> Self {
+        Self::with_legacy_zone(certificate, ZONE).await
+    }
+    async fn with_legacy_zone(certificate: &str, legacy_zone: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         let database = root.path().join("owned.db");
         let media = root.path().join("media");
@@ -497,13 +524,14 @@ impl Fixture {
         let db = SqliteStateDb::open_owned(&database, &owner).await.unwrap();
         db.upsert_seen(
             &crate::test_helpers::TestAssetRecord::new("historical-master")
+                .library(legacy_zone)
                 .filename("photo.jpg")
                 .build(),
         )
         .await
         .unwrap();
         db.mark_downloaded(
-            ZONE,
+            legacy_zone,
             "historical-master",
             "original",
             &original,
@@ -512,17 +540,17 @@ impl Fixture {
         )
         .await
         .unwrap();
-        db.set_metadata_capture_revision_for_test(ZONE, "historical-master", 0);
-        db.begin_metadata_capture_revision(ZONE, state::METADATA_CAPTURE_REVISION)
+        db.set_metadata_capture_revision_for_test(legacy_zone, "historical-master", 0);
+        db.begin_metadata_capture_revision(legacy_zone, state::METADATA_CAPTURE_REVISION)
             .await
             .unwrap();
         for id in ["historical-child-a", "historical-child-b"] {
-            db.upsert_asset_master_mapping(ZONE, id, "historical-master")
+            db.upsert_asset_master_mapping(legacy_zone, id, "historical-master")
                 .await
                 .unwrap();
         }
         let candidate = db
-            .get_metadata_capture_candidates(ZONE, state::METADATA_CAPTURE_REVISION, 10)
+            .get_metadata_capture_candidates(legacy_zone, state::METADATA_CAPTURE_REVISION, 10)
             .await
             .unwrap()
             .remove(0);
@@ -548,7 +576,7 @@ impl Fixture {
             conn.execute(
                 "INSERT INTO unattributed_legacy VALUES(?1,'historical-master',1,?2,?3,7,?4)",
                 rusqlite::params![
-                    ZONE,
+                    legacy_zone,
                     "retained original evidence: exact bytes",
                     serde_json::to_string(&files).unwrap(),
                     if certificate == "missing" {
@@ -563,7 +591,7 @@ impl Fixture {
                 conn.execute(
                     "INSERT INTO unattributed_legacy_paths VALUES(?1,'historical-master',?2,?3)",
                     rusqlite::params![
-                        ZONE,
+                        legacy_zone,
                         crate::fs_util::confined_path_key(&file.path).unwrap(),
                         file.path.to_str().unwrap()
                     ],
@@ -575,7 +603,7 @@ impl Fixture {
                 // changing the schema or relaxing production validation.
                 conn.pragma_update(None, "ignore_check_constraints", true)
                     .unwrap();
-                conn.execute("INSERT INTO unattributed_legacy_proofs VALUES(?1,'historical-master',7,?2,'obsolete dependencies','opaque historical provider bytes','old configuration','old cursor','old successor',7)", rusqlite::params![ZONE,if certificate == "future" {99} else {1}]).unwrap();
+                conn.execute("INSERT INTO unattributed_legacy_proofs VALUES(?1,'historical-master',7,?2,'obsolete dependencies','opaque historical provider bytes','old configuration','old cursor','old successor',7)", rusqlite::params![legacy_zone,if certificate == "future" {99} else {1}]).unwrap();
                 conn.pragma_update(None, "ignore_check_constraints", false)
                     .unwrap();
             }
@@ -622,6 +650,7 @@ impl Fixture {
             server,
             second_zone: false,
             collecting: false,
+            shared_successor: None,
             history,
         };
         fixture.responses(false).await;
@@ -670,11 +699,11 @@ impl Fixture {
         assert_eq!(
             rows(
                 &self.database,
-                "SELECT processed_assets FROM metadata_capture_state WHERE library='PrimarySync'"
+                "SELECT processed_assets FROM metadata_capture_state WHERE library IN (SELECT library FROM unattributed_legacy)"
             ),
             rows(
                 &self.database,
-                "SELECT count(*) FROM asset_metadata_capture_revisions WHERE library='PrimarySync' AND asset_id IN ('asset-current','asset-healthy') AND revision=1"
+                "SELECT count(*) FROM asset_metadata_capture_revisions WHERE library IN (SELECT library FROM unattributed_legacy) AND asset_id IN ('asset-current','asset-healthy','asset-second-current') AND revision=1"
             )
         );
         assert_eq!(
@@ -752,6 +781,7 @@ impl Fixture {
         let other_session = Session {
             zone: "SharedSync-HISTORY".into(),
             records: second_records,
+            successor: self.shared_successor,
             ..Default::default()
         };
         let mut other = make_run_cycle_library_state_with_album(
