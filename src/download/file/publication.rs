@@ -110,14 +110,31 @@ pub(in crate::download) async fn publish_part_to_final(
             })?;
             Ok((PublicationOutcome::IdenticalExisting, PartName::Gone))
         }
-        Err(e) => Err(e).with_context(|| {
-            format!(
-                "Could not move completed download from {} to {}",
-                part_path.display(),
-                final_path.display()
-            )
-        }),
+        Err(e) => {
+            let cause = if hard_links_unsupported(&e) {
+                "; the destination filesystem rejects both rename-without-replace and hard links, \
+                 and kei needs hard-link support to publish without overwriting"
+            } else {
+                ""
+            };
+            Err(e).with_context(|| {
+                format!(
+                    "Could not move completed download from {} to {}{cause}",
+                    part_path.display(),
+                    final_path.display()
+                )
+            })
+        }
     }
+}
+
+/// `link()` refusals that mean the filesystem has no hard links (`link(2)`
+/// reports this as `EPERM`), not a transient or access failure.
+fn hard_links_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EPERM | libc::EOPNOTSUPP | libc::ENOSYS)
+    )
 }
 
 #[cfg(test)]
@@ -203,5 +220,46 @@ mod tests {
 
         let result = rename_part_to_final(&part, &final_path).await;
         assert!(result.is_err(), "should fail when .part doesn't exist");
+    }
+
+    #[test]
+    fn hard_link_refusals_are_recognised_and_other_errors_are_not() {
+        for code in [libc::EPERM, libc::EOPNOTSUPP, libc::ENOSYS] {
+            assert!(super::hard_links_unsupported(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        for code in [libc::EIO, libc::ENOSPC, libc::EACCES, libc::EEXIST] {
+            assert!(!super::hard_links_unsupported(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+    }
+
+    /// Needs `KEI_NFS_NOLINK_TEST_DIR` on a filesystem that refuses `link()`:
+    /// publication must fail, keep the verified `.part` intact, and name
+    /// hard-link support as the cause. A filesystem that refuses `link()` here
+    /// still accepts `RENAME_NOREPLACE` through the kernel's generic path, and
+    /// NFS does the reverse, so the path-scoped seam supplies the flag
+    /// rejection and the mount supplies the real refusal.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn nfs_export_without_hard_links_keeps_the_part_and_names_the_cause() {
+        let Some(dir) = crate::test_helpers::no_link_test_dir("nfs_no_hard_links") else {
+            return;
+        };
+        let _fallback = super::super::platform::ForcedLinkFallback::new(dir.path());
+        let part = dir.path().join("photo.part");
+        let final_path = dir.path().join("photo.jpg");
+        tokio::fs::write(&part, b"verified bytes").await.unwrap();
+
+        let error = rename_part_to_final(&part, &final_path)
+            .await
+            .expect_err("publication needs hard links on this export");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("hard link"), "{message}");
+        assert_eq!(tokio::fs::read(&part).await.unwrap(), b"verified bytes");
+        assert!(!final_path.exists());
     }
 }
