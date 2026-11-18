@@ -137,12 +137,83 @@ fn same_capture_metadata(stored: &ObservedPage, incoming: &ObservedPage) -> bool
         && stored.identities == incoming.identities
 }
 
+/// Bind a completed handoff to the immutable source and its validated projection.
+/// The signed URLs themselves are no longer required to recognize an equivalent
+/// observation: the versioned canonical key includes the masked body digest.
+pub(super) fn release_binding(conn: &Connection, id: i64) -> Result<String, StateError> {
+    let header: String = conn.query_row("SELECT json_array(p.account_key,p.provider_key,p.scope,p.request_cursor,p.successor,p.more_coming,p.body_hash,c.projector_version,c.record_count,c.reference_count,c.debt_count,c.charged_bytes,t.canonical_sha,t.version)
+        FROM provider_shadow_pages p JOIN provider_catalog_pages c ON c.page_id=p.id AND c.body_hash=p.body_hash AND c.projector_version=1
+        LEFT JOIN provider_transport_canonical t ON t.page_id=p.id WHERE p.id=?1", [id], |r|r.get(0))?;
+    let mut digest = Sha256::new();
+    digest.update(header.as_bytes());
+    for identity in stored_identities(conn, id)? {
+        let bytes = serde_json::to_vec(&(identity.name, identity.record_type, identity.deleted))
+            .map_err(|_invalid| StateError::ProviderCatalogInvalid)?;
+        digest.update(bytes);
+    }
+    // The receipt also replaces replay-time validation of the catalog against
+    // the raw page. Detect mutations to facts even if row counts stay equal.
+    for query in [
+        "SELECT json_array(ordinal,record_name,record_type,deleted,kind) FROM provider_catalog_records WHERE page_id=?1 ORDER BY ordinal",
+        "SELECT json_array(ordinal,field_path,target_record_name,target_zone_name,target_zone_owner) FROM provider_catalog_references WHERE page_id=?1 ORDER BY ordinal,field_path,target_record_name",
+        "SELECT json_array(ordinal,field_path,reason) FROM provider_catalog_debt WHERE page_id=?1 ORDER BY ordinal,field_path,reason",
+    ] {
+        for fact in conn
+            .prepare(query)?
+            .query_map([id], |row| row.get::<_, String>(0))?
+        {
+            let fact = fact?;
+            digest.update((fact.len() as u64).to_le_bytes());
+            digest.update(fact.as_bytes());
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+pub(super) fn released(conn: &Connection, id: i64) -> Result<bool, StateError> {
+    let receipt: Option<(String,i64)> = conn.query_row("SELECT f.receipt,length(p.body) FROM provider_finished_changes f JOIN provider_shadow_pages p ON p.id=f.page_id WHERE f.page_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let Some((receipt, length)) = receipt else {
+        return Ok(false);
+    };
+    if length != 0 || receipt != release_binding(conn, id)? {
+        return Err(StateError::ProviderCatalogInvalid);
+    }
+    Ok(true)
+}
+
+fn checked_released_replay(
+    conn: &Connection,
+    id: i64,
+    page: &ObservedPage,
+) -> Result<bool, StateError> {
+    if !released(conn, id)? {
+        return Ok(false);
+    }
+    let matches:bool=conn.query_row("SELECT account_key=(SELECT account_key FROM account_owner WHERE singleton=1) AND provider_key=(SELECT provider_key FROM account_owner WHERE singleton=1) AND scope=?2 AND request_cursor=?3 AND successor=?4 AND more_coming=?5 FROM provider_shadow_pages WHERE id=?1",params![id,page.scope,page.request_cursor,page.successor,page.more_coming],|r|r.get(0))?;
+    if !matches || stored_identities(conn, id)? != page.identities {
+        return Err(StateError::ProviderInboxInvalid);
+    }
+    Ok(true)
+}
+
 impl SqliteStateDb {
+    #[cfg(test)]
     pub(crate) async fn capture_shadow_page(
         &self,
         owner: account::AccountOwner,
-        page: ObservedPage,
+        page: impl Into<std::sync::Arc<ObservedPage>>,
         capacity: u64,
+    ) -> Result<CapturedPageId, StateError> {
+        self.attempt_shadow_capture(owner, page.into(), capacity, true)
+            .await
+    }
+
+    pub(crate) async fn attempt_shadow_capture(
+        &self,
+        owner: account::AccountOwner,
+        page: std::sync::Arc<ObservedPage>,
+        capacity: u64,
+        final_attempt: bool,
     ) -> Result<CapturedPageId, StateError> {
         self.with_conn_mut("capturing provider shadow page", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -170,6 +241,7 @@ impl SqliteStateDb {
             ).optional()?;
             let storage: (StorageOutcome, Option<(u64, u64)>);
             let page_id = if let Some(id) = existing {
+                if checked_released_replay(&tx,id,&page)? {return Ok(CapturedPageId(id))}
                 let original = load_page(
                     &tx,
                     CapturedPageId(id),
@@ -196,6 +268,7 @@ impl SqliteStateDb {
                 if let Some((representative_id, stored_version)) = canonical_hit {
                     let (canonical_sha, version) =
                         canonical.as_ref().ok_or(StateError::ProviderInboxInvalid)?;
+                    if stored_version==i64::from(*version) && checked_released_replay(&tx,representative_id,&page)? {return Ok(CapturedPageId(representative_id))}
                     let representative = load_page(
                         &tx,
                         CapturedPageId(representative_id),
@@ -234,15 +307,17 @@ impl SqliteStateDb {
                             + id.record_type.as_ref().map_or(0, |kind| kind.len() as u64) + 32).sum::<u64>()
                         + canonical.as_ref().map_or(0, |_| 64 + 32);
                     let used: i64 = tx.query_row(
-                        "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_shadow_pages", [], |row| row.get(0),
+                        "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_shadow_pages p WHERE NOT EXISTS(SELECT 1 FROM provider_finished_changes f WHERE f.page_id=p.id)", [], |row| row.get(0),
                     )?;
                     let used = u64::try_from(used).map_err(|_error| StateError::ProviderInboxInvalid)?;
                     if charge > capacity.saturating_sub(used) {
+                        if final_attempt {
                         crate::support::record_storage(
                             StorageComponent::Inbox,
                             StorageOutcome::CapacityRejected,
                             Some((used, capacity)),
                         );
+                        }
                         return Err(StateError::ProviderInboxFull);
                     }
                     storage = (StorageOutcome::New, Some((used, capacity)));
@@ -1006,6 +1081,205 @@ mod tests {
             stored.observation_hash,
             format!("{:x}", Sha256::digest(&stored.page.body))
         );
+    }
+
+    /// Reuse the base private master fixture as an eligible Live Photo motion
+    /// descriptor. Only the descriptor field and its checksum change.
+    fn motion_observed(url: &str, checksum: &str) -> ObservedPage {
+        let mut page = observed(url);
+        page.body = String::from_utf8(page.body)
+            .unwrap()
+            .replace("resOriginalRes", "resOriginalVidComplRes")
+            .replace("checksum-A", checksum)
+            .into_bytes();
+        page
+    }
+
+    fn inbox_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM provider_shadow_pages", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn consumed_tombstones_release_space_mid_stream_and_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handoff.db");
+        let owner = owner_record();
+        let tombstone = |index: usize| {
+            let name = format!("deleted-{index}");
+            let raw = serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"records":[{"recordName":name,"recordType":"CPLAsset","deleted":true}],"syncToken":"successor","moreComing":false}]});
+            crate::icloud::photos::catalog_observed_page(
+                serde_json::to_vec(&raw).unwrap(),
+                &scope(),
+                "held",
+            )
+            .unwrap()
+        };
+        let unresolved = observed("https://p01.icloud-content.com/unknown");
+        let db = std::sync::Arc::new(
+            crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .unwrap(),
+        );
+        db.set_metadata("sync_token:PrimarySync", "held")
+            .await
+            .unwrap();
+        let mut capture = crate::icloud::photos::inbox::ShadowCapture::new(
+            db.clone(),
+            owner.clone(),
+            "legacy-realm",
+        );
+        capture.capture(unresolved.clone()).await.unwrap();
+        capture.capture(tombstone(0)).await.unwrap();
+        capture.capacity =
+            u64::try_from(charged_sum(&db.acquire_lock("initial budget").unwrap())).unwrap();
+        {
+            let conn = db
+                .acquire_lock("apply deletion while checkpoint held")
+                .unwrap();
+            for index in 0..8 {
+                conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,is_deleted) VALUES('PrimarySync',?1,'original','checksum','old.jpg',1,10,'photo','downloaded',1,1)",[format!("deleted-{index}")]).unwrap();
+            }
+            conn.execute_batch("CREATE TRIGGER fail_release BEFORE UPDATE OF body ON provider_shadow_pages BEGIN SELECT RAISE(ABORT,'injected cleanup failure'); END;").unwrap();
+        }
+        assert!(capture.capture(tombstone(1)).await.is_err());
+        {
+            let conn = db.acquire_lock("release rolled back").unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM provider_finished_changes", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                load_page(&conn, CapturedPageId(2), 16384).unwrap().page,
+                tombstone(0)
+            );
+            conn.execute_batch("DROP TRIGGER fail_release").unwrap();
+        }
+        for index in 1..8 {
+            capture.capture(tombstone(index)).await.unwrap();
+        }
+        drop(capture);
+        drop(db);
+        let db = std::sync::Arc::new(
+            crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .unwrap(),
+        );
+        let mut capture =
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner, "legacy-realm");
+        capture.capacity = 0;
+        capture.capture(tombstone(0)).await.unwrap();
+        assert!(capture.capture(tombstone(8)).await.is_err());
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("held")
+        );
+        let conn = db.acquire_lock("durable handoff").unwrap();
+        assert_eq!(
+            load_page(&conn, CapturedPageId(1), 16384).unwrap().page,
+            unresolved
+        );
+        assert_eq!(conn.query_row("SELECT count(*) FROM provider_finished_changes f JOIN provider_shadow_pages p ON p.id=f.page_id WHERE length(p.body)=0",[],|r|r.get::<_,i64>(0)).unwrap(),8);
+    }
+
+    #[tokio::test]
+    async fn motion_url_rotation_is_free_at_capacity_but_a_changed_motion_checksum_is_new_evidence()
+    {
+        const ORIGINAL_URL: &str = "https://p01.icloud-content.com/motion?token=0";
+        const ROTATED_URLS: [&str; 3] = [
+            "https://p99.icloud-content.com/rotated/motion?token=1",
+            "https://p02.cdn-apple.com/motion?token=2",
+            "https://p01.icloud-content.com/another/path?token=3",
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("motion.db");
+        let owner = owner_record();
+        let original = motion_observed(ORIGINAL_URL, "checksum-A");
+
+        // Cycle 0 captures the baseline; every later cycle reopens the owned
+        // file to replay only the signed URL, then refuse and finally retain
+        // the changed motion checksum.
+        let mut baseline: Option<(i64, i64)> = None;
+        for cycle in 0..3 {
+            let db = std::sync::Arc::new(
+                crate::state::SqliteStateDb::open_owned(&path, &owner)
+                    .await
+                    .unwrap(),
+            );
+            let mut capture = crate::icloud::photos::inbox::ShadowCapture::new(
+                db.clone(),
+                owner.clone(),
+                "legacy-realm",
+            );
+            let Some((rows, charged)) = baseline else {
+                capture.capacity = 512 * 1024 * 1024;
+                capture.capture(original.clone()).await.unwrap();
+                let conn = db.acquire_lock("captured private motion page").unwrap();
+                let rows = inbox_rows(&conn);
+                let charged = charged_sum(&conn);
+                assert_eq!(rows, 1);
+                assert!(charged > 0);
+                baseline = Some((rows, charged));
+                continue;
+            };
+
+            capture.capacity = u64::try_from(charged).unwrap();
+            for url in ROTATED_URLS {
+                capture
+                    .capture(motion_observed(url, "checksum-A"))
+                    .await
+                    .unwrap();
+            }
+            {
+                let conn = db.acquire_lock("replayed signed motion URL").unwrap();
+                assert_eq!(inbox_rows(&conn), rows);
+                assert_eq!(charged_sum(&conn), charged);
+            }
+            if cycle < 2 {
+                continue;
+            }
+
+            // A changed motion checksum is different provider evidence even
+            // with an identical cursor, scope and continuation.
+            let changed = motion_observed(ORIGINAL_URL, "checksum-B");
+            let error = capture.capture(changed.clone()).await.unwrap_err();
+            let refusal = error
+                .downcast_ref::<crate::icloud::photos::error::ShadowPageError>()
+                .expect("a refused observation keeps its typed wrapper");
+            assert_eq!(
+                refusal.to_string(),
+                crate::state::error::StateError::ProviderInboxFull.to_string(),
+                "new motion evidence must be refused for capacity: {error:#}"
+            );
+            {
+                let conn = db.acquire_lock("changed motion checksum refused").unwrap();
+                assert_eq!(inbox_rows(&conn), rows);
+                assert_eq!(charged_sum(&conn), charged);
+            }
+
+            // Adding headroom retains both pieces of evidence side by side.
+            capture.capacity = u64::try_from(charged).unwrap() + 64 * 1024;
+            capture.capture(changed.clone()).await.unwrap();
+            let conn = db.acquire_lock("changed motion checksum retained").unwrap();
+            assert_eq!(inbox_rows(&conn), 2);
+            assert!(charged_sum(&conn) > charged);
+            let bodies = conn
+                .prepare("SELECT body FROM provider_shadow_pages ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(bodies, vec![original.body.clone(), changed.body]);
+        }
     }
 
     async fn actual_inbox_migration_and_catalog_child() {

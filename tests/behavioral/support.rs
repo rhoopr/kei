@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 42;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 43;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -222,6 +222,10 @@ CREATE TABLE IF NOT EXISTS provider_shadow_records (
     deleted INTEGER NOT NULL CHECK(deleted IN (0,1)),
     PRIMARY KEY(page_id,ordinal)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_finished_changes (
+    page_id INTEGER PRIMARY KEY REFERENCES provider_shadow_pages(id),
+    receipt TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
     scope TEXT PRIMARY KEY,
     page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id)

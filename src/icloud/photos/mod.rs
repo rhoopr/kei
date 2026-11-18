@@ -35,8 +35,10 @@ pub(crate) use album::{
 pub use asset::{PhotoAsset, VersionsMap};
 pub use library::PhotoLibrary;
 pub(crate) use library::{PRIMARY_ZONE_NAME, is_shared_zone};
-#[cfg(test)]
-pub(crate) use projection::plan_retained;
+pub(crate) use projection::{
+    change_records, confirmation_contains_record, plain_primary_tombstone, plan_retained,
+    validate_empty_poll,
+};
 pub use session::{PhotosSession, SyncTokenError};
 
 use std::collections::HashMap;

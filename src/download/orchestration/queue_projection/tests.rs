@@ -5332,6 +5332,49 @@ async fn active_pending_fixture() -> (
 }
 
 #[tokio::test]
+async fn published_confirmation_releases_only_matching_inbox_records() {
+    use sha2::{Digest, Sha256};
+    let seed = Fixture::new().await;
+    let media = b"durably published media";
+    {
+        let mut records = seed.session.records.lock().unwrap();
+        let resource = &mut records[0]["fields"]["resOriginalRes"]["value"];
+        resource["fileChecksum"] = json!(data_encoding::BASE64.encode(&Sha256::digest(media)));
+        resource["size"] = json!(media.len());
+    }
+    let (f, root, decision, _) = Box::pin(admit_pending_fixture(seed, &[])).await;
+    let current: Value =
+        serde_json::from_slice(decision.decision.confirmation.as_ref().unwrap()).unwrap();
+    let records = current["records"].as_array().unwrap().clone();
+    f.capture(records.clone(), "held-live").await;
+    assert_eq!(f.count("provider_finished_changes"), 0);
+    let dst = &decision.decision.destinations[0];
+    let path = dst.path.to_path();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, media).unwrap();
+    let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+    assert!(
+        f.db.reuse_selection_publication(
+            owner(),
+            root.id,
+            decision.decision.pass_key,
+            decision.decision.child,
+            dst.path.clone(),
+            (checksum, dst.size)
+        )
+        .await
+        .unwrap()
+    );
+    f.capture(records.clone(), "held-live").await;
+    assert_eq!(f.count("provider_finished_changes"), 1);
+    let mut changed = records;
+    changed[0]["newField"] = json!("new work");
+    f.capture(changed, "held-live").await;
+    assert_eq!(f.count("provider_finished_changes"), 1);
+    assert_eq!(f.db.acquire_lock("distinct live change remains recoverable").unwrap().query_row("SELECT count(*) FROM provider_shadow_pages WHERE request_cursor='held-live' AND length(body)>0",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+}
+
+#[tokio::test]
 async fn explicit_media_source_cannot_rebind_retained_membership_evidence() {
     use crate::state::db::provider_generations::MAX_GENERATION_BYTES;
     use crate::state::db::provider_selection::SelectionMediaSource;

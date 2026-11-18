@@ -1,9 +1,10 @@
 //! Versioned transport evidence for validated private provider changes pages.
 //!
-//! The adapter recognizes two direct provider descriptors, bound to the
+//! The adapter recognizes direct provider descriptors, bound to the
 //! enclosing record's nonblank `recordName` and `recordChangeTag`:
 //!
 //! - `CPLMaster` `fields.resOriginalRes` `ASSETID`
+//! - `CPLMaster` `fields.resOriginalVidComplRes` `ASSETID` in changes pages
 //! - `CPLAsset` or `CPLMaster` `fields.resComputeStateData` `ASSETID`
 //!
 //! Each descriptor must carry a numeric `size`, nonblank `fileChecksum`,
@@ -21,8 +22,9 @@
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-/// Version of the byte-level masking and eligibility rule implemented here.
+/// Preserve existing canonical keys for pages without an eligible motion URL.
 pub(crate) const TRANSPORT_EVIDENCE_VERSION: u8 = 3;
+const MOTION_EVIDENCE_VERSION: u8 = 4;
 
 /// Deterministic replacement for one eligible URL string token, including its
 /// surrounding JSON quotes.
@@ -32,6 +34,7 @@ const MAX_JSON_DEPTH: usize = 128;
 const PRIVATE_MASTER_RECORD_TYPE: &str = "CPLMaster";
 const PRIVATE_ASSET_RECORD_TYPE: &str = "CPLAsset";
 const PRIVATE_ORIGINAL_FIELD: &str = "resOriginalRes";
+const PRIVATE_MOTION_FIELD: &str = "resOriginalVidComplRes";
 const PRIVATE_COMPUTE_STATE_FIELD: &str = "resComputeStateData";
 const PRIVATE_DESCRIPTOR_ASSET_TYPE: &str = "ASSETID";
 const DOWNLOAD_URL_FIELD: &str = "downloadURL";
@@ -53,6 +56,7 @@ enum PathSegment {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DescriptorField {
     Original,
+    Motion,
     ComputeState,
 }
 
@@ -69,6 +73,7 @@ impl DescriptorField {
     fn name(self) -> &'static str {
         match self {
             Self::Original => PRIVATE_ORIGINAL_FIELD,
+            Self::Motion => PRIVATE_MOTION_FIELD,
             Self::ComputeState => PRIVATE_COMPUTE_STATE_FIELD,
         }
     }
@@ -249,6 +254,7 @@ fn evidence_from_candidates(
     candidates: Vec<Candidate>,
 ) -> Result<Option<TransportEvidence>> {
     let mut spans = Vec::new();
+    let mut version = TRANSPORT_EVIDENCE_VERSION;
     for candidate in candidates {
         if candidate.envelope != envelope {
             continue;
@@ -262,6 +268,20 @@ fn evidence_from_candidates(
         if !eligible_download_url(&candidate.url) {
             continue;
         }
+        if candidate.field == DescriptorField::Motion {
+            // Sharing the still's (or another rendition's) URL affects which
+            // versions PhotoAsset exposes. It is not just a renewed signature.
+            if record["fields"].as_object().is_some_and(|fields| {
+                fields.iter().any(|(name, field)| {
+                    name != PRIVATE_MOTION_FIELD
+                        && field.pointer("/value/downloadURL").and_then(Value::as_str)
+                            == Some(candidate.url.as_str())
+                })
+            }) {
+                return Ok(None);
+            }
+            version = MOTION_EVIDENCE_VERSION;
+        }
         spans.push((candidate.start, candidate.end));
     }
 
@@ -270,6 +290,13 @@ fn evidence_from_candidates(
     }
 
     let mut masked = Vec::with_capacity(bytes.len());
+    // A literal provider string must never impersonate an eligible span in
+    // the new key format. 0xff cannot occur in validated UTF-8 JSON.
+    let marker = if version == MOTION_EVIDENCE_VERSION {
+        &[0xff][..]
+    } else {
+        MASKED_URL_TOKEN
+    };
     let mut cursor = 0usize;
     for (start, end) in &spans {
         masked.extend_from_slice(
@@ -277,7 +304,7 @@ fn evidence_from_candidates(
                 .get(cursor..*start)
                 .context("Invalid transport evidence span")?,
         );
-        masked.extend_from_slice(MASKED_URL_TOKEN);
+        masked.extend_from_slice(marker);
         cursor = *end;
     }
     masked.extend_from_slice(
@@ -287,7 +314,7 @@ fn evidence_from_candidates(
     );
 
     Ok(Some(TransportEvidence {
-        version: TRANSPORT_EVIDENCE_VERSION,
+        version,
         masked,
         eligible_url_tokens: spans.len(),
     }))
@@ -459,6 +486,7 @@ fn candidate_record_index(path: &[PathSegment]) -> Option<(Envelope, usize, Desc
     }
     let field = match field.as_str() {
         PRIVATE_ORIGINAL_FIELD => DescriptorField::Original,
+        PRIVATE_MOTION_FIELD if envelope == Envelope::Changes => DescriptorField::Motion,
         PRIVATE_COMPUTE_STATE_FIELD => DescriptorField::ComputeState,
         _ => return None,
     };
@@ -470,14 +498,15 @@ fn candidate_record_index(path: &[PathSegment]) -> Option<(Envelope, usize, Desc
 ///
 /// Unknown extra descriptor or record fields are allowed and preserved. Only
 /// the listed fields are required; `receipt` is optional because Apple returns
-/// it for saving, not for a fetched private download descriptor. The original
-/// descriptor remains `CPLMaster` only. The approved compute-state extension
-/// accepts only the two known CloudKit record types and never walks another
-/// field name, nested dictionary or rendition list.
+/// it for saving, not for a fetched private download descriptor. Original and
+/// motion resources require a master. Compute-state resources may also belong
+/// to a child. None of these paths matches a nested dictionary or rendition list.
 fn eligible_private_descriptor(record: &Value, field: DescriptorField) -> bool {
     let record_type = record.get("recordType").and_then(Value::as_str);
     let record_type_allowed = match field {
-        DescriptorField::Original => record_type == Some(PRIVATE_MASTER_RECORD_TYPE),
+        DescriptorField::Original | DescriptorField::Motion => {
+            record_type == Some(PRIVATE_MASTER_RECORD_TYPE)
+        }
         DescriptorField::ComputeState => matches!(
             record_type,
             Some(PRIVATE_ASSET_RECORD_TYPE | PRIVATE_MASTER_RECORD_TYPE)
@@ -689,6 +718,38 @@ mod tests {
         ] {
             assert!(masked.contains(kept), "{kept}");
         }
+    }
+
+    #[test]
+    fn motion_mask_requires_a_complete_master_resource() {
+        let page = valid_page().replace("resOriginalRes", "resOriginalVidComplRes");
+        let evidence = classify_ok(page.as_bytes());
+        assert_eq!(evidence.version, super::MOTION_EVIDENCE_VERSION);
+        for (from, to) in [
+            ("CPLMaster", "CPLAsset"),
+            ("referenceChecksum", "otherChecksum"),
+            ("resOriginalVidComplRes", "resOriginalVidComplResAlt"),
+            (VALID_URL, "https://example.invalid/motion"),
+        ] {
+            assert_not_eligible(page.replace(from, to).as_bytes());
+        }
+    }
+
+    #[test]
+    fn motion_url_alias_to_still_is_distinct_from_independent_rotation() {
+        let mut page: serde_json::Value = serde_json::from_str(&valid_page()).unwrap();
+        let fields = &mut page["zones"][0]["records"][0]["fields"];
+        fields["resOriginalVidComplRes"] = fields["resOriginalRes"].clone();
+        assert_not_eligible(&serde_json::to_vec(&page).unwrap());
+        page["zones"][0]["records"][0]["fields"]["resOriginalVidComplRes"]["value"]["downloadURL"] =
+            serde_json::json!("https://p01.icloud-content.com/motion");
+        let independent = classify_ok(&serde_json::to_vec(&page).unwrap());
+        assert_eq!(independent.eligible_url_tokens, 2);
+        // A literal provider value in a now-ineligible field is new evidence.
+        page["zones"][0]["records"][0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+            serde_json::from_slice(super::MASKED_URL_TOKEN).unwrap();
+        let literal = classify_ok(&serde_json::to_vec(&page).unwrap());
+        assert_ne!(literal.masked, independent.masked);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 42;
+pub(crate) const SCHEMA_VERSION: i32 = 43;
 const FRESH_START_VERSION: i32 = 38;
 
 /// Retire provider planning authority once, without interpreting historical
@@ -1539,6 +1539,16 @@ pub(crate) fn migrate_to_version(
                     "ALTER TABLE provider_active_destinations ADD COLUMN confirmed_repair BLOB;",
                 )?;
             }
+        }
+        43 => {
+            // Completed nonempty observations still participate in selection's
+            // change detector. They are not checkpoints or raw replay work.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS provider_finished_changes (
+                page_id INTEGER PRIMARY KEY REFERENCES provider_shadow_pages(id),
+                receipt TEXT NOT NULL
+            );",
+            )?;
         }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {

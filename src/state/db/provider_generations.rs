@@ -665,6 +665,47 @@ enum EmptySelectionDeletes {
     IgnoreAppliedAssetDeletes,
 }
 
+/// Verify the downstream owner independently retains this exact live source.
+/// A filename, a matching local checksum, or a historical downloaded row is
+/// not proof that the selected destinations consumed this provider revision.
+pub(super) fn published_change_matches(
+    conn: &Connection,
+    scope: &str,
+    name: &str,
+    record: &Value,
+) -> Result<bool, StateError> {
+    let candidate: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT w.generation,w.pass_key,w.child FROM provider_active_destinations w
+         JOIN provider_active_generations g ON g.id=w.generation
+         WHERE g.scope=?1 AND (w.child=?2 OR w.master=?2) AND w.current_publication=1
+         AND w.admitted=1 AND w.verified_media=1 AND w.prepared_hash IS NULL
+         AND (g.metadata_enabled=0 OR w.verified_metadata=1)
+         ORDER BY g.created_at DESC LIMIT 1",
+            params![scope, name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((generation, key, child)) = candidate else {
+        return Ok(false);
+    };
+    let root = load_generation(conn, &generation)?;
+    let manifest = load_decision(conn, &root, &key, &child)?;
+    if manifest
+        .decision
+        .media_source
+        .as_ref()
+        .is_some_and(|source| source.scope != scope)
+    {
+        return Ok(false);
+    }
+    Ok(manifest
+        .decision
+        .confirmation
+        .as_deref()
+        .is_some_and(|body| crate::icloud::photos::confirmation_contains_record(body, record)))
+}
+
 fn dependency_basis(
     conn: &Connection,
     scope: &str,

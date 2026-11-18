@@ -10,6 +10,63 @@ use crate::state::db::provider_catalog::{
 use crate::state::db::provider_inbox::StoredPage;
 use crate::state::error::StateError;
 
+pub(crate) fn confirmation_contains_record(body: &[u8], record: &Value) -> bool {
+    super::changes_json::parse(body).ok().is_some_and(|value| {
+        value
+            .get("records")
+            .and_then(Value::as_array)
+            .is_some_and(|records| records.contains(record))
+    })
+}
+
+pub(crate) fn plain_primary_tombstone(scope: &str, record: &Value) -> bool {
+    serde_json::from_str::<Value>(scope).ok().is_some_and(|s| {
+        s.get("database").and_then(Value::as_str) == Some("private")
+            && s.pointer("/zone/zoneName").and_then(Value::as_str) == Some("PrimarySync")
+            && s.pointer("/zone/ownerRecordName").and_then(Value::as_str) == Some("_defaultOwner")
+    }) && record.as_object().is_some_and(|r| {
+        r.get("deleted") == Some(&Value::Bool(true))
+            && r.keys()
+                .all(|k| matches!(k.as_str(), "recordName" | "recordType" | "deleted"))
+    })
+}
+
+/// Only classified live photo records or explicit photo tombstones can hand
+/// off their raw payload. Unknown shapes retain their original bytes.
+pub(crate) fn change_records(body: &[u8]) -> anyhow::Result<Vec<Value>> {
+    let mut value = super::changes_json::parse(body)?;
+    match value.pointer_mut("/zones/0/records").map(Value::take) {
+        Some(Value::Array(records)) => Ok(records),
+        _ => anyhow::bail!("Missing changes records"),
+    }
+}
+
+pub(crate) fn validate_empty_poll(
+    page: &crate::state::db::provider_inbox::ObservedPage,
+    realm: &str,
+) -> anyhow::Result<()> {
+    let scope: Value = serde_json::from_str(&page.scope)?;
+    anyhow::ensure!(
+        page.body.len() <= MAX_CHANGES_PAGE_BYTES
+            && scope.get("realm").and_then(Value::as_str) == Some(realm)
+            && scope.get("format").and_then(Value::as_u64) == Some(1)
+            && scope.get("container").and_then(Value::as_str) == Some("com.apple.photos.cloud")
+            && scope.get("environment").and_then(Value::as_str) == Some("production")
+            && matches!(
+                scope.get("database").and_then(Value::as_str),
+                Some("private" | "shared")
+            ),
+        "Invalid empty poll scope"
+    );
+    let checked =
+        super::album::catalog_observed_page(page.body.clone(), &page.scope, &page.request_cursor)?;
+    anyhow::ensure!(
+        checked == *page && checked.identities.is_empty(),
+        "Invalid empty poll"
+    );
+    Ok(())
+}
+
 fn charge(total: &mut u64, bytes: usize) -> anyhow::Result<()> {
     *total = total
         .checked_add(bytes as u64)

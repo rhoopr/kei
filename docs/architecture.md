@@ -398,19 +398,28 @@ page, full inbox, failed write or unusable identity stops that page before
 emission or successor acceptance. Such a refusal propagates through orchestration;
 an uncaptured rank inventory cannot replace it and advance the checkpoint.
 Existing typed invalid-token fallback and authentication handling remain intact.
-Exact already-captured replay remains possible at capacity. No observations are automatically pruned. SQLite WAL `NORMAL`
+Exact already-captured replay remains possible at capacity. Schema 43 releases completed payloads during incremental sync. A validated record-empty poll needs no inbox space. Previously projected empty polls are revalidated and removed during startup recovery or capacity recovery.
+
+A nonempty page gives up its whole inbox charge only when every record has independent durable evidence. For a live photo record, the current published destination must have verified media and any enabled metadata, and its checked lookup confirmation must contain the matching record in the same source scope. A simple, explicitly typed private Primary deletion can use already-deleted local renditions if no family mapping makes the identity ambiguous. Unknown records, unresolved references without that proof, legacy work dependencies and mixed pages with unfinished records keep their bytes. Sync checks on projection, revisits earlier pages while reading the stream, and checks remaining candidates before returning an inbox-capacity error.
+
+The release receipt and removal of the raw body commit together. Original hashes, identities and catalog facts still feed the existing change detector. Released pages retain their original `charged_bytes` for provenance; only pages without a `provider_finished_changes` receipt count against the live inbox. Replay still emits the current provider events. Cleanup does not advance the cursor, change media or shrink the SQLite file on demand. The catalog retains its own separate capacity limit.
+
+SQLite WAL `NORMAL`
 remains unchanged; a successful commit does not promise that every acknowledged
 observation survives power loss. Network filesystems are not newly qualified.
 
 Schema 36 adds a private-only canonical transport index. The provider adapter
 recomputes evidence from the retained page after account validation. It
-recognizes exactly two direct descriptor paths: a complete `CPLMaster`
-`fields.resOriginalRes` `ASSETID`, and a complete `CPLAsset` or `CPLMaster`
+recognizes a complete `CPLMaster` `fields.resOriginalRes` `ASSETID`, a complete
+`CPLMaster` `fields.resOriginalVidComplRes` `ASSETID` in changes pages (the
+Live Photo motion resource), and a complete `CPLAsset` or `CPLMaster`
 `fields.resComputeStateData` `ASSETID`. Each must have a nonblank `recordName`
 and `recordChangeTag`, a numeric `size`, nonblank `fileChecksum`,
 `referenceChecksum` and `wrappingKey`, and a validated download URL. Only the
-whole validated `downloadURL` token is masked. Record type, tag, descriptor
-bytes and unknown bytes stay exact, and nested or arbitrary `downloadURL`
+whole validated `downloadURL` token is masked. If an eligible motion URL is
+shared with another resource on the record, the page stays raw because URL
+aliasing affects rendition selection. Record type, tag, descriptor bytes and
+unknown bytes stay exact, and nested or arbitrary `downloadURL`
 fields are not eligible. Each candidate is bound to the envelope that produced
 its byte path: a changes candidate is resolved only against `zones[0].records`
 and a lookup candidate only against the paired root `records`, so a lookalike
@@ -424,7 +433,11 @@ private page, malformed scope, or mismatched index entry still fails validation.
 The canonical key is an unambiguous hash of account namespace,
 provider fingerprint, exact scope, request cursor, successor, `moreComing`,
 classifier version and masked body digest, so different cursors or scopes remain
-independent classes. A hit reloads the representative through the checked page
+independent classes. Only pages that mask a motion URL use classifier version 4.
+Older stored pages are not rescanned: the first rotated motion URL can require
+space for one new representative. Pages that mask only original or compute-state
+URLs retain their version 3 keys.
+A hit reloads the representative through the checked page
 loader, recomputes its key and masked bytes, and requires exact metadata and
 source-identity equality. Unsupported scopes stay ordinary raw observations;
 an invalid private page or a mismatched index entry fails validation. A replay

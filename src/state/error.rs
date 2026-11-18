@@ -37,7 +37,7 @@ pub enum StateError {
     )]
     ProviderCatalogInvalid,
     #[error(
-        "Provider shadow inbox is full; retaining observations and the current checkpoint. No automatic pruning is permitted."
+        "Provider shadow inbox is full after checking for completed work; retaining unfinished observations and the current checkpoint."
     )]
     ProviderInboxFull,
     #[error(
