@@ -110,6 +110,28 @@ pub(in crate::download) fn move_layout_confined(
     }
 }
 
+/// Move an obsolete alias into a private retirement slot: a unique name this
+/// process creates and has never used, so there is no foreign entry to replace.
+/// A filesystem without `RENAME_NOREPLACE` (NFS) therefore gets a plain rename,
+/// as `replacement_recovery::move_to_owned_slot` does for journal slots. Never
+/// use this to restore a public name; that keeps `move_layout_confined`.
+pub(in crate::download) fn retire_layout_confined(
+    source: &ConfinedPath,
+    slot: &ConfinedPath,
+) -> std::io::Result<()> {
+    let moved = move_layout_confined(source, slot);
+    #[cfg(target_os = "linux")]
+    if let Err(error) = &moved
+        && is_renameat2_unsupported(error)
+    {
+        if slot.entry_exists()? {
+            return Err(std::io::ErrorKind::AlreadyExists.into());
+        }
+        return renameat2_confined_blocking(source, slot, 0);
+    }
+    moved
+}
+
 /// `RENAME_NOREPLACE` rename. Tests can make it report the `EINVAL` an NFS
 /// client returns, to exercise the fallbacks without an NFS mount.
 #[cfg(target_os = "linux")]

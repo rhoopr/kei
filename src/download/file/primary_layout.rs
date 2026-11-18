@@ -527,7 +527,7 @@ fn retire_blocking(entries: &[RetirementEntry]) -> Result<()> {
             } else {
                 "before-sidecar"
             });
-            super::platform::move_layout_confined(&entry.source, &entry.destination)?;
+            super::platform::retire_layout_confined(&entry.source, &entry.destination)?;
             entry.source.sync_parent()?;
             entry.destination.sync_parent()?;
             #[cfg(all(test, target_os = "linux"))]
@@ -741,6 +741,43 @@ mod tests {
         );
         assert!(!retired.exists());
     }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_retire_moves_alias_to_its_private_slot(root: &std::path::Path) {
+        use super::retire;
+        use std::os::unix::fs::MetadataExt;
+
+        let alias = root.join("current.jpg");
+        let slot = root.join("history/.retired-slot");
+        tokio::fs::write(&alias, b"owned alias bytes")
+            .await
+            .unwrap();
+        let expected = snapshot(root, &alias).await.unwrap().unwrap();
+        retire(root, &alias, &slot, &expected, None).await.unwrap();
+        assert!(!alias.exists());
+        assert_eq!(tokio::fs::read(&slot).await.unwrap(), b"owned alias bytes");
+        assert_eq!(std::fs::metadata(&slot).unwrap().nlink(), 1);
+        // Replaying a completed retirement is a no-op.
+        retire(root, &alias, &slot, &expected, None).await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn retire_uses_a_plain_rename_when_noreplace_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let _fallback = super::super::platform::ForcedLinkFallback::new(dir.path());
+        assert_retire_moves_alias_to_its_private_slot(dir.path()).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn nfs_retire_moves_alias_to_its_private_slot() {
+        let Some(dir) = crate::test_helpers::nfs_test_dir("nfs_retire") else {
+            return;
+        };
+        assert_retire_moves_alias_to_its_private_slot(dir.path()).await;
+    }
+
     #[tokio::test]
     async fn contract_file_publish_no_overwrite_primary_layout_preserves_and_protects_late_writer()
     {
