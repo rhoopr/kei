@@ -109,6 +109,61 @@ threads = 4
 }
 
 #[test]
+fn config_show_roundtrips_edited_as_primary() {
+    for (input, expected) in [(false, false), (true, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        common::write_versioned_config(
+            &config_path,
+            format!(
+                r#"
+[auth]
+username = "toml@example.com"
+
+[photos]
+edited_as_primary = {input}
+"#
+            ),
+        )
+        .unwrap();
+
+        let out = clean_cmd()
+            .args(["config", "show", "--config", config_path.to_str().unwrap()])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parsed: toml::Value = toml::from_str(&stdout).unwrap();
+        let emitted = parsed
+            .get("photos")
+            .and_then(|photos| photos.get("edited_as_primary"))
+            .and_then(toml::Value::as_bool);
+        assert_eq!(
+            emitted,
+            expected.then_some(true),
+            "edited_as_primary={input} should round-trip only when enabled; stdout: {stdout}"
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    common::write_versioned_config(&config_path, "[auth]\nusername = \"toml@example.com\"\n")
+        .unwrap();
+    let out = clean_cmd()
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("edited_as_primary"),
+        "default edited_as_primary must stay omitted; stdout: {stdout}"
+    );
+}
+
+#[test]
 fn config_show_preserves_top_level_toml_values() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");

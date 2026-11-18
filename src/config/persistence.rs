@@ -124,6 +124,13 @@ impl Config {
                 } else {
                     Some(self.photos.live_photo_mov_filename_policy)
                 },
+                edited_as_primary: if self.photos.edited_naming
+                    == crate::types::EditedNaming::Primary
+                {
+                    Some(true)
+                } else {
+                    None
+                },
                 file_match_policy: if self.photos.file_match_policy
                     == FileMatchPolicy::NameSizeDedupWithSuffix
                 {
@@ -529,6 +536,56 @@ mod tests {
             Some(crate::types::FileMatchPolicy::NameId7)
         );
     }
+    #[test]
+    fn edited_as_primary_roundtrips_through_config_export() {
+        use crate::types::EditedNaming;
+
+        let input: TomlConfig =
+            toml::from_str("config_version = 1\n[photos]\nedited_as_primary = true").unwrap();
+        let resolved = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&input),
+        )
+        .unwrap();
+        assert_eq!(resolved.photos.edited_naming, EditedNaming::Primary);
+
+        let emitted = resolved.to_toml();
+        assert_eq!(
+            emitted.photos.as_ref().unwrap().edited_as_primary,
+            Some(true)
+        );
+        let serialized = toml::to_string(&emitted).unwrap();
+        let reparsed: TomlConfig = toml::from_str(&serialized).unwrap();
+        let reopened = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&reparsed),
+        )
+        .unwrap();
+        assert_eq!(reopened.photos.edited_naming, EditedNaming::Primary);
+
+        let default = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        let default_toml = default.to_toml();
+        assert_eq!(
+            default_toml.photos.as_ref().unwrap().edited_as_primary,
+            None
+        );
+        assert!(
+            !toml::to_string(&default_toml)
+                .unwrap()
+                .contains("edited_as_primary")
+        );
+    }
+
     #[test]
     fn test_to_toml_serializes_to_valid_toml() {
         let cfg = Config::build(

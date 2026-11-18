@@ -153,6 +153,10 @@ fn deserialize_fixed_date<'de, D: serde::Deserializer<'de>>(
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlPhotos {
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
+    /// Keep selected edited renditions at the asset's ordinary filename while
+    /// originals, previous edits and sidecars are preserved independently.
+    /// Defaults to `false` (edited files use an `_edited` suffix).
+    pub edited_as_primary: Option<bool>,
     pub file_match_policy: Option<FileMatchPolicy>,
     pub keep_unicode_in_filenames: Option<bool>,
 }
@@ -209,7 +213,7 @@ pub(crate) fn load_toml_config_with_source(
                     if parse_error.contains("`per_asset`") {
                         message.push_str("Lifetime retry limits are retired. Remove per_asset from [download.retry]. Unfinished work remains retryable across sync cycles; per_transfer still bounds retries within a transfer. Configuration was not changed.");
                     } else if parse_error.contains("`edited_naming`") {
-                        message.push_str("The edited_naming option is retired. Remove edited_naming from [photos]. New edited files use an edited suffix; recorded managed layouts and interrupted publications retain their existing layout. Configuration was not changed.");
+                        message.push_str("The edited_naming option is retired. Remove edited_naming from [photos]. Set edited_as_primary = true to keep edits at the ordinary filename; false (the default) uses an edited suffix. Recorded managed layouts and interrupted publications retain their existing layout. Configuration was not changed.");
                     } else if parse_error.contains("`filename_exclude`") {
                         message.push_str("Filename-based selection is no longer supported. Remove filename_exclude from [filters] after reviewing the expanded selection. Use album/library selection or fixed capture-date bounds where appropriate. Configuration was not changed.");
                     } else if ["resolution", "live_resolution", "live_photo_mode", "edited", "alternative", "raw_policy", "force_resolution", "media"].iter().any(|key| parse_error.contains(&format!("`{key}`"))) {

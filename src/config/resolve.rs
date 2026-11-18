@@ -250,7 +250,14 @@ pub(crate) fn resolve_path_derivation_fields(
         LivePhotoMovFilenamePolicy::Suffix,
     );
     let edited = true;
-    let edited_naming = crate::types::EditedNaming::Suffix;
+    let edited_naming = if toml_photos
+        .and_then(|p| p.edited_as_primary)
+        .unwrap_or(false)
+    {
+        crate::types::EditedNaming::Primary
+    } else {
+        crate::types::EditedNaming::Suffix
+    };
     let alternative = true;
     let raw_policy = RawPolicy::AsIs;
     let file_match_policy = resolve(
@@ -890,6 +897,38 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn edited_as_primary_controls_effective_edited_naming() {
+        use crate::types::EditedNaming;
+        for (input, expected) in [
+            ("", EditedNaming::Suffix),
+            ("[photos]\nedited_as_primary = false", EditedNaming::Suffix),
+            ("[photos]\nedited_as_primary = true", EditedNaming::Primary),
+        ] {
+            let toml: TomlConfig = toml::from_str(input).unwrap();
+            let cfg = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&toml),
+            )
+            .unwrap();
+            assert_eq!(cfg.photos.edited_naming, expected, "input: {input}");
+            let fields =
+                resolve_path_derivation_fields(PathDerivationCliArgs::default(), Some(&toml))
+                    .unwrap();
+            assert_eq!(fields.edited_naming, expected, "input: {input}");
+        }
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.photos.edited_naming, EditedNaming::Suffix);
     }
 
     #[test]

@@ -85,6 +85,9 @@ struct SetupAnswers {
     /// `parse_bandwidth_limit` on next sync. Empty = no limit.
     bandwidth_limit: Option<String>,
     keep_unicode_in_filenames: bool,
+    /// `[photos].edited_as_primary`: give edited renditions the ordinary
+    /// filename and archive originals under `_original`.
+    edited_as_primary: bool,
     set_exif_datetime: bool,
     set_exif_orientation: bool,
     set_exif_rating: bool,
@@ -132,6 +135,7 @@ impl Default for SetupAnswers {
             max_retries: None,
             bandwidth_limit: None,
             keep_unicode_in_filenames: false,
+            edited_as_primary: false,
             set_exif_datetime: true,
             set_exif_orientation: true,
             set_exif_rating: true,
@@ -1154,6 +1158,11 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         .default(false)
         .interact()?;
 
+    answers.edited_as_primary = Confirm::new()
+        .with_prompt("Give edited versions the original filename? (originals use _original)")
+        .default(false)
+        .interact()?;
+
     answers.set_exif_datetime = Confirm::new()
         .with_prompt("Write EXIF date tag if missing from photo?")
         .default(true)
@@ -1450,6 +1459,11 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             writeln!(out, "keep_unicode_in_filenames = true")?;
         } else {
             writeln!(out, "# keep_unicode_in_filenames = false")?;
+        }
+        if answers.edited_as_primary {
+            writeln!(out, "edited_as_primary = true")?;
+        } else {
+            writeln!(out, "# edited_as_primary = false")?;
         }
 
         // [watch]
@@ -2025,6 +2039,7 @@ mod tests {
             max_retries: Some(5),
             bandwidth_limit: Some("10MB".to_string()),
             keep_unicode_in_filenames: true,
+            edited_as_primary: true,
             set_exif_datetime: true,
             #[cfg(feature = "xmp")]
             embed_xmp: true,
@@ -2066,6 +2081,7 @@ mod tests {
             assert!(toml_str.contains("\nxmp_sidecar = false"));
         }
         assert!(toml_str.contains("keep_unicode_in_filenames = true"));
+        assert!(toml_str.contains("edited_as_primary = true"));
         assert!(toml_str.contains("data_dir = \"~/.kei\""));
         assert!(toml_str.contains("script = \"/usr/local/bin/notify.sh\""));
 
@@ -2107,6 +2123,7 @@ mod tests {
             max_retries: Some(0),
             bandwidth_limit: Some("1Mi".to_string()),
             keep_unicode_in_filenames: true,
+            edited_as_primary: true,
             set_exif_datetime: true,
             #[cfg(feature = "xmp")]
             embed_xmp: true,
@@ -2167,6 +2184,7 @@ mod tests {
         );
         assert_eq!(photos.file_match_policy, Some(FileMatchPolicy::NameId7));
         assert_eq!(photos.keep_unicode_in_filenames, Some(true));
+        assert_eq!(photos.edited_as_primary, Some(true));
 
         let watch = parsed.watch.unwrap();
         assert_eq!(watch.interval, Some(600));

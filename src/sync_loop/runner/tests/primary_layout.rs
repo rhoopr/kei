@@ -26,6 +26,7 @@ mod directory_authority;
 mod indexing;
 mod legacy_ambiguity;
 mod membership;
+mod same_name;
 
 #[derive(Clone)]
 struct IndexingOptions {
