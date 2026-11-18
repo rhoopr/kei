@@ -696,18 +696,6 @@ async fn exercise_selected_metadata_update(
     server.verify().await;
 }
 
-/// The same asset carrying a caption edit instead of a favourite, so two
-/// passes can deliver different provider snapshots of one asset and both
-/// drift from the stored row.
-#[cfg(feature = "xmp")]
-fn run_cycle_captioned_asset_page() -> serde_json::Value {
-    let mut page = run_cycle_favourited_asset_page();
-    page["records"][1]["fields"]["isFavorite"] = serde_json::json!({"value": 0, "type": "INT64"});
-    page["records"][1]["fields"]["captionEnc"] =
-        serde_json::json!({"value": "edited in another pass", "type": "STRING"});
-    page
-}
-
 // Current ranked inventories complement sparse source/lookup fixtures. Rank
 // EOF is deliberately distinct from the source successor and never clears debt.
 fn sparse_fixture_inventory(
@@ -2058,6 +2046,30 @@ async fn run_cycle_metadata_capture_retry_preserves_durable_checkpoint_until_rep
     }
 }
 
+const METADATA_CHILD_BYTES: &[u8] =
+    b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9";
+
+async fn metadata_child_page(server: &wiremock::MockServer) -> serde_json::Value {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    Mock::given(method("GET"))
+        .and(path("/metadata.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(METADATA_CHILD_BYTES.to_vec()))
+        .mount(server)
+        .await;
+    full_album_page_with_download(
+        "PrimarySync",
+        "master-PrimarySync",
+        "metadata-baseline",
+        &format!("{}/metadata.jpg", server.uri()),
+        METADATA_CHILD_BYTES.len() as u64,
+        &base64::engine::general_purpose::STANDARD.encode(Sha256::digest(METADATA_CHILD_BYTES)),
+    )
+}
+
 /// Runs one full-enumeration cycle with XMP sidecars enabled over a
 /// downloaded asset the provider now reports as a favourite.
 async fn admit_metadata_child(
@@ -2065,25 +2077,7 @@ async fn admit_metadata_child(
     directory: &std::path::Path,
     server: &wiremock::MockServer,
 ) -> (serde_json::Value, std::path::PathBuf) {
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, ResponseTemplate};
-
-    let bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9";
-    Mock::given(method("GET"))
-        .and(path("/metadata.jpg"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
-        .mount(server)
-        .await;
-    let page = full_album_page_with_download(
-        "PrimarySync",
-        "master-PrimarySync",
-        "metadata-baseline",
-        &format!("{}/metadata.jpg", server.uri()),
-        bytes.len() as u64,
-        &base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes)),
-    );
+    let page = metadata_child_page(server).await;
     let library = make_run_cycle_library_state_with_album(
         "PrimarySync",
         "sync_token:PrimarySync",
@@ -2109,7 +2103,73 @@ async fn admit_metadata_child(
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id.as_ref(), "asset-master-PrimarySync");
     let path = rows[0].local_path.clone().unwrap();
-    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(std::fs::read(&path).unwrap(), METADATA_CHILD_BYTES.to_vec());
+    (page, path)
+}
+
+/// Name an owned test album so two passes resolve distinct `{album}` paths.
+#[cfg(feature = "xmp")]
+fn make_named_metadata_album(
+    db: &Arc<state::SqliteStateDb>,
+    zone: &str,
+    name: &str,
+    page: serde_json::Value,
+) -> crate::icloud::photos::PhotoAlbum {
+    let album = make_owned_metadata_album(db, zone, page);
+    let mut album = album.with_selector_components(vec![name.to_owned()]);
+    album.name = Arc::from(name);
+    album
+}
+
+/// Admits one asset under two equally current named albums so the later
+/// race runs over two independently selected destinations.
+#[cfg(feature = "xmp")]
+async fn admit_two_album_metadata_children(
+    inner: &Arc<state::SqliteStateDb>,
+    directory: &std::path::Path,
+    server: &wiremock::MockServer,
+) -> (serde_json::Value, std::path::PathBuf) {
+    let page = metadata_child_page(server).await;
+    let pass = |name: &str| crate::commands::AlbumPass {
+        kind: crate::commands::PassKind::Album,
+        album: make_named_metadata_album(inner, "PrimarySync", name, page.clone()),
+        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+    };
+    let library = make_run_cycle_library_state_with_passes(
+        "PrimarySync",
+        "sync_token:PrimarySync",
+        vec![pass("Album A"), pass("Album B")],
+    );
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
+    let build = make_run_cycle_download_config_builder_with_options(
+        directory,
+        Arc::clone(&db),
+        RunCycleDownloadConfigOptions {
+            xmp_sidecar: true,
+            per_pass_paths: true,
+            concurrent_downloads: Some(2),
+            ..RunCycleDownloadConfigOptions::default()
+        },
+    );
+    let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+    let result = Box::pin(run_cycle(
+        &[&library],
+        &make_run_cycle_config(),
+        Some(db.as_ref()),
+        &build,
+        download::DownloadControls::download_hidden(),
+        &session,
+        &CancellationToken::new(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(result.failed_count, 0);
+    assert_eq!(result.stats.downloaded, 2);
+    let rows = inner.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id.as_ref(), "asset-master-PrimarySync");
+    let path = rows[0].local_path.clone().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), METADATA_CHILD_BYTES.to_vec());
     (page, path)
 }
 
@@ -2294,11 +2354,13 @@ async fn run_cycle_full_enumeration_reports_a_failed_rewrite_once() {
     }
 }
 
-/// #707 review: the interleaving the maintainer described. Two passes run
-/// concurrently over one asset carrying different provider snapshots. They
-/// must share one drain, so a single writer owns the file, and the sidecar
-/// must agree with whichever snapshot the row settled on with no marker
-/// left claiming otherwise.
+/// #707 review: two named albums can retain independent physical copies of the
+/// same asset. They are enumerated concurrently, so both copies must share the
+/// single metadata drain, each must receive the durable row snapshot, and no
+/// marker may survive. A legacy path from an older pass layout is not a current
+/// writer; the fixture establishes both album copies under this authority first.
+/// The passes carry different change tags but one provider snapshot because
+/// current selection defers conflicting metadata snapshots for one asset.
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row() {
@@ -2306,7 +2368,8 @@ async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row(
     let config = make_run_cycle_config();
     let download_dir = tempfile::tempdir().expect("download tempdir");
     let inner = open_owned_cycle_db(&download_dir.path().join("state.db")).await;
-    let (mut page, media_path) = admit_metadata_child(&inner, download_dir.path(), &server).await;
+    let (mut page, media_path) =
+        admit_two_album_metadata_children(&inner, download_dir.path(), &server).await;
     let before = std::fs::read(&media_path).unwrap();
     inner
         .acquire_lock("force two pass metadata enumeration")
@@ -2319,11 +2382,8 @@ async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row(
     page["syncToken"] = serde_json::json!("metadata-race");
     page["records"][1]["recordChangeTag"] = serde_json::json!("favourite");
     page["records"][1]["fields"]["isFavorite"] = serde_json::json!({"value":1,"type":"INT64"});
-    let mut captioned = page.clone();
-    captioned["records"][1]["recordChangeTag"] = serde_json::json!("captioned");
-    captioned["records"][1]["fields"]["isFavorite"]["value"] = serde_json::json!(0);
-    captioned["records"][1]["fields"]["captionEnc"] =
-        run_cycle_captioned_asset_page()["records"][1]["fields"]["captionEnc"].clone();
+    let mut second_pass = page.clone();
+    second_pass["records"][1]["recordChangeTag"] = serde_json::json!("second-pass");
     inner.acquire_lock("observe native metadata finalization").unwrap().execute_batch(
         "CREATE TABLE metadata_retirements(path TEXT NOT NULL);
          CREATE TRIGGER observe_metadata_retirement AFTER UPDATE OF metadata_write_failed_at ON asset_metadata_paths
@@ -2331,18 +2391,15 @@ async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row(
          BEGIN INSERT INTO metadata_retirements VALUES(NEW.local_path); END;"
     ).unwrap();
     let db: Arc<dyn download::DownloadStore> = inner.clone();
-    let pass = |kind, page: serde_json::Value| crate::commands::AlbumPass {
-        kind,
-        album: make_owned_metadata_album(&inner, "PrimarySync", page),
+    let pass = |name: &str, page: serde_json::Value| crate::commands::AlbumPass {
+        kind: crate::commands::PassKind::Album,
+        album: make_named_metadata_album(&inner, "PrimarySync", name, page),
         exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
     };
     let lib_state = make_run_cycle_library_state_with_passes(
         "PrimarySync",
         "sync_token:PrimarySync",
-        vec![
-            pass(crate::commands::PassKind::Unfiled, page),
-            pass(crate::commands::PassKind::Album, captioned),
-        ],
+        vec![pass("Album A", page), pass("Album B", second_pass)],
     );
     let build_download_config = make_run_cycle_download_config_builder_with_options(
         download_dir.path(),
@@ -2356,7 +2413,7 @@ async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row(
     );
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
-    run_cycle(
+    let result = run_cycle(
         &[&lib_state],
         &config,
         Some(db.as_ref()),
@@ -2367,6 +2424,12 @@ async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row(
     )
     .await
     .expect("run cycle");
+    assert_eq!(result.failed_count, 0);
+    assert_eq!(
+        result.stats.downloaded, 0,
+        "the preceding cycle already established both album copies"
+    );
+    assert!(!result.stats.sync_token_blocked);
 
     let reopened = state::SqliteStateDb::open(&download_dir.path().join("state.db"))
         .await
@@ -2388,7 +2451,7 @@ async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row(
     assert_eq!(
         finalized_paths.len(),
         2,
-        "original and album copies remain independent"
+        "both album copies remain independent"
     );
     assert!(
         finalized_paths
