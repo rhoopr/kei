@@ -795,13 +795,17 @@ impl Respond for ShadowHoldProvider {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body: Value = serde_json::from_slice(&request.body).unwrap();
         if request.url.path().ends_with("/changes/zone") {
-            let quiet = body.pointer("/zones/0/syncToken").and_then(Value::as_str)
-                == Some("delta-successor");
+            let cursor = body.pointer("/zones/0/syncToken").and_then(Value::as_str);
+            // Empty polls need no inbox space. Offer a second distinct record
+            // at the saved cursor to exercise refusal and retry at capacity.
+            let capacity_page = self.kind == "capacity" && cursor == Some("delta-successor");
+            let quiet = cursor == Some("capacity-successor")
+                || (cursor == Some("delta-successor") && !capacity_page);
             let mut response = json!({"zones":[{
                 "zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
-                "syncToken":"delta-successor","moreComing":false,
+                "syncToken":if self.kind == "capacity" && (capacity_page || quiet) { "capacity-successor" } else { "delta-successor" },"moreComing":false,
                 "records":if quiet { json!([]) } else { json!([{
-                    "recordName":"future-source","recordType":"FutureRecord",
+                    "recordName":if capacity_page { "second-source" } else { "future-source" },"recordType":"FutureRecord",
                     "futureEnvelope":{"relationship":{"recordName":"unresolved-peer"}}
                 }]) }
             }]});
@@ -1034,7 +1038,9 @@ async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quie
         success(&command(root, &account, &["sync", "--no-progress-bar"]));
         let requests = server.received_requests().await.unwrap();
         let recovery_ranks = selected_ranks(&requests[recovery_requests..]);
-        if selection_missing {
+        // Admitting the second previously unseen capacity page also changes
+        // the selection dependencies and requires one inventory revalidation.
+        if selection_missing || kind == "capacity" {
             assert_empty_inventory(&recovery_ranks, kind);
         } else {
             assert!(
@@ -1060,7 +1066,11 @@ async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quie
                     |row| row.get(0)
                 )
                 .unwrap(),
-                "delta-successor",
+                if kind == "capacity" {
+                    "capacity-successor"
+                } else {
+                    "delta-successor"
+                },
                 "{kind}"
             );
             assert_eq!(
@@ -1070,7 +1080,7 @@ async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quie
                     |row| row.get(0)
                 )
                 .unwrap(),
-                2,
+                1 + initial_pages, // Only nonempty pages remain.
                 "{kind}"
             );
             assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_shadow_records WHERE record_name='future-source'",[],|row|row.get(0)).unwrap(), 1, "{kind}");
@@ -1277,14 +1287,15 @@ async fn catalog_projection_actual_cli_replays_current_backlog_after_fault_and_s
             ("provider_catalog_records", 4),
             ("provider_catalog_references", 2),
             ("provider_catalog_debt", 4),
-            ("provider_catalog_pages", 2),
+            ("provider_catalog_pages", 1), // Only the retained backlog page.
         ] {
             assert_eq!(
                 conn.query_row::<i64, _, _>(&format!("SELECT count(*) FROM {table}"), [], |row| {
                     row.get(0)
                 })
                 .unwrap(),
-                count
+                count,
+                "{table}"
             );
         }
         assert_eq!(
