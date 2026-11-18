@@ -620,9 +620,22 @@ async fn current_capture_revision_adds_no_provider_lookup_requests() {
 async fn normal_sync_writes_configured_xmp_after_capture_revision_repair() {
     let dir = TempDir::new().expect("temp dir");
     let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
-    let stored_records = incremental_photo_records_with_favorite("CAPTURE_XMP", false);
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let checksum =
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest([0u8; 1024]));
+    let mut stored_records = incremental_photo_records_with_favorite("CAPTURE_XMP", false);
+    stored_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
     let stored_asset = PhotoAsset::new(stored_records[0].clone(), stored_records[1].clone());
-    let changed_records = incremental_photo_records_with_favorite("CAPTURE_XMP", true);
+    let mut changed_records = incremental_photo_records_with_favorite("CAPTURE_XMP", true);
+    changed_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+    let selected = super::super::test_support::selected_pass_with_session(
+        &db,
+        "",
+        Box::new(super::super::test_support::SelectedMediaSession(Arc::new(
+            changed_records.clone(),
+        ))),
+    );
     let pass = super::super::test_support::selected_pass_with_session(
         &db,
         "",
@@ -640,6 +653,19 @@ async fn normal_sync_writes_configured_xmp_after_capture_revision_repair() {
     super::super::test_support::initialize_empty_selection(&db, &config).await;
     let media_path =
         seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored_asset).await;
+    let digest = crate::download::file::compute_sha256(&media_path)
+        .await
+        .unwrap();
+    db.mark_downloaded(
+        "PrimarySync",
+        stored_asset.state_id(),
+        "original",
+        &media_path,
+        &digest,
+        Some(&digest),
+    )
+    .await
+    .unwrap();
     db.upsert_asset_master_mapping("PrimarySync", "asset-CAPTURE_XMP", "CAPTURE_XMP")
         .await
         .expect("seed durable provider identity");
@@ -659,6 +685,7 @@ async fn normal_sync_writes_configured_xmp_after_capture_revision_repair() {
     .await;
     assert_eq!(repair.failures, 0);
     assert_eq!(repair.stats.metadata_capture_refreshed, 1);
+    let selected_config = Arc::new(config.clone());
     let result = download_photos_with_sync(
         &Client::new(),
         &[pass],
@@ -667,7 +694,7 @@ async fn normal_sync_writes_configured_xmp_after_capture_revision_repair() {
         CancellationToken::new(),
     )
     .await
-    .expect("normal sync drains the explicitly admitted XMP write");
+    .expect("normal sync preserves the unselected capture evidence");
 
     assert!(matches!(result.outcome, DownloadOutcome::Success));
     assert_eq!(result.stats.downloaded, 0);
@@ -679,7 +706,33 @@ async fn normal_sync_writes_configured_xmp_after_capture_revision_repair() {
             .expect("media path has filename")
             .to_string_lossy()
     );
-    assert!(media_path.with_file_name(sidecar_name).exists());
+    let sidecar = media_path.with_file_name(sidecar_name);
+    assert!(!sidecar.exists());
+    assert!(
+        !db.get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let result = download_photos_with_sync(
+        &Client::new(),
+        &[selected],
+        selected_config,
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result.outcome, DownloadOutcome::Success),
+        "{result:?}"
+    );
+    assert_eq!(result.stats.downloaded, 0);
+    assert!(
+        sidecar.exists(),
+        "{result:?}; rows={:?}",
+        db.get_downloaded_page(0, 10).await.unwrap()
+    );
     assert!(
         db.get_pending_metadata_rewrites(10)
             .await

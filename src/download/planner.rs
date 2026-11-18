@@ -282,6 +282,14 @@ impl TaskPlanner {
             && let Ok(path) =
                 crate::fs_util::reserved_path_under_root(&config.directory, &path.to_path())
             && path.extension() == derived.path.extension()
+            && self.retry_path_allowed(
+                asset.source_zone().unwrap_or(&config.library),
+                asset.state_id(),
+                derived.version_size,
+                &derived.checksum,
+                derived.size,
+                &path,
+            )
             && super::legacy_preservation::current_path_is_independent(evidence.db, &path).await?
         {
             return Ok(Some(path));

@@ -955,8 +955,8 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     assert_eq!(replayed_relation.stats.downloaded, 0);
     assert_eq!(
         lookup_calls.load(Ordering::SeqCst),
-        8,
-        "a replayed relation is revalidated without downloading again"
+        10,
+        "relation hydration and current selection confirmation each resolve the pair without downloading again"
     );
     let quiet_session = RelationUrlSession {
         delta: Vec::new(),
@@ -976,7 +976,7 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     assert_eq!(quiet.stats.downloaded, 0);
     assert_eq!(
         lookup_calls.load(Ordering::SeqCst),
-        8,
+        10,
         "an empty reopened feed does not repeat hydration"
     );
     assert_eq!(
@@ -1147,6 +1147,7 @@ async fn full_failed_task_cleanup_is_targeted_bounded_and_durable() {
             let mut album = passes[0].clone();
             album.kind = PassKind::Album;
             album.album.name = "Album A".into();
+            album.album = album.album.with_selector_components(vec!["Album A".into()]);
             passes.insert(0, album);
         }
         let dir = TempDir::new().unwrap();
@@ -1158,6 +1159,7 @@ async fn full_failed_task_cleanup_is_targeted_bounded_and_durable() {
         config.state_db = Some(db.clone());
         if recovery.starts_with("album_") {
             config.folder_structure = "{album}".into();
+            config.folder_structure_albums = Arc::from("{album}");
         }
         let source_pass = if recovery == "album_unfiled" {
             passes.last().unwrap()
