@@ -75,6 +75,42 @@ impl LayoutSession {
     fn owners(&self, path: &Path) -> Result<impl Iterator<Item = &ReconciliationCatalogPath>> {
         Ok(self.owners.get(&path_key(path)?).into_iter().flatten())
     }
+
+    fn verify_legacy_owner(
+        &self,
+        family: &str,
+        path: &Path,
+        library: &str,
+        child: &str,
+        version: VersionSizeKey,
+    ) -> Result<()> {
+        let key = path_key(path)?;
+        let mut matched = false;
+        let mut foreign = None;
+        for owner in self.owners.get(&key).into_iter().flatten() {
+            if owner.library.as_ref() == library && owner.asset_id.as_ref() == child {
+                matched |= owner.version_size == version;
+            } else if foreign.is_none() {
+                foreign = Some(owner);
+            }
+        }
+        if matched && foreign.is_none() {
+            return Ok(());
+        }
+        let owner_ref = |library: &str, child: &str| -> Result<String> {
+            Ok(digest(serde_json::to_vec(&(library, child))?))
+        };
+        let conflicting_owner = match foreign {
+            Some(owner) => owner_ref(&owner.library, &owner.asset_id)?,
+            None => "none".into(),
+        };
+        anyhow::bail!(
+            "Ambiguous legacy primary path owner: family_ref={family} path_ref={} expected_owner_ref={} rendition={} expected_receipt_matched={matched} conflicting_owner_ref={conflicting_owner}",
+            digest(key),
+            owner_ref(library, child)?,
+            version.as_str()
+        )
+    }
 }
 
 fn digest(value: impl AsRef<[u8]>) -> String {
@@ -955,17 +991,13 @@ async fn plan(
                             && derived.path == *path),
                 "Changed legacy media cannot be relocated to another rendition slot"
             );
-            anyhow::ensure!(
-                session.owners(path)?.any(|owner| {
-                    owner.library.as_ref() == record.library
-                        && owner.asset_id.as_ref() == record.id
-                        && owner.version_size == record.version_size
-                }) && session
-                    .owners(path)?
-                    .all(|owner| owner.library.as_ref() == record.library
-                        && owner.asset_id.as_ref() == record.id),
-                "Ambiguous legacy primary path owner"
-            );
+            session.verify_legacy_owner(
+                &family,
+                path,
+                &record.library,
+                &record.id,
+                record.version_size,
+            )?;
             if oldfiles.iter().all(|f| f.path.to_path() != *path) {
                 let mut file = file_receipt(
                     &config.directory,
@@ -2464,6 +2496,68 @@ mod tests {
 
     const PREPARED: &[u8] = b"prepared current rendition";
     const LEGACY: &[u8] = b"ambiguous legacy original";
+
+    #[test]
+    fn legacy_owner_diagnostic_preserves_rendition_guard_and_redacts_identifiers() {
+        use crate::state::{ReconciliationCatalogPath, VersionSizeKey};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private-filename.jpg");
+        let mut session = LayoutSession::default();
+        let key = super::path_key(&path).unwrap();
+        let owner = |id: &str, version_size| ReconciliationCatalogPath {
+            library: "private-library".into(),
+            asset_id: id.into(),
+            version_size,
+            path: path.clone(),
+        };
+        let family = super::family_in_parent(
+            &TestPhotoAsset::new("private-child").build(),
+            &DownloadConfig::test_default(),
+            dir.path(),
+        )
+        .unwrap();
+        let verify = |session: &LayoutSession| {
+            session.verify_legacy_owner(
+                &family,
+                &path,
+                "private-library",
+                "private-child",
+                VersionSizeKey::Original,
+            )
+        };
+        session.owners.insert(
+            key.clone(),
+            vec![owner("private-child", VersionSizeKey::Adjusted)],
+        );
+        let missing = verify(&session).unwrap_err().to_string();
+        assert!(missing.contains("expected_receipt_matched=false conflicting_owner_ref=none"));
+
+        session
+            .owners
+            .get_mut(&key)
+            .unwrap()
+            .push(owner("private-child", VersionSizeKey::Original));
+        verify(&session).unwrap();
+        session
+            .owners
+            .get_mut(&key)
+            .unwrap()
+            .push(owner("private-peer", VersionSizeKey::Original));
+        let conflict = verify(&session).unwrap_err().to_string();
+        assert!(conflict.contains("expected_receipt_matched=true"));
+        assert!(conflict.contains(&format!("family_ref={family}")));
+        assert!(!conflict.contains("private-"));
+        let owner_ref = |id: &str| digest(serde_json::to_vec(&("private-library", id)).unwrap());
+        assert!(conflict.contains(&format!(
+            "expected_owner_ref={}",
+            owner_ref("private-child")
+        )));
+        assert!(conflict.contains(&format!(
+            "conflicting_owner_ref={}",
+            owner_ref("private-peer")
+        )));
+    }
 
     async fn prepared_layout(
         db: &Arc<SqliteStateDb>,

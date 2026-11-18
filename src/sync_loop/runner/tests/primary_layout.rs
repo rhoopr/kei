@@ -24,6 +24,7 @@ const EDIT_ONE: &[u8] = b"\xff\xd8\xff\xe0first adjusted independent bytes";
 const EDIT_TWO: &[u8] = b"\xff\xd8\xff\xe0second adjusted independent bytes";
 mod directory_authority;
 mod indexing;
+mod legacy_ambiguity;
 mod membership;
 
 #[derive(Clone)]
