@@ -138,7 +138,7 @@ impl PhotosSession for Session {
                 )
             };
             return Ok(
-                json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":token,"moreComing":false,"records":if self.quiet {vec![]} else {source}}]}),
+                json!({"zones":[{"zoneID":request["zones"][0]["zoneID"],"syncToken":token,"moreComing":false,"records":if self.quiet {vec![]} else {source}}]}),
             );
         }
         if url.contains("/records/lookup?") {
@@ -231,6 +231,7 @@ async fn cycle_resolution(
     .await
 }
 struct CycleOptions {
+    zone: &'static str,
     exif_description: bool,
     second_album: bool,
     album_name: &'static str,
@@ -254,6 +255,7 @@ struct CycleOptions {
 impl Default for CycleOptions {
     fn default() -> Self {
         Self {
+            zone: "PrimarySync",
             exif_description: false,
             second_album: false,
             album_name: "TestAlbum",
@@ -341,7 +343,7 @@ async fn try_cycle_options(
             obj_type: Arc::from(obj_type),
             query_filter,
             page_size: 100,
-            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            zone_id: Arc::new(json!({"zoneName":options.zone,"ownerRecordName":"_defaultOwner"})),
             retry_config: crate::retry::RetryConfig::default(),
             container_id: (options.pass_kind == PassKind::Album).then(|| Arc::from("album-501")),
             cross_zone_sources: Vec::new(),
@@ -418,21 +420,24 @@ async fn try_cycle_options(
             exclude_ids: Arc::default(),
         });
     }
-    let mut library =
-        make_run_cycle_library_state_with_passes("PrimarySync", "sync_token:PrimarySync", passes);
+    let mut library = make_run_cycle_library_state_with_passes(
+        options.zone,
+        &format!("sync_token:{}", options.zone),
+        passes,
+    );
     library.library = if let Some(indexing) = &options.indexing {
         library.plan_is_stale = indexing.stale_plan;
         crate::icloud::photos::PhotoLibrary::new(
             "https://example.com".into(),
             Arc::default(),
             Box::new(provider),
-            Arc::new(json!({"zoneName":"PrimarySync"})),
+            Arc::new(json!({"zoneName":options.zone})),
             "private".into(),
             crate::retry::RetryConfig::default(),
         )
         .await?
     } else {
-        crate::icloud::photos::PhotoLibrary::new_stub_with_zone(Box::new(provider), "PrimarySync")
+        crate::icloud::photos::PhotoLibrary::new_stub_with_zone(Box::new(provider), options.zone)
     };
     let db: Arc<dyn download::DownloadStore> = inner;
     let media = root.join(options.media_directory);
@@ -506,7 +511,7 @@ async fn try_cycle_options(
             download::SyncMode::Full,
             Arc::default(),
             Arc::default(),
-            Arc::from("PrimarySync"),
+            Arc::from(options.zone),
         );
         assert_eq!(
             download::has_due_selection_work(&library.plan.passes, &check, options.controls)
@@ -4533,6 +4538,105 @@ fn live_records(
         page[1]["fields"]["adjustmentRenderType"] = json!({"value":1});
     }
     page
+}
+
+#[tokio::test]
+async fn shared_edited_live_photo_restores_missing_bound_motion_on_quiet_sync() {
+    const ZONE: &str = "SharedSync-1060";
+    let root = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    let members = [
+        (
+            "live-original-still",
+            "IMG_0501_original.HEIC",
+            b"\0\0\0\x18ftypheicoriginal".as_slice(),
+        ),
+        (
+            "live-edited-still",
+            "IMG_0501.HEIC",
+            b"\0\0\0\x18ftypheicedited",
+        ),
+        (
+            "live-original-motion",
+            "IMG_0501_HEVC_original.MOV",
+            b"\0\0\0\x18ftypqt  original",
+        ),
+        (
+            "live-edited-motion",
+            "IMG_0501_HEVC.MOV",
+            b"\0\0\0\x18ftypqt  edited",
+        ),
+    ];
+    for (endpoint, _, bytes) in members {
+        Mock::given(method("GET"))
+            .and(path(format!("/{endpoint}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(&server)
+            .await;
+    }
+    let mut current = live_records(
+        &server.uri(),
+        members[0].2,
+        members[2].2,
+        Some((members[1].2, members[3].2)),
+    );
+    current[1]["fields"]["masterRef"]["value"]["zoneID"]["zoneName"] = json!(ZONE);
+    let options = || CycleOptions {
+        zone: ZONE,
+        #[cfg(feature = "xmp")]
+        sidecar: true,
+        ..CycleOptions::default()
+    };
+    let (initial, _) = cycle_options(
+        root.path(),
+        current.clone(),
+        false,
+        EditedNaming::Primary,
+        options(),
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_bindings WHERE source_library='SharedSync-1060'"
+        ),
+        1
+    );
+    let media = root.path().join("media");
+    for (_, name, bytes) in members {
+        assert_bytes(&media.join(name), bytes);
+    }
+    #[cfg(feature = "xmp")]
+    let packets = members.map(|(_, name, _)| {
+        let path = media.join(format!("{name}.xmp"));
+        let bytes = std::fs::read(&path).unwrap();
+        (path, bytes)
+    });
+    std::fs::remove_file(media.join(members[3].1)).unwrap();
+    let before = server.received_requests().await.unwrap().len();
+    for _ in 0..2 {
+        let (result, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Primary,
+            options(),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        for (_, name, bytes) in members {
+            assert_bytes(&media.join(name), bytes);
+        }
+        #[cfg(feature = "xmp")]
+        for (path, bytes) in &packets {
+            assert_bytes(path, bytes);
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), before + 1);
+        assert_eq!(requests[before].url.path(), "/live-edited-motion");
+    }
 }
 
 #[tokio::test]
