@@ -756,13 +756,29 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
         make_run_cycle_download_config_builder(download_dir.path(), db.clone());
 
     // Actual cycle orchestration: failed inventory token repair, then complete
-    // inventory with a failed bridge, then successful bridge after reopening.
-    for (inventory, bridge, advance) in [
-        ("", "PRIVATE_UNUSED_TOKEN", false),
-        ("PRIVATE_INVENTORY_TOKEN", "", false),
-        ("PRIVATE_INVENTORY_TOKEN", "PRIVATE_BRIDGE_TOKEN", true),
-    ] {
+    // inventory with a failed bridge, then the successful bridge after
+    // reopening, then an unchanged incremental from the promoted checkpoint.
+    for (cycle, (inventory, bridge, advance, expected_token)) in [
+        ("", "PRIVATE_UNUSED_TOKEN", false, "PRIVATE_PRIOR_TOKEN"),
+        ("PRIVATE_INVENTORY_TOKEN", "", false, "PRIVATE_PRIOR_TOKEN"),
+        (
+            "PRIVATE_INVENTORY_TOKEN",
+            "PRIVATE_BRIDGE_TOKEN",
+            true,
+            "PRIVATE_BRIDGE_TOKEN",
+        ),
+        (
+            "PRIVATE_UNUSED_TOKEN",
+            "PRIVATE_NEXT_TOKEN",
+            true,
+            "PRIVATE_NEXT_TOKEN",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let provider = ConfigBridgeSession::new("PrimarySync", inventory, bridge);
+        let calls = provider.calls.clone();
         let album = fixture_album(&db, "PrimarySync", "", Box::new(provider.clone()));
         let lib_state =
             make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
@@ -792,29 +808,63 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
         if bridge.is_empty() {
             let error = result.expect_err("blank bridge successor must remain a provider refusal");
             assert!(format!("{error:#}").contains("Missing changes/zone successor"));
-            let calls = provider.calls.lock().unwrap();
-            let query = calls.iter().position(|(kind, _)| *kind == "query").unwrap();
-            let bridge = calls
-                .iter()
-                .position(|(kind, cursor)| *kind == "changes" && cursor == "PRIVATE_PRIOR_TOKEN")
-                .unwrap();
-            assert!(
-                query < bridge,
-                "the real bridge must fail after current query coverage: {calls:?}"
-            );
         } else {
             assert_eq!(result.unwrap().db_sync_token_advance_safe, advance);
+        }
+        // Provider calls prove bridge reachability: cycle 0 never completes
+        // its inventory cursor, cycle 3 has no inventory at all and replays
+        // only the promoted active token.
+        {
+            let calls = calls.lock().unwrap();
+            let changes = calls
+                .iter()
+                .filter(|(kind, _)| *kind == "changes")
+                .map(|(_, cursor)| cursor.as_str())
+                .collect::<Vec<_>>();
+            match cycle {
+                0 => assert!(
+                    changes.is_empty(),
+                    "a failed inventory repair must not attempt the delta bridge: {calls:?}"
+                ),
+                1 | 2 => {
+                    // Both bridges replay the preserved checkpoint cursor,
+                    // not the inventory token that just completed.
+                    assert_eq!(
+                        changes,
+                        vec!["PRIVATE_PRIOR_TOKEN"],
+                        "the bridge must replay the preserved checkpoint: {calls:?}"
+                    );
+                    let query = calls.iter().position(|(kind, _)| *kind == "query").unwrap();
+                    let bridge = calls
+                        .iter()
+                        .position(|(kind, cursor)| {
+                            *kind == "changes" && cursor == "PRIVATE_PRIOR_TOKEN"
+                        })
+                        .unwrap();
+                    assert!(
+                        query < bridge,
+                        "the bridge must follow current query coverage: {calls:?}"
+                    );
+                }
+                _ => {
+                    assert_eq!(
+                        changes,
+                        vec!["PRIVATE_BRIDGE_TOKEN"],
+                        "the unchanged incremental must replay only the promoted token: {calls:?}"
+                    );
+                    assert!(
+                        !calls.iter().any(|(kind, _)| *kind == "query"),
+                        "an unchanged incremental must not run inventory: {calls:?}"
+                    );
+                }
+            }
         }
         assert_eq!(
             db.get_metadata("sync_token:PrimarySync")
                 .await
                 .unwrap()
                 .as_deref(),
-            Some(if advance {
-                "PRIVATE_BRIDGE_TOKEN"
-            } else {
-                "PRIVATE_PRIOR_TOKEN"
-            })
+            Some(expected_token)
         );
         assert_eq!(
             db.get_metadata(ENUM_CONFIG_HASH_KEY)
@@ -840,7 +890,7 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
     let history: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&history_path).unwrap()).unwrap();
     let cycles = history["cycles"].as_array().unwrap();
-    assert_eq!(cycles.len(), 3);
+    assert_eq!(cycles.len(), 4);
     let component = |cycle: usize, name: &str| -> &serde_json::Value {
         &cycles[cycle]["diagnostics"]
             .as_array()
@@ -876,6 +926,51 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
     );
     assert_eq!(component(2, "delta_bridge")["token_present"], true);
     assert_eq!(component(2, "combined")["sync_token_blocked"], false);
+
+    let delta_bridge = |cycle: usize| -> Vec<&serde_json::Value> {
+        cycles[cycle]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|diagnostic| diagnostic["kind"] == "support_delta_bridge_v1")
+            .collect()
+    };
+    // No bridge was attempted while the inventory cursor was still unproven.
+    assert!(
+        delta_bridge(0).is_empty(),
+        "bridge evidence must not precede an attempted bridge: {}",
+        cycles[0]
+    );
+    let failed_bridge = delta_bridge(1);
+    assert_eq!(failed_bridge.len(), 2, "{}", cycles[1]);
+    assert_eq!(failed_bridge[0]["fields"]["outcome"], "started");
+    assert_eq!(failed_bridge[1]["fields"]["outcome"], "failed");
+    assert_eq!(failed_bridge[1]["fields"]["reason"], "missing_successor");
+    let successful_bridge = delta_bridge(2);
+    assert_eq!(successful_bridge.len(), 1, "{}", cycles[2]);
+    assert_eq!(successful_bridge[0]["fields"]["outcome"], "started");
+    let diagnostics = cycles[2]["diagnostics"].as_array().unwrap();
+    let started = diagnostics
+        .iter()
+        .position(|diagnostic| diagnostic["kind"] == "support_delta_bridge_v1")
+        .unwrap();
+    let completed = diagnostics
+        .iter()
+        .position(|diagnostic| {
+            diagnostic["kind"] == "support_pass_completion_v1"
+                && diagnostic["fields"]["component"] == "delta_bridge"
+        })
+        .unwrap();
+    assert!(
+        started < completed,
+        "a bridge start must precede its completion evidence: {}",
+        cycles[2]
+    );
+    assert!(
+        delta_bridge(3).is_empty(),
+        "an unchanged incremental must not report a bridge: {}",
+        cycles[3]
+    );
     let encoded = history.to_string();
     for private in [
         "PRIVATE",

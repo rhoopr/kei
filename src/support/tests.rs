@@ -367,6 +367,14 @@ fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
 }
 
 #[test]
+fn bridge_history_rejects_arbitrary_error_text() {
+    let fields =
+        json!({"outcome":"failed", "reason":"PRIVATE provider response", "token":"PRIVATE"});
+    let safe = privacy::diagnostic("support_delta_bridge_v1", fields.as_object().unwrap()).unwrap();
+    assert_eq!(serde_json::Value::Object(safe), json!({"outcome":"failed"}));
+}
+
+#[test]
 fn hydration_wait_contract_retains_only_fixed_phases_outcomes_and_unsigned_time() {
     for phase in ["asset_identity", "paired_asset", "album_relation"] {
         for outcome in ["started", "waiting", "returned", "cancelled"] {

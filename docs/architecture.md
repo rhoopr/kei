@@ -1187,6 +1187,11 @@ Eligibility-config drift preserves the active checkpoint while a complete
 inventory and delta bridge build a replacement. Path-config drift preserves
 provider checkpoints while local catalog paths are reconciled.
 
+Support history records when replay from the preserved checkpoint starts. If
+replay returns an error before producing a result, history records a fixed
+reason instead of the error text. A start without a later result or failure
+means no outcome was recorded; it does not identify the cause of the hold.
+
 Schema 25 stores local reconciliation destination choices in
 `reconciliation_paths`. The planner reserves current and historical catalog
 paths and previous choices across all libraries, with library-qualified asset

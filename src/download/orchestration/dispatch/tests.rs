@@ -1163,11 +1163,9 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
         if !expired {
             // Original-page capture must reject a malformed successor rather
             // than infer token expiry from missing protocol evidence.
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("Invalid changes/zone page shape")
+            assert_eq!(
+                crate::icloud::photos::error::bridge_error_reason(&result.unwrap_err()),
+                "missing_successor"
             );
             assert_eq!(deltas.load(Ordering::SeqCst), 1);
             continue;

@@ -412,6 +412,7 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "sync_token_receivers_dropped",
             "sync_token_unique_values",
         ]),
+        "support_delta_bridge_v1" => Some(&["outcome", "reason"]),
         "support_hydration_wait_v1" => Some(&["phase", "outcome", "elapsed_secs"]),
         "support_pass_completion_v1" => Some(&[
             "outcome",
@@ -610,6 +611,13 @@ fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
                         | "live_reference"
                 )
             ),
+            _ => false,
+        };
+    }
+    if kind == "support_delta_bridge_v1" {
+        return match key {
+            "outcome" => matches!(label, Some("started" | "failed")),
+            "reason" => matches!(label, Some("missing_successor" | "replay_error")),
             _ => false,
         };
     }

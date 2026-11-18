@@ -1684,6 +1684,12 @@ async fn run_cycle_inner(
                     );
                     Arc::make_mut(&mut bridge_config).sparse_targets =
                         Arc::clone(&download_config.sparse_targets);
+                    crate::support::observe_scoped(
+                        &lib_state.zone_name,
+                        None,
+                        "support_delta_bridge_v1",
+                        serde_json::json!({"outcome":"started"}),
+                    );
                     let bridge_result = Box::pin(download::download_photos_with_sync(
                         &download_client,
                         &lib_state.plan.passes,
@@ -1691,7 +1697,16 @@ async fn run_cycle_inner(
                         download_controls,
                         shutdown_token.clone(),
                     ))
-                    .await?;
+                    .await
+                    .inspect_err(|error| {
+                        crate::support::observe_scoped(
+                            &lib_state.zone_name,
+                            None,
+                            "support_delta_bridge_v1",
+                            serde_json::json!({"outcome":"failed", "reason":
+                                crate::icloud::photos::error::bridge_error_reason(error)}),
+                        );
+                    })?;
                     observe_sync_component(
                         &lib_state.zone_name,
                         "delta_bridge",

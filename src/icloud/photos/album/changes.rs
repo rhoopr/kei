@@ -78,6 +78,12 @@ impl ValidatedChangesPage {
             "Changes/zone record failed"
         );
         let zone_scope = zone_id.clone();
+        anyhow::ensure!(
+            zone.get("syncToken")
+                .and_then(Value::as_str)
+                .is_some_and(|token| !token.trim().is_empty()),
+            crate::icloud::photos::error::MissingZoneSuccessor
+        );
         let response: ChangesZoneResponse = serde_json::from_value(response)
             .map_err(|_invalid_shape| anyhow::anyhow!("Invalid changes/zone page shape"))?;
         let zone = response
@@ -85,10 +91,6 @@ impl ValidatedChangesPage {
             .into_iter()
             .next()
             .context("Missing changes/zone result")?;
-        anyhow::ensure!(
-            !zone.sync_token.trim().is_empty(),
-            "Missing changes/zone successor"
-        );
         Ok(Self {
             zone_scope,
             records: zone.records,

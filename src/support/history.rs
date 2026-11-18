@@ -655,6 +655,7 @@ fn priority(kind: &str, fields: &Map<String, Value>) -> u8 {
     if matches!(
         kind,
         "support_checkpoint_v1"
+            | "support_delta_bridge_v1"
             | "support_pass_completion_v1"
             | "support_token_evidence_v1"
             | "support_token_equivalence_v1"
