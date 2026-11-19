@@ -4,7 +4,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use super::{assert_history, bundles, config, old_database, owner};
+use super::{LEGACY_RESPONSE, assert_history, bundles, config, large_inbox, old_database, owner};
 use crate::state::{SqliteStateDb, db::account, error::StateError, schema};
 
 const WORKER: &str =
@@ -43,6 +43,134 @@ async fn owned_migration_backup_interruption_worker() {
     panic!("production interruption point was not reached");
 }
 
+async fn paused_worker(root: &std::path::Path, point: &str) -> Worker {
+    std::fs::write(root.join("fixture-owner"), b"kei-synthetic-process-death").unwrap();
+    let mut child = Worker(
+        Command::new(std::env::current_exe().unwrap())
+            .args([WORKER, "--exact", "--nocapture"])
+            .env("KEI_TEST_SCHEMA_BACKUP_WORKER", root)
+            .env("KEI_TEST_PROCESS_DEATH_POINT", point)
+            .env("KEI_TEST_PROCESS_DEATH_ROOT", root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !root.join("ready").exists() {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "{point}: worker exited before reaching boundary"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "{point}: worker did not reach boundary"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(std::fs::read_to_string(root.join("ready")).unwrap(), point);
+    child
+}
+
+#[tokio::test]
+async fn owned_migration_backup_direct_inbox_retirement_bounds_live_file_and_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    drop(large_inbox(root, 36));
+    let path = root.join("state.db");
+    let before = path.metadata().unwrap().len();
+    let source = config(root);
+    let mut child = paused_worker(root, "schema-migration-committed").await;
+    // No close, VACUUM or maintenance checkpoint yet. Include the WAL so
+    // measuring only a stale main file cannot hide an archive-sized copy.
+    let live = path.metadata().unwrap().len();
+    let wal = root.join("state.db-wal").metadata().unwrap().len();
+    eprintln!("schema 36 retirement: live {live} + WAL {wal} bytes, from {before}");
+    assert!(live + wal < before + LEGACY_RESPONSE as u64 / 2);
+    child.0.kill().unwrap();
+    assert_eq!(child.0.wait().unwrap().signal(), Some(9));
+    let db = SqliteStateDb::open_owned_with_config(&path, &owner(), &source)
+        .await
+        .unwrap();
+    assert!(
+        db.get_metadata(schema::INBOX_COMPACTION_PENDING)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop(db);
+    assert!(before - path.metadata().unwrap().len() >= 11 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn owned_migration_backup_inbox_cleanup_and_compaction_recover_from_process_death() {
+    for point in [
+        "schema-migration-before-commit",
+        "inbox-during-vacuum",
+        "inbox-vacuum-committed",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        drop(large_inbox(root, 44));
+        let path = root.join("state.db");
+        let before = path.metadata().unwrap().len();
+        let source = config(root);
+        let mut child = paused_worker(root, point).await;
+        child.0.kill().unwrap();
+        assert_eq!(child.0.wait().unwrap().signal(), Some(9));
+        let inspected = account::open_read_only(&path).unwrap();
+        let cleanup_committed = point != "schema-migration-before-commit";
+        assert_history(&inspected);
+        assert_eq!(
+            schema::get_schema_version(&inspected).unwrap(),
+            if cleanup_committed {
+                schema::SCHEMA_VERSION
+            } else {
+                44
+            }
+        );
+        assert_eq!(
+            inspected
+                .query_row::<bool, _, _>(
+                    "SELECT EXISTS(SELECT 1 FROM metadata WHERE key=?1)",
+                    [schema::INBOX_COMPACTION_PENDING],
+                    |r| r.get(0)
+                )
+                .unwrap(),
+            cleanup_committed
+        );
+        assert_eq!(inspected.query_row::<bool,_,_>("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='historical_v030_provider_shadow_pages')", [], |r| r.get(0)).unwrap(), !cleanup_committed);
+        let cookie: i64 = inspected
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .unwrap();
+        drop(inspected);
+        for _ in 0..2 {
+            let db = SqliteStateDb::open_owned_with_config(&path, &owner(), &source)
+                .await
+                .unwrap();
+            assert!(
+                db.get_metadata(schema::INBOX_COMPACTION_PENDING)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let conn = db.acquire_lock("recovered compaction").unwrap();
+            assert_history(&conn);
+            if point == "inbox-vacuum-committed" {
+                // SQLite increments the schema cookie on every VACUUM, even
+                // when rewriting an identical database.
+                assert_eq!(
+                    conn.pragma_query_value::<i64, _>(None, "schema_version", |row| row.get(0))
+                        .unwrap(),
+                    cookie
+                );
+            }
+        }
+        assert!(before - path.metadata().unwrap().len() >= LEGACY_RESPONSE as u64);
+        assert_eq!(bundles(root).len(), if cleanup_committed { 1 } else { 2 });
+    }
+}
+
 #[tokio::test]
 async fn owned_migration_backup_process_death_recovers_and_excludes_competing_writers() {
     for point in POINTS {
@@ -51,31 +179,7 @@ async fn owned_migration_backup_process_death_recovers_and_excludes_competing_wr
         let conn = old_database(root, 35);
         let source = config(root);
         let config_bytes = std::fs::read(root.join("custom.toml")).unwrap();
-        std::fs::write(root.join("fixture-owner"), b"kei-synthetic-process-death").unwrap();
-        let mut child = Worker(
-            Command::new(std::env::current_exe().unwrap())
-                .args([WORKER, "--exact", "--nocapture"])
-                .env("KEI_TEST_SCHEMA_BACKUP_WORKER", root)
-                .env("KEI_TEST_PROCESS_DEATH_POINT", point)
-                .env("KEI_TEST_PROCESS_DEATH_ROOT", root)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !root.join("ready").exists() {
-            assert!(
-                child.0.try_wait().unwrap().is_none(),
-                "{point}: worker exited before reaching boundary"
-            );
-            assert!(
-                Instant::now() < deadline,
-                "{point}: worker did not reach boundary"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(std::fs::read_to_string(root.join("ready")).unwrap(), point);
+        let mut child = paused_worker(root, point).await;
         let committed = point == "schema-migration-committed";
         assert_history(&conn);
         assert_eq!(

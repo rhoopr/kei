@@ -18,6 +18,7 @@ mod checkpoints;
 mod contracts;
 mod identity;
 mod import;
+mod inbox_compaction;
 mod legacy_preservation;
 mod membership;
 mod metadata;
@@ -174,6 +175,7 @@ impl SqliteStateDb {
                 crate::test_helpers::process_death_point("schema-migration-committed");
             }
             conn.pragma_update(None, "journal_mode", "WAL")?;
+            inbox_compaction::retry(&mut conn, &cloned_path)?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
             conn.set_db_config(
                 rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,

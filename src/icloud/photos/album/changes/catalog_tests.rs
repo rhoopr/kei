@@ -5,6 +5,9 @@ use crate::icloud::photos::album::test_support::{
     changes_asset, changes_master, make_album_with_session,
 };
 use crate::state::SqliteStateDb;
+use crate::test_helpers::{
+    assert_no_retired_inbox_archive, recovery_bundle_connections, single_recovery_bundle_connection,
+};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -120,11 +123,11 @@ async fn catalog_projection_fresh_start_rebuilds_current_sources_through_two_qui
         let db = open(&path).await;
         if cycle == 0 {
             assert_eq!(counts(&db), [0, 0, 0, 0]);
+            assert_no_retired_inbox_archive(&db.acquire_lock("live inbox archive").unwrap());
             assert_eq!(
-                db.acquire_lock("retired raw source")
-                    .unwrap()
+                single_recovery_bundle_connection(directory.path())
                     .query_row::<Vec<u8>, _, _>(
-                        "SELECT body FROM historical_v030_provider_shadow_pages",
+                        "SELECT body FROM provider_shadow_pages",
                         [],
                         |row| row.get(0)
                     )
@@ -519,17 +522,22 @@ async fn catalog_projection_migration_conflict_preserves_schema29_source_and_unk
             .await
             .unwrap();
         assert_eq!(counts(&db), [0, 0, 0, 0]);
-        assert_eq!(
-            db.acquire_lock("retired source bytes")
-                .unwrap()
-                .query_row::<Vec<u8>, _, _>(
-                    "SELECT body FROM historical_v030_provider_shadow_pages",
-                    [],
-                    |row| row.get(0)
-                )
-                .unwrap(),
-            original
-        );
+        assert_no_retired_inbox_archive(&db.acquire_lock("live inbox archive").unwrap());
+        let originals = recovery_bundle_connections(directory.path());
+        assert!(!originals.is_empty(), "no complete recovery bundle");
+        for snapshot in &originals {
+            assert_eq!(
+                snapshot
+                    .query_row::<Vec<u8>, _, _>(
+                        "SELECT body FROM provider_shadow_pages",
+                        [],
+                        |row| { row.get(0) }
+                    )
+                    .unwrap(),
+                original,
+                "every complete recovery bundle must retain the pre-upgrade source"
+            );
+        }
         unchanged(&db, &media).await;
     }
 }

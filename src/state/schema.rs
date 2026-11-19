@@ -7,8 +7,30 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 44;
+pub(crate) const SCHEMA_VERSION: i32 = 45;
 const FRESH_START_VERSION: i32 = 38;
+const RETIRED_INBOX: [&str; 3] = [
+    "provider_shadow_receipts",
+    "provider_shadow_records",
+    "provider_shadow_pages",
+];
+pub(super) const INBOX_COMPACTION_PENDING: &str = "v030_inbox_compaction_pending";
+
+fn mark_inbox_compaction(conn: &Connection) -> Result<(), StateError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO metadata(key,value) VALUES (?1,'1')",
+        [INBOX_COMPACTION_PENDING],
+    )?;
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+        [table],
+        |row| row.get(0),
+    )
+}
 
 /// Retire provider planning authority once, without interpreting historical
 /// payloads or changing file records. The enclosing migration savepoint makes
@@ -36,32 +58,28 @@ fn retire_historical_provider_plans(conn: &Connection) -> Result<(), StateError>
         "provider_catalog_pages",
         "provider_transport_aliases",
         "provider_transport_canonical",
-        "provider_shadow_receipts",
-        "provider_shadow_records",
-        "provider_shadow_pages",
-        "scoped_db_sync_tokens",
-        "unresolved_sparse_identities",
-    ] {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
-            [table],
-            |row| row.get(0),
-        )?;
-        if !exists {
+    ]
+    .into_iter()
+    .chain(RETIRED_INBOX)
+    .chain(["scoped_db_sync_tokens", "unresolved_sparse_identities"])
+    {
+        if !table_exists(conn, table)? {
             continue;
         }
-        conn.execute_batch(&format!(
-            "CREATE TABLE historical_v030_{table} AS SELECT * FROM {table}; DELETE FROM {table};"
-        ))?;
+        let inbox = RETIRED_INBOX.contains(&table);
+        if !inbox {
+            conn.execute_batch(&format!(
+                "CREATE TABLE historical_v030_{table} AS SELECT * FROM {table}"
+            ))?;
+        }
+        let retired = conn.execute(&format!("DELETE FROM {table}"), [])?;
+        if inbox && retired > 0 {
+            mark_inbox_compaction(conn)?;
+        }
     }
     // Keep historical values byte-for-byte, including malformed tokens. Removing
     // both zone and database cursors makes the existing startup choose full sync.
-    let has_metadata: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='metadata' AND type='table')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_metadata {
+    if !table_exists(conn, "metadata")? {
         return Ok(());
     }
     conn.execute_batch(
@@ -1555,6 +1573,15 @@ pub(crate) fn migrate_to_version(
                 conn.execute_batch(include_str!("historical_deletion.sql"))?;
             }
         }
+        45 => {
+            for table in RETIRED_INBOX {
+                let archive = format!("historical_v030_{table}");
+                if table_exists(conn, &archive)? {
+                    conn.execute_batch(&format!("DROP TABLE {archive}"))?;
+                    mark_inbox_compaction(conn)?;
+                }
+            }
+        }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1579,6 +1606,8 @@ pub(crate) fn migrate_genuine_v28(conn: &Connection) -> Result<(), StateError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_helpers::assert_no_retired_inbox_archive;
+
     #[test]
     fn embedded_receipt_migration_from_38_never_adopts_legacy_metadata() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1800,6 +1829,7 @@ mod tests {
         seed_historical_provider_fixture(&conn, version);
         conn
     }
+
     fn seed_historical_provider_fixture(conn: &Connection, version: i32) {
         for target in 1..=version {
             migrate_to_version(conn, 0, target).unwrap();
@@ -1832,14 +1862,7 @@ mod tests {
     fn fresh_start_retires_planning_without_decoding_or_repeating_it() {
         let conn = historical_provider_fixture(37);
         migrate(&conn).unwrap();
-        let raw: Vec<u8> = conn
-            .query_row(
-                "SELECT body FROM historical_v030_provider_shadow_pages",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(raw, [0, 255]);
+        assert_no_retired_inbox_archive(&conn);
         let path: String = conn
             .query_row(
                 "SELECT path FROM historical_v030_provider_active_destinations",
@@ -1904,7 +1927,7 @@ mod tests {
     }
 
     #[test]
-    fn preserved_local_migration_keeps_v38_active_and_archived_evidence() {
+    fn preserved_local_migration_keeps_v38_active_evidence() {
         let conn = historical_provider_fixture(38);
         conn.execute_batch("CREATE TABLE historical_v030_provider_shadow_pages(body BLOB); INSERT INTO historical_v030_provider_shadow_pages VALUES(X'00ff');").unwrap();
         migrate(&conn).unwrap();
@@ -1943,14 +1966,7 @@ mod tests {
             migrate(&conn).unwrap();
             let retained: Vec<u8> = conn.query_row("SELECT preserved_local FROM provider_active_destinations WHERE generation='old'", [], |row| row.get(0)).unwrap();
             assert_eq!(retained, evidence);
-            let raw: Vec<u8> = conn
-                .query_row(
-                    "SELECT body FROM historical_v030_provider_shadow_pages",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(raw, [0, 255]);
+            assert_no_retired_inbox_archive(&conn);
             let live: Vec<u8> = conn
                 .query_row(
                     "SELECT specification FROM provider_active_generations WHERE id='old'",
@@ -2639,17 +2655,26 @@ mod tests {
     }
 
     #[test]
+    fn fresh_start_cannot_allocate_an_archive_sized_copy() {
+        let conn = historical_provider_fixture(36);
+        conn.execute_batch("UPDATE provider_shadow_pages SET body=zeroblob(12582912)")
+            .unwrap();
+        let pages: u32 = conn
+            .pragma_query_value(None, "page_count", |r| r.get(0))
+            .unwrap();
+        // SQLite must fail any allocation over this limit, even if a later
+        // step would free it. Leave 64 pages for unrelated migration DDL.
+        conn.pragma_update(None, "max_page_count", pages + 64)
+            .unwrap();
+        migrate(&conn).unwrap();
+        assert_no_retired_inbox_archive(&conn);
+    }
+
+    #[test]
     fn fresh_start_precedes_obsolete_transport_compaction() {
         let conn = historical_provider_fixture(35);
         migrate(&conn).unwrap();
-        let body: Vec<u8> = conn
-            .query_row(
-                "SELECT body FROM historical_v030_provider_shadow_pages",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(body, [0, 255]);
+        assert_no_retired_inbox_archive(&conn);
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(
             conn.query_row("SELECT count(*) FROM provider_shadow_pages", [], |row| row

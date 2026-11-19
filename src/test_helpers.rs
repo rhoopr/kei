@@ -6,6 +6,7 @@
 pub(crate) mod allocation;
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -46,6 +47,69 @@ pub(crate) fn assert_checkpoint_evidence(conn: &rusqlite::Connection, key: &str,
         .unwrap(),
         expected
     );
+}
+
+/// Complete pre-migration recovery bundles under `root`, opened read-only.
+/// Bundle name UUIDs are not chronology; callers with more than one bundle must
+/// verify every snapshot rather than treating the first as the latest.
+pub(crate) fn recovery_bundle_connections(root: &Path) -> Vec<rusqlite::Connection> {
+    let mut bundles = std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .extension()
+                    .is_none_or(|extension| extension != "partial")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".kei-schema-backup-"))
+                && path.join("manifest.json").is_file()
+        })
+        .collect::<Vec<_>>();
+    bundles.sort();
+    bundles
+        .into_iter()
+        .map(|bundle| {
+            rusqlite::Connection::open_with_flags(
+                bundle.join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+/// The single complete pre-migration recovery bundle under `root`.
+pub(crate) fn single_recovery_bundle_connection(root: &Path) -> rusqlite::Connection {
+    let mut connections = recovery_bundle_connections(root);
+    assert_eq!(
+        connections.len(),
+        1,
+        "expected exactly one complete recovery bundle under {}",
+        root.display()
+    );
+    connections.pop().unwrap()
+}
+
+pub(crate) fn assert_no_retired_inbox_archive(conn: &rusqlite::Connection) {
+    for table in [
+        "historical_v030_provider_shadow_pages",
+        "historical_v030_provider_shadow_records",
+        "historical_v030_provider_shadow_receipts",
+    ] {
+        assert!(
+            !conn
+                .query_row::<bool, _, _>(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            "{table} must not be copied into the live database"
+        );
+    }
 }
 
 /// Synthetic QuickTime track metadata without an ISO FullBox prefix.

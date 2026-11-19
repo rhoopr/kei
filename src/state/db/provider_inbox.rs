@@ -355,6 +355,7 @@ impl SqliteStateDb {
 mod tests {
     use super::{CapturedPageId, ObservedPage, SourceIdentity, StoredPage, load_page};
     use crate::state::db::account::AccountOwner;
+    use crate::test_helpers::{assert_no_retired_inbox_archive, single_recovery_bundle_connection};
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
 
@@ -651,31 +652,36 @@ mod tests {
                 before
             );
             assert!(alias_rows(&conn, "provider_transport_aliases").is_empty());
+            assert_no_retired_inbox_archive(&conn);
+            let original = single_recovery_bundle_connection(directory.path());
             assert_eq!(
-                conn.query_row::<Vec<u8>, _, _>(
-                    "SELECT body FROM historical_v030_provider_shadow_pages WHERE id=1",
-                    [],
-                    |row| row.get(0)
-                )
-                .unwrap(),
+                original
+                    .query_row::<Vec<u8>, _, _>(
+                        "SELECT body FROM provider_shadow_pages WHERE id=1",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
                 first.body
             );
             assert_eq!(
-                conn.query_row::<Vec<u8>, _, _>(
-                    "SELECT body FROM historical_v030_provider_shadow_pages WHERE id=2",
-                    [],
-                    |row| row.get(0)
-                )
-                .unwrap(),
+                original
+                    .query_row::<Vec<u8>, _, _>(
+                        "SELECT body FROM provider_shadow_pages WHERE id=2",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
                 Vec::<u8>::new()
             );
             assert_eq!(
-                conn.query_row::<String, _, _>(
-                    "SELECT body_hash FROM historical_v030_provider_shadow_pages WHERE id=2",
-                    [],
-                    |row| row.get(0)
-                )
-                .unwrap(),
+                original
+                    .query_row::<String, _, _>(
+                        "SELECT body_hash FROM provider_shadow_pages WHERE id=2",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
                 format!("{:x}", Sha256::digest(&second.body))
             );
             assert_eq!(load_page(&conn, id, 16 * 1024 * 1024).unwrap().page, second);
@@ -801,6 +807,8 @@ mod tests {
             0,
             "an unprovable projection must not gain an alias or index"
         );
+        assert_no_retired_inbox_archive(&conn);
+        let original = single_recovery_bundle_connection(directory.path());
         let (
             body,
             body_hash,
@@ -809,9 +817,9 @@ mod tests {
             successor,
             more_coming,
             charged,
-        ): (Vec<u8>, String, String, String, String, bool, i64) = conn
+        ): (Vec<u8>, String, String, String, String, bool, i64) = original
             .query_row(
-                "SELECT body,body_hash,scope,request_cursor,successor,more_coming,charged_bytes FROM historical_v030_provider_shadow_pages WHERE id=?1",
+                "SELECT body,body_hash,scope,request_cursor,successor,more_coming,charged_bytes FROM provider_shadow_pages WHERE id=?1",
                 [id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
             )
@@ -832,8 +840,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fresh_start_preserves_corrupted_work_dependencies_as_history() {
+    #[tokio::test]
+    async fn fresh_start_preserves_corrupted_work_dependencies_as_history() {
         for sql in [
             "UPDATE provider_work_receipts SET source_hash='tampered' WHERE page_id=2",
             "UPDATE provider_work_receipts SET confirmation_hash='tampered' WHERE page_id=2",
@@ -841,49 +849,45 @@ mod tests {
         ] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("dependency.db");
-            let (_owner, _budget) = full_legacy_v35(&path);
-            {
+            let (owner, _budget) = full_legacy_v35(&path);
+            let body: Vec<u8> = {
                 let conn = Connection::open(&path).unwrap();
                 conn.execute_batch(sql).unwrap();
-                let body: Vec<u8> = conn
-                    .query_row(
-                        "SELECT body FROM provider_shadow_pages WHERE id=2",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                crate::state::schema::migrate(&conn).unwrap();
-                assert!(
-                    !conn
-                        .query_row::<bool, _, _>(
-                            "SELECT EXISTS(SELECT 1 FROM provider_transport_aliases WHERE page_id=2)",
-                            [],
-                            |row| row.get(0)
-                        )
-                        .unwrap(),
-                    "{sql}"
-                );
-                assert!(
-                    conn.query_row::<i64, _, _>(
-                        "SELECT length(body) FROM historical_v030_provider_shadow_pages WHERE id=2",
-                        [],
-                        |row| row.get(0)
-                    )
-                    .unwrap()
-                        > 0,
-                    "{sql}"
-                );
-                assert_eq!(
-                    conn.query_row::<Vec<u8>, _, _>(
-                        "SELECT body FROM historical_v030_provider_shadow_pages WHERE id=2",
+                conn.query_row(
+                    "SELECT body FROM provider_shadow_pages WHERE id=2",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            };
+            let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .unwrap();
+            let conn = db
+                .acquire_lock("corrupted work dependencies retired")
+                .unwrap();
+            assert!(
+                !conn
+                    .query_row::<bool, _, _>(
+                        "SELECT EXISTS(SELECT 1 FROM provider_transport_aliases WHERE page_id=2)",
                         [],
                         |row| row.get(0)
                     )
                     .unwrap(),
-                    body
-                );
-                assert!(load_page(&conn, CapturedPageId(2), 16 * 1024 * 1024).is_err());
-            }
+                "{sql}"
+            );
+            assert_no_retired_inbox_archive(&conn);
+            let original = single_recovery_bundle_connection(directory.path());
+            let archived: Vec<u8> = original
+                .query_row(
+                    "SELECT body FROM provider_shadow_pages WHERE id=2",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!archived.is_empty(), "{sql}");
+            assert_eq!(archived, body, "{sql}");
+            assert!(load_page(&conn, CapturedPageId(2), 16 * 1024 * 1024).is_err());
         }
     }
 
@@ -912,6 +916,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        let original = single_recovery_bundle_connection(directory.path());
         let mut capture = crate::icloud::photos::inbox::ShadowCapture::new(
             db.clone(),
             owner.clone(),
@@ -921,23 +926,26 @@ mod tests {
         {
             let conn = db.acquire_lock("post migration full inbox").unwrap();
             assert_eq!(
-                conn.query_row::<i64, _, _>(
-                    "SELECT count(*) FROM historical_v030_provider_shadow_pages",
-                    [],
-                    |row| row.get(0)
-                )
-                .unwrap(),
+                original
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM provider_shadow_pages",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
                 before.0
             );
             assert_eq!(
-                conn.query_row::<i64, _, _>(
-                    "SELECT sum(charged_bytes) FROM historical_v030_provider_shadow_pages",
-                    [],
-                    |row| row.get(0)
-                )
-                .unwrap(),
+                original
+                    .query_row::<i64, _, _>(
+                        "SELECT sum(charged_bytes) FROM provider_shadow_pages",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
                 before.1
             );
+            assert_no_retired_inbox_archive(&conn);
             assert_eq!(
                 crate::state::schema::get_schema_version(&conn).unwrap(),
                 crate::state::schema::SCHEMA_VERSION
@@ -1066,6 +1074,7 @@ mod tests {
             crate::state::schema::get_schema_version(&conn).unwrap(),
             crate::state::schema::SCHEMA_VERSION
         );
+        assert_no_retired_inbox_archive(&conn);
         assert_eq!(charged_sum(&conn), after_new);
         assert_eq!(
             conn.query_row::<i64, _, _>(
