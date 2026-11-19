@@ -15,7 +15,7 @@ pub(crate) async fn run_migrate_state(
         "Legacy adoption requires --confirm-ownership; a filename cannot prove ownership."
     );
     let (username, password, domain, directory) =
-        config::resolve_auth(globals, &args.password, toml);
+        config::resolve_auth(globals, &args.password, toml)?;
     anyhow::ensure!(
         !username.is_empty(),
         "Set your iCloud username with ICLOUD_USERNAME or [auth].username."

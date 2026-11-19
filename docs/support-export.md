@@ -3,7 +3,7 @@
 Run this with the same configuration and data directory as your sync process:
 
 ```sh
-kei --config ~/.config/kei/config.toml support-export --output kei-support.json
+kei support-export --output kei-support.json
 ```
 
 For Docker, use the existing container and mounted configuration:

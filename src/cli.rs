@@ -479,7 +479,8 @@ pub struct InstallArgs {
 #[derive(Args, Debug, Clone)]
 pub struct UninstallArgs {
     /// Also remove the state database, configuration, and stored
-    /// credentials. Default off: data is sacred, removal is opt-in.
+    /// credentials. Requires a single discovered kei root. For a symlinked
+    /// root or custom config/state paths, uninstall without --purge.
     #[arg(long)]
     pub purge: bool,
 }
@@ -678,14 +679,11 @@ pub struct Cli {
     #[arg(long, short = 'v', global = true)]
     pub verbose: bool,
 
-    /// Path to TOML config file
-    #[arg(
-        long,
-        global = true,
-        default_value = "~/.config/kei/config.toml",
-        env = "KEI_CONFIG"
-    )]
-    pub config: String,
+    /// Path to TOML config file. Defaults to $XDG_CONFIG_HOME/kei/config.toml
+    /// when XDG_CONFIG_HOME is absolute, or ~/.config/kei/config.toml otherwise.
+    /// A lone existing legacy root is retained. Two distinct roots require explicit selection.
+    #[arg(long, global = true, env = "KEI_CONFIG")]
+    pub config: Option<String>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -1159,7 +1157,7 @@ mod tests {
     #[test]
     fn test_config_flag_default() {
         let cli = parse(&base_args());
-        assert_eq!(cli.config, "~/.config/kei/config.toml");
+        assert_eq!(cli.config, None);
     }
 
     #[test]
@@ -1167,7 +1165,7 @@ mod tests {
         let mut args = base_args();
         args.extend(["--config", "/etc/kei.toml"]);
         let cli = parse(&args);
-        assert_eq!(cli.config, "/etc/kei.toml");
+        assert_eq!(cli.config.as_deref(), Some("/etc/kei.toml"));
     }
 
     // ── Explicit subcommand required ──────────────────────────────
@@ -2078,7 +2076,7 @@ mod tests {
     fn test_config_global_before_subcommand() {
         let cli =
             Cli::try_parse_from(["kei", "--config", "/custom/config.toml", "status"]).unwrap();
-        assert_eq!(cli.config, "/custom/config.toml");
+        assert_eq!(cli.config.as_deref(), Some("/custom/config.toml"));
         assert!(matches!(cli.command, Command::Status(_)));
     }
 

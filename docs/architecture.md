@@ -294,6 +294,10 @@ The log-writer guard stays in `run` until dispatch returns. Startup injects
 the captured environment password before dispatch. Command dispatch retains
 the setup wizard's one-shot sync path and the service owner's entry point.
 
+`config/paths.rs` discovers one application root for default config, cookies, credentials and state. An absolute `XDG_CONFIG_HOME` selects its `kei` subdirectory on a fresh install; a lone existing `~/.config/kei` wins for compatibility. Discovery fails if both roots exist and resolve to different directories. An explicit config path bypasses config discovery only. An explicit data directory bypasses state discovery. Purge validates the discovered root before service removal and refuses custom locations.
+
+Linux keeps the user unit under the systemd configuration directory, even when kei selects the legacy application root. The unit records the absolute config path and install-time `XDG_CONFIG_HOME` and `KEI_DATA_DIR` overrides. It clears absent overrides so the service manager's environment cannot redirect state.
+
 The CLI requires a subcommand. `kei sync` enters the sync path. Commands such
 as `status`, `doctor`, and `manifest` read local state without entering the
 normal iCloud sync loop.

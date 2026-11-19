@@ -223,7 +223,7 @@ pub(crate) async fn run_doctor(
     config_load_error: Option<String>,
 ) -> anyhow::Result<()> {
     let (username, _, domain, cookie_dir) =
-        config::resolve_auth(globals, &cli::PasswordArgs::default(), toml);
+        config::resolve_auth(globals, &cli::PasswordArgs::default(), toml)?;
     let report_path = toml
         .and_then(|t| t.report.as_ref())
         .and_then(|r| r.json.as_deref())

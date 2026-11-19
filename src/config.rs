@@ -27,14 +27,9 @@ pub(crate) use input::{
     TomlAuth, TomlConfig, TomlDownload, TomlFilters, TomlImport, TomlMetadata, TomlNotifications,
     TomlPhotos, TomlReport, TomlRetry, TomlServer, TomlUi, TomlWatch, load_toml_config,
 };
-#[expect(
-    unused_imports,
-    reason = "preserve existing config facade paths and visibility"
-)]
 pub(crate) use paths::{
-    GlobalArgs, default_config_path, default_cookie_dir, expand_tilde, kei_data_dir,
-    kei_data_dir_with_home, resolve_data_dir, resolve_password_command, resolve_password_file,
-    validate_download_dir,
+    GlobalArgs, bootstrap_config, expand_tilde, kei_data_dir, resolve_data_dir,
+    resolve_password_command, resolve_password_file, validate_download_dir,
 };
 pub(crate) use persistence::persist_first_run_config;
 #[expect(
@@ -42,8 +37,8 @@ pub(crate) use persistence::persist_first_run_config;
     reason = "preserve existing config facade paths and visibility"
 )]
 pub(crate) use resolve::{
-    PathDerivationCliArgs, PathDerivationFields, SyncConfigOverrides, resolve_auth,
-    resolve_library_selector, resolve_media_selection, resolve_notify_systemd,
+    PathDerivationCliArgs, PathDerivationFields, SyncConfigOverrides, resolve_account,
+    resolve_auth, resolve_library_selector, resolve_media_selection, resolve_notify_systemd,
     resolve_path_derivation_fields, smart_retry_delay, unfiled_default,
 };
 #[expect(

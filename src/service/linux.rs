@@ -18,30 +18,150 @@
 //! assert key shape without spawning systemd. CI covers dry-run rendering
 //! and unit syntax; real `daemon-reload` / `enable` / `disable` handoff
 //! still needs an active user session.
+//!
+//! Both install paths pin install-time absolute `XDG_CONFIG_HOME` and
+//! `KEI_DATA_DIR` overrides into the unit, and explicitly unset them when
+//! they were absent. The daemon therefore resolves the same state root
+//! as the CLI that installed it, even when the service manager's
+//! environment (or a login session) carries a different value.
 
 #![allow(
     clippy::print_stdout,
     reason = "kei service status renders human-readable output to stdout, matching kei status / kei verify."
 )]
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use tokio::process::Command;
 
-use crate::cli::UninstallArgs;
 use crate::service::env::{
     SERVICE_DESCRIPTION, SERVICE_IDENTIFIER, current_executable, effective_uid, purge_kei_state,
 };
-use crate::service::plan::{self, InstallPlan};
+use crate::service::plan::{self, InstallPlan, InstallScope};
 use crate::service::status::ServiceState;
 
 const UNIT_FILE_NAME: &str = "kei.service";
 const PREVIOUS_LINGER_MARKER: &str = "# X-Kei-Previous-Linger=";
 
 const SYSTEM_UNIT_DIR: &str = "/etc/systemd/system";
+
+/// Install-time environment overrides that must be reproduced verbatim in
+/// the unit so the daemon resolves the same state root as the CLI.
+///
+/// `XDG_CONFIG_HOME` is only honored when absolute, matching the shared
+/// discovery rule. `KEI_DATA_DIR` is expanded like the config resolver and
+/// anchored against the install working directory, so a relative value does
+/// not silently resolve against the service manager's cwd.
+#[derive(Debug, Clone, Default)]
+struct ServiceEnvironment {
+    xdg_config_home: Option<PathBuf>,
+    kei_data_dir: Option<PathBuf>,
+}
+
+impl ServiceEnvironment {
+    fn from_process_env(scope: InstallScope) -> Result<Self> {
+        Ok(Self {
+            xdg_config_home: xdg_config_home_override(),
+            kei_data_dir: data_dir_override_from_env(scope)?,
+        })
+    }
+}
+
+fn xdg_config_home_override() -> Option<PathBuf> {
+    let raw = std::env::var_os("XDG_CONFIG_HOME")?;
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        tracing::warn!(
+            variable = "XDG_CONFIG_HOME",
+            value = %path.display(),
+            "ignoring relative XDG_CONFIG_HOME; XDG discovery requires an absolute path, so the service resolves the legacy root",
+        );
+        None
+    }
+}
+
+fn data_dir_override_from_env(scope: InstallScope) -> Result<Option<PathBuf>> {
+    let Some(raw) = std::env::var_os("KEI_DATA_DIR") else {
+        return Ok(None);
+    };
+    let raw_path = PathBuf::from(raw);
+    let raw = raw_path
+        .to_str()
+        .context("The service's KEI_DATA_DIR must be valid UTF-8")?;
+    if scope == InstallScope::System {
+        require_absolute_system_data_dir(&raw_path)?;
+    }
+    if raw_path.is_absolute() {
+        return Ok(Some(raw_path));
+    }
+    let expanded = crate::config::expand_tilde(raw);
+    let cwd = std::env::current_dir().ok();
+    let path = anchor_user_data_dir_override(raw, expanded, cwd.as_deref())?;
+    path.to_str()
+        .context("The resolved service KEI_DATA_DIR must be valid UTF-8")?;
+    Ok(Some(path))
+}
+
+fn require_absolute_system_data_dir(raw_path: &Path) -> Result<()> {
+    if raw_path.is_absolute() {
+        return Ok(());
+    }
+    bail!(
+        "KEI_DATA_DIR={} must be an absolute path for `kei install --system`. The service runs as another user, so kei will not resolve `~` or relative values against the installer's home or working directory.",
+        raw_path.display()
+    )
+}
+
+/// Anchors a user install's relative `KEI_DATA_DIR` against the install
+/// cwd after `config::expand_tilde` ran. A leading `~` that survived means
+/// HOME was unavailable; refusing is safer than creating a literal `~`
+/// directory under the service manager's cwd.
+fn anchor_user_data_dir_override(
+    raw: &str,
+    expanded: PathBuf,
+    cwd: Option<&Path>,
+) -> Result<PathBuf> {
+    if expanded.is_absolute() {
+        return Ok(expanded);
+    }
+    if expanded.starts_with("~") {
+        bail!(
+            "KEI_DATA_DIR={raw} could not be expanded because HOME is not set; pass an absolute path so the service resolves the same state root."
+        );
+    }
+    let cwd = cwd.context(
+        "Could not resolve the current directory to anchor the relative KEI_DATA_DIR needed by the service unit",
+    )?;
+    Ok(cwd.join(expanded))
+}
+
+/// Anchors a relative `--config` path against the install cwd.
+///
+/// The service manager runs the daemon from a fixed cwd (`/` for system
+/// units), so writing the raw relative value into `ExecStart=` would point
+/// at a different file than the CLI read at install time.
+fn absolute_install_config(config_path: &Path) -> Result<PathBuf> {
+    if config_path.starts_with("~") {
+        bail!(
+            "--config path {} could not be expanded; pass an absolute path so the installed service reads the same file.",
+            config_path.display()
+        );
+    }
+    let path =
+        std::path::absolute(config_path).context("Cannot resolve the service config path")?;
+    path.to_str()
+        .context("The service's --config argument must be valid UTF-8")?;
+    Ok(path)
+}
 
 /// Renders the per-user `kei.service` body.
 ///
@@ -50,16 +170,26 @@ const SYSTEM_UNIT_DIR: &str = "/etc/systemd/system";
 /// stops arriving. `WantedBy=default.target` is the right install
 /// target for a user unit; `multi-user.target` is reserved for system
 /// units.
-fn render_user_unit(exec_path: &Path, config_path: &Path) -> String {
-    render_user_unit_with_linger(exec_path, config_path, None)
+fn render_user_unit(
+    exec_path: &Path,
+    config_path: &Path,
+    service_env: &ServiceEnvironment,
+) -> String {
+    render_user_unit_with_linger(exec_path, config_path, None, service_env)
 }
 
 fn render_user_unit_with_linger(
     exec_path: &Path,
     config_path: &Path,
     previous_linger: Option<LingerState>,
+    service_env: &ServiceEnvironment,
 ) -> String {
-    render_unit(exec_path, config_path, UnitKind::User { previous_linger })
+    render_unit(
+        exec_path,
+        config_path,
+        UnitKind::User { previous_linger },
+        service_env,
+    )
 }
 
 /// Renders the system-wide `kei.service` body.
@@ -68,13 +198,19 @@ fn render_user_unit_with_linger(
 /// uses that user's HOME (and thereby `~/.config/kei`) rather than
 /// running as root. `WantedBy=multi-user.target` is the boot-time
 /// target every non-graphical Linux server reaches.
-fn render_system_unit(exec_path: &Path, config_path: &Path, user: &str) -> String {
+fn render_system_unit(
+    exec_path: &Path,
+    config_path: &Path,
+    user: &str,
+    service_env: &ServiceEnvironment,
+) -> String {
     render_unit(
         exec_path,
         config_path,
         UnitKind::System {
             user: user.to_string(),
         },
+        service_env,
     )
 }
 
@@ -88,9 +224,14 @@ enum UnitKind {
     },
 }
 
-fn render_unit(exec_path: &Path, config_path: &Path, kind: UnitKind) -> String {
-    let exec = exec_path.display();
-    let config = config_path.display();
+fn render_unit(
+    exec_path: &Path,
+    config_path: &Path,
+    kind: UnitKind,
+    service_env: &ServiceEnvironment,
+) -> String {
+    let exec = service_exec_arg(exec_path.as_os_str());
+    let config = service_exec_arg(config_path.as_os_str());
     let install_target = match &kind {
         UnitKind::User { .. } => "default.target",
         UnitKind::System { .. } => "multi-user.target",
@@ -108,6 +249,7 @@ fn render_unit(exec_path: &Path, config_path: &Path, kind: UnitKind) -> String {
         }
         | UnitKind::System { .. } => String::new(),
     };
+    let environment_lines = service_environment_lines(service_env);
 
     format!(
         "[Unit]\n\
@@ -120,7 +262,7 @@ fn render_unit(exec_path: &Path, config_path: &Path, kind: UnitKind) -> String {
          [Service]\n\
          Type=notify\n\
          {user_line}\
-         Environment=MALLOC_ARENA_MAX=2\n\
+         {environment_lines}\
          ExecStart={exec} service run --config {config}\n\
          Restart=on-failure\n\
          RestartSec=10s\n\
@@ -130,6 +272,88 @@ fn render_unit(exec_path: &Path, config_path: &Path, kind: UnitKind) -> String {
          [Install]\n\
          WantedBy={install_target}\n",
     )
+}
+
+/// Pins the install-time overrides, and clears both variables when they
+/// were absent, so the service manager cannot redirect default state.
+fn service_environment_lines(service_env: &ServiceEnvironment) -> String {
+    let mut lines = String::from("Environment=MALLOC_ARENA_MAX=2\n");
+    lines.push_str(&pinned_environment(
+        "XDG_CONFIG_HOME",
+        service_env.xdg_config_home.as_deref(),
+    ));
+    lines.push_str(&pinned_environment(
+        "KEI_DATA_DIR",
+        service_env.kei_data_dir.as_deref(),
+    ));
+    lines
+}
+
+fn pinned_environment(variable: &str, value: Option<&Path>) -> String {
+    match value {
+        Some(path) => {
+            let mut assignment = OsString::from(format!("{variable}="));
+            assignment.push(path.as_os_str());
+            format!("Environment={}\n", systemd_quote(&assignment))
+        }
+        None => format!("UnsetEnvironment={variable}\n"),
+    }
+}
+
+/// Quotes one whole systemd assignment (`NAME=value`) so a path containing
+/// whitespace, quotes, control characters, or `%` specifiers cannot
+/// terminate the value or inject a new unit directive.
+///
+/// Operates on raw `OsStr` bytes: non-UTF-8 overrides are byte-escaped
+/// instead of being silently corrupted by a lossy string conversion.
+fn systemd_quote(value: &OsStr) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for &byte in value.as_bytes() {
+        match byte {
+            b'\\' => quoted.push_str("\\\\"),
+            b'"' => quoted.push_str("\\\""),
+            b'%' => quoted.push_str("%%"),
+            b'\n' => quoted.push_str("\\n"),
+            b'\r' => quoted.push_str("\\r"),
+            b'\t' => quoted.push_str("\\t"),
+            0x20..=0x7e => quoted.push(char::from(byte)),
+            other => quoted.push_str(&format!("\\x{other:02x}")),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// Adds the ExecStart-specific `$` escape on top of [`systemd_quote`]:
+/// `$NAME` expands even inside double quotes, and `$$` is the literal
+/// dollar form.
+fn systemd_quote_exec(value: &OsStr) -> String {
+    systemd_quote(value).replace('$', "$$")
+}
+
+/// Leaves already-safe command-line words unquoted (so ordinary install
+/// paths stay readable) and quotes anything that systemd would split or
+/// expand.
+fn service_exec_arg(value: &OsStr) -> String {
+    let bytes = value.as_bytes();
+    let plain = !bytes.is_empty() && bytes.iter().all(|&byte| is_plain_exec_byte(byte));
+    if plain {
+        match std::str::from_utf8(bytes) {
+            Ok(plain) => plain.to_owned(),
+            Err(_) => systemd_quote_exec(value),
+        }
+    } else {
+        systemd_quote_exec(value)
+    }
+}
+
+fn is_plain_exec_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'/' | b'.' | b'_' | b'-' | b'+' | b'=' | b'@' | b':' | b',' | b'~'
+        )
 }
 
 /// Where the per-user unit lives. Honors `XDG_CONFIG_HOME`; falls back
@@ -148,16 +372,18 @@ fn system_unit_path() -> PathBuf {
 /// Top-level entry for `kei install --user` (and the bare `kei install`
 /// default on Linux).
 pub(crate) async fn install_user(plan: InstallPlan, config_path: &Path) -> Result<()> {
+    let config_path = absolute_install_config(config_path)?;
     let exe = current_executable()?;
+    let service_env = ServiceEnvironment::from_process_env(InstallScope::User)?;
     if plan.is_preview() {
-        let contents = render_user_unit(&exe, config_path);
+        let contents = render_user_unit(&exe, &config_path, &service_env);
         print!("{contents}");
         tracing::info!("dry run: rendered per-user systemd unit; no files written");
         return Ok(());
     }
 
     let previous_linger = current_linger_state().await;
-    let contents = render_user_unit_with_linger(&exe, config_path, previous_linger);
+    let contents = render_user_unit_with_linger(&exe, &config_path, previous_linger, &service_env);
     let unit_path =
         user_unit_path().ok_or_else(|| anyhow!("Could not find XDG_CONFIG_HOME or $HOME."))?;
     write_unit(&unit_path, &contents)?;
@@ -183,10 +409,12 @@ pub(crate) async fn install_user(plan: InstallPlan, config_path: &Path) -> Resul
 
 /// Top-level entry for `kei install --system`.
 pub(crate) async fn install_system(plan: InstallPlan, config_path: &Path) -> Result<()> {
-    let user = plan::linux_system_user(plan, config_path)?;
+    let config_path = absolute_install_config(config_path)?;
+    let user = plan::linux_system_user(plan, &config_path)?;
+    let service_env = ServiceEnvironment::from_process_env(InstallScope::System)?;
     if plan.is_preview() {
         let exe = current_executable()?;
-        let contents = render_system_unit(&exe, config_path, &user);
+        let contents = render_system_unit(&exe, &config_path, &user, &service_env);
         print!("{contents}");
         tracing::info!(
             run_as_user = user,
@@ -197,7 +425,7 @@ pub(crate) async fn install_system(plan: InstallPlan, config_path: &Path) -> Res
 
     let exe = current_executable()?;
     let unit_path = system_unit_path();
-    let contents = render_system_unit(&exe, config_path, &user);
+    let contents = render_system_unit(&exe, &config_path, &user, &service_env);
     write_unit(&unit_path, &contents)?;
     tracing::info!(
         service = SERVICE_IDENTIFIER,
@@ -221,8 +449,10 @@ pub(crate) async fn install_system(plan: InstallPlan, config_path: &Path) -> Res
 
 /// Top-level entry for `kei uninstall` on Linux. Tries the per-user
 /// path first; if no user unit exists, falls back to the system unit
-/// (which the operator will need root for).
-pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
+/// (which the operator will need root for). `purge_root` is resolved and
+/// validated by the dispatcher before any unit file is removed, so a
+/// conflicting or custom state root cannot leave a half-uninstall.
+pub(crate) async fn uninstall(purge_root: Option<&Path>) -> Result<()> {
     let user_path = user_unit_path().filter(|p| p.exists());
     let system_path = Some(system_unit_path()).filter(|p| p.exists());
 
@@ -257,11 +487,8 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
         tracing::info!(path = %path.display(), "removed system-wide systemd unit");
     }
 
-    if args.purge {
-        let Some(config_dir) = dirs::config_dir() else {
-            bail!("`--purge` needs XDG_CONFIG_HOME or a home directory so kei can find its state.");
-        };
-        purge_kei_state(&config_dir.join("kei"), &[])?;
+    if let Some(purge_root) = purge_root {
+        purge_kei_state(purge_root, &[])?;
     }
 
     Ok(())
@@ -735,6 +962,7 @@ mod tests {
         let unit = render_user_unit(
             &PathBuf::from("/usr/local/bin/kei"),
             &PathBuf::from("/home/alice/.config/kei/config.toml"),
+            &ServiceEnvironment::default(),
         );
         assert!(unit.contains("[Unit]"));
         assert!(unit.contains("[Service]"));
@@ -762,6 +990,7 @@ mod tests {
             &PathBuf::from("/usr/local/bin/kei"),
             &PathBuf::from("/home/alice/.config/kei/config.toml"),
             Some(LingerState::Disabled),
+            &ServiceEnvironment::default(),
         );
         assert!(unit.contains("# X-Kei-Previous-Linger=disabled\n"));
         assert_eq!(
@@ -775,6 +1004,7 @@ mod tests {
         let unit = render_user_unit(
             &PathBuf::from("/usr/local/bin/kei"),
             &PathBuf::from("/home/alice/.config/kei/config.toml"),
+            &ServiceEnvironment::default(),
         );
         assert!(!unit.contains(PREVIOUS_LINGER_MARKER));
         assert_eq!(previous_linger_state_from_unit(&unit), None);
@@ -820,6 +1050,7 @@ mod tests {
             &PathBuf::from("/opt/kei/bin/kei"),
             &PathBuf::from("/etc/kei/config.toml"),
             "alice",
+            &ServiceEnvironment::default(),
         );
         assert!(unit.contains("User=alice"));
         assert!(unit.contains("WantedBy=multi-user.target"));
@@ -828,6 +1059,199 @@ mod tests {
         );
         assert!(unit.contains("Type=notify"));
         assert!(unit.contains("Environment=MALLOC_ARENA_MAX=2"));
+    }
+
+    #[test]
+    fn units_clear_absent_overrides_so_the_manager_cannot_redirect_state() {
+        let env = ServiceEnvironment::default();
+        let user = render_user_unit(
+            &PathBuf::from("/usr/local/bin/kei"),
+            &PathBuf::from("/home/alice/.config/kei/config.toml"),
+            &env,
+        );
+        assert!(user.contains("UnsetEnvironment=XDG_CONFIG_HOME\n"));
+        assert!(user.contains("UnsetEnvironment=KEI_DATA_DIR\n"));
+        assert!(!user.contains("Environment=\"XDG_CONFIG_HOME="));
+
+        let system = render_system_unit(
+            &PathBuf::from("/opt/kei/bin/kei"),
+            &PathBuf::from("/etc/kei/config.toml"),
+            "alice",
+            &env,
+        );
+        assert!(system.contains("UnsetEnvironment=XDG_CONFIG_HOME\n"));
+        assert!(system.contains("UnsetEnvironment=KEI_DATA_DIR\n"));
+        assert!(!system.contains("Environment=\"KEI_DATA_DIR="));
+    }
+
+    #[test]
+    fn units_pin_absolute_install_time_overrides() {
+        let env = ServiceEnvironment {
+            xdg_config_home: Some(PathBuf::from("/srv/xdg")),
+            kei_data_dir: Some(PathBuf::from("/srv/kei-state")),
+        };
+
+        let user = render_user_unit(
+            &PathBuf::from("/usr/local/bin/kei"),
+            &PathBuf::from("/home/alice/.config/kei/config.toml"),
+            &env,
+        );
+        assert!(user.contains("Environment=\"XDG_CONFIG_HOME=/srv/xdg\"\n"));
+        assert!(user.contains("Environment=\"KEI_DATA_DIR=/srv/kei-state\"\n"));
+        assert!(!user.contains("UnsetEnvironment=XDG_CONFIG_HOME"));
+
+        let system = render_system_unit(
+            &PathBuf::from("/opt/kei/bin/kei"),
+            &PathBuf::from("/etc/kei/config.toml"),
+            "alice",
+            &env,
+        );
+        assert!(system.contains("Environment=\"XDG_CONFIG_HOME=/srv/xdg\"\n"));
+        assert!(system.contains("Environment=\"KEI_DATA_DIR=/srv/kei-state\"\n"));
+    }
+
+    #[test]
+    fn pinned_environment_escapes_specifiers_quotes_and_control_bytes() {
+        let env = ServiceEnvironment {
+            xdg_config_home: Some(PathBuf::from("/srv/xdg with \"quote\"/100%")),
+            kei_data_dir: Some(PathBuf::from("/srv/kei\nInjected=1")),
+        };
+        let unit = render_user_unit(
+            &PathBuf::from("/usr/local/bin/kei"),
+            &PathBuf::from("/home/alice/.config/kei/config.toml"),
+            &env,
+        );
+        assert!(
+            unit.contains("Environment=\"XDG_CONFIG_HOME=/srv/xdg with \\\"quote\\\"/100%%\"\n"),
+            "unexpected quoting:\n{unit}"
+        );
+        assert!(
+            unit.contains("Environment=\"KEI_DATA_DIR=/srv/kei\\nInjected=1\"\n"),
+            "newline must not inject a directive:\n{unit}"
+        );
+        assert!(!unit.contains("\nInjected=1\n"));
+    }
+
+    #[test]
+    fn non_utf8_overrides_are_byte_escaped_instead_of_lossy() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let env = ServiceEnvironment {
+            xdg_config_home: Some(PathBuf::from(OsStr::from_bytes(b"/srv/caf\xe9"))),
+            kei_data_dir: None,
+        };
+        let unit = render_user_unit(
+            &PathBuf::from("/usr/local/bin/kei"),
+            &PathBuf::from("/home/alice/.config/kei/config.toml"),
+            &env,
+        );
+        assert!(
+            unit.contains("Environment=\"XDG_CONFIG_HOME=/srv/caf\\xe9\"\n"),
+            "non-UTF-8 bytes must survive as systemd byte escapes:\n{unit}"
+        );
+        assert!(
+            !unit.contains('\u{fffd}'),
+            "lossy replacement leaked:\n{unit}"
+        );
+    }
+
+    #[test]
+    fn exec_start_quotes_paths_that_systemd_would_split_or_expand() {
+        let unit = render_user_unit(
+            &PathBuf::from("/opt/kei bin/kei"),
+            &PathBuf::from("/home/alice/100% config/$STATE.toml"),
+            &ServiceEnvironment::default(),
+        );
+        assert!(
+            unit.contains(
+                "ExecStart=\"/opt/kei bin/kei\" service run --config \"/home/alice/100%% config/$$STATE.toml\"\n"
+            ),
+            "unexpected ExecStart quoting:\n{unit}"
+        );
+    }
+
+    #[test]
+    fn plain_exec_paths_stay_unquoted() {
+        let unit = render_user_unit(
+            &PathBuf::from("/usr/local/bin/kei"),
+            &PathBuf::from("/home/alice/.config/kei/config.toml"),
+            &ServiceEnvironment::default(),
+        );
+        assert!(unit.contains(
+            "ExecStart=/usr/local/bin/kei service run --config /home/alice/.config/kei/config.toml\n"
+        ));
+    }
+
+    #[test]
+    fn user_data_dir_override_keeps_absolute_values_and_anchors_relative_names() {
+        let cwd = Path::new("/work/project");
+
+        assert_eq!(
+            anchor_user_data_dir_override(
+                "~/sync-state",
+                PathBuf::from("/home/alice/sync-state"),
+                Some(cwd),
+            )
+            .unwrap(),
+            PathBuf::from("/home/alice/sync-state"),
+        );
+        assert_eq!(
+            anchor_user_data_dir_override("state", PathBuf::from("state"), Some(cwd)).unwrap(),
+            PathBuf::from("/work/project/state"),
+        );
+        // The config resolver treats an empty explicit value as the cwd;
+        // reproduce that instead of silently falling back to a default.
+        assert_eq!(
+            anchor_user_data_dir_override("", PathBuf::new(), Some(cwd)).unwrap(),
+            PathBuf::from("/work/project"),
+        );
+        assert_eq!(
+            anchor_user_data_dir_override(
+                "/srv/kei-state",
+                PathBuf::from("/srv/kei-state"),
+                Some(cwd),
+            )
+            .unwrap(),
+            PathBuf::from("/srv/kei-state"),
+        );
+    }
+
+    #[test]
+    fn user_data_dir_override_never_silently_defaults() {
+        for (raw, expanded) in [("state", "state"), ("~/state", "~/state")] {
+            assert!(
+                anchor_user_data_dir_override(raw, PathBuf::from(expanded), None).is_err(),
+                "{raw} must not resolve against an unknown home or cwd"
+            );
+        }
+    }
+
+    #[test]
+    fn system_data_dir_override_requires_an_explicit_absolute_path() {
+        for raw in ["relative/state", "~/state"] {
+            let error = require_absolute_system_data_dir(Path::new(raw)).unwrap_err();
+            assert!(
+                error.to_string().contains("must be an absolute path"),
+                "expected absolute-path guidance for {raw}, got: {error}"
+            );
+        }
+        require_absolute_system_data_dir(Path::new("/srv/kei")).unwrap();
+    }
+
+    #[test]
+    fn absolute_install_config_anchors_relative_paths() {
+        assert_eq!(
+            absolute_install_config(Path::new("/etc/kei/config.toml")).unwrap(),
+            PathBuf::from("/etc/kei/config.toml"),
+        );
+        let anchored = absolute_install_config(Path::new("relative/config.toml")).unwrap();
+        assert!(anchored.is_absolute());
+        assert!(anchored.ends_with("relative/config.toml"));
+        assert!(absolute_install_config(Path::new("~/config.toml")).is_err());
+        assert!(
+            absolute_install_config(Path::new(OsStr::from_bytes(b"/srv/caf\xe9/config.toml")))
+                .is_err()
+        );
     }
 
     #[test]

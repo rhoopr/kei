@@ -1181,7 +1181,7 @@ pub(crate) async fn run_import_existing(
     }
 
     let (username, password, domain, cookie_directory) =
-        config::resolve_auth(globals, &args.password, toml);
+        config::resolve_auth(globals, &args.password, toml)?;
 
     let password_provider = super::super::make_provider_from_auth(
         &args.password,

@@ -27,17 +27,17 @@ pub(crate) fn initialize(
     globals: &crate::config::GlobalArgs,
     toml: Option<&crate::config::TomlConfig>,
     explicit: bool,
-) -> Option<(history::Recorder, history::Guard)> {
+) -> anyhow::Result<Option<(history::Recorder, history::Guard)>> {
     let (username, _, domain, directory) =
-        crate::config::resolve_auth(globals, &crate::cli::PasswordArgs::default(), toml);
+        crate::config::resolve_auth(globals, &crate::cli::PasswordArgs::default(), toml)?;
     if username.is_empty() {
-        return None;
+        return Ok(None);
     }
     let configuration = configuration(toml, explicit);
-    history::start(
+    Ok(history::start(
         history_path(&directory, &username, domain.as_str()),
         configuration,
-    )
+    ))
 }
 
 pub(crate) fn runtime_configuration(config: &crate::config::Config) -> Value {
@@ -213,18 +213,10 @@ fn configuration(toml: Option<&crate::config::TomlConfig>, explicit: bool) -> Va
 
 pub(crate) async fn export(
     args: crate::cli::SupportExportArgs,
-    raw_config: &str,
+    raw_config: Option<&str>,
 ) -> anyhow::Result<()> {
-    let config_path = crate::config::expand_tilde(raw_config);
-    let config_path = if raw_config == "~/.config/kei/config.toml"
-        && !config_path.exists()
-        && Path::new("/config/config.toml").is_file()
-    {
-        PathBuf::from("/config/config.toml")
-    } else {
-        config_path
-    };
-    let explicit = raw_config != "~/.config/kei/config.toml" && raw_config != "/config/config.toml";
+    let (config_path, _) = crate::config::bootstrap_config(raw_config)?;
+    let explicit = raw_config.is_some();
     let output = args.output;
     let result =
         tokio::task::spawn_blocking(move || collect::export(&config_path, explicit, &output))

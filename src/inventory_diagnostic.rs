@@ -153,7 +153,7 @@ async fn collect(
         &globals,
         &crate::cli::PasswordArgs::default(),
         config.as_ref(),
-    );
+    )?;
     anyhow::ensure!(
         !username.trim().is_empty(),
         "diagnostic_cached_session_unavailable"
