@@ -238,13 +238,11 @@ opaque and their debug output is redacted. Lookup changes do not overwrite the
 original delta evidence. A link alone does not authorize a target lookup.
 
 Selected sparse-target recovery is owned by
-`src/download/sparse_target.rs`. The cycle supplies only current selected,
-unrestricted full-library plans; it does not search an unselected library or
-infer membership for album, rank, bounded, managed-primary or provisional
-selections. A fresh source lookup must agree with its retained link. The Photos
-adapter qualifies target owner/zone and the exact child/master pair before the
-normal target download pipeline can materialize missing selected renditions.
-Ordinary downloadable validation remains strict; no deletion exception is added.
+`src/download/sparse_target.rs`. A fresh source lookup must agree with its retained link. The Photos adapter checks the target owner, zone and child/master pair. An unrestricted full-library plan can materialize missing renditions through the ordinary download pipeline.
+
+For a scoped Shared selection, the cycle runs the target library before PrimarySync. A due retained link requests a fresh scan if the target would otherwise replay an older selection. Only a clean scan of the complete current plan and a successful target checkpoint can supply the selection generation used for recovery. The source checks the current child/master pair against the destinations that generation admitted, including overlapping album paths. The checkpoint transaction rechecks those publication receipts and held files. A partial query, an absent member or conflicting identities leave the source checkpoint in place. Absence does not establish deletion.
+
+Album membership can queue a metadata rewrite even when metadata writing is off. In that case the rewrite stays queued and does not block an independently verified media copy. Enabled metadata writers require their publication receipts, and a prepared capture repair always blocks recovery.
 
 A target receipt is useful only with exact current identity, metadata, source
 provenance and independent protected-path-safe files. Trusted Legacy File

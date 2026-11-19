@@ -123,6 +123,27 @@ pub(super) async fn include_pending_local_work(
             .primary_layout_operations(zone.to_owned())
             .await
             .map_or(true, |rows| !rows.is_empty());
+        if identity_pending
+            && zone == crate::icloud::photos::PRIMARY_ZONE_NAME
+            && !library.plan.passes.is_empty()
+        {
+            match download::sparse_target::due_primary_links(db).await {
+                Ok(links) => {
+                    for target in library_states {
+                        if target.plan.passes.first().is_some_and(|pass| {
+                            links
+                                .iter()
+                                .any(|link| pass.album.sparse_link_matches(link))
+                        }) {
+                            local_work_zones.insert(target.zone_name.clone());
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Could not inspect sparse target dependencies before watch pre-check")
+                }
+            }
+        }
         let retained_checkpoint_pending = match db
             .get_metadata(&format!(
                 "{}{zone}",

@@ -460,6 +460,8 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
 pub(crate) struct DownloadConfig {
     /// One upgrade-requested inventory guarded by retained-cursor replay.
     pub(crate) inventory_reconciliation: bool,
+    /// A due sparse source in another selected zone needs a fresh membership scan.
+    pub(crate) sparse_membership_due: bool,
     pub(crate) sparse_targets: Arc<[crate::download::sparse_target::SelectedSparseTarget]>,
     /// Drain ordered queries to certify bounded local path work on config drift.
     /// Download eligibility and provider checkpoint bounds remain unchanged.
@@ -731,6 +733,7 @@ impl DownloadConfig {
             temp_suffix: Arc::from(".kei-tmp"),
             state_db: None,
             sparse_targets: Arc::from([]),
+            sparse_membership_due: false,
             complete_path_selection: false,
             selection_context: None,
             selection_run: None,

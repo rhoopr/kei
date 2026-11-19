@@ -1239,6 +1239,8 @@ the source. Recovery retains seeded files and retries after interruption or a
 state-write failure before an unchanged follow-up cycle. Parser tests round-trip
 the versioned link encoding and reject corrupt or unsupported evidence.
 
+`cargo test --lib sparse_recovery` runs the cross-library cycle fixtures. They distinguish the selected pass query from the exact target lookup and count media requests independently. `due_sparse_link_includes_its_selected_target_in_quiet_watch_cycles` checks that the watch pre-check wakes the matching target zone when a retained link is due.
+
 The sparse-deletion batch regression seeds 101 retained sources and local
 media, then runs streaming and collecting cycles against explicit source
 `UNKNOWN_ITEM` responses. It reopens SQLite between cycles, tests replayed

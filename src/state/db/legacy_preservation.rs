@@ -325,7 +325,18 @@ pub(super) fn child_receipts_ready(
     library: &str,
     id: &str,
 ) -> Result<bool, StateError> {
-    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM asset_metadata_capture_revisions WHERE library=?1 AND asset_id=?2 AND revision>=?3) AND NOT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND (status!='downloaded' OR is_deleted!=0 OR metadata_hash IS NULL OR metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND (metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL))", params![library, id, crate::state::METADATA_CAPTURE_REVISION], |row| row.get(0))?)
+    child_publications_ready(conn, library, id, true)
+}
+
+/// Grouping changes can queue a metadata rewrite even with writers disabled.
+/// A sealed selection owns its writer policy; prepared repairs always veto.
+pub(super) fn child_publications_ready(
+    conn: &Connection,
+    library: &str,
+    id: &str,
+    requires_metadata: bool,
+) -> Result<bool, StateError> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM asset_metadata_capture_revisions WHERE library=?1 AND asset_id=?2 AND revision>=?3) AND NOT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND (status!='downloaded' OR is_deleted!=0 OR metadata_hash IS NULL OR (?4 AND metadata_write_failed_at IS NOT NULL) OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND ((?4 AND metadata_write_failed_at IS NOT NULL) OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL))", params![library, id, crate::state::METADATA_CAPTURE_REVISION, requires_metadata], |row| row.get(0))?)
 }
 
 impl SqliteStateDb {
@@ -601,6 +612,28 @@ mod tests {
                     _ => "SELECT 1",
                 };
                 conn.execute_batch(sql).unwrap();
+                if matches!(fault, "asset_debt" | "path_debt" | "prepared_debt") {
+                    assert!(
+                        !super::child_publications_ready(
+                            &conn,
+                            "PrimarySync",
+                            "private-child",
+                            true
+                        )
+                        .unwrap()
+                    );
+                    assert_eq!(
+                        super::child_publications_ready(
+                            &conn,
+                            "PrimarySync",
+                            "private-child",
+                            false
+                        )
+                        .unwrap(),
+                        fault == "asset_debt",
+                        "disabling writers leaves prepared repairs blocking: {fault}"
+                    );
+                }
             }
             drop(db);
             let db = SqliteStateDb::open(&database).await.unwrap();
