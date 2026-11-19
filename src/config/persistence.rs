@@ -17,7 +17,7 @@ impl Config {
     pub(crate) fn to_toml(&self) -> TomlConfig {
         TomlConfig {
             config_version: Some(1),
-            data_dir: None, // derived from config path, not serialized unless explicit
+            data_dir: None,  // Keep automatic discovery unless explicitly configured.
             log_level: None, // only written if user explicitly set it
             auth: Some(TomlAuth {
                 username: if self.auth.username.is_empty() {

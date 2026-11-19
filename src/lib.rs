@@ -557,8 +557,7 @@ fn get_account_owner(
     globals: &config::GlobalArgs,
     toml: Option<&TomlConfig>,
 ) -> state::db::account::AccountOwner {
-    let (username, _, domain, _) =
-        config::resolve_auth(globals, &cli::PasswordArgs::default(), toml);
+    let (username, domain) = config::resolve_account(globals, toml);
     state::db::account::AccountOwner::configured(&username, domain.as_str())
 }
 
@@ -567,7 +566,7 @@ async fn get_db_path(
     toml: Option<&TomlConfig>,
 ) -> anyhow::Result<PathBuf> {
     let (username, _, domain, cookie_dir) =
-        config::resolve_auth(globals, &cli::PasswordArgs::default(), toml);
+        config::resolve_auth(globals, &cli::PasswordArgs::default(), toml)?;
     if username.is_empty() {
         anyhow::bail!("Set your iCloud username with ICLOUD_USERNAME or [auth].username.");
     }
@@ -730,12 +729,13 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
     // Export has its own input path: no runtime config construction, logging,
     // credentials, service hooks, or network-capable command dispatch.
     if let cli::Command::SupportExport(args) = &cli.command {
-        return support::export(args.clone(), &cli.config).await;
+        return support::export(args.clone(), cli.config.as_deref()).await;
     }
     if let cli::Command::Doctor(args) = &cli.command
         && args.missing_reference_inventory
     {
-        return inventory_diagnostic::run(std::path::Path::new(&cli.config)).await;
+        return inventory_diagnostic::run(&config::bootstrap_config(cli.config.as_deref())?.0)
+            .await;
     }
     let config = load_startup_config(&cli)?;
     let output = resolve_startup_output(&cli, config.toml.as_ref());
@@ -762,7 +762,7 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
                 }
         );
     let (recorder, support_guard) = if recording {
-        match support::initialize(&globals, config.toml.as_ref(), config.explicitly_set) {
+        match support::initialize(&globals, config.toml.as_ref(), config.explicitly_set)? {
             Some((recorder, guard)) => (Some(recorder), Some(guard)),
             None => (None, None),
         }
@@ -825,32 +825,9 @@ struct StartupConfig {
     load_error: Option<String>,
 }
 
-const DOCKER_FALLBACK_CONFIG: &str = "/config/config.toml";
-
 fn load_startup_config(cli: &cli::Cli) -> anyhow::Result<StartupConfig> {
-    // Load TOML config early so it can influence log level.
-    //
-    // Docker fallback: when no --config is passed, the default
-    // ~/.config/kei/config.toml may not exist inside a container (it
-    // resolves to /root/.config/kei/config.toml). Try the Docker
-    // convention /config/config.toml as a fallback so that `docker exec`
-    // subcommands (get-code, submit-code, credential, etc.) automatically
-    // find the same config the Docker CMD uses.
-    let config_explicitly_set =
-        cli.config != "~/.config/kei/config.toml" && cli.config != DOCKER_FALLBACK_CONFIG;
-    let (config_path, used_docker_fallback) = {
-        let expanded = config::expand_tilde(&cli.config);
-        if !config_explicitly_set && !expanded.exists() {
-            let docker = PathBuf::from(DOCKER_FALLBACK_CONFIG);
-            if docker.exists() {
-                (docker, true)
-            } else {
-                (expanded, false)
-            }
-        } else {
-            (expanded, false)
-        }
-    };
+    let config_explicitly_set = cli.config.is_some();
+    let (config_path, used_docker_fallback) = config::bootstrap_config(cli.config.as_deref())?;
     // When --config is explicit but the file doesn't exist and the parent
     // dir does exist, allow it (auto-config will create the file).
     // Otherwise require the file to exist so typos in --config paths error.
@@ -1120,10 +1097,17 @@ async fn dispatch_command(
             }
         },
         Command::Install(args) => {
+            // An explicit config can still need automatic state discovery.
+            // Resolve it before registering a service that could not start.
+            config::resolve_data_dir(
+                globals.data_dir.as_deref(),
+                toml_config.as_ref().and_then(|t| t.data_dir.as_deref()),
+            )?;
             return service::install::run(args, &config_path).await;
         }
         Command::Uninstall(args) => {
-            return service::uninstall::run(args).await;
+            return service::uninstall::run(args, &config_path, globals, toml_config.as_ref())
+                .await;
         }
         Command::Service { action } => match action {
             cli::ServiceAction::Status => return service::status::run().await,
@@ -1178,7 +1162,7 @@ mod tests {
 
     fn startup_cli() -> cli::Cli {
         cli::Cli {
-            config: String::new(),
+            config: None,
             log_level: None,
             verbose: false,
             command: Command::Config {
@@ -1197,7 +1181,7 @@ mod tests {
         )
         .unwrap();
         let cli = cli::Cli {
-            config: path.to_string_lossy().into_owned(),
+            config: Some(path.to_string_lossy().into_owned()),
             ..startup_cli()
         };
         let config = load_startup_config(&cli).unwrap();
@@ -1215,21 +1199,23 @@ mod tests {
     fn startup_config_allows_missing_file_only_when_parent_exists() {
         let dir = tempfile::tempdir().unwrap();
         let mut cli = startup_cli();
-        cli.config = dir
-            .path()
-            .join("config.toml")
-            .to_string_lossy()
-            .into_owned();
+        cli.config = Some(
+            dir.path()
+                .join("config.toml")
+                .to_string_lossy()
+                .into_owned(),
+        );
         let config = load_startup_config(&cli).unwrap();
         assert!(config.explicitly_set);
         assert!(config.toml.is_none());
         assert!(config.load_error.is_none());
         assert!(!config.path.exists(), "discovery must not create config");
-        cli.config = dir
-            .path()
-            .join("missing/config.toml")
-            .to_string_lossy()
-            .into_owned();
+        cli.config = Some(
+            dir.path()
+                .join("missing/config.toml")
+                .to_string_lossy()
+                .into_owned(),
+        );
         let err = load_startup_config(&cli).err().unwrap();
         assert!(err.to_string().contains("Could not read config file"));
     }
@@ -1240,7 +1226,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "broken = [").unwrap();
         let mut cli = cli::Cli {
-            config: path.to_string_lossy().into_owned(),
+            config: Some(path.to_string_lossy().into_owned()),
             ..startup_cli()
         };
         let err = load_startup_config(&cli).err().unwrap().to_string();

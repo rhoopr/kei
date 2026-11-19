@@ -1,25 +1,59 @@
 //! Bootstrap, data, credential, and download path resolution.
 
-use super::input::{TomlAuth, TomlConfig};
+use super::input::TomlAuth;
 use crate::types::Domain;
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
-pub(crate) fn kei_data_dir_with_home(home: &Path) -> PathBuf {
+fn kei_data_dir_with_home(home: &Path) -> PathBuf {
     home.join(".config").join("kei")
 }
 
-pub(crate) fn kei_data_dir() -> PathBuf {
-    dirs::home_dir()
-        .map(|home| kei_data_dir_with_home(&home))
-        .unwrap_or_else(|| PathBuf::from("~/.config/kei"))
+pub(crate) fn kei_data_dir() -> Result<PathBuf> {
+    let legacy = dirs::home_dir().map(|home| kei_data_dir_with_home(&home));
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    discover_root(legacy, xdg.as_deref())
 }
 
-pub(crate) fn default_config_path() -> PathBuf {
-    kei_data_dir().join("config.toml")
+fn discover_root(legacy: Option<PathBuf>, xdg: Option<&Path>) -> Result<PathBuf> {
+    let Some(xdg) = xdg.filter(|p| p.is_absolute()).map(|p| p.join("kei")) else {
+        return legacy.context("Cannot locate kei's root: set HOME or an absolute XDG_CONFIG_HOME");
+    };
+    let Some(legacy) = legacy.filter(|p| *p != xdg) else {
+        return Ok(xdg);
+    };
+    // A dangling link or inaccessible directory isn't evidence of a fresh install.
+    let existing = |p: &Path| -> Result<bool> {
+        match std::fs::symlink_metadata(p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Ok(entry) if entry.is_dir() || (entry.is_symlink() && p.is_dir()) => Ok(true),
+            Ok(_) => bail!("Expected a readable kei directory at {}", p.display()),
+            Err(e) => Err(e).with_context(|| format!("Cannot inspect {}", p.display())),
+        }
+    };
+    match (existing(&legacy)?, existing(&xdg)?) {
+        (false, _) => Ok(xdg),
+        (true, false) => Ok(legacy),
+        (true, true) if legacy.canonicalize()? == xdg.canonicalize()? => Ok(xdg),
+        (true, true) => bail!(
+            "Found two kei roots: {} and {}. Inspect both directories before moving either. To run without automatic discovery, select your config with --config and state with KEI_DATA_DIR or data_dir. Purge requires one unambiguous root.",
+            legacy.display(),
+            xdg.display()
+        ),
+    }
 }
 
-pub(crate) fn default_cookie_dir() -> PathBuf {
-    kei_data_dir().join("cookies")
+pub(crate) fn bootstrap_config(explicit: Option<&str>) -> Result<(PathBuf, bool)> {
+    if let Some(path) = explicit {
+        return Ok((expand_tilde(path), false));
+    }
+    let root = kei_data_dir()?;
+    let path = root.join("config.toml");
+    let docker = Path::new("/config/config.toml");
+    if !path.try_exists()? && docker.is_file() {
+        return Ok((docker.to_owned(), true));
+    }
+    Ok((path, false))
 }
 
 fn expand_tilde_with_home(path: &str, home: &Path) -> PathBuf {
@@ -88,22 +122,15 @@ impl GlobalArgs {
 /// Resolution order:
 /// 1. Explicit `KEI_DATA_DIR` environment variable
 /// 2. TOML top-level `data_dir`
-/// 3. Default: parent of the resolved config file path
+/// 3. Default: cookies under the discovered application root
 pub(crate) fn resolve_data_dir(
     data_dir_cli: Option<&str>,
-    toml: Option<&TomlConfig>,
-    config_path: &Path,
-) -> PathBuf {
-    if let Some(d) = data_dir_cli {
-        return expand_tilde(d);
+    configured: Option<&str>,
+) -> Result<PathBuf> {
+    if let Some(d) = data_dir_cli.or(configured) {
+        return Ok(expand_tilde(d));
     }
-    if let Some(d) = toml.and_then(|t| t.data_dir.as_deref()) {
-        return expand_tilde(d);
-    }
-    config_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(kei_data_dir)
+    Ok(kei_data_dir()?.join("cookies"))
 }
 
 /// Resolve `password_file` from CLI + TOML.
@@ -133,8 +160,30 @@ mod tests {
         expand_tilde, expand_tilde_with_home, kei_data_dir_with_home, resolve_data_dir,
         validate_download_dir,
     };
-    use crate::config::input::TomlConfig;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn relative_or_empty_xdg_keeps_dotted_config_root() {
+        let legacy = kei_data_dir_with_home(&std::env::temp_dir());
+        for xdg in [None, Some(Path::new("")), Some(Path::new("relative"))] {
+            assert_eq!(
+                super::discover_root(Some(legacy.clone()), xdg).unwrap(),
+                legacy
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_legacy_root_is_not_a_fresh_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy");
+        std::os::unix::fs::symlink(dir.path().join("offline"), &legacy).unwrap();
+        let xdg = dir.path().join("new");
+        let error = super::discover_root(Some(legacy.clone()), Some(&xdg)).unwrap_err();
+        assert!(error.to_string().contains(legacy.to_str().unwrap()));
+        assert!(!xdg.exists());
+    }
 
     #[test]
     fn test_expand_tilde_with_home() {
@@ -172,58 +221,22 @@ mod tests {
     }
     #[test]
     fn test_resolve_data_dir_explicit_cli() {
-        let result = resolve_data_dir(Some("/explicit"), None, Path::new("/config/config.toml"));
+        let result = resolve_data_dir(Some("/explicit"), None).unwrap();
         assert_eq!(result, PathBuf::from("/explicit"));
     }
     #[test]
     fn test_resolve_data_dir_toml_data_dir() {
-        let toml = TomlConfig {
-            config_version: Some(1),
-            data_dir: Some("/toml/data".to_string()),
-            log_level: None,
-            auth: None,
-            download: None,
-            filters: None,
-            photos: None,
-            import: None,
-            metadata: None,
-            watch: None,
-            notifications: None,
-            server: None,
-            report: None,
-            ui: None,
-        };
-        let result = resolve_data_dir(None, Some(&toml), Path::new("/config/config.toml"));
+        let result = resolve_data_dir(None, Some("/toml/data")).unwrap();
         assert_eq!(result, PathBuf::from("/toml/data"));
     }
     #[test]
-    fn test_resolve_data_dir_defaults_to_config_parent() {
-        let result = resolve_data_dir(None, None, Path::new("/config/config.toml"));
-        assert_eq!(result, PathBuf::from("/config"));
+    fn test_resolve_data_dir_defaults_to_cookie_directory() {
+        let result = resolve_data_dir(None, None).unwrap();
+        assert_eq!(result, super::kei_data_dir().unwrap().join("cookies"));
     }
     #[test]
     fn test_resolve_data_dir_cli_takes_precedence_over_toml() {
-        let toml = TomlConfig {
-            config_version: Some(1),
-            data_dir: Some("/toml/data".to_string()),
-            log_level: None,
-            auth: None,
-            download: None,
-            filters: None,
-            photos: None,
-            import: None,
-            metadata: None,
-            watch: None,
-            notifications: None,
-            server: None,
-            report: None,
-            ui: None,
-        };
-        let result = resolve_data_dir(
-            Some("/cli/data"),
-            Some(&toml),
-            Path::new("/config/config.toml"),
-        );
+        let result = resolve_data_dir(Some("/cli/data"), Some("/toml/data")).unwrap();
         assert_eq!(result, PathBuf::from("/cli/data"));
     }
     #[test]

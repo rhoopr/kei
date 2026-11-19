@@ -39,7 +39,7 @@ pub(super) fn export(
         &globals,
         &crate::cli::PasswordArgs::default(),
         toml.as_ref(),
-    );
+    )?;
     let (history, history_status) = if username.is_empty() {
         (history::History::default(), "account_unavailable")
     } else {

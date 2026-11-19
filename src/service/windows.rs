@@ -25,15 +25,13 @@
 )]
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 
-use crate::cli::UninstallArgs;
 use crate::service::env::{
-    SERVICE_DESCRIPTION, SERVICE_IDENTIFIER, current_executable, kei_state_dir_dotted,
-    purge_kei_state,
+    SERVICE_DESCRIPTION, SERVICE_IDENTIFIER, current_executable, purge_kei_state,
 };
 use crate::service::plan::{self, InstallPlan};
 use crate::service::status::ServiceState;
@@ -106,7 +104,7 @@ pub(crate) fn install_system(_plan: InstallPlan, _config_path: &Path) -> Result<
 }
 
 /// Top-level entry for `kei uninstall`.
-pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
+pub(crate) async fn uninstall(root: Option<&Path>) -> Result<()> {
     match scm_impl::uninstall_existing().await? {
         true => tracing::info!(service = SERVICE_NAME, "removed kei from SCM"),
         false => tracing::info!(
@@ -115,10 +113,8 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
         ),
     }
 
-    if args.purge {
-        let kei_dir = kei_state_dir()
-            .ok_or_else(|| anyhow!("`--purge` needs USERPROFILE so kei can find its state."))?;
-        purge_kei_state(&kei_dir, &[])?;
+    if let Some(kei_dir) = root {
+        purge_kei_state(kei_dir, &[])?;
     }
 
     Ok(())
@@ -300,10 +296,6 @@ fn current_user_name() -> Option<String> {
         .map(|f| f.to_string_lossy().into_owned())
 }
 
-fn kei_state_dir() -> Option<PathBuf> {
-    kei_state_dir_dotted()
-}
-
 fn prompt_windows_password(user: &str) -> Result<String> {
     let prompt = format!(
         "Windows password for {user} (used by SCM to launch kei under your account; \
@@ -322,6 +314,8 @@ fn prompt_windows_password(user: &str) -> Result<String> {
 #[cfg(target_os = "windows")]
 mod scm_impl {
     use super::*;
+    use anyhow::anyhow;
+    use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard};
     use windows_service::{
         define_windows_service,

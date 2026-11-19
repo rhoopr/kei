@@ -2,8 +2,8 @@
 
 use super::input::{TomlConfig, TomlFilters};
 use super::paths::{
-    GlobalArgs, default_config_path, default_cookie_dir, expand_tilde, resolve_data_dir,
-    resolve_password_command, resolve_password_file, validate_download_dir,
+    GlobalArgs, expand_tilde, resolve_data_dir, resolve_password_command, resolve_password_file,
+    validate_download_dir,
 };
 use super::runtime::{
     AuthConfig, Config, DownloadSettings, FilterConfig, ImportConfig, MediaExclusion,
@@ -326,13 +326,7 @@ pub(crate) fn smart_retry_delay(max_retries: u32) -> u64 {
     }
 }
 
-/// Resolve auth fields from global CLI args + password args + optional TOML config.
-/// Returns (username, password, domain, `cookie_directory`).
-pub(crate) fn resolve_auth(
-    globals: &GlobalArgs,
-    password_args: &crate::cli::PasswordArgs,
-    toml: Option<&TomlConfig>,
-) -> (String, Option<String>, Domain, PathBuf) {
+pub(crate) fn resolve_account(globals: &GlobalArgs, toml: Option<&TomlConfig>) -> (String, Domain) {
     let toml_auth = toml.and_then(|t| t.auth.as_ref());
 
     let username = resolve_ref(
@@ -341,26 +335,27 @@ pub(crate) fn resolve_auth(
         String::new(),
     );
 
-    // `[auth].password` in TOML is rejected in `Config::build()`; resolve_auth
-    // only pulls the password from CLI / env.
-    let password = password_args.password.clone();
-
     let domain = resolve(
         globals.domain,
         toml_auth.and_then(|a| a.domain),
         Domain::Com,
     );
+    (username, domain)
+}
 
-    let has_explicit_data_dir =
-        globals.data_dir.is_some() || toml.and_then(|t| t.data_dir.as_ref()).is_some();
-    let cookie_directory = if has_explicit_data_dir {
-        let default_config = default_config_path();
-        resolve_data_dir(globals.data_dir.as_deref(), toml, &default_config)
-    } else {
-        default_cookie_dir()
-    };
-
-    (username, password, domain, cookie_directory)
+/// Returns (username, password, domain, cookie directory).
+pub(crate) fn resolve_auth(
+    globals: &GlobalArgs,
+    password_args: &crate::cli::PasswordArgs,
+    toml: Option<&TomlConfig>,
+) -> anyhow::Result<(String, Option<String>, Domain, PathBuf)> {
+    let (username, domain) = resolve_account(globals, toml);
+    let password = password_args.password.clone();
+    let cookie_directory = resolve_data_dir(
+        globals.data_dir.as_deref(),
+        toml.and_then(|t| t.data_dir.as_deref()),
+    )?;
+    Ok((username, password, domain, cookie_directory))
 }
 
 #[cfg(test)]
@@ -443,7 +438,7 @@ impl Config {
             );
         }
 
-        let (username, password_str, domain, cookie_directory) = resolve_auth(globals, pw, toml);
+        let (username, password_str, domain, cookie_directory) = resolve_auth(globals, pw, toml)?;
         let password_file = resolve_password_file(pw, toml_auth);
         let password_command = resolve_password_command(pw, toml_auth);
         let save_password = sync.save_password;
@@ -2860,7 +2855,8 @@ mod tests {
             data_dir: None,
         };
         let pw = crate::cli::PasswordArgs::default();
-        let (username, password, domain, cookie_dir) = resolve_auth(&globals, &pw, Some(&toml));
+        let (username, password, domain, cookie_dir) =
+            resolve_auth(&globals, &pw, Some(&toml)).unwrap();
         assert_eq!(username, "toml@example.com");
         assert!(password.is_none());
         assert!(matches!(domain, Domain::Cn));
@@ -2884,7 +2880,8 @@ mod tests {
             password: Some("cli-pw".to_string()),
             ..crate::cli::PasswordArgs::default()
         };
-        let (username, password, domain, cookie_dir) = resolve_auth(&globals, &pw, Some(&toml));
+        let (username, password, domain, cookie_dir) =
+            resolve_auth(&globals, &pw, Some(&toml)).unwrap();
         assert_eq!(username, "cli@example.com");
         assert_eq!(password.as_deref(), Some("cli-pw"));
         assert!(matches!(domain, Domain::Com));
@@ -2907,7 +2904,7 @@ mod tests {
             data_dir: None,
         };
         let pw = crate::cli::PasswordArgs::default();
-        let (_, password, _, _) = resolve_auth(&globals, &pw, Some(&toml));
+        let (_, password, _, _) = resolve_auth(&globals, &pw, Some(&toml)).unwrap();
         assert!(
             password.is_none(),
             "resolve_auth must not read plaintext password from TOML"
@@ -2922,7 +2919,7 @@ mod tests {
             data_dir: None,
         };
         let pw = crate::cli::PasswordArgs::default();
-        let (username, password, domain, cookie_dir) = resolve_auth(&globals, &pw, None);
+        let (username, password, domain, cookie_dir) = resolve_auth(&globals, &pw, None).unwrap();
         assert!(username.is_empty());
         assert!(password.is_none());
         assert!(matches!(domain, Domain::Com));

@@ -7,6 +7,100 @@ use super::{
 use crate::common;
 use predicates::prelude::{PredicateBooleanExt, predicate};
 
+#[cfg(unix)]
+#[test]
+fn xdg_discovery_and_overrides_use_one_root() {
+    let home = tempfile::tempdir().unwrap();
+    let legacy = home.path().join(".config/kei");
+    let xdg_home = home.path().join("xdg");
+    let xdg = xdg_home.join("kei");
+    let command = || {
+        let mut cmd = clean_cmd();
+        cmd.current_dir(home.path())
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", &xdg_home)
+            .env_remove("KEI_DATA_DIR");
+        cmd
+    };
+    let paths = |cmd: &mut assert_cmd::Command, root: &std::path::Path, data: &std::path::Path| {
+        let out = cmd.args(["doctor", "--json"]).output().unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            report["config_path"],
+            root.join("config.toml").to_str().unwrap()
+        );
+        assert_eq!(report["data_dir"], data.to_str().unwrap());
+    };
+    paths(&mut command(), &xdg, &xdg.join("cookies"));
+    assert!(!legacy.exists());
+    std::fs::create_dir_all(&xdg).unwrap();
+    paths(&mut command(), &xdg, &xdg.join("cookies"));
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::rename(&xdg, &legacy).unwrap();
+    paths(&mut command(), &legacy, &legacy.join("cookies"));
+    assert!(!xdg.exists());
+    std::os::unix::fs::symlink(&legacy, &xdg).unwrap();
+    paths(&mut command(), &xdg, &xdg.join("cookies"));
+    std::fs::remove_file(&xdg).unwrap();
+    std::fs::create_dir(&xdg).unwrap();
+    for root in [&xdg, &legacy] {
+        std::fs::write(root.join("state.db"), b"original state").unwrap();
+    }
+    for args in [
+        &["config", "show"][..],
+        &["uninstall", "--purge"],
+        &["sync"],
+        &["support-export"],
+    ] {
+        command()
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("Found two kei roots"))
+            .stderr(predicate::str::contains(legacy.to_str().unwrap()))
+            .stderr(predicate::str::contains(xdg.to_str().unwrap()));
+    }
+    assert!(!home.path().join("kei-support.json").exists());
+    command()
+        .env("KEI_CONFIG", legacy.join("config.toml"))
+        .args(["install", "--user", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Found two kei roots"));
+    for root in [&xdg, &legacy] {
+        assert_eq!(
+            std::fs::read(root.join("state.db")).unwrap(),
+            b"original state"
+        );
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 1);
+    }
+    // An explicitly selected config supplies its own data_dir. A CLI path
+    // spelled exactly like the old default still beats KEI_CONFIG.
+    let configured = home.path().join("configured");
+    common::write_versioned_config(
+        &legacy.join("config.toml"),
+        format!(
+            "data_dir = {}\n",
+            common::toml_string(configured.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    paths(
+        command().env("KEI_CONFIG", legacy.join("config.toml")),
+        &legacy,
+        &configured,
+    );
+    let env_data = home.path().join("env-data");
+    paths(
+        command()
+            .env("KEI_CONFIG", xdg.join("config.toml"))
+            .env("KEI_DATA_DIR", &env_data)
+            .args(["--config", "~/.config/kei/config.toml"]),
+        &legacy,
+        &env_data,
+    );
+}
+
 #[test]
 fn config_show_outputs_valid_toml() {
     let out = clean_cmd()

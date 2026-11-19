@@ -444,6 +444,7 @@ fn write_setup_files(
         config_path,
         toml_content,
         answers,
+        std::env::var("KEI_DATA_DIR").ok().as_deref(),
         |username, config_dir, pw| {
             CredentialStore::new(
                 username,
@@ -459,8 +460,10 @@ fn write_setup_files_with_store(
     config_path: &Path,
     toml_content: &str,
     answers: &SetupAnswers,
+    env_data_dir: Option<&str>,
     store_password: impl FnOnce(&str, &Path, &str) -> anyhow::Result<CredentialBackend>,
 ) -> anyhow::Result<SetupWriteResult> {
+    let config_dir = credential_store_dir(answers, env_data_dir)?;
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Could not create directory {}", parent.display()))?;
@@ -468,7 +471,6 @@ fn write_setup_files_with_store(
 
     let (credential_backend, write_env) = match &answers.secret_source {
         SetupSecretSource::CredentialStore => {
-            let config_dir = credential_store_dir(answers);
             let backend = store_password(
                 &answers.username,
                 &config_dir,
@@ -500,11 +502,11 @@ fn write_config_file(config_path: &Path, toml_content: &str) -> anyhow::Result<(
     Ok(())
 }
 
-fn credential_store_dir(answers: &SetupAnswers) -> PathBuf {
-    match &answers.data_dir {
-        Some(dir) => crate::config::expand_tilde(dir),
-        None => crate::config::default_cookie_dir(),
-    }
+fn credential_store_dir(
+    answers: &SetupAnswers,
+    env_data_dir: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    crate::config::resolve_data_dir(env_data_dir, answers.data_dir.as_deref())
 }
 
 fn write_env_file(config_path: &Path, answers: &SetupAnswers) -> anyhow::Result<PathBuf> {
@@ -637,12 +639,10 @@ fn ask_destination(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     // is right for almost everyone, so it's offered here as a single line with
     // an obvious skip, not gated behind the "additional options?" extras prompt.
     let data_dir: String = Input::new()
-        .with_prompt(
-            "App data directory (advanced — leave default unless you know you need to change this)",
-        )
-        .default("~/.config/kei".to_string())
+        .with_prompt("App data directory (leave blank to use automatic discovery)")
+        .allow_empty(true)
         .interact_text()?;
-    if data_dir != "~/.config/kei" {
+    if !data_dir.is_empty() {
         answers.data_dir = Some(data_dir);
     }
 
@@ -1252,7 +1252,10 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         // Top-level keys (data_dir, log_level)
         match &answers.data_dir {
             Some(dir) => writeln!(out, "data_dir = \"{}\"", escape_toml_string(dir))?,
-            None => writeln!(out, "# data_dir = \"~/.config/kei\"")?,
+            None => writeln!(
+                out,
+                "# data_dir defaults to cookies under the discovered kei root"
+            )?,
         };
         match answers.log_level {
             Some(level) => writeln!(out, "log_level = \"{}\"", log_level_str(level))?,
@@ -1723,7 +1726,7 @@ mod tests {
         assert!(toml.contains("exclude = []"));
         assert!(toml.contains("# threads = 10"));
         assert!(toml.contains("# log_level = \"warn\""));
-        assert!(toml.contains("# data_dir = \"~/.config/kei\""));
+        assert!(toml.contains("# data_dir defaults to cookies"));
         assert!(toml.contains("Password is stored in kei's credential store"));
         assert!(toml.contains("kei password backend"));
         assert!(!toml.contains("password_file ="));
@@ -1879,6 +1882,7 @@ mod tests {
             &config_path,
             &toml_str,
             &answers,
+            None,
             |username, credential_dir, password| {
                 assert_eq!(username, "user@example.com");
                 assert_eq!(credential_dir, data_dir.as_path());
@@ -1923,6 +1927,7 @@ mod tests {
             &config_path,
             &toml_str,
             &answers,
+            None,
             |_username, _credential_dir, password| {
                 assert_eq!(password, "secret");
                 Ok(CredentialBackend::EncryptedFile)
@@ -1964,6 +1969,7 @@ mod tests {
             &config_path,
             &toml_str,
             &answers,
+            None,
             |_username, _credential_dir, _password| anyhow::bail!("store failed"),
         )
         .unwrap_err();
@@ -1995,6 +2001,7 @@ mod tests {
             &config_path,
             &toml_str,
             &answers,
+            None,
             |_username, _credential_dir, _password| {
                 panic!("env fallback must not touch credential storage");
             },
@@ -2531,6 +2538,7 @@ mod tests {
             &config_path,
             &toml_str,
             &answers,
+            None,
             |_username, _credential_dir, _password| {
                 panic!("env fallback must not touch credential storage");
             },
@@ -2625,12 +2633,19 @@ mod tests {
             data_dir: Some("/var/lib/kei".to_string()),
             ..Default::default()
         };
-        assert_eq!(credential_store_dir(&custom), PathBuf::from("/var/lib/kei"));
+        assert_eq!(
+            credential_store_dir(&custom, None).unwrap(),
+            PathBuf::from("/var/lib/kei")
+        );
 
         let default = SetupAnswers::default();
         assert_eq!(
-            credential_store_dir(&default),
-            crate::config::default_cookie_dir()
+            credential_store_dir(&default, None).unwrap(),
+            crate::config::kei_data_dir().unwrap().join("cookies")
+        );
+        assert_eq!(
+            credential_store_dir(&custom, Some("/env/data")).unwrap(),
+            PathBuf::from("/env/data")
         );
     }
 
@@ -2653,6 +2668,7 @@ mod tests {
                 &config_path,
                 "[auth]\nusername = \"user@example.com\"\n",
                 &answers,
+                None,
                 |_username, _dir, _pw| {
                     panic!("external secret sources must not write to credential store")
                 },

@@ -17,7 +17,7 @@ pub(crate) async fn run_login(
     toml: Option<&config::TomlConfig>,
     input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
-    let (username, password, domain, cookie_directory) = config::resolve_auth(globals, pw, toml);
+    let (username, password, domain, cookie_directory) = config::resolve_auth(globals, pw, toml)?;
 
     if username.is_empty() {
         anyhow::bail!(

@@ -67,7 +67,7 @@ Choose an empty destination such as `~/Photos/kei-first-backup`, your main libra
 
 If you choose watch mode instead, the setup wizard still runs only once. Later `kei sync` commands can use the repeat interval you saved.
 
-The setup wizard saves your settings in `~/.config/kei/config.toml` and offers to save your login details. If it creates an environment file, follow the printed instructions to load it before the next command. Then try a small backup. Replace both example dates below with your own small range; the dates are inclusive and use each photo's capture-local calendar date:
+The setup wizard writes `config.toml` under the kei directory described below and offers to save your login details. If it creates an environment file, follow the printed instructions to load it before the next command. Then try a small backup. Replace both example dates below with your own small range; the dates are inclusive and use each photo's capture-local calendar date:
 
 ```sh
 kei sync --skip-created-before 2025-01-01 --skip-created-after 2025-01-07
@@ -84,7 +84,15 @@ The range limits capture dates, not file count. Album copies, Live Photo videos 
 2. Open the destination in your file manager. Look for the recent photos you expected in the album and date folders, and open a photo and video if you selected both. Live Photos normally include a still image and a MOV video.
 3. Run `kei status` to check progress. A clean result does not mean you selected every item or version in iCloud. You can also run `kei verify --checksums` to check saved files against their recorded checksums. That check cannot tell you whether the backup includes everything in iCloud or repair damaged files.
 
-Photos are saved in the folder set by `[download].directory`. Settings, saved logins and kei's record of your backup normally live under `~/.config/kei`. If you use a custom configuration file, kei normally keeps its state beside that file; `data_dir` or `KEI_DATA_DIR` can change this location. Keep the state as well as your photos and videos.
+Photos are saved in the folder set by `[download].directory`. On a fresh install, kei uses `$XDG_CONFIG_HOME/kei` if `XDG_CONFIG_HOME` is an absolute path. Otherwise it uses `~/.config/kei`. If only the legacy `~/.config/kei` directory exists, kei keeps using it. If both directories exist and point to different locations, automatic discovery stops and lists both. Inspect them before moving anything.
+
+`--config` overrides `KEI_CONFIG`; both select the config file only. For saved logins and backup state, `KEI_DATA_DIR` overrides the config's `data_dir`. Without either, kei uses `cookies/` under the discovered kei directory. To run with two separate roots present, select both a config and a state directory explicitly. Keep the state as well as your photos and videos. If you manage custom paths, uninstall without `--purge` and review those files before removing them.
+
+For example, to inspect the legacy config if you used its default state location:
+
+```sh
+KEI_DATA_DIR="$HOME/.config/kei/cookies" kei --config "$HOME/.config/kei/config.toml" config show
+```
 
 By default, kei downloads available full-resolution originals, current edits and RAW/JPEG renditions, including both Live Photo components. Use `[filters].exclude` to omit ordinary photos, ordinary videos, Live Photo stills or Live Photo videos. Existing configurations need an [explicit rendition-policy migration](docs/rendition-policy-migration.md). See [example.config.toml](example.config.toml).
 

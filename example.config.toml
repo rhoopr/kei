@@ -1,7 +1,9 @@
 # Complete kei config dictionary.
 #
-# Copy this file to ~/.config/kei/config.toml, or mount it at
-# /config/config.toml in Docker, then edit account and path values.
+# Save as config.toml in $XDG_CONFIG_HOME/kei for a fresh install with an
+# absolute XDG_CONFIG_HOME, or ~/.config/kei otherwise. An existing legacy
+# directory is retained. If both exist, select config and data paths explicitly.
+# In Docker, mount this file at /config/config.toml.
 #
 # Each option block lists:
 # - Option: TOML key name
@@ -19,10 +21,10 @@
 config_version = 1
 
 # Option: data_dir
-# Default value: parent directory of the resolved config file; Docker sets KEI_DATA_DIR=/config
+# Default value: cookies/ under the discovered kei directory; KEI_DATA_DIR overrides this option (Docker uses /config)
 # Valid values: filesystem path; ~ expands to your home directory
 # Description: Stores sessions, state DBs, credentials, health data, and cookies.
-# data_dir = "~/.config/kei"
+# data_dir = "/mnt/kei-state"
 
 # Option: log_level
 # Default value: info

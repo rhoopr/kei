@@ -142,7 +142,7 @@ pub(crate) async fn run_reset_session(
     // CLI/env args, so empty PasswordArgs are fine here.
     let password_args = cli::PasswordArgs::default();
     let (username, _, domain, cookie_directory) =
-        config::resolve_auth(globals, &password_args, toml);
+        config::resolve_auth(globals, &password_args, toml)?;
 
     if username.is_empty() {
         anyhow::bail!("Set your iCloud username with ICLOUD_USERNAME or [auth].username.");
