@@ -134,12 +134,13 @@ pub(super) fn full_album_page(
 pub(super) const RUN_CYCLE_ASSET_DATE_MS: i64 = 1_700_000_000_000;
 
 /// The host-local `%Y/%m/%d` folder for an asset without an offset.
-pub(super) fn run_cycle_expected_date_dir() -> String {
-    chrono::DateTime::from_timestamp_millis(RUN_CYCLE_ASSET_DATE_MS)
+pub(super) fn run_cycle_expected_date_dir() -> std::path::PathBuf {
+    let date = chrono::DateTime::from_timestamp_millis(RUN_CYCLE_ASSET_DATE_MS)
         .expect("valid asset timestamp")
         .with_timezone(&chrono::Local)
         .format("%Y/%m/%d")
-        .to_string()
+        .to_string();
+    date.split('/').collect()
 }
 
 pub(super) fn full_album_page_with_download(

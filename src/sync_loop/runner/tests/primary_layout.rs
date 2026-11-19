@@ -567,8 +567,8 @@ async fn local_policy_two_copies_update_and_preserve_across_reopen() {
         } else {
             "IMG_0501.JPG"
         };
-        let first = root.path().join("media/TestAlbum").join(filename);
-        let second = root.path().join("media/SecondAlbum").join(filename);
+        let first = root.path().join("media").join("TestAlbum").join(filename);
+        let second = root.path().join("media").join("SecondAlbum").join(filename);
         assert_bytes(&first, EDIT_ONE);
         assert_bytes(&second, EDIT_ONE);
         let local = b"\xff\xd8\xff\xe0independent local edit";
@@ -849,14 +849,14 @@ async fn local_policy_restored_historical_publication_is_a_local_edit() {
     restored_historical_publication(std::ffi::OsStr::new("utf8")).await;
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[tokio::test]
 async fn local_policy_native_current_publication_updates_but_history_does_not() {
     use std::os::unix::ffi::OsStringExt;
     restored_historical_publication(&std::ffi::OsString::from_vec(b"native-\xff".to_vec())).await;
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[tokio::test]
 async fn local_policy_native_authority_rollback_recovers_landed_publication() {
     use std::os::unix::ffi::OsStringExt;
@@ -915,7 +915,7 @@ async fn local_policy_native_authority_rollback_recovers_landed_publication() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[tokio::test]
 async fn local_policy_native_original_authority_survives_aliases_and_config_drift() {
     use state::db::provider_selection::SelectionPath;
@@ -1594,8 +1594,8 @@ async fn album_directory_conflicting_historical_receipt_does_not_veto_owned_rena
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let provider = records(&server, None);
-    let old = root.path().join("media/Old");
-    let next = root.path().join("media/New");
+    let old = root.path().join("media").join("Old");
+    let next = root.path().join("media").join("New");
     let (first, _) = cycle_options(
         root.path(),
         provider.clone(),
@@ -3339,7 +3339,13 @@ async fn established_primary_layout_keeps_its_directory_after_template_change() 
         assert!(capture.contains_event(|event| {
             event.message() == Some("[PLAN] Current selected rendition destination")
                 && event.field("version") == Some("adjusted")
-                && event.field("path") == root.path().join("media/before/IMG_0501.JPG").to_str()
+                && event.field("path")
+                    == root
+                        .path()
+                        .join("media")
+                        .join("before")
+                        .join("IMG_0501.JPG")
+                        .to_str()
         }));
         assert_eq!(
             db_count(

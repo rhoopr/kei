@@ -278,7 +278,7 @@ async fn issue_770_seed_records(
         .unwrap()
         .1
         .clone();
-    let old_path = root.path().join("old-album/pending.jpg");
+    let old_path = root.path().join("old-album").join("pending.jpg");
     db.upsert_seen(
         &TestAssetRecord::new("PENDING")
             .filename("pending.jpg")

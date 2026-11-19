@@ -197,6 +197,11 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        // macOS TMPDIR traverses /var, a symlink deliberately refused by
+        // the no-follow inspection walk. Seed receipts under the real root.
+        #[cfg(target_os = "macos")]
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        #[cfg(not(target_os = "macos"))]
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(
             SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
@@ -3861,7 +3866,7 @@ async fn historical_shared_album_successor_fixture(metadata: bool) {
             .await
             .unwrap();
     let declarations = album_collision_declarations(&f, &passes, &old).await;
-    let original = f.config.directory.join("copies/changed.JPG");
+    let original = f.config.directory.join("copies").join("changed.JPG");
     std::fs::create_dir_all(original.parent().unwrap()).unwrap();
     std::fs::write(&original, media).unwrap();
     // Publish a historical source through the real downloaded-state owner;
@@ -4550,7 +4555,7 @@ async fn private_metadata_recovery_fixture_with_signature(
             media,
             "the embedded writer must actually have landed bytes before the state fault"
         );
-        let written_path = f.config.directory.join(format!("copies/{filename}"));
+        let written_path = f.config.directory.join("copies").join(filename);
         let own_output = std::fs::read(&written_path).unwrap();
         let (generation,key,child,prepared):(String,String,String,String)=f.db.acquire_lock("prepared output independently persisted").unwrap().query_row("SELECT generation,pass_key,child,prepared_checksum FROM provider_active_destinations WHERE prepared_checksum IS NOT NULL AND path=?1",[SelectionPath::from_path(&written_path).key().unwrap()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
         assert_eq!(prepared, format!("{:x}", Sha256::digest(&own_output)));
@@ -9678,8 +9683,8 @@ async fn completed_copy_recovery(scenario: IntegrityRecovery) {
         )
         .await;
     }
-    let a = f.config.directory.join("A/changed.JPG");
-    let b = f.config.directory.join("B/changed.JPG");
+    let a = f.config.directory.join("A").join("changed.JPG");
+    let b = f.config.directory.join("B").join("changed.JPG");
     let mut expected = passes
         .iter()
         .zip([&a, &b])
@@ -10318,8 +10323,8 @@ async fn confirmed_damage_removed_from_one_selected_album_stays_stable_without_c
         )
         .await;
     }
-    let a = f.config.directory.join("A/changed.JPG");
-    let b = f.config.directory.join("B/changed.JPG");
+    let a = f.config.directory.join("A").join("changed.JPG");
+    let b = f.config.directory.join("B").join("changed.JPG");
     let initial = crate::download::download_photos_with_sync(
         &reqwest::Client::new(),
         &passes,

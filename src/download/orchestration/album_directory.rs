@@ -44,7 +44,9 @@ async fn create_directory(root: PathBuf, path: PathBuf) -> Result<crate::fs_util
 }
 
 fn candidate(root: &Path, name: &str, ordinal: u32) -> PathBuf {
-    let path = root.join(name);
+    // Album hierarchies use '/' on every provider. Match the native
+    // component spelling used by the download planner for durable receipts.
+    let path: PathBuf = root.join(name).components().collect();
     if ordinal == 0 {
         path
     } else {
@@ -749,6 +751,9 @@ async fn prepare_projection(
     tokio::fs::create_dir_all(&root).await?;
     let opened_root = root.clone();
     let identity = tokio::task::spawn_blocking(move || {
+        #[cfg(windows)]
+        let directory = crate::fs_util::open_windows_directory(&opened_root)?;
+        #[cfg(unix)]
         let directory = std::fs::File::open(opened_root)?;
         anyhow::ensure!(
             directory.metadata()?.is_dir(),

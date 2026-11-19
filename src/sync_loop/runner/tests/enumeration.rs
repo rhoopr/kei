@@ -178,13 +178,21 @@ async fn run_cycle_destination_replaced_after_enumeration_reports_partial_failur
     let injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let fault = injected.clone();
     let root = download_root.clone();
+    let media = include_bytes!("../../../../tests/data/media/pattern.jpg");
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .respond_with(move |_: &wiremock::Request| {
             if !fault.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                std::fs::rename(&root, root.with_extension("retained")).unwrap();
-                std::fs::write(&root, b"destination replaced by fault injection").unwrap();
+                let rename = std::fs::rename(&root, root.with_extension("retained"));
+                #[cfg(unix)]
+                {
+                    rename.unwrap();
+                    std::fs::write(&root, b"destination replaced by fault injection").unwrap();
+                }
+                // Confined Windows parent handles deny delete sharing during transfer.
+                #[cfg(windows)]
+                assert!(matches!(rename.unwrap_err().raw_os_error(), Some(5 | 32)));
             }
-            wiremock::ResponseTemplate::new(200).set_body_bytes(vec![0u8; 8])
+            wiremock::ResponseTemplate::new(200).set_body_bytes(media.as_slice())
         })
         .expect(1)
         .mount(&server)
@@ -196,8 +204,8 @@ async fn run_cycle_destination_replaced_after_enumeration_reports_partial_failur
         master_record_name,
         "zone-tok-after-fault",
         &format!("{}/media.jpg", server.uri()),
-        8,
-        "AAAA",
+        media.len() as u64,
+        &base64::engine::general_purpose::STANDARD.encode(Sha256::digest(media)),
     );
     page["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
         serde_json::json!("_defaultOwner");
@@ -235,6 +243,16 @@ async fn run_cycle_destination_replaced_after_enumeration_reports_partial_failur
     let events = capture.events();
     assert!(injected.load(std::sync::atomic::Ordering::SeqCst));
 
+    if cfg!(windows) {
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.stats.downloaded, 1);
+        let files = db.get_downloaded_page(0, 2).await.unwrap();
+        assert_eq!(files.len(), 1);
+        let path = files[0].local_path.as_ref().unwrap();
+        assert!(path.starts_with(&download_root));
+        assert_eq!(std::fs::read(path).unwrap(), media);
+        return;
+    }
     assert_eq!(
         result.failed_count, 1,
         "mid-sync destination loss must produce a failed sync result"

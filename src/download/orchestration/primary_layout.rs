@@ -1446,6 +1446,10 @@ async fn plan(
 
 fn preservation_path(old: &LayoutFile, family: &str) -> SelectionPath {
     let path = old.path.to_path();
+    // Keep the journal family intact. A colon in a Windows filename
+    // denotes an alternate data stream, not a directory component.
+    #[cfg(windows)]
+    let family = family.replace(':', "-");
     let revision = digest(
         serde_json::to_vec(&serde_json::json!([
             old.version,

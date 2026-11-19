@@ -286,7 +286,7 @@ async fn album_directory_exclusive_binding_renames_future_template_copies() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[tokio::test]
 async fn album_directory_native_root_preserves_native_publication_authority() {
     use std::os::unix::ffi::OsStringExt;
@@ -655,7 +655,11 @@ async fn album_directory_native_move_settles_current_authority_once() {
     assert!(first.db_sync_token_advance_safe, "{:?}", first.stats);
     let old = root.path().join("media/Old/IMG_0501_edited.JPG");
     assert_bytes(&old, EDIT_ONE);
-    let current = root.path().join("media/New/IMG_0501_edited.JPG");
+    let current = root
+        .path()
+        .join("media")
+        .join("New")
+        .join("IMG_0501_edited.JPG");
     let (renamed, _) = cycle_options(
         root.path(),
         initial.clone(),

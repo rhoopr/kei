@@ -57,7 +57,7 @@ fn seed(root: &Path, schema_version: i32) -> Connection {
     std::fs::write(root.join("kept.jpg"), b"existing media").unwrap();
     std::fs::write(
         root.join("custom.toml"),
-        b"# preserve exact CRLF\r\n[filters]\r\nskip_created_before = '2020-01-01'\r\n",
+        b"# preserve exact CRLF\r\nconfig_version = 1\r\n[filters]\r\nskip_created_before = '2020-01-01'\r\n",
     )
     .unwrap();
     conn

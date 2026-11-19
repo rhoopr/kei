@@ -756,7 +756,7 @@ fn confined_cstring(value: &std::ffi::OsStr) -> std::io::Result<std::ffi::CStrin
 }
 
 #[cfg(windows)]
-fn open_windows_directory(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_windows_directory(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,

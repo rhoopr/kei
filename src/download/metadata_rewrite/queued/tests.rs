@@ -3604,7 +3604,8 @@ async fn capture_queue_pagination_counts_retired_capture_debt() {
             .unwrap();
         queue_capture_repair(&db, &record).await;
     }
-    std::fs::create_dir(dir.path().join("A0000.jpg.xmp")).unwrap();
+    // Fail one sidecar parse without simulating a volume-wide I/O failure.
+    std::fs::write(dir.path().join("A0000.jpg.xmp"), [0xff]).unwrap();
 
     let residual = crate::download::drain_pending_metadata_rewrites(
         &db as &dyn DownloadStore,

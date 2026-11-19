@@ -373,14 +373,14 @@ async fn departure_preserves_peer(naming: crate::types::EditedNaming) {
             assert_eq!(
                 db_count(
                     root.path(),
-                    "SELECT COUNT(*) FROM provider_active_destinations WHERE current_publication=1 AND compat_path LIKE '%/A/%'"
+                    "SELECT COUNT(*) FROM provider_active_destinations WHERE current_publication=1 AND replace(compat_path,char(92),'/') LIKE '%/A/%'"
                 ),
                 0
             );
             assert_eq!(
                 db_count(
                     root.path(),
-                    "SELECT COUNT(*) FROM provider_active_destinations WHERE current_publication=1 AND compat_path LIKE '%/B/%'"
+                    "SELECT COUNT(*) FROM provider_active_destinations WHERE current_publication=1 AND replace(compat_path,char(92),'/') LIKE '%/B/%'"
                 ),
                 1
             );
@@ -611,7 +611,7 @@ async fn membership_preserved_local_matching_bytes_never_authorize_retirement() 
     )
     .await;
     let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-    let (generation, key, path, checksum): (String,String,String,String) = conn.query_row("SELECT generation,pass_key,path,local_checksum FROM provider_active_destinations WHERE current_publication=1 AND compat_path LIKE '%/A/%'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+    let (generation, key, path, checksum): (String,String,String,String) = conn.query_row("SELECT generation,pass_key,path,local_checksum FROM provider_active_destinations WHERE current_publication=1 AND replace(compat_path,char(92),'/') LIKE '%/A/%'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
     drop(conn);
     let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &fixture_owner())
         .await
@@ -651,7 +651,7 @@ async fn membership_preserved_local_matching_bytes_never_authorize_retirement() 
         assert_eq!(
             db_count(
                 root.path(),
-                "SELECT COUNT(*) FROM provider_active_destinations WHERE compat_path LIKE '%/A/%' AND preserved_local IS NOT NULL AND current_publication=0 AND verified_media=0 AND source_checksum IS NULL"
+                "SELECT COUNT(*) FROM provider_active_destinations WHERE replace(compat_path,char(92),'/') LIKE '%/A/%' AND preserved_local IS NOT NULL AND current_publication=0 AND verified_media=0 AND source_checksum IS NULL"
             ),
             1
         );
