@@ -3,6 +3,48 @@ use tempfile::TempDir;
 use super::compute_sha256;
 
 #[tokio::test]
+async fn retained_local_observation_rejects_mtime_only_race_per_copy() {
+    let root = TempDir::new().unwrap();
+    let first = root.path().join("first.jpg");
+    let second = root.path().join("second.jpg");
+    let original_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    for path in [&first, &second] {
+        std::fs::write(path, b"same media bytes").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(original_time)
+            .unwrap();
+    }
+    let first_observation = super::retain_pending_file(root.path(), &first)
+        .await
+        .unwrap()
+        .unwrap();
+    let second_observation = super::retain_pending_file(root.path(), &second)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_observation.modified, Some(original_time));
+    assert_eq!(
+        first_observation.fingerprint,
+        second_observation.fingerprint
+    );
+
+    std::fs::File::options()
+        .write(true)
+        .open(&first)
+        .unwrap()
+        .set_modified(original_time + std::time::Duration::from_secs(60))
+        .unwrap();
+    // A timestamp-only edit cannot pass solely because SHA-256 still matches.
+    assert!(first_observation.validate().await.is_err());
+    second_observation.validate().await.unwrap();
+    assert_eq!(std::fs::read(&first).unwrap(), b"same media bytes");
+    assert_eq!(std::fs::read(&second).unwrap(), b"same media bytes");
+}
+
+#[tokio::test]
 async fn issue_770_recovery_retained_file_rejects_changed_bytes_and_identity() {
     for replace_inode in [false, true] {
         let root = TempDir::new().unwrap();
@@ -18,6 +60,13 @@ async fn issue_770_recovery_retained_file_rejects_changed_bytes_and_identity() {
             std::fs::write(&path, b"original bytes").unwrap();
         } else {
             std::fs::write(&path, b"changed! bytes").unwrap();
+            // Matching mtime must not hide a same-size byte edit.
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(retained.modified.unwrap())
+                .unwrap();
         }
         assert!(retained.validate().await.is_err());
     }

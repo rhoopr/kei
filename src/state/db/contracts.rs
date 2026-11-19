@@ -111,14 +111,24 @@ impl CaptureRepairReceipt {
 
 /// Exact native destination selected by the generation owner. The metadata
 /// writer receives this receipt without translating its path through SQLite TEXT.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreservedLocal {
+    pub(crate) intent: String,
+    pub(crate) checksum: String,
+    pub(crate) size: u64,
+    pub(crate) modified: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SelectionMetadataReceipt {
     pub(crate) generation: String,
     pub(crate) pass_key: String,
     pub(crate) child: String,
     pub(crate) grouping_hash: String,
-    pub(crate) metadata_flags: u8,
+    pub(crate) metadata_flags: u16,
     pub(crate) prepared: Option<(String, u64)>,
+    pub(crate) preserved_local: Option<PreservedLocal>,
 }
 
 /// One queued metadata rewrite and its independently persisted capture debt.
@@ -388,10 +398,10 @@ pub(crate) struct ScopedDbSyncToken {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckpointTransition {
-    /// Rechecked in the same transaction before proof activation or any write.
+    /// Qualified running album snapshots, completed under the metadata fences.
+    pub(crate) album_snapshots: Vec<(String, String, i64)>,
+    /// Rechecked in the same transaction before current-proof retirement or any write.
     pub(crate) expected_metadata: Vec<(String, Option<String>)>,
-    pub(crate) legacy_preservation_proofs: Vec<super::LegacyActivationProof>,
-    pub(crate) legacy_config_hash: Option<String>,
     pub(crate) sparse_identity_proofs: Vec<SparseIdentityProof>,
     pub(crate) metadata_updates: Vec<(String, String)>,
     pub(crate) metadata_deletes: Vec<String>,
@@ -413,6 +423,7 @@ impl AssetVerificationState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum RetryErrorRetention {
     Clear,
     Preserve(&'static str),
@@ -484,9 +495,16 @@ pub trait DownloadStateStore: Send + Sync {
     /// any kei metadata write. Adoption and local reconciliation must instead
     /// use `mark_downloaded` or `mark_downloaded_with_capture_repair`.
     /// Stores without source-provenance support retain unknown evidence.
+    /// `embedded_fields` contains only measured changes in an installed output;
+    /// identical-existing deduplication must pass empty evidence. Implementations
+    /// commit these fields atomically with downloaded status and native authority.
     ///
     /// # Errors
     /// Returns a state error if downloaded-state finalization fails.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "installed field evidence must commit with existing download and capture-repair evidence"
+    )]
     async fn mark_verified_download(
         &self,
         library: &str,
@@ -496,7 +514,15 @@ pub trait DownloadStateStore: Send + Sync {
         local_checksum: &str,
         download_checksum: Option<&str>,
         mark_capture_repair: bool,
+        embedded_fields: &crate::state::types::EmbeddedMetadataFields,
     ) -> Result<(), StateError> {
+        if *embedded_fields != Default::default() {
+            return Err(StateError::Invariant {
+                operation: "mark_verified_download",
+                detail: "atomic embedded metadata publication is not implemented by this store"
+                    .into(),
+            });
+        }
         self.mark_downloaded_with_capture_repair(
             library,
             id,
@@ -524,7 +550,7 @@ pub trait DownloadStateStore: Send + Sync {
         &self,
         library: &str,
     ) -> Result<Vec<String>, StateError>;
-    async fn reset_failed(&self) -> Result<u64, StateError>;
+    #[cfg(test)]
     async fn prepare_for_retry(
         &self,
         library: Option<&str>,
@@ -967,6 +993,32 @@ pub enum SourceMetadataRecovery {
 /// Metadata rewrite markers and hashes.
 #[async_trait]
 pub trait MetadataRewriteStore: Send + Sync {
+    /// Accept an exact previously prepared output without completing current intent.
+    async fn recover_embedded_metadata_receipt(
+        &self,
+        _pending: &PendingMetadataRewrite,
+        _receipt: &crate::state::types::EmbeddedMetadataReceipt,
+        _output_size: u64,
+    ) -> Result<(), StateError> {
+        Err(StateError::ProviderSelectionInvalid)
+    }
+    async fn embedded_metadata_receipt(
+        &self,
+        _library: &str,
+        _id: &str,
+        _version: &str,
+        _path: &Path,
+        _pending: Option<&PendingMetadataRewrite>,
+    ) -> Result<Option<crate::state::types::EmbeddedMetadataReceipt>, StateError> {
+        Ok(None)
+    }
+    async fn record_embedded_metadata_receipt(
+        &self,
+        _pending: &PendingMetadataRewrite,
+        _receipt: &crate::state::types::EmbeddedMetadataReceipt,
+    ) -> Result<(), StateError> {
+        Err(StateError::ProviderSelectionInvalid)
+    }
     /// Original media and exact sidecars protected before or after preparation.
     async fn protected_legacy_paths(&self) -> Result<Vec<PathBuf>, StateError> {
         Ok(Vec::new())
@@ -1007,17 +1059,6 @@ pub trait MetadataRewriteStore: Send + Sync {
             detail: "legacy preservation is unsupported by this store".into(),
         })
     }
-    /// Diagnostic-only explanation after a selected receipt was refused. This
-    /// cannot supply a receipt or authorize progress; unsupported stores retain
-    /// the ordinary refusal without requiring a new implementation.
-    async fn legacy_child_receipt_refusal(
-        &self,
-        _library: &str,
-        _id: &str,
-        _version_size: &str,
-    ) -> Result<super::LegacyChildReceiptRefusal, StateError> {
-        Ok(super::LegacyChildReceiptRefusal::Unavailable)
-    }
     async fn legacy_preparation_snapshots(
         &self,
         _library: &str,
@@ -1048,36 +1089,6 @@ pub trait MetadataRewriteStore: Send + Sync {
         Err(StateError::Invariant {
             operation: "prepare_legacy_preservation_validated",
             detail: "state store does not support validated historical claims".into(),
-        })
-    }
-    async fn legacy_preservations(
-        &self,
-        _library: &str,
-    ) -> Result<Vec<super::LegacyPreservation>, StateError> {
-        Err(StateError::Invariant {
-            operation: "legacy_preservations",
-            detail: "legacy preservation is unsupported by this store".into(),
-        })
-    }
-    async fn legacy_dependency_evidence(
-        &self,
-        _library: &str,
-        _id: &str,
-    ) -> Result<String, StateError> {
-        Err(StateError::Invariant {
-            operation: "legacy_dependency_evidence",
-            detail: "legacy preservation is unsupported by this store".into(),
-        })
-    }
-    async fn reactivate_legacy_preservation(
-        &self,
-        _library: &str,
-        _id: &str,
-        _expected_generation: Option<i64>,
-    ) -> Result<(), StateError> {
-        Err(StateError::Invariant {
-            operation: "reactivate_legacy_preservation",
-            detail: "legacy preservation is unsupported by this store".into(),
         })
     }
 
@@ -1230,5 +1241,7 @@ pub(crate) struct ManifestAssetRow {
     pub(crate) media_type: String,
     pub(crate) status: String,
     pub(crate) albums: Vec<String>,
+    pub(crate) is_deleted: bool,
+    pub(crate) deleted_at: Option<DateTime<Utc>>,
     pub(crate) preserved_files: Vec<super::primary_layout::PreservedManifestFile>,
 }

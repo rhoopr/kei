@@ -183,7 +183,7 @@ fn uninstall_purge_removes_kei_state_dir_when_present() {
     let home = TempDir::new().unwrap();
     let kei_dir = kei_state_dir(&home);
     std::fs::create_dir_all(&kei_dir).unwrap();
-    std::fs::write(kei_dir.join("config.toml"), "[auth]\n").unwrap();
+    common::write_versioned_config(&kei_dir.join("config.toml"), "[auth]\n").unwrap();
     std::fs::write(kei_dir.join("state.db"), b"\x00").unwrap();
 
     // Install a plist so uninstall has something to do too — but the
@@ -211,8 +211,8 @@ fn uninstall_purge_clears_encrypted_credential_file() {
     let home = TempDir::new().unwrap();
     let kei_dir = kei_state_dir(&home);
     std::fs::create_dir_all(&kei_dir).unwrap();
-    std::fs::write(
-        kei_dir.join("config.toml"),
+    common::write_versioned_config(
+        &kei_dir.join("config.toml"),
         "[auth]\nusername = \"kei-purge-test@example.invalid\"\n",
     )
     .unwrap();

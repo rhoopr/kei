@@ -441,7 +441,11 @@ fn password_command_failure() {
 fn startup_scrubs_password_before_dispatching_password_command() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(&config_path, "[auth]\nusername = 'startup@example.test'\n").unwrap();
+    crate::common::write_versioned_config(
+        &config_path,
+        "[auth]\nusername = 'startup@example.test'\n",
+    )
+    .unwrap();
     // Empty output fails before storing credentials. The other branch reports
     // a different failure if the child inherits the captured environment secret.
     clean_cmd()

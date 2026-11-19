@@ -27,9 +27,12 @@ pub(crate) async fn run_status(
         return Ok(());
     }
 
-    let db =
-        state::SqliteStateDb::open_owned(&db_path, &super::super::get_account_owner(globals, toml))
-            .await?;
+    let db = state::SqliteStateDb::open_owned_with_config(
+        &db_path,
+        &super::super::get_account_owner(globals, toml),
+        &globals.config_source,
+    )
+    .await?;
     let summary = db.get_summary().await?;
 
     println!("State Database: {}", db_path.display());
@@ -44,7 +47,7 @@ pub(crate) async fn run_status(
     let trusted = db.stored_trusted_legacy_file_count().await?;
     if trusted > 0 {
         println!(
-            "  Stored Trusted Legacy File acceptances: {trusted} (provider verification unknown)"
+            "  Stored historical local-trust declarations: {trusted} (not provider verification)"
         );
     }
 
@@ -90,12 +93,18 @@ pub(crate) async fn run_status(
             summary.unresolved_sparse_records, summary.deferred_sparse_records
         );
     }
+    let archived = db.archived_sparse_reference_count().await?;
+    if archived > 0 {
+        println!(
+            "Archived sparse references: {archived} (preserved at upgrade; not active retries)"
+        );
+    }
     if !summary.metadata_capture.is_empty() {
         println!("Metadata capture:");
         for capture in &summary.metadata_capture {
             if capture.unattributed_legacy_assets > 0 {
                 println!(
-                    "  {}: {} legacy records need attribution; {} awaiting current-work preservation proof",
+                    "  {}: preserved legacy records with unknown attribution: {}; legacy records without a stored coverage certificate: {}. Certification is retired; this is not pending sync work.",
                     capture.library,
                     capture.unattributed_legacy_assets,
                     capture.unattributed_legacy_pending

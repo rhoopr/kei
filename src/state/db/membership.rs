@@ -95,7 +95,16 @@ fn mark_album_groupings_dirty_tx(
     .map_err(|e| StateError::query("mark_album_groupings_dirty", e))?;
     tx.execute(
         "UPDATE asset_metadata_paths SET metadata_write_failed_at = COALESCE(metadata_write_failed_at, ?3) \
-         WHERE library = ?1 AND id = ?2",
+         WHERE library = ?1 AND id = ?2 \
+           AND NOT EXISTS(SELECT 1 FROM primary_layout_superseded_paths s \
+             WHERE s.library=asset_metadata_paths.library AND s.child=asset_metadata_paths.id \
+               AND s.version=asset_metadata_paths.version_size \
+               AND s.provider_checksum=asset_metadata_paths.provider_checksum \
+               AND s.compat_path=asset_metadata_paths.local_path \
+               AND NOT EXISTS(SELECT 1 FROM primary_layout_claims c \
+                 WHERE c.native_path=s.native_path AND c.library=s.library AND c.child=s.child \
+                   AND c.version=s.version AND c.provider_checksum=s.provider_checksum \
+                   AND c.operation IS NULL))",
         rusqlite::params![library, asset_id, Utc::now().timestamp()],
     ).map_err(|e| StateError::query("mark_album_metadata_paths_dirty", e))?;
     Ok(())
@@ -169,6 +178,42 @@ fn album_membership_record_from_row(
         generation: row.get(4)?,
         source: row.get(5)?,
     })
+}
+
+pub(super) fn complete_album_membership_snapshot_tx(
+    tx: &Transaction<'_>,
+    library: &str,
+    container_id: &str,
+    generation: i64,
+) -> Result<(), StateError> {
+    let now = Utc::now().timestamp();
+    let updated = tx
+        .execute(
+            "UPDATE album_membership_snapshots SET status='complete', completed_at=?1 \
+         WHERE library=?2 AND container_id=?3 AND generation=?4 AND status='running' \
+         AND NOT EXISTS(SELECT 1 FROM album_membership_snapshots newer \
+             WHERE newer.library=?2 AND newer.container_id=?3 AND newer.generation>?4)",
+            rusqlite::params![now, library, container_id, generation],
+        )
+        .map_err(|error| {
+            StateError::query("complete_album_membership_snapshot::snapshot", error)
+        })?;
+    if updated == 0 {
+        return Err(StateError::Invariant {
+            operation: "complete_album_membership_snapshot",
+            detail: "running album snapshot changed before qualification".to_owned(),
+        });
+    }
+    tx.execute(
+        "UPDATE asset_album_memberships SET is_deleted=1, updated_at=?1 \
+         WHERE library=?2 AND container_id=?3 AND generation<>?4 AND is_deleted=0 \
+         AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p \
+             WHERE p.library=asset_album_memberships.library \
+             AND p.asset_id=asset_album_memberships.asset_record_name)",
+        rusqlite::params![now, library, container_id, generation],
+    )
+    .map_err(|error| StateError::query("complete_album_membership_snapshot::prune", error))?;
+    refresh_container_groupings_tx(tx, library, container_id, None, None)
 }
 
 impl SqliteStateDb {
@@ -596,39 +641,10 @@ impl SqliteStateDb {
         let library = library.to_owned();
         let container_id = container_id.to_owned();
         self.with_conn_mut("complete_album_membership_snapshot", move |conn| {
-            let now = Utc::now().timestamp();
             let tx = conn
                 .transaction()
                 .map_err(|e| StateError::query("complete_album_membership_snapshot::begin", e))?;
-            let updated = tx
-                .execute(
-                    "UPDATE album_membership_snapshots \
-                     SET status = 'complete', completed_at = ?1 \
-                     WHERE library = ?2 AND container_id = ?3 \
-                       AND generation = ?4 AND status = 'running'",
-                    rusqlite::params![now, &library, &container_id, generation],
-                )
-                .map_err(|e| {
-                    StateError::query("complete_album_membership_snapshot::snapshot", e)
-                })?;
-            if updated == 0 {
-                return Err(StateError::Invariant {
-                    operation: "complete_album_membership_snapshot",
-                    detail: format!(
-                        "no running snapshot for library {library} container {container_id} generation {generation}"
-                    ),
-                });
-            }
-            tx.execute(
-                "UPDATE asset_album_memberships \
-                 SET is_deleted = 1, updated_at = ?1 \
-                 WHERE library = ?2 AND container_id = ?3 \
-                   AND generation <> ?4 AND is_deleted = 0 \
-                   AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=asset_album_memberships.library AND p.asset_id=asset_album_memberships.asset_record_name)",
-                rusqlite::params![now, &library, &container_id, generation],
-            )
-            .map_err(|e| StateError::query("complete_album_membership_snapshot::prune", e))?;
-            refresh_container_groupings_tx(&tx, &library, &container_id, None, None)?;
+            complete_album_membership_snapshot_tx(&tx, &library, &container_id, generation)?;
             tx.commit()
                 .map_err(|e| StateError::query("complete_album_membership_snapshot::commit", e))?;
             Ok(())

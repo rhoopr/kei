@@ -10,7 +10,8 @@ use crate::download::filter::{FilterReason, is_asset_filtered};
 use crate::icloud::photos::PhotoAsset;
 use crate::state::types::legacy_added_date_matches;
 use crate::state::{
-    DownloadContextStateStore, DownloadStateStore, MetadataRewriteStore, VersionSizeKey,
+    DownloadContextStateStore, DownloadStateStore, MetadataRewriteStore, ReportStateStore,
+    VersionSizeKey,
 };
 
 use super::config::DownloadConfig;
@@ -48,10 +49,6 @@ type LibraryAssetVersionSet = FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashSet<
 /// `library -> asset_id`. Used by retry-only mode to decide whether an asset is
 /// already known in the same CloudKit zone.
 type LibraryAssetSet = FxHashMap<Arc<str>, FxHashSet<Arc<str>>>;
-
-/// `library -> asset_id -> attempt count`. Used by max-attempt gating without
-/// leaking failures across libraries that happen to share an id.
-type LibraryAssetAttemptCounts = FxHashMap<Arc<str>, FxHashMap<Arc<str>, u32>>;
 
 /// `library -> asset_id -> (version_size -> value)`. Used by
 /// `DownloadContext::downloaded_checksums` and
@@ -118,6 +115,11 @@ const LEGACY_OWNER_CLAIM_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Default)]
 pub(crate) struct DownloadContext {
+    /// Explicitly requested truncation repair evidence, never a source of work.
+    truncated_repairs: FxHashMap<
+        crate::download::retry::PendingRetryTarget,
+        crate::download::retry::PendingRetryEvidence,
+    >,
     /// Nested map: `library` -> `asset_id` -> set of `version_sizes` that
     /// are already downloaded. Three-level shape so multi-library syncs
     /// don't dedupe the same asset_id across zones (PR10 / schema v8).
@@ -147,19 +149,18 @@ pub(crate) struct DownloadContext {
     /// `refresh_downloaded_asset_metadata` is unable to apply.
     pub(in crate::download) soft_deleted_ids: LibraryAssetSet,
     /// Nested map: `library` -> `asset_id` -> set of `version_sizes` that
-    /// are pending at sync start. Used to resolve failed/pending rows when
-    /// the expected file is already on disk instead of promoting them back to
-    /// failed after the producer skips the duplicate path.
+    /// are pending or failed at sync start. These are ownership and recovery
+    /// evidence for current selected records, not a queue of work to schedule.
     pub(in crate::download) pending_ids: LibraryAssetVersionSet,
     /// Nested map: `library` -> `asset_id` -> (`version_size` -> filename)
-    /// for pending rows. Pending on-disk adoption uses this to avoid adopting
+    /// for pending/failed rows. On-disk adoption uses this to avoid adopting
     /// a same-name/same-size collision that belongs to a different asset.
     pub(in crate::download) pending_filenames: LibraryAssetVersionValueMap,
-    /// Provider checksums for pending rows. Identity stabilization uses these
+    /// Provider checksums for pending/failed rows. Identity stabilization uses these
     /// to retain a compatible legacy master-keyed retry without merging a
     /// different sibling into it.
     pub(in crate::download) pending_checksums: LibraryAssetVersionValueMap,
-    /// Current recorded local files for pending rows. A provider checksum
+    /// Current recorded local files for pending/failed rows. A provider checksum
     /// change clears `downloaded_at`, so historical paths are excluded.
     pub(in crate::download) pending_files: LibraryAssetVersionFileMap,
     /// Provider identity families recorded before this pipeline started.
@@ -172,13 +173,6 @@ pub(crate) struct DownloadContext {
     pub(in crate::download) legacy_master_state_owners: Option<LibraryMasterAssetMap>,
     legacy_added_dates: LegacyAddedDates,
     protected_legacy_ids: LibraryAssetSet,
-    /// Nested map: `library` -> set of asset IDs known to the state DB (any
-    /// status). Used in retry-only mode to skip new assets that were never
-    /// synced in the same CloudKit zone.
-    pub(in crate::download) known_ids: LibraryAssetSet,
-    /// Per-library/asset maximum download attempt count (from failed assets).
-    /// Used to skip assets that have exceeded `max_download_attempts`.
-    pub(in crate::download) attempt_counts: LibraryAssetAttemptCounts,
     /// True when at least one downloaded asset-version lacks a metadata hash.
     /// Cached because the producer checks this on hot on-disk skip paths.
     pub(in crate::download) downloaded_without_metadata_hash: bool,
@@ -207,31 +201,75 @@ fn retain_legacy_added_date(
 }
 
 impl DownloadContext {
+    /// Keep explicit repair at its recorded destination before selection freezes
+    /// the plan. The existing planner rejects foreign claims and chooses a safe
+    /// sibling when provider content changed; it never grants replacement then.
+    pub(in crate::download) async fn plan_selected_truncation_repair(
+        &self,
+        task: crate::download::DownloadTask,
+        config: &DownloadConfig,
+        planner: &mut crate::download::planner::TaskPlanner,
+    ) -> anyhow::Result<Option<crate::download::DownloadTask>> {
+        if !config.repair_truncated || planner.managed_layout_session().is_some() {
+            return Ok(Some(task));
+        }
+        let target = crate::download::retry::PendingRetryTarget::from_task(&task);
+        let Some(evidence) = self.truncated_repairs.get(&target) else {
+            return Ok(Some(task));
+        };
+        planner
+            .retain_pending_destination(task, config, Some(evidence))
+            .await
+    }
+
+    /// Attach repair authority only after current selection binds the exact path.
+    pub(in crate::download) async fn bind_selected_truncation_repair(
+        &self,
+        task: &mut crate::download::DownloadTask,
+        config: &DownloadConfig,
+    ) -> anyhow::Result<()> {
+        if !config.repair_truncated {
+            return Ok(());
+        }
+        task.replacement_fingerprint = None;
+        let target = crate::download::retry::PendingRetryTarget::from_task(task);
+        let Some(evidence) = self.truncated_repairs.get(&target) else {
+            return Ok(());
+        };
+        if evidence.matches_provider_version(task)
+            && evidence.local_path_under(&config.directory) == Some(task.download_path.as_path())
+        {
+            task.replacement_fingerprint =
+                evidence
+                    .truncated_repair_fingerprint(true)
+                    .await?
+                    .map(|fingerprint| {
+                        Arc::new(crate::download::file::FinalPublication::ReplaceTruncated(
+                            fingerprint,
+                        ))
+                    });
+        }
+        Ok(())
+    }
+
     /// Load the download context from the state database. All state queries
     /// are independent and run concurrently so sync start doesn't serialize
     /// on round-trip latency across them.
-    pub(crate) async fn load<D>(db: &D, retry_only: bool) -> Self
+    pub(crate) async fn load<D>(db: &D) -> Self
     where
-        D: DownloadContextStateStore + DownloadStateStore + MetadataRewriteStore + ?Sized,
+        D: DownloadContextStateStore
+            + DownloadStateStore
+            + MetadataRewriteStore
+            + ReportStateStore
+            + ?Sized,
     {
-        let known_ids_fut = async {
-            if retry_only {
-                db.get_all_known_ids().await.unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to load known IDs from state DB");
-                    Default::default()
-                })
-            } else {
-                Default::default()
-            }
-        };
         let (
             downloaded_records,
             soft_deleted,
             hashes,
             markers,
             pending,
-            attempts,
-            known_id_rows,
+            failed,
             mapping_rows,
             legacy_owner_rows,
             protected_legacy_rows,
@@ -269,12 +307,11 @@ impl DownloadContext {
                 })
             },
             async {
-                db.get_attempt_counts().await.unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to load attempt counts from state DB");
+                db.get_failed().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load failed asset evidence from state DB");
                     Default::default()
                 })
             },
-            known_ids_fut,
             db.get_asset_master_mappings(),
             db.get_legacy_master_state_owners(),
             db.get_protected_legacy_ids(),
@@ -388,7 +425,19 @@ impl DownloadContext {
         let mut pending_filenames: LibraryAssetVersionValueMap = FxHashMap::default();
         let mut pending_checksums: LibraryAssetVersionValueMap = FxHashMap::default();
         let mut pending_files: LibraryAssetVersionFileMap = FxHashMap::default();
-        for record in pending {
+        let mut truncated_repairs = FxHashMap::default();
+        // These maps retain unfinished identity/path evidence. They do not
+        // schedule work or mutate durable retry status. Failed rows need the
+        // same ownership protection without a startup failed-to-pending reset.
+        for record in pending.into_iter().chain(failed) {
+            if record.last_error.as_deref()
+                == Some(crate::commands::reconcile::FILE_TRUNCATED_REASON)
+            {
+                truncated_repairs.insert(
+                    crate::download::retry::PendingRetryTarget::from_record(&record),
+                    crate::download::retry::PendingRetryEvidence::from_record(&record),
+                );
+            }
             let crate::state::AssetRecord {
                 library,
                 id,
@@ -496,19 +545,6 @@ impl DownloadContext {
                 tracing::warn!(%error, "Legacy preservation could not be loaded; legacy adoption disabled");
             }
         }
-        let mut known_ids: LibraryAssetSet = FxHashMap::default();
-        for (library, asset_id) in known_id_rows {
-            let lib = intern_id(&mut interner, library);
-            let id = intern_id(&mut interner, asset_id);
-            known_ids.entry(lib).or_default().insert(id);
-        }
-
-        let mut attempt_counts: LibraryAssetAttemptCounts = FxHashMap::default();
-        for ((library, asset_id), count) in attempts {
-            let lib = intern_id(&mut interner, library);
-            let id = intern_id(&mut interner, asset_id);
-            attempt_counts.entry(lib).or_default().insert(id, count);
-        }
         let downloaded_without_metadata_hash = if protected_legacy_ids.is_empty() {
             count_version_set_entries(&downloaded_ids)
                 > count_value_map_entries(&downloaded_metadata_hashes)
@@ -537,6 +573,7 @@ impl DownloadContext {
             metadata_retry_markers,
             soft_deleted_ids,
             pending_ids,
+            truncated_repairs,
             pending_filenames,
             pending_checksums,
             pending_files,
@@ -544,23 +581,8 @@ impl DownloadContext {
             legacy_master_state_owners,
             legacy_added_dates,
             protected_legacy_ids,
-            known_ids,
-            attempt_counts,
             downloaded_without_metadata_hash,
         }
-    }
-
-    pub(in crate::download) fn is_known(&self, library: &str, asset_id: &str) -> bool {
-        self.known_ids
-            .get(library)
-            .is_some_and(|ids| ids.contains(asset_id))
-    }
-
-    pub(in crate::download) fn attempt_count(&self, library: &str, asset_id: &str) -> Option<u32> {
-        self.attempt_counts
-            .get(library)
-            .and_then(|assets| assets.get(asset_id))
-            .copied()
     }
 
     /// Whether a downloaded asset-version needs a metadata-only rewrite:
@@ -756,10 +778,6 @@ impl DownloadContext {
         {
             return false;
         }
-        if !self.has_matching_state_checksum(library, master_record_name, asset) {
-            return false;
-        }
-
         let Some(owners) = &self.legacy_master_state_owners else {
             return false;
         };
@@ -768,6 +786,10 @@ impl DownloadContext {
             .and_then(|masters| masters.get(master_record_name))
         {
             return owner.as_ref() == asset_record_name;
+        }
+
+        if !self.has_matching_state_checksum(library, master_record_name, asset) {
+            return false;
         }
 
         let Some(provider_added) = asset.added_date_evidence() else {
@@ -860,6 +882,46 @@ impl DownloadContext {
             });
         }
         Ok(self.select_asset_state_record_name(library, asset, claimed_legacy_master_states))
+    }
+
+    /// Current selection may retain an exact recorded child/master identity,
+    /// but cannot infer a new owner from an otherwise unmapped historical row.
+    pub(crate) async fn select_current_asset_state_record_name_for_download(
+        &self,
+        db: Option<&dyn DownloadStore>,
+        library: &str,
+        asset: &PhotoAsset,
+        claimed_legacy_master_states: &mut ClaimedLegacyMasterStates,
+    ) -> std::result::Result<Arc<str>, crate::state::error::StateError> {
+        let recorded_child = self
+            .asset_master_mappings
+            .as_ref()
+            .and_then(|libraries| libraries.get(library))
+            .and_then(|masters| masters.get(asset.id()))
+            .is_some_and(|children| {
+                children.len() == 1 && children.contains(asset.asset_record_name())
+            });
+        let recorded_owner = self
+            .legacy_master_state_owners
+            .as_ref()
+            .and_then(|libraries| libraries.get(library))
+            .and_then(|masters| masters.get(asset.id()))
+            .is_some_and(|owner| owner.as_ref() == asset.asset_record_name());
+        if recorded_child || recorded_owner {
+            // The existing selector still checks protected identities, current
+            // checksums, added-date evidence and exclusive ownership. Its claim
+            // transaction rechecks competing mappings before publication.
+            return self
+                .select_asset_state_record_name_for_download(
+                    db,
+                    library,
+                    asset,
+                    claimed_legacy_master_states,
+                )
+                .await;
+        }
+        self.select_asset_state_record_name_checked(library, asset, claimed_legacy_master_states)?;
+        Ok(asset.asset_record_name_arc())
     }
 
     pub(in crate::download) async fn select_asset_state_record_name_for_download(
@@ -1065,7 +1127,7 @@ pub(in crate::download) async fn preload_download_context(
 ) -> Arc<DownloadContext> {
     let download_ctx = if let Some(db) = &config.state_db {
         tracing::debug!("Pre-loading download state from database");
-        DownloadContext::load(db.as_ref(), config.retry_only).await
+        DownloadContext::load(db.as_ref()).await
     } else {
         DownloadContext::default()
     };

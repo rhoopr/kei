@@ -850,7 +850,10 @@ async fn upsert_seen_then_summary_counts_accurate_across_transitions() {
     assert_eq!(s2.pending, 1);
 
     // Act: reset failed back to pending
-    let reset_count = db.reset_failed().await.unwrap();
+    let (reset_count, _, _) = db
+        .prepare_for_retry(None, crate::state::RetryErrorRetention::Clear)
+        .await
+        .unwrap();
     assert_eq!(reset_count, 1);
 
     // Assert: failed count goes to 0, pending increases

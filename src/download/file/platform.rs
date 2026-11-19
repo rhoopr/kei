@@ -327,69 +327,10 @@ pub(super) async fn publish_part_no_replace(
     }
 }
 
-/// Match the standard library's absolute-path handling before passing paths to
-/// Win32 APIs directly. Extended paths avoid MAX_PATH without registry or
-/// manifest requirements; native UTF-16 units and existing namespaces survive.
 #[cfg(windows)]
-fn windows_api_path(path: &Path) -> std::io::Result<Vec<u16>> {
-    use std::os::windows::ffi::OsStrExt;
-    use std::path::{Component, Prefix};
-
-    if path.as_os_str().encode_wide().any(|unit| unit == 0) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "path contains NUL",
-        ));
-    }
-    // GetFullPathNameW resolves relative paths and Win32 separators/components
-    // without filesystem traversal. Already verbatim paths stay unchanged.
-    let absolute = std::path::absolute(path)?;
-    let wide: Vec<u16> = absolute.as_os_str().encode_wide().collect();
-    let prefix = match absolute.components().next() {
-        Some(Component::Prefix(prefix)) => prefix.kind(),
-        _ => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Windows publication requires an absolute path",
-            ));
-        }
-    };
-    let mut result: Vec<u16> = match prefix {
-        Prefix::Disk(_) => r"\\?\".encode_utf16().chain(wide).collect(),
-        Prefix::UNC(_, _) => r"\\?\UNC\"
-            .encode_utf16()
-            .chain(wide.into_iter().skip(2))
-            .collect(),
-        Prefix::Verbatim(_)
-        | Prefix::VerbatimUNC(_, _)
-        | Prefix::VerbatimDisk(_)
-        | Prefix::DeviceNS(_) => wide,
-    };
-    result.push(0);
-    Ok(result)
-}
-
+pub(super) use crate::fs_util::move_file_no_replace_blocking;
 #[cfg(windows)]
-pub(super) fn move_file_no_replace_blocking(
-    part_path: &Path,
-    final_path: &Path,
-) -> std::io::Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
-
-    let part = windows_api_path(part_path)?;
-    let final_path = windows_api_path(final_path)?;
-    // SAFETY: both path arguments are live NUL-terminated absolute Windows
-    // strings, with extended namespaces for ordinary drive and UNC paths.
-    // MOVEFILE_WRITE_THROUGH keeps the existing durable-publish intent, and
-    // omitting MOVEFILE_REPLACE_EXISTING gives this promotion no-overwrite
-    // semantics.
-    let rc = unsafe { MoveFileExW(part.as_ptr(), final_path.as_ptr(), MOVEFILE_WRITE_THROUGH) };
-    if rc != 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
+use crate::fs_util::windows_api_path;
 
 #[cfg(windows)]
 pub(super) fn replace_file_with_backup_blocking(

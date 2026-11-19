@@ -241,6 +241,8 @@ test MODE="" *ARGS="":
             cargo test --test cli --test behavioral --test service_cli --test service_linux --test service_macos --test service_windows --test service_status
             ;;
         offline)
+            # Offline fixtures own their account/config inputs, including under full-test's .env.
+            unset ICLOUD_USERNAME ICLOUD_PASSWORD KEI_DATA_DIR KEI_CONFIG KEI_PASSWORD_FILE KEI_PASSWORD_COMMAND
             cargo test --all-features
             cargo test --no-default-features
             scripts/test-scenarios/check.sh
@@ -354,12 +356,12 @@ cov MODE="" BASE="main":
             cargo llvm-cov report --summary-only
             ;;
         patch)
-            cargo llvm-cov --all-features --lcov --output-path head.lcov -- --skip download::orchestration::queue_projection::tests::private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes
+            cargo llvm-cov --all-features --lcov --output-path head.lcov -- --skip download::orchestration::queue_projection::tests::private_600_independent_album_writers_finish_through_reseeds_without_repeated_writes
             # --detach so the base worktree doesn't collide with any
             # existing checkout of the base branch (e.g. the main repo
             # already sitting on main).
             git worktree add --detach ../.kei-cov-base "{{BASE}}" >/dev/null
-            (cd ../.kei-cov-base && cargo llvm-cov --all-features --lcov --output-path "$OLDPWD/base.lcov" -- --skip download::orchestration::queue_projection::tests::private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes)
+            (cd ../.kei-cov-base && cargo llvm-cov --all-features --lcov --output-path "$OLDPWD/base.lcov" -- --skip download::orchestration::queue_projection::tests::private_600_independent_album_writers_finish_through_reseeds_without_repeated_writes --skip download::orchestration::queue_projection::tests::private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes)
             git worktree remove ../.kei-cov-base >/dev/null
             python3 .github/scripts/patch_coverage.py \
                 --lcov head.lcov \

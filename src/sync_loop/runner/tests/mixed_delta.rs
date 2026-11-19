@@ -11,11 +11,62 @@ use crate::sync_cycle::{
     ENUM_CONFIG_HASH_KEY, PENDING_ENUM_CONFIG_HASH_KEY, pending_zone_token_key, run_cycle,
 };
 use crate::sync_loop::test_support::{
-    album_count_response, make_named_full_album_with_boxed_session, make_run_cycle_config,
-    make_run_cycle_download_config_builder, make_run_cycle_library_state_with_passes,
-    make_shared_session_for_run_cycle,
+    album_count_response, make_run_cycle_config, make_run_cycle_download_config_builder,
+    make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle,
 };
 use crate::{download, state};
+
+fn mixed_owner() -> state::db::account::AccountOwner {
+    state::db::account::AccountOwner::authenticated(
+        "mixed@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo": {"dsid": "mixed-fixture"}})).unwrap(),
+    )
+    .unwrap()
+}
+
+async fn mixed_db(path: &std::path::Path) -> Arc<state::SqliteStateDb> {
+    Arc::new(
+        state::SqliteStateDb::open_owned(path, &mixed_owner())
+            .await
+            .unwrap(),
+    )
+}
+
+fn capture_album(db: &Arc<state::SqliteStateDb>, mut album: PhotoAlbum) -> PhotoAlbum {
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), mixed_owner(), "com"),
+        Arc::from("private"),
+    );
+    assert!(album.current_selection_scope().unwrap().is_some());
+    album
+}
+
+fn unfiled_album(
+    db: &Arc<state::SqliteStateDb>,
+    zone: &str,
+    session: Box<dyn PhotosSession>,
+) -> PhotoAlbum {
+    capture_album(
+        db,
+        PhotoAlbum::new(
+            PhotoAlbumConfig {
+                params: Arc::new(std::collections::HashMap::new()),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from(""),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(json!({"zoneName": zone, "ownerRecordName": "_defaultOwner"})),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
+            session,
+        ),
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MixedFault {
@@ -64,8 +115,14 @@ impl PhotosSession for MixedSession {
             }));
         }
         if url.contains("/changes/zone?") {
-            assert!(!self.smart, "source delta must use the Unfiled pass");
             let request: Value = serde_json::from_str(&body).unwrap();
+            if request["zones"][0]["syncToken"].is_null() {
+                return Ok(json!({"zones": [{
+                    "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                    "syncToken": "inventory-query-eof", "moreComing": false, "records": []
+                }]}));
+            }
+            assert!(!self.smart, "source delta must use the Unfiled pass");
             assert_eq!(request["zones"][0]["syncToken"], self.expected_cursor);
             self.changes.fetch_add(1, Ordering::SeqCst);
             let mut zone = json!({
@@ -87,27 +144,35 @@ impl PhotosSession for MixedSession {
     }
 }
 
-fn smart_album(zone: &str, name: &str, session: Box<dyn PhotosSession>) -> PhotoAlbum {
+fn smart_album(
+    db: &Arc<state::SqliteStateDb>,
+    zone: &str,
+    name: &str,
+    session: Box<dyn PhotosSession>,
+) -> PhotoAlbum {
     let definition = crate::icloud::photos::smart_folders::smart_folders()
         .into_iter()
         .find(|(candidate, _)| *candidate == name)
         .unwrap()
         .1;
-    PhotoAlbum::new(
-        PhotoAlbumConfig {
-            params: Arc::new(std::collections::HashMap::new()),
-            service_endpoint: Arc::from("https://example.com"),
-            name: Arc::from(name),
-            list_type: Arc::from(definition.list_type),
-            obj_type: Arc::from(definition.obj_type),
-            query_filter: definition.query_filter,
-            page_size: 100,
-            zone_id: Arc::new(json!({"zoneName": zone})),
-            retry_config: crate::retry::RetryConfig::default(),
-            container_id: None,
-            cross_zone_sources: Vec::new(),
-        },
-        session,
+    capture_album(
+        db,
+        PhotoAlbum::new(
+            PhotoAlbumConfig {
+                params: Arc::new(std::collections::HashMap::new()),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from(name),
+                list_type: Arc::from(definition.list_type),
+                obj_type: Arc::from(definition.obj_type),
+                query_filter: definition.query_filter,
+                page_size: 100,
+                zone_id: Arc::new(json!({"zoneName": zone, "ownerRecordName": "_defaultOwner"})),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
+            session,
+        ),
     )
 }
 
@@ -152,7 +217,7 @@ async fn mixed_lifecycle(drift: bool, fault: Option<MixedFault>) {
     };
     let marker = state::unresolved_identity_key("PrimarySync");
     {
-        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        let db = mixed_db(&database).await;
         let checksum = download::file::compute_sha256(&kept).await.unwrap();
         db.upsert_seen(
             &crate::test_helpers::TestAssetRecord::new("asset-HISTORY")
@@ -192,7 +257,7 @@ async fn mixed_lifecycle(drift: bool, fault: Option<MixedFault>) {
         let resumes_candidate =
             fault == Some(MixedFault::CheckpointWrite) && cycle == recovery_cycle;
         let active_fault = if held { fault } else { None };
-        let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        let db = mixed_db(&database).await;
         if active_fault == Some(MixedFault::CheckpointWrite) {
             db.acquire_lock("mixed checkpoint fault")
                 .unwrap()
@@ -230,16 +295,12 @@ async fn mixed_lifecycle(drift: bool, fault: Option<MixedFault>) {
             vec![
                 AlbumPass {
                     kind: PassKind::Unfiled,
-                    album: make_named_full_album_with_boxed_session(
-                        "PrimarySync",
-                        "",
-                        Box::new(unfiled),
-                    ),
+                    album: unfiled_album(&db, "PrimarySync", Box::new(unfiled)),
                     exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
                 },
                 AlbumPass {
                     kind: PassKind::SmartFolder,
-                    album: smart_album("PrimarySync", "Hidden", Box::new(smart)),
+                    album: smart_album(&db, "PrimarySync", "Hidden", Box::new(smart)),
                     exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
                 },
             ],
@@ -250,7 +311,6 @@ async fn mixed_lifecycle(drift: bool, fault: Option<MixedFault>) {
             &[&library],
             &config,
             Some(db.as_ref()),
-            false,
             &builder,
             download::DownloadControls::download_hidden(),
             &shared,
@@ -341,18 +401,10 @@ async fn mixed_lifecycle(drift: bool, fault: Option<MixedFault>) {
                     .is_none(),
                 "activation consumes the pending candidate"
             );
-            if cycle > recovery_cycle || !drift || resumes_candidate {
-                assert_eq!(
-                    unfiled_queries.load(Ordering::SeqCst),
-                    0,
-                    "no repeat Unfiled inventory"
-                );
-            } else {
-                assert!(
-                    unfiled_queries.load(Ordering::SeqCst) > 0,
-                    "initial drift requires current inventory"
-                );
-            }
+            assert!(
+                unfiled_queries.load(Ordering::SeqCst) > 0,
+                "smart membership refresh must certify the whole current selection"
+            );
             assert!(
                 smart_queries.load(Ordering::SeqCst) > 0,
                 "selected Hidden refresh still runs"
@@ -415,6 +467,21 @@ impl PhotosSession for InventorySession {
             let request: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(request["zones"].as_array().unwrap().len(), 1);
             assert_eq!(request["zones"][0]["zoneID"]["zoneName"], self.zone);
+            if request["zones"][0]["syncToken"].is_null() {
+                // Bootstrap observes the same current records as this pass's
+                // inventory, including its resource bytes and injected faults.
+                let response = Box::pin(self.post(
+                    "https://example.com/records/query?",
+                    json!({"query": {"filterBy": []}, "resultsLimit": u64::MAX}).to_string(),
+                    headers,
+                ))
+                .await?;
+                return Ok(json!({"zones": [{
+                    "zoneID": {"zoneName": self.zone, "ownerRecordName": "_defaultOwner"},
+                    "syncToken": "inventory-query-eof", "moreComing": false,
+                    "records": response["records"]
+                }]}));
+            }
             assert!(matches!(
                 request["zones"][0]["syncToken"].as_str(),
                 Some("inventory-query-eof" | "validated-delta-successor" | "retained-valid-cursor")
@@ -447,6 +514,14 @@ impl PhotosSession for InventorySession {
             }
         }
         let mut response = self.inner.post(url, body, headers).await?;
+        if let Some(records) = response["records"].as_array_mut() {
+            for record in records {
+                if record["recordType"] == "CPLAsset" {
+                    record["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+                        json!("_defaultOwner");
+                }
+            }
+        }
         if let Some(download_url) = &self.download_url
             && let Some(records) = response["records"].as_array_mut()
         {
@@ -467,7 +542,6 @@ impl PhotosSession for InventorySession {
             }
         }
         if self.fault == Some(InventoryFault::MalformedAsset)
-            && url.contains("/records/query?")
             && let Some(records) = response["records"].as_array_mut()
         {
             for record in records {
@@ -487,29 +561,37 @@ impl PhotosSession for InventorySession {
     }
 }
 
-fn inventory_named_album(zone: &str, name: &str, session: Box<dyn PhotosSession>) -> PhotoAlbum {
+fn inventory_named_album(
+    db: &Arc<state::SqliteStateDb>,
+    zone: &str,
+    name: &str,
+    session: Box<dyn PhotosSession>,
+) -> PhotoAlbum {
     let container = format!("container-{name}");
-    PhotoAlbum::new(
-        PhotoAlbumConfig {
-            params: Arc::new(std::collections::HashMap::new()),
-            service_endpoint: Arc::from("https://example.com"),
-            name: Arc::from(name),
-            list_type: Arc::from("CPLContainerRelationLiveByAssetDate"),
-            obj_type: Arc::from(format!(
-                "CPLContainerRelationNotDeletedByAssetDate:{container}"
-            )),
-            query_filter: Some(Arc::new(json!([{
-                "fieldName": "parentId",
-                "comparator": "EQUALS",
-                "fieldValue": {"type": "STRING", "value": container},
-            }]))),
-            page_size: 100,
-            zone_id: Arc::new(json!({"zoneName": zone})),
-            retry_config: crate::retry::RetryConfig::default(),
-            container_id: Some(Arc::from(container)),
-            cross_zone_sources: Vec::new(),
-        },
-        session,
+    capture_album(
+        db,
+        PhotoAlbum::new(
+            PhotoAlbumConfig {
+                params: Arc::new(std::collections::HashMap::new()),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from(name),
+                list_type: Arc::from("CPLContainerRelationLiveByAssetDate"),
+                obj_type: Arc::from(format!(
+                    "CPLContainerRelationNotDeletedByAssetDate:{container}"
+                )),
+                query_filter: Some(Arc::new(json!([{
+                    "fieldName": "parentId",
+                    "comparator": "EQUALS",
+                    "fieldValue": {"type": "STRING", "value": container},
+                }]))),
+                page_size: 100,
+                zone_id: Arc::new(json!({"zoneName": zone, "ownerRecordName": "_defaultOwner"})),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: Some(Arc::from(container)),
+                cross_zone_sources: Vec::new(),
+            },
+            session,
+        ),
     )
 }
 
@@ -520,7 +602,6 @@ struct InventoryStep {
     full: bool,
     drift: bool,
     stale: bool,
-    retry: bool,
     mode: download::DownloadRunMode,
     fault: Option<InventoryFault>,
     download_url: Option<String>,
@@ -538,7 +619,6 @@ impl InventoryStep {
             full: true,
             drift: false,
             stale: false,
-            retry: false,
             mode: download::DownloadRunMode::Download,
             fault: None,
             download_url: None,
@@ -570,9 +650,7 @@ fn inventory_root() -> tempfile::TempDir {
 }
 
 async fn inventory_anchors(root: &std::path::Path) -> Vec<(String, String)> {
-    let db = state::SqliteStateDb::open(&root.join("state.db"))
-        .await
-        .unwrap();
+    let db = mixed_db(&root.join("state.db")).await;
     let conn = db.acquire_lock("inventory evidence after reopen").unwrap();
     let mut query = conn
         .prepare(
@@ -593,25 +671,30 @@ fn anchor_total(rows: &[(String, String)]) -> u64 {
     anchor["api_total_at_start"].as_u64().unwrap()
 }
 
+fn assert_renewed_inventory_anchor(before: &[(String, String)], after: &[(String, String)]) {
+    assert_eq!(before.len(), after.len());
+    for ((old_key, old_value), (new_key, new_value)) in before.iter().zip(after) {
+        assert_eq!(old_key, new_key, "same complete selected scope");
+        let mut old: Value = serde_json::from_str(old_value).unwrap();
+        let mut new: Value = serde_json::from_str(new_value).unwrap();
+        assert!(new["completed_at"].as_i64().unwrap() >= old["completed_at"].as_i64().unwrap());
+        old.as_object_mut().unwrap().remove("completed_at");
+        new.as_object_mut().unwrap().remove("completed_at");
+        assert_eq!(old, new, "renewal must preserve coverage and measurement");
+    }
+}
+
 async fn inventory_cycle(
     root: &std::path::Path,
     step: &InventoryStep,
 ) -> crate::sync_cycle::CycleResult {
     use crate::cycle_reporter::{CycleFacts, CycleReporter, CycleReporterConfig};
-    use crate::sync_loop::test_support::{
-        FailingMetadataSetDb, MetadataSetFailure,
-        make_run_cycle_download_config_builder_with_options,
-    };
+    use crate::sync_loop::test_support::make_run_cycle_download_config_builder_with_options;
 
-    let db = Arc::new(
-        state::SqliteStateDb::open(&root.join("state.db"))
-            .await
-            .unwrap(),
-    );
+    let db = mixed_db(&root.join("state.db")).await;
     let mut config = make_run_cycle_config();
-    config.runtime.dry_run = step.mode == download::DownloadRunMode::DryRun;
+    config.runtime.dry_run = !step.mode.downloads_files();
     config.runtime.refresh_metadata = step.full;
-    config.filters.recent = step.options.recent;
     config.filters.skip_created_before = step.options.skip_created_before;
     config.filters.skip_created_after = step.options.skip_created_after;
     if step.drift {
@@ -632,22 +715,45 @@ async fn inventory_cycle(
             .unwrap();
         }
     }
-    let store: Arc<dyn download::DownloadStore> = match step.fault {
-        Some(InventoryFault::AnchorRead) => Arc::new(
-            FailingMetadataSetDb::without_set_failure(db.clone(), "inventory read fault")
-                .with_get_failure(MetadataSetFailure::Prefix("inventory_anchor_v1:")),
-        ),
-        Some(InventoryFault::AnchorWrite) => Arc::new(FailingMetadataSetDb::new(
-            db.clone(),
-            MetadataSetFailure::Prefix("inventory_anchor_v1:"),
-            "inventory write fault",
-        )),
-        Some(InventoryFault::StateWrite) => Arc::new(
-            FailingMetadataSetDb::without_set_failure(db.clone(), "inventory state write fault")
-                .with_upsert_seen_failure(),
-        ),
-        _ => db.clone(),
+    let anchor_before = if step.fault == Some(InventoryFault::AnchorRead) {
+        let rows = inventory_anchors(root).await;
+        assert!(!rows.is_empty(), "read fault requires retained evidence");
+        db.acquire_lock("inject native anchor read fault").unwrap().execute_batch(
+            "UPDATE metadata SET value=CAST(value AS BLOB) WHERE key GLOB 'inventory_anchor_v1:*';",
+        ).unwrap();
+        for (key, _) in &rows {
+            assert!(
+                db.get_metadata(key).await.is_err(),
+                "native TEXT decoding must fail"
+            );
+        }
+        Some(rows)
+    } else {
+        None
     };
+    match step.fault {
+        Some(InventoryFault::AnchorWrite) => {
+            db.acquire_lock("inject native anchor write fault")
+                .unwrap()
+                .execute_batch(
+                    "CREATE TEMP TRIGGER inventory_anchor_fault BEFORE INSERT ON metadata
+                 WHEN NEW.key GLOB 'inventory_anchor_v1:*'
+                 BEGIN SELECT RAISE(ABORT, 'inventory write fault'); END;",
+                )
+                .unwrap();
+        }
+        Some(InventoryFault::StateWrite) => {
+            db.acquire_lock("inject native pending state fault")
+                .unwrap()
+                .execute_batch(
+                    "CREATE TEMP TRIGGER inventory_state_fault BEFORE INSERT ON assets
+                 BEGIN SELECT RAISE(ABORT, 'inventory state write fault'); END;",
+                )
+                .unwrap();
+        }
+        _ => {}
+    }
+    let store: Arc<dyn download::DownloadStore> = db.clone();
     let cancel = CancellationToken::new();
     let changes = Arc::new(AtomicUsize::new(0));
     let passes = step
@@ -670,11 +776,11 @@ async fn inventory_cycle(
                 cancel: cancel.clone(),
             };
             let album = if kind == PassKind::SmartFolder {
-                smart_album(step.zone, name, Box::new(session))
+                smart_album(&db, step.zone, name, Box::new(session))
             } else if kind == PassKind::Album {
-                inventory_named_album(step.zone, name, Box::new(session))
+                inventory_named_album(&db, step.zone, name, Box::new(session))
             } else {
-                make_named_full_album_with_boxed_session(step.zone, name, Box::new(session))
+                unfiled_album(&db, step.zone, Box::new(session))
             };
             AlbumPass {
                 kind,
@@ -697,7 +803,6 @@ async fn inventory_cycle(
     let builder = |mode, excludes, groupings, zone| {
         let mut config = build(mode, excludes, groupings, zone);
         let selected = Arc::make_mut(&mut config);
-        selected.retry_only = step.retry;
         selected.refresh_metadata = step.full;
         config
     };
@@ -706,7 +811,6 @@ async fn inventory_cycle(
         &[&library],
         &config,
         Some(store.as_ref()),
-        step.retry,
         &builder,
         download::DownloadControls::new(step.mode, download::DownloadReporting::hidden()),
         &shared,
@@ -714,9 +818,24 @@ async fn inventory_cycle(
     ))
     .await
     .unwrap();
-    crate::sync_loop::reporting::record_cycle_run(Some(db.as_ref()), &result, chrono::Utc::now())
+    if let Some(before) = anchor_before {
+        // Restore only SQLite's storage type. The original JSON bytes must have
+        // survived the failed read and the complete production cycle unchanged.
+        db.acquire_lock("remove native anchor read fault").unwrap().execute_batch(
+            "UPDATE metadata SET value=CAST(value AS TEXT) WHERE key GLOB 'inventory_anchor_v1:*';",
+        ).unwrap();
+        assert_eq!(inventory_anchors(root).await, before);
+    }
+    if step.mode.downloads_files() {
+        crate::sync_loop::reporting::record_cycle_run(
+            Some(db.as_ref()),
+            &result,
+            chrono::Utc::now(),
+        )
         .await;
+    }
     let report_path = root.join("inventory-report.json");
+    let prior_report = std::fs::read(&report_path).ok();
     let notifier = crate::notifications::Notifier::new(None);
     let reporter = CycleReporter::new(CycleReporterConfig {
         watch_mode: false,
@@ -739,6 +858,10 @@ async fn inventory_cycle(
             ),
         )
         .await;
+    if !step.mode.downloads_files() {
+        assert_eq!(std::fs::read(&report_path).ok(), prior_report);
+        return result;
+    }
     let report: Value = serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
     let projected = serde_json::to_value(&result.stats).unwrap();
     for field in [
@@ -763,9 +886,7 @@ async fn inventory_cycle(
 }
 
 async fn assert_inventory_ledger(root: &std::path::Path, result: &crate::sync_cycle::CycleResult) {
-    let db = state::SqliteStateDb::open(&root.join("state.db"))
-        .await
-        .unwrap();
+    let db = mixed_db(&root.join("state.db")).await;
     let summary = db.get_summary().await.unwrap();
     assert_eq!(
         summary.last_api_total_at_start,
@@ -795,7 +916,7 @@ async fn assert_inventory_ledger(root: &std::path::Path, result: &crate::sync_cy
 
 #[tokio::test]
 #[tracing_test::traced_test]
-async fn comparable_inventory_full_then_mixed_refresh_does_not_replace_anchor() {
+async fn comparable_inventory_full_then_mixed_refresh_renews_complete_anchor() {
     let root = inventory_root();
     let mut step = InventoryStep::mixed(90, 10);
     let first = inventory_cycle(root.path(), &step).await;
@@ -809,11 +930,12 @@ async fn comparable_inventory_full_then_mixed_refresh_does_not_replace_anchor() 
     let delta = inventory_cycle(root.path(), &step).await;
     assert_eq!(delta.failed_count, 0);
     assert!(delta.db_sync_token_advance_safe);
-    assert_eq!(delta.stats.api_total_at_start, Some(10));
+    assert_eq!(delta.stats.api_total_at_start, Some(100));
+    assert_eq!(delta.stats.assets_seen, 100);
     assert!(delta.stats.api_total_at_start_partial);
     assert_eq!(delta.stats.inventory_drop_warnings, 0);
     assert_inventory_ledger(root.path(), &delta).await;
-    assert_eq!(inventory_anchors(root.path()).await, before);
+    assert_renewed_inventory_anchor(&before, &inventory_anchors(root.path()).await);
     step.full = true;
     step.passes.reverse();
     let full = inventory_cycle(root.path(), &step).await;
@@ -833,18 +955,16 @@ async fn comparable_inventory_bridge_keeps_initial_count_and_additive_activity()
     let result = inventory_cycle(root.path(), &step).await;
     assert_eq!(result.failed_count, 0);
     assert!(result.db_sync_token_advance_safe);
-    assert_eq!(result.stats.api_total_at_start, Some(110));
+    assert_eq!(result.stats.api_total_at_start, Some(200));
     assert!(result.stats.api_total_at_start_partial);
-    assert_eq!(result.stats.assets_seen, 110);
+    assert_eq!(result.stats.assets_seen, 200);
     assert_eq!(result.stats.inventory_drop_warnings, 0);
     let rows = inventory_anchors(root.path()).await;
     assert_eq!(anchor_total(&rows), 100);
     let anchor: Value = serde_json::from_str(&rows[0].1).unwrap();
     assert_eq!(anchor["assets_seen"], 100);
     assert_inventory_ledger(root.path(), &result).await;
-    let db = state::SqliteStateDb::open(&root.path().join("state.db"))
-        .await
-        .unwrap();
+    let db = mixed_db(&root.path().join("state.db")).await;
     assert_eq!(
         db.get_metadata("sync_token:PrimarySync")
             .await
@@ -864,7 +984,8 @@ async fn comparable_inventory_bridge_keeps_initial_count_and_additive_activity()
     step.full = false;
     let mixed = inventory_cycle(root.path(), &step).await;
     assert_eq!(mixed.stats.inventory_drop_warnings, 0);
-    assert_eq!(inventory_anchors(root.path()).await, rows);
+    assert_eq!(mixed.stats.api_total_at_start, Some(100));
+    assert_renewed_inventory_anchor(&rows, &inventory_anchors(root.path()).await);
     step.full = true;
     let full = inventory_cycle(root.path(), &step).await;
     assert_eq!(full.stats.inventory_drop_warnings, 0);
@@ -964,9 +1085,10 @@ async fn comparable_inventory_four_percent_decline_does_not_warn() {
 #[tokio::test]
 async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
     use crate::config::CreatedDateFilter;
-    for case in 0..13 {
+    // Count-only and retry-only vetoes were retired; date vetoes still run.
+    for case in [0, 1, 2, 3, 4, 6, 7, 8, 9, 11, 12] {
         let root = inventory_root();
-        inventory_cycle(root.path(), &InventoryStep::mixed(90, 10)).await;
+        let baseline = inventory_cycle(root.path(), &InventoryStep::mixed(90, 10)).await;
         let before = inventory_anchors(root.path()).await;
         let mut step = InventoryStep::mixed(9, 1);
         match case {
@@ -975,7 +1097,6 @@ async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
             2 => step.fault = Some(InventoryFault::MalformedAsset),
             3 => step.fault = Some(InventoryFault::Cancellation),
             4 => step.stale = true,
-            5 => step.options.recent = Some(1),
             6 => {
                 step.options.skip_created_before = Some(CreatedDateFilter::CaptureDate(
                     chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
@@ -988,7 +1109,6 @@ async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
             }
             8 => step.mode = download::DownloadRunMode::DryRun,
             9 => step.mode = download::DownloadRunMode::PrintFilenames,
-            10 => step.retry = true,
             11 => {
                 step.drift = true;
                 step.fault = Some(InventoryFault::BridgeQuery);
@@ -1005,7 +1125,15 @@ async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
             "case {case}: {result:?}"
         );
         assert_eq!(inventory_anchors(root.path()).await, before, "case {case}");
-        assert_inventory_ledger(root.path(), &result).await;
+        assert_inventory_ledger(
+            root.path(),
+            if step.mode.downloads_files() {
+                &result
+            } else {
+                &baseline
+            },
+        )
+        .await;
         let recovered = inventory_cycle(root.path(), &InventoryStep::mixed(90, 10)).await;
         assert_eq!(recovered.failed_count, 0, "case {case}: {recovered:?}");
         assert_eq!(recovered.stats.inventory_drop_warnings, 0, "case {case}");
@@ -1032,13 +1160,6 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(body))
         .mount(&server)
         .await;
-    let mut paths = Vec::with_capacity(100);
-    for (prefix, count) in [("unfiled", 90), ("Hidden", 10)] {
-        for index in 0..count {
-            let path = media.join(format!("{prefix}-{index:04}.JPG"));
-            paths.push(path);
-        }
-    }
     let mut step = InventoryStep::mixed(90, 10);
     step.options.media = Default::default();
     step.download_url = Some(format!("{}/inventory-fixture.jpg", server.uri()));
@@ -1047,6 +1168,22 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
     assert_eq!(first.stats.state_write_failures, 0);
     assert_eq!(first.stats.assets_seen, 100);
     assert_eq!(first.stats.downloaded, 100);
+    let paths = {
+        let db = mixed_db(&root.path().join("state.db")).await;
+        let rows = db.get_downloaded_page(0, 101).await.unwrap();
+        assert_eq!(rows.len(), 100);
+        let mut paths = Vec::with_capacity(100);
+        for (name, count) in [("", 90), ("Hidden", 10)] {
+            for index in 0..count {
+                let id = format!("asset-{name}-master-{index:04}");
+                let row = rows.iter().find(|row| row.id.as_ref() == id).unwrap();
+                let path = row.local_path.clone().unwrap();
+                assert!(path.starts_with(&media));
+                paths.push(path);
+            }
+        }
+        paths
+    };
     for path in &paths {
         assert_eq!(std::fs::read(path).unwrap(), body);
     }
@@ -1058,11 +1195,12 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
     step.full = false;
     let delta = inventory_cycle(root.path(), &step).await;
     assert!(delta.db_sync_token_advance_safe);
-    assert_eq!(inventory_anchors(root.path()).await, before);
+    assert_eq!(delta.stats.downloaded, 0);
+    let renewed = inventory_anchors(root.path()).await;
+    assert_renewed_inventory_anchor(&before, &renewed);
+    let before = renewed;
     {
-        let db = state::SqliteStateDb::open(&root.path().join("state.db"))
-            .await
-            .unwrap();
+        let db = mixed_db(&root.path().join("state.db")).await;
         assert_eq!(
             db.get_metadata("sync_token:PrimarySync")
                 .await
@@ -1084,7 +1222,9 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
     assert_eq!(failed.stats.enumeration_errors, 0);
     assert!(!failed.stats.enumeration_incomplete);
     assert!(!failed.stats.interrupted);
-    assert_eq!(failed.stats.state_write_failures, 1);
+    // Native admission persists every current decision, including healthy
+    // peers. The transaction fault rejects each of the 95 selected assets.
+    assert_eq!(failed.stats.state_write_failures, 95);
     assert!(!failed.db_sync_token_advance_safe);
     assert_eq!(failed.stats.downloaded, 0);
     assert_eq!(failed.stats.bytes_downloaded, 0);
@@ -1092,9 +1232,7 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
     assert_eq!(inventory_anchors(root.path()).await, before);
     assert_inventory_ledger(root.path(), &failed).await;
     {
-        let db = state::SqliteStateDb::open(&root.path().join("state.db"))
-            .await
-            .unwrap();
+        let db = mixed_db(&root.path().join("state.db")).await;
         assert_eq!(
             db.get_metadata("sync_token:PrimarySync")
                 .await
@@ -1125,9 +1263,7 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
     assert_eq!(anchor_total(&inventory_anchors(root.path()).await), 95);
     assert_inventory_ledger(root.path(), &recovered).await;
     {
-        let db = state::SqliteStateDb::open(&root.path().join("state.db"))
-            .await
-            .unwrap();
+        let db = mixed_db(&root.path().join("state.db")).await;
         assert_eq!(
             db.get_metadata("sync_token:PrimarySync")
                 .await
@@ -1159,9 +1295,7 @@ async fn comparable_inventory_legacy_and_unverifiable_anchors_are_never_certifie
     let legacy_key = format!("inventory_anchor:{hash}:PrimarySync");
     let legacy =
         json!({"api_total_at_start": 110, "assets_seen": 110, "completed_at": 1}).to_string();
-    let db = state::SqliteStateDb::open(&root.path().join("state.db"))
-        .await
-        .unwrap();
+    let db = mixed_db(&root.path().join("state.db")).await;
     db.set_metadata(&legacy_key, &legacy).await.unwrap();
     drop(db);
     let step = InventoryStep::hidden(100);
@@ -1178,7 +1312,7 @@ async fn comparable_inventory_legacy_and_unverifiable_anchors_are_never_certifie
         legacy.clone(),
         json!({"version": 1, "scope": "different coverage", "api_total_at_start": 110, "assets_seen": 110, "completed_at": 1}).to_string(),
     ] {
-        let db = state::SqliteStateDb::open(&root.path().join("state.db")).await.unwrap();
+        let db = mixed_db(&root.path().join("state.db")).await;
         db.set_metadata(&rows[0].0, &invalid).await.unwrap();
         drop(db);
         let result = inventory_cycle(root.path(), &step).await;
@@ -1186,9 +1320,7 @@ async fn comparable_inventory_legacy_and_unverifiable_anchors_are_never_certifie
         assert_eq!(anchor_total(&inventory_anchors(root.path()).await), 100);
         assert_inventory_ledger(root.path(), &result).await;
     }
-    let db = state::SqliteStateDb::open(&root.path().join("state.db"))
-        .await
-        .unwrap();
+    let db = mixed_db(&root.path().join("state.db")).await;
     assert_eq!(
         db.get_metadata(&legacy_key).await.unwrap().as_deref(),
         Some(legacy.as_str())
@@ -1248,7 +1380,7 @@ async fn comparable_inventory_zones_are_independent_and_empty_count_is_available
 }
 
 #[tokio::test]
-async fn comparable_inventory_targeted_album_subset_cannot_seed_complete_scope() {
+async fn comparable_inventory_expanded_scope_requires_complete_current_selection() {
     let root = inventory_root();
     let mut step = InventoryStep::mixed(0, 0);
     step.passes = vec![(PassKind::Album, "A", 90), (PassKind::Unfiled, "", 10)];
@@ -1258,20 +1390,53 @@ async fn comparable_inventory_targeted_album_subset_cannot_seed_complete_scope()
     assert_eq!(anchor_total(&before), 100);
     step.full = false;
     step.passes.insert(1, (PassKind::Album, "B", 5));
-    let subset = inventory_cycle(root.path(), &step).await;
-    assert_eq!(subset.failed_count, 0);
-    assert!(subset.db_sync_token_advance_safe);
-    assert_eq!(subset.stats.api_total_at_start, Some(5));
-    assert_eq!(
-        subset.stats.full_enumeration_reason,
-        Some(download::FullEnumerationReason::AlbumRelationHydrationIncomplete)
-    );
-    assert_eq!(subset.stats.inventory_drop_warnings, 0);
+    // A new pass invalidates retained coverage. A failed current query must
+    // not certify that expanded scope from the historical album catalog.
+    step.fault = Some(InventoryFault::FailedQuery);
+    let incomplete = inventory_cycle(root.path(), &step).await;
+    assert!(incomplete.stats.enumeration_errors > 0, "{incomplete:?}");
+    assert!(!incomplete.can_advance_database_checkpoint());
+    assert_eq!(incomplete.stats.inventory_drop_warnings, 0);
     assert_eq!(inventory_anchors(root.path()).await, before);
-    assert_inventory_ledger(root.path(), &subset).await;
-    // Once every selected pass is really queried, the new scope can seed itself.
-    step.full = true;
+    assert_inventory_ledger(root.path(), &incomplete).await;
+    {
+        let db = mixed_db(&root.path().join("state.db")).await;
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("inventory-query-eof")
+        );
+    }
+    // The first valid delta plus current inventory queries every selected pass,
+    // and may establish the new scope without an explicit full-refresh option.
+    step.fault = None;
     let complete = inventory_cycle(root.path(), &step).await;
+    assert_eq!(complete.failed_count, 0);
+    assert!(complete.can_advance_database_checkpoint());
+    assert_eq!(complete.stats.api_total_at_start, Some(105));
+    assert_eq!(complete.stats.assets_seen, 105);
     assert_eq!(complete.stats.inventory_drop_warnings, 0);
-    assert_eq!(inventory_anchors(root.path()).await.len(), 2);
+    let expanded = inventory_anchors(root.path()).await;
+    assert_eq!(expanded.len(), 2);
+    assert!(
+        expanded.contains(&before[0]),
+        "old scope evidence remains intact"
+    );
+    let new = expanded
+        .iter()
+        .find(|(key, _)| key != &before[0].0)
+        .unwrap();
+    let evidence: Value = serde_json::from_str(&new.1).unwrap();
+    assert_eq!(evidence["api_total_at_start"], 105);
+    assert_eq!(evidence["assets_seen"], 105);
+    assert_inventory_ledger(root.path(), &complete).await;
+    let quiet = inventory_cycle(root.path(), &step).await;
+    assert_eq!(quiet.failed_count, 0);
+    assert!(quiet.can_advance_database_checkpoint());
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(quiet.stats.inventory_drop_warnings, 0);
+    // The sealed non-smart scope can replay without requerying its inventory.
+    assert_eq!(inventory_anchors(root.path()).await, expanded);
 }

@@ -653,7 +653,7 @@ async fn refresh_authentication_and_shutdown_remain_authoritative() {
 
 #[tokio::test]
 async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
-    use super::{RetryTaskKey, UrlRetrySource, build_incremental_expired_url_retry_tasks};
+    use super::{RetryTaskKey, UrlRetrySource, refresh_failed_download_urls};
     use wiremock::matchers::method;
     use wiremock::{Mock, ResponseTemplate};
     let server = crate::start_wiremock_or_skip!();
@@ -685,6 +685,7 @@ async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
     )
     .await
     .unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
     let passes = vec![AlbumPass {
         kind: PassKind::Unfiled,
         album: album_with_session(
@@ -693,7 +694,7 @@ async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
             Box::new(BoundedSession {
                 delta: Arc::new(Vec::new()),
                 fresh: Arc::new(records),
-                requests: Arc::new(Mutex::new(Vec::new())),
+                requests: Arc::clone(&requests),
             }),
         ),
         exclude_ids: Arc::new(FxHashSet::default()),
@@ -708,11 +709,29 @@ async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
             pass_index: 0,
         },
     );
-    let plan = build_incremental_expired_url_retry_tasks(
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    for evidence in [None, Some(&sources)] {
+        let held = refresh_failed_download_urls(
+            &passes,
+            std::slice::from_ref(&task),
+            &cancelled,
+            evidence,
+        )
+        .await;
+        assert!(held.tasks.is_empty());
+        assert_eq!(held.unrefreshed.len(), 1);
+        assert_eq!(
+            RetryTaskKey::from(&held.unrefreshed[0]),
+            RetryTaskKey::from(&task)
+        );
+        assert!(requests.lock().unwrap().is_empty());
+    }
+    let plan = refresh_failed_download_urls(
         &passes,
-        &sources,
         &[task.clone()],
-        CancellationToken::new(),
+        &CancellationToken::new(),
+        Some(&sources),
     )
     .await;
     assert_eq!(plan.tasks.len(), 1);
@@ -734,10 +753,10 @@ async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
         base_delay_secs: 0,
         max_delay_secs: 0,
     };
-    let result = run_download_pass(
-        PassConfig {
+    let result = plan
+        .execute(PassConfig {
             prior_auth_errors: 0,
-            url_obtained_at: plan.url_obtained_at,
+            url_obtained_at: Default::default(),
             client: &client,
             retry_config: &retry,
             metadata: MetadataFlags::default(),
@@ -747,15 +766,17 @@ async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
             temp_suffix: ".part".into(),
             shutdown_token: CancellationToken::new(),
             state_db: Some(db.clone()),
-            rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(7)),
             bandwidth_limiter: None,
             library: "PrimarySync".into(),
-        },
-        plan.tasks,
-    )
-    .await;
+        })
+        .await;
     assert_eq!(result.downloaded, 0);
     assert_eq!(result.failed.len(), 1);
+    assert_eq!(
+        result.rate_limit_observations, 0,
+        "prior pass observations must not be counted again"
+    );
     assert_eq!(std::fs::read(&path).unwrap(), b"external file edit");
     drop(db);
     let reopened = SqliteStateDb::open(&db_path).await.unwrap();
@@ -1017,7 +1038,7 @@ async fn incremental_refresh_preserves_frozen_raw_jpeg_provider_renditions() {
                 for row in rows {
                     let bytes = std::fs::read(row.local_path.unwrap()).unwrap();
                     match row.version_size {
-                        VersionSizeKey::Original => {
+                        VersionSizeKey::Alternative => {
                             assert_eq!(
                                 &*row.checksum,
                                 "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
@@ -1025,7 +1046,7 @@ async fn incremental_refresh_preserves_frozen_raw_jpeg_provider_renditions() {
                             assert_eq!(bytes, alternative_bytes);
                         }
                         _ => {
-                            assert_eq!(row.version_size, VersionSizeKey::Alternative);
+                            assert_eq!(row.version_size, VersionSizeKey::Original);
                             assert_eq!(
                                 &*row.checksum,
                                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="

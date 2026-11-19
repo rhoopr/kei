@@ -12,13 +12,15 @@ contract catalog defines required conditions, and source code wins over both.
 
 ## Navigation
 
+For an existing installation moving to schema 44, start with the [v0.30 upgrade checklist](v0.30-upgrade.md). For a checkpoint investigation, distinguish three kinds of evidence: the saved cursor says where to resume a zone, the retained inbox holds provider records still needed for replay, and destination receipts record local work. A successful empty poll can leave the cursor unchanged and leave no inbox row. Check the accepted successor and outstanding work before treating a missing row as a lost checkpoint.
+
 This index lists the highest-traffic sections, not every heading. Link labels
 match their headings, so searching a label finds the section.
 
 - [Owners](#owners): find the decision owner and its boundary.
 - [Design rules](#design-rules) and [Wrong-layer traps](#wrong-layer-traps): check layer placement before editing.
 - [Command dispatch](#command-dispatch) and [Container startup](#container-startup): find entry points.
-- [Sync and provider checkpoints](#sync-and-provider-checkpoints) and [Full and incremental enumeration](#full-and-incremental-enumeration): trace source progress.
+- [Sync and provider checkpoints](#sync-and-provider-checkpoints), [Full and incremental enumeration](#full-and-incremental-enumeration), and [Guarded current inventory](#guarded-current-inventory-after-count-retirement): trace source progress.
 - [Download and publication](#download-and-publication), [Durable pending retry](#durable-pending-retry), and [Import-existing](#import-existing): trace local work.
 - [Account ownership and legacy adoption](#account-ownership-and-legacy-adoption), [Transactional source catalog and replay](#transactional-source-catalog-and-replay), and [Current provider work admission](#current-provider-work-admission): trace durable source ownership.
 - [Selection generation shadow](#selection-generation-shadow), [Private selection and destination replay](#private-selection-and-destination-replay), and [Observed incremental shadow capture](#observed-incremental-shadow-capture): trace selection and destination projections.
@@ -33,6 +35,7 @@ match their headings, so searching a label finds the section.
 - User media and metadata must not be lost, corrupted, truncated, overwritten,
   or silently discarded.
 - Local file and metadata rewrites are opt-in.
+- An enabled metadata setting authorizes later updates to its managed fields. Setup writes enabled standard fields and disabled album/people enrichment explicitly. Version-1 omissions and no-config runs keep metadata writers disabled; capture-timestamp replacement requires its separate repair option.
 - Provider-specific parsing and identity rules stay in the iCloud adapter.
 - Sync policy stays in the sync and download orchestration layers.
 - Path rendering does not decide whether an asset should sync.
@@ -73,10 +76,10 @@ match their headings, so searching a label finds the section.
 | Sync session recovery | `src/sync_loop/session.rs` | Coordinates authentication, 2FA recovery, library initialization, and idle session-lock handoffs through the shared auth and command owners. |
 | Database change pre-check | `src/sync_loop/precheck.rs` | Owns scoped database tokens, selected-zone checks, and inclusion of pending local work. It does not replace the per-zone checkpoint gate. |
 | Sync plan refresh | `src/sync_loop/planning.rs` | Resolves and refreshes library pass plans through the command owner; reports shared-library notices and path warnings. |
-| Local drift checks | `src/sync_loop/reconcile.rs` | Runs bounded local drift recovery and periodic read-only catalog diagnostics. |
+| Local drift checks | `src/sync_loop/reconcile.rs` | Runs bounded missing-file recovery and optional periodic read-only catalog diagnostics. Present shorter files remain unchanged until explicit integrity reconciliation. |
 | Watch policy | `src/sync_loop/watch.rs` | Owns watch cadence, metadata follow-up timing, and one-shot recovery rules. |
 | Cycle ledger reporting | `src/sync_loop/reporting.rs` | Records cycle-run summaries and combines refresh-tail outcomes for reporting. |
-| One sync cycle | `src/sync_cycle.rs` | Chooses source enumeration, reconciles config drift, dispatches each library, and advances or preserves provider checkpoints. |
+| One sync cycle | `src/sync_cycle.rs` | Chooses source enumeration, reconciles config drift, dispatches each library, advances or preserves provider checkpoints, and fences retirement of current inventory requests. |
 | Library and pass planning | `src/commands/service.rs` | Resolves libraries, collection scope, album plans, smart folders, unfiled passes, and cross-zone hydration. |
 | iCloud Photos adapter | `src/icloud/photos/` | Owns CloudKit records, queries, change streams, provider identity, albums, smart folders, and metadata decoding. |
 | Album facade and counts | `src/icloud/photos/album.rs`, `src/icloud/photos/album/counts.rs` | Preserves album configuration and entry points; counts owns count queries and same-library batching. |
@@ -85,18 +88,19 @@ match their headings, so searching a label finds the section.
 | Provider page fetching | `src/icloud/photos/album/fetch.rs` | Owns query construction, empty-page probes, record pairing, deduplication, and asset emission. |
 | Enumeration completion | `src/icloud/photos/album/completion.rs` | Collects fetcher completion evidence and requires unanimous tokens before returning a checkpoint candidate. |
 | Album hydration | `src/icloud/photos/album/hydration.rs` | Matches named-album members across source zones and hydrates durable asset or master identities. |
-| Provider change streams | `src/icloud/photos/album/changes.rs` | Owns sequential change scans, delta buffering, and last-good-token delivery. |
-| Download facade and dispatch | `src/download/mod.rs`, `src/download/orchestration/dispatch.rs` | Preserves download entry points and composes full, incremental, targeted-backfill, and durable-retry work. |
+| Provider change streams | `src/icloud/photos/album/changes.rs` | Owns sequential change scans, delta buffering, terminal raw-record presence/completion evidence, and last-good-token delivery. |
+| Download facade and dispatch | `src/download/mod.rs`, `src/download/orchestration/dispatch.rs` | Preserves download entry points and composes full, incremental, targeted-backfill, durable-retry, and guarded inventory work. |
 | Download models and configuration | `src/download/orchestration/models.rs`, `src/download/orchestration/config.rs` | Owns controls, results, per-zone checkpoint evidence, reporting projections, checkpoint reasons, coverage fingerprints, and configuration hashes. |
 | Download context and selection | `src/download/orchestration/context.rs`, `src/download/orchestration/selection.rs` | Loads library-scoped state and identity evidence, derives pass configurations, and checks incremental routing eligibility. |
 | Full enumeration | `src/download/orchestration/full.rs` | Owns bounded enumeration, album snapshots, pass counts, and token evidence. |
 | Incremental enumeration | `src/download/orchestration/incremental.rs`, `src/download/orchestration/delta.rs` | Runs separate streaming and collecting strategies with one shared delta-state owner for provider-event bookkeeping and routing facts. |
 | Download recovery | `src/download/orchestration/recovery.rs`, `src/download/orchestration/url_refresh.rs` | Runs durable pending recovery and refreshes exact download tasks with current provider URLs. |
+| Legacy preservation preparation | `src/download/legacy_preservation.rs` | Validates unprepared historical families and files before storing protection evidence. It no longer certifies prepared history or supplies checkpoint permission. |
 | Local catalog maintenance | `src/download/orchestration/reconciliation.rs`, `src/download/orchestration/cleanup.rs`, `src/download/orchestration/maintenance.rs` | Reconciles catalog paths, removes durably owned stale temporary files, and repairs metadata-capture revisions. |
 | Asset planning | `src/download/planner.rs` | Applies filters, derives tasks, records dispatched pending work, and persists membership and identity mappings. |
 | Filter facade and configuration | `src/download/filter.rs`, `src/download/filter/config.rs` | Preserves filter entry points and shares path and filter settings between sync and import. |
-| Asset eligibility | `src/download/filter/eligibility.rs` | Owns content, date, and filename filters and media classification, without path or filesystem decisions. |
-| Rendition selection | `src/download/filter/versions.rs` | Owns RAW alignment, primary and companion selection, and selected-rendition metadata keys. |
+| Asset eligibility | `src/download/filter/eligibility.rs` | Owns content and date filters and media classification, without path or filesystem decisions. |
+| Rendition selection | `src/download/filter/versions.rs` | Owns full-resolution original, current-edit and alternative selection for included components, provider rendition keys, and checksum-based historical resource recovery. |
 | Task metadata | `src/download/filter/metadata.rs` | Builds metadata payloads with preloaded album and people groupings. |
 | Expected asset paths | `src/download/filter/expected_paths.rs` | Derives paths shared by sync and import before collision resolution; uses the rendition-selection owner. |
 | Collision planning | `src/download/filter/collisions.rs` | Owns normalized path claims and existing-file collision resolution. |
@@ -135,6 +139,8 @@ match their headings, so searching a label finds the section.
 | HEIF preservation checks | `src/download/heif/stream.rs`, `src/download/heif/preservation.rs` | Streams production checks of non-XMP payloads and opaque metadata; the in-memory validator remains a test and fuzz oracle. |
 | Metadata rewrite facade and immediate execution | `src/download/metadata_rewrite.rs`, `src/download/metadata_rewrite/immediate.rs` | Preserves rewrite entry points and coordinates download-time metadata writes. The pipeline retains media publication and state finalization. |
 | Metadata write planning | `src/download/metadata_rewrite/planning.rs` | Owns opt-in flags and embedded field decisions shared by immediate and queued execution. |
+| Original orientation | `src/icloud/photos/metadata.rs`, `src/download/metadata_rewrite/embedded.rs` | The provider adapter binds master orientation to the original JPEG/TIFF resource. The writer requires unchanged verified-download bytes and a proven orientation omission. The independent orientation flag and policy revision participate in frozen recipes. |
+| Metadata enrichment policy | `src/download/filter/metadata.rs` | Adds album names and people only under their independent metadata options, including queued rewrites. Standard XMP excludes provider-internal fields. Policy revision and enrichment bits participate in selection and destination fingerprints. |
 | Metadata write execution | `src/download/metadata_rewrite/embedded.rs`, `src/download/metadata_rewrite/sidecar.rs` | Coordinates fingerprint-guarded embedded writes and source-aware sidecar writes through the metadata owners. |
 | Queued metadata retries | `src/download/metadata_rewrite/queued.rs` | Tags durable rewrite work, executes bounded retry pages, and retires completed markers. |
 | Rewrite evidence and groupings | `src/download/metadata_rewrite/capture.rs`, `src/download/metadata_rewrite/grouping.rs` | Verifies capture-repair fingerprints and timestamps; loads current library-scoped groupings for queued work. |
@@ -143,8 +149,8 @@ match their headings, so searching a label finds the section.
 | SQLite facade and connection lifecycle | `src/state/mod.rs`, `src/state/db.rs` | Preserves state entry points, opens connections, and dispatches blocking SQLite work. Child owners retain their transaction boundaries. |
 | Observed provider pages | `src/icloud/photos/inbox.rs`, `src/state/db/provider_inbox.rs` | Binds validated incremental observations to the account, retains source identities and original bytes atomically with a shadow receipt, and applies bounded backpressure. It does not authorize provider checkpoints. |
 | Provider source catalog | `src/icloud/photos/projection.rs`, `src/state/db/provider_catalog.rs` | Validates replay provenance, derives versioned source facts, and atomically indexes records, references and unresolved evidence. Its receipt does not authorize queues or checkpoints. |
-| Selection shadow manifests | `src/state/db/provider_selection.rs`, `src/download/orchestration/queue_projection.rs` | Retains account-bound current planning evidence and per-pass destinations, then validates lossless replay. This shadow receipt has no selection, publication or checkpoint authority. |
-| Provider work admission | `src/icloud/photos/album/work.rs`, `src/download/orchestration/queue_projection.rs`, `src/state/db/provider_work.rs` | Confirms retained identities against current provider records, applies current task planning, and atomically admits guarded existing queue obligations and retained conflict debt. Checkpoint authority stays with the existing cycle. |
+| Shared selection decisions | `src/state/db/provider_selection.rs` | Defines decisions and lossless native destinations used by active generations and publication. Historical shadow tables have no runtime writer or replay path. |
+| Provider work admission | `src/icloud/photos/album/work.rs`, `src/download/orchestration/generation.rs`, `src/state/db/provider_generations.rs` | Confirms current provider identities and admits per-destination obligations. `provider_work.rs` retains guards for historical catalog admissions; its old scheduler and writer compile only in tests. Checkpoint authority stays with the existing cycle. |
 | SQLite schema | `src/state/schema.rs` | Owns schema versions and migrations. |
 | State-store contracts | `src/state/db/contracts.rs` | Defines store roles and records exchanged with callers. |
 | Asset state transitions | `src/state/db/assets.rs` | Owns asset lifecycle, download finalization, retry eligibility, and provider source-state transitions. |
@@ -152,14 +158,18 @@ match their headings, so searching a label finds the section.
 | Metadata capture retries | `src/state/db/metadata_capture_retry.rs` | Stores generation-fenced ambiguity evidence and bounded retry deadlines. The cycle owner retains checkpoint authority. |
 | Durable provider identity | `src/state/db/identity.rs` | Stores library-scoped asset/master mappings and legacy state ownership. Provider record parsing stays in the iCloud adapter. |
 | Durable membership | `src/state/db/membership.rs` | Stores album snapshots, provider relations, and grouping projections. |
+| Membership departure | `src/download/orchestration/primary_layout/membership.rs` | Retires unchanged owned album copies through the existing layout journal after current selected destinations complete and exact photo lookup confirms identity. Native copies require current publication authority; preserved-local copies and unowned sidecars stay in place. |
 | Durable metadata work | `src/state/db/metadata.rs` | Stores capture revisions, path-specific rewrite work, and repair receipts. It does not write media files. |
-| Durable checkpoints | `src/state/db/checkpoints.rs` | Stores provider checkpoints, scoped database tokens, and enumeration progress. Sync policy decides when checkpoint proof permits a commit. |
+| Embedded field ownership | `src/state/types.rs`, `src/download/metadata/`, `src/state/db/metadata.rs` | Writers measure changed properties and preserve exact prior values. Existing path and active-destination receipts retain prepared input/output checksums and field evidence; layout journals carry the same evidence through publication. Explicit source absence plus matching prior write proof authorizes clearing. Recipe completion alone never adopts a preexisting field. |
+| Download field publication | `src/download/file/publication.rs`, `src/download/finalize.rs`, `src/state/db/assets.rs` | The file owner distinguishes installed output from identical-existing deduplication. Only installed output supplies measured field ownership to the downloaded-state transaction. Deferred writes carry the same evidence. An identical preexisting file cannot acquire ownership from discarded temporary output. |
+| Current-selection metadata authority | `src/state/db/metadata.rs`, `src/download/orchestration/generation.rs` | Ordinary generation tails page through current exact destinations. Historical catalogue markers and older-generation writers cannot authorize a write or a checkpoint hold. Explicit capture repair keeps its library-scoped queue. |
+| Durable checkpoints | `src/state/db/checkpoints.rs` | Stores provider checkpoints, scoped database tokens, and enumeration progress. Its fenced transition also commits deferred album snapshots with inventory-request retirement; sync policy decides when proof permits either operation. |
 | Temporary-file ownership | `src/state/db/temp_files.rs` | Stores losslessly encoded paths and durable temporary-file ownership. Filesystem cleanup stays in download orchestration. |
 | Durable reconciliation | `src/state/db/reconciliation.rs` | Stores destination reservations and reads catalog evidence for reconciliation. |
 | Durable import adoption | `src/state/db/import.rs` | Atomically adopts imported files into state and reads imported records. Matching policy stays in the import command. |
-| Durable layout journals | `src/state/db/primary_layout.rs` | Stores preservation-backed layout bindings, operations, members, path claims, and immutable historical receipts. |
+| Durable layout journals | `src/state/db/primary_layout.rs`, `src/state/db/primary_layout/directory.rs` | Stores preservation-backed layout bindings, operations, members, path claims, immutable historical receipts, and typed exclusive-album directory moves. |
 | Prior publication recovery | `src/state/db/pending_publication.rs` | Recovers a rendition's unchanged prior current publication and retains conditional recovery evidence. |
-| Legacy preservation evidence | `src/state/db/legacy_preservation.rs` | Stores immutable legacy evidence and generation-fenced current-coverage receipts. It never assigns identity, writes files, or infers provider completion. |
+| Legacy preservation evidence | `src/state/db/legacy_preservation.rs` | Stores immutable originals and protected paths, retains historical coverage certificates without new certificate writes, and reads historical counters. It never assigns identity, writes files, or infers provider completion. |
 | State reports | `src/state/db/reports.rs` | Reads status, verification and manifest data, and records sync-run history. |
 | Import-existing | `src/commands/import.rs` | Matches existing files to expected iCloud paths and adopts verified files into state. |
 | Service integration | `src/service/` | Owns install, uninstall, status, service execution, and platform renderers. |
@@ -317,6 +327,10 @@ is canceled, so cleanup cannot unlock while a generation write is pending.
 
 ### Account ownership and legacy adoption
 
+Writable download dispatch requires a state store before provisional, full or incremental routing can start. `sync_loop/runner.rs` supplies authenticated owned state and fails startup if opening it fails. `download/orchestration/dispatch.rs` also rejects missing state at its entry boundary, before provider calls or local file work. Dry-run and filename previews may enumerate without a store and do not create one.
+
+`state/db/account.rs::open_sync_state` is the shared authenticated startup boundary for sync and import. It checks the configured namespace and authenticated provider identity before creating directories, resolves the state path, and delegates schema upgrades and matched config backups to `SqliteStateDb::open_owned_with_config`. Unowned legacy state still requires explicit ownership evidence; this boundary does not infer ownership from an account-like filename.
+
 Configured login and realm determine collision-resistant names for state,
 auth artifacts and encrypted credentials. Account-owner format version 1 is
 independent of the application schema version and must be checked before its
@@ -341,6 +355,32 @@ Legacy session and encrypted credential files are preserved and ignored;
 keyring identity remains unchanged. See [account migration](account-state-migration.md)
 for operator steps and compatibility limits.
 
+### Owned-schema upgrade backups
+
+`kei status` counts sparse references preserved in the v0.30 upgrade snapshot separately from current unresolved references. The archived count is informational: it does not schedule retries, hold a checkpoint or certify recovery of an original.
+
+Schema 38 establishes the v0.30 fresh-start boundary in the existing database. Before older migration steps interpret provider payloads, `state/schema.rs` copies historical provider inbox, catalog, selection, work, active-generation and sparse-identity rows into `historical_v030_*` tables and clears their active counterparts. It preserves zone and scoped database cursors, configuration checkpoints and historical identity holds in those snapshots, then removes their active authority. Preservation, retirement and schema advancement share one transaction. A failed upgrade restores the prior active state.
+
+The next selected-library sync uses the existing full-enumeration path to establish current work and a new checkpoint. Current provider failures, unresolved identities and unfinished current work retain their retry and checkpoint guards. Subsequent opens do not repeat retirement. Historical snapshots have no runtime writers or replay consumers. Current inbox capture remains active; removing that subsystem is a later simplification boundary.
+
+Asset records, local path and ownership evidence, metadata work, temporary-file ownership and publication journals remain with their existing owners. The transition does not write media or sidecars. Historical provider destinations retain their original path and progress bytes in the snapshot without keeping obsolete plans executable.
+
+Schema 44 records one historical deletion check per eligible downloaded iCloud identity present at upgrade. Fresh databases start empty. A current observation retires the check, including an in-flight lookup. After current work succeeds, or on a quiet watch cycle, sync spends at most one five-second exact lookup on up to 32 candidates in a selected, indexed library. An omitted record, provider error, duplicate record or mismatched zone or owner leaves the check retryable after one hour. A confirmed live record retires the check. An explicit deletion or expungement of the exact asset or master marks its downloaded renditions deleted, retaining any provider deletion time. Protected historical records and prepared capture repairs retain their guards. The check writes no file and neither schedules downloads nor gates checkpoints or backup health.
+
+`kei manifest` includes deleted renditions. JSON and CSV expose `is_deleted` independently of download `status`. `deleted_at` is a UTC timestamp when known, otherwise JSON null or an empty CSV field.
+
+`config/source.rs` retains the exact configuration bytes loaded at startup, or the absence of a configuration file. Debug output redacts both bytes and paths. Command dispatch passes this context to `SqliteStateDb::open_owned_with_config`; production has no context-free writable opener. CLI overrides, environment values and credentials are not included in the snapshot.
+
+For an existing older schema, the opener validates account ownership and holds a SQLite immediate transaction through backup publication and migration commit. `state/db/migration_backup.rs` copies the committed database through a separate read connection, including WAL content, into a private `.kei-schema-backup-<uuid>` directory beside the database. It writes the loaded configuration or records its absence, restoration instructions, and a checksum manifest. Exclusive creation prevents replacing earlier evidence. On Unix, files and directories are synced before the completion manifest is published without replacement. On Windows, creation-time protected owner-only ACLs secure the bundle and its contents; a native write-through, no-overwrite directory move publishes the completed `.partial` stage. A directory ending in `.partial`, or a bundle without `manifest.json`, is incomplete. Failed or interrupted bundles are retained.
+
+Backup failure refuses migration. Migration failure rolls back the upgrade transaction and retains the completed backup. Fresh and already-current databases do not create upgrade backups. Missing configuration context refuses an old-schema upgrade. Platforms outside Unix and Windows refuse old-schema upgrades. Windows storage must support persistent ACLs. The Windows publication contract uses the repository's native write-through operation; it does not claim POSIX directory-fsync equivalence or physical power-loss survival. Native Windows runtime qualification remains pending.
+
+Windows publication retains the populated stage's original identity and parent confinement through the directory move. Before releasing its no-delete handle, it opens and validates a rename-compatible handle. The published directory must match the original identity; substituting another directory cannot authorize migration.
+
+Restore instructions are in each bundle's `restore.txt`. Stop every state writer, verify the manifest checksums and matching database/account, and preserve the current database together with its `-journal`, `-wal` and `-shm` companions before installing the standalone snapshot. Never attach newer companions to the restored database. Restore the recorded configuration with a compatible previous binary and reapply invocation/environment settings separately. The bundle contains no media; rollback is supported before subsequent media or metadata changes, or with a separately matched media backup.
+
+An interrupted DELETE-mode migration can leave a hot rollback journal. If SQLite requires writable recovery before the account-owner header can be read, the opener refuses with restoration guidance. It does not recover a potentially foreign database before validating ownership. Preserve the journal; deleting it or forcing writable recovery bypasses this boundary. Restore a verified, matching backup instead.
+
 ### Observed incremental shadow capture
 
 After opening an authenticated, account-owned database, sync attaches capture to
@@ -352,10 +392,7 @@ unresolved relationships, including numeric lexemes that a typed JSON re-encode
 could alter. Cookies and authentication headers are not captured; resource URLs
 remain transient payload, never durable identity.
 
-Schema 29 adds `provider_shadow_pages`, ordinal source identities in
-`provider_shadow_records`, and a per-scope last-observed pointer in
-`provider_shadow_receipts`. An immediate SQLite transaction rechecks the
-independent account owner and commits all three together. Provenance includes the
+Schema 29 adds `provider_shadow_pages` and ordinal source identities in `provider_shadow_records`. An immediate SQLite transaction rechecks the independent account owner and commits both together. The former per-scope pointer in `provider_shadow_receipts` has no runtime reader or writer; its schema and historical bytes remain preserved. Provenance includes the
 account namespace and authenticated provider fingerprint, versioned realm,
 CloudKit container and environment, private/shared database, validated zone and
 returned owner when present, request cursor and successor. Unknown zone metadata
@@ -369,19 +406,28 @@ page, full inbox, failed write or unusable identity stops that page before
 emission or successor acceptance. Such a refusal propagates through orchestration;
 an uncaptured rank inventory cannot replace it and advance the checkpoint.
 Existing typed invalid-token fallback and authentication handling remain intact.
-Exact already-captured replay remains possible at capacity. No observations are automatically pruned. SQLite WAL `NORMAL`
+Exact already-captured replay remains possible at capacity. Schema 43 releases completed payloads during incremental sync. A validated record-empty poll needs no inbox space. Previously projected empty polls are revalidated and removed during startup recovery or capacity recovery.
+
+A nonempty page gives up its whole inbox charge only when every record has independent durable evidence. For a live photo record, the current published destination must have verified media and any enabled metadata, and its checked lookup confirmation must contain the matching record in the same source scope. A simple, explicitly typed private Primary deletion can use already-deleted local renditions if no family mapping makes the identity ambiguous. Unknown records, unresolved references without that proof, legacy work dependencies and mixed pages with unfinished records keep their bytes. Sync checks on projection, revisits earlier pages while reading the stream, and checks remaining candidates before returning an inbox-capacity error.
+
+The release receipt and removal of the raw body commit together. Original hashes, identities and catalog facts still feed the existing change detector. Released pages retain their original `charged_bytes` for provenance; only pages without a `provider_finished_changes` receipt count against the live inbox. Replay still emits the current provider events. Cleanup does not advance the cursor, change media or shrink the SQLite file on demand. The catalog retains its own separate capacity limit.
+
+SQLite WAL `NORMAL`
 remains unchanged; a successful commit does not promise that every acknowledged
 observation survives power loss. Network filesystems are not newly qualified.
 
 Schema 36 adds a private-only canonical transport index. The provider adapter
 recomputes evidence from the retained page after account validation. It
-recognizes exactly two direct descriptor paths: a complete `CPLMaster`
-`fields.resOriginalRes` `ASSETID`, and a complete `CPLAsset` or `CPLMaster`
+recognizes a complete `CPLMaster` `fields.resOriginalRes` `ASSETID`, a complete
+`CPLMaster` `fields.resOriginalVidComplRes` `ASSETID` in changes pages (the
+Live Photo motion resource), and a complete `CPLAsset` or `CPLMaster`
 `fields.resComputeStateData` `ASSETID`. Each must have a nonblank `recordName`
 and `recordChangeTag`, a numeric `size`, nonblank `fileChecksum`,
 `referenceChecksum` and `wrappingKey`, and a validated download URL. Only the
-whole validated `downloadURL` token is masked. Record type, tag, descriptor
-bytes and unknown bytes stay exact, and nested or arbitrary `downloadURL`
+whole validated `downloadURL` token is masked. If an eligible motion URL is
+shared with another resource on the record, the page stays raw because URL
+aliasing affects rendition selection. Record type, tag, descriptor bytes and
+unknown bytes stay exact, and nested or arbitrary `downloadURL`
 fields are not eligible. Each candidate is bound to the envelope that produced
 its byte path: a changes candidate is resolved only against `zones[0].records`
 and a lookup candidate only against the paired root `records`, so a lookalike
@@ -395,42 +441,24 @@ private page, malformed scope, or mismatched index entry still fails validation.
 The canonical key is an unambiguous hash of account namespace,
 provider fingerprint, exact scope, request cursor, successor, `moreComing`,
 classifier version and masked body digest, so different cursors or scopes remain
-independent classes. A hit reloads the representative through the checked page
+independent classes. Only pages that mask a motion URL use classifier version 4.
+Older stored pages are not rescanned: the first rotated motion URL can require
+space for one new representative. Pages that mask only original or compute-state
+URLs retain their version 3 keys.
+A hit reloads the representative through the checked page
 loader, recomputes its key and masked bytes, and requires exact metadata and
 source-identity equality. Unsupported scopes stay ordinary raw observations;
 an invalid private page or a mismatched index entry fails validation. A replay
 always reprojects the durable source, so an interruption after capture but before
 projection recovers on the next equivalent observation.
 
-The same schema step compacts finite legacy duplicates before ordinary admission.
-It streams one body at a time inside the migration savepoint and requires a
-validated raw hash, provider-owned evidence, exact account/provider/scope/cursor/
-successor/`moreComing` binding, complete masked-byte equality, and a fresh pure
-projection that equals every stored record, reference, debt and charge. Only then
-may an old body become empty. The old row keeps its original ID, ordinal source
-identities, historical observation hash and catalogue/work/selection references;
-a typed alias stores the canonical page, classifier version, masked digest,
-canonical certificate and an immutable provenance binding over the original ID
-and hash, canonical ID and hash, class key, version and ordinal identities.
-Known work receipts, work retries/scans and selection sources must still match
-that old identity, source hash and independent confirmation bytes before the
-body may be dropped; an unsupported or mismatched dependency pins the page as
-raw. Loads expose `Raw` versus `LegacyAlias` provenance and verify the
-representative hash, certificate, provenance binding and index on every access.
-Alias chains and cycles are refused. The historical hash is never presented as a hash
-of representative bytes, and no original hash is fabricated. Unknown formats,
-unsupported projector versions or failed projection proof stay raw; inability to
-prove the optional projection (including its byte budget) makes a page
-ineligible for compaction rather than failing migration, while SQLite and
-storage errors still abort. Migration
-charges retained provenance plus alias and index overhead, does not raise budgets
-or prune catalogue rows, and rolls every alias and body drop back with the schema
-version on any failure. Replaying a discarded URL variant validates the alias and
-returns the canonical ID; it creates no new alias.
+The transport-index schema step creates and validates its tables without compacting historical bodies. Schema 38 retires historical pages before that step; the legacy compaction algorithm, dependency-validation checks and telemetry event path have been removed. Historical diagnostic fields remain readable. New cycles record `not_observed`, zero event counts and unknown byte-reclaim totals. Current capture still uses the canonical index to avoid repeated equivalent observations.
+
+Current page loading has one raw-byte path: it validates the stored owner, continuation flag, size bound, SHA-256 and ordinal identities. Current capture verifies exact or provider-classified equivalent raw observations against that loaded page. Historical alias records and their representative bytes remain in the upgrade snapshots; they have no runtime readers or writers. The empty legacy-alias table remains in the schema for compatibility with existing schema shapes.
 
 A shadow receipt is only the last observed page, and replay can move it back. It
 is not a coverage frontier, materialization receipt or verified filesystem
-progress. Existing `CheckpointEvidence`, sparse and legacy generation proofs,
+progress. Existing `CheckpointEvidence`, sparse generation proofs,
 recovery debt and filesystem guards retain checkpoint authority. Capturing a
 tombstone cannot authorize local media deletion. Existing download and metadata
 queues still consume the current stream. Capture alone cannot admit queue work;
@@ -496,6 +524,12 @@ still require explicit policy decisions before dependent stages.
 
 ### Current provider work admission
 
+Current work uses the destination owner described under [Private selection and destination replay](#private-selection-and-destination-replay). Catalog admission and catalog wake inspection have been removed from dispatch and watch precheck. Every valid provider-discovered query supported by the old catalog scheduler has a current-selection owner. Unsupported query shapes do not acquire work authority from the old scheduler's weaker query checks. The old admission implementation compiles only in tests to construct historical databases and verify their publication guards. Existing receipts, obligations, retry deadlines and raw evidence remain stored; this retirement performs no migration or deletion.
+
+#### Historical catalog admission format
+
+The following describes the retired schema-31/32 scheduler and its retained evidence. These admission and wake operations no longer run in production.
+
 Schema 31 adds `provider_work_receipts`, generation-bound
 `provider_work_obligations`, and the `provider_work_scan` scheduling position.
 Before normal dispatch, up to 64 retained, indexed CPLAsset observations per
@@ -505,27 +539,7 @@ are retained. Duplicate keys, duplicate or omitted records, provider errors,
 wrong owners, wrong zones and changed child/master relationships cannot confirm
 work. Provider confirmation is an observation, not an atomic provider snapshot.
 
-This slice supports one private library-wide pass with an explicit default
-owner, without recent caps, album exclusions, retry-only selection or metadata
-backfill-only execution. Default `PrimarySync` selection lazily discovers the
-private `/zones/list` response using the pinned authenticated session. Discovery
-requires bounded original JSON with unique keys, an explicit zones array, unique
-zone names, no zone errors and no unsupported continuation. Only a live exact
-`PrimarySync` entry with a nonblank string owner replaces the constructor's
-ownerless primary library after that exact selected scope returns a recognized
-indexing state. `RUNNING` retains provisional readiness and requires durable
-reconciliation; owner qualification alone never certifies a checkpoint.
-The complete discovered scope is preserved, including explicit owners
-other than `_defaultOwner`; lookup and inventory references must still match it.
-The complete validated private zone descriptors are cached separately from
-initialized libraries. Primary-only lookup initializes only the selected primary;
-unrelated private indexing failures do not block it. Private and shared library
-maps publish only after all requested library initialization succeeds. A failed
-full-map initialization preserves an already qualified primary and retries
-initialization using the validated private descriptors. Shared endpoint evidence cannot
-replace private primary ownership. Missing, deleted, blank or malformed primary
-owners preserve the ownerless constructor; no owner is inferred from a name.
-The current-work admission slice still requires `_defaultOwner` and is unchanged.
+This slice supports one private library-wide pass with an explicit default owner, without album exclusions or metadata backfill-only execution. Default `PrimarySync` selection lazily discovers the private `/zones/list` response using the pinned authenticated session. Discovery requires bounded original JSON with unique keys, an explicit zones array, unique zone names, no zone errors and no unsupported continuation. Only a live exact `PrimarySync` entry with a nonblank string owner replaces the constructor's ownerless primary library after that exact selected scope returns a recognized indexing state. `RUNNING` retains provisional readiness and requires durable reconciliation; owner qualification alone never certifies a checkpoint. The complete discovered scope is preserved, including explicit owners other than `_defaultOwner`; lookup and inventory references must still match it. The complete validated private zone descriptors are cached separately from initialized libraries. Primary-only lookup initializes only the selected primary; unrelated private indexing failures do not block it. Private and shared library maps publish only after all requested library initialization succeeds. A failed full-map initialization preserves an already qualified primary and retries initialization using the validated private descriptors. Shared endpoint evidence cannot replace private primary ownership. Missing, deleted, blank or malformed primary owners preserve the ownerless constructor; no owner is inferred from a name. The current-work admission slice still requires `_defaultOwner` and is unchanged.
 Default selection needs only the cached private listing and selected primary's
 indexing success. Normal sync planning and import still request all libraries;
 their existing full-map initialization contract is unchanged.
@@ -607,52 +621,14 @@ Current versions under current configuration are the approved materialization
 scope. Historical observations and all unfinished debt remain retained. Admission
 of a current version does not prove historical completeness, acknowledge old
 unrecoverable debt, authorize local tombstone deletion or select a historical
-retention policy. Existing CheckpointEvidence, sparse/legacy proofs, opt-in
+retention policy. Existing CheckpointEvidence, sparse proofs, opt-in
 metadata writes, publication guards and WAL NORMAL qualification remain in force.
 
 ### Selection generation shadow
 
-Schema 33 adds account-bound `provider_selection_generations`, source links in
-`provider_selection_sources`, per-pass `provider_selection_decisions`, and
-rendition/path obligations in `provider_selection_destinations`. The existing
-private library-wide retained-work path captures its planning result before
-queue admission and verifies strict provider-owned equivalence on replay.
-Every non-confirmation manifest field stays exact; an eligible paired current
-confirmation may differ only in validated private `ASSETID` URL tokens. The
-retained representative keeps its original bytes and hash, while the current
-response and URLs remain the downstream planning input. A changed decision,
-identity, version, metadata or resource fact stays a distinct generation.
-Original current child/master confirmation bytes retain unknown fields and
-numeric lexemes.
-Current confirmation is separate from the historical trigger observation;
-source order, page IDs and opaque cursors cannot establish a current version.
+The schema-33 tables `provider_selection_generations`, `provider_selection_sources`, `provider_selection_decisions` and `provider_selection_destinations` remain as historical evidence. Schema 38 archives prior rows at the fresh-start boundary. Their observational writer, manifest replay and capacity gate have been removed. Current provider confirmation and task planning feed active destination admission. The later catalog admission writer `project_provider_work` also compiles only in historical-database tests.
 
-Manifest format 1 explicitly records `confirmed_sources_only` coverage. It does
-not represent a complete library inventory, a global recent frontier, album
-membership coverage or absence. Selected, excluded and deferred decisions remain
-separate from admitted queue work and verified media. Destinations include the
-pass, child, logical rendition and path so one rendition can have distinct
-copies without changing the canonical asset identity. Native path encoding is
-lossless, including non-UTF-8 roots; relative task destinations are anchored
-without changing the task path. This stage captures only
-the existing admission profile. Multi-pass selection and activation require the
-next qualified stage.
-
-Capture and replay independently check authenticated account ownership, complete
-private source scope, indexed original source bytes and identity, current paired
-confirmation, resource and metadata fingerprints, and all normalized manifest
-rows. One immediate transaction commits a manifest and its source, decision and
-destination rows. Failure retains source observations and the existing cursor;
-no queue admission can substitute for missing shadow evidence. Exact replay is
-idempotent at capacity. A manifest is bounded to 16 MiB of serialized evidence
-and this store has a separate 512 MiB logical charge budget including normalized
-row payload. These are backpressure limits, not physical SQLite/WAL quotas.
-
-Nothing is pruned, retired or acknowledged. Existing work receipts, unfinished
-generation fences, metadata queues, filesystem publication guards and checkpoint
-proofs remain authoritative. WAL NORMAL and filesystem support are unchanged.
-This shadow storage is the first PR of the selection phase, not completion of
-replay-driven multi-pass materialization.
+`provider_selection.rs` retains the shared decision, outcome, destination and lossless native-path types used by active generations. Their serialization is unchanged. Active destination publication, work retry, source checkpoint gates and raw-inbox capture keep their existing owners. Support history retains the selection storage field for compatibility; current cycles leave it unobserved.
 
 
 ### Private selection and destination replay
@@ -671,23 +647,96 @@ current confirmation, transactional queue projection and destination replay.
 admission, frozen metadata intent and completion validation.
 
 Activation requires an authenticated account-owned database and one exact
-private provider scope with an explicit default owner. Every selected pass must
-be a supported private named album or Unfiled query using the same concrete
-store and scope. Mixed, shared, smart-folder and unsupported profiles keep the
-whole existing dispatcher. Retry-only, metadata backfill, read-only execution
-and capture-local timestamp replacement keep their existing owners. Ordinary
+private or shared provider scope with an explicit nonblank owner. The exact discovered owner remains part of request, response and durable scope validation; `_defaultOwner` is not a separate eligibility rule. Every selected pass must
+be a supported named album, Unfiled query or provider-defined smart query
+using the same concrete store and membership scope. Named albums may bind authenticated foreign media sources in that store. Unsupported
+ordinary writable profiles are refused before dispatch. Both database scopes use the same validated source admission and per-destination completion owner. Database identity remains part of the durable scope; a receipt in one database cannot complete work in the other. Metadata backfill and read-only execution
+keep their existing owners. Ordinary
 explicit metadata refresh with preservation can use active destinations.
 
-A generation binds account and provider ownership, full zone identity, selected
-passes and queries, source dependencies and selection, rendition, path and
-metadata configuration. Lossless native destination paths are independently
-anchored. A rank page records its exact request and original response bytes,
-including unknown fields and tombstones. Rank pagination remains an observation
-window. EOF plus a delta bridge does not establish a snapshot or prove absence.
-Current paired confirmation determines resource identity; observed order and
-opaque rank or source tokens do not select versions. Ambiguous or incompatible
-facts remain deferred. Existing global/per-filter recent, ties, exclusions,
-RAW, companion and naming owners decide eligibility.
+Dispatch no longer runs legacy catalog admission. Inventory or replay admits and completes work per selected destination. Watch precheck uses that owner's wake decision directly; legacy catalog work cannot add a wakeup or veto it.
+
+An Unfiled pass label can render a destination path but cannot establish album membership. Destination admission excludes that label from both membership insertion and grouping-conflict checks; a current path decision is not provider membership evidence.
+
+Album discovery retains raw provider ancestry in `PhotoAlbum::selector_components()`. Qualified selectors match the full ancestry; leaf selectors can select same-named containers. Ambiguous qualified selectors and incomplete discovery fail before planning. Path rendering sanitizes each component independently. Album and smart-folder names retain separate selection identities.
+
+Discovery walks `CPLAlbumByPositionLive` breadth-first in the authenticated library zone. Explicit `albumType=3` records supply child queries through string `parentId`; type 0 records supply album passes. Root sentinels are skipped. Repeated identities or cursors, mismatched parents, unknown explicit types, and traversal limits fail discovery. Missing type retains leaf-only compatibility. The field/query contract is documented in [the iCloud Photos Sync API reference](https://icps.steiler.dev/dev/api/#albums-and-folders); [the icloud-docker nested-album fixture](https://github.com/mandarons/icloud-docker/commit/9374bad0eba38d86e0791efc22b5e99024ad9b6d) independently records string parent references.
+
+`BoundAlbumSelection` carries prior published selector-to-container evidence through startup, watch and indexing refresh. Explicit same-zone container tombstones can recover a previously bound missing selector. Missing discovery and configuration deselection never authorize retirement. Zero-pass recovery uses authenticated exact photo lookup and an empty existing selection generation; it neither enumerates ranks nor advances the provider cursor. Historical headers validate immutable bindings, while current execution rechecks durable deletion status.
+
+Completed membership deltas publish required selected destinations before retiring obsolete owned copies. Whole-photo deletion takes precedence, and unknown identity keeps recovery pending. Native retirement seeds the existing layout journal only at departure, using admitted current-publication receipts with exact source, path and hashes. Preserved-local dispositions and shared-path claims cannot authorize native retirement. Modified files and adjacent unowned sidecars remain in place. Retirement clears only the exact native publication authority in the layout commit transaction and retains historical verification receipts.
+
+The shared filesystem retirement owner checks media and sidecar disposition together, including an expected absent sidecar, before each move and after the guarded no-replace rename. Journal recovery applies the same checks to visible and already-retired entries. A late sidecar, changed owned sidecar or namespace change triggers no-overwrite restoration through retained directory capabilities. Media is restored before metadata when possible; a later writer is never replaced. Failed or partial restoration retains saved entries, claims and the pending layout journal. A preserved member receipt is revalidated on resume and does not bypass the retirement checks.
+
+Ordinary writable dispatch now requires a qualifying current-selection context for every nonempty pass set and validates the database's authenticated pin before recovery or cleanup. Unsupported query definitions and missing scope return an actionable error without dispatcher writes or provider requests. Provisional/indexing execution and previews retain their separate contracts. Empty pass sets return without work or a candidate checkpoint. The rendition-wide tail is now invoked only for read-only planning; writable startup resets and pending-to-failed promotion have been removed from dispatch.
+
+Current-selection attempts and due times remain with the destination owner; unrelated historical rendition failures are preserved. Dry-run and filename previews do not reset retry state even when a caller supplies an existing store. Provisional/indexing inventory retains its incomplete-evidence restrictions.
+
+Managed-layout completion does not re-enter legacy catalog admission. Destination completion cannot turn unrelated historical pending rows into failures. Read-only legacy retry planning still reports planned retries and unresolved identities without running that promotion.
+
+Managed inventory projects selected destinations before publishing files. After collection freezes membership and native metadata intent, the existing bounded destination replay runs the managed journal with current stored groupings. Native acknowledgement requires the exact binding, metadata recipe and verified media/sidecar fingerprints under destination locks. A journal commit alone cannot complete native metadata before its intent exists. Preserved unselected originals retain their journal protection without acquiring a current selection obligation.
+
+Ordinary authenticated current selection reads historical metadata-capture summaries for reporting without scheduling historical repair or using unresolved historical counts to block its checkpoint. Selected identity, publication and metadata obligations still gate advancement. Explicit refresh and compatibility execution retain their capture-repair policy. Historical rows, retry evidence and ownership records remain durable.
+
+Selection replay reuses independently verified destination publications before task execution. A remaining destination task bypasses rendition-wide on-disk adoption and uses normal transfer/publication finalization. This lets a landed file recover after a failed finalization transaction without marking only the aggregate asset row complete and stranding its destination obligation. No-overwrite publication and exact-path completion guards remain active.
+
+Local replacement policy is per destination. An established copy whose bytes still match its verified Kei receipt can receive the current provider resource without treating Kei's filesystem write time as a local edit. A changed copy requires a strictly newer, resource-specific provider edit time. Equal, newer-local and unknown times preserve the local copy. The Photos adapter decodes `adjustmentTimestampEnc` as a bounded plist Date only for an adjusted still supplied by CPLAsset. Originals, alternatives and video resources have no proven edit clock. CloudKit record modification time never authorizes media replacement.
+
+Schema 39 adds nullable typed `preserved_local` evidence to the existing native destination row. Its intent binds the generation, configuration, pass, child, rendition and path; its observation records the local checksum, size and optional filesystem mtime. Preservation resolves media policy while leaving `verified_media` false and `source_checksum` absent. Preserved copies cannot supply current-provider source reuse. Metadata completion retains this disposition and the original local mtime. Missing copies reopen destination work. Managed copies use their existing layout journal and preservation-backed publication owner.
+
+Timestamp-authorized publication validates displaced bytes and mtime before accepting replacement. On Linux filesystems without atomic exchange, the existing replacement journal checks both from the same confined handle after displacement and before its commit marker. Interrupted uncommitted journals restore the displaced file and its actual timestamps. The clock belongs to the active attempt; recovery never infers timestamp authorization. Windows uses its existing replacement backup and the common displaced-file mtime check. Metadata writes remain retryable if the original local mtime cannot be retained.
+
+The unchanged-output exemption requires `current_publication` authority on the existing native destination row, including checked metadata output. Schema 39 adds this marker with an unknown-by-default migration and a unique partial index per library and lossless path. The destination owner retires prior authority and assigns the checked output in the publication transaction. Historical verification remains intact. Receipt reuse and generation creation time cannot establish authority. Raw SHA-256 recovery can finalize an unfinished exact destination after publication lost its state transaction. Restoring an older published file counts as a local edit. Managed copies also retain their current layout binding, and independent peers cannot borrow a catalogue-wide receipt. Legacy metadata completion without a validated native receipt invalidates obsolete native authority.
+
+Schema 41 adds nullable embedded-field receipts to existing path and native-destination rows. Migration grants no field ownership. Initial downloads commit measured fields with installed-output finalization; identical-existing publication retains only independently valid current ownership. Metadata rewrites freeze input/output evidence before publication and complete it in the existing metadata transaction. Directory members and managed bindings carry that evidence through checked moves and copies. Checked preserved-local metadata completion uses the same current-publication marker to retain the latest physical output and field ownership across selection changes. It retains `verified_media=0`, no source checksum and its preserved-local disposition. Provider-source reuse, unchanged-provider replacement exemptions, directory handoffs and retirement require non-preserved verified media. Selection alone cannot promote a preserved copy; changed local bytes revoke its previous metadata authority.
+
+Downloaded-state completion requires parent-directory durability. `download/finalize.rs` calls the strict async wrapper around `fs_util::fsync_parent_dir` before both immediate receipt writes and deferred retries. Native destination reuse and pending-publication adoption apply the same boundary after their existing confined-file checks and before state acknowledgement. A parent sync failure retains landed bytes and unfinished debt. Exact-byte recovery retries the sync before acknowledging those bytes, without another media transfer when existing provenance guards permit reuse. Identical `.part` collisions do not bypass this boundary. The wrapper runs on the blocking pool and preserves the synchronous helper's platform policy, including its non-Unix no-op.
+
+Selected task planning can replay an exact durable reservation in another folder beneath the current root. It uses the existing retry reservation checks for owner, rendition, provider content and path confinement, while retaining protected-identity relocation. A reservation preserves a destination choice only after current selection admits the asset; it does not create selected membership or authorize adoption of unproven bytes.
+
+A sealed, checkpoint-ready selection with no decisions can survive a delta containing only applied deletions of known assets. Dependency comparison ignores those tombstone-only pages for this empty-selection reuse, without changing the original generation, seal or retained provider evidence. Unknown tombstones, typed membership deletions and mixed/live pages retain their dependencies and require revalidation. Nonempty selections retain their existing invalidation rules.
+
+Before selected planning, reserved cross-folder recovery uses the existing retained-file adoption proof. It requires the recorded local hash at that exact reserved path, rechecks ownership and the retained file, and preserves any original download hash across metadata-altered size. A failed write or changed file holds the selected work. Native destination reuse can acknowledge a prior adoption without inventing download provenance; a prior metadata publication requires matching canonical and per-path download hashes. Equivalent root spellings use the same component-normalized receipt path.
+
+A provider revert can reactivate an earlier native publication at its original path. If the canonical row is pending for that version, reuse restores it only when an independent path source receipt matches the provider checksum, size and local fingerprint. The canonical transition and native destination acknowledgement share a transaction. Import-only receipts cannot create download provenance through this path.
+
+For destination-owned selection, HTTP 410 cancels the transfer batch through a child cancellation token. Enumeration continues to project current membership and run deferred unfiled passes. Cancelled transfers enter the existing exact URL-refresh cleanup with their destination bindings intact. Checkpoint release still requires complete query coverage and completed destinations. User shutdown, authentication failure and state-write circuit failure cancel both enumeration and transfers.
+
+Authenticated current-selection previews do not append the aggregate pending-retry preview. They count or print current selected paths once and preserve historical failures without treating those failures as current preview debt. Preview sessions without authenticated selection scope retain the compatibility path.
+
+CLI dry-run and filename-only modes share read-only startup. They skip configuration creation, destination writability probes, PID files, credential saving, support history, health/report files, and notification scripts. Authentication loads existing session data without a writable account guard; response cookies and session headers remain in memory. Corrupt authentication files remain intact and cannot supply cached validation. Expired authentication stops the preview before recovery can delete caches or strip routing state. Writable authentication retains its lock, generation checks, and persistence path.
+
+Compatibility dry-run and filename planning read existing retry evidence without changing the supplied store. Targeted lookup and legacy hydration may resolve preview paths, but planning does not backfill mappings, claim owners, adopt local files, persist reservations, revalidate policy-excluded deletions, or update verification and retry rows. Full previews preserve enumeration-interruption markers; incremental previews skip startup mapping backfill. Unknown and deleted lookup results leave durable evidence intact.
+
+After confirming a current provider selection, the producer can recover a pending or failed aggregate row whose exact prior publication still matches its source, local hash, size and ownership. It uses the existing `pending_publication` transaction before destination planning, preserving the original publication timestamp, receipts and retry count. The selected destination still needs its independent completion proof. Healthy downloaded rows and managed layout journals stay with their existing replay owners. A failed recovery transaction blocks that asset without transferring comparison media; conflicting reserved paths retain an enumeration hold.
+
+If a raw file lands before its destination finalization transaction fails, destination reuse can finish it without another transfer. The current admitted path, provider SHA-256, local SHA-256, size and asset facts must match. This recovery is limited to non-imported pending or failed rows whose canonical publication is absent or still points to another path, or downloaded rows with a recorded publication at a different path. The destination must have no prepared output. Matching raw media does not complete metadata intent; selected sidecar and embed obligations remain with the metadata owner. Same-resource root drift can retain the old downloaded row when new-path finalization fails. Recovery commits downloaded state, the new path source receipt and native destination verification together through the existing publication guards, preserving the old path receipt. Opaque provider checksums and metadata-rewritten media still require their existing receipts. A failed recovery transaction retains the checkpoint hold and does not download comparison media.
+
+Download context loads both pending and failed rows as unfinished identity and path evidence. Current selection still owns admission. Loading failed evidence neither resets retry counts nor changes durable status; it preserves master/child ownership and exact prior publications after failure.
+
+After selection binds a task to its final destination, an explicit truncation-repair request can attach the existing replacement fingerprint. The saved path, provider checksum and size must match that selected task. The existing repair owner checks the durable truncation reason, prior publication, regular-file fingerprint and shortened size. A changed provider version or another destination receives no replacement authority. Publication still rechecks the fingerprint before replacing bytes.
+
+Before freezing a selected repair destination, the planner retains the recorded path through its existing reservation guards. If provider content changed, it chooses a safe sibling and leaves the damaged historical file untouched. Managed layout journals keep their own path and replacement authority. A persisted exact child/master owner survives provider checksum changes; claiming an unowned legacy master still requires matching content and identity evidence.
+
+Native selection can retain an established one-child master mapping through the existing legacy owner claim transaction. The selector requires matching current content and added-date evidence, rejects protected state and competing historical children, and keeps the recorded retry identity and reserved destination. An unmapped historical master alone cannot authorize a native claim. Persisted owner receipts continue to govern later content changes.
+
+Destination metadata completion settles the canonical path's local checksum through the existing prepared-output settlement owner in the same transaction. The update requires the exact prepared output, path, metadata generation and prior local checksum. Original download provenance stays unchanged; a different path or concurrently changed canonical row is not rewritten.
+
+Destination reuse also accepts an exact durable import whose canonical row and path receipt agree with the independently measured local checksum, imported size and current provider version. Its local pre-rewrite input becomes the destination's source fingerprint. The canonical download checksum remains absent. Changed bytes, another path or another provider version cannot use this import proof, and reuse fetches no comparison media.
+
+Explicit capture-local timestamp repair also uses current selection for destination scheduling. The existing metadata writer receives the requested repair policy. A selected destination with its own exact prepared-output receipt uses that publication owner; it does not require a second legacy capture-repair receipt. Rows with a legacy repair receipt retain that receipt's validation and finalization. Timestamp repair still requires a usable provider offset and verified local bytes, and ordinary sync preserves existing timestamps.
+
+Provider confirmation resolves a selected observation against its bound media source. Owner-library rank observations inherit the authenticated query scope; cross-zone hydrated observations carry an explicit source zone. The media source must share the selection owner's authenticated account and concrete state store. Paired lookup validation remains in `icloud/photos/album/work.rs`. Cross-zone albums refresh current inventory on incremental cycles because the membership zone's delta does not cover foreign media changes. This reuses the smart-folder refresh path.
+
+If a rendition changes during the first inventory, kei defers that asset. On retry, the inventory and a fresh lookup must agree on the current rendition. Admission can then use that revision if the retained observations all identify the same child and master in the selection's own zone, the generation basis is unchanged, and the zone has neither a saved cursor nor a reconciliation request. This resolves only the asset; the normal completion checks still govern the checkpoint.
+
+New selected decisions store an explicit `media_source` scope and zone from the authenticated provider binding. Retained decisions omit that field and retain their exact encoding and single-zone meaning. Replaying a retained decision preserves its original binding representation. Durable admission accepts a foreign media source only when the pass profile declares that exact binding, its account context matches, and all selection sources are live membership relations for the selected child. Confirmation, mapping guards, destination rows and publication receipts use the media zone. Query evidence keeps the membership zone. Profile construction uses the same provider-owned account, concrete-store and realm validation as confirmation. Sources retain the complete provider zone and are sorted by scope; duplicate zone names are refused. Empty source lists remain omitted to preserve existing single-zone configuration fingerprints.
+
+The generation source store also accepts original album-owner membership scan pages for a named-album pass. The provider adapter validates changes-page scope, record shape and continuation before capture, then captures before emitting records. Hydration task clones retain this capture context. Rank and membership pages share request/response retention and ordinal indexing. Membership requests must match the generation's owner zone and named-album pass; they are not checkpoint authority. Source linking resolves live relations to their child IDs only for the selected container. Wrong-album and deleted relations do not select a child. Original record names, response bytes and ordinals remain unchanged. Membership-backed decisions use the existing admission and replay validators.
+
+Failed confirmation preserves the observed child's authenticated media binding in the deferred decision. Retained-generation recovery can look up that exact bound identity when membership evidence contains no reconstructable media facts. Resolving it requires an unchanged generation basis, the same media binding, validated original membership links and fresh paired confirmation matching the proposed decision. Missing or mismatched proof leaves the original decision intact. Cancellation and authentication failure stop recovery; neither completes the identity.
+
+A generation binds account and provider ownership, full zone identity, selected passes and queries, source dependencies and selection, rendition, path and metadata configuration. Lossless native destination paths are independently anchored. A rank page records its exact request and original response bytes, including unknown fields and tombstones. Rank pagination remains an observation window. EOF plus a delta bridge does not establish a snapshot or prove absence. Current paired confirmation determines resource identity; observed order and opaque rank or source tokens do not select versions. Ambiguous or incompatible facts remain deferred. Existing fixed-date, exclusion, RAW, companion and naming owners decide eligibility. Sync has no newest-N frontier or per-filter count cap.
 
 An immediate projection transaction commits the validated decision, source
 links, per-pass/rendition/path obligations, existing queue records, mappings and
@@ -698,10 +747,19 @@ replaying a newer inventory cannot seal an interrupted old window. Configuration
 or source changes create a distinct generation or require existing validated
 reseed. They cannot acknowledge omitted eligibility or old unresolved debt.
 
+For an unfiled Shared rendition with no established destination, a collision
+suffix can conceal an ambiguous migration match. If the unsuffixed path is
+occupied, admission checks downloaded Primary catalog rows at that exact path.
+A matching rendition, provider checksum and size without a verified Primary
+destination defers the Shared decision as `ambiguous_primary_archive_path`.
+It neither claims the original nor transfers a suffixed copy. Other children
+can finish, and an eligible retry checks the collision again.
+
+Named albums and smart folders keep independent physical copies even when their templates render the same directory. Current selection qualifies colliding filenames with the stable pass key and retains that exact destination on replay. Planning keeps each selected rendition eligible until its own destination is verified; adoption cannot skip it using another selected album or smart folder's path. Same-pass template drift and managed bindings retain their established paths. The immediate admission transaction checks competing album and smart-folder ownership before every transition to admitted, including confirmed selected declarations deferred by an earlier conflict. A conflict retains the frozen declaration; a racing producer with an unfrozen decision can replan once through the existing sibling guards. Historical shared-path declarations remain unchanged and trigger a successor inventory. Their original receipts and metadata work retain their existing owners. The declaration's `independent_album_copies` marker distinguishes current destination policy from historical replay without changing the user configuration fingerprint or adding a ledger. Unfiled behavior is unchanged.
+
 Destination media completion requires an actual confined file fingerprint and
 independently verified selected source checksum. An exact active physical
-receipt can be reused across compatible passes after current selection and
-file verification; another path retains its own obligation. Opaque provider
+receipt remains reusable as source evidence and for compatible historical aliases after current selection and file verification; a new album destination retains its own obligation. Opaque provider
 signatures remain independent from source and local SHA-256. Fresh or legacy
 fallback publication requires a separately verified per-path source receipt;
 validated native reuse relies on its own lossless generation/destination receipt,
@@ -741,7 +799,13 @@ the selected run and preserve the existing bounded reauthentication route.
 Non-authentication proof failures retain their own deferred debt. Active cleanup
 reconstructs original failed tasks' child/master and provider-rendition binding
 from their validated declarations, then uses the existing exact URL-refresh
-owner. A refreshed URL cannot replace frozen selection, metadata, path or
+owner. Historical RAW original/alternative relabeling is resolved by a unique
+checksum-and-size match in the frozen provider response, independently of the
+current configuration. Generation replay restores historical logical RAW keys
+from the frozen destinations before projecting records or dispatching tasks.
+Pending-record metadata follows the resource's provider key. New selection
+never swaps original and alternative keys. Ambiguous siblings remain unresolved; other rendition
+keys require an exact key match. A refreshed URL cannot replace frozen selection, metadata, path or
 publication authorization. A transient per-invocation registry composes failed
 historical and current runs; it is not durable identity or a separate memory quota.
 
@@ -752,13 +816,21 @@ pruned. Logical charges do not bound physical SQLite files or WAL usage. Seals
 and retained source audits can still read substantial history; no fixed startup
 latency or constant total decode-work guarantee is advertised.
 
+A later sealed, checkpoint-ready generation can supersede an unverified planned path when it has completed the same pass, child, master and rendition at a different path. Scope, configuration, provider checksum, size, metadata and dates must match. The earlier row stays admitted and unverified as historical evidence; it is neither deleted nor marked published. That row no longer creates retained replay work, asset-write conflicts or checkpoint debt. Prepared metadata outputs, incomplete current publications and deferred identities retain their guards. Scheduling validates the scope's retained decision proofs in the same read transaction before using this rule.
+
+A changed managed rendition can also retire an older decision's admission after fresh authenticated confirmation of the same account, store, source, pass, child and master. Every old destination must match a cancelled pre-publication layout operation and a current selected rendition. The layout owner verifies retained media and sidecar fingerprints before projection. The projection transaction admits the successor, records its manifest and cancelled-operation hashes in the old decision's admission reason, and withdraws the old destinations' admission together. Any admission failure rolls back both changes. The original manifests, paths, retry evidence, journal members and publication receipts remain intact; retirement never marks media or metadata complete. The shared decision validator checks this proof on reopen, and the existing admitted-destination filters retain ownership of scheduling, grouping, metadata and checkpoint debt. Publishing journals, native prepared metadata outputs, unknown provenance and unrelated identities remain fenced. Managed current collection precedes historical replay so obsolete work cannot publish before this decision.
+
 Captured observations, admitted decisions, verified media and verified metadata
 are separate durable facts. CLI download counts retain the existing task
 semantics and do not claim unique-file counts or full-zone completion. Active
-progress cannot replace `CheckpointEvidence`, legacy/sparse generation proofs,
-filesystem guards or source checkpoint policy. Unfinished old selection debt
-vetoes the source successor, including when later configuration uses the legacy
-dispatcher. Local wake-up cannot invent a provider cursor. Tombstones do not
+progress cannot replace `CheckpointEvidence`, sparse generation proofs,
+filesystem guards or source checkpoint policy. Selection checkpoint debt uses
+the same authenticated scope and configuration as retained recovery. Unresolved
+decisions from other configurations remain evidence without independently
+vetoing the current successor. Unsettled prepared metadata outputs at overlapping current
+destinations retain their veto across configuration changes. Admission,
+publication and journal guards retain their cross-configuration protection.
+Local wake-up cannot invent a provider cursor. Tombstones do not
 authorize local media deletion. WAL `NORMAL`, filesystem support and power-loss
 limits remain unchanged. Capture-owned cursor promotion, historical intermediate
 retention, unrecoverable-debt acknowledgment, expired-epoch replacement,
@@ -793,9 +865,8 @@ collection and album plans so omitted albums can reappear after indexing.
 
 A retained hold forces full reconciliation after `FINISHED`. A scope refreshed
 while readiness is `RUNNING` remains stale even if the cycle's later probe says
-`FINISHED`; the next wake rebuilds it after readiness. Retry-only inventory can
-download known failed work but cannot discharge recovery of previously omitted
-assets. The held full-query path continues to suppress deletion-capable
+`FINISHED`; the next wake rebuilds it after readiness. Ordinary inventory recovers
+failed work and discovers previously omitted assets. The held full-query path continues to suppress deletion-capable
 maintenance, album snapshot completion, and the retained-token bridge even when
 its initial probe reports `FINISHED`.
 
@@ -809,7 +880,7 @@ the watch database shortcut across reopen. Only normal checkpoint promotion
 removes replay debt, including aggregate config-drift promotion. Rejection of
 the retained cursor preserves the existing checkpoint gates.
 
-Bounded coverage, interruption, retry-only selection, failed transfers or
+Bounded coverage, interruption, failed transfers or
 metadata, stale scope, missing proof, state-write failure, and readiness
 regression cannot qualify an inventory or advance its cursor. Provisional
 inventory cannot replace a comparable inventory anchor.
@@ -828,7 +899,7 @@ publication owners before retained-cursor replay. It bypasses quiet watch
 shortcuts and refreshes plans across restarts. An empty change feed therefore
 cannot omit assets that inventory-only qualification never queued.
 
-Managed materialization debt survives retry-only/bounded runs, failed transfers,
+Managed materialization debt survives bounded runs, failed transfers,
 metadata failure, interruption, regression and checkpoint-write failure. When an
 old cursor exists, both full publication and its incremental bridge must qualify
 before one checkpoint transaction removes materialization and replay debt.
@@ -950,11 +1021,15 @@ the existing metadata table before stream completion. The cycle owner clears
 that zone's marker atomically with a proven incremental checkpoint, including
 an inventory followed by a successful delta bridge. An inventory alone cannot
 clear it. Another zone's success and process restart retain the marker.
-Status aggregates all markers; cycle reporting does not advance health's last
-success while any remain. Selected zones with markers bypass watch-mode
-no-change shortcuts. Idle health also checks markers in unselected zones.
+Status aggregates all markers. Selected zones with markers bypass watch-mode
+no-change shortcuts. Retry debt remains visible as incomplete backup work but
+does not fail process health, including during skipped watch cycles.
 Intentional bounded checkpoint holds alone are not failures. The marker keys
 remain in metadata; JSON report version 3 is unchanged.
+
+Current destination debt is reported separately from checkpoint permission. The generation owner reads its existing selected-work debt after execution; the cycle owner makes one-shot sync fail while that work remains, including retries whose deadline has not arrived. Reports and notifications retain the partial-failure outcome. `cycle_reporter.rs` independently reports operational health: transfer and provider retry debt stay healthy, while state-access, storage or authentication blockers make `/healthz` fail immediately. Storage errors in transfer workers and metadata-only rewrites stop further file work for that cycle, retain unfinished tasks and markers, and leave watch mode running. These observations add no durable queue or checkpoint permission.
+
+The service starts its HTTP listener after initial authentication and library initialization. During initial authentication, a readiness probe cannot connect; once the listener is running, a failed authentication cycle returns HTTP 503. Watch uses the configured interval after each cycle, including cycles that progress a bounded metadata batch. Explicit capture repair keeps its saved progress for the next run.
 
 The Photos adapter emits aggregate, fixed-label identity lookup diagnostics.
 They distinguish omitted records, unexpected types, decode failures, invalid
@@ -1089,7 +1164,7 @@ of the retained boundary removes the hold in the same transaction that stages
 or activates its successor. Transaction-time metadata comparisons fence both
 hold staging and checkpoint promotion against changes to the planned cursor
 and enumeration configuration, including the exact staged candidate read during
-aggregate promotion. Existing legacy/sparse generation validation
+aggregate promotion. Existing sparse generation validation
 still applies. Global configuration activation remains atomic across selected
 zones. Zone-local hold aggregation keeps status and backup safety truthful even
 when another zone succeeds.
@@ -1119,6 +1194,11 @@ different gates:
 Eligibility-config drift preserves the active checkpoint while a complete
 inventory and delta bridge build a replacement. Path-config drift preserves
 provider checkpoints while local catalog paths are reconciled.
+
+Support history records when replay from the preserved checkpoint starts. If
+replay returns an error before producing a result, history records a fixed
+reason instead of the error text. A start without a later result or failure
+means no outcome was recorded; it does not identify the cause of the hold.
 
 Schema 25 stores local reconciliation destination choices in
 `reconciliation_paths`. The planner reserves current and historical catalog
@@ -1177,7 +1257,7 @@ bounded deferred finalization. Each attempt revalidates both identity and the
 publication fingerprint. Changes observed at revalidation retain the media and
 pending debt instead of committing stale verified provenance. Retained ownership
 and revalidation do not atomically exclude arbitrary Unix changes after the last
-validation while a database write awaits execution. Cleanup re-enumeration and
+validation while a database write awaits execution. Targeted cleanup and
 collecting incremental dispatch preserve the affected task's proof requirement;
 cleanup also requires the original failed generation's checksum and size.
 Equivalent root spelling is rebased component-wise using platform ownership keys;
@@ -1203,26 +1283,9 @@ the existing skip rules. New companions use a verified still filename. Existing
 companions with older numbered still stems remain usable after hash verification;
 Kei does not rename or delete them.
 
-Historical smart-folder membership cannot complete local path reconciliation. It reports separate conditional evidence when the fresh smart query
-is its only remaining dependency: album snapshots and catalog identity must be
-complete, with no deferred missing file or failed local work. The cycle owner
-can discharge that dependency only after successful current smart enumeration
-and durable work. During pending path drift, recent-count and lower-date-bounded
-selections drain ordered provider queries to EOF while forwarding only their
-configured selection to the existing download planner. The global recent
-frontier also drains to EOF and must report the same usable token as every
-selected pass. This costs a complete query on path drift, with bounded retained
-frontier IDs and streaming tail filtering. Cancellation stops the raw drain.
+Historical smart-folder membership cannot complete local path reconciliation. It reports separate conditional evidence when the fresh smart query is its only remaining dependency: album snapshots and catalog identity must be complete, with no deferred missing file or failed local work. The cycle owner can discharge that dependency only after successful current smart enumeration and durable work. During pending path drift, lower-date-bounded selections drain ordered provider queries to EOF while forwarding only their configured selection to the existing download planner. Every selected pass must report a usable, unanimous token. This costs a complete query on path drift, with streaming tail filtering. Cancellation stops the raw drain.
 
-Fresh query evidence certifies selected local work separately from source
-checkpoint coverage. Any excluded tail, including equal-date global-frontier
-IDs, still holds zone and database checkpoints. Stale plans, interruption,
-unresolved identity, failed enumeration, local work or state transactions retain
-the pending path hash. Every selected library must finish. Atomic promotion
-compares the active path hash and exact pending target before publishing the new
-hash and removing its marker. Eligibility inventory-and-bridge promotion remains
-separate. Unchanged cycles skip catalog reconciliation and the exhaustive path
-proof; ordinary bounded smart-folder refreshes may still query the provider.
+Fresh query evidence certifies selected local work separately from source checkpoint coverage. An excluded date tail still holds zone and database checkpoints. Stale plans, interruption, unresolved identity, failed enumeration, local work or state transactions retain the pending path hash. Every selected library must finish. Atomic promotion compares the active path hash and exact pending target before publishing the new hash and removing its marker. Eligibility inventory-and-bridge promotion remains separate. Unchanged cycles skip catalog reconciliation and the exhaustive path proof; ordinary bounded smart-folder refreshes may still query the provider.
 
 Local path reconciliation retains an unowned legacy master with multiple
 historical children as unresolved work, even when targeted lookup returns one
@@ -1416,6 +1479,8 @@ identity mappings before applying created, soft-deleted, hard-deleted, or
 hidden transitions. An asset-only `CPLAsset` creation hydrates its paired
 master through `masterRef`, the durable mapping, or a targeted identity lookup
 before routing; an inconclusive lookup preserves the prior zone checkpoint.
+Live album names must decode to a nonblank provider name. The Photos adapter accepts a valid plain-name fallback, but never substitutes a record identifier. A live delta without a usable name retains a checkpoint hold and leaves the stored container name unchanged. ID-only tombstones still identify deleted containers. Album discovery fails before returning its name-keyed map if a name is unusable or collides after sanitization, including collisions with smart folders. This prevents silent container loss; allocating independent destinations for colliding albums remains separate work.
+
 Album snapshots and smart folders may require targeted refresh work before or
 alongside the incremental stream.
 
@@ -1425,6 +1490,12 @@ event counts, and completion tokens. The streaming strategy emits created
 assets through a bounded channel and defers album, relation, and unpaired-asset
 work. The collecting strategy observes all events before state writes, hydrates
 missing identities, and applies relations before routing created assets.
+Before reserving paths, collecting coalesces equivalent consecutive observations
+for each library, source identity and selected pass, using the later signed URL.
+It compares parsed dates, metadata, resources and URL alias relationships; a
+different observation remains admitted. Raw event and checkpoint evidence is
+never coalesced. Distinct metadata revisions in one batch still follow the
+existing first-observation metadata refresh behavior.
 These orders preserve each strategy's token-safety and selected-album behavior.
 Shutdown races provider-event and successor waits in both strategies; the owned
 receiver is dropped before the successor wait to release provider backpressure.
@@ -1439,42 +1510,63 @@ marks its zone token unsafe. Both routes preserve the prior checkpoint so an
 unchanged provider record remains retryable, and neither route counts the
 record as a policy, filename, or date skip.
 
-Recent and date-bounded runs may advance only when the producer proves the
-bound did not truncate the stream. Incremental count-form recent selection
-uses the full selection owner after complete strict delta replay. Global uses
-the library-wide ranked window before filters; per-filter uses each pass's
-window. Delta arrival order and asset/pass-pair counts never define that window.
+Date-bounded runs may advance only when the producer proves the lower bound did not truncate the stream. Sync count selection, global-frontier construction, per-filter caps and the recent-only recovery engine are retired. Import sampling remains separate. Enumeration, coverage and selection-generation encodings retain their historical uncapped count/scope slots so unchanged uncapped configurations and retained generations do not drift just because the input surface was removed.
 
-`orchestration/recent.rs` stores a fixed-size `recent_selection_recovery:<zone>`
-receipt in the account-owned database. It binds the resolved provider/pass
-scope, exclusions, selection and download configuration, and the source cursor
-hash. Missing, malformed, mismatched or pending receipts require current
-inventory even when the next delta has no changes. The pending receipt is
-written before selection. A completed receipt is usable only after its actual
-changes/zone successor becomes the requested cursor, so a failed checkpoint
-commit cannot skip recovery. Cap increases and removal consume this obligation
-without a manual token reset. Watch prechecks include this local recovery even
-when the provider reports no changed zones. Enumeration safety hash version 3
-includes count and recent scope, forcing one conservative inventory/bridge for
-legacy cursors, including prior cap removal, before trusting quiet streams.
+### Guarded current inventory after count retirement
 
-Selection rank tokens prove only the existing selection EOF contract. The
-combined result returns the delta successor and carries separate completed
-replay evidence for configuration bridges; a pure full fallback has no such
-evidence. Existing identity, state-write, interruption, sparse/legacy and
-bounded-inventory vetoes remain authoritative. Unresolved delta identity does
-not starve independently valid recent media selected by current inventory;
-its source veto, failed-write counters and pending recovery receipt remain in
-force. Current queue/publication guards remain authoritative for each job. A
-truncated count window keeps
-its recovery obligation and prior cursor; repeated bounded inventory remains a
-known cost until a larger catalog selection generation stage qualifies it.
-Typed provider session errors retain the existing bounded reauthentication
-route across current selection; other selection failures do not trigger fallback.
-This receipt neither claims an atomic rank snapshot nor proves absence or
-permits local deletion.
+Schema 37 seeds `inventory_reconciliation_required:<zone>` once from the existence of each exact `recent_selection_recovery:<zone>` key. It never parses or certifies the old value. Original keys and exact value bytes, including malformed, non-UTF-8 and future-version payloads, remain untouched. An existing inventory request is not replaced. The schema version prevents completed requests from being reseeded on quiet reopen. The new request is presence-only current work, not another historical receipt ledger.
+
+`sync_loop/precheck.rs` includes a selected zone with a nonempty pass plan whenever its request exists, even if changes/database reports no changed zones. `sync_cycle.rs` snapshots the request and current cursor/configuration fences, then passes the obligation to `download/orchestration/dispatch.rs`. With retained cursor P, `reconcile_inventory` performs one guarded attempt per zone per cycle:
+
+1. Replay strict changes/zone from P through terminal successor S. The provider adapter reports terminal completion separately from whether any raw records were observed. Qualification requires a completed replay; cancellation or an incomplete result returns a hold. Identity or state failures can still allow healthy inventory work but veto qualification.
+2. Run the ordinary current inventory and publication owner for the configured selection. Supported private selections use `generation::inventory`; other scopes use `full.rs`. Queries drain to natural EOF with usable token evidence, including a filtered tail when fixed dates limit selected work. Query tokens establish enumeration completion, never replace P or S, and never establish an atomic snapshot.
+3. Only after successful current work and complete selected coverage, replay changes/zone from S to a terminal successor. Every raw records array in this replay must be empty. An empty emitted-event stream is insufficient: unknown records, tombstones or rank displacement still make the interval nonquiet. A changed interval retains the request and trusted cursor for a later cycle; there is no same-cycle catch-up loop.
+
+Unresolved initial delta identity can still allow independently valid inventory jobs to finish, but vetoes qualification. Failed transfers, metadata, state writes, incomplete enumeration, cancellation, stale plans and readiness regression retain the request. The private generation delta path does not add an implicit inventory beside this attempt. Missing cursors use the ordinary first-run path and retain the request until a later guarded attempt is possible. Healthy completed files and all original historical evidence survive retries.
+
+An explicitly rejected cursor or supported static incremental fallback can still run the ordinary inventory, but cannot qualify the request without the guarded replay evidence. Completed inventory can feed the existing retained-checkpoint hold. A fallback error on the terminal replay does not start a second inventory or substitute a query token. Session, transient and durable-capture refusals keep their existing error routes.
+
+`sync_cycle.rs` retires qualified current work only after required enumeration/path configuration activation and a final FINISHED readiness check. `state/db/checkpoints.rs::commit_checkpoint_transition` compares the exact request value, accepted retained/offered cursor, active configuration hashes, absent pending hashes, and indexing/identity holds. The same transaction completes the inventory's deferred album-membership snapshots and removes the request. Failed comparison or transaction preserves both the request and prior membership; a rejected attempt cannot infer membership absence.
+
+Request retirement writes no source checkpoint. A fixed-date selection can complete this current obligation while its excluded tail still holds the zone/database checkpoint. Sparse identity, expired-cursor and retained provider-work gates remain independent; a qualified request can retire while another hold remains. Legacy coverage certification is retired and cannot supply or veto checkpoint permission. This flow proves neither a provider snapshot nor complete historical deletion coverage, and never authorizes local media deletion.
 
 ### Download and publication
+
+`TaskPlanner::verified_downloaded_path` retains an existing recorded filename when the provider renames the same rendition within the current pass directory. Reuse still requires the same provider content generation, exclusive recorded ownership, an allowed destination and the recorded local checksum. A changed cloud filename alone does not create another local copy. Cross-directory template changes and missing-file destination recovery remain separate decisions.
+
+For captured selection generations, `verified_selection_paths` returns the retained pass key with each published path. Projection keeps a same-pass, same-generation destination across folder-template changes within the configured root. New assets use the new template. An absent recorded destination remains the recovery target when ownership and protected-path checks permit it; publication still uses the no-overwrite path. Other passes' copies need the existing path-family match. This reuses retained generation evidence and adds no mapping table or serialized field.
+
+`TaskPlanner::recorded_selection_path` owns that retained-path choice, alongside receipt reuse and retry-path resolution. Generation projection supplies authenticated scope/pass evidence and keeps authority over frozen decisions and admission. The planner preserves confinement, protected-path checks and local completion proof validation. Managed publication paths remain with the layout owner.
+
+`TaskPlanner::retain_pending_destination` also owns the final recorded-path decision for ordinary pending retries. It keeps a durable reserved destination ahead of an older path, applies the existing content/ownership checks, selects authorized truncated replacement or a safe collision sibling, and retains the accepted claim. Retry orchestration supplies saved evidence and queues only returned tasks. A refused choice leaves the durable target unresolved. Sibling selection and claim retention are private planner operations; retry orchestration no longer mutates task paths independently.
+
+Frozen-generation and authorized truncated-repair destinations use `TaskPlanner::bind_reserved_destination`. The planner claims the exact path before changing the task. Generation orchestration supplies its frozen destination and holds refused work; it no longer performs a separate task-path assignment after a claim.
+
+`TaskPlanner::bind_pending_destination_proof` attaches the cross-directory finalization requirement for a confirmed pending task when current-content saved reservations require it. Ordinary full/incremental dispatch checks its pending snapshot before calling this owner; targeted retry calls it only for selected pending tasks. Both routes use the same library, asset, rendition, checksum and size lookup. Reservation lookup errors propagate before transfer dispatch.
+
+Pending recovery and collected incremental execution share `url_refresh::refresh_expired_download_pass` for one exact-task refresh, execution and result merge. That owner admits retry only after URL expiry, below the transfer authentication threshold, without failed state writes or cancellation. Collecting execution checks its additional provider-authentication and planning-write failures before calling it. Pending recovery no longer has a separate admission branch. The shared owner carries prior authentication failures and fresh URL timestamps into the retry, starts a separate rate-limit counter and merges only the expired candidate results. Provider authentication failures return separately to checkpoint reporting.
+
+Streaming cleanup uses the same exact-task lookup owner for ordinary transfer failures and expired URLs. It no longer re-enumerates albums or replans failed destinations. Refreshed records must match the selected rendition's content generation; the task retains its original path, metadata and publication authorization. Unmatched work remains pending. Cleanup still runs within the existing bounded pass and authentication/cancellation gates.
+
+`url_refresh::refresh_failed_download_urls` is the direct refresh entry point for streaming cleanup, expired-task retry and stale-URL preflight. Captured selections supply their exact source evidence to that owner; ordinary tasks use their selected source identity. The former ordinary and incremental builder wrappers are removed. Cancellation returns the original tasks as unrefreshed without provider requests, retaining exact destination evidence in either case.
+
+`CleanupRetryPlan::execute` consumes a refreshed plan once and hands its exact tasks and URL observation times to the shared transfer/publication pipeline. It starts an independent retry rate-limit counter and includes lookup observations in the returned pass result. Its failed-task list includes both transfer failures and tasks that could not be refreshed. Streaming cleanup consumes that list instead of reconstructing remaining work from the original candidates. Expired-task merging also consumes the returned failures, retaining failures outside that retry. Provider authentication evidence remains separate from transfer authentication counts; each caller retains its existing interruption and checkpoint handling.
+
+Targeted pending recovery currently requires successful source work. A pending row alone does not prove that a destination is unattempted: expired transfers and incomplete managed publication can retain pending state. Removing this gate requires distinguishing that work before scheduling another attempt. The existing gate preserves bounded attempts; remaining pending work survives for ordinary retry after reopen.
+
+The CLI rejects the retired `--retry-failed` flag before configuration, authentication or state startup. Ordinary sync owns automatic retry. The runner no longer resets failed rows or exits early through a separate retry-only startup path; regular dispatch retains its existing pending-work preparation.
+
+`prepare_for_retry` is the state owner's retry-preparation operation, including library scoping, attempt reset and error retention. The retired `reset_failed` wrapper and trait entry have no remaining execution path.
+
+The cycle owner has no retry-only argument or alternate eligibility gates. Inventory qualification, smart-folder path reconciliation, sparse-target preparation and zero-asset warnings all use ordinary sync rules. Pending failures do not reset or consume the provider cursor. Indexing qualification, materialization and retained-cursor replay still require their existing evidence before checkpoint promotion.
+
+`dispatch::finish_incremental_attempt` owns incremental-error fallback execution and rejected-token bookkeeping for ordinary and captured selections. It returns successful attempts unchanged, preserves the captured selection's state-error refusal and chooses its existing inventory executor. Authentication, transport and capture refusals propagate without starting an inventory. Ordinary fallback retains its full-enumeration reason. Guarded inventory reconciliation still owns its separate before/after cursor evidence and does not gain another fallback pass.
+
+Download configuration no longer has a retry-only selection mode. Context loading and the producer do not load or filter against a known-ID set. Current selection can therefore recover pending destinations while discovering new assets. Historical skip diagnostics remain readable, and the inventory fingerprint retains `"retry_only": false` for ordinary-sync compatibility.
+
+Private smart-folder passes use the same captured-generation destinations when their name, query types and filter exactly match the provider's built-in definitions. The Photos adapter validates those definitions; merely labeling a pass as smart does not qualify it. Incremental cycles still refresh smart membership through the current query before admitting work. Query absence does not authorize file deletion, and only the completed zone stream supplies an incremental successor. Unsupported, cross-zone and unowned selections retain their existing dispatch and debt gates.
+
+Before a selection-work watch shortcut and before replaying a quiet delta, the generation owner checks completed selected paths for existence in pages of 256. Only `NotFound` reopens the affected destination in the existing generation queue. Existing files are not hashed or treated as damaged by this check. The state transaction clears that copy's active completion proof while retaining its recorded path, catalog receipts, provider facts and retry timing. Replay supplies the existing targeted confirmation and publication path; completed peers remain complete. Filesystem inspection and state-write errors propagate instead of certifying a quiet cycle.
 
 ```text
 PhotoAsset
@@ -1502,6 +1594,8 @@ preserving the previous path and metadata behaviour. Date-only lower bounds
 use a conservative UTC enumeration bound and then apply the exact resolved
 calendar-date filter, so enumeration safety does not depend on the backup host
 timezone.
+
+Selection date inputs are fixed: `YYYY-MM-DD` means a capture-local calendar date, and `YYYY-MM-DDTHH:MM:SS` means a host-local datetime. `config/runtime.rs::parse_created_date_filter` owns these semantics. Relative `Nd` inputs are rejected with instructions to remove the limit or use a fixed boundary. Sync/service `--recent` and `--recent-scope`, and TOML `[filters].recent` / `recent_scope`, also fail with removal and fixed-date guidance before authentication or state/media changes. TOML rejection runs in `config/input.rs` before CLI precedence, so an override cannot hide a retired saved setting. `import-existing --recent N` uses its own positive-count parser and does not acquire sync date filtering. Fixed-date fingerprints and uncapped compatibility encodings remain unchanged.
 
 Capture-local path rendering does not change the download config hash, so a
 sync that sees no other drift stays incremental and never re-enumerates an
@@ -1562,6 +1656,14 @@ inventory. The retry owner:
 
 Unknown identity is not permission to delete or forget work.
 
+A refused recorded destination stays pending rather than becoming policy-excluded. The retry selector tracks refusal separately from filter exclusions and retains a transient verification marker if no later pass can queue that rendition. A later accepted destination clears the marker. The recorded path, repair reason, attempt history and local bytes remain intact.
+
+Ordinary targeted recovery defers a completed copy when a later currently selected pass still lacks that rendition's verified copy. It uses current pass selection and existing local completion evidence; historical reservations alone do not create work. Adoption first checks the selected task's durable destination. If that reserved destination cannot be adopted, an older catalog copy cannot complete it. The current-publication transaction keeps its ownership and concurrent-change guards.
+
+Transfer admission does not consult lifetime attempt counts. Failed work remains eligible on later cycles regardless of prior attempts; bounded transfer retries and cycle failure gates still apply. The producer no longer loads an attempt-count snapshot or marks tasks exhausted. Recorded attempt counts remain diagnostic evidence. Explicit `[download.retry].per_asset` settings refuse during configuration loading with removal guidance. The retained generation-fingerprint `attempt_limit` and support-report `per_asset` fields are always zero for current execution.
+
+Pending recovery can follow a partial source transfer failure when every reported failure maps to a distinct failed library/asset/rendition target. `SyncResult` carries those transient exclusions through result composition; the pending selector omits them for the rest of that cycle. Independent pending peers can progress without giving failed source tasks another attempt. State-write failures, interruption, authentication expiry, blocked checkpoints, incomplete identities or enumeration, and unmatched failure counts retain the recovery hold. Exclusions deliberately cover all destinations of the same rendition; they can defer another copy until the next cycle. They do not authorize provider checkpoints or change durable retry state.
+
 A pending rendition can retain a valid prior publication after a later download
 attempt failed. Ordinary sync and targeted retry recovery may reuse only its
 current catalog path when prior
@@ -1596,6 +1698,10 @@ adoption requires durable proof that the path holds the current provider
 version and that its filename matches the recorded task filename.
 
 ### Import-existing
+
+Writable sync calls `commands/import.rs::adopt_startup_archive` once for an empty state database, including recovery after state loss. It collects the resolved selected passes through the ordinary import matcher before starting downloads. Existing nonempty state skips this startup census. Missing or empty destinations need no provider scan. Adoption reads provider metadata and hashes local files; it makes no media requests and leaves media and sidecars unchanged. Ambiguous candidates remain unowned so normal sync can choose safe unique destinations.
+
+The metadata key `startup_archive_adoption_v1` records `pending` before the census and `complete` after adoption. Cancellation, incomplete enumeration and local hash or state-write failures retain `pending`, including when earlier candidates were committed. A later process retries that census despite its now nonempty database. Completed startup adoption does not scan again on ordinary sync or watch cycles. Startup adoption errors are reported while independently identified current sync work proceeds; adoption does not advance provider checkpoints.
 
 `src/commands/import.rs` shares configuration, selection, pass planning, and
 path derivation with normal sync. Before matching or consulting prior imports,
@@ -1701,15 +1807,9 @@ cannot redirect deletion. It retires the claim after deletion or when the path
 is missing or no longer the claimed stale file. A suffix and file age alone
 never authorize deletion.
 
-`kei sync --repair-truncated` is the only media-replacement path. Pending
-retry planning requires the durable reconcile truncation marker, confirms the
-recorded file is still truncated, and fingerprints its bytes. After the new
-download and configured metadata writes pass, the file owner replaces only
-that exact fingerprint. It uses atomic exchange where supported and the
-journaled fallback owned by `src/download/file/replacement_recovery.rs`
-otherwise. A changed
-target is restored or retained and the state row stays failed. All other
-downloads keep no-overwrite publication.
+Explicit integrity repair uses `reconcile --inspect-path PATH --confirm-damage SHA256:SIZE`. Inspection alone grants no replacement authority. Schema 42 stores the confirmation on the existing `provider_active_destinations` row, bound to its selection manifest and inspected bytes. It reopens only that destination's completion state and retains historical receipts. The current selected pass attaches the fingerprint to its conditional publication. If the file changes again, inspection can replace the pending confirmation after the operator confirms the new fingerprint. The transaction checks that the previous confirmation still matches. Source unavailability retains damaged bytes and retry work. The file owner uses atomic exchange or its existing replacement journal. The former `sync --repair-truncated` entry point refuses with per-destination confirmation guidance.
+
+Managed primary destinations stay with the primary-layout journal. The planner pins the confirmed damaged input, clears its source provenance, and retains healthy sibling members without rewriting them. The layout owner prepares verified replacement bytes and durably preserves the damaged input before publication. Ordinary landed-repair recovery uses existing independent publication receipts; a fingerprint change by itself cannot complete repair.
 
 When no-overwrite publication finds an existing destination, the file owner
 compares it with the verified `.part` file. Identical bytes are deduplicated.
@@ -1893,18 +1993,7 @@ matching child, and full-evidence matching child counts. It contains no IDs,
 paths, checksums, or provider metadata. These counts do not authorize identity
 selection, even when only one child matches every stored rendition.
 
-Schema v28 can preserve an unclaimed legacy master receipt with at least two
-historical child mappings without assigning it to a child. A complete current
-inventory must contain at least one live child. A sole survivor must satisfy the
-same independent current-child receipt and file checks as a multi-child family;
-historical siblings missing from that inventory do not establish ownership or
-authorize source deletion. Zero-current-child families and saved legacy owners
-remain excluded. `download/legacy_preservation.rs` owns eligibility and
-file validation; `state/db/legacy_preservation.rs` owns immutable evidence and
-generation-fenced receipts. Migration creates empty tables and protection
-triggers only. It does not classify or rewrite existing records. Schema-27
-binaries reject a migrated database; read-only reports require the current
-schema and never migrate it.
+Schema v28 can preserve an unclaimed legacy master receipt with at least two historical child mappings without assigning it to a child. Preparation requires a complete current inventory with at least one live child; a sole survivor is not inferred to own the historical original. Historical siblings missing from that inventory do not establish ownership or authorize source deletion. Zero-current-child families and saved legacy owners remain excluded. Independently identified current children use the normal download and publication checks, without a legacy coverage certificate. `download/legacy_preservation.rs` owns preparation eligibility and file validation; `state/db/legacy_preservation.rs` owns immutable originals, protected paths and retained historical certificates. The original schema-28 migration created empty tables and protection triggers without classifying existing records. Retiring certification added no schema migration and rewrote no files. The subsequent fresh-start transition uses state schema 38. Older schema binaries still cannot open newer state; this change is not a downgrade guarantee.
 
 Preparation protects the original catalogue rows, capture revisions, retry
 receipts, relationship history, media paths and sidecar presence. It preserves
@@ -1932,7 +2021,7 @@ Cumulative transferred bytes are counted separately and do not consume the
 retained-evidence budget. These counts are representation bounds, not process RSS;
 one response is decoded before its page-size guard. A cycle considers at most 64
 new candidates. Exhausting a limit retains the hold. Sparse, malformed,
-cross-library or incomplete evidence cannot activate preservation. No diagnostic
+cross-library or incomplete evidence cannot establish preservation evidence. No diagnostic
 count is ownership proof.
 
 Failed preparation discovery records a versioned, library-scoped
@@ -1942,48 +2031,17 @@ for at most one hour across restart. Retry scheduling, capture cycle counters an
 unchanged relation refresh timestamps do not reset that delay. Changed
 configuration or original-family evidence permits
 a new attempt; malformed, unsupported or out-of-range retry receipts never defer
-work. Deferral supplies no provider evidence or checkpoint permission. Prepared
-records still require fresh certification, and metadata-capture retry scheduling
-remains independent. Successful discovery clears its failure delay.
+work. Deferral supplies no provider evidence or checkpoint permission. Preparation and metadata-capture retry scheduling remain independent. Successful discovery clears its failure delay. Prepared records no longer require certification; unprepared discovery and attribution limits remain outside that retirement.
 
-Preparation and certification use separate complete scans; a preparation result
-cannot certify work performed later. Failure warnings expose only a fixed stage
-and category plus aggregate page, record, transferred-byte and retained-byte
-counts. Provider error text, record identities, paths and URLs remain private.
+Preparation still requires its complete scan. It establishes protected historical evidence, not current work completion or checkpoint permission. Failure warnings expose only a fixed stage and category plus aggregate page, record, transferred-byte and retained-byte counts. Provider error text, record identities, paths and URLs remain private.
 
-Activation requires a normal completed current inventory and, when a retained
-cursor exists, a successful delta bridge. Independently identified current
-children need separate, finalized receipts and verified files for every selected
-rendition. Qualification requires independently verified per-path source
-provenance for the exact child, rendition, provider generation and catalogue
-path, with a freshly verified current local SHA-256. Provider MMCS signatures
-are generation identities and are never compared to local content hashes.
-Historical download hashes and publication without durable source provenance
-remain insufficient. A new unverified publication that changes local bytes
-clears prior source provenance; verified metadata rewrites retain their source
-receipt. Exact-byte relocation can reuse an unambiguous source receipt bound
-to the same library, child, rendition and provider generation. Pending
-rewrite, capture-repair or path-reconciliation debt keeps this conservative
-qualification blocked. Retained reconciliation destination choices are naming
-evidence, not pending work, and remain part of the dependency comparison. No metadata writer is enabled automatically. A replay
-that creates debt holds the cursor; a later cycle may qualify after configured
-current-child work completes.
+Prepared history is no longer revalidated or activated during normal sync. Missing certificates, changed historical dependencies or changed historical files alone do not force a full inventory, delta bridge, checkpoint hold or cycle failure. Existing `unattributed_legacy_proofs` rows and `active_generation` pointers remain unchanged history; normal sync no longer appends certificates or reactivates their old holds. Independently identified current work still uses its normal provider discovery, finalization, retry and checkpoint owners.
 
-Original media and sidecars are fingerprinted through confined paths. Symlinks,
-pending temporary writes, replacement journals, shared paths and changed bytes
-reject qualification. Multiple hard links also reject qualification by default. Preparation warnings retain the aggregate
-`invalid_original_files` candidate count and expose `shared_file_links` as a subset,
-counting each candidate once at its first rejected media or sidecar. Typed shared-link
-errors also expose only the fixed reason `shared_file_links` at certification and
-checkpoint stages. The TOML-only `[download].legacy_preservation_allow_hardlinks`
-flag defaults to false. True waives only the hard-link-count check for original
-and current-child media and sidecars during legacy qualification and revalidation.
-Actual use emits one redacted aggregate warning per library cycle, deduplicated
-by evidence path; enabling the flag without linked evidence emits no warning.
-Other confined-path, byte, receipt, debt and checkpoint validation stays intact.
-Preparation, certification and checkpoint validation consume the same flag.
-Its value is bound into the separate legacy policy hash; ordinary download and
-enumeration hashes remain unchanged. False retains the previous legacy hash.
+Native admission protects the actual state identity recorded in `unattributed_legacy`. An independently authenticated current child is not blocked solely because its provider master matches an ambiguous historical row. Current mapping and unfinished-generation guards still apply. Protected historical paths do not become adoptable by that child; path ownership checks retain their separate authority.
+
+Current source provenance remains separate from historical certificates. Provider MMCS signatures identify generations and are never compared to local SHA-256. Historical download hashes, local-trust declarations and publication without durable source provenance do not establish verified source bytes. Current transfer, metadata, source-identity and state-write failures retain their existing obligations; retiring certification neither clears them nor enables a metadata writer.
+
+Preparation fingerprints original media and sidecars through confined paths. Symlinks, pending temporary writes, replacement journals, shared paths and changed bytes reject preparation. Multiple hard links also reject it by default. Preparation warnings retain the aggregate `invalid_original_files` candidate count and expose `shared_file_links` as a subset, counting each candidate once at its first rejected media or sidecar. The TOML-only `[download].legacy_preservation_allow_hardlinks` flag defaults to false. True waives only the hard-link-count check for qualifying evidence paths. Actual use emits one redacted aggregate warning per library cycle, deduplicated by evidence path; enabling the flag without linked evidence emits no warning. Other confined-path, byte, receipt and current-work guards stay intact. The separate legacy policy hash retains its existing encoding for retained-checkpoint policy comparisons; certification retirement does not change the ordinary download or enumeration hashes.
 
 The opt-in assumes external tools are coordinated so they do not change linked
 contents, metadata, or kei-managed names during the operation. It does not prove
@@ -1999,8 +2057,7 @@ all libraries before opening a journal, including unselected libraries. Missing
 protected parents retain their path reservation through the nearest existing
 ancestor; they do not abort unrelated recovery or clear preservation/checkpoint
 holds. Other filesystem errors and existing protected journals still block
-recovery. Current child files and sidecar presence are also bound
-into the receipt. The preservation owner never moves, rewrites, adopts or deletes
+recovery. The preservation owner never moves, rewrites, adopts or deletes
 original paths. With the hardlink opt-in, that path protection cannot prevent
 changes made through another alias by an unchanged write path.
 Normal downloads, metadata repair, local path reconciliation, imports and source
@@ -2018,40 +2075,11 @@ Source metadata recovery distinguishes protected legacy originals from healthy
 managed primary-layout sources. Managed sources continue through their layout
 owner; pending media or sidecar replacement journals still hold reconciliation.
 
-The final SQLite transaction compares the original snapshot, current child and
-family evidence, receipt generation, configuration metadata and prior cursor.
-It appends the proof and commits the cursor together. Staged config-reconciliation
-cursors use the same transaction. Invalid or stale proof, incomplete current work,
-interruption and write failure retain the prior cursor. Existing current-provider
-identity and checkpoint guards remain independent and are never cleared to permit
-preservation. An unchanged activated receipt can support ordinary incremental
-cycles without another full inventory. Changed family, configuration, file or
-receipt evidence reactivates the hold while retaining every original snapshot and
-prior proof. Reactivation does not authorize historical attribution or rewriting.
+Current checkpoint transactions retain their source cursor, configuration, sparse-identity and stale-plan fences. Failed enumeration, cancellation, unfinished current work without sufficient durable recovery proof, or a failed state transaction retain the affected checkpoint. Historical certificates are neither an extra prerequisite nor a substitute for these checks. The raw inbox, unprepared attribution, all-generation provider-work debt and expired-cursor recovery retain their existing policies and limits; certification retirement does not resolve every historical-state hold or establish recovery of the reports collected in #1044.
 
-`status`, cycle reports and health JSON expose `unattributed_legacy_assets` and
-`unattributed_legacy_pending` separately from download failures. Pending current
-proof makes one-shot exit status, cycle reports and health incomplete, including
-idle health for unselected libraries. Certified but unattributed history alone
-does not fail current sync. Certification refusals include the fixed-label
-`legacy_certification_refusal_v1` diagnostic and a bounded `subreason`; unknown
-errors use `unclassified`, without logging their private source text. The first counts
-legacy records still needing attribution; the second counts records awaiting
-valid current-work preservation proof. Original capture revision and retry history
-remain stored. Advancing current sync does not claim a complete historical backup;
-backup safety remains false while attribution is unresolved.
+`status`, cycle reports and health JSON retain `unattributed_legacy_assets` and `unattributed_legacy_pending` with their existing names, types and scopes. The first counts preserved records with unknown attribution, not paths or renditions. The second counts records without a stored certificate at their recorded `active_generation`, including absent pointers. This is a presence lookup: it does not validate certificate versions, payloads, dependencies, configuration or files. Despite its historical name, it is not pending sync work. Status is per library, completed cycles total selected libraries, and skipped watch cycles report all-catalogue historical totals. Current capture `remaining`, `unresolved` and `deferred` counts, revision `processed` and `failed` tallies, and cycle metadata-capture observations keep their existing meanings.
 
-A missing selected receipt also emits `legacy_receipt_prerequisite_v1` with
-one fixed `prerequisite`: child readiness, absent rendition or scoped path receipt,
-binding mismatch, or missing/invalid verified source. This is a read-only snapshot
-after refusal, not acceptance evidence. A newly eligible snapshot reports
-`receipt_state_changed`; failed or unsupported inspection reports
-`diagnostic_unavailable`. Both retain the original `child_receipt_missing` hold.
-The lookup cannot grant qualification, retry work, write state or inspect media.
-It emits no child/library identifiers, paths, hashes or private database errors;
-support history retains only the enumerated prerequisite. One refusal does not
-establish how many families lack proof. Primary sparse-identity recovery remains
-independent.
+Historical attribution still makes status report `Backup status: unsafe`, because current sync success does not establish historical completeness. Historical counters alone no longer fail one-shot sync, increment cycle or health failures, prevent health's `last_success_at` update, or wake an otherwise idle watch cycle. Current identity and selected-work failures keep their ordinary effects. Primary sparse-identity recovery still requires verified source provenance; stored local trust cannot replace it.
 
 Automatic repair processes at most 500 stale assets per library in one sync
 cycle. When a clean batch makes progress and work remains, watch and service
@@ -2072,7 +2100,7 @@ corrected catalogue metadata, the current revision, and any configured rewrite
 marker before the library revision can become active. Lookup or state failures
 leave the row stale, report the remaining work, and preserve the affected
 provider checkpoint. A library promotes its active revision only when every
-live downloaded row is current. Persisted rewrite markers may drain later
+live downloaded row is current, excluding prepared historical originals without requiring a coverage certificate. Persisted rewrite markers may drain later
 because they are durable recovery evidence.
 
 Metadata failure markers must survive so a later run can retry metadata
@@ -2083,12 +2111,12 @@ deciding whether unchanged media needs downloading. A failed commit preserves
 the provider checkpoint. Queued rewrites drain once per cycle, after every
 producer has finished, so a single writer owns each file. Read-only runs never
 drain. Only that drain retires a marker on success, because it writes the file
-from the same row it then clears. Each bounded rewrite batch loads current
-album and people rows for its library-scoped asset IDs. A grouping-read failure
+from the same row it then clears. Bounded rewrite batches with enabled optional enrichment load current
+album and people rows for their library-scoped asset IDs. A grouping-read failure
 leaves the affected markers pending. A completed download writes the snapshot
 it was planned from, so it records a marker on failure but never retires one.
 
-The first task payload includes its concrete pass album, even when the cycle's
+With `metadata.include_albums` enabled, the first task payload includes its concrete pass album, even when the cycle's
 grouping preload is empty. Provider membership changes update the
 `asset_albums` read model and metadata retry markers in one transaction. The
 projection uses child identity or the recorded legacy state owner, never a
@@ -2241,7 +2269,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 
 | Contract | Owner | Required behavior |
 |----------|-------|-------------------|
-| `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs`, `src/download/pipeline.rs` | Publishing a completed `.part` file never replaces an existing final file unless `--repair-truncated` carries exact durable path and fingerprint authorization, or opt-in `photos.edited_naming="primary"` carries a journaled owned-slot handover with an independent exact preservation receipt. A no-replace collision succeeds only when the verified `.part` and destination bytes are identical. Different or unverifiable bytes retain retry evidence and cannot reach metadata writes or downloaded finalization. |
+| `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs`, `src/download/pipeline.rs` | Replacement requires exact path and fingerprint authorization from explicit fingerprint-confirmed or truncated repair, the per-copy local replacement policy, or a journaled managed-layout handover with independent preservation evidence. Timestamp-based authorization also guards the observed local mtime through publication. A no-replace collision succeeds only when the verified `.part` and destination bytes are identical. Different or unverifiable bytes retain retry evidence and cannot reach metadata writes or downloaded finalization. |
 | `TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP` | `src/download/orchestration/cleanup.rs`, `src/download/pipeline.rs`, `src/fs_util.rs`, `src/state/db.rs` | Orphan cleanup deletes only an exact stale path claimed in durable state. It retains verified filesystem handles through removal and never follows a directory or file symlink. Normal completion and graceful interruption retire the claim. |
 | `SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE` | `src/sync_cycle.rs` | The database pre-check token advances only after a successful non-dry-run cycle with a current pass plan. |
 | `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/orchestration/` | A zone checkpoint advances only with complete token evidence and durable recovery for unfinished work. |
@@ -2362,9 +2390,52 @@ final authority. Do not cite build output, local session files, retained
 investigation notes, or release history as an ownership claim. Describe the
 current owner instead.
 
+## Rendition policy and configuration migration
+
+`config/input.rs` requires top-level `config_version = 1` in existing files and
+rejects retired rendition restrictions before startup can persist configuration
+or open provider work. `config/resolve.rs` maps `[filters].exclude` to four
+independent components: ordinary photos, ordinary videos, Live Photo stills and
+Live Photo videos. Excluding all four is invalid. Persistence and setup emit the
+same marker and exclusions.
+
+`download/filter/versions.rs` selects available full-resolution originals,
+current edits and alternatives for included components. Medium and thumbnail
+resources do not replace a missing original. Live Photo still exclusion covers
+original, edited and alternative stills; video exclusion covers original and
+edited companions. URL deduplication prevents duplicate transfers. Shared
+expected paths keep import and sync resource identities and filenames aligned.
+Historical rendition keys remain readable for state and metadata recovery.
+Expanded defaults intentionally change the enumeration safety hash; its old
+policy encoding remains pinned for historical evidence.
+
 ## Managed edited-primary layouts
 
-`download/orchestration/primary_layout.rs` owns opt-in `photos.edited_naming` transitions. The shared selected-rendition renderer assigns current/original-archive roles without changing rendition keys, RAW selection or URL deduplication. The layout owner confirms current provider resources through the Photos adapter, prepares all selected members, preserves displaced media and sidecars as independent exact copies, then conditionally publishes and retires verified obsolete aliases. Default suffix families retain ordinary append-only behavior.
+### Album path transitions
+
+Schema 40 adds a nullable `directory_binding` to `album_containers`. `download/orchestration/album_directory.rs` binds authenticated container identity to its current path under an unchanged root. It supports a component-aligned `{album}` token with static or `{library}` ancestors and dated descendants. Sanitized hierarchy components remain relative to that root. Initial foreign-directory collisions choose a distinct sibling. Existing per-file receipts retain their paths through an explicitly unclaimed binding; they never establish exclusive directory ownership. Mixed selections also remain unclaimed.
+
+The existing layout operation and member tables store `album-directory-v1` headers and exact per-file evidence. A same-parent move requires exclusive ownership, unchanged managed bytes and sidecars, completed work, stable provider container scope except its name, and unchanged directory identity. The file owner moves the directory without replacement, including user files, verifies its identity, and syncs both retained parents. An occupied destination gets a unique sibling; a racing collision cancels only an operation whose original source identity is still present. Recovery reuses the frozen target after a move has landed.
+
+Recovery checks stable authenticated container identity before its unchanged-name shortcut. If the provider renames the container again during interruption, including back to its original name, preparation finishes the recorded transition before processing the latest name and template. It does not require discovery to reproduce the intermediate name.
+
+An anchored binding remembers additional templates and their confined download root when future files can land outside its original directory. Rename planning combines the anchor census with exact selected external copies. External parent routes reuse the existing operation and member journal and force independent-file fallback. All destination directories are installed before eligible anchor user entries move. External user trees remain in place. Pending route collisions retain the journal; recovery does not cancel only the anchor after another destination has landed. Nested destination routes that leaf collision suffixes cannot separate fail before publication.
+
+Replay rechecks managed bytes before moving a planned source. Local edits cancel the unmoved intent so the next census selects independent-file fallback. A byte mismatch found after movement restores the source without replacement before cancellation. The source census uses validated current native publication or current managed claims. Historical path receipts cannot supply ownership or veto current work.
+
+Independent-file fallback creates its empty directory at a private operation-specific staging path, then journals that identity before publishing the final directory name without replacement. A crash before journaling can leave an unclaimed staging directory, but does not occupy the selected destination or grow its collision suffix. Replay after journaling recognizes the staged or installed identity. Foreign final-directory arrivals cancel only a still-unmoved staging intent and retain the original source.
+
+Publication appends exact current-path compatibility receipts where paths are representable, and successor managed bindings while retaining old manifests, layout bindings, members, and path receipts. Old slots remain fenced. Missing-file recovery does not revive a moved historical slot. Current selection owns scheduling and checkpoint debt. Historical manifests need no directory-specific successor certificate; unfinished physical operations retain their journals and path fences.
+
+For native copies, the directory member freezes the exact source publication identity before movement. The durable move transaction clears that old path's marker and commits the new container binding. The committed operation then represents a landed move, so recovery never restores it over later file writes. Its unsettled native member supplies bounded actual-publication evidence to the existing local policy and finalization owners. Matching current content receives a native receipt only after independent target fingerprinting; changed provider content uses ordinary replacement policy. Actual replacement, metadata publication or preserved-local completion consumes the handoff transactionally. Consumed members retain their evidence but cannot authorize restored historical bytes. Unselected historical renditions do not become checkpoint debt.
+
+Modified or missing media, modified managed sidecars, preserved-local copies, retained edit history, unclaimed directories, mixed selections, and changed hierarchy parents use the journal's independent-file fallback. It freezes the trusted old receipts separately from observed local bytes, creates one stable destination directory, and fences relinquished source slots. Source media remains in place as unmanaged local copies; the ordinary file owner independently establishes the selected destinations. User-added entries move without replacement only from an exclusively owned source directory. Unknown trees and private history remain at their original paths. Current publication and metadata obligations remain with the existing selection owner.
+
+Managed-primary missing-file repair uses the current binding and confirmed rendition. Its existing member journal records optional missing-file evidence while retaining old encodings when that field is absent. The replacement is published without overwrite authority for the absent media. Any surviving owned sidecar is independently preserved before conditional replacement. An unexpected media arrival or changed sidecar remains protected. Recovery never recreates a fenced historical directory. Membership transitions use stable authenticated container identity and the current binding, preserve outstanding publication, and independently complete each destination before withdrawing source admission.
+
+Established managed families resolve their recorded directory from same-pass binding and journal evidence before deriving destinations. Folder-template changes therefore affect new families rather than duplicating existing ones. The same resolution is used by queue planning, previews, processing and interrupted-operation recovery. Recorded rendition filenames remain stable when the resource is unchanged or the file extension stays the same; format-extension transitions retain the layout owner's preserving publication behavior. Historical candidates outside the configured root, or multiple candidates that cannot identify one family, are not guessed into a binding.
+
+`download/orchestration/primary_layout.rs` owns managed-layout transitions. For new families, `photos.edited_as_primary` selects primary naming when true and suffix naming when false (default). Existing bindings retain their recorded naming policy. Pending operations take precedence over committed bindings so interrupted publication finishes under its journaled policy. Processing, queue planning and read-only previews resolve this policy in the layout owner before deriving paths or comparing decisions. The shared selected-rendition renderer assigns current/original-archive roles without changing rendition keys, RAW selection or URL deduplication. The layout owner confirms current provider resources through the Photos adapter, prepares all selected members, preserves displaced media and sidecars as independent exact copies, then conditionally publishes and retires verified obsolete aliases. Default suffix families retain ordinary append-only behavior.
 
 Schema 35 adds independently addressable layout bindings, operations, members, path claims and immutable preservation receipts under `state/db/primary_layout.rs`. Scoped native paths, stable child and pass identity, source/config decisions and a checked binding generation pin each operation. Durable phases are planned, prepared, preserved, publishing and committed; cancellation retains its journal and private prepared files. Recovery runs after filesystem replacement recovery and before ordinary source dispatch. A started handover finishes its recorded generation before new source/config work may plan another operation. Config/path reconciliation performs this recovery before reading catalogue paths, including operations at a previous root or template. First-binding migration inventories each scoped per-path rendition receipt and its own recorded placement independently of current selection or the latest catalogue filename; exact local bytes and the complete path-owner census remain required before preservation or retirement.
 
@@ -2434,21 +2505,15 @@ SQL observations before transaction commit are explicitly identified as attempts
 projection. It exports fixed classes and numeric status codes from the cause
 chain, never messages or provider payloads, and does not decide retry policy.
 
-The inbox, catalogue, selection and work owners publish fixed storage counters
+The inbox, catalogue and work owners publish fixed storage counters
 after successful transaction commit and at existing capacity refusal branches.
 The history worker retains a fixed summary per cycle, not response rows.
 Budgets reuse existing admission accounting and are labeled last observed,
-pre-admission logical charges. Migration returns its compaction summary to the
-schema owner, which publishes it only after the migration savepoint commits;
-failed migration reports no committed reclaim. Optional charge observations
-cannot fail migration. Retained reasons and counters contain no source identity,
+pre-admission logical charges. Historical selection and compaction fields remain readable, but their runtime event writers are retired. Migration retains its savepoints, rollback attempts and error reporting without emitting compaction events. Retained reasons and counters contain no source identity,
 URL or arbitrary error text, and remain subject to queue loss and bounded
 history retention. Unknown observations stay explicitly unavailable.
 
-History and export schema version 1 are separate from report version 3 and state
-schema 36. Raw reports and databases are never packaged. Interrupted writes
-preserve the previous history; read errors and limits appear as partial evidence.
-See [the operator guide](support-export.md) for limits and unavailable evidence.
+History and export schema version 1 are separate from report version 3 and state schema 42. Raw reports and databases are never packaged. Interrupted writes preserve the previous history; read errors and limits appear as partial evidence. See [the operator guide](support-export.md) for limits and unavailable evidence.
 
 ### Explicit missing-reference inventory diagnostic
 
@@ -2465,24 +2530,10 @@ or CompleteLegacyInventory proof. At most one later lookup is observational.
 Ordinary preservation retains its candidate, scope, date and completeness gates.
 See `docs/missing-reference-inventory.md` for bounds and supervision requirements.
 
-### Explicit trusted local bytes for legacy migration
+<a id="explicit-trusted-local-bytes-for-legacy-migration"></a>
 
-`commands/trusted_legacy.rs` owns the offline `reconcile trust-legacy-files plan/apply`
-interface and account lock. `download/trusted_legacy.rs` owns bounded plans,
-confined retained file handles and final byte validation.
-`state/db/trusted_legacy.rs` owns typed `TrustedLegacyFile` acceptances in
-versioned, content-addressed `metadata` keys. Apply installs prefix-scoped
-immutability guards in the acceptance transaction; no-acceptance catalogues are
-unchanged. Their account/provider identity,
-current-child generation, metadata/path and protected-family snapshots are
-rebuilt from current state at apply and receipt lookup. Apply commits all entries
-atomically after final file and cancellation checks. No source checksum is
-inferred or written.
+### Retired legacy local-trust commands
 
-Only legacy current-child coverage consumes this alternate provenance. Its fresh
-inventory, readiness, ownership, file and checkpoint guards still run.
-Nonempty library-scoped acceptance rows extend the legacy dependency fence;
-provider evidence records `verified_source` or `trusted_legacy_file` explicitly.
-No-acceptance dependency serialization is unchanged. Native source verification,
-GPS and ordinary adoption retain their verified-source requirements. See
-[Trusted Legacy Files](trusted-legacy-files.md) for the command boundary.
+`reconcile trust-legacy-files plan/apply` remains parseable and documented in CLI help only to refuse early with guidance to run `kei sync`. `commands/reconcile.rs::run_reconcile` refuses the nested action before resolving the database path; no authentication, state opening, plan creation or media work follows. It adds no declaration and leaves existing trust records, plans and media unchanged. No useful sync consumer of new local-trust declarations remains after coverage certification retires.
+
+Existing `trusted_legacy_file:v1:` metadata records and their immutability guards remain historical evidence. Status counts stored declarations, including obsolete bindings, rather than currently verified files. They do not establish source provenance, ownership, adoption permission or checkpoint authority. Native source verification, sparse recovery, GPS and ordinary adoption retain their source and ownership requirements. See [Trusted Legacy Files](trusted-legacy-files.md) for operator guidance.

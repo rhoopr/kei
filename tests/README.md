@@ -1,5 +1,13 @@
 # kei tests
 
+## Explicit integrity repair
+
+`cargo test --lib explicit_integrity_` exercises per-destination confirmation through the command parser and reconciliation owner, then real selected sync and database reopens. It covers shorter and same-size damage, stale confirmation, concurrent edits, unavailable media, interrupted finalization, and managed-layout publication. Peer byte, modification-time and inode assertions catch accidental republishing. Managed repairs also check retained damaged bytes without cloud-source provenance.
+
+`private_selection_actual_cli_and_watch_reopen_independent_destination_debt` exercises executable inspection, confirmation and unavailable-source sync. When `KEI_INTEGRITY_TLS_PROXY` and `KEI_INTEGRITY_TLS_CA` point to an isolated HTTPS fixture serving its synthetic media, it also checks executable successful repair and a quiet reopened sync. Production certificate and provider-URL validation remain enabled.
+
+## Test workflow
+
 Local iteration uses focused tests. Hosted PR CI owns complete offline and
 platform validation; do not repeat those suites locally by default. Run live
 provider and real host-service checks only when relevant and authorized.
@@ -36,6 +44,18 @@ tests/
 
 ## Test catalog
 
+The `album_directory_` runner tests cover exclusive moves and independent-file fallback, modified local media, unclaimed legacy trees, dated and library-prefixed paths, hierarchy-parent changes, retained edit history, sidecars, occupied destinations, publication failures, and SIGKILL recovery. Each completed transition checks quiet reopens and checkpoint settlement. `primary_layout_missing_member_preserves_legacy_encoding` checks compatibility of missing-primary recovery evidence.
+
+`retired_selection_settings_refuse_before_provider_or_state_writes` runs the real CLI with empty, nonempty and malformed retired filename restrictions and both retired edited-naming values. It checks actionable refusal, unchanged config/database/media bytes and zero provider requests. Filtered-work recovery fixtures use fixed-date bounds; bounded inventory retains its cursor until the expanded selection completes. Managed-layout tests retain established paths under the new suffix default, including read-only previews, edits, metadata updates, interrupted publication, indexing recovery and quiet reopens.
+
+`rendition_migration_refuses_before_provider_or_state_writes` runs sync,
+import-existing and config-show against unversioned configs, an unsupported
+version and every retired rendition restriction. It checks unchanged config,
+database and media bytes and zero provider requests. Component-exclusion tests
+resolve real TOML and compare sync tasks with import paths, including original,
+edited, RAW and both Live Photo video renditions. Persistence tests cover all 16
+exclusion combinations, including refusal when all components are excluded.
+
 | Target | Network | Runs via |
 |--------|:-------:|----------|
 | `cargo test --lib` | no | `just test fast` |
@@ -69,6 +89,12 @@ The three live Rust integration targets also contain offline tests. Without `--i
 they run shared helper tests; `import_existing_live` also checks fixture
 isolation, command construction, and rejection of a removed CLI flag. These
 offline tests run in `just test offline` and `just gate` without credentials.
+
+## Album directory transition checks
+
+`cargo test --lib initial_download_embedded_description_ownership -- --test-threads=1` kills a real sync worker after downloaded-state commit, reopens the database, and delivers an explicit provider description clear. It checks durable field ownership, preservation of unmanaged native metadata, zero recovery downloads, and two quiet reopens. Run with `--no-default-features` for both UTF-8 and non-UTF-8 roots; the default XMP toolkit supports only the UTF-8 fixture. `ordinary_metadata_ownership_survives_managed_adoption_and_clear` covers the same ownership handoff through managed layout adoption, and `identical_existing_publication_does_not_acquire_temporary_field_ownership` checks that discarded temporary metadata cannot authorize clearing an existing file.
+
+`cargo test --lib album_directory_ -- --test-threads=1` covers exclusive initial binding, normal-sync rename with foreign-target collisions, current source ownership, retained historical receipts, current-path missing-file repair, failed state finalization, and Linux SIGKILL recovery before movement, after movement, and after parent durability. Run the same filter with `--no-default-features` for the native build. Successful transitions reopen for two quiet cycles. The schema test checks migration from schema 39 with native authority, preserved-local evidence and pending layout bytes retained across two reopens. The subprocess parent owns the ignored `album_directory_process_death_child` test and its private fixture environment; do not run that child directly. Directory tests use synthetic provider responses and local media. `cargo test --lib album_discovery_` and `cargo test --lib album_delta_` check usable provider names, duplicate leaves, tombstones, and checkpoint refusal for malformed live names.
 
 ## HEIF streaming allocation regression
 
@@ -105,18 +131,12 @@ library suite and need no credentials or stored media fixtures.
 
 Ordinary `cargo test`, `just gate`, coverage, and their all-feature and
 no-default-feature runs exclude the ignored 300-photo stress case. The
-three-photo fixture still checks two source reseeds, two quiet SQLite reopens,
-unchanged media and sidecar timestamps, logical obligations, and preserved
-proof. A separate three-photo, single-cycle test uses a task-scoped test-only
-budget of four writers, crossing the same priority/remaining scheduling branch
-with a reserve of two. The scheduler owner separately asserts the production
-250-current/500-total limits. The small test retains the physical-writer versus
-logical-alias assertions on every code PR with XMP enabled; the full 300-photo
-case crosses the real default limits. The override cannot affect parallel tests
-or production builds.
+three-photo fixture checks two independent album copies per photo, two source reseeds, two quiet SQLite reopens, unchanged completed media and sidecar timestamps, logical obligations, and preserved proof. A separate three-photo, single-cycle test uses a task-scoped budget of eight writers with a reserve of four, crossing the priority/remaining scheduling branch with six physical writers. A five-writer budget exercises overflow across reseeds with the same six copies. The scheduler owner separately asserts the production 250-current/500-total limits. The 300-photo case has 600 independent physical writers. Each reseed leaves 100 current metadata receipts pending under the 500-row budget; the first unchanged cycle drains them, followed by two quiet reopens. Completed physical sidecars must remain unchanged across every later cycle, including source reseeds. Task-scoped overrides cannot affect parallel tests or production builds.
+
+The collision regressions cover album/album, album/smart-folder and smart-folder/smart-folder destinations, completed-copy deletion, exact-path recovery, locally edited peer preservation, and two quiet reopens. Admission regressions cover both concurrent fresh decisions and a confirmed selected deferred decision whose path was claimed before its original blocker cleared. The latter retains its frozen declaration on conflict and recovers through a current-configuration successor. Historical shared-path receipts remain intact; the historical metadata control still requires one physical writer for two retained aliases. Current colliding-album metadata fixtures retain prepared-output corruption, writer-option drift, finalization faults and native-path controls for independent physical copies.
 
 Run `just test stress` (or `bash scripts/test-copies-stress.sh`) for the full
-300-photo, five-cycle proof. The runner requires exactly one ignored test in
+300-photo, six-cycle proof. The runner requires exactly one ignored test in
 the catalog and one passing execution; `--check` validates only the catalog.
 The regular Linux CI test job checks this catalog so a rename, lost ignore
 marker, or feature change cannot silently remove the stress proof.
@@ -172,7 +192,7 @@ suites execute these same tests; the gate also validates the scenario filters.
 | Evidence | Tests selected by the slice |
 |----------|-----------------------------|
 | Missing, null, out-of-range, and valid epoch capture dates; one child or a matching visible/hidden sibling | `hidden_invalid_capture_date` selects both metadata capture and pending recovery |
-| Conflicting or missing historical dates/owners and failed retry persistence | `run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint`, `bounded_full_sync_hydrates_live_legacy_pending_master` |
+| Historical dates, ownership and preservation of unselected pending media | `run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint`, `bounded_full_sync_preserves_unselected_legacy_pending_master` |
 | Deferred work, changed authoritative evidence, bounded recovery, and no repeated completed work | `run_cycle_metadata_capture_retry_preserves_durable_checkpoint_until_repaired`, `ambiguous_capture_repair_keeps_identity_and_checkpoint_without_full_backfill` |
 | Schema-28 preservation with one or multiple current children | `run_cycle_single_survivor_preserved`, `run_cycle_ambiguous_children_preserved_independently` |
 | Changed rendition evidence and stale retry attempts | `metadata_capture_retry_changed_evidence_is_due_and_old_attempt_cannot_delay_it` |
@@ -264,22 +284,9 @@ replays. Each entry records its provenance and relationships among the provider
 family, SQLite evidence, files, and configuration. The runner instantiates those
 relationships using the existing synthetic recovery fixture.
 
-Eight default seeds draw 1-18 faults with replacement from nine events. They vary
-length, repetition, missing child evidence, invalid dates, visibility, temporary
-recent-item filtering, interrupted lookup, and failed refresh. Every history has
-the same required ambiguity/deferred/failed-refresh prefix and valid/two-quiet
-cycle tail. The prefix establishes a known durable owner; generated faults test
-that retained owner's recovery, not arbitrary attribution of unknown families.
-The original four fixed schedules remain separately runnable. Together, the six
-tests execute 192 production cycles. The initial all-feature run took 7.02 seconds
-with a warm build cache; compilation is excluded.
+Eight default seeds draw 1-18 faults with replacement from nine events. They vary length, repetition, missing child evidence, invalid dates, visibility, temporary fixed-date filtering, interrupted lookup, and failed refresh. Every history has the same required ambiguity/deferred/failed-refresh prefix and valid/two-quiet cycle tail. The prefix establishes a known durable owner; generated faults test that retained owner's recovery, not arbitrary attribution of unknown families. The original four fixed schedules remain separately runnable. Together, the six tests execute 192 production cycles. The initial all-feature run took 7.02 seconds with a warm build cache; compilation is excluded.
 
-All histories enter the production cycle and reopen SQLite after every operation.
-The oracle uses fixture facts to check exact ownership, status, dates, checksums,
-retry/revision state, checkpoints, original bytes, unrelated sidecar bytes, and
-bounded work. Recovery must complete on the first valid tail cycle. Two further
-cycles must not repeat metadata hydration, repair, or download. Configuration
-changes here cover recent-item selection only; metadata writers remain disabled.
+All histories enter the production cycle and reopen SQLite after every operation. The oracle uses fixture facts to check exact ownership, status, dates, checksums, retry/revision state, checkpoints, original bytes, unrelated sidecar bytes, and bounded work. Recovery must complete on the first valid tail cycle. Two further cycles must not repeat metadata hydration, repair, or download. Configuration changes here cover fixed-date selection only; metadata writers remain disabled.
 
 Run the focused slice with `just test scenario identity-recovery`. Replay a seed:
 
@@ -306,17 +313,11 @@ state, abrupt process death, or power-loss durability.
 
 ### Legacy current-content provenance
 
-`run_cycle_legacy_opaque_mmcs_qualifies_after_reopen` uses opaque 21-byte and
-32-byte provider generation signatures unrelated to downloaded SHA-256. Actual
-ordinary and Hidden-only cycles qualify independently downloaded current work,
-then reopen SQLite twice without repeating downloads or altering retained
-legacy evidence. Unknown source provenance and failed checkpoint transactions
-have separate held-cycle controls. State receipt tests refuse unknown historical
-hashes, generation/path/local-byte mismatches, metadata debt and unverified
-replacement bytes after reopen. Exact-byte relocation retains only unambiguous,
-scope-matched source lineage. A publication state-write failure remains held
-after on-disk adoption; its recovery fixture retains that copy and performs
-a fresh verified download before certification and a quiet reopened cycle.
+`run_cycle_legacy_opaque_mmcs_qualifies_after_reopen` uses opaque 21-byte and 32-byte provider generation signatures unrelated to downloaded SHA-256. Ordinary and Hidden-only production cycles download independent current copies, preserve historical rows and originals, and check two reopened cycles without repeat transfers. The old test name does not imply certificate activation: `active_generation` stays unset and the uncertified historical count stays visible.
+
+`run_cycle_legacy_opaque_mmcs_checkpoint_failure_stays_atomic` injects a current cursor-write failure, retains the prior cursor, then removes the failure and checks reopened recovery. `run_cycle_legacy_opaque_mmcs_unknown_source_stays_unverified` exercises sync with the unverified-source store variant; unknown historical provenance no longer creates a certification hold. The state-owner `legacy_current_receipts_require_exact_verified_source_after_reopen` matrix separately rejects historical hashes, generation/path/local-byte mismatches, metadata debt and unverified replacements. `legacy_relocated_receipts_reuse_only_exact_unambiguous_source` checks scope-matched source lineage.
+
+`run_cycle_single_survivor_current_write_failure_recovers` retains bytes from a failed publication finalization. Its later recovery moves those unverified copies aside, invokes the production drift probe, requires a fresh download and checks stable follow-up cycles. No recovery step writes a legacy coverage certificate.
 
 `private_destination_opaque_mmcs_proofs_survive_reopen` covers native destination
 proof creation and validation through normal downloads, compatible destination
@@ -333,27 +334,11 @@ The current-child seed records verified source explicitly; historical legacy and
 other generic receipts keep unknown source. The fixture asserts these initial
 source facts before running its unchanged progress and preservation oracles.
 
-`mixed_library_provider_shapes` composes long-lived synthetic families in two
-zones with reused raw IDs, distinct dates and checksums, independent current
-children, unattributed legacy files, and numbered Live Photo publications in
-two zone-local albums. Two fixed histories each run six production cycles through
-`run_cycle`, reopening real SQLite after every cycle. One withholds the final
-inventory while another zone progresses; the other changes still-only selection
-to both renditions and changes album selection and order during identity debt.
-Both retain complete-evidence recovery and two quiet cycles. The recovery
-cycle makes any synthetic discovery retry eligible by changing only its due
-timestamp; it retains the retry signature, identity debt and all receipts.
-This models elapsed scheduling time without sleeping or bypassing proof gates.
+`mixed_library_provider_shapes` composes long-lived synthetic families in two zones with reused raw IDs, distinct dates and checksums, independent current children, unattributed legacy files, and numbered Live Photo publications in two zone-local albums. Two fixed histories each run six production cycles through `run_cycle`, reopening real SQLite after every cycle. One withholds the final inventory while another zone progresses; the other changes still-only selection to both renditions and changes album selection and order during identity debt. Both explicitly seed current selection drift to reach inventory discovery without a historical-certification trigger. A healthy zone can finish local work and stage its successor while another zone holds atomic configuration activation. Both histories retain complete-evidence recovery and two quiet cycles. The recovery cycle makes any synthetic discovery retry eligible by changing only its due timestamp; it retains the retry signature, identity debt and all receipts. This models elapsed scheduling time without sleeping or bypassing proof gates.
 
-Each history runs through baseline responses, independent-family reordering and
-alternate page cuts, then those same cuts with exact duplicate observations and
-an empty continuation page. These are equivalent snapshots, not reordered causal
-updates or tombstones. Normalized state comparisons include identity, ownership,
-publication receipts, membership, retry and deletion state, and active and staged
-zone checkpoints. Independent oracles check legacy bytes, existing numbered paths,
-new-child ownership and subsequent stability, request bounds, and quiet hydration,
-download, metadata-repair and file counts. New collision suffix spelling is not
-part of response equivalence. Mock-server bind failures fail the test.
+Each history runs through baseline inventory responses, independent-family reordering and alternate page cuts, then those same inventory cuts with exact duplicate observations and an empty continuation page. These are equivalent snapshots, not reordered causal updates, tombstones or duplicate-delta scheduling tests. Normalized state comparisons include identity, ownership, publication receipts, membership, retry and deletion state, and active and staged zone checkpoints. Independent oracles check legacy bytes, existing numbered paths, new-child ownership and subsequent stability, request bounds, and quiet hydration, download, metadata-repair and file counts. New collision suffix spelling is not part of response equivalence. Mock-server bind failures fail the test.
+
+`duplicate_created_prepared_archive_replay` covers the separate unchanged-config collecting route with a retained cursor, prepared uncertified historical files and one repeated Created child. It requires one transfer, file and receipt, unchanged historical bytes and retry evidence, cursor progress, and two quiet reopened cycles. The historical transfer and finalization failure fixtures also use duplicate Created input through collecting before checking retry and quiet recovery.
 
 The cap is 36 production cycles per feature configuration. Replay JSON selects
 one complete six-cycle history and encoding; a non-baseline encoding also runs its
@@ -377,6 +362,14 @@ separate lower-level coverage. This small composition matrix does not qualify
 whole-library inventory memory or request cost at production library scale.
 
 ### Abrupt process-death recovery
+
+The destination process-death matrix includes authenticated non-default owners with distinct membership and media owner strings. It checks exact persisted owner fields after reopen; source-confirmation tests reject a different owner before making a provider request. The explicit-owner parent also runs without default features.
+
+`cargo test --lib destination_process_death_preserves_unfinished_peer` runs the same-zone and cross-zone destination cases on Linux. The cross-zone case uses authenticated source profiles and real production dispatch, retains original membership pages, verifies media-library ownership, and refreshes current queries after owner-zone deltas. Both cases restore only the unfinished peer after killing the child, then preserve historical reservations and bytes through two quiet follow-ups. The cross-zone case also runs without default features.
+
+`private_capture_timestamp_repair_uses_selected_destinations_and_existing_writer` covers a separate returned-error boundary: ordinary sync preserves existing EXIF time, explicit repair changes it, and a finalization fault leaves exact prepared output that completes after reopen without downloading again. It checks two quiet follow-up cycles and runs with and without default features. This is not an abrupt process-death test.
+
+`cargo test --lib shared_destination_process_death_preserves_unfinished_peer` exercises shared-database selection on Linux. It kills a child after one selected album copy is durably verified while the second transfer is in flight. Production dispatch restores only the unfinished copy, then makes no media requests through two further reopens. Historical reservations and bytes remain unchanged. The ignored child test runs only under its parent.
 
 On Linux, `process_death_recovery_matrix` kills six dedicated subprocesses with
 SIGKILL: fallback-journal displacement, installation and commit; media publication
@@ -617,8 +610,7 @@ full-zone history, expired-epoch completeness or inbox-driven materialization.
 
 ## Transactional source catalog replay
 
-Owned file-backed fixtures replay schema-29 captured sources through migration
-and two quiet reopens. Independent expected facts include masters, assets,
+Owned file-backed fixtures preserve schema-29 captured sources as historical evidence through migration, then rebuild current sources and check two quiet reopens. Independent expected facts include masters, assets,
 albums, membership, unknown records, typeless tombstones and incomplete links.
 Literal references retain escaped source field paths and cross-zone provenance;
 original JSON bytes and numeric lexemes remain unchanged. Distinct revisions and
@@ -626,7 +618,7 @@ private/shared scopes stay separate; replaying an old page cannot overwrite fact
 
 A receipt trigger aborts after real record, reference and unresolved-evidence
 writes. The index rolls back completely while the original capture survives.
-An actual CLI fixture starts with a schema-29 backlog, fails projection in two
+An actual CLI fixture starts with a current-schema backlog, fails projection in two
 processes, removes only the injected trigger, recovers and repeats quietly twice.
 Existing media, downloaded receipts, metadata revisions, pending retry and old
 scope sparse debt remain intact. That retained debt keeps the overall CLI cycle
@@ -726,46 +718,73 @@ perform no new lookup or download and preserve existing media, sidecar, old
 cursor and unrelated debt. Metadata-only wake-up remains with its option-aware
 precheck rather than forcing disabled writers to run.
 
-These tests qualify bounded supported-path admission and targeted queue recovery.
-They do not claim recent-cap semantics, named-album or shared-endpoint admission,
-capture-owned cursor promotion, snapshot absence, pruning, historical retention
-or acknowledgment of unrecoverable debt.
+These tests qualify bounded supported-path admission and targeted queue recovery. They do not claim named-album or shared-endpoint admission, capture-owned cursor promotion, snapshot absence, pruning, historical retention or acknowledgment of unrecoverable debt.
 
-## Recent count selection recovery
+## Count retirement and guarded inventory
 
-The recent overflow fixture starts with owned, populated SQLite/media and a
-retained source cursor. Shuffled multi-page deltas, overlapping albums and an
-unfiled pass enter the actual dispatcher. Independent expected paths distinguish
-library-wide top N before filters from up to N per filter; duplicate album copies
-and a Live Photo companion distinguish assets from output-file counts. Reopening
-with unchanged provider deltas increases and removes the cap, recovers omitted
-work, and checks two quiet cycles without additional byte requests or inventory
-once current EOF evidence qualifies the receipt.
-The actual CLI history uses its existing name-id7 skip policy for synthetic
-local files and checks the selected paths, scoped catalog/receipt/checkpoint,
-unchanged bytes/mtime, other account and unselected pending scope. It does not
-claim that a filename skip creates downloaded-state or verifies source bytes;
-fresh publication/checksum/finalization are asserted in dispatcher histories.
+`cargo test --lib sync_loop::runner::tests::inventory_reconciliation::` exercises the production cycle and dispatcher with account-owned file-backed SQLite, historical media, unrelated sidecars, retained retry evidence and a source cursor. Fixtures explicitly run historical migration steps to construct the outstanding inventory request, retaining exact old receipt bytes for malformed, future-version and already-complete-but-mismatched payloads. Schema-38 production upgrades instead retire those historical cursors. Matching, missing and mismatched enumeration hashes cannot hide a current presence-only inventory obligation. A separate schema-owner test checks the historical step's exact old-key prefix matching, existing-request preservation and no reseeding after completion.
 
-The recent recovery receipt is fixed-size hashed account-database-local evidence,
-not a retained list of selected or discarded records. Pending, malformed, future
-version, changed scope/exclusions and failed successor commits force current
-inventory. Receipt/task write failures and cancellation preserve the prior
-cursor and historical media, then reopen through the same production owner.
-Actual cycle tests cover exact EOF and enumeration-hash drift with a rank token
-that differs from the completed changes/zone successor. Quiet watch prechecks
-wake only the affected selected zone. Unknown catalog records and old-epoch debt
-remain retained. Sparse/deletion cycle controls keep recent enabled and provide
-coherent current inventories. A valid media asset still publishes while an
-unrelated source identity remains unresolved; its source checkpoint and recent
-receipt remain held. These histories grant no absence, deletion or expired-history
-proof. Truncated windows still hold the existing checkpoint and may repeat
-inventory. Catalog-owned selection generations remain a later stage.
-Global-frontier dispatcher controls cover 401/403/421 session recovery and a
-non-session failure with no fallback, preserving the cursor, pending receipt
-and existing media across database reopen.
+The shared/private histories require replay from P to S, one current inventory, and a terminal raw-empty replay from S. Query tokens differ from source successors. A multi-page rank displacement and an unknown raw record that emits no asset event must retain the request and trusted cursor. Later quiet evidence recovers the omitted asset exactly once. Healthy media still publishes when initial delta identity, transfer or state work fails; those failures cannot qualify the inventory. The private-generation case bounds the attempt without implicit extra generation scans.
+
+Request-clear transaction failure, cancellation, changed configuration and changed request values preserve the request and prior album membership across SQLite reopen. Successful retirement completes deferred membership in the same fenced transaction. Two quiet reopened cycles check exact downloaded bytes, receipt preservation, no repeated guarded replay and no duplicate transfers. Missing-cursor coverage retains the request through the ordinary first run. Fixed-date coverage can retire the current request while source/database checkpoints remain bounded; independent recovery holds can also remain. Historical legacy certification is no longer a checkpoint requirement. These are current-work proofs, not provider snapshot, complete deletion-history, power-loss or live-account qualification.
+
+`cargo test --test behavioral retired_sync_count_inputs_preserve_archive_before_auth_or_startup_writes` checks sync/service flags and saved `recent` / `recent_scope` against a populated archive. Rejection must precede authentication and startup writes, preserve config/state/media, and give fixed-date guidance. CLI and config tests keep positive import-only sampling separate from the retired sync settings. Generated config and the example must omit both retired keys.
+
+## Historical evidence and current work
+
+Legacy coverage certificates are retained history, not current completion or checkpoint authority. When adapting fixtures, keep their original discovery, ownership, path, media, metadata and failure stimuli. Replace certification-only assertions; do not remove a current observation just because the retired route used to discover it. A current write failure must remain reachable through a production owner rather than an inactive proof writer.
+
+Require current-item progress with preserved historical rows, protected originals, missing certificates and changed historical evidence. Historical counters alone must not fail a cycle, prevent a health success or cause repeated inventories. `unattributed_legacy_pending` now inventories missing stored certificates at the recorded generation without dependency revalidation. Preserve the separate `Backup status: unsafe` historical-completeness warning and all current retry, unresolved-identity, metadata and checkpoint failure oracles.
+
+Retired `reconcile trust-legacy-files plan/apply` cases must prove early actionable refusal with existing declarations, configuration, state and media unchanged. Historical declarations are setup evidence, not a successful new trust operation or verified source provenance. Preserve real current discovery, healthy-peer progress and current-failure recovery in former trust fixtures. Use reopened state and quiet follow-up cycles where applicable; record actual test entry points and results only after the adapted production paths have run.
+
+These requirements do not retire raw-inbox limits, all-generation provider-work debt, unprepared attribution or expired-cursor holds. They add no schema migration or media rewrite and do not establish recovery of a reporter's complete account.
+
+### Production-cycle regression entry points
+
+`cargo test --lib sync_loop::runner::tests::historical_preservation::` selects account-owned, file-backed production-cycle fixtures with nonempty historical originals and sidecars, a selected Live Photo and a healthy peer. `historical_certificates_missing_stale_and_future_do_not_gate_current_live_photos` asserts current completion with absent, stale or unsupported stored certificates. `historical_changed_or_missing_originals_do_not_recertify_or_release_reserved_names` checks that historical drift neither creates current retries nor releases protected paths. `historical_records_allow_current_config_activation_in_same_and_second_zone` checks current configuration and cursor activation without altering retained history.
+
+`historical_records_do_not_hide_explicit_child_or_master_family_deletion` applies explicit deletion observations to both current Live Photo renditions while retaining local media. `historical_records_retain_current_transfer_finalization_and_missing_file_failures` injects failed transfers, downloaded-state finalization failure and production-detected missing current media; it requires retained failed work, healthy-peer progress and later recovery. With `xmp`, `historical_records_retain_selected_metadata_failure_until_quiet_retry` checks a conflicting sidecar, retained media and failure markers, then successful queued retry.
+
+`historical_records_do_not_relax_current_identity_enumeration_cancellation_or_stale_plan` retains current refusals and the original cursor. `historical_records_preserve_checkpoint_and_configuration_transaction_atomicity` injects cursor and active-configuration writes that fail, then checks recovery after removing the faults. These fixtures compare historical rows after each cycle, reopen owned state and require two successful unchanged tail cycles with stable files, receipts and checkpoints, no new media GETs and no rank inventory. They use synthetic responses and local HTTP downloads; SQLite reopen is not process-death or power-loss qualification.
+
+`historical_legacy_counters_do_not_fail_completed_reporting` asserts successful JSON reporting and health updates with nonzero historical counts. `historical_legacy_counters_do_not_fail_idle_health` checks all-catalogue counts during skipped watch cycles without failing health, including a stored certificate with stale dependencies. The behavioral `preserved_legacy_status_and_reconcile_keep_attribution_separate_from_failure` checks the separate unsafe historical-backup status and protects original receipts from integrity-retry conversion. These are test entry points and assertion contracts, not a record of the latest qualification results.
 
 ## State-transition proof
+
+`cargo test --lib primary_layout::membership` exercises membership departures through `run_cycle` with authenticated synthetic provider pages and reopened SQLite. Initial cycles publish album copies before relation-only departures, a cross-page move, or a container tombstone. Checks cover remaining-album copies, enabled and disabled unfiled placement, interruption, unavailable photo identity, malformed relations, missing discovery, whole-photo deletion, modified media and foreign sidecars. Native copies create no initial layout journals; departure retains source receipts and clears only exact current publication authority. Preserved-local dispositions cannot authorize retirement even with matching bytes. Linux subprocess fixtures kill retirement before publication and after file retirement, reopen non-UTF-8 destinations, and check two quiet cycles. A preservation disposition recorded after journal creation also prevents recovery from retiring that copy. The same tests run with `--no-default-features`.
+
+`cargo test --lib historical_shared_album` retains the historical shared-path controls in the queue-projection fixture. Legacy source reuse alone grants no current authority. A real metadata publication can grant one alias current authority, but another pass's historical claim still prevents exclusive membership retirement. The original receipts, shared file, independent successor copies and two quiet reopens remain checked.
+
+`cargo test --lib late_sidecar` kills membership retirement after durable preservation and after media has moved but before sidecar retirement. Reopening after a native foreign-sidecar creation or a managed owned-sidecar edit must leave or restore the media next to the user's metadata and retain the journal, claims and publication evidence across two further reopens. Unchanged controls complete without repeated media requests. Managed XMP creation runs with the `xmp` feature; the native cases also run with `--no-default-features`. `cargo test --lib retirement_pair` injects changes between disposition validation and no-replace rename, after each move, and during parent-directory replacement. It checks restoration, retained saved bytes when a later media writer occupies the original path, and untouched entries in the replacement namespace.
+
+The durable-container fixture starts from ordinary native publication, persists deletion through the membership owner, then reopens with no current delta tombstone. The deleted-bound zero-pass fixture feeds the selector handoff into `run_cycle`, retries unavailable identity after reopen, and checks that no unfiled destination or rank-enumeration page appears. It rejects caller-only deletion flags, selector-component drift and configuration drift. The production watch precheck wakes unresolved recovery and stops forcing work after retirement. Two quiet reopens leave the original provider checkpoint and layout-operation count unchanged. Restoring the container revokes recovery authority while retaining readable generation history.
+
+`deleted_bound_album_actual_cli_redistributes_real_publications` combines hierarchical selector startup with native membership recovery through the actual CLI. It downloads from an isolated HTTPS fixture and verifies native destination receipts before deletion, without seeding fallback files or publication receipts. It checks unfiled enabled and disabled, foreign-sidecar preservation, missing/live tombstone refusal, incomplete discovery, unknown selectors, and two quiet reopens. This test is ignored by default: provide `KEI_TEST_HTTPS_PROXY` for a local CONNECT proxy serving the fixture bytes at `https://p01.icloud-content.com/media`, and `KEI_TEST_CA` for its test CA, then run `cargo test --test behavioral deleted_bound_album_actual_cli_redistributes_real_publications -- --ignored`. The subprocess trusts that CA through `SSL_CERT_FILE`; production HTTPS and hostname checks stay enabled. The same command supports `--no-default-features` before `--test`.
+
+`cargo test --lib destination_retry_does_not_resurrect_historical_reservations` runs the same two-album partial-transfer scenario through captured selection and ordinary dispatch. One copy completes, the other fails, and an unselected same-content historical reservation points to an absent file. After SQLite reopen with a quiet provider delta, only the failed selected copy downloads. Two further reopens make zero media requests. Both selected copies have the expected bytes, the historical reservation remains exact, unrelated historical bytes stay untouched and the historical missing file is not recreated.
+
+`refused_recorded_destination_remains_pending_across_reopen` exercises the retry planner with a recorded truncated file and a competing in-flight path claim. Refusal preserves pending state through two database reopens, including path, attempt count, repair reason and bytes. Removing the competing claim permits the recorded repair task and clears its transient marker. This proves retry admission; the publication/recovery suite covers subsequent transfer and publication safety.
+
+`inventory_initial_delta_failure_cannot_advance_before_inventory_qualifies` retains the provider cursor after a transfer failure, then seeds 100 historical attempts and reopens through the production runner. Recovery completes only the failed media, preserves completed peers and reaches two quiet cycles. The real-CLI retired-setting matrix checks `per_asset` values zero, ten, one hundred and malformed text, with unchanged config/state/media and zero provider requests.
+
+`cargo test --lib pending_peer_progresses_during_partial_failure_without_extra_same_cycle_attempts` exercises ordinary incremental dispatch with a missing recorded pending destination and an unrelated new transfer failure. The pending peer completes during the failing cycle; the failed source transfer recovers after reopen, followed by two quiet reopened cycles. The fixture checks exact media GET counts, bytes and pending/failed/completed rows. Authentication, interruption, state-write, checkpoint, identity, enumeration and unmatched-count controls retain pending work without HTTP transfers. Composed results preserve retry exclusions.
+
+`cargo test --lib fresh_start_ -- --test-threads=1` checks the schema-38 fresh-start boundary. The production-cycle fixture starts with existing media and sidecar bytes, completed peers and a failed transfer, then damages historical planning payloads and sparse identity evidence. It checks that retirement preserves historical bytes, starts a full enumeration, keeps a current transfer failure checkpoint-blocking, and completes the retry without downloading completed peers again. A separate process reopens the same database for two quiet cycles. Other controls cover transaction rollback, retirement before old payload compaction and recovery of an interrupted primary publication. The ignored restart worker is invoked by its parent test.
+
+Provider-inbox upgrade tests seed historical alias rows with uninterpretable certificate bytes and check exact preservation of the alias, original observation hash and representative body. Current raw capture must succeed, reuse equivalent observations at zero spare capacity through two reopens, and still reject corrupted current bytes. The retired alias reader and compaction algorithm have no execution tests. Other upgrade fixtures check full inboxes, oversized historical projections and inconsistent dependencies. Current capacity and catalog-refusal telemetry retain production-path coverage.
+
+The provider-inbox diagnostic fixture checks that a real upgrade emits no compaction event. `historical_compaction_evidence_survives_new_cycles_and_reopen` reads released-format support history, adds current cycles and saves it twice, checking that all historical compaction fields survive while new cycles remain unobserved. Migration rollback and recovery stay covered by the schema and owned-backup tests.
+
+Capture-failure fixtures inject faults into actual page or ordinal-identity writes. They retain rollback, capacity, checkpoint and reopen assertions after retirement of the unused `provider_shadow_receipts` pointer. The provider fixture also installs a fault on that obsolete writer and requires successful current capture without invoking it.
+
+Owned-schema backup checks run with `cargo test --lib owned_migration_backup` and `cargo test --test behavioral migration_backup`. They use existing file-backed databases, committed WAL rows and exact startup configuration bytes through the production writable opener. They check independent snapshot restoration, writer exclusion, backup failure before migration, late migration rollback, private permissions, no-overwrite publication and unchanged reopens. On Linux, subprocess checks kill the owner at six backup/migration boundaries and reopen the resulting state. These are process-interruption checks, not power-loss qualification.
+
+The behavioral backup matrix is enabled on Unix and Windows and covers eight writable command routes and configuration-file versus no-file startup. A portable classification regression checks that `.partial` directories remain incomplete even when they contain a manifest. CLI/environment overrides and credentials are outside the backup contract. Windows-specific fixtures cover ACLs, publication and SQLite-backed recovery. Native Windows execution remains pending; cross-compilation of filesystem helpers alone does not qualify the complete upgrade path.
+
+Windows stage-substitution regressions replace the populated directory before publication and require identity refusal. The production-opener fixture checks unchanged source schema, database/WAL, configuration and media, preserved backup and foreign evidence, then recovery and two quiet reopens. Helper controls check parent confinement and legitimate publication. Source-bound helper/regression compilation passed; the complete Windows workspace build and native execution remain pending.
+
+The Linux DELETE-mode interruption regression forces migration page spill before killing the production opener. Correct-account and wrong-account reopen attempts must both preserve the database and hot journal when ownership cannot be read safely. The fixture then restores the verified snapshot and checks successful migration and two unchanged reopens. It checks the generated restoration guidance, including preservation of rollback journals. It does not execute an older kei binary or prove power-loss recovery.
 
 Changes to durable configuration, filesystem paths, media publication,
 metadata, SQLite state, retry work, or provider checkpoints require a
@@ -829,17 +848,7 @@ canonical database inode. This proves process-interruption recovery, not
 power-loss durability or automatic orphan cleanup. Other platforms run the
 owner, CLI and quiet-cycle tests without the Linux SIGKILL matrix.
 
-The `smart_reconciliation` production-cycle tests use file-backed SQLite,
-pre-existing downloaded media and a changed smart-folder path template. Bounded
-cases change recent eligibility or a lower date bound, preserve the excluded
-provider tail, reopen state each cycle and check retained old media, atomic
-path-hash promotion, held source/database checkpoints and an unchanged cycle
-without catalog reconciliation or duplicate files. Failure cases cover malformed
-queries, missing or mismatched frontier tokens, cancellation after the selected
-prefix, stale plans, local finalization and checkpoint/promotion write failures.
-An owned private selection with real retained deferred debt also keeps the path
-transition pending after a successful bounded query and file-backed reopen.
-Ordinary bounded refresh queries remain part of the unchanged cycle.
+The `smart_reconciliation` production-cycle tests use file-backed SQLite, pre-existing downloaded media and a changed smart-folder path template. Bounded cases change a lower date bound, preserve the excluded provider tail, reopen state each cycle and check retained old media, atomic path-hash promotion, held source/database checkpoints and an unchanged cycle without catalog reconciliation or duplicate files. Failure cases cover malformed queries, missing query tokens, cancellation after the selected prefix, stale plans, local finalization and checkpoint/promotion write failures. An owned private selection with real retained deferred debt also keeps the path transition pending after a successful bounded query and file-backed reopen. Ordinary bounded refresh queries remain part of the unchanged cycle.
 
 The `sync_loop::runner::tests::indexing` tests use file-backed SQLite reopened
 between cycles, pre-existing downloaded media, real local HTTP downloads, and
@@ -879,6 +888,7 @@ Choose the route by purpose:
 | Optional combined local battery | `just full-test` | The offline gate's checks plus nightly tools, package, Docker, live provider, release-binary, and service phases |
 
 `just test offline` runs the behavior and catalog portion of `just gate`.
+It clears inherited account, credential and config-path inputs in its child process so offline fixtures cannot consume the live account loaded by `just full-test`. The parent keeps those inputs for the later live phases.
 `just test` runs only the all-feature suite. Existing focused, packaging,
 Docker, service, and live commands remain available individually.
 
@@ -1012,18 +1022,13 @@ opt-in (nightly + cargo-fuzz), excluded from `just gate`, and run via
    This prompts for a 2FA code and writes session tokens. Redo only when
    the session expires (typically months).
 
-3. Keep at least one eligible asset in the primary library. General live
-   tests use `tests/data/live-selection.toml`: albums `none`, unfiled enabled,
-   primary library, and the 10 most recent assets. Change the bound only there.
-   No named album, filename, date, or media format is required. A read-only
-   preflight reports the eligible filename count and fails if it is zero.
-   When the bound truncates the inventory, live tests require checkpoint
-   suppression and a no-download repeat full pass. Positive incremental live
-   checks apply only when this bounded selection proves EOF. Deterministic
-   production-path tests cover both cases and config reconciliation.
+3. Choose an explicit fixed lower capture date containing at least one eligible primary-library asset. Set `KEI_LIVE_SKIP_CREATED_BEFORE` to that `YYYY-MM-DD` before running an authorized general live sync route, for example `KEI_LIVE_SKIP_CREATED_BEFORE=2025-01-01 just test live`. Replace the example date with your own narrowly chosen bound; all selected dates at or after it can download, so this is not a ten-item cap. An unset, invalid or rolling value fails closed before provider preflight.
 
-Import runners also pass the shared count as `--recent`, because
-`import-existing` does not use the TOML recent count.
+General live tests read the selectors in `tests/data/live-selection.toml`: albums `none`, unfiled enabled and the primary library. Rust `tests/common/live_selection.rs` and shell `tests/shell/lib.sh` add `[filters].skip_created_before` from `KEI_LIVE_SKIP_CREATED_BEFORE` to each generated config. Set optional `KEI_LIVE_SKIP_CREATED_AFTER` to an inclusive fixed upper capture date when the approved fixture is a closed interval. Missing upper dates retain lower-bound-only selection; empty, malformed or inverted dates fail before live authentication. Rust scenarios may narrow the configured interval but cannot widen it. Both bounds reach shell, cross-zone and release-binary sync configs. No named album, filename or media format is required. A filename-only preflight reports the eligible count and fails on an empty selection without downloading media. It uses isolated config/state paths and can reuse or refresh cached authentication.
+
+A truncated fixed-date selection must preserve the checkpoint, report `date_bounded_full_enumeration` and repeat without new downloads. Positive incremental live checks apply only when the selected inventory proves EOF. Deterministic production-path tests cover both cases and config reconciliation. The Rust and shell live assertions use the fixed-date hold reason; live execution still requires explicit authorization.
+
+`tests/data/live-selection.toml` also holds `[import_sample].recent = 10`. That table is harness input, not a supported kei configuration table; it is not copied into generated configs. Import runners pass this separate positive count as `import-existing --recent N`, unless a scenario overrides it. Import does not use sync date bounds for matching.
 
 Exact content checks use the [bundled corpus](data/README.md). The
 [migration map](data/live-migration.md) names each deterministic replacement
@@ -1040,6 +1045,8 @@ details are baked into test code.
 | `ICLOUD_USERNAME` | required | Apple ID email |
 | `ICLOUD_PASSWORD` | required | Apple ID password |
 | `ICLOUD_TEST_COOKIE_DIR` | `./.test-cookies` | Pre-authenticated session dir |
+| `KEI_LIVE_SKIP_CREATED_BEFORE` | required for live sync fixtures | Explicit fixed `YYYY-MM-DD` lower capture-date bound, written as `[filters].skip_created_before`; no rolling or count fallback |
+| `KEI_LIVE_SKIP_CREATED_AFTER` | unset | Optional inclusive fixed `YYYY-MM-DD` upper capture-date bound, written as `[filters].skip_created_after`; must not precede the lower date |
 | `KEI_DOCKER_IMAGE` | `kei:latest` | Docker image under test |
 | `CARGO_TARGET_DIR` | `./target` | Cargo build directory. Full-test packaging, shell, live, service, and metrics phases use release artifacts from this directory. |
 | `KEI_FULL_TEST_TMPDIR` | `/tmp/codex/kei/full-test/tmp` | Temporary directory for full-test child processes and shell-suite scratch data. |
@@ -1102,7 +1109,7 @@ happens:
   Content policies and metadata use bundled production-path tests under
   `src/download/orchestration/fixture_tests/`.
 - **`state_auth.rs`** - live iCloud, `#[ignore]` gated. Covers status /
-  reset state / verify / import-existing / sync --retry-failed.
+  reset state / verify / import-existing / automatic retry through ordinary sync.
 - **`import_existing_live.rs`** - live iCloud, `#[ignore]` gated.
   Comprehensive `import-existing` scenarios: matches a real-sync fixture,
   dry-run, idempotency, `--recent` cap, `--recent Nd` rejection, truncated
@@ -1247,35 +1254,9 @@ completion-evidence roundtrip tests prevent reuse of invalid deletion evidence.
 
 ## Selection generation shadow
 
-`selection_shadow` tests enter the real retained-work admission owner against
-account-owned file-backed SQLite, historical source records, existing media and
-sidecars, a retained cursor, sparse debt and an unknown BLOB table. Current lookup
-confirmation differs from the historical trigger. Replay must preserve the
-original confirmation numeric lexeme and the current resource checksum. Two
-released-handle reopens retain pending queue status, source cursor and original
-media; repeat admission performs no current lookup or duplicate shadow insert.
+`queue_projection_obsolete_selection_shadow_cannot_block_current_work` enters retained-work admission with opaque shadow bytes, an exhausted historical charge and a shadow-write fault. A current work-receipt fault must still roll back admission. Removing that current fault allows admission while preserving the shadow bytes and existing media, sidecars and checkpoint evidence through two reopened cycles. The schema-32 live WAL test retains migration collision and evidence-preservation coverage.
 
-The bounded storage tests represent the same child/rendition in two pass paths,
-refuse new evidence at capacity, replay exact evidence at capacity, and roll back
-all manifest, source, decision and destination rows on a second-destination SQL
-failure. Corrupted rows, source bytes, confirmation identity and foreign owners
-cannot replay. A capture failure precedes queue admission; valid recovery and two
-quiet admission cycles retain all source and unrelated work. Relative download
-roots retain the existing admission contract; shadow destinations are anchored
-without changing the task path. Linux non-UTF-8 roots preserve actual filesystem
-admission. A separate native Unix/Windows path fixture round-trips manifest and
-normalized destination bytes through two released-handle SQLite reopens without
-creating a filesystem name; macOS filesystems can reject invalid UTF-8 names
-before admission. Corruption probes commit their mutations before
-replay, include a healthy replay control, and assert the specific validation
-error rather than a transaction-entry failure. The schema-32 live
-WAL test preserves queue work, original confirmation and unknown tables across a
-refused conflicting migration and a subsequent successful migration.
-
-These tests prove shadow representation and parity for the existing sole Unfiled
-profile. They do not qualify album selection, multi-destination publication,
-late filesystem faults, catalog selection activation or cursor ownership. Those
-are acceptance requirements for the next PR in the same phase.
+The shadow writer and its exclusive replay tests are retired. Current work tests retain owner, source, resource, metadata, retry and transaction guards. URL-rotation tests check bounded work-receipt reuse across reopen and beyond 64 confirmation classes. Relative and Linux non-UTF-8 roots enter real planning and admission; a separate Unix/Windows encoding fixture checks the shared native-path serialization without requiring filesystem support. Active destination publication and reopen coverage remains in the private-selection tests below. Diagnostics exercise real work capacity and single-item limits while the historical selection field stays unobserved.
 
 
 ## Private selection activation and destination recovery
@@ -1405,7 +1386,7 @@ mutations before unchanged success.
 
 `behavioral::released_upgrade::released_v0240_history_preserves_durable_evidence_through_upgrade`
 starts from the SQL schema emitted by the official v0.24.0 Linux x86_64
-binary (schema 25), then executes the current production CLI through schema 34.
+binary (schema 25), then executes the current production CLI through schema 42.
 The fixture contains no captured user data. SQL explicitly reconstructs a
 synthetic history with original and edited renditions, repeated IDs in two
 libraries, a local removal, metadata debt, an unfinished sync ledger row,
@@ -1419,7 +1400,7 @@ Restoring a file alone must not falsely finalize its failed row. The companion l
 the same schema fixture (or actual released-binary-created schema), retains an
 explicit authoritative source/master mapping and failed media row, and runs
 three production cycles. The first injects a state-write failure and must retain
-the checkpoint and a pending retry row (retry routing resets failed to
+the archived checkpoint, no active replacement checkpoint and a pending retry row (retry routing resets failed to
 pending before the injected write). After reopening SQLite, authoritative synthetic
 provider evidence and a local HTTP JPEG must finish recovery on the second
 cycle. The third must retain the recovered path and bytes without another
@@ -1557,23 +1538,13 @@ retained-history recovery proof. Permanently expired boundaries with
 unproven history retain a finite actionable hold. Successful replay does not
 resolve the distinct reporter limitations tracked in #765, #853 or #845.
 
-## Legacy current-work certification regression
+<a id="legacy-current-work-certification-regression"></a>
 
-`run_cycle_legacy_smart_only_bridge_qualifies_after_reopen` uses the Hidden query
-with real SQLite, independently named current outputs and retained originals.
-`run_cycle_legacy_smart_only_bridge_preserves_failure_guards` exercises cancellation, current receipt write failure and proof transaction
-failure before reopened recovery. The same helper checks unchanged historical
-rows, dates, owners, original files, sidecars and mapping history.
-`run_cycle_ambiguous_children_unselected_hidden` retains missing-current-receipt
-holds and verifies a redacted fixed-label refusal. Cycle reporting distinguishes
-pending certification from certified history still needing attribution.
+## Preserved history and current checkpoint regression
 
-`run_cycle_legacy_smart_only_query_cannot_replace_missing_delta_successor` keeps
-healthy query tokens separate from missing/blank source successors and retains
-original cursors without proof publication. The positive cycle fixture uses a
-distinct delta successor. `smart_only_delta_replays_source_without_admitting_unselected_media`
-adds a delta-only child while the smart query is empty; source replay supplies the
-token but no off-selection download. Existing bridge-debt controls remain active.
+`run_cycle_legacy_smart_only_bridge_qualifies_after_reopen` uses the Hidden query with real SQLite, independently named current outputs and retained originals. Current selection drift supplies its inventory-and-bridge requirement; historical certification does not. `run_cycle_legacy_smart_only_bridge_preserves_failure_guards` retains cancellation, current receipt-write failure and current cursor-transaction failure before reopened recovery. The shared helper checks historical rows, dates, owners, originals, sidecars and mappings, an unset certificate generation and the visible historical counter.
+
+`run_cycle_ambiguous_children_unselected_hidden` preserves the historical family and downloads selected children without requiring a receipt for the unselected hidden child. It does not infer ownership or download that child. `run_cycle_legacy_smart_only_query_cannot_replace_missing_delta_successor` keeps healthy query tokens separate from missing or blank source successors and retains the original cursor without certificate writes. The positive fixture uses a distinct delta successor. `smart_only_delta_replays_source_without_admitting_unselected_media` adds a delta-only child while the smart query is empty; source replay supplies the token but no off-selection download. Existing current bridge-debt controls remain active.
 
 The smart-only replay controls also cover a date bound already active before a
 path-template change. A real initial source cursor and subsequent zone request
@@ -1583,21 +1554,13 @@ tokens retain the pending config until healthy query recovery. The query owns
 its local selection proof and inventory; delta evidence adds vetoes and supplies
 only the source successor.
 
-### Legacy receipt prerequisite diagnostics
+<a id="legacy-receipt-prerequisite-diagnostics"></a>
 
-`legacy_receipt_prerequisites_are_read_only_after_reopen` uses verified file-backed
-SQLite receipts and 23 synthetic conditions, then reopens each database and runs
-the explanation twice on a query-only connection. It distinguishes readiness,
-missing rendition/path receipt, wrong scoped binding, unknown/invalid source and
-a now-eligible snapshot; qualification, SQLite change count and media stay intact.
-The existing historical-source and exact-binding matrices retain their acceptance
-oracles. Ordinary and Hidden production-cycle unknown-source controls retain the
-original checkpoint/proof/row/file checks and require the fixed prerequisite label.
-A production-cycle fallback control injects read failure, unavailable inspection
-and a changed snapshot while retaining unknown provenance and every checkpoint hold.
-Support-history round-trip coverage permits only the eight fixed labels and drops
-identifiers, paths, hashes, errors and unknown future labels. No reporter data,
-authenticated run, recovery action, migration or new acceptance rule is exercised.
+### Read-only receipts and historical diagnostic decoding
+
+`legacy_receipt_prerequisites_are_read_only_after_reopen` retains its original test name but now checks the surviving receipt reader rather than a certification explanation. Its file-backed matrix varies readiness, rendition/path receipts, scoped bindings and source provenance, reopens SQLite, then compares receipt eligibility before and after enabling query-only mode. It asserts unchanged SQLite change counts and media bytes. The ready control remains eligible; invalid or missing evidence does not become a usable receipt.
+
+`historical_legacy_receipt_prerequisites_roundtrip_only_fixed_labels` retains decoding of previously stored `legacy_receipt_prerequisite_v1` support history. It accepts the eight known labels and drops identifiers, paths, hashes, errors and unknown labels. Normal sync no longer emits this retired certification diagnostic. Neither test grants ownership, source verification or checkpoint permission.
 
 ## Token-equivalence diagnostics
 
@@ -1698,14 +1661,15 @@ ordinary fail-closed acceptance controls. No live account is used. Hard process
 supervision remains an external operational requirement, as documented in
 `docs/missing-reference-inventory.md`.
 
-`cargo test --lib trusted_legacy_files` exercises explicit local-byte acceptance
-through the real cycle owner using six synthetic historical renditions, four
-ready children and two mixed-owner families. It checks zero media GETs, unchanged
-source receipts and legacy rows/aliases, restart/idempotency, two quiet followups,
-atomic stale/cancelled/SQL-failed plans, and readiness/Primary bridge holds.
-Run it with default and `--no-default-features` profiles when changing trusted
-legacy receipts. Existing `legacy_preservation` tests retain the no-acceptance
-verified-source controls.
+## Historical trust declarations and retired commands
+
+`cargo test --lib sync_loop::runner::tests::trusted_legacy::` selects the historical-trust fixtures, including mixed current work. Declarations are seeded initial history with the released key, payload and immutability triggers; no test performs a successful new plan or apply operation. `trusted_legacy_files_zero_get_reopen_and_quiet_followups` checks six local-only historical declarations, unchanged originals and source provenance, zero media GETs and no certificate writes. `trusted_legacy_files_unaccepted_rendition_is_not_checkpoint_debt` leaves one rendition without a declaration and still requires current checkpoint progress. `trusted_legacy_files_historical_receipt_immutability` checks refusal of declaration mutation, deletion, renaming and conflicting replacement.
+
+`trusted_legacy_mixed_local_only_cohort_downloads_ready_child_without_historical_hold` and `trusted_legacy_mixed_ready_control_completes_and_reopens_quietly` introduce current observations through ordinary discovery, require one independent source-verified download and check two quiet reopened cycles. Historical declarations never supply a source receipt or guessed owner. `trusted_legacy_mixed_six_acceptance_survives_readiness_failure_and_reopens` retains existing metadata-failure markers and an ineligible current receipt while independent work progresses. Its metadata writers are disabled; configured metadata retry is covered separately by the `xmp` historical-preservation fixture above.
+
+`trusted_legacy_mixed_six_acceptance_with_primary_hold_downloads_and_reopens` keeps the primary cursor and aggregate checkpoint held while the independent shared-library child completes. `trusted_legacy_mixed_missing_parent_holds_and_preserves_acceptances` checks pre-cancellation, then current missing-parent discovery, healthy-child progress and a durable `asset_delta_hydration_incomplete` hold across reopen. Both preserve historical declarations, original bytes and ownership without inventing source provenance.
+
+`trusted_legacy_files_retired_commands_refuse_before_state_or_plan_access` checks both retained CLI spellings and the command-owner refusal before database or plan access. The behavioral `retired_legacy_trust_plan_and_apply_refuse_before_archive_or_auth_writes` invokes both real binary routes against populated state and media with a forced-authentication test seam. It requires the actionable retirement error, no authentication, no plan, empty stdout and unchanged archive bytes, paths and modification times. Run the library module and behavioral entry point under the applicable default and `--no-default-features` profiles; these descriptions make no claim about the latest run results.
 
 ## Recovery evidence regressions
 

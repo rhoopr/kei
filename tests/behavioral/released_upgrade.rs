@@ -201,9 +201,13 @@ fn released_v0240_history_preserves_durable_evidence_through_upgrade() {
         owners
     );
     assert_eq!(
-        rows(&db, "SELECT * FROM metadata ORDER BY key"),
+        rows(
+            &db,
+            "SELECT * FROM historical_v030_checkpoints ORDER BY key"
+        ),
         checkpoints
     );
+    assert!(rows(&db, "SELECT * FROM metadata ORDER BY key").is_empty());
     assert_eq!(
         rows(&db, "SELECT * FROM metadata_capture_state ORDER BY library"),
         capture
@@ -238,9 +242,13 @@ fn released_v0240_history_preserves_durable_evidence_through_upgrade() {
             stable
         );
         assert_eq!(
-            rows(&db, "SELECT * FROM metadata ORDER BY key"),
+            rows(
+                &db,
+                "SELECT * FROM historical_v030_checkpoints ORDER BY key"
+            ),
             checkpoints
         );
+        assert!(rows(&db, "SELECT * FROM metadata ORDER BY key").is_empty());
         assert_eq!(schema_version(&db), super::support::HELPER_SCHEMA_VERSION);
         for (_, _, _, filename, bytes) in entries {
             assert_eq!(std::fs::read(media.join(filename)).unwrap(), bytes);

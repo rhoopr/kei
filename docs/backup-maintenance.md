@@ -10,8 +10,9 @@ files, temporary siblings, or the state database to make a warning disappear.
 | Inspect recorded progress | `kei status` | No repair |
 | Check recorded bytes | `kei verify --checksums` | Integrity diagnostics, not restoration |
 | Preview missing/truncated state | `kei reconcile --dry-run` | No repair-row changes; owned-state opening can still migrate the database |
-| Queue missing/truncated files | `kei reconcile` | SQLite state, not media |
-| Replace a recorded truncated file | `kei sync --repair-truncated` | Verified media replacement with explicit consent |
+| Queue missing files | `kei reconcile` | SQLite state, not media; shorter files are reported |
+| Inspect one changed copy | `kei reconcile --inspect-path /absolute/path` | Prints a fingerprint; no repair authorization |
+| Confirm damage to that copy | Repeat inspection with `--confirm-damage SHA256:SIZE` | Queues conditional replacement for the next selected sync |
 | Refresh provider metadata | `kei sync --refresh-metadata` | Catalogue plus configured local outputs |
 | Replace capture timestamps | `kei sync --refresh-metadata --repair-capture-timestamps` | Supported embedded timestamps, including camera values |
 | Change folder layout | Edit path configuration, then `kei sync` | Verified local copies; old copies remain |
@@ -21,21 +22,16 @@ Automatic path reconciliation after configuration changes is separate from the
 
 ## Refresh catalogue and configured outputs
 
-Use a separate repair configuration that preserves your existing `data_dir`,
-credentials, and download directory. Remove the `albums` and `smart_folders`
-keys entirely, even when they contain `all` or `none`: explicit selectors reject
-this repair. Also remove date bounds and `recent`/`recent_scope`. This selection
-covers all visible libraries and enables the unfiled pass:
+Use a separate repair configuration that preserves your existing `data_dir`, credentials, and download directory. Remove the `albums` and `smart_folders` keys entirely, even when they contain `all` or `none`: explicit selectors reject this repair. Also remove date bounds. Retired `recent` / `recent_scope` keys must be removed from any config before it can load. This selection covers all visible libraries and enables the unfiled pass:
 
 ```toml
 [filters]
 libraries = ["all"]
 unfiled = true
-media = ["photos", "videos", "live-photos"]
+exclude = []
 ```
 
-Choose the libraries you intend to repair. Do not add one-run date or recent
-filters. Then run:
+Choose the libraries you intend to repair. Do not add one-run date filters. Then run:
 
 ```sh
 kei sync --config /path/to/repair.toml --refresh-metadata
@@ -47,10 +43,7 @@ It does not download media again. Embedded and sidecar changes follow the
 configured metadata writers. Disable embedded outputs if media bytes must stay
 unchanged; disable sidecar output too if no local metadata should change.
 
-This is one-shot even when the TOML file sets a watch interval. It rejects
-`--dry-run`, `--retry-failed`, `--only-print-filenames`, `--recent`, narrowing
-selection, and `service run`. See [Metadata output](metadata.md) for automatic
-bounded capture repair, which is different from this explicit full sweep.
+This is one-shot even when the TOML file sets a watch interval. It rejects `--dry-run`, `--only-print-filenames`, narrowing selection, and `service run`. The retired `--retry-failed` flag is rejected by all sync invocations; ordinary sync retries unfinished work automatically. See [Metadata output](metadata.md) for automatic bounded capture repair, which is different from this explicit full sweep.
 
 ### Replace capture timestamps
 
@@ -69,30 +62,23 @@ Prepared-output receipts allow a later explicit repair to finish interrupted
 state finalization without trusting unrelated bytes. Do not promise that every
 historical file can be repaired. Ordinary writes preserve native timestamps.
 
-## Repair a truncated file
+## Repair a confirmed damaged copy
 
 Inspect before changing state:
 
 ```sh
-kei reconcile --dry-run
-kei reconcile
-kei sync --repair-truncated
+kei reconcile --inspect-path /photos/Album/photo.jpg
+kei reconcile --inspect-path /photos/Album/photo.jpg --confirm-damage SHA256:SIZE
+kei sync
 ```
 
-Reconcile checks recorded paths and metadata-aware sizes, then marks missing or truncated downloads for retry. It reads media and writes repair rows unless `--dry-run` is set. Even a preview opens owned state through the migration-capable opener, so take the cold backup before inspection with a newer binary. The opt-in periodic full reconciliation walk only warns; a separate automatic bounded pre-cycle probe can mark missing/truncated rows failed.
+Replace `SHA256:SIZE` with the fingerprint printed by the first command. Confirm only after establishing that this copy is damaged. A changed checksum or shorter file may be an intentional edit. Confirmation applies to that exact managed destination and those inspected bytes. It does not authorize replacement of other album copies.
 
-Only explicit repair may replace an existing recorded truncated file. It
-requires the durable truncation marker, verifies the new download and configured
-metadata writes, and checks the old fingerprint before guarded replacement.
-Linux filesystems that reject atomic exchange use the journaled fallback
-shown in [Guarded publication](metadata.md#guarded-publication).
-A changed target remains a failure rather than permission to overwrite it.
-Normal downloads and missing-file retries keep no-overwrite publication.
+If the file changes again before repair, inspect it again. The command shows the pending fingerprint. To replace the newly inspected bytes, confirm their new fingerprint. A locally preserved copy can also be explicitly confirmed this way.
 
-Truncated-file repair is one-shot and rejects `service run`, `--dry-run`,
-`--only-print-filenames`, and `--refresh-metadata`. Unlike metadata refresh,
-it can use your current selection. Files excluded by that selection are not a
-promise of completed repair. Inspect the result before resuming a service.
+The next sync uses the current selected provider resource and existing conditional publication. A changed target refuses replacement. An unavailable source leaves the damaged bytes and retry intent in place. Excluding the destination from selection does not complete its repair. Linux filesystems that reject atomic exchange use the existing journaled fallback described in [Guarded publication](metadata.md#guarded-publication).
+
+Ordinary sync and periodic presence diagnostics do not hash files for integrity checks. `kei verify --checksums` reports differences without treating them as proven corruption. Plain `kei reconcile` marks missing files for retry and reports shorter files without authorizing replacement. `--repair-truncated` is retired because its size-based marker cannot distinguish damage from local edits. State opening can still migrate the database during inspection.
 
 ## Change the backup layout
 
@@ -163,6 +149,31 @@ evidence limits; integrity commands cannot prove completeness against iCloud or
 restore damaged media. Never remove temporary files by suffix and age alone:
 cleanup requires durable ownership evidence.
 
+### Upgrade retired sync selection
+
+Sync and service mode reject `--recent` and `--recent-scope`. Remove those flags and `[filters].recent` / `recent_scope` before starting. If you still want a limited backup, choose fixed capture-date bounds, such as `skip_created_before = "2025-01-01"` and `skip_created_after = "2025-01-07"`; replace both dates with your own range. Relative `Nd` values are unsupported too. Startup errors give removal and replacement guidance without changing configuration, state or media. Import-only `import-existing --recent N` still accepts a positive sample count and does not apply sync date filters.
+
+Schema 37 preserves old recent-selection receipts and records a one-time inventory request for each zone with an old receipt key, regardless of its payload. A selected zone can therefore need a current inventory even when iCloud reports no changes. Each attempt replays the retained cursor, inventories the current selection, then requires a raw-empty terminal replay before retiring the request. A busy interval, interruption, failed write or incomplete current work keeps it pending for a later cycle; no same-cycle catch-up loop is added. Healthy media can still complete while other work remains held.
+
+This proves current selected coverage, not an atomic provider snapshot, complete historical deletions or permission to delete local files. Completing it can retire the inventory request while a separate sparse-identity, expired-cursor or retained provider-work hold remains. Historical legacy certification is no longer a checkpoint requirement. Preserve the state and investigate any remaining hold rather than resetting it.
+
+After upgrading, let normal sync or watch continue to check previously downloaded records. Each successful or quiet cycle can check up to 32 historical identities after current work finishes. A record missing from a folder or lookup stays live unless iCloud explicitly confirms deletion. `kei manifest` reports `is_deleted` and `deleted_at` in JSON and CSV; a row can be both `downloaded` locally and deleted upstream. A null or empty deletion time means the provider supplied no known time. Local copies are kept.
+
+### Historical legacy evidence
+
+Run normal `kei sync`; there is no certificate repair step. Preserved legacy records and old coverage certificates remain in the database, but sync no longer revalidates or writes those certificates. For already prepared records, a missing certificate or changed historical file alone does not force another inventory, fail the current cycle or make the process unhealthy. This retirement adds no schema migration and rewrites no files.
+
+Status, sync reports and health JSON retain their existing field names:
+
+- `unattributed_legacy_assets` counts preserved legacy records with unknown attribution, not paths or renditions.
+- `unattributed_legacy_pending` counts those records without a stored coverage certificate at their recorded generation. The historical name is retained for compatibility; this is not pending sync work. The count does not revalidate configuration, file contents or certificate dependencies.
+
+Unresolved historical attribution still makes `kei status` say `Backup status: unsafe`. That means historical completeness is unproven; it does not by itself fail a current sync, increment health failures or prevent a successful health update. Current transfer, metadata, identity, enumeration and state-write failures keep their existing retry and checkpoint effects. A healthy process is not proof of a complete backup.
+
+The old [`reconcile trust-legacy-files plan/apply` commands](trusted-legacy-files.md) now refuse early and direct you to `kei sync`. They create no plan or trust declaration. Existing declarations remain stored history, not provider verification or new ownership permission.
+
+Original-file protection remains in force before and after preservation preparation. The separate preparation scan, unresolved source identity, raw-inbox capacity, unfinished provider-selection work across generations and expired-cursor recovery retain their existing limits. Certification retirement does not resolve every historical-state or Shared Library problem reported in [#1044](https://github.com/rhoopr/kei/issues/1044), and it never permits deletion or overwrite of uncertain files.
+
 ## Unresolved provider identities
 
 If logs show `asset_delta_hydration_incomplete`, keep the state database and
@@ -185,7 +196,7 @@ or rendition evidence becomes eligible immediately. Status reports unresolved
 identities and deferred retries separately from failed repair attempts.
 Deferral keeps the capture revision and checkpoint pending; it is not recovery.
 
-Stable v0.26.0 uses schema 36. Even `kei status` can migrate an owned database. Stop all workers and take a matched cold backup of configuration/state, SQLite companions and media/sidecars before upgrading. Older binaries cannot open schema 36. Rollback requires the complete matched old set and retained old binary. Do not reset state or lower its schema version. See the [v0.26.0 upgrade guide](v0.26.0-upgrade.md).
+The current development branch uses schema 42; stable v0.26.0 uses schema 36. Existing configs also require the [rendition-policy migration](rendition-policy-migration.md) before ordinary commands can proceed. Even `kei status` can migrate an owned database after config validation. Stop all workers and take a matched cold backup of configuration/state, SQLite companions and media/sidecars before upgrading. Older binaries cannot open a newer schema. Rollback requires the complete matched old set and retained old binary. Do not reset state or lower its schema version. See the [v0.26.0 upgrade guide](v0.26.0-upgrade.md) for that release's backup and restoration procedure.
 
 Kei marks unresolved asset identity cycles incomplete. Status
 remains unsafe across restarts and successful syncs in other libraries until

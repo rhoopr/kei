@@ -6,28 +6,35 @@ use std::sync::Arc;
 use rustc_hash::FxHashSet;
 
 use crate::download::{DownloadConfig, paths};
-use crate::types::{
-    AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
-};
+use crate::types::{FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy};
 
 pub(crate) trait PathDerivationSource {
+    fn album_bound_parent(
+        &self,
+        _library: Option<&str>,
+        _child: &str,
+    ) -> Option<std::path::PathBuf> {
+        None
+    }
+    fn album_bound_path(
+        &self,
+        _library: Option<&str>,
+        _child: &str,
+        _version: &str,
+    ) -> Option<std::path::PathBuf> {
+        None
+    }
     fn directory(&self) -> &Path;
     fn folder_structure(&self) -> &str;
-    fn resolution(&self) -> crate::types::PhotoResolution;
     fn media(&self) -> &crate::config::MediaSelection;
     fn skip_created_before(&self) -> Option<crate::config::CreatedDateFilter>;
     fn skip_created_after(&self) -> Option<crate::config::CreatedDateFilter>;
     fn live_photo_mode(&self) -> LivePhotoMode;
-    fn live_resolution(&self) -> AssetVersionSize;
     fn live_photo_mov_filename_policy(&self) -> LivePhotoMovFilenamePolicy;
-    fn edited(&self) -> bool;
     fn edited_naming(&self) -> crate::types::EditedNaming;
-    fn alternative(&self) -> bool;
     fn raw_policy(&self) -> RawPolicy;
     fn file_match_policy(&self) -> FileMatchPolicy;
-    fn force_resolution(&self) -> bool;
     fn keep_unicode_in_filenames(&self) -> bool;
-    fn filename_exclude(&self) -> &[glob::Pattern];
     fn album_name(&self) -> Option<&str>;
     fn exclude_asset_ids(&self) -> &FxHashSet<String>;
 }
@@ -44,21 +51,15 @@ pub(crate) struct PathDerivationConfig {
     pub(crate) folder_structure: String,
     pub(crate) folder_structure_albums: Arc<str>,
     pub(crate) folder_structure_smart_folders: Arc<str>,
-    pub(crate) resolution: crate::types::PhotoResolution,
     pub(crate) media: crate::config::MediaSelection,
     pub(crate) skip_created_before: Option<crate::config::CreatedDateFilter>,
     pub(crate) skip_created_after: Option<crate::config::CreatedDateFilter>,
     pub(crate) live_photo_mode: LivePhotoMode,
-    pub(crate) live_resolution: AssetVersionSize,
     pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
-    pub(crate) edited: bool,
     pub(crate) edited_naming: crate::types::EditedNaming,
-    pub(crate) alternative: bool,
     pub(crate) raw_policy: RawPolicy,
     pub(crate) file_match_policy: FileMatchPolicy,
-    pub(crate) force_resolution: bool,
     pub(crate) keep_unicode_in_filenames: bool,
-    pub(crate) filename_exclude: Arc<[glob::Pattern]>,
     pub(crate) album_name: Option<Arc<str>>,
     pub(crate) library: Arc<str>,
     pub(crate) exclude_asset_ids: Arc<FxHashSet<String>>,
@@ -77,21 +78,15 @@ impl PathDerivationConfig {
             folder_structure_smart_folders: Arc::from(
                 fields.folder_structure_smart_folders.as_str(),
             ),
-            resolution: fields.resolution,
             media,
             skip_created_before: None,
             skip_created_after: None,
             live_photo_mode: fields.live_photo_mode,
-            live_resolution: fields.live_resolution.to_asset_version_size(),
             live_photo_mov_filename_policy: fields.live_photo_mov_filename_policy,
-            edited: fields.edited,
             edited_naming: fields.edited_naming,
-            alternative: fields.alternative,
             raw_policy: fields.raw_policy,
             file_match_policy: fields.file_match_policy,
-            force_resolution: fields.force_resolution,
             keep_unicode_in_filenames: fields.keep_unicode_in_filenames,
-            filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
             album_name: None,
             library: Arc::from(crate::icloud::photos::PRIMARY_ZONE_NAME),
             exclude_asset_ids: Arc::new(FxHashSet::default()),
@@ -144,7 +139,11 @@ pub(in crate::download) fn folder_structure_for_pass(
         crate::commands::PassKind::Unfiled => folder_structure,
     };
     let name_ref = Some(pass.album.name.as_ref()).filter(|n: &&str| !n.is_empty());
-    let category_expanded = paths::expand_named_token(template, pass.kind.token(), name_ref);
+    let category_expanded = if pass.kind == crate::commands::PassKind::Album {
+        paths::expand_album_components(template, pass.album.selector_components())
+    } else {
+        paths::expand_named_token(template, pass.kind.token(), name_ref)
+    };
     // Apply `{library}` last with the path-friendly truncated zone name,
     // so callers see `SharedSync-A1B2C3D4/...` instead of the full UUID.
     // The state-DB key still uses the full zone name.
@@ -165,10 +164,6 @@ impl PathDerivationSource for PathDerivationConfig {
         &self.folder_structure
     }
 
-    fn resolution(&self) -> crate::types::PhotoResolution {
-        self.resolution
-    }
-
     fn media(&self) -> &crate::config::MediaSelection {
         &self.media
     }
@@ -185,24 +180,12 @@ impl PathDerivationSource for PathDerivationConfig {
         self.live_photo_mode
     }
 
-    fn live_resolution(&self) -> AssetVersionSize {
-        self.live_resolution
-    }
-
     fn live_photo_mov_filename_policy(&self) -> LivePhotoMovFilenamePolicy {
         self.live_photo_mov_filename_policy
     }
 
     fn edited_naming(&self) -> crate::types::EditedNaming {
         self.edited_naming
-    }
-
-    fn edited(&self) -> bool {
-        self.edited
-    }
-
-    fn alternative(&self) -> bool {
-        self.alternative
     }
 
     fn raw_policy(&self) -> RawPolicy {
@@ -213,16 +196,8 @@ impl PathDerivationSource for PathDerivationConfig {
         self.file_match_policy
     }
 
-    fn force_resolution(&self) -> bool {
-        self.force_resolution
-    }
-
     fn keep_unicode_in_filenames(&self) -> bool {
         self.keep_unicode_in_filenames
-    }
-
-    fn filename_exclude(&self) -> &[glob::Pattern] {
-        &self.filename_exclude
     }
 
     fn album_name(&self) -> Option<&str> {
@@ -235,16 +210,34 @@ impl PathDerivationSource for PathDerivationConfig {
 }
 
 impl PathDerivationSource for DownloadConfig {
+    fn album_bound_parent(&self, library: Option<&str>, child: &str) -> Option<std::path::PathBuf> {
+        let container = self.primary_layout_source.as_ref()?.container_id()?;
+        self.selection_context.as_ref()?.album_parent(
+            container,
+            library.unwrap_or(&self.library),
+            child,
+        )
+    }
+    fn album_bound_path(
+        &self,
+        library: Option<&str>,
+        child: &str,
+        version: &str,
+    ) -> Option<std::path::PathBuf> {
+        let container = self.primary_layout_source.as_ref()?.container_id()?;
+        self.selection_context.as_ref()?.album_file(
+            container,
+            library.unwrap_or(&self.library),
+            child,
+            version,
+        )
+    }
     fn directory(&self) -> &Path {
         &self.directory
     }
 
     fn folder_structure(&self) -> &str {
         &self.folder_structure
-    }
-
-    fn resolution(&self) -> crate::types::PhotoResolution {
-        self.resolution
     }
 
     fn media(&self) -> &crate::config::MediaSelection {
@@ -263,24 +256,12 @@ impl PathDerivationSource for DownloadConfig {
         self.live_photo_mode
     }
 
-    fn live_resolution(&self) -> AssetVersionSize {
-        self.live_resolution
-    }
-
     fn live_photo_mov_filename_policy(&self) -> LivePhotoMovFilenamePolicy {
         self.live_photo_mov_filename_policy
     }
 
     fn edited_naming(&self) -> crate::types::EditedNaming {
         self.edited_naming
-    }
-
-    fn edited(&self) -> bool {
-        self.edited
-    }
-
-    fn alternative(&self) -> bool {
-        self.alternative
     }
 
     fn raw_policy(&self) -> RawPolicy {
@@ -291,16 +272,8 @@ impl PathDerivationSource for DownloadConfig {
         self.file_match_policy
     }
 
-    fn force_resolution(&self) -> bool {
-        self.force_resolution
-    }
-
     fn keep_unicode_in_filenames(&self) -> bool {
         self.keep_unicode_in_filenames
-    }
-
-    fn filename_exclude(&self) -> &[glob::Pattern] {
-        &self.filename_exclude
     }
 
     fn album_name(&self) -> Option<&str> {
@@ -309,5 +282,30 @@ impl PathDerivationSource for DownloadConfig {
 
     fn exclude_asset_ids(&self) -> &FxHashSet<String> {
         &self.exclude_asset_ids
+    }
+}
+
+#[cfg(test)]
+mod hierarchy_tests {
+    use super::folder_structure_for_pass;
+    use crate::commands::{AlbumPass, PassKind};
+    use crate::icloud::photos::PhotoAlbum;
+    use std::sync::Arc;
+
+    #[test]
+    fn album_hierarchy_renders_components_without_inventing_separators() {
+        let pass = AlbumPass {
+            kind: PassKind::Album,
+            album: PhotoAlbum::stub_for_test(Arc::from("unused-rendered-name"))
+                .with_selector_components(vec![
+                    "Family/Work".into(),
+                    "..".into(),
+                    "100% Trips".into(),
+                ]),
+            exclude_ids: Arc::default(),
+        };
+        let template = folder_structure_for_pass("", "{album}/%Y", "", "PrimarySync", &pass);
+        assert_eq!(template, "Family_Work/_/100%% Trips/%Y");
+        assert_eq!(pass.album.selector_components()[0], "Family/Work");
     }
 }

@@ -22,10 +22,12 @@ mod retained_recovery;
 
 mod indexing;
 
+mod historical_preservation;
 mod trusted_legacy;
 
 mod shared_keys;
 
 mod sparse_recovery;
 
+mod inventory_reconciliation;
 mod unprepared_recovery;

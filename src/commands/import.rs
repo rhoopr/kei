@@ -60,6 +60,7 @@ pub(crate) struct ImportStats {
     pub strict_refused: u64,
     pub hash_errors: u64,
     pub skipped_already_imported: u64,
+    pub state_write_failures: u64,
 }
 
 impl std::ops::AddAssign for ImportStats {
@@ -71,6 +72,7 @@ impl std::ops::AddAssign for ImportStats {
         self.strict_refused += rhs.strict_refused;
         self.hash_errors += rhs.hash_errors;
         self.skipped_already_imported += rhs.skipped_already_imported;
+        self.state_write_failures += rhs.state_write_failures;
     }
 }
 
@@ -716,6 +718,7 @@ impl ImportPreflight {
                 .await
                 {
                     tracing::warn!(error = %e, "Failed to adopt asset");
+                    stats.state_write_failures += 1;
                     continue;
                 }
                 stats.matched += 1;
@@ -753,6 +756,84 @@ fn record_import_summary(stats: &ImportStats, dry_run: bool) {
             "dry_run": dry_run,
         }),
     );
+}
+
+const STARTUP_ADOPTION_KEY: &str = "startup_archive_adoption_v1";
+
+/// Adopt a first-run archive using the ordinary import census, without fetching
+/// media. A pending marker survives partial adoption and process interruption.
+pub(crate) async fn adopt_startup_archive(
+    db: &state::SqliteStateDb,
+    plans: &[(Arc<download::DownloadConfig>, &[super::AlbumPass])],
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<ImportStats> {
+    let marker = db.get_metadata(STARTUP_ADOPTION_KEY).await?;
+    if marker.as_deref() == Some("complete")
+        || (marker.is_none() && db.get_summary().await?.total_assets > 0)
+    {
+        return Ok(ImportStats::default());
+    }
+    anyhow::ensure!(
+        marker.is_none() || marker.as_deref() == Some("pending"),
+        "Unknown startup archive adoption state"
+    );
+    db.set_metadata(STARTUP_ADOPTION_KEY, "pending").await?;
+    anyhow::ensure!(
+        !shutdown.is_cancelled(),
+        "Startup archive adoption interrupted"
+    );
+    let mut preflight = ImportPreflight::default();
+    let mut cache = DirCache::new();
+    let mut stats = ImportStats::default();
+    let options = ImportRunOptions {
+        shutdown_token: Some(shutdown),
+        ..ImportRunOptions::default()
+    };
+    for (config, passes) in plans {
+        let mut directory = match tokio::fs::read_dir(&config.directory).await {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if directory.next_entry().await?.is_none() {
+            continue;
+        }
+        for pass in *passes {
+            anyhow::ensure!(
+                !shutdown.is_cancelled(),
+                "Startup archive adoption interrupted"
+            );
+            let pass_config = config.with_pass(pass);
+            let (stream, panic_rx) = pass.album.photo_stream(None, None, 1);
+            stats += collect_import_assets(
+                stream,
+                panic_rx,
+                db,
+                &pass_config,
+                &config.library,
+                &mut cache,
+                options,
+                &mut preflight,
+            )
+            .await?;
+        }
+    }
+    stats += preflight.adopt(db, options).await?;
+    anyhow::ensure!(
+        !shutdown.is_cancelled(),
+        "Startup archive adoption interrupted"
+    );
+    if stats.hash_errors == 0 && stats.state_write_failures == 0 {
+        db.set_metadata(STARTUP_ADOPTION_KEY, "complete").await?;
+    }
+    tracing::info!(
+        matched = stats.matched,
+        unmatched = stats.unmatched,
+        hash_errors = stats.hash_errors,
+        state_write_failures = stats.state_write_failures,
+        "Startup archive adoption finished"
+    );
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -808,7 +889,7 @@ where
     tokio::pin!(stream);
     let mut stats = ImportStats::default();
     let mut scan_started_emitted = false;
-    let identity_context = download::DownloadContext::load(db, false).await;
+    let identity_context = download::DownloadContext::load(db).await;
     let import_root = Arc::new(path_config.directory().to_path_buf());
     let mut claimed_legacy_master_states = download::ClaimedLegacyMasterStates::default();
     if preflight.durable.is_none() {
@@ -942,7 +1023,6 @@ where
             tracing::warn!(
                 id = %asset.id(),
                 live_photo_mode = ?path_config.live_photo_mode(),
-                force_resolution = path_config.force_resolution(),
                 "Skipping asset with no expected paths from path-derivation",
             );
             stats.filtered += 1;
@@ -1087,15 +1167,7 @@ pub(crate) async fn run_import_existing(
         }),
     );
 
-    let recent_count: Option<u32> = match args.recent {
-        None => None,
-        Some(crate::cli::RecentLimit::Count(n)) => Some(n),
-        Some(crate::cli::RecentLimit::Days(n)) => {
-            anyhow::bail!(
-                "`--recent {n}d` is not supported for import-existing because it scans existing files instead of filtering by iCloud date. Use a count like `--recent 1000` instead."
-            );
-        }
-    };
+    let recent_count = args.recent;
 
     // Bail clearly on missing/non-dir; `dir_cache::read_dir_entries`
     // swallows read errors and would otherwise report "0 files matched".
@@ -1138,7 +1210,16 @@ pub(crate) async fn run_import_existing(
         domain.as_str(),
         &auth_result.data,
     )?;
-    let db = Arc::new(state::SqliteStateDb::open_owned(&db_path, &owner).await?);
+    let db = Arc::new(
+        state::db::account::open_sync_state(
+            &cookie_directory,
+            &username,
+            domain.as_str(),
+            &owner,
+            &globals.config_source,
+        )
+        .await?,
+    );
     tracing::debug!(path = %db_path.display(), "State database opened");
 
     // `kei import-existing` runs without the friendly download bar; off-mode
@@ -1374,24 +1455,8 @@ fn build_import_path_config(
     config::validate_download_dir(&directory_path)?;
     let directory: Arc<Path> = Arc::from(directory_path.as_path());
 
-    let path_fields = config::resolve_path_derivation_fields(
-        config::PathDerivationCliArgs {
-            folder_structure: None,
-            folder_structure_albums: None,
-            folder_structure_smart_folders: None,
-            resolution: None,
-            live_photo_mode: None,
-            live_resolution: None,
-            live_photo_mov_filename_policy: None,
-            edited: None,
-            alternative: None,
-            raw_policy: None,
-            file_match_policy: None,
-            force_resolution: None,
-            keep_unicode_in_filenames: None,
-        },
-        toml,
-    )?;
+    let path_fields =
+        config::resolve_path_derivation_fields(config::PathDerivationCliArgs::default(), toml)?;
     let media = config::resolve_media_selection(toml.and_then(|t| t.filters.as_ref()), None, None)?;
 
     let config = PathDerivationConfig::from_path_fields(directory, path_fields, media);
@@ -1875,8 +1940,7 @@ mod wiremock_tests {
             repair_truncated: false,
             legacy_preservation_allow_hardlinks: false,
             concurrent_downloads: 1,
-            recent: None,
-            recent_scope: crate::cli::RecentScope::Global,
+            inventory_reconciliation: false,
             retry: RetryConfig::default(),
             live_photo_mode: LivePhotoMode::Both,
             live_resolution: AssetVersionSize::LiveOriginal,
@@ -1893,13 +1957,10 @@ mod wiremock_tests {
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_resolution: false,
             keep_unicode_in_filenames: false,
-            filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
             temp_suffix: Arc::from(".kei-tmp"),
             state_db: None,
-            retry_only: false,
             provisional: false,
             indexing_inventory_only: false,
-            max_download_attempts: 0,
             sync_mode: SyncMode::Full,
             enum_config_hash: None,
             album_name: None,
@@ -2111,6 +2172,131 @@ mod wiremock_tests {
     }
 
     #[tokio::test]
+    async fn startup_archive_adopts_without_media_requests_and_stays_quiet_after_reopen() {
+        let server = crate::start_wiremock_or_skip!();
+        let asset = WiremockAsset::new("STARTUP", "archive.JPG", "public.jpeg").orig(
+            12,
+            "provider-generation",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(base_config(&tmp.path().join("photos")));
+        let paths = stage_expected(&asset.to_photo_asset(), &config);
+        let sidecar = paths[0].with_extension("xmp");
+        std::fs::write(&sidecar, b"existing metadata").unwrap();
+        let original = std::fs::read(&paths[0]).unwrap();
+        stub_records_query(&server, &[asset]).await;
+        let passes = [crate::commands::AlbumPass {
+            kind: crate::commands::PassKind::Unfiled,
+            album: album_pointed_at(&server),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let plans = [(config, passes.as_slice())];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let db = open_db(&tmp).await;
+        let stats = super::adopt_startup_archive(&db, &plans, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(stats.matched, 1);
+        assert_eq!(stats.state_write_failures, 0);
+        assert_eq!(all_downloaded(db.as_ref()).await.len(), 1);
+        assert_eq!(
+            db.get_metadata(super::STARTUP_ADOPTION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("complete")
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method.as_str() == "POST")
+        );
+        drop(db);
+        server.reset().await;
+        for _ in 0..2 {
+            let db = open_db(&tmp).await;
+            let stats = super::adopt_startup_archive(&db, &plans, &cancel)
+                .await
+                .unwrap();
+            assert_eq!(stats.total, 0);
+            assert_eq!(all_downloaded(db.as_ref()).await.len(), 1);
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), original);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), b"existing metadata");
+    }
+
+    #[tokio::test]
+    async fn startup_archive_retries_failed_state_write_without_rewriting_media() {
+        let server = crate::start_wiremock_or_skip!();
+        let asset = WiremockAsset::new("STARTUP_RETRY", "archive.JPG", "public.jpeg").orig(
+            12,
+            "provider-generation",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(base_config(&tmp.path().join("photos")));
+        let paths = stage_expected(&asset.to_photo_asset(), &config);
+        let peer = WiremockAsset::new("STARTUP_PEER", "peer.JPG", "public.jpeg").orig(
+            12,
+            "peer-generation",
+            "public.jpeg",
+        );
+        stage_expected(&peer.to_photo_asset(), &config);
+        let assets = [peer, asset];
+        stub_records_query(&server, &assets).await;
+        let passes = [crate::commands::AlbumPass {
+            kind: crate::commands::PassKind::Unfiled,
+            album: album_pointed_at(&server),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let plans = [(config, passes.as_slice())];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let db = open_db(&tmp).await;
+        db.acquire_lock("inject adoption failure").unwrap().execute_batch(
+            "CREATE TRIGGER fail_startup_adoption BEFORE INSERT ON assets WHEN NEW.filename = 'archive.JPG' BEGIN SELECT RAISE(ABORT, 'injected'); END;"
+        ).unwrap();
+        let stats = super::adopt_startup_archive(&db, &plans, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(stats.state_write_failures, 1);
+        assert_eq!(stats.matched, 1);
+        assert_eq!(all_downloaded(db.as_ref()).await.len(), 1);
+        assert_eq!(
+            db.get_metadata(super::STARTUP_ADOPTION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("pending")
+        );
+        db.acquire_lock("restore adoption writes")
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_startup_adoption")
+            .unwrap();
+        drop(db);
+        server.reset().await;
+        stub_records_query(&server, &assets).await;
+        let db = open_db(&tmp).await;
+        let stats = super::adopt_startup_archive(&db, &plans, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(stats.matched, 2);
+        assert_eq!(all_downloaded(db.as_ref()).await.len(), 2);
+        assert_eq!(
+            db.get_metadata(super::STARTUP_ADOPTION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("complete")
+        );
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), vec![0; 12]);
+    }
+
+    #[tokio::test]
     async fn unmatched_when_size_differs() {
         let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("A2", "IMG_0002.JPG", "public.jpeg").orig(
@@ -2135,6 +2321,67 @@ mod wiremock_tests {
         assert_eq!(stats.matched, 0);
         assert_eq!(stats.unmatched, 1);
         assert!(all_downloaded(db.as_ref()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_archive_preserves_ambiguous_files_and_resumes_after_cancellation() {
+        let server = crate::start_wiremock_or_skip!();
+        let assets = [
+            WiremockAsset::new("AMBIG_A", "same.JPG", "public.jpeg").orig(
+                12,
+                "a-generation",
+                "public.jpeg",
+            ),
+            WiremockAsset::new("AMBIG_B", "same.JPG", "public.jpeg").orig(
+                12,
+                "b-generation",
+                "public.jpeg",
+            ),
+        ];
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(base_config(&tmp.path().join("photos")));
+        let paths = stage_expected(&assets[0].to_photo_asset(), &config);
+        stub_records_query(&server, &assets).await;
+        let passes = [crate::commands::AlbumPass {
+            kind: crate::commands::PassKind::Unfiled,
+            album: album_pointed_at(&server),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let plans = [(config, passes.as_slice())];
+        let db = open_db(&tmp).await;
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            super::adopt_startup_archive(&db, &plans, &cancelled)
+                .await
+                .is_err()
+        );
+        assert!(all_downloaded(db.as_ref()).await.is_empty());
+        assert_eq!(
+            db.get_metadata(super::STARTUP_ADOPTION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("pending")
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        server.reset().await;
+        stub_records_query(&server, &assets).await;
+        let stats =
+            super::adopt_startup_archive(&db, &plans, &tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap();
+        assert_eq!(stats.matched, 0);
+        assert_eq!(stats.unmatched, 2);
+        assert!(all_downloaded(db.as_ref()).await.is_empty());
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), vec![0; 12]);
+        assert_eq!(
+            db.get_metadata(super::STARTUP_ADOPTION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("complete")
+        );
     }
 
     #[tokio::test]
@@ -2417,6 +2664,11 @@ mod wiremock_tests {
                 assert_eq!(db.get_summary().await.unwrap().total_assets, 1);
                 assert!(db.get_asset_master_mappings().await.unwrap().is_empty());
             }
+            let changed_identity = if persisted_owner {
+                "master-913"
+            } else {
+                "child-913"
+            };
             assert_eq!(
                 preflight
                     .candidates
@@ -2429,7 +2681,7 @@ mod wiremock_tests {
                         "master-913",
                         "other-child",
                         "master-913",
-                        "child-913",
+                        changed_identity,
                     ]
                 } else {
                     [
@@ -2437,7 +2689,7 @@ mod wiremock_tests {
                         "master-913",
                         "master-913",
                         "other-child",
-                        "child-913",
+                        changed_identity,
                     ]
                 }
             );
@@ -2445,13 +2697,28 @@ mod wiremock_tests {
                 .adopt(db.as_ref(), ImportRunOptions::default())
                 .await
                 .unwrap();
-            assert_eq!((stats.matched, stats.unmatched), (3, 2));
+            assert_eq!(
+                (stats.matched, stats.unmatched),
+                if persisted_owner { (4, 1) } else { (3, 2) }
+            );
             drop(db);
             let db = open_db(&tmp).await;
             let rows = all_downloaded(db.as_ref()).await;
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].id.as_ref(), "master-913");
-            assert_eq!(rows[0].local_path.as_ref(), Some(&files[2]));
+            assert_eq!(
+                rows[0].local_path.as_ref(),
+                Some(&files[if persisted_owner { 3 } else { 2 }])
+            );
+            assert_eq!(
+                rows[0].checksum.as_ref(),
+                if persisted_owner {
+                    "changed-provider-generation"
+                } else {
+                    "legacy-checksum"
+                }
+            );
+            assert!(rows[0].download_checksum.is_none());
             assert_eq!(db.get_asset_master_mappings().await.unwrap().len(), 1);
             assert_eq!(
                 db.get_legacy_master_state_owners().await.unwrap(),
@@ -3354,7 +3621,7 @@ mod wiremock_tests {
     }
 
     #[tokio::test]
-    async fn force_resolution_strict_skips_when_size_missing() {
+    async fn missing_local_original_is_unmatched_not_filtered() {
         let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("FS2", "IMG_0002.JPG", "public.jpeg").orig(
             1000,
@@ -3371,12 +3638,10 @@ mod wiremock_tests {
         let db = open_db(&tmp).await;
         let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
         assert_eq!(stats.total, 1);
-        assert_eq!(stats.matched, 0, "force_resolution strict must skip");
-        assert_eq!(stats.unmatched, 0);
-        assert_eq!(
-            stats.filtered, 1,
-            "force_resolution + missing size produces empty expected paths -> filtered",
-        );
+        assert_eq!(stats.matched, 0);
+        assert_eq!(stats.unmatched, 1);
+        assert_eq!(stats.filtered, 0);
+        assert!(all_downloaded(db.as_ref()).await.is_empty());
     }
 
     // ── Tests: pagination + EOF ───────────────────────────────────────
@@ -3487,9 +3752,9 @@ mod wiremock_tests {
                 for row in &rows {
                     let (width, height, checksum) = if row.version_size == VersionSizeKey::Original
                     {
-                        (6000, 4500, "alternative")
-                    } else {
                         (4000, 3000, "original")
+                    } else {
+                        (6000, 4500, "alternative")
                     };
                     assert_eq!(
                         (row.metadata.width, row.metadata.height),
@@ -3850,7 +4115,7 @@ mod wiremock_tests {
     // `is_asset_filtered_blocks_excluded_asset_id` already pin the gate
     // for two filter sources. The branch's commit "honor is_asset_filtered"
     // (05356d2) ties the import path to ALL filter sources, not just two.
-    // These pin media / date / filename-exclude so a future change
+    // These pin media and date eligibility so a future change
     // that loses one of them surfaces here.
     //
     // Each test stages the file the matcher would land on without the
@@ -3914,7 +4179,7 @@ mod wiremock_tests {
     }
 
     #[tokio::test]
-    async fn filename_exclude_glob_drops_matching_assets() {
+    async fn fixed_date_filter_drops_matching_assets_before_hash() {
         let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("BLOCK1", "IMG_BLOCK.JPG", "public.jpeg").orig(
             1000,
@@ -3925,8 +4190,8 @@ mod wiremock_tests {
         let dl = tmp.path().join("photos");
         std::fs::create_dir_all(&dl).unwrap();
         let mut config = base_config(&dl);
-        let pattern = glob::Pattern::new("IMG_BLOCK.*").expect("compile glob");
-        config.filename_exclude = Arc::from(vec![pattern]);
+        config.skip_created_before =
+            Some(crate::config::parse_created_date_filter("2099-01-01").unwrap());
         stage_expected(&asset.to_photo_asset(), &base_config(&dl));
 
         let db = open_db(&tmp).await;
@@ -3934,7 +4199,7 @@ mod wiremock_tests {
         assert_eq!(stats.total, 1);
         assert_eq!(
             stats.matched, 0,
-            "filename_exclude must drop the asset before hash"
+            "fixed date filter must drop the asset before hash"
         );
         assert_eq!(stats.unmatched, 0);
         assert_eq!(stats.filtered, 1);
@@ -4970,9 +5235,7 @@ mod build_config_tests {
     use super::build_import_path_config;
     use crate::cli::{Cli, Command};
     use crate::config::{Config, GlobalArgs, TomlConfig};
-    use crate::types::{
-        AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
-    };
+    use crate::types::{FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy};
     use clap::Parser;
 
     fn parse_import_args(extra: &[&str]) -> crate::cli::ImportArgs {
@@ -5006,33 +5269,25 @@ mod build_config_tests {
             folder_structure = "%Y/%m"
 
             [photos]
-            resolution = "medium"
             file_match_policy = "name-id7"
-            live_photo_mode = "video-only"
-            live_resolution = "thumb"
             live_photo_mov_filename_policy = "original"
-            raw_policy = "prefer-raw"
-            force_resolution = true
             keep_unicode_in_filenames = true
 
             [filters]
-            media = ["photos", "live-photos"]
+            exclude = ["videos", "live-photo-stills"]
             "#,
         );
 
         let cfg = build_import_path_config(Some(&toml)).unwrap();
 
         assert_eq!(cfg.folder_structure, "%Y/%m");
-        assert_eq!(cfg.resolution, crate::types::PhotoResolution::Medium);
         assert_eq!(cfg.file_match_policy, FileMatchPolicy::NameId7);
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::VideoOnly);
-        assert_eq!(cfg.live_resolution, AssetVersionSize::LiveThumb);
         assert_eq!(
             cfg.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Original
         );
-        assert_eq!(cfg.raw_policy, RawPolicy::PreferRaw);
-        assert!(cfg.force_resolution);
+        assert_eq!(cfg.raw_policy, RawPolicy::AsIs);
         assert!(cfg.keep_unicode_in_filenames);
         assert!(cfg.media.photos);
         assert!(!cfg.media.videos);
@@ -5045,19 +5300,16 @@ mod build_config_tests {
     fn build_import_path_config_falls_through_to_default() {
         let toml = toml_with_download("");
         let cfg = build_import_path_config(Some(&toml)).unwrap();
-        assert_eq!(cfg.resolution, crate::types::PhotoResolution::Original);
         assert_eq!(
             cfg.file_match_policy,
             FileMatchPolicy::NameSizeDedupWithSuffix
         );
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::Both);
-        assert_eq!(cfg.live_resolution, AssetVersionSize::LiveOriginal);
         assert_eq!(
             cfg.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Suffix
         );
         assert_eq!(cfg.raw_policy, RawPolicy::AsIs);
-        assert!(!cfg.force_resolution);
         assert!(!cfg.keep_unicode_in_filenames);
         assert_eq!(cfg.folder_structure, "%Y/%m/%d");
     }
@@ -5085,12 +5337,8 @@ mod build_config_tests {
             folder_structure = "%Y/%m"
 
             [photos]
-            resolution = "original"
-            edited = true
             file_match_policy = "name-id7"
             live_photo_mov_filename_policy = "original"
-            raw_policy = "prefer-raw"
-            force_resolution = true
             keep_unicode_in_filenames = true
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
@@ -5099,6 +5347,7 @@ mod build_config_tests {
 
         let sync = SyncArgs::default();
         let globals = GlobalArgs {
+            config_source: Default::default(),
             username: Some("u@example.com".to_string()),
             domain: None,
             data_dir: None,
@@ -5115,12 +5364,7 @@ mod build_config_tests {
             import_cfg.folder_structure,
             sync_cfg.download.folder_structure
         );
-        assert_eq!(import_cfg.resolution, sync_cfg.photos.resolution);
         assert_eq!(import_cfg.live_photo_mode, sync_cfg.photos.live_photo_mode);
-        assert_eq!(
-            import_cfg.live_resolution,
-            sync_cfg.photos.live_resolution.to_asset_version_size()
-        );
         assert_eq!(
             import_cfg.live_photo_mov_filename_policy,
             sync_cfg.photos.live_photo_mov_filename_policy
@@ -5129,10 +5373,6 @@ mod build_config_tests {
         assert_eq!(
             import_cfg.file_match_policy,
             sync_cfg.photos.file_match_policy
-        );
-        assert_eq!(
-            import_cfg.force_resolution,
-            sync_cfg.photos.force_resolution
         );
         assert_eq!(
             import_cfg.keep_unicode_in_filenames,
@@ -5156,6 +5396,7 @@ mod build_config_tests {
 
         let sync = SyncArgs::default();
         let globals = GlobalArgs {
+            config_source: Default::default(),
             username: Some("u@example.com".to_string()),
             domain: None,
             data_dir: None,

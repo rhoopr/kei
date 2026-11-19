@@ -583,6 +583,7 @@ mod tests {
         std::fs::write(&media_path, b"placeholder").unwrap();
 
         let first = MetadataWrite {
+            orientation: None,
             title: Some("Before".into()),
             ..MetadataWrite::default()
         };
@@ -795,6 +796,9 @@ mod tests {
 
         let first = MetadataWrite {
             datetime: Some("2024:06:15 10:00:00".into()),
+            prior_embedded: Default::default(),
+            clear_embedded: Default::default(),
+            orientation: None,
             datetime_subseconds: None,
             offset_time_original: Some("+10:00".into()),
             clear_datetime_offsets: false,

@@ -1,6 +1,4 @@
 #[cfg(feature = "xmp")]
-use super::super::test_support::mock_album_with_container;
-#[cfg(feature = "xmp")]
 use std::collections::HashMap;
 #[cfg(feature = "xmp")]
 use std::path::Path;
@@ -42,7 +40,333 @@ use super::super::test_support::{
     incremental_test_config, mock_album, relation_delete_record, seed_complete_album_snapshot,
     seed_downloaded_metadata_asset, test_config, unused_unfiled_changes_pass,
 };
-use super::{download_photos_incremental, download_photos_incremental_collecting_inner};
+use super::{
+    coalesce_collecting_assets, download_photos_incremental,
+    download_photos_incremental_collecting, download_photos_incremental_collecting_inner,
+};
+
+#[test]
+fn collecting_duplicate_admission_preserves_distinct_observations() {
+    let records = incremental_photo_records("duplicate");
+    let make =
+        |records: &[serde_json::Value]| PhotoAsset::new(records[0].clone(), records[1].clone());
+    let base = make(&records);
+    let mut renewal = records.clone();
+    renewal[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+        json!("https://p01.icloud-content.com/renewed.jpg");
+    let renewed = make(&renewal);
+    let inputs = vec![(base.clone(), 0), (renewed.clone(), 0)];
+    let admitted = coalesce_collecting_assets(&inputs, "PrimarySync");
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(
+        admitted[0].0.versions()[0].1.url.as_ref(),
+        "https://p01.icloud-content.com/renewed.jpg"
+    );
+
+    for (label, index, pointer, value) in [
+        (
+            "checksum",
+            0,
+            "/fields/resOriginalRes/value/fileChecksum",
+            json!("different"),
+        ),
+        ("size", 0, "/fields/resOriginalRes/value/size", json!(1025)),
+        (
+            "resource type",
+            0,
+            "/fields/resOriginalFileType/value",
+            json!("public.png"),
+        ),
+        (
+            "filename",
+            0,
+            "/fields/filenameEnc/value",
+            json!("other.jpg"),
+        ),
+        ("master", 0, "/recordName", json!("other-master")),
+        ("child", 1, "/recordName", json!("other-child")),
+        (
+            "capture date",
+            1,
+            "/fields/assetDate/value",
+            json!(1700000000001i64),
+        ),
+        (
+            "added date",
+            1,
+            "/fields/addedDate/value",
+            json!(1700000000001i64),
+        ),
+        (
+            "rendition width",
+            0,
+            "/fields/resOriginalWidth/value",
+            json!(101),
+        ),
+        (
+            "malformed resource",
+            0,
+            "/fields/resOriginalRes/value/downloadURL",
+            json!("not-a-url"),
+        ),
+    ] {
+        let mut changed = records.clone();
+        *changed[index].pointer_mut(pointer).unwrap() = value;
+        let inputs = vec![(base.clone(), 0), (make(&changed), 0)];
+        assert_eq!(
+            coalesce_collecting_assets(&inputs, "PrimarySync").len(),
+            2,
+            "{label}"
+        );
+    }
+    let mut changed = records.clone();
+    changed[1]["fields"]["isFavorite"] = json!({"value": 1});
+    let changed = make(&changed);
+    let inputs = vec![(base.clone(), 0), (changed, 0), (base.clone(), 0)];
+    assert_eq!(
+        coalesce_collecting_assets(&inputs, "PrimarySync").len(),
+        3,
+        "A/B/A is not globally deduplicated"
+    );
+    let inputs = vec![
+        (base.clone(), 0),
+        (base.clone(), 1),
+        (base.clone().with_source_zone(Arc::from("SharedSync")), 0),
+        (
+            base.clone()
+                .with_state_record_name(Arc::from("legacy-state")),
+            0,
+        ),
+    ];
+    assert_eq!(
+        coalesce_collecting_assets(&inputs, "PrimarySync").len(),
+        4,
+        "passes, libraries and state identities remain distinct"
+    );
+}
+
+#[test]
+fn collecting_duplicate_admission_preserves_companions_and_url_aliases() {
+    let mut records = incremental_photo_records("live");
+    records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {"downloadURL":"https://p01.icloud-content.com/motion", "size": 50, "fileChecksum":"motion"}});
+    records[0]["fields"]["resOriginalVidComplFileType"] =
+        json!({"value":"com.apple.quicktime-movie"});
+    let make =
+        |records: &[serde_json::Value]| PhotoAsset::new(records[0].clone(), records[1].clone());
+    let original = make(&records);
+    assert!(original.is_live_photo());
+    let mut renewed = records.clone();
+    renewed[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+        json!("https://p01.icloud-content.com/new-still");
+    renewed[0]["fields"]["resOriginalVidComplRes"]["value"]["downloadURL"] =
+        json!("https://p01.icloud-content.com/new-motion");
+    let renewed = make(&renewed);
+    let inputs = vec![(original.clone(), 0), (renewed, 0)];
+    let admitted = coalesce_collecting_assets(&inputs, "PrimarySync");
+    assert_eq!(admitted.len(), 1);
+    assert!(admitted[0].0.is_live_photo());
+    assert_eq!(admitted[0].0.versions().len(), 2);
+    let mut aliased = records.clone();
+    aliased[0]["fields"]["resOriginalVidComplRes"]["value"]["downloadURL"] =
+        records[0]["fields"]["resOriginalRes"]["value"]["downloadURL"].clone();
+    let inputs = vec![(original.clone(), 0), (make(&aliased), 0)];
+    assert_eq!(
+        coalesce_collecting_assets(&inputs, "PrimarySync").len(),
+        2,
+        "URL alias changes selection"
+    );
+    records[0]["fields"]["resOriginalVidComplRes"]["value"]["fileChecksum"] = json!("new-motion");
+    let inputs = vec![(original, 0), (make(&records), 0)];
+    assert_eq!(
+        coalesce_collecting_assets(&inputs, "PrimarySync").len(),
+        2,
+        "changed companion is new evidence"
+    );
+}
+
+#[test]
+fn collecting_duplicate_admission_tracks_master_and_state_transitions_per_child() {
+    let a_records = incremental_photo_records("master-a");
+    let mut b_records = incremental_photo_records("master-b");
+    b_records[1]["recordName"] = a_records[1]["recordName"].clone();
+    let a = PhotoAsset::new(a_records[0].clone(), a_records[1].clone());
+    let b = PhotoAsset::new(b_records[0].clone(), b_records[1].clone());
+    let other_state = a.clone().with_state_record_name(Arc::from("legacy-state"));
+    for (label, middle) in [
+        ("master", b),
+        ("state", other_state),
+        (
+            "source-zone-evidence",
+            a.clone().with_source_zone(Arc::from("PrimarySync")),
+        ),
+    ] {
+        let inputs = vec![(a.clone(), 0), (middle, 0), (a.clone(), 0)];
+        let admitted = coalesce_collecting_assets(&inputs, "PrimarySync");
+        assert_eq!(admitted.len(), 3, "{label} A/B/A must stay in order");
+        assert!(std::ptr::eq(admitted[0].0, &inputs[0].0));
+        assert!(std::ptr::eq(admitted[1].0, &inputs[1].0));
+        assert!(std::ptr::eq(admitted[2].0, &inputs[2].0));
+    }
+
+    let other_child = PhotoAsset::new(
+        a_records[0].clone(),
+        incremental_photo_records("other")[1].clone(),
+    );
+    for (label, other, pass) in [
+        ("child", other_child, 0),
+        (
+            "zone",
+            a.clone().with_source_zone(Arc::from("SharedSync")),
+            0,
+        ),
+        ("pass", a.clone(), 1),
+    ] {
+        let inputs = vec![(a.clone(), 0), (other, pass), (a.clone(), 0)];
+        let admitted = coalesce_collecting_assets(&inputs, "PrimarySync");
+        assert_eq!(
+            admitted.len(),
+            2,
+            "{label} does not split an independent stream"
+        );
+        assert!(
+            std::ptr::eq(admitted[0].0, &inputs[2].0),
+            "later equivalent URL is retained"
+        );
+        assert!(std::ptr::eq(admitted[1].0, &inputs[1].0));
+    }
+}
+
+#[tokio::test]
+async fn collecting_master_aba_preserves_final_durable_mapping() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = crate::start_wiremock_or_skip!();
+    let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, 0x4A, 0x46];
+    Mock::given(method("GET"))
+        .and(path("/aba.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&server)
+        .await;
+    let url = format!("{}/aba.jpg", server.uri());
+    let mut a = incremental_photo_records_with_url("master-a", "aba.jpg", &url, body.len() as u64);
+    let mut b = incremental_photo_records_with_url("master-b", "aba.jpg", &url, body.len() as u64);
+    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+    a[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+    b[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+    b[1]["recordName"] = a[1]["recordName"].clone();
+    let records = vec![
+        a[0].clone(),
+        a[1].clone(),
+        b[0].clone(),
+        b[1].clone(),
+        a[1].clone(),
+    ];
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: changes_album(
+            "",
+            changes_zone_session(Arc::new(AtomicUsize::new(0)), records),
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let root = TempDir::new().unwrap();
+    let database = root.path().join("state.db");
+    let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+    db.acquire_lock("mapping transitions").unwrap().execute_batch(
+        "CREATE TABLE mapping_observations(master TEXT NOT NULL);\
+         CREATE TRIGGER track_mapping_insert AFTER INSERT ON asset_master_mappings BEGIN INSERT INTO mapping_observations VALUES(NEW.master_record_name); END;\
+         CREATE TRIGGER track_mapping_update AFTER UPDATE ON asset_master_mappings BEGIN INSERT INTO mapping_observations VALUES(NEW.master_record_name); END;"
+    ).unwrap();
+    let mut config = test_config();
+    config.directory = Arc::from(root.path().join("media"));
+    config.concurrent_downloads = 1;
+    config.state_db = Some(db.clone());
+    let result = download_photos_incremental_collecting(
+        &Client::new(),
+        &[pass],
+        &Arc::new(config),
+        "before",
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result.outcome, DownloadOutcome::Success),
+        "{result:?}"
+    );
+    assert_eq!(
+        result.stats.downloaded, 3,
+        "all three distinct observations reach execution"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    assert_eq!(
+        db.get_master_record_name_for_asset("PrimarySync", "asset-master-a")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("master-a")
+    );
+    let observations = {
+        let conn = db.acquire_lock("inspect mapping transitions").unwrap();
+        let mut query = conn
+            .prepare("SELECT master FROM mapping_observations ORDER BY rowid")
+            .unwrap();
+        query
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        observations,
+        [
+            "master-a", "master-b", "master-a", "master-a", "master-b", "master-a"
+        ]
+    );
+    drop(db);
+    let reopened = SqliteStateDb::open(&database).await.unwrap();
+    assert_eq!(
+        reopened
+            .get_master_record_name_for_asset("PrimarySync", "asset-master-a")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("master-a")
+    );
+}
+
+async fn run_incremental_strategy(
+    collecting: bool,
+    passes: &[AlbumPass],
+    config: &Arc<DownloadConfig>,
+    cursor: &str,
+) -> anyhow::Result<super::super::models::SyncResult> {
+    if collecting {
+        download_photos_incremental_collecting(
+            &Client::new(),
+            passes,
+            config,
+            cursor,
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+    } else {
+        download_photos_incremental(
+            &Client::new(),
+            passes,
+            config,
+            cursor,
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+    }
+}
 
 async fn relation_removed_metadata_edit_fixture(
     db: &Arc<SqliteStateDb>,
@@ -359,28 +683,30 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
         );
         records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
             json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body)));
-        let passes: Vec<_> = [("Family", "family"), ("Trip", "trip")]
-            .into_iter()
-            .map(|(name, id)| AlbumPass {
-                kind: PassKind::Album,
-                album: mock_album_with_container(
-                    name,
-                    id,
-                    MockPhotosFlow::new()
-                        .album_count(1)
-                        .query_page(records.clone(), Some("token-full"))
-                        .build(),
-                ),
-                exclude_ids: Arc::new(FxHashSet::default()),
-            })
-            .collect();
+        records[1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+            json!("_defaultOwner");
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("state.db");
-        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let db = super::super::test_support::open_fixture_db(&db_path).await;
+        let passes: Vec<_> = [("Family", "family"), ("Trip", "trip")]
+            .into_iter()
+            .map(|(name, id)| {
+                let mut pass = super::super::test_support::selected_pass_with_session(
+                    &db,
+                    id,
+                    Box::new(super::super::test_support::SelectedMediaSession(Arc::new(
+                        records.clone(),
+                    ))),
+                );
+                pass.album.name = Arc::from(name);
+                pass
+            })
+            .collect();
         let mut config = test_config();
         config.directory = Arc::from(dir.path().join("media"));
         config.metadata.xmp_sidecar = true;
         config.metadata.embed_xmp = embed_xmp;
+        config.metadata.include_albums = true;
         config.state_db = Some(db.clone());
         let initial = download_photos_with_sync(
             &Client::new(),
@@ -477,10 +803,10 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
             2
         );
         config.state_db = None;
+        drop(passes);
         drop(db);
         let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
         config.state_db = Some(db.clone());
-        config.recent = Some(10);
         let pass = AlbumPass {
             kind: PassKind::Unfiled,
             album: changes_album(
@@ -498,7 +824,7 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
         tokio::fs::write(&sidecars[0], b"not parseable XMP")
             .await
             .unwrap();
-        let failed = download_photos_incremental(
+        let failed = download_photos_incremental_collecting(
             &Client::new(),
             std::slice::from_ref(&pass),
             &Arc::new(config.clone()),
@@ -527,7 +853,7 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
         tokio::fs::write(&sidecars[0], original_sidecar)
             .await
             .unwrap();
-        let repaired = download_photos_incremental(
+        let repaired = download_photos_incremental_collecting(
             &Client::new(),
             std::slice::from_ref(&pass),
             &Arc::new(config.clone()),
@@ -578,7 +904,7 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
                 .unwrap()
                 .is_empty()
         );
-        let steady = download_photos_incremental(
+        let steady = download_photos_incremental_collecting(
             &Client::new(),
             &[pass],
             &Arc::new(config),
@@ -645,6 +971,7 @@ async fn album_membership_first_xmp_and_tracked_path_removal() {
     config.directory = Arc::from(dir.path().join("media"));
     config.album_name = Some(Arc::from("Trip"));
     config.metadata.xmp_sidecar = true;
+    config.metadata.include_albums = true;
     config.state_db = Some(db.clone());
     assert!(
         db.get_all_asset_albums("PrimarySync")
@@ -722,7 +1049,6 @@ async fn album_membership_first_xmp_and_tracked_path_removal() {
     );
 
     config.album_name = None;
-    config.recent = Some(10);
     let pass = AlbumPass {
         kind: PassKind::Unfiled,
         album: changes_album(
@@ -735,7 +1061,7 @@ async fn album_membership_first_xmp_and_tracked_path_removal() {
         exclude_ids: Arc::new(FxHashSet::default()),
     };
     for _ in 0..2 {
-        let removed = download_photos_incremental(
+        let removed = download_photos_incremental_collecting(
             &Client::new(),
             std::slice::from_ref(&pass),
             &Arc::new(config.clone()),
@@ -792,7 +1118,6 @@ async fn collecting_album_membership_failure_replays_without_redownloading() {
     };
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
-    config.recent = Some(10);
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
     let media_path = seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &asset).await;
     let config = Arc::new(config);
@@ -801,7 +1126,7 @@ async fn collecting_album_membership_failure_replays_without_redownloading() {
         .expect("read seeded media");
 
     db.fail_asset_album_writes_for_test();
-    let failed = download_photos_incremental(
+    let failed = download_photos_incremental_collecting(
         &Client::new(),
         std::slice::from_ref(&pass),
         &config,
@@ -828,7 +1153,7 @@ async fn collecting_album_membership_failure_replays_without_redownloading() {
 
     db.allow_asset_album_writes_for_test();
     for cycle in 2..=3 {
-        let recovered = download_photos_incremental(
+        let recovered = download_photos_incremental_collecting(
             &Client::new(),
             std::slice::from_ref(&pass),
             &config,
@@ -870,7 +1195,7 @@ async fn filtered_original_replacement_refreshes_metadata_and_advances_checkpoin
         ("com.apple.quicktime-movie", false),
         ("public.jpeg", true),
     ] {
-        for recent in [None, Some(10)] {
+        for collecting in [false, true] {
             let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
             let dir = TempDir::new().unwrap();
             let mut records = incremental_photo_records_with_favorite("REPLACED", false);
@@ -889,7 +1214,21 @@ async fn filtered_original_replacement_refreshes_metadata_and_advances_checkpoin
                 records[0]["fields"]["resOriginalAltWidth"] = json!({"value": 6000});
                 records[0]["fields"]["resOriginalAltHeight"] = json!({"value": 4500});
             }
-            let stored = PhotoAsset::new(records[0].clone(), records[1].clone())
+            // Seed the historical RAW-only original binding directly. Current
+            // selection includes both siblings, so it cannot recreate this old
+            // restrictive policy through the live selector.
+            let mut stored_master = records[0].clone();
+            if swapped_original_only {
+                for suffix in ["Res", "FileType", "Width", "Height"] {
+                    let value = stored_master["fields"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(&format!("resOriginalAlt{suffix}"))
+                        .unwrap();
+                    stored_master["fields"][format!("resOriginal{suffix}")] = value;
+                }
+            }
+            let stored = PhotoAsset::new(stored_master, records[1].clone())
                 .with_state_record_name(Arc::from("asset-REPLACED"));
             let pass = AlbumPass {
                 kind: PassKind::Unfiled,
@@ -901,7 +1240,6 @@ async fn filtered_original_replacement_refreshes_metadata_and_advances_checkpoin
             };
             let mut config = test_config();
             config.directory = Arc::from(dir.path());
-            config.recent = recent;
             config.file_match_policy = FileMatchPolicy::NameId7;
             config.state_db = Some(db.clone());
             config.raw_policy = RawPolicy::PreferRaw;
@@ -956,19 +1294,17 @@ async fn filtered_original_replacement_refreshes_metadata_and_advances_checkpoin
                     ),
                     exclude_ids: Arc::new(FxHashSet::default()),
                 };
-                let result = download_photos_incremental(
-                    &Client::new(),
+                let result = run_incremental_strategy(
+                    collecting,
                     &[pass],
                     &Arc::new(config.clone()),
                     &token,
-                    DownloadControls::download_hidden(),
-                    CancellationToken::new(),
                 )
                 .await
                 .unwrap();
                 assert!(
                     matches!(result.outcome, DownloadOutcome::Success),
-                    "{item_type}, swapped={swapped_original_only}, recent={recent:?}, cycle={cycle}: {result:?}"
+                    "{item_type}, swapped={swapped_original_only}, collecting={collecting}, cycle={cycle}: {result:?}"
                 );
                 assert_eq!(result.stats.downloaded, 0);
                 assert_eq!(result.stats.state_write_failures, 0);
@@ -1047,7 +1383,6 @@ async fn raw_policy_incremental_metadata_refresh_captures_unknown_bytes_without_
         config.directory = Arc::from(dir.path());
         config.raw_policy = policy;
         config.alternative = true;
-        config.recent = Some(10);
         config.state_db = Some(db.clone());
         seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored).await;
         let before = db.get_downloaded_page(0, 10).await.unwrap();
@@ -1086,7 +1421,7 @@ async fn raw_policy_incremental_metadata_refresh_captures_unknown_bytes_without_
                 ),
                 exclude_ids: Arc::new(FxHashSet::default()),
             };
-            let result = download_photos_incremental(
+            let result = download_photos_incremental_collecting(
                 &Client::new(),
                 &[pass],
                 &Arc::new(config.clone()),
@@ -1109,7 +1444,7 @@ async fn raw_policy_incremental_metadata_refresh_captures_unknown_bytes_without_
                     .iter()
                     .find(|initial| initial.version_size == row.version_size)
                     .unwrap();
-                let expected = if row.version_size == VersionSizeKey::Original {
+                let expected = if row.version_size == VersionSizeKey::Alternative {
                     if cycle < 2 {
                         (Some(6200), Some(4500))
                     } else {
@@ -1120,7 +1455,7 @@ async fn raw_policy_incremental_metadata_refresh_captures_unknown_bytes_without_
                 };
                 assert_eq!((row.metadata.width, row.metadata.height), expected);
                 assert_eq!(row.metadata.is_favorite, cycle >= 2);
-                if cycle >= 2 && row.version_size == VersionSizeKey::Original {
+                if cycle >= 2 && row.version_size == VersionSizeKey::Alternative {
                     assert_eq!(row.metadata.duration_secs, None);
                 }
                 assert_eq!(
@@ -1207,7 +1542,6 @@ async fn collecting_metadata_edit_refreshes_catalogue_without_duplicate_for_both
         let mut config = test_config();
         config.directory = Arc::from(dir.path());
         config.file_match_policy = policy;
-        config.recent = Some(10);
         config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         let media_path =
             seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored_asset).await;
@@ -1215,7 +1549,7 @@ async fn collecting_metadata_edit_refreshes_catalogue_without_duplicate_for_both
         assert_eq!(initial.len(), 2);
         let config = Arc::new(config);
         db.fail_provider_metadata_refresh_for_test();
-        let failed = download_photos_incremental(
+        let failed = download_photos_incremental_collecting(
             &Client::new(),
             std::slice::from_ref(&pass),
             &config,
@@ -1271,7 +1605,7 @@ async fn collecting_metadata_edit_refreshes_catalogue_without_duplicate_for_both
             if cycle == 1 {
                 db.fail_provider_metadata_refresh_for_test();
             }
-            let result = download_photos_incremental(
+            let result = download_photos_incremental_collecting(
                 &Client::new(),
                 std::slice::from_ref(&pass),
                 &config,
@@ -1477,13 +1811,12 @@ async fn collecting_unchanged_metadata_is_a_production_path_noop() {
     };
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
-    config.recent = Some(10);
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
     let media_path =
         seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored_asset).await;
     db.fail_provider_metadata_refresh_for_test();
 
-    let result = download_photos_incremental(
+    let result = download_photos_incremental_collecting(
         &Client::new(),
         std::slice::from_ref(&pass),
         &Arc::new(config),
@@ -1546,11 +1879,10 @@ async fn collecting_zero_download_cycle_drains_metadata_rewrite_batch() {
     };
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
-    config.recent = Some(10);
     config.metadata.xmp_sidecar = true;
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
 
-    let result = download_photos_incremental(
+    let result = download_photos_incremental_collecting(
         &Client::new(),
         std::slice::from_ref(&pass),
         &Arc::new(config),
@@ -1653,17 +1985,10 @@ async fn rejected_capture_upserts_never_dispatch_streaming_or_collecting_tasks()
         };
         let mut config = incremental_test_config(&dir);
         config.state_db = Some(db.clone());
-        config.recent = collecting.then_some(10);
-        let result = download_photos_incremental(
-            &Client::new(),
-            &[pass],
-            &Arc::new(config),
-            "zone-token-prev",
-            DownloadControls::download_hidden(),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+        let result =
+            run_incremental_strategy(collecting, &[pass], &Arc::new(config), "zone-token-prev")
+                .await
+                .unwrap();
         assert_eq!(
             server.received_requests().await.unwrap().len(),
             0,
@@ -1710,10 +2035,13 @@ async fn rejected_capture_upserts_never_dispatch_streaming_or_collecting_tasks()
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stays_incremental() {
+    use crate::icloud::photos::PhotosSession;
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
     use xmp_toolkit::{XmpMeta, xmp_ns};
 
-    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
     let dir = TempDir::new().unwrap();
+    let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
     let still = include_bytes!("../../../../tests/data/sample.heic").as_slice();
     let motion = b"\0\0\0\x14ftypqt  \0\0\0\0qt  ".as_slice();
     let mut records = incremental_photo_records_with_url(
@@ -1723,14 +2051,18 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
         still.len() as u64,
     );
     records[0]["fields"]["itemType"] = json!({"value": "public.heic"});
+    records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+        json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(still)));
     records[0]["fields"]["resOriginalFileType"] = json!({"value": "public.heic"});
     records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
         "downloadURL": "https://p01.icloud-content.com/capture.MOV",
-        "fileChecksum": "provider-motion", "size": motion.len(),
+        "fileChecksum": base64::engine::general_purpose::STANDARD.encode(Sha256::digest(motion)), "size": motion.len(),
     }});
     records[0]["fields"]["resOriginalVidComplFileType"] =
         json!({"value": "com.apple.quicktime-movie"});
     records[1]["fields"]["timeZoneOffset"] = json!({"value": 0});
+    records[1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+        json!("_defaultOwner");
     let old = PhotoAsset::new(records[0].clone(), records[1].clone());
     records[1]["fields"]["assetDate"]["value"] = json!(1_700_000_000_123_i64);
     records[1]["fields"]["addedDate"]["value"] = json!(1_700_000_000_789_i64);
@@ -1739,17 +2071,52 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
         old.metadata().metadata_hash,
         current.metadata().metadata_hash
     );
+    let current_lookup =
+        super::super::test_support::SelectedMediaSession(Arc::new(records.clone()));
     let session = changes_zone_session_with_query_page(
         Arc::new(AtomicUsize::new(0)),
         records.clone(),
         json!({"records": records, "syncToken": "full-token"}),
         1,
     );
-    let pass = AlbumPass {
-        kind: PassKind::Unfiled,
-        album: changes_album("", session.clone()),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    };
+    #[derive(Clone)]
+    struct RefreshSession {
+        enumeration: super::super::test_support::CountingChangesZoneSession,
+        current: super::super::test_support::SelectedMediaSession,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for RefreshSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            headers: &[(&str, &str)],
+        ) -> anyhow::Result<serde_json::Value> {
+            if url.contains("/records/lookup?") {
+                self.current.post(url, body, headers).await
+            } else {
+                let unchanged = url.contains("/changes/zone?")
+                    && serde_json::from_str::<serde_json::Value>(&body)?["zones"][0]["syncToken"]
+                        == "zone-token-next";
+                let mut response = self.enumeration.post(url, body, headers).await?;
+                if unchanged {
+                    response["zones"][0]["records"] = json!([]);
+                }
+                Ok(response)
+            }
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+    let pass = super::super::test_support::selected_pass_with_session(
+        &db,
+        "",
+        Box::new(RefreshSession {
+            enumeration: session.clone(),
+            current: current_lookup,
+        }),
+    );
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
     config.state_db = Some(db.clone());
@@ -1799,9 +2166,63 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
         assert!(!outcome.any_failed());
     }
     let before = db.get_downloaded_page(0, 10).await.unwrap();
+    let still_path = &expected
+        .iter()
+        .find(|rendition| rendition.version_size == VersionSizeKey::Original)
+        .unwrap()
+        .path;
+    let mut changed_still = still.to_vec();
+    *changed_still.last_mut().unwrap() ^= 1;
+    tokio::fs::write(still_path, &changed_still).await.unwrap();
+    let refused = download_photos_with_sync(
+        &Client::new(),
+        std::slice::from_ref(&pass),
+        Arc::new(config.clone()),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        refused.stats.sync_token_blocked,
+        "changed imported bytes cannot establish publication proof: {refused:?}"
+    );
+    assert_eq!(refused.sync_token, None);
+    assert_eq!(refused.stats.downloaded, 0);
+    assert_eq!(tokio::fs::read(still_path).await.unwrap(), changed_still);
+    let verified: i64 = db
+        .acquire_lock("changed import must remain unverified")
+        .unwrap()
+        .query_row(
+            "SELECT verified_media FROM provider_active_destinations WHERE version_size='original'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(verified, 0);
+    // Restore only the test-owned corruption, then recover through normal sync.
+    tokio::fs::write(still_path, still).await.unwrap();
+    let recovery = download_photos_with_sync(
+        &Client::new(),
+        std::slice::from_ref(&pass),
+        Arc::new(config.clone()),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovery.stats.downloaded, 0);
+    let evidence: Vec<String> = db.acquire_lock("import recovery evidence").unwrap()
+        .prepare("SELECT json_array(w.version_size,w.compat_path,w.verified_media,w.verified_metadata,a.local_checksum,p.local_checksum,a.imported_size,a.download_checksum,p.source_checksum,a.status) FROM provider_active_destinations w JOIN assets a ON a.library=w.library AND a.id=w.asset_id AND a.version_size=w.version_size JOIN asset_metadata_paths p ON p.library=a.library AND p.id=a.id AND p.version_size=a.version_size").unwrap()
+        .query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+    assert!(!recovery.stats.sync_token_blocked, "{evidence:?}");
+    assert_eq!(tokio::fs::read(still_path).await.unwrap(), still);
     let mut sidecars = HashMap::new();
     let mut full_query_count = 0;
-    for refresh in [true, false] {
+    // Turning explicit refresh off changes the selection configuration once;
+    // the following unchanged cycle must stay incremental and preserve bytes.
+    for (cycle, refresh) in [true, false, false].into_iter().enumerate() {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         config.refresh_metadata = refresh;
         let result = download_photos_with_sync(
             &Client::new(),
@@ -1814,14 +2235,15 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
         .unwrap();
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
-            "{:?}",
-            result.stats
+            "{:?}: {:?}",
+            result.stats,
+            capture.events()
         );
-        assert_eq!(result.full_enumeration_ran, refresh);
+        assert_eq!(result.full_enumeration_ran, cycle < 2);
         assert_eq!(result.stats.downloaded, 0);
         assert_eq!(result.stats.state_write_failures, 0);
         assert_eq!(result.stats.exif_failures, 0);
-        assert!(!result.stats.sync_token_blocked);
+        assert!(!result.stats.sync_token_blocked, "{result:?}");
         assert_eq!(
             result.sync_token.as_deref(),
             Some(if refresh {
@@ -1833,8 +2255,33 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
         if refresh {
             full_query_count = session.records_query_count();
             assert!(full_query_count > 0);
-            assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 2);
-            // The explicit sync owner drains only after the full producer has finished.
+            let destination_state: Vec<(String, i64, i64, i64)> = db.acquire_lock("refresh destination evidence").unwrap()
+                .prepare("SELECT version_size,admitted,verified_media,verified_metadata FROM provider_active_destinations").unwrap()
+                .query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().map(Result::unwrap).collect();
+            assert_eq!(
+                destination_state
+                    .iter()
+                    .filter(|row| row.2 == 0)
+                    .collect::<Vec<_>>(),
+                [&("original".into(), 1, 0, 0)],
+                "retain the obsolete unverified path without inventing a publication receipt"
+            );
+            for version in ["original", "live_original"] {
+                assert!(
+                    destination_state
+                        .iter()
+                        .any(|row| row == &(version.into(), 1, 1, 1)),
+                    "current {version} must have independent media and metadata proof"
+                );
+            }
+            assert!(
+                db.get_pending_metadata_rewrites(10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            // Destination metadata finalizes before releasing the checkpoint;
+            // the explicit command's subsequent drain is therefore quiet.
             assert_eq!(
                 drain_pending_metadata_rewrites(
                     db.as_ref(),
@@ -1844,7 +2291,8 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
                     config.temp_suffix.clone(),
                     &CancellationToken::new(),
                 )
-                .await,
+                .await
+                .failed,
                 0
             );
         }
@@ -1896,12 +2344,72 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(session.records_query_count(), full_query_count);
+        if cycle == 1 {
+            assert!(session.records_query_count() > full_query_count);
+            full_query_count = session.records_query_count();
+        } else {
+            assert_eq!(session.records_query_count(), full_query_count);
+        }
         config.sync_mode = SyncMode::Incremental {
             zone_sync_token: result.sync_token.unwrap(),
         };
     }
-    assert_eq!(session.changes_zone_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(session.changes_zone_calls.load(Ordering::SeqCst), 2);
+    let (scope, historical_config, obsolete_path): (String, String, String) = db.acquire_lock("retained obsolete destination").unwrap()
+        .query_row("SELECT g.scope,g.config_hash,w.compat_path FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.verified_media=0", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    assert!(
+        !Path::new(&obsolete_path).exists(),
+        "historical planning must not create a comparison copy"
+    );
+    config.state_db = None;
+    drop(pass);
+    drop(db);
+    let reopened = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
+    let owner = super::super::test_support::fixture_owner();
+    assert!(
+        !reopened
+            .unfinished_selection_debt(owner.clone(), scope.clone(), historical_config.clone())
+            .await
+            .unwrap()
+    );
+    assert!(
+        reopened
+            .retained_selection_root(
+                owner.clone(),
+                scope.clone(),
+                historical_config.clone(),
+                String::new()
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "obsolete historical planning must not wake the scheduler after reopen"
+    );
+    let retained: i64 = reopened.acquire_lock("preserved historical evidence").unwrap()
+        .query_row("SELECT COUNT(*) FROM provider_active_destinations WHERE compat_path=?1 AND admitted=1 AND verified_media=0 AND verified_metadata=0", [&obsolete_path], |row| row.get(0)).unwrap();
+    assert_eq!(retained, 1);
+    reopened
+        .acquire_lock("corrupt completed supersession proof")
+        .unwrap()
+        .execute(
+            "UPDATE provider_active_destinations SET verified_metadata=0 WHERE verified_metadata=1",
+            [],
+        )
+        .unwrap();
+    assert!(
+        reopened
+            .unfinished_selection_debt(owner.clone(), scope.clone(), historical_config.clone())
+            .await
+            .is_err(),
+        "an invalid current completion receipt must not hide retained debt"
+    );
+    assert!(
+        reopened
+            .retained_selection_root(owner, scope, historical_config, String::new())
+            .await
+            .is_err(),
+        "scheduling must validate the completion proof before suppressing old work"
+    );
 }
 
 #[cfg(feature = "xmp")]
@@ -1974,10 +2482,9 @@ async fn collecting_rewrite_failure_retains_marker_and_advances_durable_checkpoi
             };
             let mut config = test_config();
             config.directory = Arc::from(media.clone());
-            config.recent = Some(10);
             config.metadata.xmp_sidecar = true;
             config.state_db = Some(db.clone());
-            let result = download_photos_incremental(
+            let result = download_photos_incremental_collecting(
                 &Client::new(),
                 std::slice::from_ref(&pass),
                 &Arc::new(config),
@@ -2406,19 +2913,19 @@ async fn incremental_collecting_paired_asset_preserves_child_state_identity() {
     changed_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
         json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&changed_body)));
 
-    let full_passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: mock_album(
-            "Library",
-            MockPhotosFlow::new()
-                .album_count(1)
-                .query_page(original_records, Some("zone-token-full"))
-                .build(),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+    for records in [&mut original_records, &mut changed_records] {
+        records[1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+            json!("_defaultOwner");
+    }
     let dir = TempDir::new().expect("temp dir");
+    let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
+    let full_passes = vec![super::super::test_support::selected_pass_with_session(
+        &db,
+        "",
+        Box::new(super::super::test_support::SelectedMediaSession(Arc::new(
+            original_records,
+        ))),
+    )];
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
     config.concurrent_downloads = 1;
@@ -2443,27 +2950,22 @@ async fn incremental_collecting_paired_asset_preserves_child_state_identity() {
         .clone()
         .expect("full state row has a local path");
 
-    let incremental_passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: mock_album(
-            "Library",
-            MockPhotosFlow::new()
-                .changes_zone_page(changed_records.clone(), "zone-token-next", false)
-                .album_count(1)
-                .query_page(changed_records, Some("rank-selection-token"))
-                .build(),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-    config.recent = Some(10);
+    let incremental_passes = vec![super::super::test_support::selected_pass_with_session(
+        &db,
+        "",
+        Box::new(super::super::test_support::SelectedMediaSession(Arc::new(
+            changed_records,
+        ))),
+    )];
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-full".to_string(),
     };
 
-    let incremental = download_photos_with_sync(
+    let incremental = download_photos_incremental_collecting(
         &Client::new(),
         &incremental_passes,
-        Arc::new(config),
+        &Arc::new(config),
+        "zone-token-full",
         DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
@@ -2473,7 +2975,7 @@ async fn incremental_collecting_paired_asset_preserves_child_state_identity() {
     assert!(matches!(incremental.outcome, DownloadOutcome::Success));
     assert_eq!(incremental.stats.downloaded, 1);
     assert_eq!(incremental.stats.failed, 0);
-    assert_eq!(incremental.sync_token.as_deref(), Some("zone-token-next"));
+    assert_eq!(incremental.sync_token.as_deref(), Some("fixture-token"));
     let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
     assert_eq!(downloaded.len(), 1);
     assert_eq!(downloaded[0].id.as_ref(), "asset-COLLECTING_IDENTITY");
@@ -2690,16 +3192,8 @@ async fn malformed_delta_page_rejected_by_streaming_and_collecting_consumers() {
         };
         let mut config = incremental_test_config(&dir);
         config.state_db = Some(db.clone());
-        config.recent = collecting.then_some(10);
-        let result = download_photos_incremental(
-            &Client::new(),
-            &[pass],
-            &Arc::new(config),
-            "saved",
-            DownloadControls::download_hidden(),
-            CancellationToken::new(),
-        )
-        .await;
+        let result =
+            run_incremental_strategy(collecting, &[pass], &Arc::new(config), "saved").await;
         assert!(
             result.is_err(),
             "collecting={collecting}: malformed page completed"
@@ -2728,8 +3222,10 @@ async fn malformed_delta_page_rejected_by_streaming_and_collecting_consumers() {
 }
 
 #[tokio::test]
-async fn recent_overflow_uses_current_inventory_and_preserves_checkpoint() {
+async fn uncapped_delta_processes_every_asset_independent_of_arrival_order() {
+    use crate::icloud::photos::PhotosSession;
     use base64::Engine as _;
+    use serde_json::Value;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
@@ -2756,6 +3252,8 @@ async fn recent_overflow_uses_current_inventory_and_preserves_checkpoint() {
         records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
             json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body)));
         records[1]["fields"]["assetDate"]["value"] = json!(date);
+        records[1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+            json!("_defaultOwner");
         records
     };
     let oldest = records("oldest", 1_600_000_000_000);
@@ -2765,7 +3263,6 @@ async fn recent_overflow_uses_current_inventory_and_preserves_checkpoint() {
     let database = dir.path().join("state.db");
     let mut config = test_config();
     config.directory = Arc::from(dir.path().join("media"));
-    config.recent = Some(1);
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "saved-cursor".to_string(),
     };
@@ -2773,31 +3270,64 @@ async fn recent_overflow_uses_current_inventory_and_preserves_checkpoint() {
     let previous = PhotoAsset::new(previous_records[0].clone(), previous_records[1].clone());
     let previous_path;
     {
-        let db = SqliteStateDb::open(&database).await.unwrap();
+        let db = super::super::test_support::open_fixture_db(&database).await;
+        config.state_db = Some(db.clone());
+        super::super::test_support::initialize_empty_selection(&db, &config).await;
         db.set_metadata("sync_token:PrimarySync", "saved-cursor")
             .await
             .unwrap();
         let pass = unused_unfiled_changes_pass();
         previous_path = seed_downloaded_metadata_asset(&db, &config, &pass, &previous).await;
+        config.state_db = None;
     }
     let previous_bytes = tokio::fs::read(&previous_path).await.unwrap();
-    let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+    let db = super::super::test_support::open_fixture_db(&database).await;
     config.state_db = Some(db.clone());
-    let session = MockPhotosFlow::new()
-        .changes_zone_page(oldest.clone(), "delta-page-1", true)
-        .changes_zone_page(
-            [middle.clone(), newest.clone()].concat(),
-            "delta-terminal",
-            false,
-        )
-        .album_count(3)
-        .query_page([newest, middle, oldest].concat(), Some("inventory-token"))
-        .build();
-    let pass = AlbumPass {
-        kind: PassKind::Unfiled,
-        album: mock_album("", session),
-        exclude_ids: Arc::new(FxHashSet::default()),
+    #[derive(Clone)]
+    struct OrderedDeltaSession {
+        oldest: Vec<Value>,
+        later: Vec<Value>,
+        current: super::super::test_support::SelectedMediaSession,
+        cursors: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for OrderedDeltaSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if !url.contains("/changes/zone?") {
+                return self.current.post(url, body, headers).await;
+            }
+            let request: Value = serde_json::from_str(&body)?;
+            let cursor = request["zones"][0]["syncToken"].as_str().unwrap();
+            self.cursors.lock().unwrap().push(cursor.to_owned());
+            let (records, token, more) = match cursor {
+                "saved-cursor" => (&self.oldest, "delta-page-1", true),
+                "delta-page-1" => (&self.later, "delta-terminal", false),
+                _ => panic!("unexpected fixture delta cursor"),
+            };
+            let mut response =
+                super::super::test_support::changes_zone_response(records.clone(), token);
+            response["zones"][0]["moreComing"] = json!(more);
+            Ok(response)
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+    let cursors = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let session = OrderedDeltaSession {
+        oldest: oldest.clone(),
+        later: [middle.clone(), newest.clone()].concat(),
+        current: super::super::test_support::SelectedMediaSession(Arc::new(
+            [newest, middle, oldest].concat(),
+        )),
+        cursors: cursors.clone(),
     };
+    let pass = super::super::test_support::selected_pass_with_session(&db, "", Box::new(session));
     let result = download_photos_with_sync(
         &Client::new(),
         &[pass],
@@ -2811,19 +3341,21 @@ async fn recent_overflow_uses_current_inventory_and_preserves_checkpoint() {
         matches!(result.outcome, DownloadOutcome::Success),
         "{result:?}"
     );
+    assert_eq!(*cursors.lock().unwrap(), ["saved-cursor", "delta-page-1"]);
     let rows = db.get_downloaded_page(0, 10).await.unwrap();
     let mut names: Vec<_> = rows.iter().map(|row| row.filename.as_ref()).collect();
     names.sort_unstable();
     assert_eq!(
         names,
-        ["changed.JPG", "newest.JPG"],
-        "production recent selection must use current descending inventory, not shuffled delta arrival: {result:?}"
+        ["changed.JPG", "middle.JPG", "newest.JPG", "oldest.JPG"],
+        "uncapped selection must retain every observed current asset: {result:?}"
     );
     assert_eq!(
-        result.sync_token, None,
-        "bounded current inventory cannot accept a successor: {result:?}"
+        result.sync_token.as_deref(),
+        Some("delta-terminal"),
+        "the complete ordinary delta supplies its actual successor: {result:?}"
     );
-    assert!(result.checkpoint.sync_token_blocked);
+    assert!(!result.checkpoint.sync_token_blocked);
     assert_eq!(
         tokio::fs::read(&previous_path).await.unwrap(),
         previous_bytes
@@ -2866,21 +3398,20 @@ async fn first_album_sync_keeps_capture_mtime_after_embedded_metadata_rewrite() 
     );
     records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
         json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body)));
-    let pass = || AlbumPass {
-        kind: PassKind::Album,
-        album: mock_album_with_container(
+    records[1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+        json!("_defaultOwner");
+    let pass = |db: &Arc<SqliteStateDb>| {
+        super::super::test_support::selected_pass_with_session(
+            db,
             "Trip",
-            "trip",
-            MockPhotosFlow::new()
-                .album_count(1)
-                .query_page(records.clone(), Some("token-full"))
-                .build(),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
+            Box::new(super::super::test_support::SelectedMediaSession(Arc::new(
+                records.clone(),
+            ))),
+        )
     };
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("state.db");
-    let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+    let db = super::super::test_support::open_fixture_db(&db_path).await;
     let media_dir = dir.path().join("media");
     let mut config = test_config();
     config.directory = Arc::from(media_dir);
@@ -2892,7 +3423,7 @@ async fn first_album_sync_keeps_capture_mtime_after_embedded_metadata_rewrite() 
     assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
     let first = download_photos_with_sync(
         &Client::new(),
-        &[pass()],
+        &[pass(&db)],
         Arc::new(config.clone()),
         DownloadControls::download_hidden(),
         CancellationToken::new(),
@@ -2926,11 +3457,11 @@ async fn first_album_sync_keeps_capture_mtime_after_embedded_metadata_rewrite() 
 
     config.state_db = None;
     drop(db);
-    let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+    let db = super::super::test_support::open_fixture_db(&db_path).await;
     config.state_db = Some(db.clone());
     let steady = download_photos_with_sync(
         &Client::new(),
-        &[pass()],
+        &[pass(&db)],
         Arc::new(config),
         DownloadControls::download_hidden(),
         CancellationToken::new(),

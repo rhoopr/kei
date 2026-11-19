@@ -133,8 +133,8 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
         let data_dir = prepare_fixture_data_dir(&download_dir, &cookie_dir);
 
         eprintln!(
-            "Building import-existing fixture: --recent {} into {}",
-            common::live_selection::live_recent(),
+            "Building import-existing fixture with fixed lower date {} into {}",
+            common::live_selection::require_fixed_date(),
             download_dir.display()
         );
         // Keep the reusable fixture to one library-wide pass. The default
@@ -151,8 +151,6 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
                 &password,
                 "--config",
                 config_path.to_str().unwrap(),
-                "--recent",
-                &common::live_selection::live_recent().to_string(),
                 "--no-progress-bar",
             ])
             .timeout(Duration::from_secs(FIXTURE_TIMEOUT_SECS))
@@ -261,7 +259,7 @@ fn import_cmd(
 #[test]
 fn import_command_uses_shared_bound_unless_scenario_overrides_it() {
     let dir = tempdir().unwrap();
-    for (extra, expected) in [
+    for (mut extra, expected) in [
         (
             Vec::new(),
             common::live_selection::live_recent().to_string(),
@@ -269,6 +267,7 @@ fn import_command_uses_shared_bound_unless_scenario_overrides_it() {
         (vec!["--recent", "3"], "3".to_owned()),
         (vec!["--recent", "30d"], "30d".to_owned()),
     ] {
+        extra.extend(["--config", "unused-construction-only.toml"]);
         let command = import_cmd(
             "test@example.invalid",
             "test",
@@ -366,17 +365,129 @@ fn selected_fixture_files(data_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn fixture_asset_count(data_dir: &Path) -> u64 {
+    let db_path = std::fs::read_dir(data_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "db"))
+        .unwrap();
+    rusqlite::Connection::open(db_path).unwrap().query_row(
+        "SELECT COUNT(*) FROM (SELECT DISTINCT library, id FROM assets WHERE status = 'downloaded')",
+        [], |row| row.get::<_, i64>(0),
+    ).map(|count| u64::try_from(count).expect("fixture count is nonnegative")).unwrap()
+}
+
+fn assert_fixture_matches(summary: &ImportSummary, assets: u64, versions: u64) {
+    assert!(
+        assets > 0 && versions > 0,
+        "fixture must contain source-backed media"
+    );
+    if assets <= u64::from(common::live_selection::live_recent()) {
+        assert_eq!(
+            summary.matched, versions,
+            "every known fixture version must match"
+        );
+    } else {
+        // A count sample may select only part of a larger date-bounded tree.
+        let eligible = summary.total.saturating_sub(summary.filtered);
+        assert!(
+            eligible > 0 && summary.matched as f64 / eligible as f64 >= 0.90,
+            "sample match ratio too low: {summary:?}"
+        );
+    }
+}
+
+fn import_fixture_summary(
+    username: &str,
+    password: &str,
+    cookies: &Path,
+    media: &Path,
+    data: &Path,
+) -> ImportSummary {
+    let output = import_cmd(username, password, cookies, media, data, &[])
+        .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    parse_summary(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn assert_one_version_lost(before: &ImportSummary, after: &ImportSummary) {
+    assert!(
+        before.matched > 0,
+        "healthy import must match the mutation target"
+    );
+    assert_eq!(
+        after.total, before.total,
+        "provider sample changed during mutation test"
+    );
+    assert_eq!(after.filtered, before.filtered);
+    assert_eq!(
+        after.matched + 1,
+        before.matched,
+        "exactly one known match must be lost"
+    );
+    assert_eq!(
+        after.unmatched,
+        before.unmatched + 1,
+        "only the mutated version may add an unmatched result"
+    );
+}
+
+#[test]
+fn bounded_fixture_oracles_preserve_count_sampling_and_exact_mutation_loss() {
+    let healthy = ImportSummary {
+        total: 10,
+        matched: 1,
+        unmatched: 9,
+        filtered: 0,
+    };
+    assert_fixture_matches(&healthy, 1, 1);
+    let paired = ImportSummary {
+        total: 10,
+        matched: 2,
+        unmatched: 9,
+        filtered: 0,
+    };
+    assert_fixture_matches(&paired, 1, 2);
+    let missing = ImportSummary {
+        total: 10,
+        matched: 0,
+        unmatched: 10,
+        filtered: 0,
+    };
+    assert_one_version_lost(&healthy, &missing);
+    let complete = ImportSummary {
+        total: 10,
+        matched: 10,
+        unmatched: 0,
+        filtered: 0,
+    };
+    let one_lost = ImportSummary {
+        total: 10,
+        matched: 9,
+        unmatched: 1,
+        filtered: 0,
+    };
+    assert_one_version_lost(&complete, &one_lost);
+    assert!(std::panic::catch_unwind(|| assert_fixture_matches(&healthy, 1, 2)).is_err());
+    assert!(std::panic::catch_unwind(|| assert_fixture_matches(&healthy, 11, 11)).is_err());
+    assert!(std::panic::catch_unwind(|| assert_one_version_lost(&healthy, &healthy)).is_err());
+    assert!(std::panic::catch_unwind(|| assert_one_version_lost(&complete, &missing)).is_err());
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 /// Smoke test: import media written by the fixture sync with the same
-/// bounded primary-library selection. The recent window can change between
-/// scans, so the match ratio and row-count bounds are broad smoke checks.
+/// bounded primary-library selection. Import sampling remains count-based;
+/// versions outside the date-bounded local tree may legitimately be unmatched.
 /// This fixture does not exercise album overlap or shared libraries.
 #[test]
 #[ignore]
 fn import_matches_default_layout_after_sync() {
     let (username, password, cookie_dir) = common::require_preauth();
-    let (download_dir, _sync_data_dir) = fixture();
+    let (download_dir, sync_data_dir) = fixture();
 
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
@@ -398,18 +509,10 @@ fn import_matches_default_layout_after_sync() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let summary = parse_summary(&stdout);
         assert!(summary.total > 0, "expected some assets, got {summary:?}");
-        // CloudKit's recent window can change while the live suite runs.
-        // Keep this as a broad smoke threshold. Offline import tests in
-        // src/commands/import.rs cover controlled matching cases.
-        let eligible = summary.total.saturating_sub(summary.filtered);
-        let match_ratio = if eligible > 0 {
-            (summary.matched as f64) / (eligible as f64)
-        } else {
-            1.0
-        };
-        assert!(
-            match_ratio >= 0.90,
-            "match ratio too low: {match_ratio:.2} ({summary:?}) eligible={eligible}\n{stdout}"
+        assert_fixture_matches(
+            &summary,
+            fixture_asset_count(sync_data_dir),
+            selected_fixture_files(sync_data_dir).len() as u64,
         );
 
         let rows = count_downloaded_rows(test_data.path());
@@ -553,33 +656,29 @@ fn import_recent_limit_caps_scan() {
     });
 }
 
-/// `--recent <N>d` (date filter) is rejected with a clear bail message,
-/// matching the explicit handling we added to the binary. No fixture
-/// required: the bail happens before any I/O against the download dir.
+/// Retired date windows fail at CLI parsing without credentials or provider I/O.
 #[test]
-#[ignore]
 fn import_recent_days_form_is_rejected() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let test_root = tempdir().unwrap();
-        let download_dir = test_root.path().join("photos");
-        std::fs::create_dir_all(&download_dir).unwrap();
-        import_cmd(
-            &username,
-            &password,
-            &cookie_dir,
-            &download_dir,
-            test_root.path(),
-            &["--recent", "30d"],
-        )
-        .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
+    let test_root = tempdir().unwrap();
+    common::cmd()
+        .env_remove("ICLOUD_USERNAME")
+        .env_remove("ICLOUD_PASSWORD")
+        .env("KEI_DATA_DIR", test_root.path())
+        .args(["import-existing", "--recent", "30d"])
+        .timeout(Duration::from_secs(10))
         .assert()
-        .failure()
+        .code(2)
         .stderr(predicate::str::contains(
-            "is not supported for import-existing",
-        ));
-    });
+            "import-existing --recent requires a positive count",
+        ))
+        .stderr(predicate::str::contains("omit --recent"))
+        .stderr(predicate::str::contains("--recent 100"));
+    assert!(
+        std::fs::read_dir(test_root.path())
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 /// Truncating one of the fixture's files makes that version come up
@@ -609,36 +708,48 @@ fn import_unmatches_truncated_file() {
             std::fs::copy(src, &dst).unwrap();
         }
 
-        // Truncate the first file by 1 byte.
-        let first_rel = files[0].strip_prefix(download_dir).unwrap();
-        let truncated = test_dl.join(first_rel);
+        // Prove a healthy match in this exact count sample before changing it.
+        let healthy_data = tempdir().unwrap();
+        let before = import_fixture_summary(
+            &username,
+            &password,
+            &cookie_dir,
+            &test_dl,
+            healthy_data.path(),
+        );
+        let matched = selected_fixture_files(healthy_data.path());
+        assert!(
+            !matched.is_empty(),
+            "healthy import must have a source-backed target"
+        );
+        let truncated = &matched[0];
+        let relative = truncated.strip_prefix(&test_dl).unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|path| path.strip_prefix(download_dir).unwrap() == relative)
+        );
+        assert!(
+            std::fs::read(truncated).unwrap()
+                == std::fs::read(download_dir.join(relative)).unwrap(),
+            "mutation target must retain the source-backed fixture bytes"
+        );
         let f = std::fs::OpenOptions::new()
             .write(true)
-            .open(&truncated)
+            .open(truncated)
             .unwrap();
         let len = f.metadata().unwrap().len();
         f.set_len(len.saturating_sub(1)).unwrap();
 
         let test_data = tempdir().unwrap();
-        let output = import_cmd(
+        let after = import_fixture_summary(
             &username,
             &password,
             &cookie_dir,
             &test_dl,
             test_data.path(),
-            &[],
-        )
-        .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let summary = parse_summary(&stdout);
-        assert_eq!(
-            summary.unmatched, 1,
-            "only the truncated version should be unmatched: {summary:?}\n{stdout}"
         );
+        assert_one_version_lost(&before, &after);
     });
 }
 
@@ -655,8 +766,7 @@ fn import_unmatches_missing_file() {
         std::fs::create_dir_all(&test_dl).unwrap();
         let files = selected_fixture_files(sync_data_dir);
         assert!(!files.is_empty(), "bounded fixture contains no media");
-        // Omit one known file, even when the library contains only one asset.
-        for src in &files[..files.len() - 1] {
+        for src in &files {
             let rel = src.strip_prefix(download_dir).unwrap();
             let dst = test_dl.join(rel);
             if let Some(parent) = dst.parent() {
@@ -665,26 +775,41 @@ fn import_unmatches_missing_file() {
             std::fs::copy(src, &dst).unwrap();
         }
 
+        let healthy_data = tempdir().unwrap();
+        let before = import_fixture_summary(
+            &username,
+            &password,
+            &cookie_dir,
+            &test_dl,
+            healthy_data.path(),
+        );
+        let matched = selected_fixture_files(healthy_data.path());
+        assert!(
+            !matched.is_empty(),
+            "healthy import must have a source-backed target"
+        );
+        let missing = &matched[0];
+        let relative = missing.strip_prefix(&test_dl).unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|path| path.strip_prefix(download_dir).unwrap() == relative)
+        );
+        assert!(
+            std::fs::read(missing).unwrap() == std::fs::read(download_dir.join(relative)).unwrap(),
+            "mutation target must retain the source-backed fixture bytes"
+        );
+        std::fs::remove_file(missing).unwrap();
+
         let test_data = tempdir().unwrap();
-        let output = import_cmd(
+        let after = import_fixture_summary(
             &username,
             &password,
             &cookie_dir,
             &test_dl,
             test_data.path(),
-            &[],
-        )
-        .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let summary = parse_summary(&stdout);
-        assert_eq!(
-            summary.unmatched, 1,
-            "only the missing version should be unmatched: {summary:?}\n{stdout}"
         );
+        assert_one_version_lost(&before, &after);
     });
 }
 
@@ -735,14 +860,9 @@ fn import_reads_toml_for_path_derivation() {
             r#"folder_structure = "%Y/%m/%d"
 
 [photos]
-resolution = "original"
 file_match_policy = "name-size-dedup-with-suffix"
-live_photo_mode = "both"
-live_resolution = "original"
 live_photo_mov_filename_policy = "suffix"
-raw_policy = "as-is"
 keep_unicode_in_filenames = false
-force_resolution = false
 "#,
         );
 
@@ -795,7 +915,7 @@ fn write_kei_toml(dir: &Path, download_dir: &Path, extra: &str) -> std::path::Pa
         "[download]\ndirectory = {dl:?}\n{extra}",
         dl = download_dir.to_string_lossy(),
     );
-    std::fs::write(&path, common::live_selection::live_config(&body)).unwrap();
+    common::write_versioned_config(&path, common::live_selection::live_config(&body)).unwrap();
     path
 }
 
@@ -832,7 +952,7 @@ fn kei_std_command() -> std::process::Command {
     std::process::Command::new(env!("CARGO_BIN_EXE_kei"))
 }
 
-/// Run `kei sync --recent N` reusing the post-import data_dir, capture
+/// Run fixed-date `kei sync` reusing the post-import data_dir, capture
 /// stderr, and parse downloaded/skipped counts. Returns
 /// `(downloaded, skipped_or_zero)`. Sync logs go to stderr via
 /// `tracing::info!`. Two patterns to match:
@@ -858,8 +978,6 @@ fn run_sync_against_fixture(
         password,
         "--config",
         config_path.to_str().unwrap(),
-        "--recent",
-        &common::live_selection::live_recent().to_string(),
         "--no-progress-bar",
     ]);
     let output = cmd

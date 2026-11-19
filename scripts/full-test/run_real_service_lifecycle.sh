@@ -74,6 +74,7 @@ config="$work/config.toml"
 {
     printf 'data_dir = %s\n' "$(kei_toml_string "$data")"
     echo
+    echo "config_version = 1"
     echo "[auth]"
     printf 'username = %s\n' "$(kei_toml_string "$ICLOUD_USERNAME")"
     printf 'password_file = %s\n' "$(kei_toml_string "$password_file")"

@@ -52,7 +52,7 @@ fn state_machine_quiet_greps_do_not_sigpipe() {
     assert_eq!(predicates.len(), 8, "quiet search lines: {predicates:#?}");
 
     let matching = concat!(
-        "recent_limited_full_enumeration Fetching full enumeration fallback ",
+        "date_bounded_full_enumeration Fetching full enumeration fallback ",
         "No new photos Completed Existing session token is valid ",
         "accountLogin succeeded Session validated recently, skipping /validate call ",
         "Authenticating SRP",
@@ -1641,13 +1641,13 @@ fn copies_stress_routes_relevant_changes_and_explicit_events() {
     assert!(!ci.contains("  schedule:\n"));
     assert_eq!(
         repo_file("justfile")
-            .matches(" -- --skip download::orchestration::queue_projection::tests::private_300_")
+            .matches(" -- --skip download::orchestration::queue_projection::tests::private_600_")
             .count(),
         2
     );
     assert_eq!(
         ci.matches(
-            "--no-report -- --skip download::orchestration::queue_projection::tests::private_300_"
+            "--no-report -- --skip download::orchestration::queue_projection::tests::private_600_"
         )
         .count(),
         2
@@ -1710,7 +1710,7 @@ esac
         );
         for call in invocations {
             assert!(
-                call.starts_with("download::orchestration::queue_projection::tests::private_300_")
+                call.starts_with("download::orchestration::queue_projection::tests::private_600_")
             );
             assert!(call.contains(" --ignored --exact "));
         }
@@ -2067,11 +2067,11 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_conditional_publish_error",
         "classify_download_task_error",
         "classify_exit_error",
+        "bridge_error_reason", // Provider-owned diagnostic for wrapped changes/zone failures.
         "classify_heif_metadata_limit",
         "classify_incremental_error",
         "classify_legacy_file_error",
         "classify_legacy_inventory_error",
-        "classify_legacy_proof_refusal",
         "classify_provider_lookup_error",
         "classify_rate_limit_error",
         "classify_reconciliation_io_error",
@@ -2082,6 +2082,8 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_support_error",
         "classify_sync_auth_error",
         "is_session_error",
+        "is_directory_collision",
+        "is_operational_storage_error",
         "map_library_init_error",
     ]
     .into_iter()
@@ -2197,7 +2199,7 @@ fn live_import_rehearsal_uses_shared_bounded_selection() {
         let selection: toml::Table = repo_file("tests/data/live-selection.toml").parse().unwrap();
         assert_eq!(
             String::from_utf8(output.stdout).unwrap().trim(),
-            selection["filters"]["recent"]
+            selection["import_sample"]["recent"]
                 .as_integer()
                 .unwrap()
                 .to_string()
@@ -2223,6 +2225,136 @@ fn live_import_rehearsal_uses_shared_bounded_selection() {
         rehearsal.contains("import-existing --force-empty --recent \"$recent\" --no-progress-bar"),
         "live import rehearsal real import should keep import-existing bounded to the same recent count"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_import_rehearsal_validates_known_receipts_and_repeat_counts() {
+    let script = repo_file("scripts/full-test/run_live_import_rehearsal.sh");
+    let validator = script
+        .split_once("<<'PY'\n")
+        .unwrap()
+        .1
+        .split_once("\nPY")
+        .unwrap()
+        .0;
+    for (case, seed_count, matched, unmatched, hash_errors, error) in [
+        ("healthy", 1, 1, 9, 0, ""),
+        ("complete", 10, 10, 0, 0, ""),
+        ("capacity", 11, 10, 0, 0, "seed fixture exceeds"),
+        ("no_match", 1, 0, 10, 0, "import must match"),
+        ("identity", 1, 1, 9, 0, "independent seed receipts"),
+        ("checksum", 1, 1, 9, 0, "independent seed receipts"),
+        ("path", 1, 1, 9, 0, "independent seed receipts"),
+        ("duplicate", 1, 1, 9, 0, "duplicate asset receipt identity"),
+        (
+            "hash_error",
+            1,
+            1,
+            9,
+            1,
+            "import must match without hash errors",
+        ),
+        ("repeat_counts", 1, 1, 9, 0, "summaries differ"),
+        ("known_missing", 2, 1, 9, 0, "known seed receipt missing"),
+        ("dry_write", 1, 1, 9, 0, "dry-run wrote asset rows"),
+        (
+            "repeat_rows",
+            1,
+            1,
+            9,
+            0,
+            "repeat dry-run changed asset receipts",
+        ),
+        ("over_cap", 1, 1, 9, 0, "scan exceeded"),
+        ("zero_cap", 1, 1, 9, 0, "sample cap must be positive"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let seed = root.path().join("seed");
+        let import = root.path().join("import");
+        let mut import_rows = Vec::new();
+        for (directory, count) in [(&seed, seed_count), (&import, matched)] {
+            std::fs::create_dir(directory).unwrap();
+            let connection = rusqlite::Connection::open(directory.join("fixture.db")).unwrap();
+            connection.execute_batch("CREATE TABLE assets(library TEXT,id TEXT,version_size TEXT,checksum TEXT,local_path TEXT,status TEXT)").unwrap();
+            for index in 0..count {
+                let mut row = vec![
+                    "PrimarySync".to_owned(),
+                    format!("fixture-{index}"),
+                    "original".to_owned(),
+                    "checksum".to_owned(),
+                    format!("/fixture/{index}.jpg"),
+                    "downloaded".to_owned(),
+                ];
+                if directory == &import {
+                    match case {
+                        "identity" => row[1] = "foreign-fixture".to_owned(),
+                        "checksum" => row[3] = "wrong-checksum".to_owned(),
+                        "path" => row[4] = "/fixture/wrong.jpg".to_owned(),
+                        _ => {}
+                    }
+                    import_rows.push(row.clone());
+                }
+                connection
+                    .execute(
+                        "INSERT INTO assets VALUES (?1,?2,?3,?4,?5,?6)",
+                        rusqlite::params_from_iter(&row),
+                    )
+                    .unwrap();
+            }
+            if directory == &import && case == "duplicate" {
+                connection
+                    .execute("INSERT INTO assets SELECT * FROM assets", [])
+                    .unwrap();
+                import_rows.extend(import_rows.clone());
+            }
+        }
+        let dry_snapshot = root.path().join("dry.json");
+        std::fs::write(
+            &dry_snapshot,
+            if case == "dry_write" {
+                serde_json::to_vec(&import_rows).unwrap()
+            } else {
+                b"[]".to_vec()
+            },
+        )
+        .unwrap();
+        if case == "repeat_rows" {
+            import_rows[0][3] = "before-checksum".to_owned();
+        }
+        let real_snapshot = root.path().join("real.json");
+        std::fs::write(&real_snapshot, serde_json::to_vec(&import_rows).unwrap()).unwrap();
+        let reports: Vec<_> = (0..3).map(|index| {
+            let path = root.path().join(format!("{index}.out"));
+            let count = if index == 2 && case == "repeat_counts" { matched + 1 } else { matched };
+            let total = if case == "over_cap" { 11 } else { 10 };
+            std::fs::write(&path, format!("Total assets scanned: {total}\nFiles matched: {count}\nUnmatched versions: {unmatched}\nHash errors: {hash_errors}\n")).unwrap();
+            path
+        }).collect();
+        let output = Command::new("python3")
+            .args(["-c", validator])
+            .arg(&seed)
+            .arg(&import)
+            .arg(if case == "zero_cap" { "0" } else { "10" })
+            .arg(dry_snapshot)
+            .arg(real_snapshot)
+            .args(reports)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            error.is_empty(),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !error.is_empty() {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(error),
+                "{case}: wrong refusal: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }
 
 #[test]
@@ -2261,6 +2393,174 @@ fn full_test_cross_zone_album_phase_is_opt_in_and_checks_source_zone() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn full_test_cross_zone_album_requires_fixed_date_before_auth_and_preserves_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let bin = root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir_all(root.join("tests/shell")).unwrap();
+    let library = format!(
+        "{}\n{}",
+        repo_file("tests/shell/lib.sh"),
+        r#"
+kei_require_env() { printf 'auth\n' >> "$CALLS"; }
+kei_require_release_binary() { printf 'build\n' >> "$CALLS"; }
+kei_release_bin() { printf '%s/kei' "$FIXTURE_BIN"; }
+kei_copy_session_without_state() { printf 'session\n' >> "$CALLS"; }
+"#
+    );
+    std::fs::write(root.join("tests/shell/lib.sh"), library).unwrap();
+    write_executable(
+        &bin.join("git"),
+        "#!/bin/sh\nprintf '%s' \"$FIXTURE_ROOT\"\n",
+    );
+    write_executable(&bin.join("sqlite3"), "#!/bin/sh\nexit 99\n");
+    // Stop at the would-be binary boundary. No real binary, credentials,
+    // provider calls or host services are used by this harness proof.
+    write_executable(
+        &bin.join("kei"),
+        "#!/bin/bash\n[[ $1 == sync && $2 == --no-progress-bar && $3 == --config ]] || exit 98\ncp \"$4\" \"$CAPTURED_CONFIG\"\nexit 77\n",
+    );
+    let calls = root.join("calls");
+    let captured = root.join("captured.toml");
+    for (value, upper) in [
+        (None, None),
+        (Some(""), None),
+        (Some("30d"), None),
+        (Some("2025-02-30"), None),
+        (Some("2025-01-02"), Some("")),
+        (Some("2025-01-02"), Some("3d")),
+        (Some("2025-01-02"), Some("2025-02-30")),
+        (Some("2025-01-02"), Some("2025-01-01")),
+        (Some("2025-01-02"), None),
+        (Some("2025-01-02"), Some("2025-01-03")),
+    ] {
+        std::fs::write(&calls, "").unwrap();
+        if captured.exists() {
+            std::fs::remove_file(&captured).unwrap();
+        }
+        let mut command = Command::new("bash");
+        command
+            .arg(repo_path(
+                "scripts/full-test/run_cross_zone_album_hydration.sh",
+            ))
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("FIXTURE_ROOT", root)
+            .env("FIXTURE_BIN", &bin)
+            .env("CALLS", &calls)
+            .env("CAPTURED_CONFIG", &captured)
+            .env("TMPDIR", root)
+            .env("ICLOUD_USERNAME", "synthetic@example.invalid")
+            .env("KEI_FULL_TEST_CROSS_ZONE_ALBUM", "Cross-zone fixture")
+            .env_remove("KEI_LIVE_SKIP_CREATED_BEFORE")
+            .env_remove("KEI_LIVE_SKIP_CREATED_AFTER");
+        if let Some(value) = value {
+            command.env("KEI_LIVE_SKIP_CREATED_BEFORE", value);
+        }
+        if let Some(upper) = upper {
+            command.env("KEI_LIVE_SKIP_CREATED_AFTER", upper);
+        }
+        let output = command.output().unwrap();
+        if value == Some("2025-01-02") && [None, Some("2025-01-03")].contains(&upper) {
+            assert_eq!(output.status.code(), Some(77), "{output:?}");
+            assert_eq!(
+                std::fs::read_to_string(&calls).unwrap(),
+                "auth\nbuild\nsession\n"
+            );
+            let config: toml::Table = std::fs::read_to_string(&captured).unwrap().parse().unwrap();
+            assert_eq!(
+                config["filters"]["skip_created_before"].as_str(),
+                Some("2025-01-02")
+            );
+            assert_eq!(
+                config["filters"]["albums"].as_array().unwrap(),
+                &[toml::Value::String("Cross-zone fixture".into())]
+            );
+            assert_eq!(
+                config["filters"]["libraries"].as_array().unwrap(),
+                &[toml::Value::String("all".into())]
+            );
+            assert_eq!(config["filters"]["unfiled"].as_bool(), Some(false));
+            assert_eq!(
+                config["filters"]
+                    .get("skip_created_after")
+                    .and_then(toml::Value::as_str),
+                upper
+            );
+        } else {
+            assert_eq!(output.status.code(), Some(64), "{value:?}: {output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("explicit fixed YYYY-MM-DD")
+                    || stderr.contains("lower date must not be after")
+            );
+            assert!(
+                std::fs::read_to_string(&calls).unwrap().is_empty(),
+                "invalid bound reached auth/build/session"
+            );
+            assert!(!captured.exists());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_checkpoint_oracles_require_fixed_date_hold_or_complete_inventory() {
+    let script = repo_file("tests/shell/state-machine.sh");
+    let helper = script
+        .split_once("check_checkpoint() {")
+        .unwrap()
+        .1
+        .split_once("\n}")
+        .unwrap()
+        .0;
+    for (reason, token, success) in [
+        ("date_bounded_full_enumeration", "", true),
+        (
+            "date_bounded_full_enumeration",
+            "incorrect-new-token",
+            false,
+        ),
+        ("complete inventory", "saved-token", true),
+        ("complete inventory", "", false),
+        ("recent_limited_full_enumeration", "", false),
+    ] {
+        let command = format!(
+            "get_token() {{ printf '%s' \"$TOKEN\"; }}\nkei_check() {{ return $?; }}\ncheck_checkpoint() {{{helper}\n}}\ncheck_checkpoint"
+        );
+        let output = Command::new("bash")
+            .args(["-c", &command])
+            .env("OUTPUT", reason)
+            .env("TOKEN", token)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{reason}/{token}: {output:?}"
+        );
+    }
+    let sync = repo_file("tests/sync.rs");
+    let scenario = sync
+        .split_once("fn sync_bounded_second_run_preserves_checkpoint_and_skips_download()")
+        .unwrap()
+        .1
+        .split_once("\n#[test]")
+        .unwrap()
+        .0;
+    assert!(scenario.contains("date_bounded_full_enumeration"));
+    assert!(!scenario.contains("recent_limited_full_enumeration"));
+    assert!(
+        scenario.contains("token().is_none()")
+            && scenario.contains("second run must report no new downloads")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn full_test_offline_dispatch_preserves_features_and_checks_scenario_filters() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -2289,6 +2589,11 @@ set -euo pipefail
 call=$(printf '%s' "$1"; shift; printf '\t%s' "$@")
 printf '%s\n' "$call" >> "$CALL_LOG"
 [[ "$call" != "${FAIL_CALL:-}" ]] || exit 23
+if [[ "${EXPECT_OFFLINE_ENV_ISOLATION:-0}" == 1 ]]; then
+    for key in ICLOUD_USERNAME ICLOUD_PASSWORD KEI_DATA_DIR KEI_CONFIG KEI_PASSWORD_FILE KEI_PASSWORD_COMMAND; do
+        [[ ! -v "$key" ]] || exit 24
+    done
+fi
 if [[ "$call" == *--list ]]; then
     [[ "${EMPTY_CATALOG:-0}" != 1 ]] || exit 0
     cat "$CATALOG"
@@ -2310,6 +2615,20 @@ fi
             .env("CATALOG", root.join("catalog"))
             .env("FAIL_CALL", fail)
             .env("EMPTY_CATALOG", if empty { "1" } else { "0" })
+            .env("ICLOUD_USERNAME", "fixture-bootstrap@example.invalid")
+            .env("ICLOUD_PASSWORD", "fixture-password")
+            .env("KEI_DATA_DIR", root.join("unselected-data"))
+            .env("KEI_CONFIG", "unselected-config.toml")
+            .env("KEI_PASSWORD_FILE", "unselected-password-file")
+            .env("KEI_PASSWORD_COMMAND", "DO_NOT_EXECUTE")
+            .env(
+                "EXPECT_OFFLINE_ENV_ISOLATION",
+                if args == ["test", "offline"] {
+                    "1"
+                } else {
+                    "0"
+                },
+            )
             .output()
             .unwrap();
         let calls: Vec<String> = std::fs::read_to_string(&log)
@@ -2397,6 +2716,12 @@ fn full_test_live_dispatch_reaches_lookup_only_and_propagates_failure() {
     let bin = root.join("bin");
     std::fs::create_dir_all(&scripts).unwrap();
     std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir_all(root.join("tests/shell")).unwrap();
+    std::fs::write(
+        root.join("tests/shell/lib.sh"),
+        repo_file("tests/shell/lib.sh"),
+    )
+    .unwrap();
     std::fs::write(root.join("justfile"), repo_file("justfile")).unwrap();
     std::fs::write(
         scripts.join("live-env.sh"),
@@ -2429,6 +2754,9 @@ printf '%s\n' "$call" >> "$CALL_LOG"
                 format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
             )
             .env("ICLOUD_USERNAME", "fixture@example.invalid")
+            .env("PROJECT_DIR", root)
+            .env("KEI_LIVE_SKIP_CREATED_BEFORE", "2025-01-02")
+            .env("KEI_LIVE_SKIP_CREATED_AFTER", "2025-01-03")
             .env_remove("ICLOUD_PASSWORD")
             .env("CALL_LOG", &log)
             .env("FAIL_CALL", fail)
@@ -2450,6 +2778,28 @@ printf '%s\n' "$call" >> "$CALL_LOG"
             assert!(!output.status.success(), "must propagate {fail}");
             assert_eq!(calls.last().unwrap(), fail, "must stop after child failure");
         }
+    }
+    for upper in ["", "3d", "2025-02-30", "2025-01-01"] {
+        std::fs::write(&log, "").unwrap();
+        let output = Command::new("just")
+            .args(["test", "live"])
+            .current_dir(root)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("PROJECT_DIR", root)
+            .env("ICLOUD_USERNAME", "fixture@example.invalid")
+            .env("KEI_LIVE_SKIP_CREATED_BEFORE", "2025-01-02")
+            .env("KEI_LIVE_SKIP_CREATED_AFTER", upper)
+            .env("CALL_LOG", &log)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            std::fs::read_to_string(&log).unwrap().is_empty(),
+            "invalid upper bound reached Cargo"
+        );
     }
 }
 
@@ -2667,12 +3017,20 @@ fn live_selection_guard_rejects_retired_album_consumers() {
 fn live_shell_preflight_rejects_empty_selection() {
     let dir = tempfile::tempdir().unwrap();
     let binary = dir.path().join("kei");
+    let captured = dir.path().join("config.toml");
     for (output, success) in [("", false), ("controlled.JPG", true)] {
-        write_executable(&binary, &format!("#!/bin/sh\nprintf '%s\\n' '{output}'\n"));
+        write_executable(
+            &binary,
+            &format!("#!/bin/sh\ncp \"$3\" \"$CAPTURED_CONFIG\"\nprintf '%s\\n' '{output}'\n"),
+        );
         let result = Command::new("bash")
             .args(["-c", r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_release_bin() { printf '%s' "$BINARY"; }; kei_copy_session_without_state() { mkdir -p "$1"; }; kei_preflight_selection"#])
             .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
+            .env("ICLOUD_USERNAME", "fixture@example.invalid")
             .env("BINARY", &binary)
+            .env("KEI_LIVE_SKIP_CREATED_BEFORE", "2025-01-02")
+            .env("KEI_LIVE_SKIP_CREATED_AFTER", "2025-01-03")
+            .env("CAPTURED_CONFIG", &captured)
             .output().unwrap();
         assert_eq!(
             result.status.success(),
@@ -2680,10 +3038,39 @@ fn live_shell_preflight_rejects_empty_selection() {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
+        let config: toml::Table = std::fs::read_to_string(&captured).unwrap().parse().unwrap();
+        assert_eq!(
+            config["filters"]["skip_created_before"].as_str(),
+            Some("2025-01-02")
+        );
+        assert_eq!(
+            config["filters"]["skip_created_after"].as_str(),
+            Some("2025-01-03")
+        );
         if !success {
             assert!(
                 String::from_utf8_lossy(&result.stderr).contains("empty bounded live selection")
             );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_shell_preflight_requires_fixed_date_before_provider_or_session_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("unexpected-provider-work");
+    for value in ["", "30d", "2025-02-30"] {
+        for preflight in ["kei_preflight_selection", "kei_preflight_session"] {
+            let result = Command::new("bash")
+                .args(["-c",r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_copy_session_without_state() { touch "$MARKER"; }; kei_release_bin() { touch "$MARKER"; }; "$PREFLIGHT""#])
+                .env("PROJECT_DIR",env!("CARGO_MANIFEST_DIR"))
+                .env("ICLOUD_USERNAME", "fixture@example.invalid")
+                .env("KEI_LIVE_SKIP_CREATED_BEFORE",value).env("MARKER",&marker)
+                .env("PREFLIGHT",preflight).output().unwrap();
+            assert!(!result.status.success());
+            assert!(String::from_utf8_lossy(&result.stderr).contains("explicit fixed YYYY-MM-DD"));
+            assert!(!marker.exists());
         }
     }
 }

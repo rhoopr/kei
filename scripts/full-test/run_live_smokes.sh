@@ -31,6 +31,7 @@ fi
 USR="${ICLOUD_USERNAME:-missing@example.invalid}"
 DD="${KEI_TEST_DATA_DIR:-$repo_root/.test-cookies}"
 DOWNLOAD_DIR="${KEI_TEST_DOWNLOAD_DIR:-${TMPDIR:-/tmp/codex/kei/full-test/tmp}/photos-test}"
+kei_live_fixed_date >/dev/null || exit 1
 mkdir -p "$DOWNLOAD_DIR"
 
 sync_config="$(kei_write_sync_config "$DD" "$DOWNLOAD_DIR")"
@@ -57,7 +58,7 @@ export USR DD binary
 run live_status env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" status
 run live_libraries env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" list libraries
 run live_albums env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" list albums
-run live_dryrun env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" sync --dry-run --recent 5 --config "$sync_config"
+run live_dryrun env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" sync --dry-run --config "$sync_config"
 run live_config_show env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" config show
 run live_verify bash -c verify_wrapper
 run live_reconcile_dryrun env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" reconcile --dry-run

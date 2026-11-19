@@ -103,6 +103,7 @@ export_photos="$work/export-photos"
 export_output="$work/export-output"
 mkdir -p "$export_config" "$export_photos" "$export_output"
 cat >"$export_config/config.toml" <<'TOML'
+config_version = 1
 [auth]
 username = "private-user@example.invalid"
 password_command = "touch /output/private-command-ran"
@@ -215,6 +216,7 @@ echo "--- v0.20 Docker preflight: explicit non-default --config bypasses check -
 custom_cfg_dir="$work/custom-config"
 mkdir -p "$custom_cfg_dir"
 cat >"$custom_cfg_dir/custom.toml" <<'TOML'
+config_version = 1
 [auth]
 username = "docker-preflight@example.invalid"
 TOML

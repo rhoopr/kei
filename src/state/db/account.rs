@@ -64,7 +64,19 @@ fn owner_row(conn: &Connection) -> Result<Option<(i64, String, String)>, StateEr
 }
 
 pub(super) fn validate(conn: &Connection, owner: &AccountOwner) -> Result<(), StateError> {
-    let (version, key, provider) = owner_row(conn)?.ok_or(StateError::AccountOwnerMissing)?;
+    let row = owner_row(conn).map_err(|error| match error {
+        StateError::Migration(source)
+            if source.sqlite_error().is_some_and(|error| {
+                error.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK
+            }) =>
+        {
+            // SQLite must write before it can read a hot rollback journal.
+            // Without a verified owner, recovering the original is not safe.
+            StateError::AccountRollbackRecoveryRequired(source)
+        }
+        other => other,
+    })?;
+    let (version, key, provider) = row.ok_or(StateError::AccountOwnerMissing)?;
     if version != ACCOUNT_OWNER_FORMAT_VERSION
         || key != owner.key
         || (provider.len() != 64 || !provider.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -102,7 +114,7 @@ fn bind(conn: &Connection, owner: &AccountOwner) -> Result<(), StateError> {
     Ok(())
 }
 
-pub(super) fn open(path: &Path, owner: &AccountOwner) -> Result<Connection, StateError> {
+pub(super) fn open(path: &Path, owner: &AccountOwner) -> Result<(Connection, bool), StateError> {
     // Reserve the new file exclusively. A pre-existing empty/unowned file is
     // never silently claimed, including one left by an interrupted creation.
     if owner.provider.is_none()
@@ -152,11 +164,9 @@ pub(super) fn open(path: &Path, owner: &AccountOwner) -> Result<Connection, Stat
     } else {
         validate(&conn, owner)?;
     }
-    conn.set_db_config(
-        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
-        false,
-    )?;
-    Ok(conn)
+    // The lifecycle owner enables close-time checkpointing only after backup
+    // and migration succeed. Refusals must preserve a crash-left WAL.
+    Ok((conn, created))
 }
 
 pub(super) fn open_read_only(path: &Path) -> Result<Connection, StateError> {
@@ -201,6 +211,26 @@ pub(crate) async fn state_path(
         return Err(StateError::LegacyAccountMigrationRequired);
     }
     Ok(path)
+}
+
+/// Resolve and open authenticated sync/import state through one startup boundary.
+/// Identity refusal precedes directory creation; schema upgrades retain the
+/// loaded configuration through the existing durable backup owner.
+pub(crate) async fn open_sync_state(
+    directory: &Path,
+    username: &str,
+    realm: &str,
+    owner: &AccountOwner,
+    config: &crate::config::ConfigSource,
+) -> Result<super::SqliteStateDb, StateError> {
+    if owner.key != crate::account::namespace(username, realm) {
+        return Err(StateError::AccountOwnerMismatch);
+    }
+    if owner.provider.is_none() {
+        return Err(StateError::AccountIdentityUnavailable);
+    }
+    let path = state_path(directory, username, realm).await?;
+    super::SqliteStateDb::open_owned_with_config(&path, owner, config).await
 }
 
 /// Copy a confirmed legacy snapshot, bind the staged copy and publish without

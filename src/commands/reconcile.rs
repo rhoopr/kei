@@ -2,8 +2,8 @@
 //!
 //! Scans every asset marked `downloaded` in the state database and checks
 //! that its recorded `local_path` still exists and is not shorter than the
-//! provider-reported size. Drifted files are marked as failed so the next sync
-//! re-downloads them.
+//! provider-reported size. Missing files are marked failed for retry. Shorter
+//! files are reported without granting replacement authority.
 //!
 //! This guards against:
 //! - User manually deleting files from the photo directory.
@@ -12,8 +12,8 @@
 //!
 //! The reconcile pass is intentionally additive-only: it never deletes files,
 //! never removes DB rows, and never modifies files on disk. The only DB
-//! change is status transitions from `downloaded` -> `failed`, which the
-//! normal sync path knows how to retry.
+//! changes are missing-file status transitions and explicit fingerprint-pinned
+//! repair intent on the existing selected destination owner.
 
 #![allow(
     clippy::print_stdout,
@@ -93,8 +93,22 @@ pub(crate) struct ScanCounts {
     pub(crate) no_path: u64,
 }
 
+#[cfg(test)]
 pub(crate) async fn classify_local_drift(
     asset: state::AssetRecord,
+) -> anyhow::Result<(Option<LocalDriftAsset>, bool)> {
+    classify_local_drift_for(asset, LocalInspection::Integrity).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalInspection {
+    Presence,
+    Integrity,
+}
+
+async fn classify_local_drift_for(
+    asset: state::AssetRecord,
+    inspection: LocalInspection,
 ) -> anyhow::Result<(Option<LocalDriftAsset>, bool)> {
     let state::AssetRecord {
         library,
@@ -128,6 +142,9 @@ pub(crate) async fn classify_local_drift(
         Err(e) => return Err(e.into()),
     };
 
+    if inspection == LocalInspection::Presence {
+        return Ok((None, false));
+    }
     let actual_size = metadata.len();
     if !local_file_size_matches_state(
         &local_path,
@@ -160,6 +177,29 @@ pub(crate) async fn classify_local_drift(
 /// shift OFFSET pagination and skip rows.
 pub(crate) async fn scan_local_drift<D>(
     db: &D,
+    report_drift: impl FnMut(&LocalDriftAsset),
+    report_no_path: impl FnMut(&str),
+) -> anyhow::Result<(ScanCounts, Vec<LocalDriftUpdate>)>
+where
+    D: ReportStateStore + ?Sized,
+{
+    scan_local_files(db, LocalInspection::Integrity, report_drift, report_no_path).await
+}
+
+pub(crate) async fn scan_missing_local_files<D>(
+    db: &D,
+    report_drift: impl FnMut(&LocalDriftAsset),
+    report_no_path: impl FnMut(&str),
+) -> anyhow::Result<(ScanCounts, Vec<LocalDriftUpdate>)>
+where
+    D: ReportStateStore + ?Sized,
+{
+    scan_local_files(db, LocalInspection::Presence, report_drift, report_no_path).await
+}
+
+async fn scan_local_files<D>(
+    db: &D,
+    inspection: LocalInspection,
     mut report_drift: impl FnMut(&LocalDriftAsset),
     mut report_no_path: impl FnMut(&str),
 ) -> anyhow::Result<(ScanCounts, Vec<LocalDriftUpdate>)>
@@ -179,7 +219,7 @@ where
 
         for asset in page {
             let no_path_id = asset.local_path.is_none().then(|| asset.id.clone());
-            let (record, no_path) = classify_local_drift(asset).await?;
+            let (record, no_path) = classify_local_drift_for(asset, inspection).await?;
             if no_path {
                 if let Some(id) = no_path_id {
                     report_no_path(&id);
@@ -208,24 +248,86 @@ pub(crate) async fn run_reconcile(
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
 ) -> anyhow::Result<()> {
-    if let Some(cli::ReconcileAction::TrustLegacyFiles(trust)) = args.action {
-        anyhow::ensure!(
-            !args.dry_run,
-            "Use the trust-legacy-files plan action to review acceptance; --dry-run applies to ordinary reconcile"
+    anyhow::ensure!(
+        args.action.is_none() || args.inspect_path.is_none(),
+        "Integrity inspection cannot be combined with a reconcile subcommand"
+    );
+    if args.action.is_some() {
+        anyhow::bail!(
+            "Legacy file trust is no longer supported. Run kei sync. Existing trust records and media were not changed."
         );
-        return super::trusted_legacy::run(trust, globals, toml).await;
     }
     let db_path = super::super::get_db_path(globals, toml).await?;
 
     if !db_path.exists() {
+        anyhow::ensure!(
+            args.inspect_path.is_none(),
+            "Integrity inspection requires an existing owned state database"
+        );
         println!("No state database found at {}", db_path.display());
         println!("Run a sync first to create the database.");
         return Ok(());
     }
 
-    let db =
-        state::SqliteStateDb::open_owned(&db_path, &super::super::get_account_owner(globals, toml))
-            .await?;
+    let db = state::SqliteStateDb::open_owned_with_config(
+        &db_path,
+        &super::super::get_account_owner(globals, toml),
+        &globals.config_source,
+    )
+    .await?;
+    if let Some(path) = args.inspect_path {
+        let path = std::path::absolute(path)?;
+        let inspected = db
+            .inspect_integrity_destination(path.clone())
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Path has no current independently verified destination receipt")
+            })?;
+        let root = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Inspection requires a file path"))?;
+        let (checksum, size) =
+            crate::download::file::inspect_integrity_fingerprint(root, &path).await?;
+        let token = format!("{checksum}:{size}");
+        println!("Path: {}", path.display());
+        println!("Fingerprint: {token}");
+        if let Some(confirmed) = args.confirm_damage {
+            anyhow::ensure!(
+                confirmed == token,
+                "File changed since inspection; confirmation refused"
+            );
+            anyhow::ensure!(
+                inspected.preserved
+                    || inspected.confirmed.is_some()
+                    || inspected.local_checksum.as_deref() != Some(checksum.as_str()),
+                "File matches its recorded local checksum; no damage to confirm"
+            );
+            let replacing = inspected.confirmed.is_some();
+            db.confirm_integrity_damage(inspected, (checksum, size))
+                .await?;
+            println!(
+                "Confirmed damage queued for this destination. Run `kei sync` to attempt repair."
+            );
+            if replacing {
+                println!("Replaced the previous pending damage confirmation.");
+            }
+        } else if let Some((checksum, size)) = &inspected.confirmed {
+            println!(
+                "Damage is already confirmed for fingerprint {checksum}:{size}. To replace it with the current bytes, repeat with --confirm-damage {token}"
+            );
+        } else if inspected.preserved {
+            println!(
+                "Locally preserved copy. Confirm this fingerprint only to replace these bytes with the selected provider rendition."
+            );
+        } else if inspected.local_checksum.as_deref() == Some(checksum.as_str()) {
+            println!("Matches the recorded local checksum.");
+        } else {
+            println!(
+                "DIFFERENT: this may be an intentional edit. To confirm damage, repeat with --confirm-damage {token}"
+            );
+        }
+        return Ok(());
+    }
     let summary = db.get_summary().await?;
 
     if args.dry_run {
@@ -257,7 +359,7 @@ pub(crate) async fn run_reconcile(
                         actual_size,
                         expected_size,
                     } => println!(
-                        "TRUNCATED: {} ({}, {}) - {actual_size} < {expected_size} bytes",
+                        "SHORTER: {} ({}, {}) - {actual_size} < {expected_size} bytes; may be an intentional edit",
                         m.local_path.display(),
                         m.id,
                         m.version_size.as_str(),
@@ -291,6 +393,11 @@ pub(crate) async fn run_reconcile(
     let mut mark_errors = 0u64;
     if !args.dry_run {
         for m in &drifted {
+            // A shortened file alone does not establish damage. Only explicit
+            // per-destination fingerprint confirmation authorizes replacement.
+            if matches!(m.kind, LocalDriftKind::Truncated { .. }) {
+                continue;
+            }
             if protected.contains(&(m.library.to_string(), m.id.to_string())) {
                 protected_drift += 1;
                 continue;
@@ -329,7 +436,10 @@ pub(crate) async fn run_reconcile(
     println!("  Present:  {}", counts.present);
     println!("  Missing:  {}", counts.missing);
     if counts.damaged > 0 {
-        println!("  Damaged:  {}", counts.damaged);
+        println!("  Shorter:  {}", counts.damaged);
+        println!(
+            "Inspect changed copies with `kei reconcile --inspect-path PATH`; shorter size alone does not authorize replacement."
+        );
     }
     if counts.no_path > 0 {
         println!("  No path:  {}", counts.no_path);
@@ -365,6 +475,33 @@ mod tests {
     use super::*;
     use crate::state::{AssetStatus, SqliteStateDb};
     use crate::test_helpers::TestAssetRecord;
+
+    #[tokio::test]
+    async fn periodic_presence_scan_does_not_open_shorter_metadata_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = TestAssetRecord::new("NO_INTEGRITY_READ")
+            .size(std::fs::metadata(dir.path()).unwrap().len() + 1)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "NO_INTEGRITY_READ",
+            "original",
+            dir.path(),
+            "local-write",
+            Some("source-write"),
+        )
+        .await
+        .unwrap();
+        // Opening a directory for content hashing fails. Presence diagnostics
+        // must only stat the entry, without granting it media completion.
+        assert!(scan_local_drift(&db, |_| {}, |_| {}).await.is_err());
+        let (counts, updates) = scan_missing_local_files(&db, |_| {}, |_| {}).await.unwrap();
+        assert_eq!(counts.present, 1);
+        assert!(updates.is_empty());
+        assert!(db.get_failed().await.unwrap().is_empty());
+    }
 
     /// Seed a `downloaded` row whose `local_path` points at `path`; the path
     /// itself is not touched on disk, so the scan treats it as missing

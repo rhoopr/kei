@@ -173,6 +173,11 @@ impl DownloadControls {
 /// Result of a sync cycle, including the optional new syncToken.
 #[derive(Debug)]
 pub struct SyncResult {
+    /// Exact transfer targets already handled by this cycle's bounded retry.
+    /// This is transient scheduling evidence, never checkpoint permission.
+    pub(crate) retry_exclusions: rustc_hash::FxHashSet<crate::download::retry::PendingRetryTarget>,
+    /// Exact running snapshots, completed only with guarded inventory retirement.
+    pub(crate) deferred_album_snapshots: Vec<(String, String, i64)>,
     /// The outcome of the download pass (success, session expired, partial failure).
     pub outcome: DownloadOutcome,
     /// The new zone-level syncToken, if one was captured during this sync.
@@ -205,11 +210,13 @@ pub(crate) struct InventoryMeasurement {
 #[derive(Debug, Default)]
 #[must_use]
 pub(crate) struct CheckpointEvidence {
-    /// Every fresh ordered path-selection query (including the global frontier)
+    pub(crate) inventory_reconciliation_complete: bool,
+    /// Every fresh ordered path-selection query
     /// reached proven EOF with usable unanimous tokens, but the selected work
     /// excluded a tail. This certifies local work only, never a source cursor.
     pub(crate) bounded_path_selection_complete: bool,
     pub(crate) state_write_failures: usize,
+    pub(crate) storage_failed: bool,
     pub(crate) enumeration_errors: usize,
     pub(crate) enumeration_incomplete: bool,
     pub(crate) interrupted: bool,
@@ -222,6 +229,10 @@ pub(crate) struct CheckpointEvidence {
     /// selection also ran or source progress remains held. Any offered successor
     /// belongs to that replay. A rank query never sets this evidence.
     pub(crate) completed_delta_replay: bool,
+    /// Raw records observed in the terminal replay, before pairing. Absence
+    /// means no completion proof, including a closed consumer's last-good token.
+    pub(crate) delta_raw_records_observed: Option<bool>,
+    pub(crate) delta_successor: Option<String>,
     /// The provider explicitly rejected the retained changes/zone cursor.
     /// Static decoding failures and rank-query tokens do not prove expiry.
     pub(crate) retained_token_rejected: bool,
@@ -234,6 +245,7 @@ impl CheckpointEvidence {
     fn from_execution_stats(stats: &SyncStats) -> Self {
         Self {
             state_write_failures: stats.state_write_failures,
+            storage_failed: stats.storage_failed,
             enumeration_errors: stats.enumeration_errors,
             enumeration_incomplete: stats.enumeration_incomplete,
             interrupted: stats.interrupted,
@@ -252,12 +264,23 @@ impl CheckpointEvidence {
             && other.enumeration_errors == 0
             && other.state_write_failures == 0;
         self.state_write_failures += other.state_write_failures;
+        self.storage_failed |= other.storage_failed;
         self.enumeration_errors += other.enumeration_errors;
         self.enumeration_incomplete |= other.enumeration_incomplete;
         self.interrupted |= other.interrupted;
         self.identity_incomplete |= other.identity_incomplete;
         self.sync_token_blocked |= other.sync_token_blocked;
         self.completed_delta_replay |= other.completed_delta_replay;
+        if other.completed_delta_replay {
+            self.delta_successor.clone_from(&other.delta_successor);
+        }
+        self.delta_raw_records_observed = match (
+            self.delta_raw_records_observed,
+            other.delta_raw_records_observed,
+        ) {
+            (Some(left), Some(right)) => Some(left || right),
+            (left, right) => left.or(right),
+        };
         self.retained_token_rejected |= other.retained_token_rejected;
         self.retry_passes.extend(other.retry_passes.iter().cloned());
         self.revalidate_records
@@ -268,6 +291,7 @@ impl CheckpointEvidence {
 
     pub(crate) fn project(&self, stats: &mut SyncStats) {
         stats.state_write_failures = self.state_write_failures;
+        stats.storage_failed = self.storage_failed;
         stats.enumeration_errors = self.enumeration_errors;
         stats.enumeration_incomplete = self.enumeration_incomplete;
         stats.interrupted = self.interrupted;
@@ -286,11 +310,15 @@ impl SyncResult {
         sync_token: Option<String>,
         stats: SyncStats,
         proofs: Vec<crate::state::SparseIdentityProof>,
-        completed_delta_replay: bool,
+        completion: Option<(bool, String)>,
     ) -> Self {
         let mut result = Self::from_execution(outcome, sync_token, stats);
         result.checkpoint.sparse_identity_proofs = proofs;
-        result.checkpoint.completed_delta_replay = completed_delta_replay;
+        result.checkpoint.completed_delta_replay = completion.is_some();
+        if let Some((raw_records_observed, successor)) = completion {
+            result.checkpoint.delta_raw_records_observed = Some(raw_records_observed);
+            result.checkpoint.delta_successor = Some(successor);
+        }
         result
     }
 
@@ -303,6 +331,8 @@ impl SyncResult {
     ) -> Self {
         let checkpoint = CheckpointEvidence::from_execution_stats(&stats);
         Self {
+            deferred_album_snapshots: Vec::new(),
+            retry_exclusions: Default::default(),
             outcome,
             sync_token,
             stats,
@@ -315,12 +345,29 @@ impl SyncResult {
     /// Compose evidence and reports in one zone. The caller retains ownership
     /// of outcome precedence and source-token selection.
     pub(crate) fn accumulate(&mut self, other: &Self) {
+        self.retry_exclusions
+            .extend(other.retry_exclusions.iter().cloned());
         self.stats.accumulate_report_counters(&other.stats);
         self.checkpoint.accumulate(&other.checkpoint);
         self.checkpoint.project(&mut self.stats);
         self.full_enumeration_ran |= other.full_enumeration_ran;
+        self.deferred_album_snapshots
+            .extend(other.deferred_album_snapshots.iter().cloned());
         // Inventory belongs only to the original query invocation. Do not
         // import a later smart refresh, targeted retry, or bridge measurement.
+    }
+
+    #[must_use]
+    pub(in crate::download) fn with_retry_exclusions(
+        mut self,
+        tasks: &[crate::download::filter::DownloadTask],
+    ) -> Self {
+        self.retry_exclusions.extend(
+            tasks
+                .iter()
+                .map(crate::download::retry::PendingRetryTarget::from_task),
+        );
+        self
     }
 
     pub(crate) fn block_for_metadata_capture(&mut self) {
@@ -375,11 +422,18 @@ pub struct SyncStats {
     pub metadata_capture_unresolved: u64,
     pub metadata_capture_deferred: u64,
     pub unattributed_legacy_assets: u64,
+    /// Historical rows lacking a stored certificate, not pending sync work.
     pub unattributed_legacy_pending: u64,
     /// True when this cycle durably reduced metadata-capture work.
     #[serde(skip)]
     pub(crate) metadata_capture_progressed: bool,
     pub state_write_failures: usize,
+    /// A file operation failed because local storage could not serve it.
+    #[serde(skip)]
+    pub(crate) storage_failed: bool,
+    /// Current selected destinations or provider references remain unfinished.
+    #[serde(skip)]
+    pub(crate) selected_work_remaining: bool,
     pub enumeration_errors: usize,
     /// Best-effort count-probe failures observed before full enumeration.
     /// These are reported separately from producer enumeration errors because
@@ -541,6 +595,8 @@ impl SyncStats {
     // Per-zone composition folds safety fields only in CheckpointEvidence.
     // Cycle reports separately aggregate their projected counters above.
     fn accumulate_report_counters(&mut self, other: &SyncStats) {
+        self.storage_failed |= other.storage_failed;
+        self.selected_work_remaining |= other.selected_work_remaining;
         // primary_layout is a database-wide inventory assigned by the report
         // owner after the cycle. Summing it across passes would duplicate history.
         self.assets_seen += other.assets_seen;
@@ -638,8 +694,6 @@ pub(super) const ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON: &str =
 
 pub(super) const DATE_BOUNDED_FULL_ENUMERATION_REASON: &str = "date_bounded_full_enumeration";
 
-pub(super) const RECENT_LIMITED_FULL_ENUMERATION_REASON: &str = "recent_limited_full_enumeration";
-
 pub(super) const UNPARSABLE_RELATION_DELTA_REASON: &str = "unparsable_relation_delta";
 
 pub(super) const UNKNOWN_ALBUM_RELATION_CONTAINER_REASON: &str = "unknown_album_relation_container";
@@ -693,7 +747,7 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
         | INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON
         | "kei_internal_token_receiver_dropped"
         | PRODUCER_ENUMERATION_INCOMPLETE_REASON
-        | RECENT_LIMITED_FULL_ENUMERATION_REASON
+        | "inventory_reconciliation_required"
         | SMART_FOLDER_REFRESH_FAILED_REASON
         | TARGETED_ALBUM_BACKFILL_FAILED_REASON
         | PENDING_RETRY_UNMATCHED_REASON
@@ -740,8 +794,8 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
         PRODUCER_ENUMERATION_INCOMPLETE_REASON => {
             "kei stopped before iCloud enumeration reached the natural end of the stream"
         }
-        RECENT_LIMITED_FULL_ENUMERATION_REASON => {
-            "a count-limited recent sync is a bounded enumeration, so kei intentionally did not persist a full-enumeration sync token"
+        "inventory_reconciliation_required" => {
+            "current inventory did not qualify with a terminal raw-empty replay; the next cycle will try once again"
         }
         DATE_BOUNDED_FULL_ENUMERATION_REASON => {
             "a lower-date-bounded sync is a bounded enumeration, so kei intentionally did not persist a full-enumeration sync token"
@@ -862,7 +916,6 @@ impl SkipBreakdown {
             filter::FilterReason::MediaType => self.by_media_type += 1,
             filter::FilterReason::LivePhoto => self.by_live_photo += 1,
             filter::FilterReason::DateRange => self.by_date_range += 1,
-            filter::FilterReason::Filename => self.by_filename += 1,
         }
     }
 }
@@ -948,6 +1001,7 @@ pub(super) fn merge_streaming_result(combined: &mut StreamingResult, result: Str
     combined.auth_errors += result.auth_errors;
     combined.provider_auth_errors += result.provider_auth_errors;
     combined.state_write_failures += result.state_write_failures;
+    combined.storage_failed |= result.storage_failed;
     combined.enumeration_errors += result.enumeration_errors;
     combined.assets_seen += result.assets_seen;
     combined.skip_summary += result.skip_summary;
@@ -971,6 +1025,7 @@ pub(super) fn merge_token_recovery_result(combined: &mut StreamingResult, result
     combined.auth_errors += result.auth_errors;
     combined.provider_auth_errors += result.provider_auth_errors;
     combined.state_write_failures += result.state_write_failures;
+    combined.storage_failed |= result.storage_failed;
     combined.enumeration_errors += result.enumeration_errors;
     combined.bytes_downloaded += result.bytes_downloaded;
     combined.disk_bytes_written += result.disk_bytes_written;

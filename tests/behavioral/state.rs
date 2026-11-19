@@ -9,7 +9,7 @@ use rusqlite::OptionalExtension;
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 36). The shared helper
+/// `state::schema::SCHEMA_VERSION` (currently 42). The shared helper
 /// claims to "Mirror the latest schema" and must therefore land on the
 /// same version. Otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of
@@ -27,7 +27,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` in support to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 36;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 44;
     let production_schema = include_str!("../../src/state/schema.rs");
     assert!(
         production_schema.contains(&format!(
@@ -219,17 +219,13 @@ fn verify_checksums_mismatch() {
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("CORRUPTED"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Different or unreadable: 1"),
+        "stdout: {stdout}"
+    );
 }
 
-/// CG-1 (2026-05-03 test review): if a future refactor of the
-/// `CORRUPTED:` line in `run_verify` drops the asset id from the
-/// printed output, operators can see "1 corrupted" without any way
-/// to find which asset. This test pins the contract that the asset
-/// id reaches stdout for every corrupted entry. Sibling to
-/// `verify_checksums_mismatch` so the existing test stays focused
-/// on exit-code + summary text and this one stays focused on the
-/// per-asset trace.
+/// Identify the changed copy without claiming that a local edit is damage.
 #[test]
 fn verify_checksums_mismatch_emits_asset_id_in_output() {
     use std::io::Write;
@@ -266,12 +262,10 @@ fn verify_checksums_mismatch_emits_asset_id_in_output() {
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("CORRUPTED"),
-        "expected CORRUPTED line, stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains(asset_id),
-        "expected asset id {asset_id} in CORRUPTED line, stdout: {stdout}"
+        stdout
+            .lines()
+            .any(|line| line.starts_with("DIFFERENT:") && line.contains(asset_id)),
+        "expected asset id {asset_id} on the DIFFERENT line, stdout: {stdout}"
     );
 }
 
@@ -896,7 +890,7 @@ fn reconcile_subcommand_marks_missing_and_preserves_present() {
 }
 
 #[test]
-fn reconcile_marks_truncated_file_failed() {
+fn reconcile_reports_shorter_file_without_authorizing_replacement() {
     let data_dir = tempfile::tempdir().unwrap();
     let photos_dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
@@ -924,24 +918,22 @@ fn reconcile_marks_truncated_file_failed() {
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("TRUNCATED:"), "stdout: {stdout}");
-    assert!(stdout.contains("Damaged:  1"), "stdout: {stdout}");
-    assert!(
-        stdout.contains("Marked failed: 1"),
-        "one drifted row must be re-queued: {stdout}"
-    );
+    assert!(stdout.contains("SHORTER:"), "stdout: {stdout}");
+    assert!(stdout.contains("Shorter:  1"), "stdout: {stdout}");
+    assert!(stdout.contains("Marked failed: 0"), "stdout: {stdout}");
+    assert_eq!(std::fs::read(truncated_path).unwrap(), b"short");
 
     let db_name = format!("{}.db", sanitize_username(username));
     let conn = rusqlite::Connection::open(data_dir.path().join(db_name)).unwrap();
-    let (status, error): (String, String) = conn
+    let (status, error): (String, Option<String>) = conn
         .query_row(
             "SELECT status, last_error FROM assets WHERE id = 'TRUNCATED'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!(status, "failed");
-    assert_eq!(error, "FILE_TRUNCATED_AT_STARTUP");
+    assert_eq!(status, "downloaded");
+    assert_eq!(error, None);
 }
 
 #[test]
@@ -1026,56 +1018,11 @@ fn behavioral_helper_carries_every_migrated_column() {
     let dir = tempfile::tempdir().unwrap();
     let conn = create_state_db(dir.path(), "schema_check@example.com");
 
-    let shapes = |db: &rusqlite::Connection| {
-        db.prepare("SELECT type,name,sql FROM sqlite_master WHERE name LIKE 'provider_active_%' OR name LIKE 'provider_selection_rank_%' OR name IN ('idx_selection_rank_identity','idx_active_destination_identity') ORDER BY type,name")
-            .unwrap()
-            .query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?)))
-            .unwrap().collect::<Result<Vec<_>, _>>().unwrap()
-    };
-    let expected_shapes = |source: &str| {
-        // Match Rust's source normalization before extracting its raw-string DDL.
-        // include_str! retains checkout CRLFs; compiled raw strings use LFs.
-        let production_schema = source.replace("\r\n", "\n");
-        let begin = production_schema
-            .find("conn.execute_batch(r\"CREATE TABLE IF NOT EXISTS provider_active_generations")
-            .unwrap()
-            + "conn.execute_batch(r\"".len();
-        let remainder = production_schema.get(begin..).unwrap();
-        let end = remainder.find("\n\")?;").unwrap();
-        let expected = rusqlite::Connection::open_in_memory().unwrap();
-        expected
-            .execute_batch(remainder.get(..end).unwrap())
-            .unwrap();
-        shapes(&expected)
-    };
-    let lf_schema = include_str!("../../src/state/schema.rs").replace("\r\n", "\n");
-    let crlf_schema = lf_schema.replace('\n', "\r\n");
-    let actual = shapes(&conn);
-    for source in [lf_schema.as_str(), crlf_schema.as_str()] {
-        assert_eq!(
-            actual,
-            expected_shapes(source),
-            "schema34 helper must retain every additive table, key, constraint and index"
-        );
-        for (before, after) in [
-            (
-                "PRIMARY KEY(generation,pass_key,child)",
-                "PRIMARY KEY(generation,child,pass_key)",
-            ),
-            (
-                "CHECK(outcome IN ('selected','excluded','deferred'))",
-                "CHECK(outcome IN ('selected','excluded'))",
-            ),
-        ] {
-            let drifted = source.replacen(before, after, 1);
-            assert_ne!(source, drifted, "negative control must change the schema");
-            assert_ne!(
-                actual,
-                expected_shapes(&drifted),
-                "source newline normalization must not conceal key or constraint drift"
-            );
-        }
-    }
+    // Exact provider-schema equivalence is checked against a database built by
+    // the real migration chain in `src/state/schema.rs`:
+    // `behavioral_helper_matches_real_migrated_provider_schema`. That test
+    // compares columns, primary keys, foreign keys, checks, indexes and rowid
+    // mode. Keep the explicit behavioral-side column pins below.
 
     fn has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
         conn.prepare(&format!("PRAGMA table_info({table})"))
@@ -1083,6 +1030,24 @@ fn behavioral_helper_carries_every_migrated_column() {
             .query_map([], |row| row.get::<_, String>(1))
             .unwrap()
             .any(|name| name.is_ok_and(|n| n == column))
+    }
+
+    for (table, column, migration) in [
+        ("provider_active_destinations", "current_publication", "v39"),
+        ("provider_active_destinations", "preserved_local", "v39"),
+        ("album_containers", "directory_binding", "v40"),
+        (
+            "provider_active_destinations",
+            "embedded_metadata_receipt",
+            "v41",
+        ),
+        ("asset_metadata_paths", "embedded_metadata_receipt", "v41"),
+        ("provider_active_destinations", "confirmed_repair", "v42"),
+    ] {
+        assert!(
+            has_column(&conn, table, column),
+            "{migration} column {table}.{column} must exist in the behavioral helper's DDL"
+        );
     }
 
     assert!(
@@ -1307,7 +1272,7 @@ fn preserved_legacy_status_and_reconcile_keep_attribution_separate_from_failure(
     let output = String::from_utf8(out).unwrap();
     assert!(
         output.contains(
-            "1 legacy records need attribution; 1 awaiting current-work preservation proof"
+            "preserved legacy records with unknown attribution: 1; legacy records without a stored coverage certificate: 1. Certification is retired; this is not pending sync work."
         ),
         "{output}"
     );
@@ -1349,4 +1314,80 @@ fn preserved_legacy_status_and_reconcile_keep_attribution_separate_from_failure(
         ("downloaded".into(), None, "original-checksum".into())
     );
     assert!(!missing.exists());
+}
+
+#[test]
+fn retired_legacy_trust_plan_and_apply_refuse_before_archive_or_auth_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    let media = root.path().join("photos");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&media).unwrap();
+    let username = "retired-trust@example.invalid";
+    let conn = create_state_db(&data, username);
+    let photo = media.join("existing.jpg");
+    std::fs::write(&photo, b"retained synthetic media").unwrap();
+    std::fs::write(media.join("existing.jpg.xmp"), b"retained custom metadata").unwrap();
+    insert_asset(
+        &conn,
+        "existing",
+        "downloaded",
+        "existing.jpg",
+        Some(photo.to_str().unwrap()),
+        None,
+        Some("old-local-proof"),
+    );
+    conn.execute("INSERT INTO metadata VALUES('trusted_legacy_file:v1:historical:receipt','immutable historical declaration')",[]).unwrap();
+    conn.execute(
+        "INSERT INTO metadata VALUES('sync_token:PrimarySync','old-cursor')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let config = root.path().join("config.toml");
+    crate::common::write_versioned_config(&config,format!("[auth]\nusername = {username:?}\npassword = 'synthetic-not-a-real-password'\n[download]\ndirectory = {:?}\n",media.to_str().unwrap())).unwrap();
+    let plan = root.path().join("plan.json");
+    let snapshot = || {
+        crate::common::walkdir(root.path())
+            .into_iter()
+            .map(|path| {
+                let bytes = std::fs::read(&path).unwrap();
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                (path, bytes, modified)
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = snapshot();
+    for args in [
+        vec![
+            "plan",
+            "--library",
+            "PrimarySync",
+            "--output",
+            plan.to_str().unwrap(),
+        ],
+        vec!["apply", "--plan", plan.to_str().unwrap()],
+    ] {
+        let output = clean_cmd()
+            .env("KEI_DATA_DIR", &data)
+            .env("KEI_UNSTABLE_FAKE_TWO_FACTOR_REQUIRED_FOR_TESTS", "1")
+            .arg("--config")
+            .arg(&config)
+            .args(["reconcile", "trust-legacy-files"])
+            .args(args)
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("Legacy file trust is no longer supported. Run kei sync. Existing trust records and media were not changed."),"{error}");
+        assert!(!error.contains("Authenticating"), "{error}");
+        assert!(
+            !error.contains("Offline 2FA-required test seam enabled"),
+            "{error}"
+        );
+        assert!(output.stdout.is_empty());
+        assert_eq!(snapshot(), before);
+        assert!(!plan.exists());
+    }
 }

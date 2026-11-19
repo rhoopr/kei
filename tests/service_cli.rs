@@ -66,7 +66,8 @@ fn service_run_help_inherits_runtime_sync_flags() {
         .args(["service", "run", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--recent"))
+        .stdout(predicate::str::contains("--skip-created-before"))
+        .stdout(predicate::str::contains("--recent").not())
         .stdout(predicate::str::contains("--download-dir").not())
         .stdout(predicate::str::contains("--threads").not());
 }

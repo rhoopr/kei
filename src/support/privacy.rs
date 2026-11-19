@@ -57,10 +57,13 @@ const CONFIG_NUMBERS: &[&str] = &[
     "skip_videos",
     "skip_photos",
     "set_exif_datetime",
+    "set_exif_orientation",
     "set_exif_rating",
     "set_exif_gps",
     "set_exif_description",
     "embed_xmp",
+    "include_albums",
+    "include_people",
     "xmp_sidecar",
     "album_selectors",
     "smart_folder_selectors",
@@ -409,6 +412,7 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "sync_token_receivers_dropped",
             "sync_token_unique_values",
         ]),
+        "support_delta_bridge_v1" => Some(&["outcome", "reason"]),
         "support_hydration_wait_v1" => Some(&["phase", "outcome", "elapsed_secs"]),
         "support_pass_completion_v1" => Some(&[
             "outcome",
@@ -470,6 +474,7 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "interrupted",
         ]),
         "recovery_decision_v1" => Some(&["mechanism", "decision", "reason"]),
+        // Read-only compatibility for support history from older binaries.
         "legacy_receipt_prerequisite_v1" => Some(&["prerequisite"]),
         "legacy_preservation_hardlink_trust" => Some(&["stage", "reason", "affected_paths"]),
         "expired_url_refresh_failed" => Some(&[
@@ -606,6 +611,13 @@ fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
                         | "live_reference"
                 )
             ),
+            _ => false,
+        };
+    }
+    if kind == "support_delta_bridge_v1" {
+        return match key {
+            "outcome" => matches!(label, Some("started" | "failed")),
+            "reason" => matches!(label, Some("missing_successor" | "replay_error")),
             _ => false,
         };
     }
@@ -907,6 +919,7 @@ const LABELS: &[&str] = &[
     "retry_passes",
     "revalidate_records",
     "selection_generation_deferred",
+    "inventory_reconciliation_required",
     "smart_folder_refresh_failed",
     "stop",
     "sync_token_missing",

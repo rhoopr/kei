@@ -1,6 +1,5 @@
 //! Pass finalization, retry cleanup, and sync outcome aggregation.
 
-use rustc_hash::FxHashSet;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,7 +23,7 @@ use crate::state::SyncRunStats;
 
 use super::StreamPipelineShared;
 use super::consumer::StreamConsumerResult;
-use super::pass::{PassConfig, run_download_pass};
+use super::pass::PassConfig;
 use super::producer::{ProducerSkipSummary, StreamProducer};
 use super::progress::{log_sync_summary, maybe_warn_rate_limit_pressure};
 use super::task::AUTH_ERROR_THRESHOLD;
@@ -39,6 +38,7 @@ pub(in crate::download) struct StreamingResult {
     /// CloudKit session failures require recovery even without failed CDN transfers.
     pub(in crate::download) provider_auth_errors: usize,
     pub(in crate::download) state_write_failures: usize,
+    pub(in crate::download) storage_failed: bool,
     pub(in crate::download) enumeration_errors: usize,
     pub(in crate::download) assets_seen: u64,
     pub(in crate::download) skip_summary: ProducerSkipSummary,
@@ -187,6 +187,7 @@ pub(super) async fn finalize_streaming_download(
         .state_write_failures
         .load(std::sync::atomic::Ordering::Relaxed);
     let state_write_failures = final_state_flush.failures
+        + consumer.failure_state_writes
         + producer_state_write_failures
         + usize::from(complete_sync_failed);
     if consumer.state_write_circuit_error.is_none()
@@ -201,20 +202,22 @@ pub(super) async fn finalize_streaming_download(
     // without re-downloading bytes; the alternative was to leave markers
     // accumulating in the DB forever.
     if consumer.state_write_circuit_error.is_none()
+        && !consumer.storage_failed
         && !defer_metadata_drain
         && !config.refresh_metadata
         && let Some(db) = &state_db
     {
         let metadata_flags = MetadataFlags::from(config.as_ref());
         if metadata_flags.has_any_write() {
-            consumer.exif_failures += metadata_rewrite::run_pending(
+            let pass = metadata_rewrite::run_pending(
                 db.as_ref(),
                 metadata_flags,
                 Arc::clone(&config.temp_suffix),
                 &pipeline_shutdown,
             )
-            .await
-            .failed;
+            .await;
+            consumer.exif_failures += pass.failed;
+            consumer.storage_failed |= pass.storage_failed;
         }
     }
 
@@ -240,6 +243,10 @@ pub(super) async fn finalize_streaming_download(
             .load(std::sync::atomic::Ordering::Relaxed);
 
     Ok(StreamingResult {
+        storage_failed: consumer.storage_failed
+            || metrics
+                .storage_failed
+                .load(std::sync::atomic::Ordering::Relaxed),
         downloaded: consumer.downloaded,
         exif_failures: consumer.exif_failures,
         failed: consumer.failed,
@@ -307,6 +314,7 @@ fn mark_producer_enumeration_incomplete(
 /// Build a `DownloadOutcome` from a `StreamingResult`, running a cleanup
 /// pass if there were failures. Shared between `download_photos` and
 /// `download_photos_full_with_token`.
+#[cfg(test)]
 pub(in crate::download) async fn build_download_outcome(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
@@ -349,6 +357,7 @@ pub(in crate::download) async fn build_download_result(
     let enumeration_incomplete =
         producer_enumeration_incomplete(&streaming_result, &shutdown_token);
     let mut checkpoint = CheckpointEvidence {
+        storage_failed: streaming_result.storage_failed,
         state_write_failures,
         enumeration_errors,
         interrupted: shutdown_token.is_cancelled(),
@@ -471,7 +480,9 @@ pub(in crate::download) async fn build_download_result(
         ));
     }
 
-    if streaming_result.url_expired_abort && failed_tasks.is_empty() {
+    if streaming_result.storage_failed
+        || (streaming_result.url_expired_abort && failed_tasks.is_empty())
+    {
         let retry_exhausted = skip_breakdown.retry_exhausted;
         let mut stats = crate::download::SyncStats {
             assets_seen: streaming_result.assets_seen,
@@ -561,43 +572,30 @@ pub(in crate::download) async fn build_download_result(
         "── Cleanup pass: re-fetching URLs and retrying failed downloads ──"
     );
 
-    let refresh = if streaming_result.url_expired_abort {
-        crate::download::CleanupUrlRefresh::Lookup
-    } else {
-        crate::download::CleanupUrlRefresh::Enumerate
-    };
-    let retry_plan = if let Some(context) = &config.selection_context {
+    let retry_sources = if let Some(context) = &config.selection_context {
         if let Some(run) = &config.selection_run {
-            run.remember_retry_sources(&failed_tasks, passes, config)
-                .await?;
+            run.remember_retry_sources(&failed_tasks, passes).await?;
         }
-        let sources = context.exact_retry_sources()?;
-        crate::download::orchestration::url_refresh::build_incremental_expired_url_retry_tasks(
-            passes,
-            &sources,
-            &failed_tasks,
-            shutdown_token.clone(),
-        )
-        .await
+        Some(context.exact_retry_sources()?)
     } else {
-        crate::download::build_retry_download_tasks(
-            passes,
-            config,
-            &failed_tasks,
-            refresh,
-            shutdown_token.clone(),
-        )
-        .await?
+        None
     };
+    let retry_plan = crate::download::orchestration::url_refresh::refresh_failed_download_urls(
+        passes,
+        &failed_tasks,
+        &shutdown_token,
+        retry_sources.as_ref(),
+    )
+    .await;
     tracing::debug!(target: "kei::download::pipeline",
         count = retry_plan.tasks.len(),
         "  Re-fetched failed tasks with fresh URLs"
     );
 
-    let phase2_rate_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let retry_provider_auth_errors = retry_plan.provider_auth_errors;
     let pass_config = PassConfig {
         prior_auth_errors: auth_errors,
-        url_obtained_at: retry_plan.url_obtained_at,
+        url_obtained_at: Default::default(),
         client: download_client,
         retry_config: &config.retry,
         metadata: MetadataFlags::from(config.as_ref()),
@@ -610,12 +608,11 @@ pub(in crate::download) async fn build_download_result(
         temp_suffix: Arc::clone(&config.temp_suffix),
         shutdown_token: shutdown_token.clone(),
         state_db: config.state_db.clone(),
-        rate_limit_counter: Arc::clone(&phase2_rate_counter),
+        rate_limit_counter: Default::default(),
         bandwidth_limiter: config.bandwidth_limiter.clone(),
         library: Arc::clone(&config.library),
     };
-    let mut pass_result = run_download_pass(pass_config, retry_plan.tasks).await;
-    pass_result.rate_limit_observations += retry_plan.rate_limit_observations;
+    let pass_result = retry_plan.execute(pass_config).await;
 
     crate::support::observe(
         "support_transfer_pass_v1",
@@ -627,24 +624,18 @@ pub(in crate::download) async fn build_download_result(
         }),
     );
     let phase2_downloaded = pass_result.downloaded;
-    // Only completed exact tasks retire the original failed work.
-    let downloaded_keys: FxHashSet<_> = pass_result
-        .downloaded_tasks
-        .iter()
-        .map(crate::download::RetryTaskKey::from)
-        .collect();
-    let remaining_failed: Vec<_> = failed_tasks
-        .into_iter()
-        .filter(|task| !downloaded_keys.contains(&crate::download::RetryTaskKey::from(task)))
-        .collect();
+    // The refresh execution result includes failed transfers and unrefreshed
+    // exact tasks; successful peers are already excluded by the pass owner.
+    let remaining_failed = pass_result.failed;
     let phase2_auth_errors = pass_result.auth_errors;
     exif_failures += pass_result.exif_failures;
     state_write_failures += pass_result.state_write_failures;
+    checkpoint.storage_failed |= pass_result.storage_failed;
     checkpoint.state_write_failures = state_write_failures;
     checkpoint.interrupted = shutdown_token.is_cancelled();
-    let total_auth_errors = auth_errors + phase2_auth_errors + retry_plan.provider_auth_errors;
+    let total_auth_errors = auth_errors + phase2_auth_errors + retry_provider_auth_errors;
 
-    if total_auth_errors >= AUTH_ERROR_THRESHOLD || retry_plan.provider_auth_errors > 0 {
+    if total_auth_errors >= AUTH_ERROR_THRESHOLD || retry_provider_auth_errors > 0 {
         checkpoint.interrupted = true;
         let mut merged_recap = streaming_result.recap.clone();
         merged_recap.merge(pass_result.recap.clone());
@@ -728,7 +719,8 @@ pub(in crate::download) async fn build_download_result(
             },
             stats,
             checkpoint,
-        ));
+        )
+        .with_retry_exclusions(&remaining_failed));
     }
 
     Ok(finish_download_result(
@@ -746,6 +738,8 @@ fn finish_download_result(
 ) -> SyncResult {
     checkpoint.project(&mut stats);
     SyncResult {
+        deferred_album_snapshots: Vec::new(),
+        retry_exclusions: Default::default(),
         outcome,
         sync_token: None,
         stats,

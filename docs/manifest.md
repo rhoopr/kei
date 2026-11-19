@@ -41,7 +41,9 @@ the local state DB:
     "last_seen_at": "2024-01-02T03:06:30Z",
     "media_type": "photo",
     "status": "downloaded",
-    "albums": ["Favorites"]
+    "albums": ["Favorites"],
+    "is_deleted": false,
+    "deleted_at": null
   }
 ]
 ```
@@ -55,6 +57,8 @@ is not proof of backup completeness. See [maintenance](backup-maintenance.md).
 Fields may be `null` when kei doesn't have that value. The schema may grow in
 later releases, so consumers should ignore fields they don't recognize.
 
+A rendition can have `status: "downloaded"` and `is_deleted: true`: kei kept the local copy and recorded its deletion upstream. `deleted_at` is the provider timestamp when known. To list only catalog entries without a recorded deletion, run `kei manifest | jq '.[] | select(.is_deleted == false)'`.
+
 ## CSV
 
 CSV output has the same information with one row per asset version. The
@@ -64,7 +68,7 @@ unambiguous.
 Columns:
 
 ```text
-library,asset_id,version,filename,local_path,checksum,local_checksum,download_checksum,size_bytes,created_at,added_at,downloaded_at,last_seen_at,media_type,status,albums
+library,asset_id,version,filename,local_path,checksum,local_checksum,download_checksum,size_bytes,created_at,added_at,downloaded_at,last_seen_at,media_type,status,albums,is_deleted,deleted_at
 ```
 
-Managed edited-primary archives add an optional `preserved_files` array to each rendition's JSON row. It identifies independently preserved earlier provider checksums and exact local media/sidecar hashes using lossless native path encoding, family and operation identifiers, previous generation and journal phase. An old adjusted row whose primary path was handed over has a null `local_path`; its retained bytes are addressed by these receipts. CSV includes a JSON-valued `preserved_files` column only when at least one row has preserved receipts. Default suffix archives keep the existing JSON and sixteen-column CSV shape.
+An unknown `deleted_at` is an empty CSV cell. Managed edited-primary archives add an optional `preserved_files` array to each rendition's JSON row. It identifies independently preserved earlier provider checksums and exact local media/sidecar hashes using lossless native path encoding, family and operation identifiers, previous generation and journal phase. An old adjusted row whose primary path was handed over has a null `local_path`; its retained bytes are addressed by these receipts. CSV includes a JSON-valued `preserved_files` column only when at least one row has preserved receipts.

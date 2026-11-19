@@ -34,6 +34,7 @@ download pipeline does not parse CloudKit records.
 - Preserve `.part` writes, SHA-256 verification, no-overwrite publication,
   parent-directory fsync, and durable state finalization.
 - Local media or metadata rewrites require an explicit user option.
+- An enabled metadata setting authorizes later updates to its managed fields. Setup emits explicit choices; version-1 omissions and no-config runs stay disabled. Capture-timestamp replacement still requires explicit repair.
 - Preserve provider checkpoint gates across interruption, retry, partial work,
   config drift, and stale planning.
 - Unknown provider identity is durable retry evidence, not permission to delete

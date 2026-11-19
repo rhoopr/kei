@@ -1,4 +1,4 @@
-//! Trusted Legacy File migration through the real cycle owner. Synthetic accounts and bytes only.
+//! Historical local-trust evidence through the real cycle owner. Synthetic accounts and bytes only.
 #![cfg(target_os = "linux")]
 
 use crate::icloud::photos::{PhotoAsset, PhotosSession};
@@ -6,7 +6,7 @@ use crate::state::VersionSizeKey;
 use crate::sync_cycle::run_cycle;
 use crate::sync_loop::test_support::{
     RunCycleDownloadConfigOptions, album_count_response, full_album_page_with_download,
-    make_full_album_with_boxed_session, make_run_cycle_config,
+    make_captured_cycle_album, make_run_cycle_config,
     make_run_cycle_download_config_builder_with_options, make_run_cycle_library_state_with_album,
     make_shared_session_for_run_cycle,
 };
@@ -23,11 +23,54 @@ const ZONE: &str = "SharedSync-SYNTHETIC-853";
 const TOKEN: &str = "sync_token:SharedSync-SYNTHETIC-853";
 const USER: &str = "receipt-recovery@example.invalid";
 
+fn fixture_owner() -> state::db::account::AccountOwner {
+    state::db::account::AccountOwner::authenticated(
+        USER,
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-only"}})).unwrap(),
+    )
+    .unwrap()
+}
+
+async fn open_fixture_db(path: &Path) -> state::SqliteStateDb {
+    state::SqliteStateDb::open_owned(path, &fixture_owner())
+        .await
+        .unwrap()
+}
+
 #[derive(Clone, Debug)]
 struct Provider {
     records: Vec<Value>,
     zone: String,
     bridge_missing: bool,
+}
+impl Provider {
+    fn selected_records(&self) -> Vec<Value> {
+        // The supported unfiled query excludes hidden/deleted children. Lookup
+        // and changes/zone still expose the retained source facts independently.
+        let children: Vec<_> = self
+            .records
+            .iter()
+            .filter(|record| {
+                record["recordType"] == "CPLAsset"
+                    && record["fields"]["isHidden"]["value"] != 1
+                    && record["fields"]["isDeleted"]["value"] != 1
+                    && record["deleted"] != true
+            })
+            .collect();
+        self.records
+            .iter()
+            .filter(|record| {
+                children.contains(record)
+                    || (record["recordType"] == "CPLMaster"
+                        && children.iter().any(|child| {
+                            child["fields"]["masterRef"]["value"]["recordName"]
+                                == record["recordName"]
+                        }))
+            })
+            .cloned()
+            .collect()
+    }
 }
 #[async_trait::async_trait]
 impl PhotosSession for Provider {
@@ -35,7 +78,7 @@ impl PhotosSession for Provider {
         let request: Value = serde_json::from_str(&body)?;
         if url.contains("/records/query/batch?") {
             return Ok(album_count_response(
-                self.records
+                self.selected_records()
                     .iter()
                     .filter(|r| r["recordType"] == "CPLAsset")
                     .count() as u64,
@@ -50,7 +93,7 @@ impl PhotosSession for Provider {
                 .and_then(|v| v["fieldValue"]["value"].as_u64())
                 .unwrap_or(0);
             return Ok(
-                json!({"records":if offset==0 {self.records.clone()} else {Vec::new()}, "syncToken":"inventory-after"}),
+                json!({"records":if offset==0 {self.selected_records()} else {Vec::new()}, "syncToken":"inventory-after"}),
             );
         }
         if url.contains("/records/lookup?") {
@@ -69,7 +112,7 @@ impl PhotosSession for Provider {
         let delta = request["zones"][0]["syncToken"].is_string();
         let mut response = json!({"zones":[{"zoneID":{"zoneName":self.zone,"ownerRecordName":"_defaultOwner"},
             "syncToken":if delta {"delta-after"} else {"inventory-after"}, "moreComing":false,
-            "records":if delta {Vec::new()} else {self.records.clone()}}]});
+            "records":self.records}]});
         if delta && self.bridge_missing {
             response["zones"][0]["syncToken"] = json!("");
         }
@@ -123,6 +166,7 @@ struct Fixture {
     old: Vec<OldFile>,
     moved: Vec<(PathBuf, PathBuf)>,
     originals: Value,
+    historical_evidence: Vec<Value>,
     globals: crate::config::GlobalArgs,
     server: Arc<MockServer>,
     body: Vec<u8>,
@@ -148,6 +192,14 @@ fn rows(path: &Path, sql: &str) -> Value {
     json!(result)
 }
 const ORIGINAL_SQL: &str = "SELECT * FROM assets WHERE id LIKE 'family-%' ORDER BY id,version_size";
+const HISTORICAL_EVIDENCE: &[&str] = &[
+    "SELECT * FROM asset_metadata_paths WHERE id LIKE 'family-%' ORDER BY id,version_size,local_path",
+    "SELECT * FROM asset_metadata_capture_revisions WHERE asset_id LIKE 'family-%' ORDER BY asset_id",
+    "SELECT * FROM metadata_capture_retries WHERE asset_id LIKE 'family-%' ORDER BY asset_id",
+    "SELECT * FROM unattributed_legacy ORDER BY library,asset_id",
+    "SELECT * FROM unattributed_legacy_paths ORDER BY library,asset_id,path_key",
+    "SELECT * FROM unattributed_legacy_proofs ORDER BY library,asset_id,generation",
+];
 impl Fixture {
     async fn new(name: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -160,25 +212,14 @@ impl Fixture {
         let media = root.join("media");
         std::fs::create_dir_all(&media).unwrap();
         let globals = crate::config::GlobalArgs {
+            config_source: Default::default(),
             username: Some(USER.into()),
             domain: None,
             data_dir: Some(root.join("state").display().to_string()),
         };
         let database = crate::get_db_path(&globals, None).await.unwrap();
         assert!(database.starts_with(&root));
-        let db = state::SqliteStateDb::open(&database).await.unwrap();
-        {
-            let conn = db.acquire_lock("synthetic ownership fixture").unwrap();
-            conn.execute_batch("CREATE TABLE account_owner(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL,account_key TEXT NOT NULL,provider_key TEXT NOT NULL)").unwrap();
-            conn.execute(
-                "INSERT INTO account_owner VALUES(1,1,?1,?2)",
-                (
-                    crate::account::namespace(USER, "com"),
-                    crate::account::provider_fingerprint("com", "synthetic-only"),
-                ),
-            )
-            .unwrap();
-        }
+        let db = open_fixture_db(&database).await;
         let server = Arc::new(MockServer::start().await);
         let body = include_bytes!("../../../../tests/data/media/pattern.jpg").to_vec();
         let mut records = Vec::new();
@@ -212,6 +253,8 @@ impl Fixture {
             for child in 0..2 {
                 let id = format!("child-{family}-{child}");
                 let mut record = page["records"][1].clone();
+                record["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+                    json!("_defaultOwner");
                 record["recordName"] = json!(id);
                 record["fields"]["isHidden"] = json!({"value":1});
                 record["fields"]["addedDate"]["value"] = json!(if child == 0 {
@@ -348,8 +391,44 @@ impl Fixture {
             )
             .unwrap();
         }
+        // These fixtures start with retained historical preservation, rather than
+        // asking current sync to classify unrelated ambiguous master rows.
+        let historical = db.legacy_preparation_snapshots(ZONE, 10).await.unwrap();
+        assert_eq!(historical.len(), 2);
+        for snapshot in historical {
+            let mut files = Vec::new();
+            for path in &snapshot.paths {
+                let mut sidecar = path.as_os_str().to_os_string();
+                sidecar.push(".xmp");
+                for path in [path.clone(), PathBuf::from(sidecar)] {
+                    let evidence = match std::fs::read(&path) {
+                        Ok(bytes) => (
+                            Some(data_encoding::HEXLOWER.encode(&Sha256::digest(&bytes))),
+                            Some(bytes.len() as u64),
+                        ),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+                        Err(error) => panic!("read historical fixture: {error}"),
+                    };
+                    files.push(state::LegacyFileEvidence {
+                        root: media.clone(),
+                        path,
+                        sha256: evidence.0,
+                        size: evidence.1,
+                    });
+                }
+            }
+            assert!(
+                db.prepare_legacy_preservation(&snapshot, &files)
+                    .await
+                    .unwrap()
+            );
+        }
         drop(db);
         let originals = rows(&database, ORIGINAL_SQL);
+        let historical_evidence = HISTORICAL_EVIDENCE
+            .iter()
+            .map(|sql| rows(&database, sql))
+            .collect();
         let old = old
             .into_iter()
             .map(|entry| OldFile::capture(entry.path))
@@ -368,6 +447,7 @@ impl Fixture {
             old,
             moved: Vec::new(),
             originals,
+            historical_evidence,
             globals,
             server,
             body,
@@ -399,6 +479,14 @@ impl Fixture {
             "legacy rows/dates/checksums/owners unchanged"
         );
         assert_eq!(
+            HISTORICAL_EVIDENCE
+                .iter()
+                .map(|sql| rows(&self.database, sql))
+                .collect::<Vec<_>>(),
+            self.historical_evidence,
+            "historical receipts, retry evidence and protection remain read-only"
+        );
+        assert_eq!(
             rows(&self.database, "SELECT * FROM legacy_master_state_owners"),
             json!([])
         );
@@ -412,7 +500,7 @@ impl Fixture {
         std::fs::write(self.root.join(format!("{stage}.json")),serde_json::to_vec_pretty(&json!({"stage":stage,"details":details,"child_receipts":state,"retained_files":self.old.len(),"renamed_entries":self.moved})).unwrap()).unwrap();
     }
     async fn source_counts(&self) -> (usize, usize) {
-        let db = state::SqliteStateDb::open(&self.database).await.unwrap();
+        let db = open_fixture_db(&self.database).await;
         let valid: i64 = {
             let conn = db.acquire_lock("source count").unwrap();
             conn.query_row(
@@ -434,38 +522,44 @@ impl Fixture {
         }
         (usize::try_from(valid).unwrap(), eligible)
     }
-    async fn plan(&self) -> download::trusted_legacy::TrustedLegacyPlan {
-        let db = state::SqliteStateDb::open_owned_read_only(
-            &self.database,
-            &crate::get_account_owner(&self.globals, None),
-        )
-        .await
-        .unwrap();
-        download::trusted_legacy::plan(
-            &db,
-            ZONE,
-            &self.media,
-            ".part",
-            true,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap()
+    async fn historical_declarations(&self) -> Vec<state::db::trusted_legacy::TrustedLegacyFile> {
+        let db = state::SqliteStateDb::open_owned_read_only(&self.database, &fixture_owner())
+            .await
+            .unwrap();
+        let mut targets = db.historical_trust_targets_for_test(ZONE).await;
+        for target in &mut targets {
+            target.local_size = std::fs::metadata(&target.path).unwrap().len();
+        }
+        targets
     }
-    async fn apply(
+    async fn seed_history(
         &self,
-        plan: download::trusted_legacy::TrustedLegacyPlan,
-        cancel: &CancellationToken,
-    ) -> anyhow::Result<usize> {
-        let db = state::SqliteStateDb::open_owned(
-            &self.database,
-            &crate::get_account_owner(&self.globals, None),
-        )
-        .await?;
-        download::trusted_legacy::apply(&db, plan, &self.media, ".part", true, cancel).await
+        targets: Vec<state::db::trusted_legacy::TrustedLegacyFile>,
+    ) -> usize {
+        // Initial immutable history, not execution/completion evidence. Preserve
+        // the released command's exact key, payload and immutability triggers.
+        let conn = rusqlite::Connection::open(&self.database).unwrap();
+        for target in &targets {
+            let digest =
+                |value: &str| data_encoding::HEXLOWER.encode(&Sha256::digest(value.as_bytes()));
+            let key = format!(
+                "trusted_legacy_file:v1:{}:{}",
+                digest(&target.library),
+                digest(&target.binding)
+            );
+            conn.execute(
+                "INSERT OR IGNORE INTO metadata VALUES(?1,?2)",
+                (key, serde_json::to_string(target).unwrap()),
+            )
+            .unwrap();
+        }
+        conn.execute_batch("CREATE TRIGGER IF NOT EXISTS trusted_legacy_file_no_update BEFORE UPDATE ON metadata WHEN substr(OLD.key,1,length('trusted_legacy_file:v1:'))='trusted_legacy_file:v1:' OR substr(NEW.key,1,length('trusted_legacy_file:v1:'))='trusted_legacy_file:v1:' BEGIN SELECT RAISE(ABORT,'trusted legacy file acceptance is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS trusted_legacy_file_no_delete BEFORE DELETE ON metadata WHEN substr(OLD.key,1,length('trusted_legacy_file:v1:'))='trusted_legacy_file:v1:' BEGIN SELECT RAISE(ABORT,'trusted legacy file acceptance is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS trusted_legacy_file_no_replace BEFORE INSERT ON metadata WHEN substr(NEW.key,1,length('trusted_legacy_file:v1:'))='trusted_legacy_file:v1:' AND EXISTS(SELECT 1 FROM metadata WHERE key=NEW.key AND value!=NEW.value) BEGIN SELECT RAISE(ABORT,'trusted legacy file acceptance is immutable'); END;").unwrap();
+        targets.len()
     }
     async fn prepare_primary_hold(&self) {
-        let db = state::SqliteStateDb::open(&self.database).await.unwrap();
+        let db = open_fixture_db(&self.database).await;
         db.set_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY, "old-enum-hash")
             .await
             .unwrap();
@@ -473,13 +567,42 @@ impl Fixture {
             .await
             .unwrap();
     }
+    async fn quiet_twice(&self) {
+        let requests = self.server.received_requests().await.unwrap().len();
+        let receipts = rows(
+            &self.database,
+            "SELECT a.id,a.version_size,a.status,a.local_path,a.local_checksum,p.source_checksum FROM assets a LEFT JOIN asset_metadata_paths p USING(library,id,version_size) ORDER BY a.id,a.version_size,p.local_path",
+        );
+        for label in ["quiet-reopen-one", "quiet-reopen-two"] {
+            let result = self
+                .cycle(label, CancellationToken::new(), false)
+                .await
+                .unwrap();
+            assert_eq!(result.stats.downloaded, 0);
+            assert_eq!(result.failed_count, 0);
+            assert!(result.can_advance_database_checkpoint());
+            assert_eq!(
+                self.server.received_requests().await.unwrap().len(),
+                requests
+            );
+            assert_eq!(
+                rows(
+                    &self.database,
+                    "SELECT a.id,a.version_size,a.status,a.local_path,a.local_checksum,p.source_checksum FROM assets a LEFT JOIN asset_metadata_paths p USING(library,id,version_size) ORDER BY a.id,a.version_size,p.local_path"
+                ),
+                receipts
+            );
+        }
+    }
     async fn cycle(
         &self,
         label: &str,
         token: CancellationToken,
         primary_hold: bool,
     ) -> anyhow::Result<crate::sync_cycle::CycleResult> {
-        let db = Arc::new(state::SqliteStateDb::open(&self.database).await.unwrap());
+        let db = Arc::new(open_fixture_db(&self.database).await);
+        let capture =
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), fixture_owner(), "com");
         let mut config = make_run_cycle_config();
         config.photos.edited = true;
         config.download.legacy_preservation_allow_hardlinks = true;
@@ -487,10 +610,11 @@ impl Fixture {
         let mut shared = make_run_cycle_library_state_with_album(
             ZONE,
             TOKEN,
-            make_full_album_with_boxed_session(ZONE, Box::new(provider.clone())),
+            make_captured_cycle_album(ZONE, capture.clone(), Box::new(provider.clone())),
         );
         shared.library =
             crate::icloud::photos::PhotoLibrary::new_stub_with_zone(Box::new(provider), ZONE);
+        shared.library.shadow_capture = Some(capture.clone());
         let primary_provider = Provider {
             records: Vec::new(),
             zone: "PrimarySync".into(),
@@ -499,12 +623,17 @@ impl Fixture {
         let mut primary = make_run_cycle_library_state_with_album(
             "PrimarySync",
             "sync_token:PrimarySync",
-            make_full_album_with_boxed_session("PrimarySync", Box::new(primary_provider.clone())),
+            make_captured_cycle_album(
+                "PrimarySync",
+                capture.clone(),
+                Box::new(primary_provider.clone()),
+            ),
         );
         primary.library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
             Box::new(primary_provider),
             "PrimarySync",
         );
+        primary.library.shadow_capture = Some(capture);
         let mut libraries = vec![&shared];
         if primary_hold {
             libraries.push(&primary);
@@ -541,7 +670,6 @@ impl Fixture {
                 &libraries,
                 &config,
                 Some(store.as_ref()),
-                false,
                 &builder,
                 download::DownloadControls::download_hidden(),
                 &session,
@@ -567,20 +695,11 @@ async fn trusted_legacy_files_zero_get_reopen_and_quiet_followups() {
         .cycle("baseline", CancellationToken::new(), false)
         .await
         .unwrap();
-    assert!(baseline.stats.sync_token_blocked);
-    let plan = f.plan().await;
-    assert_eq!(plan.targets.len(), 6);
-    assert_eq!(
-        f.apply(plan.clone(), &CancellationToken::new())
-            .await
-            .unwrap(),
-        6
-    );
-    assert_eq!(
-        f.apply(plan, &CancellationToken::new()).await.unwrap(),
-        6,
-        "idempotent after reopen"
-    );
+    assert!(!baseline.stats.sync_token_blocked);
+    let history = f.historical_declarations().await;
+    assert_eq!(history.len(), 6);
+    assert_eq!(f.seed_history(history.clone()).await, 6);
+    assert_eq!(f.seed_history(history).await, 6, "idempotent after reopen");
     assert_eq!(
         f.source_counts().await,
         (0, 6),
@@ -598,75 +717,10 @@ async fn trusted_legacy_files_zero_get_reopen_and_quiet_followups() {
     }
     assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
     f.verify_old();
-    let proof = rows(
-        &f.database,
-        "SELECT provider_evidence FROM unattributed_legacy_proofs ORDER BY asset_id,generation",
+    assert_eq!(
+        rows(&f.database, "SELECT * FROM unattributed_legacy_proofs"),
+        json!([])
     );
-    assert!(proof.to_string().contains("trusted_legacy_file"));
-}
-
-#[tokio::test]
-async fn trusted_legacy_files_stale_cancelled_and_failed_plans_are_atomic() {
-    for scenario in [
-        "account",
-        "library",
-        "child",
-        "master",
-        "rendition",
-        "path",
-        "provider",
-        "bytes",
-        "temporary",
-        "symlink",
-        "cancel",
-        "sql",
-        "duplicate",
-        "empty",
-    ] {
-        let f = Fixture::new(scenario).await;
-        f.cycle("baseline", CancellationToken::new(), false)
-            .await
-            .unwrap();
-        let mut plan = f.plan().await;
-        let token = CancellationToken::new();
-        let conn = rusqlite::Connection::open(&f.database).unwrap();
-        match scenario {
-            "account"=> {conn.execute("UPDATE account_owner SET provider_key=?1",["a".repeat(64)]).unwrap();}
-            "library"=>plan.targets.last_mut().unwrap().library="OtherLibrary".into(),
-            "child"=>plan.targets.last_mut().unwrap().child="other-child".into(),
-            "master"=>plan.targets.last_mut().unwrap().master="other-master".into(),
-            "rendition"=>plan.targets.last_mut().unwrap().rendition="other".into(),
-            "path"=>plan.targets.last_mut().unwrap().path=f.media.join("other.jpg"),
-            "provider"=>{conn.execute("UPDATE assets SET checksum='other-generation' WHERE id='child-1-1'",[]).unwrap();}
-            "bytes"=>{std::fs::write(&plan.targets.last().unwrap().path,b"changed").unwrap();}
-            "temporary" => {
-                let mut part = plan.targets.last().unwrap().path.as_os_str().to_owned();
-                part.push(".part");
-                std::fs::write(Path::new(&part), b"pending").unwrap();
-            }
-            "symlink" => {
-                let target = &plan.targets.last().unwrap().path;
-                std::fs::remove_file(target).unwrap();
-                std::os::unix::fs::symlink(&f.old.first().unwrap().path, target).unwrap();
-            }
-            "cancel" => token.cancel(),
-            "sql"=>conn.execute_batch("CREATE TRIGGER refuse_trust BEFORE INSERT ON metadata WHEN NEW.key LIKE 'trusted_legacy_file:%' AND NEW.value LIKE '%child-1-1%' BEGIN SELECT RAISE(ABORT,'synthetic receipt failure'); END;").unwrap(),
-            "duplicate"=>plan.targets.push(plan.targets.first().unwrap().clone()),
-            "empty"=>plan.targets.clear(),
-            _=>panic!("unexpected synthetic scenario: {scenario}"),
-        }
-        drop(conn);
-        assert!(f.apply(plan, &token).await.is_err(), "{scenario}");
-        assert_eq!(
-            rows(
-                &f.database,
-                "SELECT key,value FROM metadata WHERE key LIKE 'trusted_legacy_file:%'"
-            ),
-            json!([]),
-            "no partial acceptance: {scenario}"
-        );
-        assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
-    }
 }
 
 #[tokio::test]
@@ -676,9 +730,7 @@ async fn trusted_legacy_files_readiness_and_primary_bridge_still_hold() {
         f.cycle("baseline", CancellationToken::new(), false)
             .await
             .unwrap();
-        f.apply(f.plan().await, &CancellationToken::new())
-            .await
-            .unwrap();
+        f.seed_history(f.historical_declarations().await).await;
         if scenario == "readiness" {
             let conn = rusqlite::Connection::open(&f.database).unwrap();
             conn.execute(
@@ -686,7 +738,7 @@ async fn trusted_legacy_files_readiness_and_primary_bridge_still_hold() {
                 [],
             )
             .unwrap();
-            let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+            let db = open_fixture_db(&f.database).await;
             assert!(
                 db.legacy_child_receipts(ZONE, "child-1-1")
                     .await
@@ -695,12 +747,29 @@ async fn trusted_legacy_files_readiness_and_primary_bridge_still_hold() {
             );
         } else {
             f.prepare_primary_hold().await;
-            let result = f
+            let error = f
                 .cycle("primary-hold", CancellationToken::new(), true)
                 .await
-                .unwrap();
-            assert!(result.stats.sync_token_blocked);
-            assert!(!result.can_advance_database_checkpoint());
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("Missing changes/zone successor"),
+                "{error:#}"
+            );
+            let db = open_fixture_db(&f.database).await;
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("primary-before")
+            );
+            assert_eq!(
+                db.get_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("old-enum-hash")
+            );
         }
         assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
         f.verify_old();
@@ -743,9 +812,7 @@ async fn trusted_legacy_files_acceptance_invalidates_after_binding_changes() {
         f.cycle("baseline", CancellationToken::new(), false)
             .await
             .unwrap();
-        f.apply(f.plan().await, &CancellationToken::new())
-            .await
-            .unwrap();
+        f.seed_history(f.historical_declarations().await).await;
         assert_eq!(f.source_counts().await, (0, 6));
         // Persisted coverage is established before the dependency changes.
         assert!(
@@ -757,7 +824,7 @@ async fn trusted_legacy_files_acceptance_invalidates_after_binding_changes() {
         let conn = rusqlite::Connection::open(&f.database).unwrap();
         conn.execute(sql, []).unwrap();
         drop(conn);
-        let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+        let db = open_fixture_db(&f.database).await;
         assert!(
             db.legacy_child_receipts(ZONE, "child-1-1")
                 .await
@@ -770,7 +837,7 @@ async fn trusted_legacy_files_acceptance_invalidates_after_binding_changes() {
             status
                 .iter()
                 .any(|s| s.library == ZONE && s.unattributed_legacy_pending > 0),
-            "changed binding invalidates checkpoint coverage: {name}"
+            "historical certificates are not written by sync: {name}"
         );
         assert_eq!(db.stored_trusted_legacy_file_count().await.unwrap(), 6);
         assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
@@ -778,34 +845,12 @@ async fn trusted_legacy_files_acceptance_invalidates_after_binding_changes() {
 }
 
 #[tokio::test]
-async fn trusted_legacy_files_commit_failure_and_receipt_immutability() {
+async fn trusted_legacy_files_historical_receipt_immutability() {
     let f = Fixture::new("commit").await;
     f.cycle("baseline", CancellationToken::new(), false)
         .await
         .unwrap();
-    let plan = f.plan().await;
-    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
-    let cancel = CancellationToken::new();
-    let cancelled = cancel.clone();
-    assert!(
-        db.apply_trusted_legacy_files(plan.targets.clone(), move || {
-            cancelled.cancel();
-            Err(state::error::StateError::Invariant {
-                operation: "synthetic_final_validation",
-                detail: "cancelled after insertion".into(),
-            })
-        })
-        .await
-        .is_err()
-    );
-    assert!(cancel.is_cancelled());
-    assert_eq!(
-        db.stored_trusted_legacy_file_count().await.unwrap(),
-        0,
-        "final validation rolls back every insertion"
-    );
-    drop(db);
-    f.apply(plan, &CancellationToken::new()).await.unwrap();
+    f.seed_history(f.historical_declarations().await).await;
     let conn = rusqlite::Connection::open(&f.database).unwrap();
     for sql in [
         "UPDATE metadata SET value='changed' WHERE key LIKE 'trusted_legacy_file:%'",
@@ -820,7 +865,7 @@ async fn trusted_legacy_files_commit_failure_and_receipt_immutability() {
 }
 
 #[tokio::test]
-async fn trusted_legacy_files_offline_command_and_account_lock() {
+async fn trusted_legacy_files_retired_commands_refuse_before_state_or_plan_access() {
     use clap::Parser;
     crate::cli::Cli::try_parse_from([
         "kei",
@@ -851,26 +896,6 @@ async fn trusted_legacy_files_offline_command_and_account_lock() {
         f.media.display().to_string()
     ))
     .unwrap();
-    let db = state::SqliteStateDb::open_owned_read_only(
-        &f.database,
-        &crate::get_account_owner(&f.globals, None),
-    )
-    .await
-    .unwrap();
-    assert!(
-        download::trusted_legacy::plan(
-            &db,
-            ZONE,
-            &f.media,
-            ".part",
-            false,
-            &CancellationToken::new()
-        )
-        .await
-        .is_err(),
-        "hardlink trust remains default off"
-    );
-    drop(db);
     let output = f.root.join("plan.json");
     let args = crate::cli::TrustedLegacyArgs {
         action: crate::cli::TrustedLegacyAction::Plan {
@@ -878,65 +903,43 @@ async fn trusted_legacy_files_offline_command_and_account_lock() {
             output: output.clone(),
         },
     };
-    run_trust_command(args.clone(), &f.globals, Some(&toml))
-        .await
-        .unwrap();
-    assert_eq!(f.source_counts().await, (0, 0), "plan cannot accept files");
-    assert!(
-        run_trust_command(args, &f.globals, Some(&toml))
-            .await
-            .is_err(),
-        "no output overwrite"
-    );
-    let config = crate::config::Config::build(
-        &f.globals,
-        &crate::cli::PasswordArgs::default(),
-        crate::cli::SyncArgs::default(),
-        Some(&toml),
-    )
-    .unwrap();
-    let guard = crate::auth::session::SessionStateGuard::acquire(
-        &config.auth.cookie_directory,
-        &config.auth.username,
-        config.auth.domain.as_str(),
-    )
-    .await
-    .unwrap();
     let apply = crate::cli::TrustedLegacyArgs {
         action: crate::cli::TrustedLegacyAction::Apply { plan: output },
     };
-    assert!(
-        run_trust_command(apply.clone(), &f.globals, Some(&toml))
+    let before = std::fs::read(&f.database).unwrap();
+    for command in [args, apply] {
+        let error = run_trust_command(command, &f.globals, Some(&toml))
             .await
-            .is_err(),
-        "sync account lock excludes offline apply"
-    );
-    drop(guard);
-    run_trust_command(apply, &f.globals, Some(&toml))
-        .await
-        .unwrap();
-    assert_eq!(f.source_counts().await, (0, 6));
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Legacy file trust is no longer supported. Run kei sync. Existing trust records and media were not changed."
+        );
+        assert_eq!(std::fs::read(&f.database).unwrap(), before);
+    }
+    assert!(!f.root.join("plan.json").exists());
+    assert_eq!(f.source_counts().await, (0, 0));
     assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
     f.verify_old();
 }
 
 #[tokio::test]
-async fn trusted_legacy_files_unaccepted_rendition_remains_held() {
+async fn trusted_legacy_files_unaccepted_rendition_is_not_checkpoint_debt() {
     let f = Fixture::new("partial-reviewed-cohort").await;
     f.cycle("baseline", CancellationToken::new(), false)
         .await
         .unwrap();
-    let mut plan = f.plan().await;
-    let unaccepted = plan.targets.pop().unwrap();
-    assert_eq!(f.apply(plan, &CancellationToken::new()).await.unwrap(), 5);
+    let mut history = f.historical_declarations().await;
+    let unaccepted = history.pop().unwrap();
+    assert_eq!(f.seed_history(history).await, 5);
     assert_eq!(f.source_counts().await, (0, 5));
     let result = f
         .cycle("unaccepted-control", CancellationToken::new(), false)
         .await
         .unwrap();
-    assert!(result.stats.sync_token_blocked);
-    assert!(!result.can_advance_database_checkpoint());
-    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    assert!(!result.stats.sync_token_blocked);
+    assert!(result.can_advance_database_checkpoint());
+    let db = open_fixture_db(&f.database).await;
     assert!(
         db.legacy_child_provenance(ZONE, &unaccepted.child, &unaccepted.rendition)
             .await
@@ -952,7 +955,7 @@ fn add_independent_child(f: &mut Fixture) -> (&'static str, String) {
     let record_name = "ordinary-1";
     let asset_id = "asset-ordinary-1";
     let checksum = data_encoding::BASE64.encode(&Sha256::digest(&f.body));
-    let page = full_album_page_with_download(
+    let mut page = full_album_page_with_download(
         ZONE,
         record_name,
         TOKEN,
@@ -960,6 +963,8 @@ fn add_independent_child(f: &mut Fixture) -> (&'static str, String) {
         f.body.len() as u64,
         &checksum,
     );
+    page["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+        json!("_defaultOwner");
     f.provider.records.push(page["records"][0].clone());
     f.provider.records.push(page["records"][1].clone());
     (asset_id, checksum)
@@ -984,6 +989,12 @@ fn add_missing_parent_reference(f: &mut Fixture) -> String {
         .as_object_mut()
         .unwrap()
         .remove("masterRef");
+    f.provider.records.push(orphan.clone());
+    // Retain the original hidden malformed observation, and supply a current
+    // created observation too. Normal delta identity recovery, not retired
+    // historical certification, must retain its unresolved provider reference.
+    orphan["recordName"] = json!("current-missing-parent-1");
+    orphan["fields"]["isHidden"] = json!({"value":0});
     f.provider.records.push(orphan);
     record_name
 }
@@ -1071,7 +1082,7 @@ async fn assert_independent_download(f: &Fixture, asset_id: &str, provider_check
 }
 
 #[tokio::test]
-async fn trusted_legacy_mixed_blocked_cohort_downloads_ready_child_and_holds() {
+async fn trusted_legacy_mixed_local_only_cohort_downloads_ready_child_without_historical_hold() {
     let mut f = Fixture::new("mixed-blocked").await;
     f.cycle("baseline", CancellationToken::new(), false)
         .await
@@ -1079,9 +1090,9 @@ async fn trusted_legacy_mixed_blocked_cohort_downloads_ready_child_and_holds() {
     // Introduce the ready child only after the trusted-legacy baseline so the
     // measured transfer belongs to the mixed blocked cohort cycle below.
     let (asset_id, provider_checksum) = add_independent_child(&mut f);
-    let mut plan = f.plan().await;
-    let unresolved = plan.targets.pop().unwrap();
-    assert_eq!(f.apply(plan, &CancellationToken::new()).await.unwrap(), 5);
+    let mut history = f.historical_declarations().await;
+    let unresolved = history.pop().unwrap();
+    assert_eq!(f.seed_history(history).await, 5);
     assert_eq!(
         f.source_counts().await,
         (0, 5),
@@ -1093,10 +1104,10 @@ async fn trusted_legacy_mixed_blocked_cohort_downloads_ready_child_and_holds() {
         .unwrap();
     assert_eq!(first.stats.downloaded, 1, "ready child transfers once");
     assert!(
-        first.stats.sync_token_blocked,
-        "unresolved cohort keeps the checkpoint held"
+        !first.stats.sync_token_blocked,
+        "local-only historical evidence is not checkpoint debt"
     );
-    assert!(!first.can_advance_database_checkpoint());
+    assert!(first.can_advance_database_checkpoint());
     assert_independent_download(&f, asset_id, &provider_checksum).await;
     assert_eq!(
         accepted_child_source_count(&f.database, &f.targets),
@@ -1109,9 +1120,8 @@ async fn trusted_legacy_mixed_blocked_cohort_downloads_ready_child_and_holds() {
         "no fabricated ownership from the mixed cohort"
     );
     assert!(
-        state::SqliteStateDb::open(&f.database)
+        open_fixture_db(&f.database)
             .await
-            .unwrap()
             .legacy_child_provenance(ZONE, &unresolved.child, &unresolved.rendition)
             .await
             .unwrap()
@@ -1125,10 +1135,10 @@ async fn trusted_legacy_mixed_blocked_cohort_downloads_ready_child_and_holds() {
         .unwrap();
     assert_eq!(reopen.stats.downloaded, 0, "no duplicate eligible transfer");
     assert!(
-        reopen.stats.sync_token_blocked,
-        "refusal/held checkpoint survives reopen"
+        !reopen.stats.sync_token_blocked,
+        "historical counters do not hold the reopened checkpoint"
     );
-    assert!(!reopen.can_advance_database_checkpoint());
+    assert!(reopen.can_advance_database_checkpoint());
     assert_independent_download(&f, asset_id, &provider_checksum).await;
     assert_eq!(
         f.source_counts().await,
@@ -1137,6 +1147,7 @@ async fn trusted_legacy_mixed_blocked_cohort_downloads_ready_child_and_holds() {
     );
     assert_eq!(accepted_child_source_count(&f.database, &f.targets), 0);
     f.verify_old();
+    f.quiet_twice().await;
 }
 
 #[tokio::test]
@@ -1146,12 +1157,7 @@ async fn trusted_legacy_mixed_ready_control_completes_and_reopens_quietly() {
         .await
         .unwrap();
     let (asset_id, provider_checksum) = add_independent_child(&mut f);
-    assert_eq!(
-        f.apply(f.plan().await, &CancellationToken::new())
-            .await
-            .unwrap(),
-        6
-    );
+    assert_eq!(f.seed_history(f.historical_declarations().await).await, 6);
     assert_eq!(f.source_counts().await, (0, 6));
     let first = f
         .cycle("mixed-ready-control", CancellationToken::new(), false)
@@ -1187,6 +1193,7 @@ async fn trusted_legacy_mixed_ready_control_completes_and_reopens_quietly() {
     );
     assert_eq!(accepted_child_source_count(&f.database, &f.targets), 0);
     f.verify_old();
+    f.quiet_twice().await;
 }
 
 #[tokio::test]
@@ -1195,12 +1202,7 @@ async fn trusted_legacy_mixed_six_acceptance_survives_readiness_failure_and_reop
     f.cycle("baseline", CancellationToken::new(), false)
         .await
         .unwrap();
-    assert_eq!(
-        f.apply(f.plan().await, &CancellationToken::new())
-            .await
-            .unwrap(),
-        6
-    );
+    assert_eq!(f.seed_history(f.historical_declarations().await).await, 6);
     assert_eq!(f.source_counts().await, (0, 6));
     {
         let conn = rusqlite::Connection::open(&f.database).unwrap();
@@ -1210,7 +1212,7 @@ async fn trusted_legacy_mixed_six_acceptance_survives_readiness_failure_and_reop
         )
         .unwrap();
     }
-    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    let db = open_fixture_db(&f.database).await;
     assert!(
         db.legacy_child_receipts(ZONE, "child-1-1")
             .await
@@ -1230,10 +1232,10 @@ async fn trusted_legacy_mixed_six_acceptance_survives_readiness_failure_and_reop
         "independent child still transfers"
     );
     assert!(
-        first.stats.sync_token_blocked,
-        "disqualified child keeps the checkpoint held"
+        !first.stats.sync_token_blocked,
+        "disabled metadata writers retain their markers without a certification hold"
     );
-    assert!(!first.can_advance_database_checkpoint());
+    assert!(first.can_advance_database_checkpoint());
     let (rows_failed, rows_total): (i64, i64) = {
         let conn = rusqlite::Connection::open(&f.database).unwrap();
         conn.query_row(
@@ -1248,7 +1250,7 @@ async fn trusted_legacy_mixed_six_acceptance_survives_readiness_failure_and_reop
         rows_failed, rows_total,
         "existing per-row readiness failure remains visible on every controlled child row"
     );
-    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    let db = open_fixture_db(&f.database).await;
     assert_eq!(
         db.stored_trusted_legacy_file_count().await.unwrap(),
         6,
@@ -1285,15 +1287,15 @@ async fn trusted_legacy_mixed_six_acceptance_survives_readiness_failure_and_reop
         .unwrap();
     assert_eq!(reopen.stats.downloaded, 0, "no duplicate transfer");
     assert!(
-        reopen.stats.sync_token_blocked,
-        "readiness failure keeps the checkpoint held on reopen"
+        !reopen.stats.sync_token_blocked,
+        "disabled metadata markers do not become historical certification work"
     );
-    assert!(!reopen.can_advance_database_checkpoint());
+    assert!(reopen.can_advance_database_checkpoint());
     assert_eq!(
         reopen.stats.failed, 0,
         "reopen remains quiet without new failures"
     );
-    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    let db = open_fixture_db(&f.database).await;
     assert_eq!(
         db.stored_trusted_legacy_file_count().await.unwrap(),
         6,
@@ -1323,35 +1325,44 @@ async fn trusted_legacy_mixed_six_acceptance_with_primary_hold_downloads_and_reo
     f.cycle("baseline", CancellationToken::new(), false)
         .await
         .unwrap();
-    assert_eq!(
-        f.apply(f.plan().await, &CancellationToken::new())
-            .await
-            .unwrap(),
-        6
-    );
+    assert_eq!(f.seed_history(f.historical_declarations().await).await, 6);
     assert_eq!(f.source_counts().await, (0, 6));
     f.prepare_primary_hold().await;
-    let before = {
-        let db = state::SqliteStateDb::open(&f.database).await.unwrap();
-        db.get_metadata("sync_token:PrimarySync").await.unwrap()
+    let (before, shared_before) = {
+        let db = open_fixture_db(&f.database).await;
+        (
+            db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+            db.get_metadata(TOKEN).await.unwrap(),
+        )
     };
     assert_eq!(before.as_deref(), Some("primary-before"));
     let (asset_id, provider_checksum) = add_independent_child(&mut f);
-    let first = f
+    let error = f
         .cycle("mixed-primary-hold", CancellationToken::new(), true)
         .await
-        .unwrap();
-    assert_eq!(
-        first.stats.downloaded, 1,
-        "independent child download stays eligible while Primary is held"
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Missing changes/zone successor"),
+        "{error:#}"
     );
-    assert!(first.stats.sync_token_blocked);
-    assert!(!first.can_advance_database_checkpoint());
-    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    assert_eq!(
+        f.server.received_requests().await.unwrap().len(),
+        1,
+        "independent child transfers once before the Primary successor refusal"
+    );
+    let db = open_fixture_db(&f.database).await;
     assert_eq!(
         db.get_metadata("sync_token:PrimarySync").await.unwrap(),
         before,
         "Primary cursor remains held at the prepared value"
+    );
+    assert_eq!(db.get_metadata(TOKEN).await.unwrap(), shared_before);
+    assert_eq!(
+        db.get_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("old-enum-hash")
     );
     assert_eq!(
         db.stored_trusted_legacy_file_count().await.unwrap(),
@@ -1372,21 +1383,32 @@ async fn trusted_legacy_mixed_six_acceptance_with_primary_hold_downloads_and_reo
         "no invented owners"
     );
     f.verify_old();
-    let reopen = f
+    let error = f
         .cycle("mixed-primary-hold-reopen", CancellationToken::new(), true)
         .await
-        .unwrap();
-    assert_eq!(
-        reopen.stats.downloaded, 0,
-        "no duplicate transfer on reopen"
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Missing changes/zone successor"),
+        "{error:#}"
     );
-    assert!(reopen.stats.sync_token_blocked);
-    assert!(!reopen.can_advance_database_checkpoint());
-    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    assert_eq!(
+        f.server.received_requests().await.unwrap().len(),
+        1,
+        "no duplicate or comparison transfer on reopen"
+    );
+    let db = open_fixture_db(&f.database).await;
     assert_eq!(
         db.get_metadata("sync_token:PrimarySync").await.unwrap(),
         before,
         "reopen does not rewrite the held Primary cursor"
+    );
+    assert_eq!(db.get_metadata(TOKEN).await.unwrap(), shared_before);
+    assert_eq!(
+        db.get_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("old-enum-hash")
     );
     assert_eq!(db.stored_trusted_legacy_file_count().await.unwrap(), 6);
     drop(db);
@@ -1403,9 +1425,7 @@ async fn trusted_legacy_mixed_missing_parent_holds_and_preserves_acceptances() {
         .await
         .unwrap();
     assert_eq!(
-        f.apply(f.plan().await, &CancellationToken::new())
-            .await
-            .unwrap(),
+        f.seed_history(f.historical_declarations().await).await,
         6,
         "six trusted bindings are retained before the structural variant appears"
     );
@@ -1436,7 +1456,7 @@ async fn trusted_legacy_mixed_missing_parent_holds_and_preserves_acceptances() {
     };
     assert_eq!(orphan_mappings, 0, "no matching mapping for the orphan");
     let token_before = {
-        let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+        let db = open_fixture_db(&f.database).await;
         assert_eq!(db.stored_trusted_legacy_file_count().await.unwrap(), 6);
         db.get_metadata(TOKEN).await.unwrap()
     };
@@ -1460,7 +1480,7 @@ async fn trusted_legacy_mixed_missing_parent_holds_and_preserves_acceptances() {
         "acceptances remain eligible and no source receipt is fabricated"
     );
     {
-        let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+        let db = open_fixture_db(&f.database).await;
         assert_eq!(
             db.get_metadata(TOKEN).await.unwrap(),
             token_before,
@@ -1490,8 +1510,8 @@ async fn trusted_legacy_mixed_missing_parent_holds_and_preserves_acceptances() {
     );
     assert_eq!(
         first.stats.sync_token_blocked_reason,
-        Some("legacy_preservation_incomplete"),
-        "the hold is the missing-reference preservation refusal"
+        Some("asset_delta_hydration_incomplete"),
+        "current unknown identity, not history, holds the checkpoint"
     );
     assert!(!first.can_advance_database_checkpoint());
     assert_independent_download(&f, asset_id, &provider_checksum).await;
@@ -1511,7 +1531,7 @@ async fn trusted_legacy_mixed_missing_parent_holds_and_preserves_acceptances() {
         "no invented owner from the missing-parent variant"
     );
     {
-        let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+        let db = open_fixture_db(&f.database).await;
         assert_eq!(
             db.stored_trusted_legacy_file_count().await.unwrap(),
             6,
@@ -1540,8 +1560,8 @@ async fn trusted_legacy_mixed_missing_parent_holds_and_preserves_acceptances() {
     );
     assert_eq!(
         reopen.stats.sync_token_blocked_reason,
-        Some("legacy_preservation_incomplete"),
-        "the missing-reference refusal survives reopen"
+        Some("asset_delta_hydration_incomplete"),
+        "the current missing-reference refusal survives reopen"
     );
     assert!(!reopen.can_advance_database_checkpoint());
     assert_eq!(reopen.stats.failed, 0, "reopen is quiet");
@@ -1549,7 +1569,7 @@ async fn trusted_legacy_mixed_missing_parent_holds_and_preserves_acceptances() {
     assert_eq!(accepted_child_source_count(&f.database, &f.targets), 0);
     assert_eq!(f.source_counts().await, (1, 6));
     {
-        let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+        let db = open_fixture_db(&f.database).await;
         assert_eq!(db.stored_trusted_legacy_file_count().await.unwrap(), 6);
         assert_eq!(
             db.get_metadata(TOKEN).await.unwrap(),
@@ -1579,6 +1599,8 @@ async fn run_trust_command(
 ) -> anyhow::Result<()> {
     crate::commands::run_reconcile(
         crate::cli::ReconcileArgs {
+            inspect_path: None,
+            confirm_damage: None,
             dry_run: false,
             action: Some(crate::cli::ReconcileAction::TrustLegacyFiles(args)),
         },

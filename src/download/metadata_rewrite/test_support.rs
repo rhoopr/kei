@@ -18,6 +18,9 @@ pub(super) fn now_local() -> DateTime<FixedOffset> {
 #[cfg(feature = "xmp")]
 pub(super) fn rich_payload() -> MetadataPayload {
     MetadataPayload {
+        observed_absent: 0,
+        prior_embedded: Default::default(),
+        original_orientation: None,
         timezone_offset: Some(39_600),
         rating: Some(4),
         latitude: Some(37.7),

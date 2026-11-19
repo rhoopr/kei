@@ -47,7 +47,7 @@ get_effective_enum_hash() {
     kei_db_query "SELECT value FROM metadata WHERE key IN ('pending_enum_config_hash', 'enum_config_hash') ORDER BY key DESC LIMIT 1"
 }
 check_checkpoint() {
-    if grep -q 'recent_limited_full_enumeration' <<<"$OUTPUT"; then
+    if grep -q 'date_bounded_full_enumeration' <<<"$OUTPUT"; then
         [ -z "$(get_token)" ]
         kei_check "bounded incomplete inventory does not checkpoint"
     else
@@ -112,12 +112,12 @@ kei_check "0 new downloads"
 kei_check "checkpoint preserved"
 check_checkpoint
 
-# ── 3. Config change: medium resolution -> enum hash changes ─────────────
+# ── 3. Live Photo component exclusion changes the enumeration hash ──────
 echo ""
 echo "=== 3. Config change stages reconciliation ==="
 ENUM_HASH_BEFORE=$(get_effective_enum_hash)
-OUTPUT=$(KEI_SYNC_PHOTOS_TOML=$'resolution = "medium"\n' kei_sync "$DIR")
-kei_check "resolution-change sync exit status" "$?"
+OUTPUT=$(KEI_SYNC_FILTERS_TOML=$'exclude = ["live-photo-videos"]\n' kei_sync "$DIR")
+kei_check "component-exclusion sync exit status" "$?"
 echo "$OUTPUT" | grep -E "config|changed|cleared|token|incremental|download|completed"
 ENUM_HASH_AFTER=$(get_effective_enum_hash)
 [ "$ENUM_HASH_BEFORE" != "$ENUM_HASH_AFTER" ]
@@ -234,7 +234,7 @@ kei_check "token unchanged after dry-run"
 echo ""
 echo "=== 9. Filter flag changes enum config hash ==="
 ENUM_HASH_BEFORE=$(get_effective_enum_hash)
-OUTPUT=$(KEI_SYNC_FILTERS_TOML=$'media = ["photos", "live-photos"]\n' kei_sync "$DIR")
+OUTPUT=$(KEI_SYNC_FILTERS_TOML=$'exclude = ["videos"]\n' kei_sync "$DIR")
 kei_check "media-filter sync exit status" "$?"
 echo "$OUTPUT" | grep -E "config|changed|cleared|token|download|completed"
 [ "$ENUM_HASH_BEFORE" != "$(get_effective_enum_hash)" ]

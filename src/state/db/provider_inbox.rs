@@ -28,44 +28,14 @@ pub(crate) struct ObservedPage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CapturedPageId(pub(crate) i64);
 
-/// A retained legacy source whose transport-varying bytes were discarded after
-/// the migration proved exact masked equivalence with a canonical page.
-///
-/// `certificate` is the provider-owned canonical key, `masked_sha` is the
-/// digest of the classifier's complete masked bytes, and `classifier_version`
-/// binds both to the rule that produced them. None of these values is content
-/// proof. `StoredPage::observation_hash` remains the historical original hash,
-/// not a digest of the representative bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LegacyAlias {
-    pub(crate) canonical_page_id: CapturedPageId,
-    pub(crate) classifier_version: u8,
-    pub(crate) masked_sha: String,
-    pub(crate) certificate: String,
-    /// Immutable binding over the original identity, both raw observation
-    /// hashes, the canonical class key, the classifier version and the exact
-    /// ordinal identity list. It is verified on every load.
-    pub(crate) provenance_hash: String,
-}
-
-/// Distinguishes a raw retained observation from a typed historical alias.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum PageProvenance {
-    Raw,
-    LegacyAlias(LegacyAlias),
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredPage {
     pub(crate) id: CapturedPageId,
     pub(crate) account_key: String,
     pub(crate) provider_key: String,
     /// The exact hash observed when this durable identity was first admitted.
-    /// For `Raw` this is the SHA-256 of `page.body`; for `LegacyAlias` it is
-    /// the historical hash of discarded transport bytes and must never be
-    /// compared with representative bytes.
+    /// This is the SHA-256 of `page.body`, validated on every load.
     pub(crate) observation_hash: String,
-    pub(crate) provenance: PageProvenance,
     pub(crate) page: ObservedPage,
 }
 
@@ -115,125 +85,22 @@ pub(super) fn load_page(
     if (&account_key, &provider_key) != (&owner.0, &owner.1) || !matches!(more, 0 | 1) {
         return Err(StateError::ProviderCatalogInvalid);
     }
-    let alias: Option<(i64, i64, String, String, String)> = conn.query_row(
-        "SELECT canonical_page_id,classifier_version,masked_sha,certificate,provenance_hash FROM provider_transport_aliases WHERE page_id=?1",
-        [id.0],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-    ).optional()?;
-    let (provenance, page, observation_hash) = if let Some((
-        canonical_id,
-        version,
-        masked_sha,
-        certificate,
-        provenance_hash,
-    )) = alias
-    {
-        // The legacy row keeps only provenance. A nonempty body would mean the
-        // discarded original was not actually removed and violates the alias
-        // certificate.
-        if !body.is_empty() || canonical_id == id.0 {
-            return Err(StateError::ProviderCatalogInvalid);
-        }
-        // An alias target must itself be a raw representative. Reject chains
-        // and mutual cycles before any recursive load, so malformed rows fail
-        // promptly instead of recursing.
-        let target_is_alias: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM provider_transport_aliases WHERE page_id=?1)",
-            [canonical_id],
-            |row| row.get(0),
-        )?;
-        if target_is_alias {
-            return Err(StateError::ProviderCatalogInvalid);
-        }
-        let canonical = load_page(conn, CapturedPageId(canonical_id), max_body_bytes)?;
-        let identities = stored_identities(conn, id.0)?;
-        if !matches!(canonical.provenance, PageProvenance::Raw)
-            || (&canonical.account_key, &canonical.provider_key) != (&account_key, &provider_key)
-            || !same_capture_metadata(
-                &ObservedPage {
-                    scope: scope.clone(),
-                    request_cursor: request_cursor.clone(),
-                    successor: successor.clone(),
-                    more_coming: more == 1,
-                    body: Vec::new(),
-                    identities: identities.clone(),
-                },
-                &canonical.page,
-            )
-        {
-            return Err(StateError::ProviderCatalogInvalid);
-        }
-        let classifier_version =
-            u8::try_from(version).map_err(|_error| StateError::ProviderCatalogInvalid)?;
-        let evidence = crate::icloud::photos::transport_evidence::capture_evidence(&canonical.page)
-            .map_err(|_error| StateError::ProviderCatalogInvalid)?
-            .ok_or(StateError::ProviderCatalogInvalid)?;
-        let expected_masked = format!("{:x}", Sha256::digest(&evidence.masked));
-        let expected_certificate = canonical_key(
-            &canonical.account_key,
-            &canonical.provider_key,
-            &canonical.page,
-            &evidence,
-        )?;
-        let expected_provenance = alias_provenance_hash(
-            id.0,
-            &observation_hash,
-            canonical_id,
-            &canonical.observation_hash,
-            &certificate,
-            classifier_version,
-            &identities,
-        )?;
-        if evidence.version != classifier_version
-            || masked_sha != expected_masked
-            || certificate != expected_certificate
-            || provenance_hash != expected_provenance
-        {
-            return Err(StateError::ProviderCatalogInvalid);
-        }
-        let indexed: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM provider_transport_canonical WHERE canonical_sha=?1 AND version=?2 AND page_id=?3)",
-            params![certificate, i64::from(classifier_version), canonical_id],
-            |row| row.get(0),
-        )?;
-        if !indexed {
-            return Err(StateError::ProviderCatalogInvalid);
-        }
-        (
-            PageProvenance::LegacyAlias(LegacyAlias {
-                canonical_page_id: CapturedPageId(canonical_id),
-                classifier_version,
-                masked_sha,
-                certificate,
-                provenance_hash,
-            }),
-            canonical.page,
-            observation_hash,
-        )
-    } else {
-        if observation_hash != format!("{:x}", Sha256::digest(&body)) {
-            return Err(StateError::ProviderCatalogInvalid);
-        }
-        (
-            PageProvenance::Raw,
-            ObservedPage {
-                scope,
-                request_cursor,
-                successor,
-                more_coming: more == 1,
-                body,
-                identities: stored_identities(conn, id.0)?,
-            },
-            observation_hash,
-        )
-    };
+    if observation_hash != format!("{:x}", Sha256::digest(&body)) {
+        return Err(StateError::ProviderCatalogInvalid);
+    }
     Ok(StoredPage {
         id,
         account_key,
         provider_key,
         observation_hash,
-        provenance,
-        page,
+        page: ObservedPage {
+            scope,
+            request_cursor,
+            successor,
+            more_coming: more == 1,
+            body,
+            identities: stored_identities(conn, id.0)?,
+        },
     })
 }
 
@@ -270,437 +137,83 @@ fn same_capture_metadata(stored: &ObservedPage, incoming: &ObservedPage) -> bool
         && stored.identities == incoming.identities
 }
 
-/// Immutable provenance binding for one typed alias. The class key stays a
-/// separate lookup value; this hash additionally binds the original durable
-/// identity and historical hash to the canonical identity and both identity
-/// lists, so neither side can be rewritten independently.
-fn alias_provenance_hash(
-    original_id: i64,
-    original_hash: &str,
-    canonical_id: i64,
-    canonical_hash: &str,
-    certificate: &str,
-    version: u8,
-    identities: &[SourceIdentity],
-) -> Result<String, StateError> {
-    let identities: Vec<(usize, &str, Option<&str>, bool)> = identities
-        .iter()
-        .enumerate()
-        .map(|(ordinal, identity)| {
-            (
-                ordinal,
-                identity.name.as_str(),
-                identity.record_type.as_deref(),
-                identity.deleted,
-            )
-        })
-        .collect();
-    let tuple = serde_json::to_vec(&(
-        "provider-transport-alias-provenance",
-        1u8,
-        original_id,
-        original_hash,
-        canonical_id,
-        canonical_hash,
-        certificate,
-        version,
-        identities,
-    ))
-    .map_err(|_error| StateError::ProviderInboxInvalid)?;
-    Ok(format!("{:x}", Sha256::digest(tuple)))
+/// Bind a completed handoff to the immutable source and its validated projection.
+/// The signed URLs themselves are no longer required to recognize an equivalent
+/// observation: the versioned canonical key includes the masked body digest.
+pub(super) fn release_binding(conn: &Connection, id: i64) -> Result<String, StateError> {
+    let header: String = conn.query_row("SELECT json_array(p.account_key,p.provider_key,p.scope,p.request_cursor,p.successor,p.more_coming,p.body_hash,c.projector_version,c.record_count,c.reference_count,c.debt_count,c.charged_bytes,t.canonical_sha,t.version)
+        FROM provider_shadow_pages p JOIN provider_catalog_pages c ON c.page_id=p.id AND c.body_hash=p.body_hash AND c.projector_version=1
+        LEFT JOIN provider_transport_canonical t ON t.page_id=p.id WHERE p.id=?1", [id], |r|r.get(0))?;
+    let mut digest = Sha256::new();
+    digest.update(header.as_bytes());
+    for identity in stored_identities(conn, id)? {
+        let bytes = serde_json::to_vec(&(identity.name, identity.record_type, identity.deleted))
+            .map_err(|_invalid| StateError::ProviderCatalogInvalid)?;
+        digest.update(bytes);
+    }
+    // The receipt also replaces replay-time validation of the catalog against
+    // the raw page. Detect mutations to facts even if row counts stay equal.
+    for query in [
+        "SELECT json_array(ordinal,record_name,record_type,deleted,kind) FROM provider_catalog_records WHERE page_id=?1 ORDER BY ordinal",
+        "SELECT json_array(ordinal,field_path,target_record_name,target_zone_name,target_zone_owner) FROM provider_catalog_references WHERE page_id=?1 ORDER BY ordinal,field_path,target_record_name",
+        "SELECT json_array(ordinal,field_path,reason) FROM provider_catalog_debt WHERE page_id=?1 ORDER BY ordinal,field_path,reason",
+    ] {
+        for fact in conn
+            .prepare(query)?
+            .query_map([id], |row| row.get::<_, String>(0))?
+        {
+            let fact = fact?;
+            digest.update((fact.len() as u64).to_le_bytes());
+            digest.update(fact.as_bytes());
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
-/// Budget charge retained for one typed legacy alias: canonical certificate,
-/// masked digest, classifier version, provenance binding, and the alias
-/// table/index row.
-const ALIAS_OVERHEAD_BYTES: u64 = 320;
-/// Canonical index row charge when migration must create one for a retained
-/// representative. New captures already include this in their own charge.
-const CANONICAL_INDEX_OVERHEAD_BYTES: u64 = 96;
-
-/// Optional logical-charge aggregate for diagnostics. A read failure records
-/// unknown rather than failing the migration.
-fn logical_charge(conn: &Connection) -> Option<u64> {
-    conn.query_row(
-        "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_shadow_pages",
-        [],
-        |row| row.get::<_, i64>(0),
-    )
-    .ok()
-    .and_then(|charge| u64::try_from(charge).ok())
-}
-
-/// Validate every known consumer of a page before its body may be dropped.
-/// Work receipts, work retries/scans and selection sources all retain the old
-/// durable identity; a hash, scope, ordinal or confirmation mismatch pins the
-/// page as raw rather than silently discarding the proof a consumer relies on.
-fn dependencies_are_valid(conn: &Connection, page: &StoredPage) -> Result<bool, StateError> {
-    let identities = page.page.identities.len();
-    let invalid_ordinal: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM provider_work_retries WHERE page_id=?1 AND (ordinal<0 OR ordinal>=?2)) OR EXISTS(SELECT 1 FROM provider_work_scan WHERE page_id=?1 AND (ordinal<0 OR ordinal>=?2))",
-        params![page.id.0, i64::try_from(identities).map_err(|_error| StateError::ProviderInboxInvalid)?],
-        |row| row.get(0),
-    )?;
-    if invalid_ordinal {
+pub(super) fn released(conn: &Connection, id: i64) -> Result<bool, StateError> {
+    let receipt: Option<(String,i64)> = conn.query_row("SELECT f.receipt,length(p.body) FROM provider_finished_changes f JOIN provider_shadow_pages p ON p.id=f.page_id WHERE f.page_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let Some((receipt, length)) = receipt else {
         return Ok(false);
-    }
-    let mut receipts = conn.prepare(
-        "SELECT ordinal,confirmation_hash,confirmation,source_hash,scope FROM provider_work_receipts WHERE page_id=?1",
-    )?;
-    let mut rows = receipts.query([page.id.0])?;
-    // Stream receipts so at most one confirmation blob is resident while each
-    // stored confirmation is checked.
-    while let Some(row) = rows.next()? {
-        let ordinal: i64 = row.get(0)?;
-        let confirmation_hash: String = row.get(1)?;
-        let confirmation: Option<Vec<u8>> = row.get(2)?;
-        let source_hash: String = row.get(3)?;
-        let scope: String = row.get(4)?;
-        let expected_confirmation = confirmation
-            .as_ref()
-            .map_or_else(String::new, |body| format!("{:x}", Sha256::digest(body)));
-        if usize::try_from(ordinal)
-            .ok()
-            .is_none_or(|ordinal| ordinal >= identities)
-            || confirmation_hash != expected_confirmation
-            || source_hash != page.observation_hash
-            || scope != page.page.scope
-        {
-            return Ok(false);
-        }
-    }
-    let sources: Vec<(i64, String)> = conn
-        .prepare("SELECT ordinal,body_hash FROM provider_selection_sources WHERE page_id=?1")?
-        .query_map([page.id.0], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
-    for (ordinal, body_hash) in sources {
-        if usize::try_from(ordinal)
-            .ok()
-            .is_none_or(|ordinal| ordinal >= identities)
-            || body_hash != page.observation_hash
-        {
-            return Ok(false);
-        }
+    };
+    if length != 0 || receipt != release_binding(conn, id)? {
+        return Err(StateError::ProviderCatalogInvalid);
     }
     Ok(true)
 }
 
-/// Recompute every stored projection fact for a page and compare it with a
-/// fresh pure projection of retained bytes. Unsupported projector versions,
-/// unknown shapes, and any mismatch pin the page as raw.
-fn projection_is_valid(conn: &Connection, page: &StoredPage) -> Result<bool, StateError> {
-    use std::collections::BTreeSet;
-
-    // Projection proof is optional evidence for dropping a duplicate body. A
-    // page whose normalized reference paths exceed the projection budget stays
-    // raw; only SQLite/storage failures while reading retained facts propagate.
-    let Ok(plan) = crate::icloud::photos::plan_retained(page) else {
-        return Ok(false);
-    };
-    let receipt: Option<(i64, String, i64, i64, i64, i64)> = conn.query_row(
-        "SELECT projector_version,body_hash,record_count,reference_count,debt_count,charged_bytes FROM provider_catalog_pages WHERE page_id=?1",
-        [page.id.0],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
-    ).optional()?;
-    let Some((version, body_hash, records, references, debt, charged)) = receipt else {
-        // No projection exists, so no derived fact is being retained. A work
-        // or selection reference without its source projection is ambiguous
-        // and pins the original page.
-        let dependent: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM provider_work_receipts WHERE page_id=?1) OR EXISTS(SELECT 1 FROM provider_work_obligations WHERE page_id=?1) OR EXISTS(SELECT 1 FROM provider_selection_sources WHERE page_id=?1)",
-            [page.id.0], |row| row.get(0),
-        )?;
-        return Ok(!dependent);
-    };
-    if version != crate::state::db::provider_catalog::PROJECTOR_VERSION
-        || body_hash != page.observation_hash
-        || usize::try_from(records).ok() != Some(plan.records.len())
-        || usize::try_from(references).ok()
-            != Some(plan.records.iter().map(|r| r.references.len()).sum())
-        || usize::try_from(debt).ok() != Some(plan.records.iter().map(|r| r.debt.len()).sum())
-        || u64::try_from(charged).ok() != Some(plan.charged_bytes)
-    {
-        return Ok(false);
-    }
-    let stored: Vec<(i64,String,Option<String>,i64,String)> = conn.prepare(
-        "SELECT ordinal,record_name,record_type,deleted,kind FROM provider_catalog_records WHERE page_id=?1 ORDER BY ordinal",
-    )?.query_map([page.id.0], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?
-        .collect::<Result<Vec<_>,_>>()?;
-    if stored.len() != plan.records.len() {
-        return Ok(false);
-    }
-    for (ordinal, (row, (identity, record))) in stored
-        .iter()
-        .zip(page.page.identities.iter().zip(&plan.records))
-        .enumerate()
-    {
-        if row.0 != i64::try_from(ordinal).map_err(|_error| StateError::ProviderCatalogInvalid)?
-            || row.1 != identity.name
-            || row.2 != identity.record_type
-            || row.3 != i64::from(identity.deleted)
-            || row.4 != record.kind
-        {
-            return Ok(false);
-        }
-    }
-    let expected_references: BTreeSet<_> = plan
-        .records
-        .iter()
-        .enumerate()
-        .flat_map(|(ordinal, record)| {
-            record.references.iter().map(move |reference| {
-                (
-                    ordinal as i64,
-                    reference.path.clone(),
-                    reference.target.clone(),
-                    reference.zone_name.clone(),
-                    reference.zone_owner.clone(),
-                )
-            })
-        })
-        .collect();
-    let actual_references: BTreeSet<_> = conn.prepare(
-        "SELECT ordinal,field_path,target_record_name,target_zone_name,target_zone_owner FROM provider_catalog_references WHERE page_id=?1",
-    )?.query_map([page.id.0], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?
-        .collect::<Result<_,_>>()?;
-    let expected_debt: BTreeSet<_> = plan
-        .records
-        .iter()
-        .enumerate()
-        .flat_map(|(ordinal, record)| {
-            record
-                .debt
-                .iter()
-                .map(move |debt| (ordinal as i64, debt.path.clone(), debt.reason.to_owned()))
-        })
-        .collect();
-    let actual_debt: BTreeSet<_> = conn
-        .prepare("SELECT ordinal,field_path,reason FROM provider_catalog_debt WHERE page_id=?1")?
-        .query_map([page.id.0], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .collect::<Result<_, _>>()?;
-    Ok(expected_references == actual_references
-        && expected_debt == actual_debt
-        && dependencies_are_valid(conn, page)?)
-}
-
-/// Replace strictly equivalent legacy transport duplicate bodies with typed
-/// aliases. Runs inside the schema migration savepoint, streams one body at a
-/// time, and never aliases a page whose projection, references, debt, owner,
-/// raw hash, or classifier evidence cannot be proved.
-pub(crate) fn compact_legacy_aliases(
+fn checked_released_replay(
     conn: &Connection,
-) -> Result<crate::support::CompactionSummary, StateError> {
-    use crate::support::CompactionSummary;
-    use std::collections::HashMap;
-
-    let mut summary = CompactionSummary::default();
-    let before_charge = logical_charge(conn);
-    let ids: Vec<i64> = conn.prepare(
-        "SELECT p.id FROM provider_shadow_pages p LEFT JOIN provider_transport_aliases a ON a.page_id=p.id WHERE a.page_id IS NULL ORDER BY p.id",
-    )?.query_map([], |row| row.get(0))?.collect::<Result<_,_>>()?;
-    let mut groups: HashMap<String, (u8, Vec<i64>)> = HashMap::new();
-    for id in ids {
-        let page = load_page(
-            conn,
-            CapturedPageId(id),
-            crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES,
-        )?;
-        if !matches!(page.provenance, PageProvenance::Raw) {
-            summary.retained_unsupported_shape =
-                summary.retained_unsupported_shape.saturating_add(1);
-            continue;
-        }
-        summary.examined_raw_pages = summary.examined_raw_pages.saturating_add(1);
-        if page.page.body.is_empty() {
-            summary.retained_unsupported_shape =
-                summary.retained_unsupported_shape.saturating_add(1);
-            continue;
-        }
-        let Some(evidence) =
-            crate::icloud::photos::transport_evidence::capture_evidence(&page.page)
-                .map_err(|_error| StateError::ProviderInboxInvalid)?
-        else {
-            summary.retained_unsupported_shape =
-                summary.retained_unsupported_shape.saturating_add(1);
-            continue;
-        };
-        let key = canonical_key(&page.account_key, &page.provider_key, &page.page, &evidence)?;
-        if !projection_is_valid(conn, &page)? {
-            summary.retained_projection_or_dependency =
-                summary.retained_projection_or_dependency.saturating_add(1);
-            continue;
-        }
-        summary.eligible = summary.eligible.saturating_add(1);
-        groups
-            .entry(key)
-            .or_insert_with(|| (evidence.version, Vec::new()))
-            .1
-            .push(id);
+    id: i64,
+    page: &ObservedPage,
+) -> Result<bool, StateError> {
+    if !released(conn, id)? {
+        return Ok(false);
     }
-    for (certificate, (version, members)) in groups {
-        if members.len() < 2 {
-            summary.no_equivalent_peer = summary.no_equivalent_peer.saturating_add(1);
-            continue;
-        }
-        let group_pages = u64::try_from(members.len()).unwrap_or(u64::MAX);
-        // An existing canonical index is authoritative. A representative that
-        // failed validation must pin the whole group rather than being replaced.
-        let existing: Option<i64> = conn.query_row(
-            "SELECT page_id FROM provider_transport_canonical WHERE canonical_sha=?1 AND version=?2",
-            params![certificate, i64::from(version)],
-            |row| row.get(0),
-        ).optional()?;
-        let canonical_id = match existing {
-            Some(id) if members.contains(&id) => id,
-            Some(_) => {
-                summary.invalid_canonical_or_member = summary
-                    .invalid_canonical_or_member
-                    .saturating_add(group_pages);
-                continue;
-            }
-            None => *members
-                .iter()
-                .min()
-                .ok_or(StateError::ProviderInboxInvalid)?,
-        };
-        let canonical = load_page(
-            conn,
-            CapturedPageId(canonical_id),
-            crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES,
-        )?;
-        let canonical_evidence =
-            crate::icloud::photos::transport_evidence::capture_evidence(&canonical.page)
-                .map_err(|_error| StateError::ProviderInboxInvalid)?
-                .ok_or(StateError::ProviderInboxInvalid)?;
-        if canonical_evidence.version != version
-            || canonical_key(
-                &canonical.account_key,
-                &canonical.provider_key,
-                &canonical.page,
-                &canonical_evidence,
-            )? != certificate
-        {
-            summary.invalid_canonical_or_member = summary
-                .invalid_canonical_or_member
-                .saturating_add(group_pages);
-            continue;
-        }
-        summary.retained_representative = summary.retained_representative.saturating_add(1);
-        if existing.is_none() {
-            conn.execute(
-                "INSERT INTO provider_transport_canonical(canonical_sha,version,page_id) VALUES (?1,?2,?3)",
-                params![certificate, i64::from(version), canonical_id],
-            )?;
-            conn.execute(
-                "UPDATE provider_shadow_pages SET charged_bytes=charged_bytes+?2 WHERE id=?1",
-                params![
-                    canonical_id,
-                    i64::try_from(CANONICAL_INDEX_OVERHEAD_BYTES)
-                        .map_err(|_error| StateError::ProviderInboxInvalid)?
-                ],
-            )?;
-        }
-        for member_id in members {
-            if member_id == canonical_id {
-                continue;
-            }
-            let member = load_page(
-                conn,
-                CapturedPageId(member_id),
-                crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES,
-            )?;
-            let member_evidence =
-                crate::icloud::photos::transport_evidence::capture_evidence(&member.page)
-                    .map_err(|_error| StateError::ProviderInboxInvalid)?
-                    .ok_or(StateError::ProviderInboxInvalid)?;
-            let masked_sha = format!("{:x}", Sha256::digest(&member_evidence.masked));
-            if member_evidence.version != version
-                || member_evidence.masked != canonical_evidence.masked
-                || masked_sha != format!("{:x}", Sha256::digest(&canonical_evidence.masked))
-                || !same_capture_metadata(&member.page, &canonical.page)
-            {
-                summary.invalid_canonical_or_member =
-                    summary.invalid_canonical_or_member.saturating_add(1);
-                continue;
-            }
-            if !projection_is_valid(conn, &member)? {
-                summary.retained_projection_or_dependency =
-                    summary.retained_projection_or_dependency.saturating_add(1);
-                continue;
-            }
-            let body_len = member.page.body.len() as u64;
-            let old_charge = conn.query_row(
-                "SELECT charged_bytes FROM provider_shadow_pages WHERE id=?1",
-                [member_id],
-                |row| row.get::<_, i64>(0),
-            )?;
-            let old_charge =
-                u64::try_from(old_charge).map_err(|_error| StateError::ProviderInboxInvalid)?;
-            let new_charge = old_charge
-                .saturating_sub(body_len)
-                .saturating_add(ALIAS_OVERHEAD_BYTES);
-            if new_charge >= old_charge {
-                summary.no_positive_saving = summary.no_positive_saving.saturating_add(1);
-                continue;
-            }
-            // Certificate fields repeat only this proven pair. The alias row
-            // itself is the only added durable identity; replay of the old URL
-            // variant returns the canonical page and creates no new alias.
-            let provenance_hash = alias_provenance_hash(
-                member_id,
-                &member.observation_hash,
-                canonical_id,
-                &canonical.observation_hash,
-                &certificate,
-                version,
-                &member.page.identities,
-            )?;
-            let inserted = conn.execute(
-                "INSERT INTO provider_transport_aliases(page_id,canonical_page_id,classifier_version,masked_sha,certificate,provenance_hash) VALUES (?1,?2,?3,?4,?5,?6)",
-                params![member_id, canonical_id, i64::from(version), masked_sha, certificate, provenance_hash],
-            )?;
-            if inserted != 1 {
-                return Err(StateError::ProviderInboxInvalid);
-            }
-            conn.execute(
-                "UPDATE provider_shadow_pages SET body=X'',charged_bytes=?2 WHERE id=?1",
-                params![
-                    member_id,
-                    i64::try_from(new_charge).map_err(|_error| StateError::ProviderInboxInvalid)?
-                ],
-            )?;
-            summary.compacted_aliases = summary.compacted_aliases.saturating_add(1);
-            #[cfg(test)]
-            {
-                let remaining = TEST_ABORT_AFTER_ALIASES.with(std::cell::Cell::get);
-                if remaining > 0 {
-                    TEST_ABORT_AFTER_ALIASES.with(|count| count.set(remaining - 1));
-                    if remaining == 1 {
-                        return Err(StateError::ProviderInboxInvalid);
-                    }
-                }
-            }
-        }
+    let matches:bool=conn.query_row("SELECT account_key=(SELECT account_key FROM account_owner WHERE singleton=1) AND provider_key=(SELECT provider_key FROM account_owner WHERE singleton=1) AND scope=?2 AND request_cursor=?3 AND successor=?4 AND more_coming=?5 FROM provider_shadow_pages WHERE id=?1",params![id,page.scope,page.request_cursor,page.successor,page.more_coming],|r|r.get(0))?;
+    if !matches || stored_identities(conn, id)? != page.identities {
+        return Err(StateError::ProviderInboxInvalid);
     }
-    summary.logical_charge_before = before_charge;
-    summary.logical_charge_after = logical_charge(conn);
-    Ok(summary)
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Test-only deterministic interruption point after a durable alias write.
-    pub(crate) static TEST_ABORT_AFTER_ALIASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    Ok(true)
 }
 
 impl SqliteStateDb {
+    #[cfg(test)]
     pub(crate) async fn capture_shadow_page(
         &self,
         owner: account::AccountOwner,
-        page: ObservedPage,
+        page: impl Into<std::sync::Arc<ObservedPage>>,
         capacity: u64,
+    ) -> Result<CapturedPageId, StateError> {
+        self.attempt_shadow_capture(owner, page.into(), capacity, true)
+            .await
+    }
+
+    pub(crate) async fn attempt_shadow_capture(
+        &self,
+        owner: account::AccountOwner,
+        page: std::sync::Arc<ObservedPage>,
+        capacity: u64,
+        final_attempt: bool,
     ) -> Result<CapturedPageId, StateError> {
         self.with_conn_mut("capturing provider shadow page", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -728,41 +241,19 @@ impl SqliteStateDb {
             ).optional()?;
             let storage: (StorageOutcome, Option<(u64, u64)>);
             let page_id = if let Some(id) = existing {
+                if checked_released_replay(&tx,id,&page)? {return Ok(CapturedPageId(id))}
                 let original = load_page(
                     &tx,
                     CapturedPageId(id),
                     crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES,
                 )?;
-                match &original.provenance {
-                    PageProvenance::Raw => {
-                        if original.page.body != page.body
-                            || !same_capture_metadata(&original.page, &page)
-                        {
-                            return Err(StateError::ProviderInboxInvalid);
-                        }
-                        storage = (StorageOutcome::Exact, None);
-                        id
-                    }
-                    PageProvenance::LegacyAlias(alias) => {
-                        // The request bytes are the discarded historical
-                        // variant, so they can never equal the representative.
-                        // Prove the typed alias instead: same complete masked
-                        // bytes, classifier, and capture metadata. Return the
-                        // canonical ID so replay never creates a new alias.
-                        let incoming = evidence
-                            .as_ref()
-                            .ok_or(StateError::ProviderInboxInvalid)?;
-                        let masked_sha = format!("{:x}", Sha256::digest(&incoming.masked));
-                        if masked_sha != alias.masked_sha
-                            || incoming.version != alias.classifier_version
-                            || !same_capture_metadata(&original.page, &page)
-                        {
-                            return Err(StateError::ProviderInboxInvalid);
-                        }
-                        storage = (StorageOutcome::Equivalent, None);
-                        alias.canonical_page_id.0
-                    }
+                if original.page.body != page.body
+                    || !same_capture_metadata(&original.page, &page)
+                {
+                    return Err(StateError::ProviderInboxInvalid);
                 }
+                storage = (StorageOutcome::Exact, None);
+                id
             } else {
                 let canonical_hit = match canonical.as_ref() {
                     Some((canonical_sha, _)) => tx
@@ -777,14 +268,12 @@ impl SqliteStateDb {
                 if let Some((representative_id, stored_version)) = canonical_hit {
                     let (canonical_sha, version) =
                         canonical.as_ref().ok_or(StateError::ProviderInboxInvalid)?;
+                    if stored_version==i64::from(*version) && checked_released_replay(&tx,representative_id,&page)? {return Ok(CapturedPageId(representative_id))}
                     let representative = load_page(
                         &tx,
                         CapturedPageId(representative_id),
                         crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES,
                     )?;
-                    if !matches!(representative.provenance, PageProvenance::Raw) {
-                        return Err(StateError::ProviderInboxInvalid);
-                    }
                     let representative_evidence =
                         crate::icloud::photos::transport_evidence::capture_evidence(
                             &representative.page,
@@ -818,15 +307,17 @@ impl SqliteStateDb {
                             + id.record_type.as_ref().map_or(0, |kind| kind.len() as u64) + 32).sum::<u64>()
                         + canonical.as_ref().map_or(0, |_| 64 + 32);
                     let used: i64 = tx.query_row(
-                        "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_shadow_pages", [], |row| row.get(0),
+                        "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_shadow_pages p WHERE NOT EXISTS(SELECT 1 FROM provider_finished_changes f WHERE f.page_id=p.id)", [], |row| row.get(0),
                     )?;
                     let used = u64::try_from(used).map_err(|_error| StateError::ProviderInboxInvalid)?;
                     if charge > capacity.saturating_sub(used) {
+                        if final_attempt {
                         crate::support::record_storage(
                             StorageComponent::Inbox,
                             StorageOutcome::CapacityRejected,
                             Some((used, capacity)),
                         );
+                        }
                         return Err(StateError::ProviderInboxFull);
                     }
                     storage = (StorageOutcome::New, Some((used, capacity)));
@@ -853,12 +344,6 @@ impl SqliteStateDb {
                     id
                 }
             };
-            // Last observed receipt only. Replaying an older legacy cursor may
-            // replace this pointer; it is neither materialization nor coverage.
-            tx.execute(
-                "INSERT INTO provider_shadow_receipts(scope,page_id) VALUES (?1,?2) ON CONFLICT(scope) DO UPDATE SET page_id=excluded.page_id",
-                params![page.scope, page_id],
-            )?;
             tx.commit()?;
             crate::support::record_storage(StorageComponent::Inbox, storage.0, storage.1);
             Ok(CapturedPageId(page_id))
@@ -868,10 +353,7 @@ impl SqliteStateDb {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CapturedPageId, ObservedPage, PageProvenance, SourceIdentity, StoredPage,
-        TEST_ABORT_AFTER_ALIASES, load_page,
-    };
+    use super::{CapturedPageId, ObservedPage, SourceIdentity, StoredPage, load_page};
     use crate::state::db::account::AccountOwner;
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
@@ -939,7 +421,6 @@ mod tests {
             account_key,
             provider_key,
             observation_hash: format!("{:x}", Sha256::digest(&page.body)),
-            provenance: PageProvenance::Raw,
             page: page.clone(),
         };
         let plan = crate::icloud::photos::plan_retained(&source).unwrap();
@@ -997,7 +478,7 @@ mod tests {
 
     fn charged_sum(conn: &Connection) -> i64 {
         conn.query_row(
-            "SELECT SUM(charged_bytes) FROM provider_shadow_pages",
+            "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_shadow_pages",
             [],
             |row| row.get(0),
         )
@@ -1116,125 +597,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_duplicates_compact_to_typed_aliases_then_capture_reuses_canonical() {
+    async fn fresh_start_archives_alias_bytes_then_captures_current_raw_pages() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("legacy.db");
         let (owner, first, second) = legacy_v35(&path);
-        let (before, alias_hash) = {
-            let conn = Connection::open(&path).unwrap();
-            (
-                charged_sum(&conn),
-                format!("{:x}", Sha256::digest(&second.body)),
-            )
+        let alias_rows = |conn: &Connection, table: &str| {
+            conn.prepare(&format!("SELECT * FROM {table} ORDER BY page_id"))
+                .unwrap()
+                .query_map([], |row| {
+                    (0..6)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
         };
-        {
+        let before = {
             let conn = Connection::open(&path).unwrap();
-            crate::state::schema::migrate(&conn).unwrap();
-            assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+            for version in 36..=37 {
+                crate::state::schema::migrate_to_version(&conn, 35, version).unwrap();
+            }
+            // Unsupported historical certificate bytes must never be interpreted.
+            conn.execute_batch("INSERT INTO provider_transport_canonical VALUES ('old-certificate',99,1);
+                INSERT INTO provider_transport_aliases VALUES (2,1,99,'old-mask','old-certificate',X'00ff');
+                UPDATE provider_shadow_pages SET body=X'' WHERE id=2;").unwrap();
+            alias_rows(&conn, "provider_transport_aliases")
+        };
+        for cycle in 0..3 {
+            let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .unwrap();
+            let id = db
+                .capture_shadow_page(
+                    owner.clone(),
+                    second.clone(),
+                    if cycle == 0 { 512 * 1024 * 1024 } else { 0 },
+                )
+                .await
+                .unwrap();
+            assert_eq!(id.0, 1);
+            assert_eq!(
+                db.capture_shadow_page(owner.clone(), first.clone(), 0)
+                    .await
+                    .unwrap(),
+                id
+            );
+            let conn = db
+                .acquire_lock("archived aliases and current raw capture")
+                .unwrap();
+            assert_eq!(
+                alias_rows(&conn, "historical_v030_provider_transport_aliases"),
+                before
+            );
+            assert!(alias_rows(&conn, "provider_transport_aliases").is_empty());
+            assert_eq!(
+                conn.query_row::<Vec<u8>, _, _>(
+                    "SELECT body FROM historical_v030_provider_shadow_pages WHERE id=1",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                first.body
+            );
+            assert_eq!(
+                conn.query_row::<Vec<u8>, _, _>(
+                    "SELECT body FROM historical_v030_provider_shadow_pages WHERE id=2",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                Vec::<u8>::new()
+            );
+            assert_eq!(
+                conn.query_row::<String, _, _>(
+                    "SELECT body_hash FROM historical_v030_provider_shadow_pages WHERE id=2",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                format!("{:x}", Sha256::digest(&second.body))
+            );
+            assert_eq!(load_page(&conn, id, 16 * 1024 * 1024).unwrap().page, second);
             assert_eq!(
                 conn.query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_transport_aliases",
+                    "SELECT count(*) FROM provider_shadow_pages",
                     [],
-                    |r| r.get(0)
+                    |row| row.get(0)
                 )
                 .unwrap(),
                 1
             );
-            assert!(charged_sum(&conn) < before);
-            let alias_id: i64 = conn
-                .query_row("SELECT page_id FROM provider_transport_aliases", [], |r| {
-                    r.get(0)
-                })
-                .unwrap();
-            let canonical_id: i64 = conn
-                .query_row(
-                    "SELECT canonical_page_id FROM provider_transport_aliases",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(alias_id, 2);
-            assert_eq!(canonical_id, 1);
-            assert_eq!(
-                conn.query_row::<i64, _, _>(
-                    "SELECT length(body) FROM provider_shadow_pages WHERE id=?1",
-                    [alias_id],
-                    |r| r.get(0)
-                )
-                .unwrap(),
-                0
-            );
-            assert_eq!(
-                conn.query_row::<String, _, _>(
-                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
-                    [],
-                    |r| r.get(0)
-                )
-                .unwrap(),
-                "saved"
-            );
-            assert_eq!(
-                conn.query_row::<String, _, _>(
-                    "SELECT value FROM metadata WHERE key='pending_sync_token:old:PrimarySync'",
-                    [],
-                    |r| r.get(0)
-                )
-                .unwrap(),
-                "debt"
-            );
-            let stored = load_page(&conn, CapturedPageId(alias_id), 16 * 1024 * 1024).unwrap();
-            assert_eq!(stored.observation_hash, alias_hash);
-            assert!(matches!(stored.provenance, PageProvenance::LegacyAlias(_)));
-            assert_eq!(stored.page.body, first.body);
         }
         let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
             .await
             .unwrap();
-        let id = db
-            .capture_shadow_page(owner.clone(), second.clone(), 512 * 1024 * 1024)
-            .await
-            .unwrap();
-        assert_eq!(id.0, 1);
-        {
-            let conn = db.acquire_lock("legacy alias replay").unwrap();
-            assert_eq!(
-                conn.query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_transport_aliases",
-                    [],
-                    |r| r.get(0)
-                )
-                .unwrap(),
-                1
-            );
-        }
-        let mut novel = second.clone();
-        novel.body = String::from_utf8(novel.body)
+        db.acquire_lock("corrupt current bytes")
             .unwrap()
-            .replace("master-1", "master-2")
-            .replace("tag-1", "tag-2")
-            .into_bytes();
-        novel.identities[0].name = "master-2".to_owned();
-        let novel_id = db
-            .capture_shadow_page(owner.clone(), novel, 512 * 1024 * 1024)
-            .await
+            .execute("UPDATE provider_shadow_pages SET body=X'00' WHERE id=1", [])
             .unwrap();
-        assert_eq!(novel_id.0, 3);
-        let conn = db.acquire_lock("legacy alias replay").unwrap();
-        assert_eq!(
-            conn.query_row::<i64, _, _>(
-                "SELECT count(*) FROM provider_transport_aliases",
-                [],
-                |r| r.get(0)
-            )
-            .unwrap(),
-            1
+        assert!(
+            db.capture_shadow_page(owner, second, 0).await.is_err(),
+            "current raw hash validation must still refuse corruption"
         );
-
-        // A corrupt representative or certificate refuses instead of yielding
-        // fabricated original bytes or hashes.
-        conn.execute("UPDATE provider_shadow_pages SET body=X'00' WHERE id=1", [])
-            .unwrap();
-        assert!(load_page(&conn, CapturedPageId(2), 16 * 1024 * 1024).is_err());
     }
 
     fn oversized_unprojected_observed() -> ObservedPage {
@@ -1264,7 +729,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_compaction_pins_captured_page_whose_projection_exceeds_budget() {
+    async fn fresh_start_preserves_history_whose_projection_exceeds_budget() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("oversized-projection.db");
         let (owner, _, _) = legacy_v35(&path);
@@ -1287,7 +752,6 @@ mod tests {
                 account_key,
                 provider_key,
                 observation_hash: original_hash.clone(),
-                provenance: PageProvenance::Raw,
                 page: oversized.clone(),
             };
             let error = match crate::icloud::photos::plan_retained(&stored) {
@@ -1313,7 +777,10 @@ mod tests {
             .await
             .unwrap();
         let conn = db.acquire_lock("oversized projection oracle").unwrap();
-        assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+        assert_eq!(
+            crate::state::schema::get_schema_version(&conn).unwrap(),
+            crate::state::schema::SCHEMA_VERSION
+        );
         assert_eq!(
             conn.query_row::<i64, _, _>(
                 "SELECT count(*) FROM provider_transport_aliases",
@@ -1321,8 +788,8 @@ mod tests {
                 |r| r.get(0)
             )
             .unwrap(),
-            1,
-            "unrelated eligible duplicates still compact"
+            0,
+            "historical pages must not create current aliases"
         );
         assert_eq!(
             conn.query_row::<i64, _, _>(
@@ -1344,7 +811,7 @@ mod tests {
             charged,
         ): (Vec<u8>, String, String, String, String, bool, i64) = conn
             .query_row(
-                "SELECT body,body_hash,scope,request_cursor,successor,more_coming,charged_bytes FROM provider_shadow_pages WHERE id=?1",
+                "SELECT body,body_hash,scope,request_cursor,successor,more_coming,charged_bytes FROM historical_v030_provider_shadow_pages WHERE id=?1",
                 [id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
             )
@@ -1356,163 +823,17 @@ mod tests {
         assert_eq!(successor, oversized.successor);
         assert_eq!(more_coming, oversized.more_coming);
         assert_eq!(charged, 200_000);
-        let stored = load_page(&conn, CapturedPageId(id), 16 * 1024 * 1024).unwrap();
-        assert!(matches!(stored.provenance, PageProvenance::Raw));
-        assert_eq!(stored.page.body, oversized.body);
-        assert_eq!(stored.observation_hash, original_hash);
-        assert_eq!(
-            conn.query_row::<String, _, _>(
-                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
-                [],
-                |r| r.get(0)
-            )
-            .unwrap(),
-            "saved"
-        );
-        assert_eq!(
-            conn.query_row::<String, _, _>(
-                "SELECT value FROM metadata WHERE key='pending_sync_token:old:PrimarySync'",
-                [],
-                |r| r.get(0)
-            )
-            .unwrap(),
-            "debt"
+        assert!(load_page(&conn, CapturedPageId(id), 16 * 1024 * 1024).is_err());
+        crate::test_helpers::assert_checkpoint_evidence(&conn, "sync_token:PrimarySync", "saved");
+        crate::test_helpers::assert_checkpoint_evidence(
+            &conn,
+            "pending_sync_token:old:PrimarySync",
+            "debt",
         );
     }
 
     #[test]
-    fn alias_migration_rolls_back_after_first_alias_and_reopens_quietly() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("rollback.db");
-        let (_owner, first, second) = legacy_v35(&path);
-        {
-            let conn = Connection::open(&path).unwrap();
-            let before = charged_sum(&conn);
-            TEST_ABORT_AFTER_ALIASES.with(|count| count.set(1));
-            assert!(crate::state::schema::migrate(&conn).is_err());
-            TEST_ABORT_AFTER_ALIASES.with(|count| count.set(0));
-            assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 35);
-            assert_eq!(charged_sum(&conn), before);
-            assert!(!conn.query_row::<bool,_,_>("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='provider_transport_aliases')", [], |r|r.get(0)).unwrap());
-            assert_eq!(
-                conn.query_row::<Vec<u8>, _, _>(
-                    "SELECT body FROM provider_shadow_pages WHERE id=2",
-                    [],
-                    |r| r.get(0)
-                )
-                .unwrap(),
-                second.body
-            );
-        }
-        {
-            let conn = Connection::open(&path).unwrap();
-            crate::state::schema::migrate(&conn).unwrap();
-        }
-        let conn = Connection::open(&path).unwrap();
-        assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
-        assert_eq!(
-            conn.query_row::<i64, _, _>(
-                "SELECT count(*) FROM provider_transport_aliases",
-                [],
-                |r| r.get(0)
-            )
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            conn.query_row::<String, _, _>(
-                "SELECT body_hash FROM provider_shadow_pages WHERE id=2",
-                [],
-                |r| r.get(0)
-            )
-            .unwrap(),
-            format!("{:x}", Sha256::digest(&second.body))
-        );
-        let stored = load_page(&conn, CapturedPageId(2), 16 * 1024 * 1024).unwrap();
-        assert_eq!(stored.page.body, first.body);
-        assert_eq!(
-            stored.observation_hash,
-            format!("{:x}", Sha256::digest(&second.body))
-        );
-    }
-
-    fn migrated_legacy(path: &std::path::Path) -> AccountOwner {
-        let (owner, _, _) = legacy_v35(path);
-        let conn = Connection::open(path).unwrap();
-        crate::state::schema::migrate(&conn).unwrap();
-        owner
-    }
-
-    #[test]
-    fn alias_self_chain_and_mutual_cycles_are_refused_promptly() {
-        // Self reference.
-        {
-            let directory = tempfile::tempdir().unwrap();
-            let path = directory.path().join("self.db");
-            let _owner = migrated_legacy(&path);
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "PRAGMA ignore_check_constraints=ON;
-                 UPDATE provider_transport_aliases SET canonical_page_id=2 WHERE page_id=2;",
-            )
-            .unwrap();
-            assert!(load_page(&conn, CapturedPageId(2), 16 * 1024 * 1024).is_err());
-        }
-        // Mutual cycle: 2 -> 1 and 1 -> 2.
-        {
-            let directory = tempfile::tempdir().unwrap();
-            let path = directory.path().join("mutual.db");
-            let _owner = migrated_legacy(&path);
-            let conn = Connection::open(&path).unwrap();
-            conn.execute(
-                "INSERT INTO provider_transport_aliases(page_id,canonical_page_id,classifier_version,masked_sha,certificate,provenance_hash) VALUES (1,2,1,'a','b','c')",
-                [],
-            )
-            .unwrap();
-            assert!(load_page(&conn, CapturedPageId(2), 16 * 1024 * 1024).is_err());
-        }
-        // Chain: 2 -> 1 and 1 -> 8, where 8 is raw.
-        {
-            let directory = tempfile::tempdir().unwrap();
-            let path = directory.path().join("chain.db");
-            let (_owner, _budget) = full_legacy_v35(&path);
-            {
-                let conn = Connection::open(&path).unwrap();
-                crate::state::schema::migrate(&conn).unwrap();
-            }
-            let conn = Connection::open(&path).unwrap();
-            conn.execute(
-                "INSERT INTO provider_transport_aliases(page_id,canonical_page_id,classifier_version,masked_sha,certificate,provenance_hash) VALUES (1,8,1,'a','b','c')",
-                [],
-            )
-            .unwrap();
-            assert!(load_page(&conn, CapturedPageId(2), 16 * 1024 * 1024).is_err());
-        }
-    }
-
-    #[test]
-    fn alias_provenance_binding_detects_each_tamper() {
-        let tampers = [
-            "UPDATE provider_shadow_pages SET body_hash='tampered' WHERE id=2",
-            "UPDATE provider_transport_aliases SET certificate='tampered' WHERE page_id=2",
-            "UPDATE provider_transport_aliases SET provenance_hash='tampered' WHERE page_id=2",
-            "PRAGMA ignore_check_constraints=ON; UPDATE provider_transport_aliases SET canonical_page_id=2 WHERE page_id=2",
-        ];
-        for sql in tampers {
-            let directory = tempfile::tempdir().unwrap();
-            let path = directory.path().join("tamper.db");
-            let _owner = migrated_legacy(&path);
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(sql).unwrap();
-            assert!(
-                load_page(&conn, CapturedPageId(2), 16 * 1024 * 1024).is_err(),
-                "{sql}"
-            );
-        }
-    }
-
-    #[test]
-    fn corrupted_work_or_selection_dependency_pins_body_without_drop() {
+    fn fresh_start_preserves_corrupted_work_dependencies_as_history() {
         for sql in [
             "UPDATE provider_work_receipts SET source_hash='tampered' WHERE page_id=2",
             "UPDATE provider_work_receipts SET confirmation_hash='tampered' WHERE page_id=2",
@@ -1524,6 +845,13 @@ mod tests {
             {
                 let conn = Connection::open(&path).unwrap();
                 conn.execute_batch(sql).unwrap();
+                let body: Vec<u8> = conn
+                    .query_row(
+                        "SELECT body FROM provider_shadow_pages WHERE id=2",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
                 crate::state::schema::migrate(&conn).unwrap();
                 assert!(
                     !conn
@@ -1537,7 +865,7 @@ mod tests {
                 );
                 assert!(
                     conn.query_row::<i64, _, _>(
-                        "SELECT length(body) FROM provider_shadow_pages WHERE id=2",
+                        "SELECT length(body) FROM historical_v030_provider_shadow_pages WHERE id=2",
                         [],
                         |row| row.get(0)
                     )
@@ -1545,14 +873,22 @@ mod tests {
                         > 0,
                     "{sql}"
                 );
-                let stored = load_page(&conn, CapturedPageId(2), 16 * 1024 * 1024).unwrap();
-                assert!(matches!(stored.provenance, PageProvenance::Raw));
+                assert_eq!(
+                    conn.query_row::<Vec<u8>, _, _>(
+                        "SELECT body FROM historical_v030_provider_shadow_pages WHERE id=2",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    body
+                );
+                assert!(load_page(&conn, CapturedPageId(2), 16 * 1024 * 1024).is_err());
             }
         }
     }
 
     #[tokio::test]
-    async fn full_inbox_compaction_makes_room_for_new_distinct_page() {
+    async fn fresh_start_full_inbox_retirement_allows_current_capture_and_quiet_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("full.db");
         let (owner, budget) = full_legacy_v35(&path);
@@ -1571,8 +907,6 @@ mod tests {
         assert_eq!(before.0, 35);
         assert_eq!(u64::try_from(before.1).unwrap(), budget);
 
-        // Opening the database performs the complete migration, including
-        // compaction. No schema action or manual charge discount is applied.
         let db = std::sync::Arc::new(
             crate::state::SqliteStateDb::open_owned(&path, &owner)
                 .await
@@ -1586,7 +920,28 @@ mod tests {
         capture.capacity = budget;
         {
             let conn = db.acquire_lock("post migration full inbox").unwrap();
-            assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+            assert_eq!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM historical_v030_provider_shadow_pages",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                before.0
+            );
+            assert_eq!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT sum(charged_bytes) FROM historical_v030_provider_shadow_pages",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                before.1
+            );
+            assert_eq!(
+                crate::state::schema::get_schema_version(&conn).unwrap(),
+                crate::state::schema::SCHEMA_VERSION
+            );
             assert_eq!(
                 conn.query_row::<i64, _, _>(
                     "SELECT count(*) FROM provider_shadow_pages",
@@ -1594,7 +949,7 @@ mod tests {
                     |r| r.get(0)
                 )
                 .unwrap(),
-                35
+                0
             );
             assert_eq!(
                 conn.query_row::<i64, _, _>(
@@ -1603,7 +958,7 @@ mod tests {
                     |r| r.get(0)
                 )
                 .unwrap(),
-                30
+                0
             );
             assert_eq!(
                 conn.query_row::<i64, _, _>(
@@ -1612,13 +967,13 @@ mod tests {
                     |r| r.get(0)
                 )
                 .unwrap(),
-                5
+                0
             );
             let used = u64::try_from(charged_sum(&conn)).unwrap();
-            assert!(used < budget, "compaction must release real budget");
+            assert_eq!(used, 0, "retired pages must not consume current capacity");
             assert!(
                 conn.query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_catalog_debt WHERE page_id=2",
+                    "SELECT count(*) FROM historical_v030_provider_catalog_debt WHERE page_id=2",
                     [],
                     |r| r.get(0)
                 )
@@ -1627,7 +982,7 @@ mod tests {
             );
             assert_eq!(
                 conn.query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_work_receipts WHERE page_id=2",
+                    "SELECT count(*) FROM historical_v030_provider_work_receipts WHERE page_id=2",
                     [],
                     |r| r.get(0)
                 )
@@ -1636,24 +991,19 @@ mod tests {
             );
             assert_eq!(
                 conn.query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_selection_sources WHERE page_id=2",
+                    "SELECT count(*) FROM historical_v030_provider_selection_sources WHERE page_id=2",
                     [],
                     |r| r.get(0)
                 )
                 .unwrap(),
                 1
             );
-            assert_eq!(
-                conn.query_row::<String, _, _>(
-                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
-                    [],
-                    |r| r.get(0)
-                )
-                .unwrap(),
-                "saved"
+            crate::test_helpers::assert_checkpoint_evidence(
+                &conn,
+                "sync_token:PrimarySync",
+                "saved",
             );
-            let alias = load_page(&conn, CapturedPageId(2), 16 * 1024 * 1024).unwrap();
-            assert!(matches!(alias.provenance, PageProvenance::LegacyAlias(_)));
+            assert!(load_page(&conn, CapturedPageId(2), 16 * 1024 * 1024).is_err());
         }
 
         let new_page = fixture_observed(99, "https://p01.icloud-content.com/asset-new?token=0");
@@ -1667,7 +1017,7 @@ mod tests {
                     |r| r.get(0)
                 )
                 .unwrap(),
-                36
+                1
             );
             assert_eq!(
                 conn.query_row::<i64, _, _>(
@@ -1676,7 +1026,7 @@ mod tests {
                     |r| r.get(0)
                 )
                 .unwrap(),
-                30
+                0
             );
             assert_eq!(
                 charged_sum(&conn),
@@ -1703,7 +1053,7 @@ mod tests {
                     |r| r.get(0)
                 )
                 .unwrap(),
-                36
+                1
             );
         }
         drop(capture);
@@ -1712,7 +1062,10 @@ mod tests {
             .await
             .unwrap();
         let conn = reopened.acquire_lock("reopened full inbox").unwrap();
-        assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+        assert_eq!(
+            crate::state::schema::get_schema_version(&conn).unwrap(),
+            crate::state::schema::SCHEMA_VERSION
+        );
         assert_eq!(charged_sum(&conn), after_new);
         assert_eq!(
             conn.query_row::<i64, _, _>(
@@ -1721,14 +1074,212 @@ mod tests {
                 |r| r.get(0)
             )
             .unwrap(),
-            30
+            0
         );
-        assert!(matches!(
-            load_page(&conn, CapturedPageId(2), 16 * 1024 * 1024)
+        let stored = load_page(&conn, CapturedPageId(1), 16 * 1024 * 1024).unwrap();
+        assert_eq!(
+            stored.observation_hash,
+            format!("{:x}", Sha256::digest(&stored.page.body))
+        );
+    }
+
+    /// Reuse the base private master fixture as an eligible Live Photo motion
+    /// descriptor. Only the descriptor field and its checksum change.
+    fn motion_observed(url: &str, checksum: &str) -> ObservedPage {
+        let mut page = observed(url);
+        page.body = String::from_utf8(page.body)
+            .unwrap()
+            .replace("resOriginalRes", "resOriginalVidComplRes")
+            .replace("checksum-A", checksum)
+            .into_bytes();
+        page
+    }
+
+    fn inbox_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM provider_shadow_pages", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn consumed_tombstones_release_space_mid_stream_and_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handoff.db");
+        let owner = owner_record();
+        let tombstone = |index: usize| {
+            let name = format!("deleted-{index}");
+            let raw = serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"records":[{"recordName":name,"recordType":"CPLAsset","deleted":true}],"syncToken":"successor","moreComing":false}]});
+            crate::icloud::photos::catalog_observed_page(
+                serde_json::to_vec(&raw).unwrap(),
+                &scope(),
+                "held",
+            )
+            .unwrap()
+        };
+        let unresolved = observed("https://p01.icloud-content.com/unknown");
+        let db = std::sync::Arc::new(
+            crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .unwrap(),
+        );
+        db.set_metadata("sync_token:PrimarySync", "held")
+            .await
+            .unwrap();
+        let mut capture = crate::icloud::photos::inbox::ShadowCapture::new(
+            db.clone(),
+            owner.clone(),
+            "legacy-realm",
+        );
+        capture.capture(unresolved.clone()).await.unwrap();
+        capture.capture(tombstone(0)).await.unwrap();
+        capture.capacity =
+            u64::try_from(charged_sum(&db.acquire_lock("initial budget").unwrap())).unwrap();
+        {
+            let conn = db
+                .acquire_lock("apply deletion while checkpoint held")
+                .unwrap();
+            for index in 0..8 {
+                conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,is_deleted) VALUES('PrimarySync',?1,'original','checksum','old.jpg',1,10,'photo','downloaded',1,1)",[format!("deleted-{index}")]).unwrap();
+            }
+            conn.execute_batch("CREATE TRIGGER fail_release BEFORE UPDATE OF body ON provider_shadow_pages BEGIN SELECT RAISE(ABORT,'injected cleanup failure'); END;").unwrap();
+        }
+        assert!(capture.capture(tombstone(1)).await.is_err());
+        {
+            let conn = db.acquire_lock("release rolled back").unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM provider_finished_changes", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                load_page(&conn, CapturedPageId(2), 16384).unwrap().page,
+                tombstone(0)
+            );
+            conn.execute_batch("DROP TRIGGER fail_release").unwrap();
+        }
+        for index in 1..8 {
+            capture.capture(tombstone(index)).await.unwrap();
+        }
+        drop(capture);
+        drop(db);
+        let db = std::sync::Arc::new(
+            crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .unwrap(),
+        );
+        let mut capture =
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner, "legacy-realm");
+        capture.capacity = 0;
+        capture.capture(tombstone(0)).await.unwrap();
+        assert!(capture.capture(tombstone(8)).await.is_err());
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
                 .unwrap()
-                .provenance,
-            PageProvenance::LegacyAlias(_)
-        ));
+                .as_deref(),
+            Some("held")
+        );
+        let conn = db.acquire_lock("durable handoff").unwrap();
+        assert_eq!(
+            load_page(&conn, CapturedPageId(1), 16384).unwrap().page,
+            unresolved
+        );
+        assert_eq!(conn.query_row("SELECT count(*) FROM provider_finished_changes f JOIN provider_shadow_pages p ON p.id=f.page_id WHERE length(p.body)=0",[],|r|r.get::<_,i64>(0)).unwrap(),8);
+    }
+
+    #[tokio::test]
+    async fn motion_url_rotation_is_free_at_capacity_but_a_changed_motion_checksum_is_new_evidence()
+    {
+        const ORIGINAL_URL: &str = "https://p01.icloud-content.com/motion?token=0";
+        const ROTATED_URLS: [&str; 3] = [
+            "https://p99.icloud-content.com/rotated/motion?token=1",
+            "https://p02.cdn-apple.com/motion?token=2",
+            "https://p01.icloud-content.com/another/path?token=3",
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("motion.db");
+        let owner = owner_record();
+        let original = motion_observed(ORIGINAL_URL, "checksum-A");
+
+        // Cycle 0 captures the baseline; every later cycle reopens the owned
+        // file to replay only the signed URL, then refuse and finally retain
+        // the changed motion checksum.
+        let mut baseline: Option<(i64, i64)> = None;
+        for cycle in 0..3 {
+            let db = std::sync::Arc::new(
+                crate::state::SqliteStateDb::open_owned(&path, &owner)
+                    .await
+                    .unwrap(),
+            );
+            let mut capture = crate::icloud::photos::inbox::ShadowCapture::new(
+                db.clone(),
+                owner.clone(),
+                "legacy-realm",
+            );
+            let Some((rows, charged)) = baseline else {
+                capture.capacity = 512 * 1024 * 1024;
+                capture.capture(original.clone()).await.unwrap();
+                let conn = db.acquire_lock("captured private motion page").unwrap();
+                let rows = inbox_rows(&conn);
+                let charged = charged_sum(&conn);
+                assert_eq!(rows, 1);
+                assert!(charged > 0);
+                baseline = Some((rows, charged));
+                continue;
+            };
+
+            capture.capacity = u64::try_from(charged).unwrap();
+            for url in ROTATED_URLS {
+                capture
+                    .capture(motion_observed(url, "checksum-A"))
+                    .await
+                    .unwrap();
+            }
+            {
+                let conn = db.acquire_lock("replayed signed motion URL").unwrap();
+                assert_eq!(inbox_rows(&conn), rows);
+                assert_eq!(charged_sum(&conn), charged);
+            }
+            if cycle < 2 {
+                continue;
+            }
+
+            // A changed motion checksum is different provider evidence even
+            // with an identical cursor, scope and continuation.
+            let changed = motion_observed(ORIGINAL_URL, "checksum-B");
+            let error = capture.capture(changed.clone()).await.unwrap_err();
+            let refusal = error
+                .downcast_ref::<crate::icloud::photos::error::ShadowPageError>()
+                .expect("a refused observation keeps its typed wrapper");
+            assert_eq!(
+                refusal.to_string(),
+                crate::state::error::StateError::ProviderInboxFull.to_string(),
+                "new motion evidence must be refused for capacity: {error:#}"
+            );
+            {
+                let conn = db.acquire_lock("changed motion checksum refused").unwrap();
+                assert_eq!(inbox_rows(&conn), rows);
+                assert_eq!(charged_sum(&conn), charged);
+            }
+
+            // Adding headroom retains both pieces of evidence side by side.
+            capture.capacity = u64::try_from(charged).unwrap() + 64 * 1024;
+            capture.capture(changed.clone()).await.unwrap();
+            let conn = db.acquire_lock("changed motion checksum retained").unwrap();
+            assert_eq!(inbox_rows(&conn), 2);
+            assert!(charged_sum(&conn) > charged);
+            let bodies = conn
+                .prepare("SELECT body FROM provider_shadow_pages ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(bodies, vec![original.body.clone(), changed.body]);
+        }
     }
 
     async fn actual_inbox_migration_and_catalog_child() {
@@ -1791,31 +1342,6 @@ mod tests {
         capture.capture(equivalent).await.unwrap();
         drop(capture);
         drop(db);
-
-        crate::support::begin(serde_json::json!({"scenario": "failed-alias"}));
-        let failed_path = directory.path().join("failed.db");
-        let (_owner, _, _) = legacy_v35(&failed_path);
-        {
-            let conn = Connection::open(&failed_path).unwrap();
-            TEST_ABORT_AFTER_ALIASES.with(|count| count.set(1));
-            assert!(crate::state::schema::migrate(&conn).is_err());
-            TEST_ABORT_AFTER_ALIASES.with(|count| count.set(0));
-        }
-
-        crate::support::begin(serde_json::json!({"scenario": "reopen-commit"}));
-        {
-            let conn = Connection::open(&failed_path).unwrap();
-            crate::state::schema::migrate(&conn).unwrap();
-        }
-
-        crate::support::begin(serde_json::json!({"scenario": "unprojectable"}));
-        let unprojectable_path = directory.path().join("unprojectable.db");
-        let (_owner, _, _) = legacy_v35(&unprojectable_path);
-        {
-            let conn = Connection::open(&unprojectable_path).unwrap();
-            insert_legacy(&conn, &oversized_unprojected_observed(), 200_000);
-            crate::state::schema::migrate(&conn).unwrap();
-        }
 
         crate::support::begin(serde_json::json!({"scenario": "inbox-catalogue-single-item-limit"}));
         let db = std::sync::Arc::new(
@@ -1947,12 +1473,13 @@ mod tests {
         let snapshot = crate::support::history::test_retained_snapshot(&history);
         let cycles = snapshot["cycles"].as_array().unwrap();
         let committed = &cycles[0]["transport_compaction"];
-        assert_eq!(committed["committed"], 1);
-        assert_eq!(committed["reason"], "committed");
-        let before = committed["logical_charge_before"].as_u64().unwrap();
-        let after = committed["logical_charge_after"].as_u64().unwrap();
-        assert!(before > after);
-        assert_eq!(committed["committed_reclaim"], before - after);
+        assert_eq!(committed["committed"], 0);
+        assert_eq!(committed["failed"], 0);
+        assert_eq!(committed["reason"], "not_observed");
+        assert_eq!(committed["compacted_aliases"], 0);
+        assert!(committed["committed_reclaim"].is_null());
+        assert!(committed["logical_charge_before"].is_null());
+        assert!(committed["logical_charge_after"].is_null());
         let inbox_new = &cycles[1]["storage_reuse"]["inbox"];
         assert_eq!(inbox_new["new"], 1);
         assert_eq!(inbox_new["capacity_rejected"], 1);
@@ -1963,33 +1490,16 @@ mod tests {
         assert_eq!(inbox_reuse["equivalent"], 1);
         assert_eq!(inbox_reuse["last_reason"], "none");
         assert!(inbox_reuse["last_observed_used"].is_null());
-        let failed = &cycles[3]["transport_compaction"];
-        assert_eq!(failed["failed"], 1);
-        assert_eq!(failed["reason"], "migration_failed");
-        assert_eq!(failed["committed_reclaim"], 0);
-        assert!(failed["logical_charge_before"].is_null());
-        let reopened = &cycles[4]["transport_compaction"];
-        assert_eq!(reopened["committed"], 1);
-        assert_eq!(reopened["reason"], "committed");
-        assert!(reopened["committed_reclaim"].as_u64().unwrap() > 0);
-        let unprojectable = &cycles[5]["transport_compaction"];
-        assert!(
-            unprojectable["retained_projection_or_dependency"]
-                .as_u64()
-                .unwrap()
-                >= 1
-        );
-        assert_eq!(cycles[5]["storage_reuse"]["catalogue"]["observed"], false);
-        let normal_capacity = &cycles[6]["storage_reuse"]["catalogue"];
+        let normal_capacity = &cycles[3]["storage_reuse"]["catalogue"];
         assert_eq!(normal_capacity["single_item_limit"], 1);
         assert_eq!(normal_capacity["new"], 0);
-        let catalogue = &cycles[7]["storage_reuse"]["catalogue"];
+        let catalogue = &cycles[4]["storage_reuse"]["catalogue"];
         assert_eq!(catalogue["new"], 1);
         assert_eq!(catalogue["exact"], 1);
         assert_eq!(catalogue["capacity_rejected"], 1);
         assert_eq!(catalogue["last_reason"], "capacity");
         assert_eq!(catalogue["last_observed_limit"], 0);
-        let unknown = &cycles[8]["storage_reuse"]["inbox"];
+        let unknown = &cycles[5]["storage_reuse"]["inbox"];
         assert_eq!(unknown["new"], 1);
         assert_eq!(unknown["exact"], 10);
         assert_eq!(unknown["equivalent"], 0);

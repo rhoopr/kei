@@ -617,6 +617,7 @@ pub(crate) fn is_retryable_auth_failure(msg: &str) -> bool {
 /// Panics if credentials are not configured or session validation fails.
 #[allow(dead_code)]
 pub fn require_preauth() -> (String, String, PathBuf) {
+    live_selection::require_fixed_date();
     if RATE_LIMITED.load(Ordering::SeqCst) {
         eprintln!("\n*** ABORTING: Apple 503 rate limit detected in earlier test ***");
         std::process::exit(1);
@@ -755,6 +756,7 @@ pub fn toml_string(s: &str) -> String {
 }
 
 /// Write a per-test TOML config next to the test data directory.
+/// `body` contains settings below the current rendition-policy version marker.
 ///
 /// Live tests run single-threaded, so a stable filename per process keeps the
 /// command lines short without racing another test in the same target.
@@ -762,6 +764,16 @@ pub fn toml_string(s: &str) -> String {
 pub fn write_toml_config(dir: &Path, name: &str, body: &str) -> PathBuf {
     std::fs::create_dir_all(dir).expect("create config dir");
     let path = dir.join(format!(".kei-{name}-{}.toml", std::process::id()));
-    std::fs::write(&path, body).expect("write test TOML config");
+    write_versioned_config(&path, body).expect("write test TOML config");
     path
+}
+
+/// Write a current-policy config fixture. Migration-refusal fixtures write raw
+/// bytes directly so this helper cannot hide an absent version marker.
+#[allow(
+    dead_code,
+    reason = "shared integration helper compiled by independent test targets"
+)]
+pub fn write_versioned_config(path: &Path, body: impl AsRef<str>) -> std::io::Result<()> {
+    std::fs::write(path, format!("config_version = 1\n{}", body.as_ref()))
 }

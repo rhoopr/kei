@@ -81,8 +81,12 @@ pub(crate) async fn run_list(
             for library in &libraries {
                 println!("Library: {}", library.zone_name());
                 let albums = library.albums().await?;
-                for name in albums.keys() {
-                    println!("  {name}");
+                let mut entries: Vec<_> = albums.iter().collect();
+                entries.sort_by_key(|(name, _)| *name);
+                for (name, matches) in entries {
+                    for _album in matches {
+                        println!("  {name}");
+                    }
                 }
             }
         }

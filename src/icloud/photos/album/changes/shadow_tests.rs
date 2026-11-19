@@ -5,6 +5,7 @@ use crate::state::SqliteStateDb;
 use crate::state::db::account::AccountOwner;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_stream::StreamExt;
 
@@ -112,7 +113,7 @@ pub(super) async fn collect(
 }
 
 #[tokio::test]
-async fn shadow_source_payload_roundtrip_reopens_losslessly_and_replays_legacy_parity() {
+async fn shadow_source_payload_roundtrip_preserves_history_and_current_replay_parity() {
     use crate::icloud::photos::album::test_support::{changes_asset, changes_master};
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("owned.db");
@@ -156,7 +157,7 @@ async fn shadow_source_payload_roundtrip_reopens_losslessly_and_replays_legacy_p
     );
     let bound = album(body.clone(), capture(&db));
     assert_eq!(collect(&bound.clone()).await, baseline);
-    assert_eq!(counts(&db), (1, 5, 1));
+    assert_eq!(counts(&db), (1, 5, 0));
     // Synthetic version rewind exercises migration re-entry with observations
     // already present, as the established earlier-version controls do.
     db.acquire_lock("synthetic migration re-entry")
@@ -170,16 +171,18 @@ async fn shadow_source_payload_roundtrip_reopens_losslessly_and_replays_legacy_p
         let stored: Vec<u8> = db
             .acquire_lock("independent raw replay")
             .unwrap()
-            .query_row("SELECT body FROM provider_shadow_pages", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT body FROM historical_v030_provider_shadow_pages",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(stored, body);
         assert!(String::from_utf8_lossy(&stored).contains("9007199254740993.0"));
         {
             let conn = db.acquire_lock("scope and ordinal facts").unwrap();
             let (scope, request, successor, account, provider): (String,String,String,String,String) = conn.query_row(
-                "SELECT scope,request_cursor,successor,account_key,provider_key FROM provider_shadow_pages", [],
+                "SELECT scope,request_cursor,successor,account_key,provider_key FROM historical_v030_provider_shadow_pages", [],
                 |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
             let scope: Value = serde_json::from_str(&scope).unwrap();
             assert_eq!(scope["realm"], "com");
@@ -193,7 +196,7 @@ async fn shadow_source_payload_roundtrip_reopens_losslessly_and_replays_legacy_p
             );
             assert!(account.starts_with("account-v1-"));
             assert_eq!(provider.len(), 64);
-            let mut query = conn.prepare("SELECT ordinal,record_name,record_type,deleted FROM provider_shadow_records ORDER BY ordinal").unwrap();
+            let mut query = conn.prepare("SELECT ordinal,record_name,record_type,deleted FROM historical_v030_provider_shadow_records ORDER BY ordinal").unwrap();
             let identities: Vec<(i64, String, Option<String>, bool)> = query
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                 .unwrap()
@@ -224,22 +227,15 @@ async fn shadow_source_payload_roundtrip_reopens_losslessly_and_replays_legacy_p
         assert_eq!(collect(&bound).await, baseline);
         assert_eq!(
             counts(&db),
-            (1, 5, 1),
+            (1, 5, 0),
             "exact observed-page replay must be idempotent"
         );
-        assert_eq!(
-            db.get_metadata("sync_token:PrimarySync")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("saved")
-        );
-        assert_eq!(
-            db.get_metadata("pending_sync_token:old-epoch:PrimarySync")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("retained-debt")
+        let conn = db.acquire_lock("retired checkpoint bytes").unwrap();
+        crate::test_helpers::assert_checkpoint_evidence(&conn, "sync_token:PrimarySync", "saved");
+        crate::test_helpers::assert_checkpoint_evidence(
+            &conn,
+            "pending_sync_token:old-epoch:PrimarySync",
+            "retained-debt",
         );
         assert_eq!(std::fs::read(&media).unwrap(), b"preexisting-media");
     }
@@ -251,7 +247,7 @@ async fn shadow_transaction_failure_and_capacity_hold_then_recover_after_reopen(
     let path = directory.path().join("owned.db");
     let db = open(&path).await;
     db.acquire_lock("capture fault").unwrap().execute_batch(
-        "CREATE TRIGGER shadow_receipt_fault BEFORE INSERT ON provider_shadow_receipts BEGIN SELECT RAISE(ABORT,'synthetic receipt failure'); END").unwrap();
+        "CREATE TRIGGER shadow_receipt_fault AFTER INSERT ON provider_shadow_records BEGIN SELECT RAISE(ABORT,'synthetic identity write failure'); END").unwrap();
     let bound = album(unknown_page(), capture(&db));
     let (events, errors, token) = collect(&bound).await;
     assert!(events.is_empty());
@@ -268,7 +264,8 @@ async fn shadow_transaction_failure_and_capacity_hold_then_recover_after_reopen(
     assert_eq!(counts(&db), (0, 0, 0));
     db.acquire_lock("remove only injected fault")
         .unwrap()
-        .execute_batch("DROP TRIGGER shadow_receipt_fault")
+        .execute_batch("DROP TRIGGER shadow_receipt_fault;
+            CREATE TRIGGER obsolete_receipt_fault BEFORE INSERT ON provider_shadow_receipts BEGIN SELECT RAISE(ABORT,'obsolete pointer must not be written'); END;")
         .unwrap();
     let mut full = capture(&db);
     full.capacity = 0;
@@ -285,7 +282,7 @@ async fn shadow_transaction_failure_and_capacity_hold_then_recover_after_reopen(
         collect(&recovered).await,
         (Vec::new(), Vec::new(), "successor".into())
     );
-    assert_eq!(counts(&db), (1, 1, 1));
+    assert_eq!(counts(&db), (1, 1, 0));
     drop(recovered);
     // Existing exact observations do not need another byte allocation, even
     // when capacity is exhausted. A changed revision must hold, not overwrite.
@@ -300,7 +297,7 @@ async fn shadow_transaction_failure_and_capacity_hold_then_recover_after_reopen(
         .replace("v1", "v2")
         .into_bytes();
     assert_eq!(collect(&album(changed, full)).await.2, "saved");
-    assert_eq!(counts(&db), (1, 1, 1));
+    assert_eq!(counts(&db), (1, 1, 0));
 }
 
 #[tokio::test]
@@ -361,7 +358,7 @@ async fn shadow_scopes_and_revisions_remain_distinct_and_owner_is_rechecked() {
             .1
             .is_empty()
     );
-    assert_eq!(counts(&db), (3, 3, 2));
+    assert_eq!(counts(&db), (3, 3, 0));
     {
         let conn = db
             .acquire_lock("independent stable scope and version facts")
@@ -406,7 +403,7 @@ async fn shadow_scopes_and_revisions_remain_distinct_and_owner_is_rechecked() {
     );
     assert_eq!(
         counts(&db),
-        (3, 3, 2),
+        (3, 3, 0),
         "wrong owner cannot even acknowledge an existing page"
     );
 }
@@ -502,7 +499,7 @@ async fn shadow_cancelled_receiver_before_capture_preserves_page_and_legacy_curs
             .1
             .is_empty()
     );
-    assert_eq!(counts(&db), (1, 1, 1));
+    assert_eq!(counts(&db), (1, 1, 0));
     assert_eq!(
         db.get_metadata("sync_token:PrimarySync")
             .await
@@ -557,4 +554,384 @@ async fn issue765_receiver_close_cancels_scheduled_retry_after() {
     assert_eq!(token.unwrap(), "saved");
     assert!(started.elapsed() < RETRY_DELAY);
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+/// A completed scan may return many record-empty continuation pages. They
+/// carry no source identities, references or debt, so their admission charge
+/// must be released while earlier unresolved evidence and its catalogue debt
+/// stay durable. The bound is smaller than the combined empty-page bodies, so
+/// retaining them as charged observations would stop the scan.
+const RECLAMATION_INBOX_BUDGET: u64 = 12 * 1024;
+const RECLAMATION_EMPTY_PAGES: usize = 5;
+const RECLAMATION_CHANGED_URL: &str = "https://p77.icloud-content.com/changed.jpg";
+
+fn empty_continuation(index: usize) -> Vec<u8> {
+    serde_json::to_vec(&json!({"zones": [{
+        "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+        "syncToken": format!("empty-{index}"), "moreComing": true, "records": [],
+        "quietPayloadPadding": "x".repeat(4 * 1024),
+    }]}))
+    .unwrap()
+}
+
+fn finished_page(changed: bool) -> Vec<u8> {
+    use crate::icloud::photos::album::test_support::{changes_asset, changes_master};
+    let mut master = changes_master("known-master");
+    let mut asset = changes_asset("known-asset", "known-master");
+    if changed {
+        master["recordChangeTag"] = json!("ct-changed");
+        master["fields"]["resOriginalRes"]["value"]["downloadURL"] = json!(RECLAMATION_CHANGED_URL);
+        master["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!("changed-checksum");
+        asset["recordChangeTag"] = json!("ct-changed-asset");
+        asset["fields"]["assetDate"]["value"] = json!(1_700_000_001_000i64);
+    }
+    serde_json::to_vec(&json!({"zones": [{
+        "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+        "syncToken": "finished", "moreComing": false, "records": [master, asset],
+    }]}))
+    .unwrap()
+}
+
+/// The shared unresolved fixture is a single-page response; the reclamation
+/// scan continues past it before the record-empty continuations arrive.
+fn unresolved_page() -> Vec<u8> {
+    String::from_utf8(unknown_page())
+        .unwrap()
+        .replace("\"moreComing\":false", "\"moreComing\":true")
+        .into_bytes()
+}
+
+fn quiet_page() -> Vec<u8> {
+    serde_json::to_vec(&json!({"zones": [{
+        "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+        "syncToken": "quiet-successor", "moreComing": false, "records": [],
+        "quietPayloadPadding": "y".repeat(2 * 1024),
+    }]}))
+    .unwrap()
+}
+
+fn reclamation_page(token: &str, phase: u8) -> anyhow::Result<Vec<u8>> {
+    if token == "saved" {
+        return Ok(unresolved_page());
+    }
+    if token == "successor" {
+        return Ok(empty_continuation(1));
+    }
+    if let Some(index) = token.strip_prefix("empty-") {
+        let Ok(index) = index.parse::<usize>() else {
+            anyhow::bail!("unexpected reclamation continuation");
+        };
+        if index < RECLAMATION_EMPTY_PAGES {
+            return Ok(empty_continuation(index + 1));
+        }
+        if index == RECLAMATION_EMPTY_PAGES {
+            return Ok(finished_page(phase != 0));
+        }
+    }
+    if token == "finished" && phase == 2 {
+        return Ok(quiet_page());
+    }
+    anyhow::bail!("unexpected reclamation replay cursor")
+}
+
+#[derive(Clone)]
+struct ReclamationSession {
+    phase: u8,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for ReclamationSession {
+    async fn post(&self, _: &str, _: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
+        anyhow::bail!("unexpected value-based request")
+    }
+
+    async fn post_changes_body(
+        &self,
+        _: &str,
+        body: String,
+        _: &[(&str, &str)],
+    ) -> anyhow::Result<Vec<u8>> {
+        let request: Value = serde_json::from_str(&body)?;
+        let token = request
+            .pointer("/zones/0/syncToken")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        self.requests.lock().unwrap().push(token.clone());
+        reclamation_page(&token, self.phase)
+    }
+
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+fn reclamation_album(
+    session: ReclamationSession,
+    capture: ShadowCapture,
+) -> crate::icloud::photos::PhotoAlbum {
+    let mut album = make_album_with_session(100, Box::new(session));
+    album.set_shadow_capture(capture, Arc::from("private"));
+    album
+}
+
+fn bounded_capture(db: &Arc<SqliteStateDb>) -> ShadowCapture {
+    let mut capture = capture(db);
+    capture.capacity = RECLAMATION_INBOX_BUDGET;
+    capture
+}
+
+/// Capacity accounting is the live inbox: pages whose evidence was already
+/// released never reserve budget again.
+fn live_inbox_charge(db: &SqliteStateDb) -> i64 {
+    db.acquire_lock("live reclamation inbox charge")
+        .unwrap()
+        .query_row(
+            "SELECT COALESCE(SUM(p.charged_bytes),0) FROM provider_shadow_pages p WHERE NOT EXISTS(SELECT 1 FROM provider_finished_changes f WHERE f.page_id=p.id)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn page_charge(db: &SqliteStateDb, cursor: &str, marker: &str) -> i64 {
+    db.acquire_lock("retained reclamation page charge")
+        .unwrap()
+        .query_row(
+            "SELECT charged_bytes FROM provider_shadow_pages WHERE request_cursor=?1 AND instr(CAST(body AS TEXT),?2)>0",
+            rusqlite::params![cursor, marker],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn live_pages_without_identities(db: &SqliteStateDb) -> i64 {
+    db.acquire_lock("empty reclamation pages")
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM provider_shadow_pages p WHERE NOT EXISTS(SELECT 1 FROM provider_shadow_records r WHERE r.page_id=p.id) AND NOT EXISTS(SELECT 1 FROM provider_finished_changes f WHERE f.page_id=p.id)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+async fn collect_urls(
+    album: &crate::icloud::photos::PhotoAlbum,
+    cursor: &str,
+) -> (Vec<String>, Vec<String>, String) {
+    let (stream, token) = album.changes_stream(cursor);
+    let mut urls = Vec::new();
+    let mut errors = Vec::new();
+    for item in stream.collect::<Vec<_>>().await {
+        match item {
+            Ok(event) => {
+                if let Some(asset) = event.asset {
+                    for (_, version) in asset.versions() {
+                        urls.push(version.url.to_string());
+                    }
+                }
+            }
+            Err(error) => errors.push(format!("{error:#}")),
+        }
+    }
+    (urls, errors, token.await.unwrap())
+}
+
+#[tokio::test]
+async fn reclaimed_empty_continuations_keep_raw_debt_and_replay_a_changed_record() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("owned.db");
+    let db = open(&path).await;
+    db.set_metadata("sync_token:PrimarySync", "saved")
+        .await
+        .unwrap();
+    db.set_metadata("pending_sync_token:old-epoch:PrimarySync", "retained-debt")
+        .await
+        .unwrap();
+
+    let mut expected_requests = vec!["saved".to_owned(), "successor".to_owned()];
+    expected_requests.extend((1..=RECLAMATION_EMPTY_PAGES).map(|index| format!("empty-{index}")));
+
+    let first_requests = Arc::new(Mutex::new(Vec::new()));
+    let first = reclamation_album(
+        ReclamationSession {
+            phase: 0,
+            requests: first_requests.clone(),
+        },
+        bounded_capture(&db),
+    );
+    let (first_urls, first_errors, first_token) = collect_urls(&first, "saved").await;
+    assert!(first_errors.is_empty(), "{first_errors:?}");
+    assert_eq!(first_token, "finished");
+    assert!(first_urls.iter().any(|url| url.contains("photo.jpg")));
+    assert!(!first_urls.iter().any(|url| url == RECLAMATION_CHANGED_URL));
+    assert_eq!(*first_requests.lock().unwrap(), expected_requests);
+
+    let unresolved_charge = page_charge(&db, "saved", "future-source");
+    let finished_charge = page_charge(&db, "empty-5", "photo.jpg");
+    assert!(unresolved_charge > 0);
+    assert!(finished_charge > 0);
+    let retained_charge = unresolved_charge + finished_charge;
+    assert!(u64::try_from(retained_charge).unwrap() <= RECLAMATION_INBOX_BUDGET);
+    assert_eq!(live_inbox_charge(&db), retained_charge);
+    assert_eq!(counts(&db), (2, 3, 0));
+    assert_eq!(
+        live_pages_without_identities(&db),
+        0,
+        "record-empty pages must not keep live inbox space"
+    );
+    let empty_bodies: u64 = (1..=RECLAMATION_EMPTY_PAGES)
+        .map(|index| empty_continuation(index).len() as u64)
+        .sum();
+    assert!(
+        empty_bodies > RECLAMATION_INBOX_BUDGET,
+        "the continuation bodies alone exceed the whole inbox budget"
+    );
+    {
+        let conn = db
+            .acquire_lock("retained unresolved source and debt")
+            .unwrap();
+        let (page_id, body): (i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT id,body FROM provider_shadow_pages WHERE request_cursor='saved'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(body, unresolved_page());
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM provider_shadow_records WHERE page_id=?1",
+                [page_id],
+                |row| row.get(0),
+            )
+            .unwrap(),
+            1
+        );
+        let (target, zone_name, zone_owner): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT target_record_name,target_zone_name,target_zone_owner FROM provider_catalog_references WHERE page_id=?1 AND target_record_name='target'",
+                [page_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (target.as_str(), zone_name.as_deref(), zone_owner.as_deref()),
+            ("target", Some("other-zone"), Some("other-owner"))
+        );
+        assert!(
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM provider_catalog_debt WHERE page_id=?1 AND reason='unresolved_reference'",
+                [page_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+                > 0
+        );
+        crate::test_helpers::assert_checkpoint_evidence(&conn, "sync_token:PrimarySync", "saved");
+        crate::test_helpers::assert_checkpoint_evidence(
+            &conn,
+            "pending_sync_token:old-epoch:PrimarySync",
+            "retained-debt",
+        );
+    }
+    drop(first);
+    drop(db);
+
+    // Shutdown/reopen keeps the old checkpoint and the retained evidence. The
+    // replay starts there and reaches a later page whose record changed.
+    let db = open(&path).await;
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("saved")
+    );
+    assert_eq!(counts(&db), (2, 3, 0));
+    assert_eq!(live_inbox_charge(&db), retained_charge);
+    let replay_requests = Arc::new(Mutex::new(Vec::new()));
+    let replay = reclamation_album(
+        ReclamationSession {
+            phase: 1,
+            requests: replay_requests.clone(),
+        },
+        bounded_capture(&db),
+    );
+    let (replay_urls, replay_errors, replay_token) = collect_urls(&replay, "saved").await;
+    assert!(replay_errors.is_empty(), "{replay_errors:?}");
+    assert_eq!(replay_token, "finished");
+    assert_eq!(*replay_requests.lock().unwrap(), expected_requests);
+    assert!(
+        replay_urls.iter().any(|url| url == RECLAMATION_CHANGED_URL),
+        "the old checkpoint replay must observe the changed subsequent record"
+    );
+    let changed_charge = page_charge(&db, "empty-5", RECLAMATION_CHANGED_URL);
+    assert!(changed_charge > 0);
+    assert_eq!(
+        live_inbox_charge(&db),
+        retained_charge + changed_charge,
+        "empty continuations contribute nothing to the live inbox"
+    );
+    assert_eq!(counts(&db), (3, 5, 0));
+    assert_eq!(live_pages_without_identities(&db), 0);
+    {
+        let conn = db
+            .acquire_lock("changed record retained with original debt")
+            .unwrap();
+        assert_eq!(
+            conn.query_row::<Vec<u8>, _, _>(
+                "SELECT body FROM provider_shadow_pages WHERE request_cursor='saved'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+            unresolved_page()
+        );
+        assert!(
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM provider_catalog_debt d JOIN provider_shadow_pages p ON p.id=d.page_id WHERE p.request_cursor='saved'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+                > 0
+        );
+        crate::test_helpers::assert_checkpoint_evidence(&conn, "sync_token:PrimarySync", "saved");
+    }
+    drop(replay);
+    drop(db);
+
+    // A quiet page after another restart is released again instead of turning
+    // its admission charge into a permanent one.
+    let db = open(&path).await;
+    let quiet_requests = Arc::new(Mutex::new(Vec::new()));
+    let quiet = reclamation_album(
+        ReclamationSession {
+            phase: 2,
+            requests: quiet_requests.clone(),
+        },
+        bounded_capture(&db),
+    );
+    let (quiet_urls, quiet_errors, quiet_token) = collect_urls(&quiet, "finished").await;
+    assert!(quiet_errors.is_empty(), "{quiet_errors:?}");
+    assert!(quiet_urls.is_empty());
+    assert_eq!(quiet_token, "quiet-successor");
+    assert_eq!(*quiet_requests.lock().unwrap(), ["finished".to_owned()]);
+    assert_eq!(live_inbox_charge(&db), retained_charge + changed_charge);
+    assert_eq!(counts(&db), (3, 5, 0));
+    assert_eq!(live_pages_without_identities(&db), 0);
+    assert_eq!(
+        db.acquire_lock("quiet page not retained")
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM provider_shadow_pages p WHERE instr(CAST(p.body AS TEXT),'quietPayloadPadding')>0 AND NOT EXISTS(SELECT 1 FROM provider_finished_changes f WHERE f.page_id=p.id)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        0
+    );
 }

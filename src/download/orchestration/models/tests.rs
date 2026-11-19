@@ -63,6 +63,8 @@ fn test_sync_result_session_expired() {
 #[test]
 fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
     let lib_a = SyncStats {
+        storage_failed: true,
+        selected_work_remaining: false,
         primary_layout: None,
         unattributed_legacy_assets: 2,
         unattributed_legacy_pending: 1,
@@ -135,6 +137,8 @@ fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
     };
 
     let lib_b = SyncStats {
+        storage_failed: false,
+        selected_work_remaining: true,
         primary_layout: None,
         unattributed_legacy_assets: 3,
         unattributed_legacy_pending: 2,
@@ -543,7 +547,7 @@ async fn sparse_receipts_survive_report_changes_and_inventory_bridge_composition
         Some("after".into()),
         SyncStats::default(),
         vec![proof.clone()],
-        true,
+        Some((true, "after".into())),
     );
     // Reporting snapshots cannot erase or create durable checkpoint receipts.
     delta.stats = SyncStats::default();
@@ -558,9 +562,8 @@ async fn sparse_receipts_survive_report_changes_and_inventory_bridge_composition
             .is_none()
     );
     db.commit_checkpoint_transition(CheckpointTransition {
+        album_snapshots: Vec::new(),
         expected_metadata: Vec::new(),
-        legacy_preservation_proofs: Vec::new(),
-        legacy_config_hash: None,
         sparse_identity_proofs: inventory.checkpoint.sparse_identity_proofs,
         metadata_updates: vec![("sync_token:PrimarySync".into(), "after".into())],
         metadata_deletes: vec![unresolved_identity_key("PrimarySync")],
@@ -604,7 +607,7 @@ fn mixed_delta_completion_provenance_preserves_vetoes_and_does_not_invent_succes
                 ..SyncStats::default()
             },
             Vec::new(),
-            complete,
+            complete.then_some((false, "delta-successor".into())),
         );
         let mut query = SyncResult::from_execution(
             DownloadOutcome::Success,

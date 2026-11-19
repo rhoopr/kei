@@ -18,8 +18,8 @@ use crate::sync_loop::reporting::maybe_write_offline_fake_sync_report;
 use crate::sync_loop::reporting::merge_refresh_tail_outcome;
 use crate::sync_loop::session::reacquire_session;
 use crate::sync_loop::watch::{
-    metadata_capture_watch_interval, refresh_metadata_forces_one_shot,
-    repair_truncated_forces_one_shot, validate_capture_timestamp_repair,
+    refresh_metadata_forces_one_shot, repair_truncated_forces_one_shot,
+    validate_capture_timestamp_repair,
 };
 use crate::sync_loop::{SyncArgs, service_mode_default_interval, should_reconcile_this_cycle};
 use crate::systemd::SystemdNotifier;
@@ -45,7 +45,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         input_mode,
     } = args;
 
-    let is_retry_failed = sync.retry_failed;
     let toml_existed = toml_config.is_some();
     let cli_data_dir = globals.data_dir.clone();
     let mut config = config::Config::build_inner(
@@ -56,18 +55,31 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         personality_mode,
         friendly_request,
     )?;
+    config.runtime.dry_run |= config.runtime.only_print_filenames;
     let capture_timestamp_repair = if config.runtime.repair_capture_timestamps {
         download::CaptureTimestampRepair::ReplaceWithCaptureLocal
     } else {
         download::CaptureTimestampRepair::Preserve
     };
 
-    // On first run (no config file), persist bootstrap values so subsequent
-    // runs don't need the same env again. Only when the user explicitly chose
-    // a config path (--config), to avoid surprise writes at the default
-    // location during tests or one-off runs.
-    if !toml_existed
+    // Keep fresh-install auto-config behavior, but never create a previously
+    // absent config ahead of the recovery backup for retained state.
+    let defer_first_run_config =
+        if !config.runtime.dry_run && !toml_existed && config_explicitly_set {
+            let path = state::db::account::state_path(
+                &config.auth.cookie_directory,
+                &config.auth.username,
+                config.auth.domain.as_str(),
+            )
+            .await?;
+            tokio::fs::try_exists(path).await?
+        } else {
+            false
+        };
+    if !config.runtime.dry_run
+        && !toml_existed
         && config_explicitly_set
+        && !defer_first_run_config
         && let Err(e) =
             config::persist_first_run_config(&config_path, &config, cli_data_dir.as_deref())
     {
@@ -78,7 +90,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // which would cause the process to loop forever instead of exiting.
     // retry-failed: one-shot by definition.
     // setup → "sync now": initial test sync, not a daemon.
-    if is_one_shot {
+    if is_one_shot || config.runtime.dry_run {
         config.watch.interval = None;
     }
 
@@ -99,7 +111,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // Service-mode contract: the daemon must poll. If neither CLI nor TOML
     // supplied an interval, fall through to the canonical 24h default so a
     // launchd/systemd/SCM unit still has a heartbeat.
-    if let Some(applied) = service_mode_default_interval(config.watch.interval, service_mode) {
+    if !config.runtime.dry_run
+        && let Some(applied) = service_mode_default_interval(config.watch.interval, service_mode)
+    {
         config.watch.interval = Some(applied);
         tracing::info!(
             interval_secs = applied,
@@ -123,24 +137,21 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .watch
         .pid_file
         .as_ref()
+        .filter(|_| !config.runtime.dry_run)
         .map(|p| PidFileGuard::new(p.clone()))
         .transpose()?;
 
-    let sd_notifier = SystemdNotifier::new(config.watch.notify_systemd);
-    let notifier = Notifier::new(config.notifications.script.clone());
+    let sd_notifier = SystemdNotifier::new(config.watch.notify_systemd && !config.runtime.dry_run);
+    let notifier = Notifier::new(if config.runtime.dry_run {
+        None
+    } else {
+        config.notifications.script.clone()
+    });
 
     tracing::info!(concurrency = config.download.threads_num, "Starting kei");
 
     if config.auth.username.is_empty() {
         anyhow::bail!("Set your iCloud username with ICLOUD_USERNAME or [auth].username.");
-    }
-
-    // retry-failed + dry-run is unsupported: dry-run skips the state DB,
-    // but retry-failed needs it to know which assets failed.
-    if is_retry_failed && config.runtime.dry_run {
-        anyhow::bail!(
-            "`--dry-run` cannot be used with `--retry-failed` because retrying failed downloads needs to update the state database."
-        );
     }
 
     // Validate download directory early (before auth) to avoid wasting a 2FA code
@@ -153,33 +164,35 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     }
 
     // Validate download directory is writable before spending time on authentication.
-    tokio::fs::create_dir_all(&config.download.directory)
-        .await
-        .with_context(|| {
+    if !config.runtime.dry_run {
+        tokio::fs::create_dir_all(&config.download.directory)
+            .await
+            .with_context(|| {
+                format!(
+                    "Could not create download directory {}",
+                    config.download.directory.display()
+                )
+            })?;
+        let probe = config.download.directory.join(".kei_probe");
+        tokio::fs::write(&probe, b"").await.with_context(|| {
             format!(
-                "Could not create download directory {}",
+                "Cannot write to download directory {}",
                 config.download.directory.display()
             )
         })?;
-    let probe = config.download.directory.join(".kei_probe");
-    tokio::fs::write(&probe, b"").await.with_context(|| {
-        format!(
-            "Cannot write to download directory {}",
-            config.download.directory.display()
-        )
-    })?;
-    if let Err(e) = tokio::fs::remove_file(&probe).await {
-        tracing::trace!(
-            probe = %probe.display(),
-            error = %e,
-            "Could not clean up writability-probe file; harmless leakage"
-        );
-    }
+        if let Err(e) = tokio::fs::remove_file(&probe).await {
+            tracing::trace!(
+                probe = %probe.display(),
+                error = %e,
+                "Could not clean up writability-probe file; harmless leakage"
+            );
+        }
 
-    // Abort if available disk space is too low. See `check_min_disk_space`
-    // for the pure inner check.
-    if let Some(avail) = available_disk_space(&config.download.directory) {
-        check_min_disk_space(avail, &config.download.directory)?;
+        // Abort if available disk space is too low. See `check_min_disk_space`
+        // for the pure inner check.
+        if let Some(avail) = available_disk_space(&config.download.directory) {
+            check_min_disk_space(avail, &config.download.directory)?;
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -209,9 +222,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // Compute the save-password decision while `source` is still owned here.
     // The resulting action carries no password payload and survives moving the
     // source into the provider closure below.
-    let save_password_action = config
-        .auth
-        .save_password
+    let save_password_action = (config.auth.save_password && !config.runtime.dry_run)
         .then(|| password::decide_save_password_action(&source));
     let password_provider = make_password_provider(source, input_mode);
 
@@ -297,25 +308,22 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // Skip for --dry-run so a preview doesn't create the DB or poison
     // sync tokens, which would cause a subsequent real sync to believe
     // nothing has changed and download 0 photos.
-    let state_db: Option<Arc<dyn download::DownloadStore>> = if config.runtime.dry_run {
+    let startup_db = if config.runtime.dry_run {
         None
     } else {
-        let db_path = state::db::account::state_path(
+        match state::db::account::open_sync_state(
             &config.auth.cookie_directory,
             &config.auth.username,
             config.auth.domain.as_str(),
-        )
-        .await?;
-        match state::SqliteStateDb::open_owned(
-            &db_path,
             account_owner
                 .as_ref()
                 .ok_or(state::error::StateError::AccountIdentityUnavailable)?,
+            &globals.config_source,
         )
         .await
         {
             Ok(db) => {
-                tracing::debug!(path = %db_path.display(), "State database opened");
+                tracing::debug!("Account state database opened");
                 let db = Arc::new(db);
                 photos_service.set_shadow_capture(
                     crate::icloud::photos::inbox::ShadowCapture::new(
@@ -365,29 +373,26 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     }
                 }
 
-                // For retry-failed, reset failed assets to pending
-                if is_retry_failed {
-                    match db.reset_failed().await {
-                        Ok(0) => {
-                            tracing::info!("No failed assets to retry");
-                            return Ok(());
-                        }
-                        Ok(count) => {
-                            tracing::debug!(count, "Reset failed assets to pending");
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Failed to reset failed assets");
-                        }
-                    }
-                }
-
-                Some(db as Arc<dyn download::DownloadStore>)
+                Some(db)
             }
             Err(e) => {
-                anyhow::bail!("Could not open state database {}: {e}", db_path.display());
+                anyhow::bail!("Could not open account state database: {e}");
             }
         }
     };
+
+    let state_db: Option<Arc<dyn download::DownloadStore>> = startup_db
+        .as_ref()
+        .map(|db| Arc::clone(db) as Arc<dyn download::DownloadStore>);
+
+    // Persist first-run settings only after the state upgrade boundary: an old
+    // owned database must be backed up before creating a previously absent config.
+    if defer_first_run_config
+        && let Err(e) =
+            config::persist_first_run_config(&config_path, &config, cli_data_dir.as_deref())
+    {
+        tracing::warn!(error = %e, "Failed to save first-run config");
+    }
 
     // First-sync notice: tell users on the `PrimarySync` default about any
     // shared libraries they could be syncing. Runs once per data dir,
@@ -422,11 +427,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // Promote the String / Vec / PathBuf config fields to their Arc
     // counterparts once, outside the per-library closure. Otherwise the
     // Arc-sharing win is half-defeated: each build_download_config
-    // call would re-allocate directory / filename_exclude / temp_suffix
+    // call would re-allocate directory / temp_suffix
     // from scratch instead of refcount-bumping.
     let cfg_directory: Arc<std::path::Path> = Arc::from(config.download.directory.as_path());
-    let cfg_filename_exclude: Arc<[glob::Pattern]> =
-        Arc::from(config.download.filename_exclude.clone());
     let cfg_temp_suffix: Arc<str> = Arc::from(config.download.temp_suffix.as_str());
     let cfg_folder_structure_albums: Arc<str> =
         Arc::from(config.download.folder_structure_albums.as_str());
@@ -440,6 +443,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                                  library: Arc<str>|
      -> Arc<download::DownloadConfig> {
         Arc::new(download::DownloadConfig {
+            inventory_reconciliation: false,
             directory: Arc::clone(&cfg_directory),
             folder_structure: config.download.folder_structure.clone(),
             folder_structure_albums: Arc::clone(&cfg_folder_structure_albums),
@@ -457,8 +461,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 .download
                 .legacy_preservation_allow_hardlinks,
             concurrent_downloads: config.download.threads_num as usize,
-            recent: config.filters.recent,
-            recent_scope: config.filters.recent_scope,
             retry: retry_config,
             live_photo_mode: config.photos.live_photo_mode,
             live_resolution,
@@ -475,7 +477,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             file_match_policy: config.photos.file_match_policy,
             force_resolution: config.photos.force_resolution,
             keep_unicode_in_filenames: config.photos.keep_unicode_in_filenames,
-            filename_exclude: Arc::clone(&cfg_filename_exclude),
             temp_suffix: Arc::clone(&cfg_temp_suffix),
             state_db: state_db.clone(),
             sparse_targets: Arc::from([]),
@@ -483,10 +484,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             selection_context: None,
             selection_run: None,
             selection_pass: None,
-            retry_only: is_retry_failed,
             provisional: false,
             indexing_inventory_only: false,
-            max_download_attempts: config.retry.max_download_attempts,
             sync_mode,
             enum_config_hash: Some(Arc::clone(&enum_config_hash)),
             album_name: None,
@@ -535,7 +534,36 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let mut cumulative_failed_count = 0usize;
 
     let (mut library_states, mut collection_context) =
-        super::planning::resolve_library_plans(&mut photos_service, &libraries, &config).await?;
+        super::planning::resolve_library_plans_with_recovery(
+            &mut photos_service,
+            &libraries,
+            &config,
+            startup_db.as_deref().zip(account_owner.as_ref()),
+        )
+        .await?;
+    if run_mode.downloads_files()
+        && let Some(db) = startup_db.as_deref()
+    {
+        let plans: Vec<_> = library_states
+            .iter()
+            .map(|library| {
+                (
+                    build_download_config(
+                        download::SyncMode::Full,
+                        Arc::new(rustc_hash::FxHashSet::default()),
+                        Arc::new(download::AssetGroupings::default()),
+                        Arc::from(library.zone_name.as_str()),
+                    ),
+                    library.plan.passes.as_slice(),
+                )
+            })
+            .collect();
+        if let Err(error) =
+            crate::commands::adopt_startup_archive(db, &plans, &shutdown_token).await
+        {
+            tracing::warn!(%error, "Startup archive adoption incomplete; continuing current sync");
+        }
+    }
     let db_precheck_scope = DbPrecheckScope::from_config(
         &config,
         &library_states,
@@ -607,12 +635,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             break;
         }
         cycle_index = cycle_index.saturating_add(1);
-        let mut next_watch_interval = config.watch.interval;
 
         // Readiness may change without changes/database events. Persist holds
         // before any shortcut and rebuild collection/pass scope while held so
         // a provisional album list cannot certify FINISHED reconciliation.
-        super::planning::refresh_indexing_library_plans(
+        super::planning::refresh_indexing_library_plans_with_recovery(
             &mut photos_service,
             &libraries,
             &config,
@@ -621,6 +648,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 .map(|db| db as &dyn download::DownloadStore),
             &mut library_states,
             &mut collection_context,
+            startup_db.as_deref().zip(account_owner.as_ref()),
         )
         .await?;
 
@@ -650,7 +678,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             if drift.marked_failed > 0 {
                 tracing::warn!(
                     marked_failed = drift.marked_failed,
-                    "Local drift probe found missing or damaged files; forcing this cycle to retry them"
+                    "Local drift probe found missing files; forcing this cycle to retry them"
                 );
                 watch_precheck = WatchPrecheck::proceed_all();
             }
@@ -672,7 +700,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             .await;
         }
 
+        let current_work_complete;
         if matches!(watch_precheck, WatchPrecheck::SkipAll) {
+            current_work_complete = true;
             cycle_reporter.report_skipped_watch_cycle(&mut health).await;
         } else {
             refresh_needed_library_plans(
@@ -706,7 +736,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &cycle_library_states,
                 &config,
                 state_db.as_deref(),
-                is_retry_failed,
                 &build_download_config,
                 download_controls,
                 &shared_session,
@@ -714,37 +743,40 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             )
             .await?;
             // Drain tagged rewrites now so the one-shot --refresh-metadata repair finishes in this run.
-            let refresh_tail_failures = if config.runtime.refresh_metadata {
-                if let Some(db) = state_db.as_deref() {
-                    let library_scope: Vec<&str> = libraries
-                        .iter()
-                        .map(|library| library.zone_name())
-                        .collect();
-                    download::drain_pending_metadata_rewrites(
-                        db,
-                        &config.metadata,
-                        capture_timestamp_repair,
-                        &library_scope,
-                        Arc::clone(&cfg_temp_suffix),
-                        &shutdown_token,
-                    )
-                    .await
+            let refresh_tail =
+                if config.runtime.refresh_metadata && !cycle_result.stats.storage_failed {
+                    if let Some(db) = state_db.as_deref() {
+                        let library_scope: Vec<&str> = libraries
+                            .iter()
+                            .map(|library| library.zone_name())
+                            .collect();
+                        download::drain_pending_metadata_rewrites(
+                            db,
+                            &config.metadata,
+                            capture_timestamp_repair,
+                            &library_scope,
+                            Arc::clone(&cfg_temp_suffix),
+                            &shutdown_token,
+                        )
+                        .await
+                    } else {
+                        download::MetadataDrainOutcome::default()
+                    }
                 } else {
-                    0
-                }
-            } else {
-                0
-            };
+                    download::MetadataDrainOutcome::default()
+                };
             if config.runtime.refresh_metadata {
                 merge_refresh_tail_outcome(
                     &mut cycle_result,
-                    refresh_tail_failures,
+                    refresh_tail.failed,
+                    refresh_tail.storage_failed,
                     shutdown_token.is_cancelled(),
                 );
             }
-            if refresh_tail_failures > 0 {
+            if refresh_tail.failed > 0 {
                 tracing::warn!(
-                    failed = refresh_tail_failures,
+                    failed = refresh_tail.failed,
+                    storage_failed = refresh_tail.storage_failed,
                     "Some --refresh-metadata rewrites did not complete; sync will exit non-zero"
                 );
             }
@@ -772,34 +804,16 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 }
             }
 
-            cycle_reporter
-                .report_completed_cycle(
-                    &mut health,
-                    crate::cycle_reporter::CycleFacts::new(
-                        &cycle_result.stats,
-                        cycle_result.failed_count,
-                        cycle_result.session_expired,
-                        cycle_started_at.elapsed(),
-                    ),
-                )
-                .await;
-
-            next_watch_interval = metadata_capture_watch_interval(
-                config.watch.interval,
+            let facts = crate::cycle_reporter::CycleFacts::new(
                 &cycle_result.stats,
                 cycle_result.failed_count,
+                cycle_result.session_expired,
+                cycle_started_at.elapsed(),
             );
-            if let (Some(configured_interval), Some(follow_up_interval)) =
-                (config.watch.interval, next_watch_interval)
-                && follow_up_interval < configured_interval
-            {
-                tracing::info!(
-                    refreshed = cycle_result.stats.metadata_capture_refreshed,
-                    remaining = cycle_result.stats.metadata_capture_remaining,
-                    interval_secs = follow_up_interval,
-                    "Metadata-capture repair scheduled a bounded follow-up cycle"
-                );
-            }
+            current_work_complete = facts.status == crate::cycle_reporter::CycleStatus::Success;
+            cycle_reporter
+                .report_completed_cycle(&mut health, facts)
+                .await;
 
             // Handle aggregate outcome across all libraries
             if cycle_result.session_expired {
@@ -830,6 +844,16 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
         }
 
+        if current_work_complete
+            && !shutdown_token.is_cancelled()
+            && let Some(db) = startup_db.as_deref()
+            && super::reconcile::recover_historical_sources(db, &library_states, &shutdown_token)
+                .await
+                .is_err()
+        {
+            tracing::warn!("Historical source checks deferred after a state error");
+        }
+
         // Periodic local-vs-state reconciliation. This full-catalog walk is
         // read-only and surfaces missing or damaged files via `tracing::warn!`.
         // The bounded pre-cycle probe owns automatic requeue for the rows it
@@ -842,7 +866,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             run_periodic_reconcile(db.as_ref() as &dyn state::ReportStateStore, cycle_index).await;
         }
 
-        if let Some(interval) = next_watch_interval {
+        if let Some(interval) = config.watch.interval {
             if shutdown_token.is_cancelled() {
                 tracing::info!("Shutdown requested, exiting...");
                 break;

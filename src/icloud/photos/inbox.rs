@@ -1,13 +1,14 @@
 //! Provider capture composition; no selection or checkpoint policy lives here.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use serde_json::{Value, json};
 
 use crate::state::SqliteStateDb;
 use crate::state::db::{account::AccountOwner, provider_inbox::ObservedPage};
 
-/// Operational safety bounds. Observations are retained, never evicted to fit.
+/// Operational safety bounds. Unfinished observations are never evicted to fit.
 pub(crate) const MAX_CHANGES_PAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SHADOW_INBOX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CATALOG_INDEX_BYTES: u64 = 512 * 1024 * 1024;
@@ -19,6 +20,7 @@ pub(crate) struct ShadowCapture {
     realm: Arc<str>,
     pub(crate) capacity: u64,
     pub(crate) catalog_capacity: u64,
+    recheck_after: Arc<AtomicI64>,
 }
 
 impl ShadowCapture {
@@ -29,6 +31,7 @@ impl ShadowCapture {
             realm: Arc::from(realm),
             capacity: MAX_SHADOW_INBOX_BYTES,
             catalog_capacity: MAX_CATALOG_INDEX_BYTES,
+            recheck_after: Arc::default(),
         }
     }
 
@@ -87,22 +90,77 @@ impl ShadowCapture {
             };
             self.project(source).await?;
         }
+        if !cancel.is_cancelled() {
+            self.reclaim_empty_pages().await?;
+        }
         Ok(())
     }
 
-    pub(crate) async fn capture(&self, page: ObservedPage) -> anyhow::Result<()> {
-        let id = self
+    async fn reclaim_empty_pages(&self) -> anyhow::Result<()> {
+        self.db
+            .reclaim_empty_catalog_pages(self.owner.clone(), MAX_CHANGES_PAGE_BYTES)
+            .await
+            .map_err(|error| super::error::ShadowPageError::from(anyhow::Error::new(error)).into())
+    }
+
+    async fn recheck_next(&self, after: i64) -> anyhow::Result<Option<i64>> {
+        let candidate = self
             .db
-            .capture_shadow_page(self.owner.clone(), page, self.capacity)
+            .next_handoff_candidate(self.owner.clone(), after, MAX_CHANGES_PAGE_BYTES)
             .await
             .map_err(|error| super::error::ShadowPageError::from(anyhow::Error::new(error)))?;
+        let Some(source) = candidate else {
+            return Ok(None);
+        };
+        let id = source.id.0;
+        self.project(source).await?;
+        Ok(Some(id))
+    }
+
+    pub(crate) async fn capture(&self, page: ObservedPage) -> anyhow::Result<()> {
+        let after = self.recheck_after.load(Ordering::Relaxed);
+        self.recheck_after.store(
+            self.recheck_next(after).await?.unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        if page.identities.is_empty() {
+            let realm = self.realm.clone();
+            let owner = self.owner.clone();
+            self.db
+                .validate_empty_poll(owner, page, realm)
+                .await
+                .map_err(|error| super::error::ShadowPageError::from(anyhow::Error::new(error)))?;
+            return Ok(());
+        }
+        let page = Arc::new(page);
+        let capture = |final_attempt| {
+            self.db.attempt_shadow_capture(
+                self.owner.clone(),
+                Arc::clone(&page),
+                self.capacity,
+                final_attempt,
+            )
+        };
+        let id = match capture(false).await {
+            Err(crate::state::error::StateError::ProviderInboxFull) => {
+                self.reclaim_empty_pages().await?;
+                let mut after = 0;
+                while let Some(id) = self.recheck_next(after).await? {
+                    after = id;
+                }
+                capture(true).await
+            }
+            result => result,
+        }
+        .map_err(|error| super::error::ShadowPageError::from(anyhow::Error::new(error)))?;
         // Projection is always replayed from durable state. An interruption
         // after capture but before projection recovers on the next observation.
         let source = self
             .db
-            .catalog_source(self.owner.clone(), id, MAX_CHANGES_PAGE_BYTES)
+            .active_catalog_source(self.owner.clone(), id, MAX_CHANGES_PAGE_BYTES)
             .await
             .map_err(|error| super::error::ShadowPageError::from(anyhow::Error::new(error)))?;
+        let Some(source) = source else { return Ok(()) };
         self.project(source).await
     }
 }

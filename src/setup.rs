@@ -8,15 +8,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use console::Style;
-use dialoguer::{Confirm, Input, Password, Select};
+use dialoguer::{Confirm, Input, MultiSelect, Password, Select};
 use indicatif::ProgressBar;
 use secrecy::ExposeSecret;
 
+use crate::config::MediaExclusion;
 use crate::credential::{CredentialBackend, CredentialStore};
-use crate::types::{
-    Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LogLevel, PhotoResolution,
-    RawPolicy,
-};
+use crate::types::{Domain, FileMatchPolicy, LivePhotoMovFilenamePolicy, LogLevel};
 
 /// Result of the setup wizard — either the user wants to sync now or just exit.
 #[derive(Debug)]
@@ -63,23 +61,12 @@ struct SetupAnswers {
     /// picks specific albums and doesn't also want every other photo).
     /// `None` keeps the v0.13 default (`true`).
     unfiled: Option<bool>,
-    /// v0.13 `[filters].filename_exclude` patterns; empty = don't emit.
-    filename_exclude: Vec<String>,
 
     // Media types
-    skip_videos: bool,
-    /// `Some(_)` emits `[photos].live_photo_mode = "..."`; `None` keeps the
-    /// `Both` default. Replaces the wizard's old binary skip prompt.
-    live_photo_mode: Option<LivePhotoMode>,
+    exclude: Vec<MediaExclusion>,
     live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
 
-    // Quality
-    resolution: Option<PhotoResolution>,
-    force_resolution: bool,
-    raw_policy: Option<RawPolicy>,
-
     // Date range
-    recent: Option<u32>,
     skip_created_before: Option<String>,
     skip_created_after: Option<String>,
 
@@ -98,7 +85,14 @@ struct SetupAnswers {
     /// `parse_bandwidth_limit` on next sync. Empty = no limit.
     bandwidth_limit: Option<String>,
     keep_unicode_in_filenames: bool,
+    /// `[photos].edited_as_primary`: give edited renditions the ordinary
+    /// filename and archive originals under `_original`.
+    edited_as_primary: bool,
     set_exif_datetime: bool,
+    set_exif_orientation: bool,
+    set_exif_rating: bool,
+    set_exif_gps: bool,
+    set_exif_description: bool,
     #[cfg(feature = "xmp")]
     embed_xmp: bool,
     #[cfg(feature = "xmp")]
@@ -128,14 +122,8 @@ impl Default for SetupAnswers {
             smart_folders: Vec::new(),
             folder_structure_smart_folders: None,
             unfiled: None,
-            filename_exclude: Vec::new(),
-            skip_videos: false,
-            live_photo_mode: None,
+            exclude: Vec::new(),
             live_photo_mov_filename_policy: None,
-            resolution: None,
-            force_resolution: false,
-            raw_policy: None,
-            recent: None,
             skip_created_before: None,
             skip_created_after: None,
             watch_interval: None,
@@ -147,9 +135,14 @@ impl Default for SetupAnswers {
             max_retries: None,
             bandwidth_limit: None,
             keep_unicode_in_filenames: false,
-            set_exif_datetime: false,
+            edited_as_primary: false,
+            set_exif_datetime: true,
+            set_exif_orientation: true,
+            set_exif_rating: true,
+            set_exif_gps: true,
+            set_exif_description: true,
             #[cfg(feature = "xmp")]
-            embed_xmp: false,
+            embed_xmp: true,
             #[cfg(feature = "xmp")]
             xmp_sidecar: false,
             file_match_policy: None,
@@ -283,7 +276,6 @@ pub(crate) fn run_setup(
 
     // Step 6: Photo quality & RAW
     section_header("Quality");
-    ask_quality(&mut answers)?;
 
     // Step 7: Date range
     section_header("Date range");
@@ -849,39 +841,38 @@ fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
 
 fn ask_media_types(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     println!();
-    let include_videos = Confirm::new()
-        .with_prompt("Include videos along with photos?")
-        .default(true)
-        .interact()?;
-    answers.skip_videos = !include_videos;
-
-    // Four-way choice (matches the runtime `LivePhotoMode` enum). The old
-    // wizard only exposed Both vs Skip, hiding the image-only / video-only
-    // modes that the CLI surface and TOML accept.
-    let live_items = [
-        "Both: image + video (default)",
-        "Image only: skip the .mov video file",
-        "Video only: skip the still image",
-        "Skip live photos entirely",
+    println!(
+        "Selected media includes full-resolution originals, current edits and available RAW/JPEG renditions."
+    );
+    let components = [
+        MediaExclusion::Photos,
+        MediaExclusion::Videos,
+        MediaExclusion::LivePhotoStills,
+        MediaExclusion::LivePhotoVideos,
     ];
-    let live_choice = Select::new()
-        .with_prompt("How should live photos be downloaded?")
-        .items(live_items)
-        .default(0)
+    let excluded = MultiSelect::new()
+        .with_prompt("Exclude components (leave unchecked to include)")
+        .items([
+            "Ordinary photos",
+            "Ordinary videos",
+            "Live Photo stills",
+            "Live Photo videos",
+        ])
         .interact()?;
-    answers.live_photo_mode = match live_choice {
-        1 => Some(LivePhotoMode::ImageOnly),
-        2 => Some(LivePhotoMode::VideoOnly),
-        3 => Some(LivePhotoMode::Skip),
-        // `Both` is the default; leave as None so the emitted TOML keeps the
-        // commented hint instead of an explicit assignment.
-        _ => None,
-    };
+    anyhow::ensure!(
+        excluded.len() < components.len(),
+        "Leave at least one media component selected."
+    );
+    answers.exclude = excluded
+        .into_iter()
+        .filter_map(|index| components.get(index).copied())
+        .collect();
 
     // The .mov filename policy only matters when both image and video land
     // on disk together. Image-only / video-only / skip leave the .mov on its
     // own (or absent), so the suffix-vs-original choice is moot.
-    let download_both_parts = matches!(live_choice, 0);
+    let download_both_parts = !answers.exclude.contains(&MediaExclusion::LivePhotoStills)
+        && !answers.exclude.contains(&MediaExclusion::LivePhotoVideos);
     if download_both_parts {
         let mov_items = [
             "Add -live suffix (IMG_1234-live.mov)",
@@ -901,65 +892,12 @@ fn ask_media_types(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Step 5: Photo quality & RAW ────────────────────────────────────
-
-fn ask_quality(answers: &mut SetupAnswers) -> anyhow::Result<()> {
-    println!();
-    let size_items = ["Original (full resolution)", "Medium", "Thumbnail"];
-    let size = Select::new()
-        .with_prompt("What size should photos be downloaded at?")
-        .items(size_items)
-        .default(0)
-        .interact()?;
-
-    answers.resolution = match size {
-        1 => Some(PhotoResolution::Medium),
-        2 => Some(PhotoResolution::Thumb),
-        _ => None, // original is the default
-    };
-
-    // If not original, ask about fallback
-    if answers.resolution.is_some() {
-        let fallback = Confirm::new()
-            .with_prompt("If that size isn't available, fall back to original?")
-            .default(true)
-            .interact()?;
-        answers.force_resolution = !fallback;
-    }
-
-    println!();
-    let shoots_raw = Confirm::new()
-        .with_prompt("Do you shoot RAW?")
-        .default(false)
-        .interact()?;
-
-    if shoots_raw {
-        let raw_items = [
-            "Download both as-is",
-            "Prefer the RAW original",
-            "Prefer the processed JPEG",
-        ];
-        let raw_policy = Select::new()
-            .with_prompt("When both RAW and JPEG versions exist:")
-            .items(raw_items)
-            .default(0)
-            .interact()?;
-        answers.raw_policy = match raw_policy {
-            1 => Some(RawPolicy::PreferRaw),
-            2 => Some(RawPolicy::PreferJpeg),
-            _ => None, // as-is is the default
-        };
-    }
-
-    Ok(())
-}
-
 // ── Step 6: Date range ─────────────────────────────────────────────
 
 fn ask_date_range(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     println!();
     let limit = Confirm::new()
-        .with_prompt("Want to limit syncing to a specific date range or recent photos?")
+        .with_prompt("Want to limit syncing to a fixed capture-date range?")
         .default(false)
         .interact()?;
 
@@ -970,27 +908,15 @@ fn ask_date_range(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     answers.skip_created_before = date_prompt("Only sync photos created after")?;
     answers.skip_created_after = date_prompt("Only sync photos created before")?;
 
-    let recent: String = Input::new()
-        .with_prompt(
-            "Only consider the N most-recent assets per selected library/album/smart-folder pass (blank = all)",
-        )
-        .default(String::new())
-        .show_default(false)
-        .allow_empty(true)
-        .validate_with(|s: &String| parse_positive_or_blank::<u32>(s).map(|_| ()))
-        .interact_text()?;
-    if let Ok(Some(n)) = parse_positive_or_blank::<u32>(&recent) {
-        answers.recent = Some(n);
-    }
-
     Ok(())
 }
 
 /// One of the two date-range prompts (`skip_created_before` /
 /// `skip_created_after`). Returns the trimmed value or `None` for blank.
-/// The `(ISO date ...)` suffix is uniform across both prompts.
+/// The fixed-date syntax hint is uniform across both prompts.
 fn date_prompt(label: &str) -> anyhow::Result<Option<String>> {
-    let prompt = format!("{label} (ISO date, datetime, or Nd interval; blank = no limit)");
+    let prompt =
+        format!("{label} (YYYY-MM-DD or host-local YYYY-MM-DDTHH:MM:SS; blank = no limit)");
     let raw: String = Input::new()
         .with_prompt(prompt)
         .default(String::new())
@@ -1225,29 +1151,6 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         }
     }
 
-    // Exclusions: filename glob patterns applied across every pass.
-    println!();
-    let exclude = Confirm::new()
-        .with_prompt("Exclude files matching glob patterns (e.g. IMG_screenshot*.png)?")
-        .default(false)
-        .interact()?;
-    if exclude {
-        println!("  Enter one pattern per line. Press Enter on a blank line to finish.");
-        loop {
-            let pat: String = Input::new()
-                .with_prompt("Pattern (blank to finish)")
-                .default(String::new())
-                .show_default(false)
-                .allow_empty(true)
-                .interact_text()?;
-            let trimmed = pat.trim();
-            if trimmed.is_empty() {
-                break;
-            }
-            answers.filename_exclude.push(trimmed.to_string());
-        }
-    }
-
     // Filenames
     println!();
     answers.keep_unicode_in_filenames = Confirm::new()
@@ -1255,16 +1158,38 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         .default(false)
         .interact()?;
 
+    answers.edited_as_primary = Confirm::new()
+        .with_prompt("Give edited versions the original filename? (originals use _original)")
+        .default(false)
+        .interact()?;
+
     answers.set_exif_datetime = Confirm::new()
         .with_prompt("Write EXIF date tag if missing from photo?")
-        .default(false)
+        .default(true)
+        .interact()?;
+
+    answers.set_exif_orientation = Confirm::new()
+        .with_prompt("Fill missing orientation on proven untransformed JPEG/TIFF originals?")
+        .default(true)
+        .interact()?;
+    answers.set_exif_rating = Confirm::new()
+        .with_prompt("Write favourite/rating metadata?")
+        .default(true)
+        .interact()?;
+    answers.set_exif_gps = Confirm::new()
+        .with_prompt("Write location metadata if missing?")
+        .default(true)
+        .interact()?;
+    answers.set_exif_description = Confirm::new()
+        .with_prompt("Write description/caption metadata?")
+        .default(true)
         .interact()?;
 
     #[cfg(feature = "xmp")]
     {
         answers.embed_xmp = Confirm::new()
-            .with_prompt("Embed XMP metadata (rating, GPS, description) into photos?")
-            .default(false)
+            .with_prompt("Embed standard XMP title and keywords into supported files?")
+            .default(true)
             .interact()?;
 
         answers.xmp_sidecar = Confirm::new()
@@ -1333,6 +1258,8 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             Some(level) => writeln!(out, "log_level = \"{}\"", log_level_str(level))?,
             None => writeln!(out, "# log_level = \"warn\"")?,
         };
+
+        writeln!(out, "config_version = 1")?;
 
         // [auth]
         writeln!(out)?;
@@ -1435,26 +1362,29 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         // [metadata]
         writeln!(out)?;
         writeln!(out, "[metadata]")?;
-        if answers.set_exif_datetime {
-            writeln!(out, "set_exif_datetime = true")?;
-        } else {
-            writeln!(out, "# set_exif_datetime = false")?;
-        }
-        writeln!(out, "# set_exif_rating = false")?;
-        writeln!(out, "# set_exif_gps = false")?;
-        writeln!(out, "# set_exif_description = false")?;
+        writeln!(
+            out,
+            "# Enabled fields authorize updates to kei-managed files on later syncs."
+        )?;
+        writeln!(out, "set_exif_datetime = {}", answers.set_exif_datetime)?;
+        writeln!(
+            out,
+            "set_exif_orientation = {}",
+            answers.set_exif_orientation
+        )?;
+        writeln!(out, "set_exif_rating = {}", answers.set_exif_rating)?;
+        writeln!(out, "set_exif_gps = {}", answers.set_exif_gps)?;
+        writeln!(
+            out,
+            "set_exif_description = {}",
+            answers.set_exif_description
+        )?;
         #[cfg(feature = "xmp")]
         {
-            if answers.embed_xmp {
-                writeln!(out, "embed_xmp = true")?;
-            } else {
-                writeln!(out, "# embed_xmp = false")?;
-            }
-            if answers.xmp_sidecar {
-                writeln!(out, "xmp_sidecar = true")?;
-            } else {
-                writeln!(out, "# xmp_sidecar = false")?;
-            }
+            writeln!(out, "embed_xmp = {}", answers.embed_xmp)?;
+            writeln!(out, "xmp_sidecar = {}", answers.xmp_sidecar)?;
+            writeln!(out, "include_albums = false")?;
+            writeln!(out, "include_people = false")?;
         }
 
         // [filters]
@@ -1495,29 +1425,12 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             Some(true) => writeln!(out, "unfiled = true")?,
             None => writeln!(out, "# unfiled = true")?,
         };
-        if answers.filename_exclude.is_empty() {
-            writeln!(out, "# filename_exclude = []")?;
-        } else {
-            let pat_strs: Vec<String> = answers
-                .filename_exclude
-                .iter()
-                .map(|p| format!("\"{}\"", escape_toml_string(p)))
-                .collect();
-            writeln!(out, "filename_exclude = [{}]", pat_strs.join(", "))?;
-        }
-        if answers.skip_videos {
-            writeln!(out, "media = [\"photos\", \"live-photos\"]")?;
-        } else {
-            writeln!(out, "# media = [\"photos\", \"videos\", \"live-photos\"]")?;
-        }
-        // `live_photo_mode` is emitted in the [photos] section below.
-        match answers.recent {
-            Some(n) => writeln!(out, "recent = {n}")?,
-            None => writeln!(
-                out,
-                "# recent = 0  # 0 = all; cap applies per selected library/album/smart-folder pass"
-            )?,
-        };
+        let exclusions: Vec<String> = answers
+            .exclude
+            .iter()
+            .map(|kind| format!("\"{}\"", kind.as_str()))
+            .collect();
+        writeln!(out, "exclude = [{}]", exclusions.join(", "))?;
         match &answers.skip_created_before {
             Some(d) => writeln!(out, "skip_created_before = \"{}\"", escape_toml_string(d))?,
             None => writeln!(out, "# skip_created_before = \"\"")?,
@@ -1530,17 +1443,6 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         // [photos]
         writeln!(out)?;
         writeln!(out, "[photos]")?;
-        match answers.resolution {
-            Some(size) => writeln!(out, "resolution = \"{}\"", version_size_str(size))?,
-            None => writeln!(out, "# resolution = \"original\"")?,
-        };
-        writeln!(out, "# edited = false")?;
-        writeln!(out, "# alternative = false")?;
-        writeln!(out, "# live_resolution = \"original\"")?;
-        match answers.live_photo_mode {
-            Some(mode) => writeln!(out, "live_photo_mode = \"{}\"", live_photo_mode_str(mode))?,
-            None => writeln!(out, "# live_photo_mode = \"both\"")?,
-        };
         match answers.live_photo_mov_filename_policy {
             Some(p) => writeln!(
                 out,
@@ -1549,23 +1451,19 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             )?,
             None => writeln!(out, "# live_photo_mov_filename_policy = \"suffix\"")?,
         };
-        match answers.raw_policy {
-            Some(p) => writeln!(out, "raw_policy = \"{}\"", raw_policy_str(p))?,
-            None => writeln!(out, "# raw_policy = \"as-is\"")?,
-        };
         match answers.file_match_policy {
             Some(p) => writeln!(out, "file_match_policy = \"{}\"", file_match_str(p))?,
             None => writeln!(out, "# file_match_policy = \"name-size-dedup-with-suffix\"")?,
         };
-        if answers.force_resolution {
-            writeln!(out, "force_resolution = true")?;
-        } else {
-            writeln!(out, "# force_resolution = false")?;
-        }
         if answers.keep_unicode_in_filenames {
             writeln!(out, "keep_unicode_in_filenames = true")?;
         } else {
             writeln!(out, "# keep_unicode_in_filenames = false")?;
+        }
+        if answers.edited_as_primary {
+            writeln!(out, "edited_as_primary = true")?;
+        } else {
+            writeln!(out, "# edited_as_primary = false")?;
         }
 
         // [watch]
@@ -1638,38 +1536,10 @@ fn log_level_str(level: LogLevel) -> &'static str {
     }
 }
 
-fn version_size_str(size: PhotoResolution) -> &'static str {
-    match size {
-        PhotoResolution::None => "none",
-        PhotoResolution::Original => "original",
-        PhotoResolution::Medium => "medium",
-        PhotoResolution::Thumb => "thumb",
-    }
-}
-
 fn mov_policy_str(policy: LivePhotoMovFilenamePolicy) -> &'static str {
     match policy {
         LivePhotoMovFilenamePolicy::Suffix => "suffix",
         LivePhotoMovFilenamePolicy::Original => "original",
-    }
-}
-
-fn live_photo_mode_str(mode: LivePhotoMode) -> &'static str {
-    // Must match the kebab-case rename in `LivePhotoMode`'s `Deserialize`
-    // (`#[serde(rename_all = "kebab-case")]`).
-    match mode {
-        LivePhotoMode::Both => "both",
-        LivePhotoMode::ImageOnly => "image-only",
-        LivePhotoMode::VideoOnly => "video-only",
-        LivePhotoMode::Skip => "skip",
-    }
-}
-
-fn raw_policy_str(policy: RawPolicy) -> &'static str {
-    match policy {
-        RawPolicy::AsIs => "as-is",
-        RawPolicy::PreferRaw => "prefer-raw",
-        RawPolicy::PreferJpeg => "prefer-jpeg",
     }
 }
 
@@ -1682,9 +1552,50 @@ fn file_match_str(policy: FileMatchPolicy) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn setup_standard_metadata_defaults_are_explicit_and_opt_outs_stay_false() {
+        for enabled in [true, false] {
+            let answers = super::SetupAnswers {
+                set_exif_datetime: enabled,
+                set_exif_orientation: enabled,
+                set_exif_rating: enabled,
+                set_exif_gps: enabled,
+                set_exif_description: enabled,
+                #[cfg(feature = "xmp")]
+                embed_xmp: enabled,
+                ..super::SetupAnswers::default()
+            };
+            let parsed: crate::config::TomlConfig =
+                toml::from_str(&super::generate_toml(&answers)).unwrap();
+            assert_eq!(parsed.config_version, Some(1));
+            let metadata = parsed.metadata.unwrap();
+            assert_eq!(metadata.set_exif_datetime, Some(enabled));
+            assert_eq!(metadata.set_exif_orientation, Some(enabled));
+            assert_eq!(metadata.set_exif_rating, Some(enabled));
+            assert_eq!(metadata.set_exif_gps, Some(enabled));
+            assert_eq!(metadata.set_exif_description, Some(enabled));
+            #[cfg(feature = "xmp")]
+            {
+                assert_eq!(metadata.embed_xmp, Some(enabled));
+                assert_eq!(metadata.xmp_sidecar, Some(false));
+                assert_eq!(metadata.include_albums, Some(false));
+                assert_eq!(metadata.include_people, Some(false));
+            }
+        }
+        let defaults = super::SetupAnswers::default();
+        assert!(defaults.set_exif_orientation);
+        assert!(
+            defaults.set_exif_datetime
+                && defaults.set_exif_rating
+                && defaults.set_exif_gps
+                && defaults.set_exif_description
+        );
+        #[cfg(feature = "xmp")]
+        assert!(defaults.embed_xmp);
+    }
+
     use super::*;
     use crate::config::TomlConfig;
-    use crate::types::LivePhotoMode;
 
     #[test]
     fn dim_comments_preserves_toml_text_while_styling_comments_and_sections() {
@@ -1791,6 +1702,7 @@ mod tests {
         let answers = SetupAnswers {
             username: "user@example.com".to_string(),
             password: secrecy::SecretString::from("secret"),
+            set_exif_orientation: true,
             directory: "~/Photos/iCloud".to_string(),
             ..Default::default()
         };
@@ -1807,7 +1719,8 @@ mod tests {
         // Password should NOT be in the TOML
         assert!(!toml.contains("secret"));
         // Defaults should be commented out
-        assert!(toml.contains("# resolution = \"original\""));
+        assert!(toml.contains("config_version = 1"));
+        assert!(toml.contains("exclude = []"));
         assert!(toml.contains("# threads = 10"));
         assert!(toml.contains("# log_level = \"warn\""));
         assert!(toml.contains("# data_dir = \"~/.config/kei\""));
@@ -2100,6 +2013,7 @@ mod tests {
     #[test]
     fn test_generate_toml_full() {
         let answers = SetupAnswers {
+            set_exif_orientation: true,
             username: "user@example.com".to_string(),
             password: secrecy::SecretString::from("secret"),
             domain: Some(Domain::Cn),
@@ -2112,14 +2026,8 @@ mod tests {
             smart_folders: vec!["all".to_string()],
             folder_structure_smart_folders: None,
             unfiled: Some(false),
-            filename_exclude: vec!["IMG_screenshot*.png".to_string()],
-            skip_videos: true,
-            live_photo_mode: Some(LivePhotoMode::Both),
+            exclude: vec![MediaExclusion::Videos],
             live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
-            resolution: Some(PhotoResolution::Medium),
-            force_resolution: true,
-            raw_policy: Some(RawPolicy::PreferRaw),
-            recent: Some(100),
             skip_created_before: Some("2024-01-01".to_string()),
             skip_created_after: Some("2025-01-01".to_string()),
             watch_interval: Some(1800),
@@ -2131,9 +2039,13 @@ mod tests {
             max_retries: Some(5),
             bandwidth_limit: Some("10MB".to_string()),
             keep_unicode_in_filenames: true,
+            edited_as_primary: true,
             set_exif_datetime: true,
             #[cfg(feature = "xmp")]
             embed_xmp: true,
+            set_exif_rating: true,
+            set_exif_gps: true,
+            set_exif_description: true,
             #[cfg(feature = "xmp")]
             xmp_sidecar: false,
             file_match_policy: Some(FileMatchPolicy::NameId7),
@@ -2151,15 +2063,10 @@ mod tests {
         assert!(toml_str.contains("libraries = [\"all\"]"));
         assert!(toml_str.contains("smart_folders = [\"all\"]"));
         assert!(toml_str.contains("unfiled = false"));
-        assert!(toml_str.contains("filename_exclude = [\"IMG_screenshot*.png\"]"));
-        assert!(toml_str.contains("media = [\"photos\", \"live-photos\"]"));
-        assert!(toml_str.contains("resolution = \"medium\""));
-        // live_photo_mode = "both" is the default; emitting it explicitly is
-        // also fine, but the test above sets `Some(Both)` so we expect it.
-        assert!(toml_str.contains("live_photo_mode = \"both\""));
-        assert!(toml_str.contains("force_resolution = true"));
-        assert!(toml_str.contains("raw_policy = \"prefer-raw\""));
-        assert!(toml_str.contains("recent = 100"));
+        assert!(!toml_str.contains("filename_exclude"));
+        assert!(toml_str.contains("exclude = [\"videos\"]"));
+        assert!(toml_str.contains("config_version = 1"));
+        assert!(!toml_str.contains("recent ="));
         assert!(toml_str.contains("interval = 1800"));
         assert!(toml_str.contains("notify_systemd = true"));
         assert!(toml_str.contains("reconcile_every_n_cycles = 24"));
@@ -2171,10 +2078,10 @@ mod tests {
         #[cfg(feature = "xmp")]
         {
             assert!(toml_str.contains("embed_xmp = true"));
-            // `xmp_sidecar = false` here means it's commented out, not active.
-            assert!(toml_str.contains("# xmp_sidecar = false"));
+            assert!(toml_str.contains("\nxmp_sidecar = false"));
         }
         assert!(toml_str.contains("keep_unicode_in_filenames = true"));
+        assert!(toml_str.contains("edited_as_primary = true"));
         assert!(toml_str.contains("data_dir = \"~/.kei\""));
         assert!(toml_str.contains("script = \"/usr/local/bin/notify.sh\""));
 
@@ -2188,6 +2095,7 @@ mod tests {
         let answers = SetupAnswers {
             username: "test@icloud.com".to_string(),
             password: secrecy::SecretString::from("pw"),
+            set_exif_orientation: true,
             domain: Some(Domain::Cn),
             secret_source: SetupSecretSource::CredentialStore,
             directory: "/data/photos".to_string(),
@@ -2198,15 +2106,13 @@ mod tests {
             smart_folders: vec!["Favorites".to_string()],
             folder_structure_smart_folders: None,
             unfiled: Some(false),
-            filename_exclude: vec!["*.tmp".to_string()],
-            skip_videos: true,
-            live_photo_mode: Some(LivePhotoMode::Skip),
+            exclude: vec![
+                MediaExclusion::Videos,
+                MediaExclusion::LivePhotoStills,
+                MediaExclusion::LivePhotoVideos,
+            ],
             live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
-            resolution: Some(PhotoResolution::Thumb),
-            force_resolution: true,
-            raw_policy: Some(RawPolicy::PreferJpeg),
-            recent: Some(50),
-            skip_created_before: Some("30d".to_string()),
+            skip_created_before: Some("2024-01-01".to_string()),
             skip_created_after: Some("2025-06-01".to_string()),
             watch_interval: Some(600),
             notify_systemd: true,
@@ -2217,9 +2123,13 @@ mod tests {
             max_retries: Some(0),
             bandwidth_limit: Some("1Mi".to_string()),
             keep_unicode_in_filenames: true,
+            edited_as_primary: true,
             set_exif_datetime: true,
             #[cfg(feature = "xmp")]
             embed_xmp: true,
+            set_exif_rating: true,
+            set_exif_gps: true,
+            set_exif_description: true,
             #[cfg(feature = "xmp")]
             xmp_sidecar: true,
             file_match_policy: Some(FileMatchPolicy::NameId7),
@@ -2259,38 +2169,22 @@ mod tests {
             Some(&["Favorites".to_string()][..])
         );
         assert_eq!(filters.unfiled, Some(false));
-        assert_eq!(
-            filters.filename_exclude.as_deref(),
-            Some(&["*.tmp".to_string()][..])
-        );
-        assert_eq!(
-            filters.media.as_deref(),
-            Some(
-                &[
-                    crate::config::MediaKind::Photos,
-                    crate::config::MediaKind::LivePhotos,
-                ][..]
-            )
-        );
+        assert_eq!(filters.exclude.as_deref(), Some(answers.exclude.as_slice()));
         assert!(
             filters.libraries.is_none(),
             "empty libraries vec must produce a comment, not an array"
         );
-        assert_eq!(filters.recent, Some(crate::cli::RecentLimit::Count(50)));
-        assert_eq!(filters.skip_created_before.as_deref(), Some("30d"));
+        assert_eq!(filters.skip_created_before.as_deref(), Some("2024-01-01"));
         assert_eq!(filters.skip_created_after.as_deref(), Some("2025-06-01"));
 
         let photos = parsed.photos.unwrap();
-        assert_eq!(photos.resolution, Some(PhotoResolution::Thumb));
-        assert_eq!(photos.force_resolution, Some(true));
-        assert_eq!(photos.raw_policy, Some(RawPolicy::PreferJpeg));
         assert_eq!(
             photos.live_photo_mov_filename_policy,
             Some(LivePhotoMovFilenamePolicy::Original)
         );
-        assert_eq!(photos.live_photo_mode, Some(LivePhotoMode::Skip));
         assert_eq!(photos.file_match_policy, Some(FileMatchPolicy::NameId7));
         assert_eq!(photos.keep_unicode_in_filenames, Some(true));
+        assert_eq!(photos.edited_as_primary, Some(true));
 
         let watch = parsed.watch.unwrap();
         assert_eq!(watch.interval, Some(600));
@@ -2346,13 +2240,12 @@ mod tests {
                 smart_folders: vec!["all".to_string()],
                 folder_structure_smart_folders: None,
                 unfiled: Some(false),
-                filename_exclude: vec!["*.tmp".to_string()],
-                skip_videos: true,
-                live_photo_mode: Some(LivePhotoMode::Skip),
+                exclude: vec![
+                    MediaExclusion::Videos,
+                    MediaExclusion::LivePhotoStills,
+                    MediaExclusion::LivePhotoVideos,
+                ],
                 live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
-                resolution: Some(PhotoResolution::Thumb),
-                force_resolution: true,
-                raw_policy: Some(RawPolicy::PreferJpeg),
                 bandwidth_limit: Some("10MB".to_string()),
                 reconcile_every_n_cycles: Some(24),
                 set_exif_datetime: true,
@@ -2371,6 +2264,15 @@ mod tests {
         // `key = ` (with the equals sign) so we don't false-positive on
         // comment hints or substring matches inside another key.
         const REMOVED_KEYS: &[(&str, &str)] = &[
+            ("resolution =", "full-resolution renditions are fixed"),
+            ("edited =", "current edits are included"),
+            (
+                "alternative =",
+                "available RAW/JPEG renditions are included",
+            ),
+            ("raw_policy =", "provider rendition identities are fixed"),
+            ("live_photo_mode =", "use filters.exclude"),
+            ("media =", "use filters.exclude"),
             (
                 "cookie_directory =",
                 "[auth].cookie_directory -> top-level data_dir",
@@ -2515,31 +2417,25 @@ mod tests {
         assert!(toml_str.contains("# folder_structure_albums = \"{album}\""));
     }
 
-    /// The wizard must be able to emit every `LivePhotoMode` value the
-    /// runtime accepts. The pre-fix wizard only exposed Both vs Skip, hiding
-    /// `image-only` and `video-only` from interactive setup.
     #[test]
-    fn test_live_photo_mode_emits_every_runtime_variant() {
-        for (mode, expected) in [
-            (LivePhotoMode::Both, "live_photo_mode = \"both\""),
-            (LivePhotoMode::ImageOnly, "live_photo_mode = \"image-only\""),
-            (LivePhotoMode::VideoOnly, "live_photo_mode = \"video-only\""),
-            (LivePhotoMode::Skip, "live_photo_mode = \"skip\""),
+    fn test_component_exclusions_emit_every_choice() {
+        for component in [
+            MediaExclusion::Photos,
+            MediaExclusion::Videos,
+            MediaExclusion::LivePhotoStills,
+            MediaExclusion::LivePhotoVideos,
         ] {
             let answers = SetupAnswers {
                 username: "u@e.com".to_string(),
                 password: secrecy::SecretString::from("p"),
                 directory: "/d".to_string(),
-                live_photo_mode: Some(mode),
+                exclude: vec![component],
                 ..Default::default()
             };
             let toml_str = generate_toml(&answers);
-            assert!(
-                toml_str.contains(expected),
-                "expected `{expected}` for mode {mode:?}; got:\n{toml_str}"
-            );
             let parsed: TomlConfig = toml::from_str(&toml_str).expect("must parse");
-            assert_eq!(parsed.photos.unwrap().live_photo_mode, Some(mode));
+            assert_eq!(parsed.filters.unwrap().exclude, Some(vec![component]));
+            assert_eq!(parsed.config_version, Some(1));
         }
     }
 
@@ -2588,13 +2484,6 @@ mod tests {
     fn test_generate_toml_enum_values() {
         // Verify each enum serializes to the correct TOML string that
         // the config parser expects.
-        assert_eq!(version_size_str(PhotoResolution::Original), "original");
-        assert_eq!(version_size_str(PhotoResolution::Medium), "medium");
-        assert_eq!(version_size_str(PhotoResolution::Thumb), "thumb");
-
-        assert_eq!(raw_policy_str(RawPolicy::AsIs), "as-is");
-        assert_eq!(raw_policy_str(RawPolicy::PreferRaw), "prefer-raw");
-        assert_eq!(raw_policy_str(RawPolicy::PreferJpeg), "prefer-jpeg");
 
         assert_eq!(
             file_match_str(FileMatchPolicy::NameSizeDedupWithSuffix),
@@ -2607,11 +2496,6 @@ mod tests {
             mov_policy_str(LivePhotoMovFilenamePolicy::Original),
             "original"
         );
-
-        assert_eq!(live_photo_mode_str(LivePhotoMode::Both), "both");
-        assert_eq!(live_photo_mode_str(LivePhotoMode::ImageOnly), "image-only");
-        assert_eq!(live_photo_mode_str(LivePhotoMode::VideoOnly), "video-only");
-        assert_eq!(live_photo_mode_str(LivePhotoMode::Skip), "skip");
 
         assert_eq!(log_level_str(LogLevel::Debug), "debug");
         assert_eq!(log_level_str(LogLevel::Info), "info");
@@ -2797,9 +2681,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_date_or_blank_accepts_relative_interval() {
-        assert!(validate_date_or_blank("30d").is_ok());
-        assert!(validate_date_or_blank("1d").is_ok());
+    fn validate_date_or_blank_rejects_relative_interval_with_resolution() {
+        for value in ["30d", "1d", " 30d "] {
+            let err = validate_date_or_blank(value).unwrap_err();
+            assert!(
+                err.contains("Relative date windows are no longer supported"),
+                "{err}"
+            );
+            assert!(err.contains("Remove this date limit"), "{err}");
+            assert!(err.contains("YYYY-MM-DD"), "{err}");
+        }
     }
 
     #[test]

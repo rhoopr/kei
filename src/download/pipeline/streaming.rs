@@ -416,6 +416,7 @@ where
         state_db: state_db.clone(),
         pb: pb.clone(),
         pipeline_shutdown: pipeline_shutdown.clone(),
+        cycle_shutdown: shutdown_token.clone(),
     };
     let producer = spawn_stream_download_producer(
         download_client.clone(),

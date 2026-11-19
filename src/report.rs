@@ -100,11 +100,14 @@ pub(crate) struct RunOptions {
     pub skip_videos: bool,
     pub skip_photos: bool,
     pub set_exif_datetime: bool,
+    pub set_exif_orientation: bool,
     pub set_exif_rating: bool,
     pub set_exif_gps: bool,
     pub set_exif_description: bool,
     pub embed_xmp: bool,
     pub xmp_sidecar: bool,
+    pub include_albums: bool,
+    pub include_people: bool,
     pub threads: u16,
     pub dry_run: bool,
 }
@@ -135,6 +138,7 @@ impl RunOptions {
             skip_videos: config.filters.skip_videos,
             skip_photos: config.filters.skip_photos,
             set_exif_datetime: config.metadata.set_exif_datetime,
+            set_exif_orientation: config.metadata.set_exif_orientation,
             set_exif_rating: config.metadata.set_exif_rating,
             set_exif_gps: config.metadata.set_exif_gps,
             set_exif_description: config.metadata.set_exif_description,
@@ -146,6 +150,14 @@ impl RunOptions {
             xmp_sidecar: config.metadata.xmp_sidecar,
             #[cfg(not(feature = "xmp"))]
             xmp_sidecar: false,
+            #[cfg(feature = "xmp")]
+            include_albums: config.metadata.include_albums,
+            #[cfg(not(feature = "xmp"))]
+            include_albums: false,
+            #[cfg(feature = "xmp")]
+            include_people: config.metadata.include_people,
+            #[cfg(not(feature = "xmp"))]
+            include_people: false,
             threads: config.download.threads_num,
             dry_run: config.runtime.dry_run,
         }
@@ -211,6 +223,7 @@ mod tests {
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "success".to_string(),
             options: RunOptions {
+                set_exif_orientation: false,
                 username: "user@example.com".to_string(),
                 download_dir: PathBuf::from("/photos"),
                 folder_structure: "{:%Y/%m/%d}".to_string(),
@@ -234,6 +247,8 @@ mod tests {
                 set_exif_description: false,
                 embed_xmp: false,
                 xmp_sidecar: false,
+                include_albums: false,
+                include_people: false,
                 threads: 4,
                 dry_run: false,
             },
@@ -300,6 +315,7 @@ mod tests {
     fn run_options_from_config_uses_schema_v2_option_names() {
         let download_dir = tempfile::tempdir().expect("download dir");
         let globals = crate::config::GlobalArgs {
+            config_source: Default::default(),
             username: Some("report@example.com".to_string()),
             domain: None,
             data_dir: None,
@@ -344,6 +360,7 @@ mod tests {
     fn run_options_from_config_reports_media_selection() {
         let download_dir = tempfile::tempdir().expect("download dir");
         let globals = crate::config::GlobalArgs {
+            config_source: Default::default(),
             username: Some("report@example.com".to_string()),
             domain: None,
             data_dir: None,
@@ -356,7 +373,7 @@ mod tests {
             ..crate::cli::SyncArgs::default()
         };
         let toml: crate::config::TomlConfig =
-            toml::from_str("[filters]\nmedia = [\"photos\", \"videos\"]\n")
+            toml::from_str("[filters]\nexclude = ['live-photo-stills', 'live-photo-videos']\n")
                 .expect("parse media config");
         let config = crate::config::Config::build(
             &globals,
@@ -393,6 +410,7 @@ mod tests {
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "success".to_string(),
             options: RunOptions {
+                set_exif_orientation: false,
                 username: "u".to_string(),
                 download_dir: PathBuf::from("/x"),
                 folder_structure: String::new(),
@@ -416,6 +434,8 @@ mod tests {
                 set_exif_description: false,
                 embed_xmp: false,
                 xmp_sidecar: false,
+                include_albums: false,
+                include_people: false,
                 threads: 1,
                 dry_run: false,
             },
@@ -447,6 +467,7 @@ mod tests {
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "partial_failure".to_string(),
             options: RunOptions {
+                set_exif_orientation: false,
                 username: "u".to_string(),
                 download_dir: PathBuf::from("/x"),
                 folder_structure: String::new(),
@@ -470,6 +491,8 @@ mod tests {
                 set_exif_description: false,
                 embed_xmp: false,
                 xmp_sidecar: false,
+                include_albums: false,
+                include_people: false,
                 threads: 1,
                 dry_run: false,
             },
@@ -496,6 +519,7 @@ mod tests {
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "partial_failure".to_string(),
             options: RunOptions {
+                set_exif_orientation: false,
                 username: "u".to_string(),
                 download_dir: PathBuf::from("/x"),
                 folder_structure: String::new(),
@@ -519,6 +543,8 @@ mod tests {
                 set_exif_description: false,
                 embed_xmp: false,
                 xmp_sidecar: false,
+                include_albums: false,
+                include_people: false,
                 threads: 1,
                 dry_run: false,
             },
@@ -546,6 +572,7 @@ mod tests {
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "success".to_string(),
             options: RunOptions {
+                set_exif_orientation: false,
                 username: "test@example.com".to_string(),
                 download_dir: PathBuf::from("/tmp/photos"),
                 folder_structure: "{:%Y/%m/%d}".to_string(),
@@ -569,6 +596,8 @@ mod tests {
                 set_exif_description: false,
                 embed_xmp: false,
                 xmp_sidecar: false,
+                include_albums: false,
+                include_people: false,
                 threads: 3,
                 dry_run: false,
             },

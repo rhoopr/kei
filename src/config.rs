@@ -10,7 +10,11 @@ mod paths;
 mod persistence;
 mod resolve;
 mod runtime;
+mod source;
 mod templates;
+
+pub(crate) use input::load_toml_config_with_source;
+pub(crate) use source::ConfigSource;
 
 #[cfg(test)]
 mod test_support;
@@ -51,7 +55,7 @@ pub use runtime::{
     MetadataConfig, NotificationConfig, PhotoConfig, ReportConfig, ResolvedRetryConfig,
     RuntimeConfig, ServerConfig, UiConfig, WatchConfig,
 };
-pub(crate) use runtime::{MediaKind, MediaSelection, parse_created_date_filter};
+pub(crate) use runtime::{MediaExclusion, MediaKind, MediaSelection, parse_created_date_filter};
 #[cfg_attr(
     not(test),
     expect(

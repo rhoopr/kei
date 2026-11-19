@@ -11,6 +11,477 @@ use std::sync::Arc;
 use xmp_toolkit::{XmpMeta, xmp_ns};
 
 #[tokio::test]
+async fn original_orientation_requires_byte_proven_unrendered_pixels_and_is_fill_only() {
+    use crate::state::VersionSizeKey;
+    use little_exif::{exif_tag::ExifTag, metadata::Metadata};
+    use serde_json::json;
+
+    for (extension, file_type, source) in [
+        (
+            "jpg",
+            "public.jpeg",
+            include_bytes!("../../../../tests/data/media/pattern.jpg").to_vec(),
+        ),
+        ("tif", "public.tiff", orientation_test_tiff()),
+    ] {
+        for scenario in [
+            "original",
+            "edited",
+            "asset-resource",
+            "unobserved",
+            "existing",
+            "unproven-bytes",
+            "disabled",
+            "invalid",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("original.{extension}"));
+            std::fs::write(&path, &source).unwrap();
+            let mut native = Metadata::new_from_path(&path).unwrap_or_else(|_| Metadata::new());
+            native.set_tag(ExifTag::ImageDescription("camera caption".into()));
+            if extension == "tif" {
+                let resolution = little_exif::rational::uR64 {
+                    nominator: 72,
+                    denominator: 1,
+                };
+                native.set_tag(ExifTag::XResolution(vec![resolution.clone()]));
+                native.set_tag(ExifTag::YResolution(vec![resolution]));
+                native.set_tag(ExifTag::ResolutionUnit(vec![2]));
+            }
+            if scenario == "existing" {
+                native.set_tag(ExifTag::Orientation(vec![3]));
+            }
+            native.write_to_file(&path).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let pixels = orientation_test_pixels(&before, extension);
+            let resource = json!({"value":{"size":before.len(),"fileChecksum":"original-resource","downloadURL":"https://example.invalid/original"}});
+            let mut master = json!({"recordName":"MASTER", "fields":{
+                "itemType":{"value":file_type}, "resOriginalFileType":{"value":file_type},
+                "resOriginalRes":resource, "originalOrientation":{"value":6}
+            }});
+            let mut asset = json!({"recordName":"ASSET", "fields":{
+                "orientation":{"value":1}, "resJPEGFullRes":resource,
+                "resJPEGFullFileType":{"value":file_type}
+            }});
+            if scenario == "asset-resource" {
+                asset["fields"]["resOriginalRes"] = resource;
+            }
+            if scenario == "unobserved" {
+                master["fields"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("originalOrientation");
+            }
+            if scenario == "invalid" {
+                master["fields"]["originalOrientation"]["value"] = json!(9);
+            }
+            let photo = crate::icloud::photos::PhotoAsset::new(master, asset);
+            let mut config = crate::download::DownloadConfig::test_default();
+            config.metadata.set_exif_orientation = scenario != "disabled";
+            let version = if scenario == "edited" {
+                VersionSizeKey::Adjusted
+            } else {
+                VersionSizeKey::Original
+            };
+            let payload = crate::download::filter::build_selected_payload(&photo, &config, version);
+            let raw = crate::download::file::compute_sha256(&path).await.unwrap();
+            let source_checksum = if scenario == "unproven-bytes" {
+                None
+            } else {
+                Some(raw.as_str())
+            };
+            for attempt in 0..3 {
+                let prior = std::fs::read(&path).unwrap();
+                let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+                let fingerprint = crate::download::file::fingerprint_regular_file(&path)
+                    .await
+                    .unwrap();
+                let result = write_download_metadata(MetadataWriteRequest {
+                    final_path: &path,
+                    embed_path: Some(&path),
+                    expected_embed_fingerprint: Some(fingerprint),
+                    source_checksum,
+                    sidecar_path: None,
+                    payload: Arc::clone(&payload),
+                    created_local: now_local(),
+                    flags: MetadataFlags::from(&config),
+                    capture_timestamp_repair: CaptureTimestampRepair::Preserve,
+                    temp_suffix: ".orientation-test",
+                })
+                .await;
+                assert!(!result.any_failed(), "{extension}/{scenario}/{attempt}");
+                let after = std::fs::read(&path).unwrap();
+                assert_eq!(orientation_test_pixels(&after, extension), pixels);
+                let native = Metadata::new_from_path(&path).unwrap();
+                assert!(
+                    matches!(native.get_tag(&ExifTag::ImageDescription(String::new())).next(),
+                    Some(ExifTag::ImageDescription(value)) if value == "camera caption")
+                );
+                let orientation = native.get_tag(&ExifTag::Orientation(vec![])).next();
+                match scenario {
+                    "original" => assert!(
+                        matches!(orientation, Some(ExifTag::Orientation(value)) if value == &[6]),
+                        "{extension}: {orientation:?}"
+                    ),
+                    "existing" => assert!(
+                        matches!(orientation, Some(ExifTag::Orientation(value)) if value == &[3])
+                    ),
+                    _ => assert!(orientation.is_none(), "{extension}/{scenario}"),
+                }
+                if attempt > 0 || scenario != "original" {
+                    assert_eq!(after, prior, "{extension}/{scenario}/{attempt}");
+                    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+                }
+            }
+        }
+    }
+}
+
+fn orientation_test_tiff() -> Vec<u8> {
+    let mut bytes = b"II*\0\x08\0\0\0".to_vec();
+    let entries = [
+        (256_u16, 4_u16, 1_u32, 2_u32),
+        (257, 4, 1, 1),
+        (258, 3, 3, 122),
+        (259, 3, 1, 1),
+        (262, 3, 1, 2),
+        (273, 4, 1, 128),
+        (277, 3, 1, 3),
+        (278, 4, 1, 1),
+        (279, 4, 1, 6),
+    ];
+    bytes.extend_from_slice(&9_u16.to_le_bytes());
+    for (tag, kind, count, value) in entries {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&kind.to_le_bytes());
+        bytes.extend_from_slice(&count.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(&[8, 0, 8, 0, 8, 0, 10, 20, 30, 40, 50, 60]);
+    bytes
+}
+
+#[cfg(feature = "xmp")]
+#[test]
+fn clearing_owned_xmp_preserves_identical_unowned_native_description() {
+    use crate::download::metadata::{MetadataWrite, prepare_metadata_with_expected_fingerprint};
+    use little_exif::{exif_tag::ExifTag, metadata::Metadata};
+    use xmp_toolkit::{OpenFileOptions, XmpFile, xmp_ns};
+    for (extension, bytes) in [
+        (
+            "jpg",
+            include_bytes!("../../../../tests/data/media/pattern.jpg").to_vec(),
+        ),
+        ("tif", orientation_test_tiff()),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("peer.{extension}"));
+        std::fs::write(&path, bytes).unwrap();
+        let write = |text: &str| MetadataWrite {
+            description: Some(text.into()),
+            ..Default::default()
+        };
+        prepare_metadata_with_expected_fingerprint(&path, &write("A"), ".peer", None)
+            .unwrap()
+            .publish(&path)
+            .unwrap();
+        let mut native = Metadata::new_from_path(&path).unwrap();
+        native.set_tag(ExifTag::ImageDescription("B".into()));
+        native.set_tag(ExifTag::Artist("camera artist".into()));
+        if extension == "tif" {
+            let resolution = little_exif::rational::uR64 {
+                nominator: 72,
+                denominator: 1,
+            };
+            native.set_tag(ExifTag::XResolution(vec![resolution.clone()]));
+            native.set_tag(ExifTag::YResolution(vec![resolution]));
+            native.set_tag(ExifTag::ResolutionUnit(vec![2]));
+        }
+        native.write_to_file(&path).unwrap();
+        let pixels = orientation_test_pixels(&std::fs::read(&path).unwrap(), extension);
+        let prepared =
+            prepare_metadata_with_expected_fingerprint(&path, &write("B"), ".peer", None).unwrap();
+        let fields = (*prepared.embedded_fields).clone();
+        assert_eq!(fields.description.as_deref(), Some("B"));
+        assert!(
+            fields.native_description.is_none(),
+            "identical native text is not owned"
+        );
+        prepared.publish(&path).unwrap();
+        let clear = MetadataWrite {
+            prior_embedded: fields.clone(),
+            clear_embedded: fields,
+            ..Default::default()
+        };
+        prepare_metadata_with_expected_fingerprint(&path, &clear, ".peer", None)
+            .unwrap()
+            .publish(&path)
+            .unwrap();
+        let native = Metadata::new_from_path(&path).unwrap();
+        assert!(
+            matches!(native.get_tag(&ExifTag::ImageDescription(String::new())).next(),Some(ExifTag::ImageDescription(value)) if value=="B")
+        );
+        assert!(
+            matches!(native.get_tag(&ExifTag::Artist(String::new())).next(),Some(ExifTag::Artist(value)) if value=="camera artist")
+        );
+        let mut packet = XmpFile::new().unwrap();
+        packet
+            .open_file(&path, OpenFileOptions::default().use_packet_scanning())
+            .unwrap();
+        let meta = packet.xmp().unwrap();
+        assert!(!meta.contains_property(xmp_ns::DC, "description"));
+        assert_eq!(
+            orientation_test_pixels(&std::fs::read(&path).unwrap(), extension),
+            pixels
+        );
+    }
+}
+
+#[test]
+fn embedded_field_evidence_preserves_identical_native_companions_and_pixels() {
+    use crate::download::metadata::{GpsCoords, MetadataWrite};
+    use little_exif::{exif_tag::ExifTag, ifd::ExifTagGroup, metadata::Metadata};
+    for (extension, bytes) in [
+        (
+            "jpg",
+            include_bytes!("../../../../tests/data/media/pattern.jpg").to_vec(),
+        ),
+        ("tif", orientation_test_tiff()),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("proof.{extension}"));
+        std::fs::write(&path, bytes).unwrap();
+        let mut camera = Metadata::new_from_path(&path).unwrap_or_else(|_| Metadata::new());
+        camera.set_tag(ExifTag::Artist("camera artist".into()));
+        camera.set_tag(ExifTag::GPSLatitudeRef("N".into()));
+        camera.set_tag(ExifTag::UnknownINT16U(
+            vec![5],
+            0x4746,
+            ExifTagGroup::GENERIC,
+        ));
+        if extension == "tif" {
+            let resolution = little_exif::rational::uR64 {
+                nominator: 72,
+                denominator: 1,
+            };
+            camera.set_tag(ExifTag::XResolution(vec![resolution.clone()]));
+            camera.set_tag(ExifTag::YResolution(vec![resolution]));
+            camera.set_tag(ExifTag::ResolutionUnit(vec![2]));
+        }
+        camera.write_to_file(&path).unwrap();
+        let pixels = orientation_test_pixels(&std::fs::read(&path).unwrap(), extension);
+        let write = MetadataWrite {
+            rating: Some(5),
+            description: Some("Kei description".into()),
+            title: Some("Kei title".into()),
+            keywords: vec!["Kei keyword".into()],
+            people: vec!["Kei person".into()],
+            gps: Some(GpsCoords {
+                latitude: 1.5,
+                longitude: 2.5,
+                altitude: Some(10.0),
+            }),
+            ..Default::default()
+        };
+        let prepared = crate::download::metadata::prepare_metadata_with_expected_fingerprint(
+            &path, &write, ".fields", None,
+        )
+        .unwrap();
+        let fields = (*prepared.embedded_fields).clone();
+        prepared.publish(&path).unwrap();
+        assert_eq!(fields.description.as_deref(), Some("Kei description"));
+        #[cfg(not(feature = "xmp"))]
+        {
+            assert!(fields.rating.is_none());
+            assert!(fields.rating_percent.is_some());
+            assert!(fields.gps[3].is_none());
+        }
+        let clear = MetadataWrite {
+            prior_embedded: fields.clone(),
+            clear_embedded: fields,
+            ..Default::default()
+        };
+        let prepared = crate::download::metadata::prepare_metadata_with_expected_fingerprint(
+            &path, &clear, ".fields", None,
+        )
+        .unwrap();
+        let remaining = (*prepared.embedded_fields).clone();
+        prepared.publish(&path).unwrap();
+        assert_eq!(remaining, Default::default());
+        let native = Metadata::new_from_path(&path).unwrap();
+        assert!(
+            matches!(native.get_tag(&ExifTag::Artist(String::new())).next(),Some(ExifTag::Artist(value)) if value=="camera artist")
+        );
+        assert!(
+            matches!(native.get_tag(&ExifTag::GPSLatitudeRef(String::new())).next(),Some(ExifTag::GPSLatitudeRef(value)) if value=="N"),
+            "{extension}: camera reference must survive"
+        );
+        assert!(
+            native
+                .get_tag(&ExifTag::UnknownINT16U(
+                    vec![],
+                    0x4746,
+                    ExifTagGroup::GENERIC
+                ))
+                .next()
+                .is_some()
+        );
+        assert!(
+            native
+                .get_tag(&ExifTag::ImageDescription(String::new()))
+                .next()
+                .is_none()
+        );
+        assert_eq!(
+            orientation_test_pixels(&std::fs::read(&path).unwrap(), extension),
+            pixels
+        );
+    }
+}
+
+// Independent container checks retain compressed JPEG scans and TIFF strip bytes.
+fn orientation_test_pixels(bytes: &[u8], extension: &str) -> Vec<u8> {
+    if extension == "jpg" {
+        let mut output = Vec::new();
+        let mut offset = 2;
+        while offset < bytes.len() {
+            assert_eq!(bytes[offset], 0xff);
+            let marker = bytes[offset + 1];
+            if marker == 0xda || marker == 0xd9 {
+                output.extend_from_slice(&bytes[offset..]);
+                break;
+            }
+            let end = offset
+                + 2
+                + usize::from(u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]));
+            if !(0xe0..=0xef).contains(&marker) && marker != 0xfe {
+                output.extend_from_slice(&bytes[offset..end]);
+            }
+            offset = end;
+        }
+        return output;
+    }
+    assert_eq!(&bytes[..4], b"II*\0");
+    let u32_at = |n| u32::from_le_bytes(bytes[n..n + 4].try_into().unwrap()) as usize;
+    let ifd = u32_at(4);
+    let count = usize::from(u16::from_le_bytes(bytes[ifd..ifd + 2].try_into().unwrap()));
+    let value = |tag| {
+        (0..count)
+            .find_map(|n| {
+                let at = ifd + 2 + n * 12;
+                (u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) == tag)
+                    .then(|| u32_at(at + 8))
+            })
+            .unwrap()
+    };
+    let offset = value(273);
+    let length = value(279);
+    bytes[offset..offset + length].to_vec()
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn standard_fields_exclude_provider_data_and_require_grouping_opt_ins() {
+    use crate::download::AssetGroupings;
+    use xmp_toolkit::{OpenFileOptions, XmpFile};
+
+    for include_albums in [false, true] {
+        for include_people in [false, true] {
+            let metadata = crate::config::MetadataConfig {
+                set_exif_orientation: false,
+                set_exif_datetime: true,
+                set_exif_rating: true,
+                set_exif_gps: true,
+                set_exif_description: true,
+                embed_xmp: true,
+                xmp_sidecar: true,
+                include_albums,
+                include_people,
+            };
+            let flags = MetadataFlags::from(&metadata);
+            assert_eq!(MetadataFlags::from_bits(flags.bits()), Some(flags));
+            let mut groupings = AssetGroupings::default();
+            groupings
+                .albums
+                .insert("asset".into(), vec!["Album".into()]);
+            groupings
+                .people
+                .insert("asset".into(), vec!["Alice".into()]);
+            let source = crate::state::AssetMetadata {
+                title: Some("Title".into()),
+                description: Some("Caption".into()),
+                keywords: Some(r#"["source-tag"]"#.into()),
+                rating: Some(5),
+                latitude: Some(1.0),
+                longitude: Some(2.0),
+                timezone_offset: Some(39_600),
+                is_hidden: true,
+                is_archived: true,
+                media_subtype: Some("portrait".into()),
+                burst_id: Some("internal-burst".into()),
+                ..crate::state::AssetMetadata::default()
+            };
+            let payload = groupings.metadata_payload("asset", &source, flags);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("photo.jpg");
+            std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
+            let outcome = write_download_metadata(MetadataWriteRequest {
+                final_path: &path,
+                embed_path: Some(&path),
+                expected_embed_fingerprint: None,
+                source_checksum: None,
+                sidecar_path: Some(&path),
+                payload: Arc::new(payload),
+                created_local: now_local(),
+                flags,
+                capture_timestamp_repair: CaptureTimestampRepair::Preserve,
+                temp_suffix: ".metadata-test",
+            })
+            .await;
+            assert!(!outcome.any_failed());
+            let mut file = XmpFile::new().unwrap();
+            file.open_file(&path, OpenFileOptions::default().for_read())
+                .unwrap();
+            let embedded = file.xmp().unwrap();
+            let sidecar: XmpMeta = std::fs::read_to_string(path.with_extension("jpg.xmp"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            for packet in [&embedded, &sidecar] {
+                let keywords: Vec<_> = packet
+                    .property_array(xmp_ns::DC, "subject")
+                    .map(|v| v.value)
+                    .collect();
+                assert!(keywords.iter().any(|v| v == "source-tag"));
+                assert_eq!(keywords.iter().any(|v| v == "Album"), include_albums);
+                let people: Vec<_> = packet
+                    .property_array(xmp_ns::IPTC_EXT, "PersonInImage")
+                    .map(|v| v.value)
+                    .collect();
+                assert_eq!(
+                    people,
+                    if include_people {
+                        vec!["Alice".to_owned()]
+                    } else {
+                        vec![]
+                    }
+                );
+                assert!(packet.contains_property(xmp_ns::DC, "title"));
+                assert!(packet.contains_property(xmp_ns::DC, "description"));
+                assert!(packet.contains_property(xmp_ns::XMP, "Rating"));
+                assert!(packet.contains_property(xmp_ns::EXIF, "GPSLatitude"));
+                for field in ["hidden", "archived", "mediaSubtype", "burstId"] {
+                    assert!(
+                        !packet.contains_property("https://github.com/rhoopr/kei/ns/1.0/", field)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn contract_metadata_writes_require_opt_in_leaves_files_untouched() {
     let dir = tempfile::tempdir().expect("metadata temp dir");
     let photo_path = dir.path().join("photo.jpg");
@@ -39,6 +510,67 @@ async fn contract_metadata_writes_require_opt_in_leaves_files_untouched() {
         .expect("read metadata temp dir")
         .count();
     assert_eq!(files, 1, "disabled metadata options created another file");
+}
+
+/// Download-time metadata writes carry storage-only evidence separately from
+/// ordinary metadata failure so the transfer loop can stop the cycle.
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn immediate_metadata_permission_denied_sets_storage_evidence() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestorePermissions {
+        path: std::path::PathBuf,
+        permissions: std::fs::Permissions,
+    }
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.path, self.permissions.clone());
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let media_dir = dir.path().join("media");
+    std::fs::create_dir(&media_dir).unwrap();
+    let path = media_dir.join("photo.jpg");
+    std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
+
+    let original = std::fs::metadata(&media_dir).unwrap().permissions();
+    let mut read_only = original.clone();
+    read_only.set_mode(0o555);
+    std::fs::set_permissions(&media_dir, read_only).unwrap();
+    let _restore = RestorePermissions {
+        path: media_dir.clone(),
+        permissions: original,
+    };
+    let probe = media_dir.join("write-probe");
+    if std::fs::File::create(&probe).is_ok() {
+        std::fs::remove_file(&probe).unwrap();
+        return;
+    }
+
+    let outcome = write_download_metadata(MetadataWriteRequest {
+        final_path: &path,
+        embed_path: Some(&path),
+        expected_embed_fingerprint: None,
+        source_checksum: None,
+        sidecar_path: None,
+        payload: Arc::new(MetadataPayload {
+            rating: Some(3),
+            ..MetadataPayload::default()
+        }),
+        created_local: now_local(),
+        flags: MetadataFlags::RATING | MetadataFlags::EMBED_XMP,
+        capture_timestamp_repair: CaptureTimestampRepair::Preserve,
+        temp_suffix: ".metadata-storage-test",
+    })
+    .await;
+
+    assert!(outcome.embed_failed);
+    assert!(
+        outcome.storage_failed,
+        "permission denied on the metadata destination must surface as storage"
+    );
 }
 
 #[cfg(feature = "xmp")]
@@ -115,7 +647,9 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
         });
         let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
         assert!(
-            write_sidecar_metadata(&path, payload, now_local(), Some(&checksum), ".gps-test").await
+            !write_sidecar_metadata(&path, payload, now_local(), Some(&checksum), ".gps-test")
+                .await
+                .failed
         );
         let xmp: XmpMeta = std::fs::read_to_string(path.with_extension("jpg.xmp"))
             .unwrap()
@@ -143,7 +677,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
     std::fs::write(&path, &source).unwrap();
     for checksum in [None, Some("different-source-checksum")] {
         assert!(
-            write_sidecar_metadata(
+            !write_sidecar_metadata(
                 &path,
                 Arc::new(MetadataPayload {
                     latitude: Some(1.5),
@@ -155,6 +689,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
                 ".gps-test"
             )
             .await
+            .failed
         );
         let xmp: XmpMeta = std::fs::read_to_string(path.with_extension("jpg.xmp"))
             .unwrap()
@@ -264,7 +799,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
             _ => (1.5, 2.5, "1,30.0000N"),
         };
         assert!(
-            write_sidecar_metadata(
+            !write_sidecar_metadata(
                 &path,
                 Arc::new(MetadataPayload {
                     latitude: Some(latitude),
@@ -275,7 +810,8 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
                 Some(&checksum),
                 ".gps-test"
             )
-            .await,
+            .await
+            .failed,
             "{name}"
         );
         let xmp: XmpMeta = std::fs::read_to_string(path.with_extension("jpg.xmp"))

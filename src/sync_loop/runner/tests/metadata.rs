@@ -1,4 +1,3 @@
-use crate::sync_loop::test_support::MetadataSetFailure;
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
@@ -7,19 +6,146 @@ use tokio_util::sync::CancellationToken;
 use crate::config;
 #[cfg(feature = "xmp")]
 use crate::sync_cycle::preload_asset_groupings;
-use crate::sync_cycle::{ENUM_CONFIG_HASH_KEY, run_cycle};
-#[cfg(feature = "xmp")]
-use crate::sync_loop::test_support::make_named_full_album_with_boxed_session;
+use crate::sync_cycle::run_cycle;
 use crate::sync_loop::test_support::{
-    FailingMetadataSetDb, RUN_CYCLE_ASSET_DATE_MS, RunCycleDownloadConfigOptions,
-    album_count_response, full_album_page, full_album_page_with_download,
-    make_full_album_with_boxed_session, make_full_album_with_session, make_run_cycle_config,
-    make_run_cycle_download_config_builder, make_run_cycle_download_config_builder_with_options,
-    make_run_cycle_library_state_with_album, make_run_cycle_library_state_with_passes,
-    make_shared_session_for_run_cycle, make_state_db, media_without_photo_downloads,
-    run_cycle_expected_date_dir,
+    RUN_CYCLE_ASSET_DATE_MS, RunCycleDownloadConfigOptions, album_count_response,
+    make_owned_cycle_album, make_run_cycle_config, make_run_cycle_download_config_builder,
+    make_run_cycle_download_config_builder_with_options, make_run_cycle_library_state_with_album,
+    make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle,
+    media_without_photo_downloads, open_owned_cycle_db, run_cycle_expected_date_dir,
 };
 use crate::{download, retry, state};
+
+fn full_album_page_with_download(
+    zone: &str,
+    master: &str,
+    token: &str,
+    url: &str,
+    size: u64,
+    checksum: &str,
+) -> serde_json::Value {
+    let mut page = crate::sync_loop::test_support::full_album_page_with_download(
+        zone, master, token, url, size, checksum,
+    );
+    page["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+        serde_json::json!("_defaultOwner");
+    page
+}
+
+fn make_owned_metadata_album(
+    db: &Arc<state::SqliteStateDb>,
+    zone: &str,
+    mut page: serde_json::Value,
+) -> crate::icloud::photos::PhotoAlbum {
+    #[derive(Clone, Debug)]
+    struct MetadataSession {
+        zone: String,
+        page: serde_json::Value,
+    }
+    #[async_trait::async_trait]
+    impl crate::icloud::photos::PhotosSession for MetadataSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            _: &[(&str, &str)],
+        ) -> anyhow::Result<serde_json::Value> {
+            let request: serde_json::Value = serde_json::from_str(&body)?;
+            let records = self.page["records"].as_array().unwrap();
+            if url.contains("/records/lookup?") {
+                let requested = request["records"].as_array().unwrap();
+                let selected: Vec<_> = records
+                    .iter()
+                    .filter(|record| {
+                        requested
+                            .iter()
+                            .any(|name| name["recordName"] == record["recordName"])
+                    })
+                    .collect();
+                return Ok(serde_json::json!({"records": selected}));
+            }
+            if url.contains("/changes/zone?") {
+                let changes = if request["zones"][0]["syncToken"] == self.page["syncToken"] {
+                    Vec::new()
+                } else {
+                    records.clone()
+                };
+                return Ok(serde_json::json!({"zones":[{
+                    "zoneID":{"zoneName":self.zone,"ownerRecordName":"_defaultOwner"},
+                    "syncToken":self.page["syncToken"],"moreComing":false,"records":changes
+                }]}));
+            }
+            if url.contains("/records/query/batch?") {
+                return Ok(album_count_response(
+                    records
+                        .iter()
+                        .filter(|record| record["recordType"] == "CPLAsset")
+                        .count() as u64,
+                ));
+            }
+            assert!(url.contains("/records/query?"));
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                .unwrap_or(0);
+            Ok(
+                serde_json::json!({"records":if offset == 0 { records.clone() } else { Vec::new() },"syncToken":self.page["syncToken"]}),
+            )
+        }
+        fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+    for record in page["records"].as_array_mut().unwrap() {
+        if record["recordType"] == "CPLAsset" && record["fields"]["masterRef"].is_object() {
+            record["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+                serde_json::json!("_defaultOwner");
+        }
+    }
+    crate::sync_loop::test_support::make_owned_cycle_album(
+        db,
+        zone,
+        if zone.starts_with("SharedSync") {
+            "shared"
+        } else {
+            "private"
+        },
+        Box::new(MetadataSession {
+            zone: zone.to_owned(),
+            page,
+        }),
+    )
+}
+
+fn bind_metadata_capture(
+    db: &Arc<state::SqliteStateDb>,
+    zone: &str,
+    database: &str,
+    album: &mut crate::icloud::photos::PhotoAlbum,
+) {
+    let owned = make_owned_cycle_album(
+        db,
+        zone,
+        database,
+        Box::new(crate::test_helpers::MockPhotosSession::new()),
+    );
+    let (capture, _, _) = owned.owned_selection_scope().unwrap().unwrap();
+    album.set_shadow_capture(capture, Arc::from(database));
+}
+
+async fn repair_historical_capture(
+    db: &Arc<state::SqliteStateDb>,
+    library: &str,
+    passes: &[crate::commands::AlbumPass],
+) -> (download::SyncStats, usize) {
+    let mut config = download::DownloadConfig::test_default();
+    config.library = Arc::from(library);
+    config.state_db = Some(db.clone());
+    config.repair_metadata_capture_for_test(passes).await
+}
 
 #[cfg(feature = "xmp")]
 #[tokio::test]
@@ -61,16 +187,14 @@ async fn run_cycle_capture_offset_drives_date_filter_path_and_sidecar() {
     page["records"][1]["fields"]["timeZoneOffset"] =
         serde_json::json!({"value": 39_600, "type": "INT64"});
 
-    let album = make_full_album_with_session(
-        "PrimarySync",
-        crate::test_helpers::MockPhotosSession::new()
-            .ok(album_count_response(1))
-            .ok(page),
-    );
+    let download_dir = tempfile::tempdir().expect("download tempdir");
+    let inner =
+        crate::sync_loop::test_support::open_owned_cycle_db(&download_dir.path().join("state.db"))
+            .await;
+    let album = make_owned_metadata_album(&inner, "PrimarySync", page);
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
-    let db = make_state_db();
-    let download_dir = tempfile::tempdir().expect("download tempdir");
+    let db: Arc<dyn download::DownloadStore> = inner;
     let boundary = config::CreatedDateFilter::CaptureDate(capture_date);
     let build_download_config = make_run_cycle_download_config_builder_with_options(
         download_dir.path(),
@@ -91,7 +215,6 @@ async fn run_cycle_capture_offset_drives_date_filter_path_and_sidecar() {
         &[&lib_state],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -152,34 +275,21 @@ async fn run_cycle_capture_offset_drives_date_filter_path_and_sidecar() {
 
 #[tokio::test]
 async fn incremental_invalid_capture_date_preserves_prior_checkpoint() {
+    let server = crate::start_wiremock_or_skip!();
     let config = make_run_cycle_config();
-    let db = make_state_db();
-    db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
-        .await
-        .expect("seed zone token");
-    db.set_metadata(
-        ENUM_CONFIG_HASH_KEY,
-        &download::compute_config_hash(&config),
-    )
-    .await
-    .expect("seed current enum config hash");
-
-    let mut page = full_album_page("PrimarySync", "bad-date", "zone-tok-new");
+    let download_dir = tempfile::tempdir().expect("download tempdir");
+    let inner =
+        crate::sync_loop::test_support::open_owned_cycle_db(&download_dir.path().join("state.db"))
+            .await;
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
+    let (mut page, media_path) = admit_metadata_child(&inner, download_dir.path(), &server).await;
+    let before = std::fs::read(&media_path).unwrap();
+    page["syncToken"] = serde_json::json!("zone-tok-new");
+    page["records"][1]["recordChangeTag"] = serde_json::json!("malformed-date-edit");
     page["records"][1]["fields"]["assetDate"]["value"] = serde_json::json!("not-a-timestamp");
-    let album = make_full_album_with_session(
-        "PrimarySync",
-        crate::test_helpers::MockPhotosSession::new().ok(serde_json::json!({
-            "zones": [{
-                "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
-                "syncToken": "zone-tok-new",
-                "moreComing": false,
-                "records": page["records"].clone()
-            }]
-        })),
-    );
+    let album = make_owned_metadata_album(&inner, "PrimarySync", page);
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
-    let download_dir = tempfile::tempdir().expect("download tempdir");
     let build_download_config =
         make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
@@ -188,7 +298,6 @@ async fn incremental_invalid_capture_date_preserves_prior_checkpoint() {
         &[&lib_state],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -197,7 +306,7 @@ async fn incremental_invalid_capture_date_preserves_prior_checkpoint() {
     .await
     .expect("run malformed capture-date cycle");
 
-    assert_eq!(result.failed_count, 0);
+    assert_eq!(result.failed_count, 1);
     assert!(result.stats.sync_token_blocked);
     assert_eq!(
         result.stats.sync_token_blocked_reason,
@@ -210,9 +319,21 @@ async fn incremental_invalid_capture_date_preserves_prior_checkpoint() {
             .await
             .expect("read zone token")
             .as_deref(),
-        Some("zone-tok-prev"),
+        Some("metadata-baseline"),
         "invalid capture dates must replay from the prior checkpoint"
     );
+    let reopened = state::SqliteStateDb::open(&download_dir.path().join("state.db"))
+        .await
+        .unwrap();
+    let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].created_at.timestamp_millis(),
+        RUN_CYCLE_ASSET_DATE_MS
+    );
+    assert_eq!(rows[0].local_path.as_deref(), Some(media_path.as_path()));
+    assert_eq!(std::fs::read(media_path).unwrap(), before);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 // ── preload_asset_groupings ──────────────────────────────────────
@@ -264,7 +385,7 @@ async fn preload_asset_groupings_partial_people_failure_keeps_albums() {
 
     // Seed the inner DB with two album memberships across two assets,
     // so we can verify the surviving map is non-empty.
-    let inner = make_state_db();
+    let inner = crate::sync_loop::test_support::make_state_db();
     inner
         .add_asset_album("PrimarySync", "ASSET_A", "Vacation", "icloud")
         .await
@@ -306,79 +427,12 @@ async fn preload_asset_groupings_no_db_returns_empty() {
 
 #[tokio::test]
 async fn run_cycle_provider_metadata_write_failure_preserves_zone_checkpoint() {
-    let mut config = make_run_cycle_config();
-    config.filters.recent = Some(10);
-    let inner = make_state_db();
-    inner
-        .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
-        .await
-        .expect("seed zone token");
-    let download_dir = tempfile::tempdir().expect("download tempdir");
-    seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
-
-    let db: Arc<dyn download::DownloadStore> = Arc::new(
-        FailingMetadataSetDb::without_set_failure(
-            Arc::clone(&inner),
-            "simulated provider metadata write failure",
-        )
-        .with_refresh_downloaded_metadata_failure(),
-    );
-    let page = run_cycle_favourited_asset_page();
-    let album = make_full_album_with_session(
-        "PrimarySync",
-        crate::test_helpers::MockPhotosSession::new().ok(serde_json::json!({
-            "zones": [{
-                "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
-                "syncToken": "zone-tok-new",
-                "moreComing": false,
-                "records": page["records"].clone()
-            }]
-        })).ok(serde_json::json!({"records":page["records"].clone(),"syncToken":"metadata-rank-token"})),
-    );
-    let lib_state =
-        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
-    let states = vec![&lib_state];
-    let build_download_config = make_run_cycle_download_config_builder_with_options(
-        download_dir.path(),
-        Arc::clone(&db),
-        RunCycleDownloadConfigOptions {
-            media: media_without_photo_downloads(),
-            recent: Some(10),
-            ..RunCycleDownloadConfigOptions::default()
-        },
-    );
-    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-
-    let result = run_cycle(
-        &states,
-        &config,
-        Some(db.as_ref()),
-        false,
-        &build_download_config,
-        download::DownloadControls::download_hidden(),
-        &shared_session,
-        &CancellationToken::new(),
-    )
-    .await
-    .expect("run cycle");
-
-    assert!(result.failed_count > 0);
-    assert_eq!(result.stats.downloaded, 0);
-    assert_eq!(result.stats.failed, 0);
-    assert!(result.stats.sync_token_blocked);
-    assert_eq!(
-        result.stats.sync_token_blocked_reason,
-        Some("provider_metadata_state_write_failed")
-    );
-    assert_eq!(
-        inner
-            .get_metadata("sync_token:PrimarySync")
-            .await
-            .expect("read zone token")
-            .as_deref(),
-        Some("zone-tok-prev"),
-        "failed provider metadata write must preserve the replay checkpoint"
-    );
+    Box::pin(exercise_selected_metadata_update(
+        SelectedMetadataFault::StateWrite,
+        2,
+        SelectedMetadataRoute::Incremental,
+    ))
+    .await;
 }
 
 /// Seeds a downloaded asset whose stored metadata is not a favourite,
@@ -442,16 +496,204 @@ fn run_cycle_favourited_asset_page() -> serde_json::Value {
     page
 }
 
-/// The same asset carrying a caption edit instead of a favourite, so two
-/// passes can deliver different provider snapshots of one asset and both
-/// drift from the stored row.
-#[cfg(feature = "xmp")]
-fn run_cycle_captioned_asset_page() -> serde_json::Value {
-    let mut page = run_cycle_favourited_asset_page();
-    page["records"][1]["fields"]["isFavorite"] = serde_json::json!({"value": 0, "type": "INT64"});
-    page["records"][1]["fields"]["captionEnc"] =
-        serde_json::json!({"value": "edited in another pass", "type": "STRING"});
-    page
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectedMetadataFault {
+    None,
+    StateWrite,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectedMetadataRoute {
+    Incremental,
+    Full,
+}
+
+async fn exercise_selected_metadata_update(
+    fault: SelectedMetadataFault,
+    pass_count: usize,
+    route: SelectedMetadataRoute,
+) {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let snapshot_files = |directory: &std::path::Path| {
+        let mut files = std::collections::BTreeMap::new();
+        let mut directories = vec![directory.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    directories.push(path);
+                } else {
+                    files.insert(path.clone(), std::fs::read(path).unwrap());
+                }
+            }
+        }
+        files
+    };
+
+    let server = crate::start_wiremock_or_skip!();
+    let bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9";
+    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+    Mock::given(method("GET"))
+        .and(path("/selected.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("state.db");
+    let media = dir.path().join("media");
+    std::fs::create_dir(&media).unwrap();
+    std::fs::write(media.join("unrelated.xmp"), b"private sidecar bytes").unwrap();
+    let config = make_run_cycle_config();
+    let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+    let mut original_files = None;
+    for cycle in 0..4 {
+        let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
+        if cycle == 1 && route == SelectedMetadataRoute::Full {
+            inner
+                .acquire_lock("force full metadata selection")
+                .unwrap()
+                .execute(
+                    "DELETE FROM metadata WHERE key=?1",
+                    ["sync_token:PrimarySync"],
+                )
+                .unwrap();
+        }
+        let db: Arc<dyn download::DownloadStore> = inner.clone();
+        let token = if cycle == 0 {
+            "metadata-before"
+        } else {
+            "metadata-after"
+        };
+        let mut page = full_album_page_with_download(
+            "PrimarySync",
+            "selected-master",
+            token,
+            &format!("{}/selected.jpg", server.uri()),
+            bytes.len() as u64,
+            &checksum,
+        );
+        page["records"][1]["fields"]["isFavorite"] =
+            serde_json::json!({"value":i32::from(cycle > 0),"type":"INT64"});
+        page["records"][1]["recordChangeTag"] = serde_json::json!(if cycle == 0 {
+            "original"
+        } else {
+            "favourite-edit"
+        });
+        let album = make_owned_metadata_album(&inner, "PrimarySync", page);
+        let mut library =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        for _ in 1..pass_count {
+            let mut pass = library.plan.passes[0].clone();
+            pass.kind = crate::commands::PassKind::Album;
+            library.plan.passes.push(pass);
+        }
+        let injected = cycle == 1 && fault == SelectedMetadataFault::StateWrite;
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        conn.execute_batch("DROP TRIGGER IF EXISTS fail_selected_metadata_update")
+            .unwrap();
+        if injected {
+            conn.execute_batch("CREATE TRIGGER fail_selected_metadata_update BEFORE UPDATE OF is_favorite ON assets
+                WHEN OLD.id='asset-selected-master' AND NEW.is_favorite=1
+                BEGIN SELECT RAISE(ABORT,'injected selected metadata update failure'); END;").unwrap();
+        }
+        drop(conn);
+        let build = make_run_cycle_download_config_builder(&media, db.clone());
+        let result = Box::pin(run_cycle(
+            &[&library],
+            &config,
+            Some(db.as_ref()),
+            &build,
+            download::DownloadControls::download_hidden(),
+            &session,
+            &CancellationToken::new(),
+        ))
+        .await
+        .unwrap();
+        drop(build);
+        drop(db);
+        drop(inner);
+
+        let reopened = state::SqliteStateDb::open(&database).await.unwrap();
+        let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1, "one independently identified selected child");
+        assert_eq!(rows[0].id.as_ref(), "asset-selected-master");
+        assert_eq!(
+            rows[0].metadata.is_favorite,
+            cycle > 0 && !injected,
+            "selected metadata changes only after its transaction commits"
+        );
+        assert_eq!(
+            std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+            bytes
+        );
+        let source: Option<String> = rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT source_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-selected-master' AND version_size='original' AND local_path=?1",
+                [rows[0].local_path.as_ref().unwrap().to_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            source,
+            Some(data_encoding::HEXLOWER.encode(&Sha256::digest(bytes)))
+        );
+        assert!(
+            reopened
+                .get_legacy_master_state_owners()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            if injected && route == SelectedMetadataRoute::Full {
+                None
+            } else {
+                Some(if cycle == 0 || injected {
+                    "metadata-before"
+                } else {
+                    "metadata-after"
+                })
+            }
+        );
+        if cycle == 1 && route == SelectedMetadataRoute::Full {
+            assert_eq!(
+                result.stats.full_enumeration_reason,
+                Some(download::FullEnumerationReason::NoStoredToken)
+            );
+        }
+        assert_eq!(result.stats.downloaded, usize::from(cycle == 0));
+        if injected {
+            assert!(
+                result.stats.state_write_failures > 0,
+                "native metadata SQL fault must execute"
+            );
+            assert!(result.failed_count > 0);
+        } else {
+            assert_eq!(result.failed_count, 0);
+            assert!(!result.stats.sync_token_blocked);
+        }
+        let files = snapshot_files(&media);
+        if let Some(original) = &original_files {
+            assert_eq!(
+                &files, original,
+                "metadata-only updates preserve every media and sidecar path and byte"
+            );
+        }
+        original_files = Some(files);
+    }
+    server.verify().await;
 }
 
 // Current ranked inventories complement sparse source/lookup fixtures. Rank
@@ -519,6 +761,23 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                 return Ok(page);
             }
             if url.contains("/records/lookup?") {
+                let requested = request["records"].as_array().unwrap();
+                if requested.iter().all(|name| {
+                    self.valid
+                        .iter()
+                        .any(|record| record["recordName"] == name["recordName"])
+                }) {
+                    let records: Vec<_> = self
+                        .valid
+                        .iter()
+                        .filter(|record| {
+                            requested
+                                .iter()
+                                .any(|name| name["recordName"] == record["recordName"])
+                        })
+                        .collect();
+                    return Ok(serde_json::json!({"records": records}));
+                }
                 self.lookups
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let body: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -603,18 +862,15 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
         files
     };
 
-    for (recent, evidence) in [Some(10), None].into_iter().flat_map(|recent| {
-        [
-            EvidenceCase::Ordinary,
-            EvidenceCase::Sparse,
-            EvidenceCase::DeletedDelta,
-            EvidenceCase::HardDeletedDelta,
-            EvidenceCase::Malformed,
-            EvidenceCase::Changed,
-            EvidenceCase::MarkerWriteFailure,
-        ]
-        .map(|evidence| (recent, evidence))
-    }) {
+    for evidence in [
+        EvidenceCase::Ordinary,
+        EvidenceCase::Sparse,
+        EvidenceCase::DeletedDelta,
+        EvidenceCase::HardDeletedDelta,
+        EvidenceCase::Malformed,
+        EvidenceCase::Changed,
+        EvidenceCase::MarkerWriteFailure,
+    ] {
         let server = crate::start_wiremock_or_skip!();
         // Valid JPEG framing; no optional metadata writer is needed.
         let bytes = vec![
@@ -643,7 +899,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
         let database = dir.path().join("state.db");
         let media = dir.path().join("media");
         {
-            let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+            let inner = open_owned_cycle_db(&database).await;
             let db = inner.clone() as Arc<dyn download::DownloadStore>;
             seed_run_cycle_metadata_drift_asset(&db, &media).await;
             let run = inner.start_sync_run().await.unwrap();
@@ -681,8 +937,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
         }
         let before = snapshot_files(&media);
         let mut after_download = None;
-        let mut config = make_run_cycle_config();
-        config.filters.recent = recent;
+        let config = make_run_cycle_config();
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
         // Reopen SQLite each time. After marker failure, replay once to persist it
         // before selecting only the clean zone, recovering, and checking steady state.
@@ -696,7 +951,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             let phase = cycle.saturating_sub(usize::from(marker_failure));
             let fail_marker = marker_failure && cycle == 0;
             let fail_deletion = deletion_delta && phase == 3;
-            let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+            let inner = open_owned_cycle_db(&database).await;
             if phase == 3 {
                 // Simulate the retry deadline without sleeping or changing production time.
                 rusqlite::Connection::open(&database).unwrap().execute(
@@ -704,27 +959,30 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                 ).unwrap();
             }
             let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let db: Arc<dyn download::DownloadStore> = if fail_marker {
-                Arc::new(FailingMetadataSetDb::new(
-                    inner.clone(),
-                    MetadataSetFailure::Prefix(state::UNRESOLVED_IDENTITY_PREFIX),
-                    "injected unresolved marker write failure",
-                ))
-            } else if fail_deletion {
-                let mut failing = FailingMetadataSetDb::without_set_failure(
-                    inner.clone(),
-                    "injected source deletion write failure",
-                );
-                failing.fail_source_delete = true;
-                Arc::new(failing)
-            } else {
-                inner.clone()
-            };
+            let conn = rusqlite::Connection::open(&database).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS fail_identity_marker;
+                DROP TRIGGER IF EXISTS fail_identity_retirement;",
+            )
+            .unwrap();
+            if fail_marker {
+                conn.execute_batch(&format!("CREATE TRIGGER fail_identity_marker BEFORE INSERT ON metadata
+                    WHEN NEW.key='{}' BEGIN SELECT RAISE(ABORT,'injected unresolved marker write failure'); END;",
+                    state::unresolved_identity_key("PrimarySync"))).unwrap();
+            }
+            if fail_deletion {
+                conn.execute_batch("CREATE TRIGGER fail_identity_retirement BEFORE DELETE ON unresolved_sparse_identities
+                    WHEN OLD.library='PrimarySync' BEGIN SELECT RAISE(ABORT,'injected source deletion write failure'); END;").unwrap();
+            }
+            drop(conn);
+            let db: Arc<dyn download::DownloadStore> = inner.clone();
             let primary = make_run_cycle_library_state_with_album(
                 "PrimarySync",
                 "sync_token:PrimarySync",
-                make_full_album_with_boxed_session(
+                make_owned_cycle_album(
+                    &inner,
                     "PrimarySync",
+                    "private",
                     Box::new(IdentitySession {
                         unresolved: phase < 3,
                         lookups: lookups.clone(),
@@ -763,7 +1021,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             let shared = make_run_cycle_library_state_with_album(
                 "SharedSync-test",
                 "sync_token:SharedSync-test",
-                make_full_album_with_boxed_session("SharedSync-test", Box::new(QuietShared)),
+                make_owned_cycle_album(&inner, "SharedSync-test", "shared", Box::new(QuietShared)),
             );
             let libraries = if phase == 1 {
                 vec![&shared]
@@ -773,16 +1031,12 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             let builder = make_run_cycle_download_config_builder_with_options(
                 &media,
                 db.clone(),
-                RunCycleDownloadConfigOptions {
-                    recent,
-                    ..RunCycleDownloadConfigOptions::default()
-                },
+                RunCycleDownloadConfigOptions::default(),
             );
             let result = run_cycle(
                 &libraries,
                 &config,
                 Some(db.as_ref()),
-                false,
                 &builder,
                 download::DownloadControls::download_hidden(),
                 &shared_session,
@@ -790,12 +1044,17 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             )
             .await
             .unwrap();
+            // Phase 1 selects only the healthy shared zone. The primary
+            // marker still fences the database cursor, not cycle completion.
+            let selected_identity_debt = phase != 1 && phase < recovery_phase;
+            if phase == 1 && !fail_marker {
+                assert!(!result.can_advance_database_checkpoint());
+            }
             assert_eq!(
-                result.stats.identity_incomplete,
-                phase < recovery_phase,
-                "recent={recent:?} evidence={evidence:?} cycle={cycle}"
+                result.stats.identity_incomplete, selected_identity_debt,
+                "evidence={evidence:?} cycle={cycle}"
             );
-            assert_eq!(result.failed_count > 0, phase < recovery_phase);
+            assert_eq!(result.failed_count > 0, selected_identity_debt);
             let deferred = phase == 2
                 && matches!(
                     evidence,
@@ -807,7 +1066,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             assert_eq!(
                 lookups.load(std::sync::atomic::Ordering::Relaxed),
                 usize::from(phase != 1 && !deferred && !(phase >= 3 && deletion_delta)),
-                "recent={recent:?} evidence={evidence:?} cycle={cycle} phase={phase}"
+                "evidence={evidence:?} cycle={cycle} phase={phase}"
             );
             let retained = inner.sparse_identities("PrimarySync").await.unwrap();
             let stable_link = matches!(
@@ -831,7 +1090,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                     result.failed_count,
                     result.session_expired
                 ),
-                if phase < recovery_phase {
+                if selected_identity_debt {
                     crate::cycle_reporter::CycleStatus::Failed
                 } else {
                     crate::cycle_reporter::CycleStatus::Success
@@ -865,7 +1124,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             assert_eq!(
                 crate::commands::backup_status_line(&summary).contains("unresolved asset identity"),
                 marker_expected,
-                "recent={recent:?} evidence={evidence:?} cycle={cycle}: {}",
+                "evidence={evidence:?} cycle={cycle}: {}",
                 crate::commands::backup_status_line(&summary)
             );
             assert_eq!(
@@ -888,22 +1147,10 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                     .as_deref(),
                 Some("shared-after")
             );
-            if recent.is_some() && phase < recovery_phase {
-                let raw = inner
-                    .get_metadata("recent_selection_recovery:PrimarySync")
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(
-                    serde_json::from_str::<serde_json::Value>(&raw).unwrap()["complete"],
-                    false,
-                    "healthy materialization never clears unrelated source identity debt"
-                );
-            }
             assert_eq!(
                 result.stats.downloaded,
                 usize::from(cycle == 0),
-                "recent={recent:?} evidence={evidence:?} cycle={cycle}: {:?}",
+                "evidence={evidence:?} cycle={cycle}: {:?}",
                 result.stats
             );
             let files = snapshot_files(&media);
@@ -922,89 +1169,16 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
 }
 /// #707: the paired single-pass streaming path must gate the zone
 /// checkpoint on provider-metadata durability exactly as the collecting
-/// path does. Identical to the collecting regression above but without
-/// `recent`, which is what routes the cycle through the streaming
+/// path does. The single unfiled pass routes the cycle through the streaming
 /// producer rather than collecting incremental planning.
 #[tokio::test]
 async fn run_cycle_single_pass_metadata_refresh_failure_preserves_zone_checkpoint() {
-    let config = make_run_cycle_config();
-    let inner = make_state_db();
-    inner
-        .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
-        .await
-        .expect("seed zone token");
-    let download_dir = tempfile::tempdir().expect("download tempdir");
-    seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
-
-    let db: Arc<dyn download::DownloadStore> = Arc::new(
-        FailingMetadataSetDb::without_set_failure(
-            Arc::clone(&inner),
-            "simulated provider metadata write failure",
-        )
-        .with_refresh_downloaded_metadata_failure(),
-    );
-    let mut page = full_album_page_with_download(
-        "PrimarySync",
-        "master-PrimarySync",
-        "zone-tok-new",
-        "https://p01.icloud-content.com/photo.jpg",
-        1024,
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-    );
-    // A metadata-only edit: the provider now reports the asset as a
-    // favourite while the stored row does not.
-    page["records"][1]["fields"]["isFavorite"] = serde_json::json!({"value": 1, "type": "INT64"});
-    let album = make_full_album_with_session(
-        "PrimarySync",
-        crate::test_helpers::MockPhotosSession::new().ok(serde_json::json!({
-            "zones": [{
-                "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
-                "syncToken": "zone-tok-new",
-                "moreComing": false,
-                "records": page["records"].clone()
-            }]
-        })),
-    );
-    let lib_state =
-        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
-    let states = vec![&lib_state];
-    let build_download_config = make_run_cycle_download_config_builder_with_options(
-        download_dir.path(),
-        Arc::clone(&db),
-        RunCycleDownloadConfigOptions {
-            media: media_without_photo_downloads(),
-            ..RunCycleDownloadConfigOptions::default()
-        },
-    );
-    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-
-    let result = run_cycle(
-        &states,
-        &config,
-        Some(db.as_ref()),
-        false,
-        &build_download_config,
-        download::DownloadControls::download_hidden(),
-        &shared_session,
-        &CancellationToken::new(),
-    )
-    .await
-    .expect("run cycle");
-
-    assert_eq!(result.stats.downloaded, 0);
-    assert!(
-        result.stats.state_write_failures > 0,
-        "the streaming producer must report the failed refresh as non-durable state"
-    );
-    assert_eq!(
-        inner
-            .get_metadata("sync_token:PrimarySync")
-            .await
-            .expect("read zone token")
-            .as_deref(),
-        Some("zone-tok-prev"),
-        "a failed provider metadata refresh must preserve the replay checkpoint"
-    );
+    Box::pin(exercise_selected_metadata_update(
+        SelectedMetadataFault::StateWrite,
+        1,
+        SelectedMetadataRoute::Incremental,
+    ))
+    .await;
 }
 
 /// #707: the single-pass streaming path must advance the zone checkpoint
@@ -1012,75 +1186,12 @@ async fn run_cycle_single_pass_metadata_refresh_failure_preserves_zone_checkpoin
 /// without downloading media.
 #[tokio::test]
 async fn run_cycle_single_pass_metadata_refresh_advances_checkpoint_after_durable_state() {
-    let config = make_run_cycle_config();
-    let inner = make_state_db();
-    inner
-        .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
-        .await
-        .expect("seed zone token");
-    let download_dir = tempfile::tempdir().expect("download tempdir");
-    seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
-
-    let db: Arc<dyn download::DownloadStore> =
-        Arc::clone(&inner) as Arc<dyn download::DownloadStore>;
-    let page = run_cycle_favourited_asset_page();
-    let album = make_full_album_with_session(
-        "PrimarySync",
-        crate::test_helpers::MockPhotosSession::new().ok(serde_json::json!({
-            "zones": [{
-                "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
-                "syncToken": "zone-tok-new",
-                "moreComing": false,
-                "records": page["records"].clone()
-            }]
-        })),
-    );
-    let lib_state =
-        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
-    let states = vec![&lib_state];
-    let build_download_config = make_run_cycle_download_config_builder_with_options(
-        download_dir.path(),
-        Arc::clone(&db),
-        RunCycleDownloadConfigOptions {
-            media: media_without_photo_downloads(),
-            ..RunCycleDownloadConfigOptions::default()
-        },
-    );
-    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-
-    let result = run_cycle(
-        &states,
-        &config,
-        Some(db.as_ref()),
-        false,
-        &build_download_config,
-        download::DownloadControls::download_hidden(),
-        &shared_session,
-        &CancellationToken::new(),
-    )
-    .await
-    .expect("run cycle");
-
-    assert_eq!(
-        result.stats.downloaded, 0,
-        "a metadata-only edit downloads nothing"
-    );
-    assert_eq!(result.stats.state_write_failures, 0);
-    assert!(
-        inner.get_downloaded_page(0, 1).await.unwrap()[0]
-            .metadata
-            .is_favorite,
-        "the edited provider metadata must reach the catalogue"
-    );
-    assert_eq!(
-        inner
-            .get_metadata("sync_token:PrimarySync")
-            .await
-            .expect("read zone token")
-            .as_deref(),
-        Some("zone-tok-new"),
-        "durable provider state must allow the zone checkpoint to advance"
-    );
+    Box::pin(exercise_selected_metadata_update(
+        SelectedMetadataFault::None,
+        1,
+        SelectedMetadataRoute::Incremental,
+    ))
+    .await;
 }
 
 #[tokio::test]
@@ -1109,7 +1220,17 @@ async fn run_cycle_hidden_legacy_capture_repair_survives_restart() {
             let request: Value = serde_json::from_str(&body)?;
             if url.contains("/records/lookup?") {
                 self.repair_requests.fetch_add(1, Ordering::SeqCst);
-                return Ok(json!({"records": [self.records[0]]}));
+                let names = request["records"].as_array().unwrap();
+                let records: Vec<_> = self
+                    .records
+                    .iter()
+                    .filter(|record| {
+                        names
+                            .iter()
+                            .any(|name| name["recordName"] == record["recordName"])
+                    })
+                    .collect();
+                return Ok(json!({"records": records}));
             }
             if url.contains("/changes/zone?") {
                 let records = if request["zones"][0]["syncToken"].is_string() {
@@ -1154,7 +1275,7 @@ async fn run_cycle_hidden_legacy_capture_repair_survives_restart() {
     let original_bytes = vec![0u8; 1024];
     std::fs::write(&media_path, &original_bytes).unwrap();
     {
-        let db = state::SqliteStateDb::open(&db_path).await.unwrap();
+        let db = open_owned_cycle_db(&db_path).await;
         let record = crate::test_helpers::TestAssetRecord::new(MASTER)
             .library(ZONE)
             .filename("legacy.jpg")
@@ -1209,7 +1330,7 @@ async fn run_cycle_hidden_legacy_capture_repair_survives_restart() {
             obj_type: Arc::from("CPLAssetHiddenByAssetDate"),
             query_filter: None,
             page_size: 100,
-            zone_id: Arc::new(json!({"zoneName": ZONE})),
+            zone_id: Arc::new(json!({"zoneName": ZONE, "ownerRecordName": "_defaultOwner"})),
             retry_config: retry::RetryConfig::default(),
             container_id: None,
             cross_zone_sources: Vec::new(),
@@ -1219,7 +1340,7 @@ async fn run_cycle_hidden_legacy_capture_repair_survives_restart() {
             repair_requests: Arc::clone(&repair_requests),
         }),
     );
-    let lib_state = make_run_cycle_library_state_with_passes(
+    let mut lib_state = make_run_cycle_library_state_with_passes(
         ZONE,
         TOKEN_KEY,
         vec![crate::commands::AlbumPass {
@@ -1230,7 +1351,13 @@ async fn run_cycle_hidden_legacy_capture_repair_survives_restart() {
     );
     let config = make_run_cycle_config();
     for cycle in 0..2 {
-        let inner = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
+        let inner = open_owned_cycle_db(&db_path).await;
+        bind_metadata_capture(&inner, ZONE, "shared", &mut lib_state.plan.passes[0].album);
+        let before_lookups = repair_requests.load(Ordering::SeqCst);
+        let (capture, failures) =
+            repair_historical_capture(&inner, ZONE, &lib_state.plan.passes).await;
+        let capture_lookups = repair_requests.load(Ordering::SeqCst) - before_lookups;
+        assert_eq!(failures, 0);
         let db = Arc::clone(&inner) as Arc<dyn download::DownloadStore>;
         let build_config = make_run_cycle_download_config_builder_with_options(
             &media_dir,
@@ -1245,7 +1372,6 @@ async fn run_cycle_hidden_legacy_capture_repair_survives_restart() {
             &[&lib_state],
             &config,
             Some(db.as_ref()),
-            false,
             &build_config,
             download::DownloadControls::download_hidden(),
             &session,
@@ -1255,11 +1381,12 @@ async fn run_cycle_hidden_legacy_capture_repair_survives_restart() {
         .unwrap();
         assert_eq!(result.failed_count, 0);
         assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(capture.metadata_capture_refreshed, usize::from(cycle == 0));
+        assert_eq!(capture.metadata_capture_remaining, 0);
         assert_eq!(
-            result.stats.metadata_capture_refreshed,
-            usize::from(cycle == 0)
+            result.stats.metadata_capture_refreshed, 0,
+            "ordinary sync does not repeat explicit maintenance"
         );
-        assert_eq!(result.stats.metadata_capture_remaining, 0);
         assert_eq!(
             inner.get_metadata(TOKEN_KEY).await.unwrap().as_deref(),
             Some("zone-tok-new")
@@ -1285,8 +1412,8 @@ async fn run_cycle_hidden_legacy_capture_repair_survives_restart() {
         assert_eq!(std::fs::read(&media_path).unwrap(), original_bytes);
         assert_eq!(std::fs::read_dir(&media_dir).unwrap().count(), 1);
         assert_eq!(
-            repair_requests.load(Ordering::SeqCst),
-            2,
+            capture_lookups,
+            if cycle == 0 { 2 } else { 0 },
             "restart must not repeat metadata lookup or repair scan"
         );
     }
@@ -1318,7 +1445,17 @@ async fn run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint() {
             let request: Value = serde_json::from_str(&body)?;
             if url.contains("/records/lookup?") {
                 self.repair_requests.fetch_add(1, Ordering::SeqCst);
-                return Ok(json!({"records": [self.records[0]]}));
+                let names = request["records"].as_array().unwrap();
+                let records: Vec<_> = self
+                    .records
+                    .iter()
+                    .filter(|record| {
+                        names
+                            .iter()
+                            .any(|name| name["recordName"] == record["recordName"])
+                    })
+                    .collect();
+                return Ok(json!({"records": records}));
             }
             if url.contains("/changes/zone?") {
                 let records = if request["zones"][0]["syncToken"].is_string() {
@@ -1370,7 +1507,7 @@ async fn run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint() {
         let original_bytes = vec![0u8; 1024];
         std::fs::write(&media_path, &original_bytes).unwrap();
         {
-            let db = state::SqliteStateDb::open(&db_path).await.unwrap();
+            let db = open_owned_cycle_db(&db_path).await;
             let mut record = crate::test_helpers::TestAssetRecord::new(MASTER)
                 .library(ZONE)
                 .filename("legacy.jpg")
@@ -1451,7 +1588,7 @@ async fn run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint() {
                 obj_type: Arc::from("CPLAssetHiddenByAssetDate"),
                 query_filter: None,
                 page_size: 100,
-                zone_id: Arc::new(json!({"zoneName": ZONE})),
+                zone_id: Arc::new(json!({"zoneName": ZONE, "ownerRecordName": "_defaultOwner"})),
                 retry_config: retry::RetryConfig::default(),
                 container_id: None,
                 cross_zone_sources: Vec::new(),
@@ -1461,7 +1598,7 @@ async fn run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint() {
                 repair_requests: Arc::clone(&repair_requests),
             }),
         );
-        let lib_state = make_run_cycle_library_state_with_passes(
+        let mut lib_state = make_run_cycle_library_state_with_passes(
             ZONE,
             TOKEN_KEY,
             vec![crate::commands::AlbumPass {
@@ -1472,7 +1609,16 @@ async fn run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint() {
         );
         let config = make_run_cycle_config();
         for cycle in 0..3 {
-            let inner = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
+            let inner = open_owned_cycle_db(&db_path).await;
+            bind_metadata_capture(&inner, ZONE, "shared", &mut lib_state.plan.passes[0].album);
+            let before_lookups = repair_requests.load(Ordering::SeqCst);
+            let (capture, _) =
+                repair_historical_capture(&inner, ZONE, &lib_state.plan.passes).await;
+            let capture_lookups = repair_requests.load(Ordering::SeqCst) - before_lookups;
+            assert!(
+                capture.sync_token_blocked,
+                "explicit repair must retain its ownership refusal"
+            );
             let db = Arc::clone(&inner) as Arc<dyn download::DownloadStore>;
             let build_config = make_run_cycle_download_config_builder_with_options(
                 &media_dir,
@@ -1487,7 +1633,6 @@ async fn run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint() {
                 &[&lib_state],
                 &config,
                 Some(db.as_ref()),
-                false,
                 &build_config,
                 download::DownloadControls::download_hidden(),
                 &session,
@@ -1495,17 +1640,20 @@ async fn run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint() {
             )
             .await
             .unwrap();
-            assert!(result.failed_count > 0);
+            assert_eq!(
+                result.failed_count, 0,
+                "historical ownership refusal cannot veto ordinary excluded-current sync"
+            );
             assert_eq!(result.stats.downloaded, 0);
             assert_eq!(result.stats.metadata_capture_refreshed, 0);
-            assert_eq!(result.stats.metadata_capture_remaining, 1);
+            assert_eq!(capture.metadata_capture_remaining, 1);
             assert_eq!(
-                result.stats.metadata_capture_failures,
+                capture.metadata_capture_failures,
                 usize::from(cycle == 0 || (fail_retry_write && cycle == 1))
             );
             assert_eq!(
                 inner.get_metadata(TOKEN_KEY).await.unwrap().as_deref(),
-                Some("zone-tok-prev")
+                Some("zone-tok-new")
             );
             let rows = inner.get_downloaded_page(0, 10).await.unwrap();
             assert_eq!(rows.len(), 2);
@@ -1534,7 +1682,7 @@ async fn run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint() {
                 if fail_retry_write && cycle > 0 { 2 } else { 1 }
             );
             if fail_retry_write && cycle == 0 {
-                assert!(result.stats.state_write_failures > 0);
+                assert!(capture.state_write_failures > 0);
                 rusqlite::Connection::open(&db_path)
                     .unwrap()
                     .execute_batch("DROP TRIGGER fail_owner_guard_retry")
@@ -1543,8 +1691,12 @@ async fn run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint() {
             assert_eq!(std::fs::read(&media_path).unwrap(), original_bytes);
             assert_eq!(std::fs::read_dir(&media_dir).unwrap().count(), 2);
             assert_eq!(
-                repair_requests.load(Ordering::SeqCst),
-                if fail_retry_write && cycle > 0 { 4 } else { 2 },
+                capture_lookups,
+                if cycle == 0 || (fail_retry_write && cycle == 1) {
+                    2
+                } else {
+                    0
+                },
                 "deferred ownership guard must not repeat metadata lookup or repair scan"
             );
         }
@@ -1582,7 +1734,7 @@ async fn run_cycle_capture_revision_repair_advances_checkpoint_after_durable_met
                     }]
                 }));
             }
-            Ok(serde_json::json!({"records": []}))
+            Ok(serde_json::json!({"records": [], "syncToken": "zone-tok-new"}))
         }
 
         fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
@@ -1591,7 +1743,8 @@ async fn run_cycle_capture_revision_repair_advances_checkpoint_after_durable_met
     }
 
     let config = make_run_cycle_config();
-    let inner = Arc::new(state::SqliteStateDb::open_in_memory().expect("state db"));
+    let state_dir = tempfile::tempdir().unwrap();
+    let inner = open_owned_cycle_db(&state_dir.path().join("state.db")).await;
     inner
         .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
@@ -1624,8 +1777,10 @@ async fn run_cycle_capture_revision_repair_advances_checkpoint_after_durable_met
         .as_array()
         .expect("provider page records")
         .clone();
-    let album = make_full_album_with_boxed_session(
+    let album = make_owned_cycle_album(
+        &inner,
         "PrimarySync",
+        "private",
         Box::new(CaptureRevisionSession {
             records: Arc::new(records),
         }),
@@ -1633,6 +1788,9 @@ async fn run_cycle_capture_revision_repair_advances_checkpoint_after_durable_met
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
     let states = vec![&lib_state];
+    let (capture, failures) =
+        repair_historical_capture(&inner, "PrimarySync", &lib_state.plan.passes).await;
+    assert_eq!(failures, 0);
     let build_download_config = make_run_cycle_download_config_builder_with_options(
         download_dir.path(),
         Arc::clone(&db),
@@ -1647,7 +1805,6 @@ async fn run_cycle_capture_revision_repair_advances_checkpoint_after_durable_met
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1658,13 +1815,14 @@ async fn run_cycle_capture_revision_repair_advances_checkpoint_after_durable_met
 
     assert_eq!(result.failed_count, 0);
     assert_eq!(result.stats.downloaded, 0);
-    assert_eq!(result.stats.metadata_capture_refreshed, 1);
+    assert_eq!(capture.metadata_capture_refreshed, 1);
+    assert_eq!(result.stats.metadata_capture_refreshed, 0);
     assert_eq!(result.stats.metadata_capture_remaining, 0);
     assert!(
         inner.get_downloaded_page(0, 1).await.unwrap()[0]
             .metadata
             .is_favorite,
-        "automatic repair must durably store the provider metadata"
+        "explicit repair must durably store the provider metadata"
     );
     assert_eq!(
         inner
@@ -1743,7 +1901,7 @@ async fn run_cycle_metadata_capture_retry_preserves_durable_checkpoint_until_rep
         let db_path = dir.path().join("state.db");
         let download_dir = tempfile::tempdir().unwrap();
         {
-            let inner = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
+            let inner = open_owned_cycle_db(&db_path).await;
             inner
                 .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
                 .await
@@ -1771,7 +1929,7 @@ async fn run_cycle_metadata_capture_retry_preserves_durable_checkpoint_until_rep
         for cycle in 0..5 {
             config.runtime.refresh_metadata = refresh_deferred && matches!(cycle, 1 | 2);
             // Reopen the database on every cycle, including the deferred cycle.
-            let inner = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
+            let inner = open_owned_cycle_db(&db_path).await;
             if cycle == 3 {
                 // A controlled authoritative fixture, not a new matcher rule.
                 assert!(
@@ -1786,8 +1944,10 @@ async fn run_cycle_metadata_capture_retry_preserves_durable_checkpoint_until_rep
                 );
             }
             let db = inner.clone() as Arc<dyn download::DownloadStore>;
-            let album = make_full_album_with_boxed_session(
+            let album = make_owned_cycle_album(
+                &inner,
                 "PrimarySync",
+                "private",
                 Box::new(RetrySession {
                     records: Arc::clone(&records),
                     calls: Arc::clone(&calls),
@@ -1812,11 +1972,12 @@ async fn run_cycle_metadata_capture_retry_preserves_durable_checkpoint_until_rep
                 Arc::new(download_config)
             };
             calls.lock().unwrap().clear();
+            let (repair, _) =
+                repair_historical_capture(&inner, "PrimarySync", &lib_state.plan.passes).await;
             let result = run_cycle(
                 &[&lib_state],
                 &config,
                 Some(db.as_ref()),
-                false,
                 &refresh_build,
                 download::DownloadControls::download_hidden(),
                 &shared_session,
@@ -1825,27 +1986,20 @@ async fn run_cycle_metadata_capture_retry_preserves_durable_checkpoint_until_rep
             .await
             .unwrap();
             assert_eq!(result.stats.downloaded, 0);
+            assert_eq!(repair.metadata_capture_failures, usize::from(cycle == 0));
+            assert_eq!(repair.metadata_capture_refreshed, usize::from(cycle == 3));
+            assert_eq!(repair.identity_incomplete, cycle < 3);
             assert_eq!(
-                result.stats.metadata_capture_failures,
-                usize::from(cycle == 0)
+                result.failed_count > 0,
+                config.runtime.refresh_metadata && cycle < 3
             );
-            assert_eq!(
-                result.stats.metadata_capture_refreshed,
-                usize::from(cycle == 3)
-            );
-            assert_eq!(result.stats.identity_incomplete, cycle < 3);
-            assert_eq!(result.failed_count > 0, cycle < 3);
             assert_eq!(
                 inner
                     .get_metadata("sync_token:PrimarySync")
                     .await
                     .unwrap()
                     .as_deref(),
-                Some(if cycle < 3 {
-                    "zone-tok-prev"
-                } else {
-                    "zone-tok-new"
-                })
+                Some("zone-tok-new")
             );
             assert_eq!(
                 calls
@@ -1865,18 +2019,16 @@ async fn run_cycle_metadata_capture_retry_preserves_durable_checkpoint_until_rep
                     .count(),
                 usize::from(cycle == 0)
             );
-            assert_eq!(
-                calls
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|&&call| call == "full")
-                    .count(),
-                if config.runtime.refresh_metadata {
-                    usize::try_from(crate::icloud::photos::MAX_EMPTY_PAGE_PROBES).unwrap()
-                } else {
-                    0
-                }
+            let full_queries = calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|&&call| call == "full")
+                .count();
+            assert!(
+                full_queries
+                    <= usize::try_from(crate::icloud::photos::MAX_EMPTY_PAGE_PROBES).unwrap(),
+                "at most one bounded empty current inventory"
             );
             let capture = inner
                 .get_summary()
@@ -1894,23 +2046,155 @@ async fn run_cycle_metadata_capture_retry_preserves_durable_checkpoint_until_rep
     }
 }
 
+const METADATA_CHILD_BYTES: &[u8] =
+    b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9";
+
+async fn metadata_child_page(server: &wiremock::MockServer) -> serde_json::Value {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    Mock::given(method("GET"))
+        .and(path("/metadata.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(METADATA_CHILD_BYTES.to_vec()))
+        .mount(server)
+        .await;
+    full_album_page_with_download(
+        "PrimarySync",
+        "master-PrimarySync",
+        "metadata-baseline",
+        &format!("{}/metadata.jpg", server.uri()),
+        METADATA_CHILD_BYTES.len() as u64,
+        &base64::engine::general_purpose::STANDARD.encode(Sha256::digest(METADATA_CHILD_BYTES)),
+    )
+}
+
 /// Runs one full-enumeration cycle with XMP sidecars enabled over a
 /// downloaded asset the provider now reports as a favourite.
+async fn admit_metadata_child(
+    inner: &Arc<state::SqliteStateDb>,
+    directory: &std::path::Path,
+    server: &wiremock::MockServer,
+) -> (serde_json::Value, std::path::PathBuf) {
+    let page = metadata_child_page(server).await;
+    let library = make_run_cycle_library_state_with_album(
+        "PrimarySync",
+        "sync_token:PrimarySync",
+        make_owned_metadata_album(inner, "PrimarySync", page.clone()),
+    );
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
+    let build = make_run_cycle_download_config_builder(directory, db.clone());
+    let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+    let result = Box::pin(run_cycle(
+        &[&library],
+        &make_run_cycle_config(),
+        Some(db.as_ref()),
+        &build,
+        download::DownloadControls::download_hidden(),
+        &session,
+        &CancellationToken::new(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(result.failed_count, 0);
+    assert_eq!(result.stats.downloaded, 1);
+    let rows = inner.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id.as_ref(), "asset-master-PrimarySync");
+    let path = rows[0].local_path.clone().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), METADATA_CHILD_BYTES.to_vec());
+    (page, path)
+}
+
+/// Name an owned test album so two passes resolve distinct `{album}` paths.
+#[cfg(feature = "xmp")]
+fn make_named_metadata_album(
+    db: &Arc<state::SqliteStateDb>,
+    zone: &str,
+    name: &str,
+    page: serde_json::Value,
+) -> crate::icloud::photos::PhotoAlbum {
+    let album = make_owned_metadata_album(db, zone, page);
+    let mut album = album.with_selector_components(vec![name.to_owned()]);
+    album.name = Arc::from(name);
+    album
+}
+
+/// Admits one asset under two equally current named albums so the later
+/// race runs over two independently selected destinations.
+#[cfg(feature = "xmp")]
+async fn admit_two_album_metadata_children(
+    inner: &Arc<state::SqliteStateDb>,
+    directory: &std::path::Path,
+    server: &wiremock::MockServer,
+) -> (serde_json::Value, std::path::PathBuf) {
+    let page = metadata_child_page(server).await;
+    let pass = |name: &str| crate::commands::AlbumPass {
+        kind: crate::commands::PassKind::Album,
+        album: make_named_metadata_album(inner, "PrimarySync", name, page.clone()),
+        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+    };
+    let library = make_run_cycle_library_state_with_passes(
+        "PrimarySync",
+        "sync_token:PrimarySync",
+        vec![pass("Album A"), pass("Album B")],
+    );
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
+    let build = make_run_cycle_download_config_builder_with_options(
+        directory,
+        Arc::clone(&db),
+        RunCycleDownloadConfigOptions {
+            xmp_sidecar: true,
+            per_pass_paths: true,
+            concurrent_downloads: Some(2),
+            ..RunCycleDownloadConfigOptions::default()
+        },
+    );
+    let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+    let result = Box::pin(run_cycle(
+        &[&library],
+        &make_run_cycle_config(),
+        Some(db.as_ref()),
+        &build,
+        download::DownloadControls::download_hidden(),
+        &session,
+        &CancellationToken::new(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(result.failed_count, 0);
+    assert_eq!(result.stats.downloaded, 2);
+    let rows = inner.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id.as_ref(), "asset-master-PrimarySync");
+    let path = rows[0].local_path.clone().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), METADATA_CHILD_BYTES.to_vec());
+    (page, path)
+}
+
 #[cfg(feature = "xmp")]
 async fn run_full_enumeration_metadata_cycle(
-    inner: &Arc<dyn download::DownloadStore>,
+    inner: &Arc<state::SqliteStateDb>,
     download_dir: &std::path::Path,
+    mut page: serde_json::Value,
     per_pass_paths: bool,
     controls: download::DownloadControls,
 ) -> crate::sync_cycle::CycleResult {
     let config = make_run_cycle_config();
-    let db: Arc<dyn download::DownloadStore> = Arc::clone(inner);
-    let album = make_full_album_with_session(
-        "PrimarySync",
-        crate::test_helpers::MockPhotosSession::new()
-            .ok(album_count_response(1))
-            .ok(run_cycle_favourited_asset_page()),
-    );
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
+    inner
+        .acquire_lock("force full metadata cycle")
+        .unwrap()
+        .execute(
+            "DELETE FROM metadata WHERE key=?1",
+            ["sync_token:PrimarySync"],
+        )
+        .unwrap();
+    page["syncToken"] = serde_json::json!("metadata-edited");
+    page["records"][1]["fields"]["isFavorite"] = serde_json::json!({"value":1,"type":"INT64"});
+    page["records"][1]["recordChangeTag"] = serde_json::json!("favourite-edit");
+    let album = make_owned_metadata_album(inner, "PrimarySync", page);
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
     let states = vec![&lib_state];
@@ -1918,7 +2202,6 @@ async fn run_full_enumeration_metadata_cycle(
         download_dir,
         Arc::clone(&db),
         RunCycleDownloadConfigOptions {
-            media: media_without_photo_downloads(),
             xmp_sidecar: true,
             per_pass_paths,
             ..RunCycleDownloadConfigOptions::default()
@@ -1930,7 +2213,6 @@ async fn run_full_enumeration_metadata_cycle(
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         controls,
         &shared_session,
@@ -1940,6 +2222,96 @@ async fn run_full_enumeration_metadata_cycle(
     .expect("run cycle")
 }
 
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn current_metadata_selection_ignores_deselected_and_foreign_markers() {
+    let server = crate::start_wiremock_or_skip!();
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let inner = open_owned_cycle_db(&database).await;
+    let (page, selected) = admit_metadata_child(&inner, directory.path(), &server).await;
+    let mut historical = Vec::new();
+    for library in ["PrimarySync", "ForeignLibrary"] {
+        let path = directory.path().join(format!("unselected-{library}.jpg"));
+        let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::create_dir(format!("{}.xmp", path.display())).unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("unselected")
+            .library(library)
+            .filename("unselected.jpg")
+            .metadata(state::AssetMetadata {
+                rating: Some(5),
+                ..Default::default()
+            })
+            .build();
+        inner.upsert_seen(&record).await.unwrap();
+        inner
+            .mark_downloaded(
+                library,
+                "unselected",
+                "original",
+                &path,
+                "historical-checksum",
+                None,
+            )
+            .await
+            .unwrap();
+        inner
+            .record_metadata_write_failure(library, "unselected", "original")
+            .await
+            .unwrap();
+        historical.push((
+            path.clone(),
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+        ));
+    }
+    let markers = inner.get_metadata_retry_markers().await.unwrap();
+    drop(inner);
+    let mut prior_sidecar = None;
+    for _ in 0..3 {
+        let inner = open_owned_cycle_db(&database).await;
+        let result = run_full_enumeration_metadata_cycle(
+            &inner,
+            directory.path(),
+            page.clone(),
+            false,
+            download::DownloadControls::download_hidden(),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0);
+        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("metadata-edited")
+        );
+        assert_eq!(inner.get_metadata_retry_markers().await.unwrap(), markers);
+        for (path, modified) in &historical {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                include_bytes!("../../../../tests/data/media/pattern.jpg")
+            );
+            assert_eq!(
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+                *modified
+            );
+            assert!(std::path::Path::new(&format!("{}.xmp", path.display())).is_dir());
+        }
+        let sidecar = std::path::PathBuf::from(format!("{}.xmp", selected.display()));
+        let current = (
+            std::fs::read(&sidecar).unwrap(),
+            std::fs::metadata(sidecar).unwrap().modified().unwrap(),
+        );
+        if let Some(prior) = prior_sidecar {
+            assert_eq!(current, prior);
+        }
+        prior_sidecar = Some(current);
+    }
+}
+
 /// #707 review: both enumeration branches defer their queue, so a full
 /// enumeration drains once. A second drain in the same cycle would retry a
 /// failed rewrite immediately and report it twice.
@@ -1947,21 +2319,19 @@ async fn run_full_enumeration_metadata_cycle(
 #[tokio::test]
 async fn run_cycle_full_enumeration_reports_a_failed_rewrite_once() {
     for per_pass_paths in [false, true] {
-        let inner = make_state_db();
+        let server = crate::start_wiremock_or_skip!();
         let download_dir = tempfile::tempdir().expect("download tempdir");
-        seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
+        let inner = open_owned_cycle_db(&download_dir.path().join("state.db")).await;
+        let (page, media_path) = admit_metadata_child(&inner, download_dir.path(), &server).await;
+        let before = std::fs::read(&media_path).unwrap();
         // A directory where the sidecar belongs makes the rewrite fail.
-        std::fs::create_dir(
-            download_dir
-                .path()
-                .join(run_cycle_expected_date_dir())
-                .join("photo.jpg.xmp"),
-        )
-        .expect("block the sidecar path");
+        std::fs::create_dir(format!("{}.xmp", media_path.display()))
+            .expect("block the sidecar path");
 
         let result = run_full_enumeration_metadata_cycle(
             &inner,
             download_dir.path(),
+            page,
             per_pass_paths,
             download::DownloadControls::download_hidden(),
         )
@@ -1979,54 +2349,62 @@ async fn run_cycle_full_enumeration_reports_a_failed_rewrite_once() {
                 .is_empty(),
             "the marker must survive for the next run to retry"
         );
+        assert_eq!(std::fs::read(media_path).unwrap(), before);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }
 
-/// #707 review: the interleaving the maintainer described. Two passes run
-/// concurrently over one asset carrying different provider snapshots. They
-/// must share one drain, so a single writer owns the file, and the sidecar
-/// must agree with whichever snapshot the row settled on with no marker
-/// left claiming otherwise.
+/// #707 review: two named albums can retain independent physical copies of the
+/// same asset. They are enumerated concurrently, so both copies must share the
+/// single metadata drain, each must receive the durable row snapshot, and no
+/// marker may survive. A legacy path from an older pass layout is not a current
+/// writer; the fixture establishes both album copies under this authority first.
+/// The passes carry different change tags but one provider snapshot because
+/// current selection defers conflicting metadata snapshots for one asset.
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row() {
+    let server = crate::start_wiremock_or_skip!();
     let config = make_run_cycle_config();
-    let inner = make_state_db();
     let download_dir = tempfile::tempdir().expect("download tempdir");
-    seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
-
-    let counting = FailingMetadataSetDb::without_set_failure(
-        Arc::clone(&inner),
-        "__unused_metadata_message__",
-    );
-    let drains = counting.drain_counter();
-    let db: Arc<dyn download::DownloadStore> = Arc::new(counting);
+    let inner = open_owned_cycle_db(&download_dir.path().join("state.db")).await;
+    let (mut page, media_path) =
+        admit_two_album_metadata_children(&inner, download_dir.path(), &server).await;
+    let before = std::fs::read(&media_path).unwrap();
+    inner
+        .acquire_lock("force two pass metadata enumeration")
+        .unwrap()
+        .execute(
+            "DELETE FROM metadata WHERE key=?1",
+            ["sync_token:PrimarySync"],
+        )
+        .unwrap();
+    page["syncToken"] = serde_json::json!("metadata-race");
+    page["records"][1]["recordChangeTag"] = serde_json::json!("favourite");
+    page["records"][1]["fields"]["isFavorite"] = serde_json::json!({"value":1,"type":"INT64"});
+    let mut second_pass = page.clone();
+    second_pass["records"][1]["recordChangeTag"] = serde_json::json!("second-pass");
+    inner.acquire_lock("observe native metadata finalization").unwrap().execute_batch(
+        "CREATE TABLE metadata_retirements(path TEXT NOT NULL);
+         CREATE TRIGGER observe_metadata_retirement AFTER UPDATE OF metadata_write_failed_at ON asset_metadata_paths
+         WHEN OLD.metadata_write_failed_at IS NOT NULL AND NEW.metadata_write_failed_at IS NULL
+         BEGIN INSERT INTO metadata_retirements VALUES(NEW.local_path); END;"
+    ).unwrap();
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
     let pass = |name: &str, page: serde_json::Value| crate::commands::AlbumPass {
         kind: crate::commands::PassKind::Album,
-        album: make_named_full_album_with_boxed_session(
-            "PrimarySync",
-            name,
-            Box::new(
-                crate::test_helpers::MockPhotosSession::new()
-                    .ok(album_count_response(1))
-                    .ok(page),
-            ),
-        ),
+        album: make_named_metadata_album(&inner, "PrimarySync", name, page),
         exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
     };
     let lib_state = make_run_cycle_library_state_with_passes(
         "PrimarySync",
         "sync_token:PrimarySync",
-        vec![
-            pass("Favourited", run_cycle_favourited_asset_page()),
-            pass("Captioned", run_cycle_captioned_asset_page()),
-        ],
+        vec![pass("Album A", page), pass("Album B", second_pass)],
     );
     let build_download_config = make_run_cycle_download_config_builder_with_options(
         download_dir.path(),
         Arc::clone(&db),
         RunCycleDownloadConfigOptions {
-            media: media_without_photo_downloads(),
             xmp_sidecar: true,
             per_pass_paths: true,
             concurrent_downloads: Some(2),
@@ -2035,11 +2413,10 @@ async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row(
     );
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
-    run_cycle(
+    let result = run_cycle(
         &[&lib_state],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -2047,38 +2424,73 @@ async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row(
     )
     .await
     .expect("run cycle");
+    assert_eq!(result.failed_count, 0);
+    assert_eq!(
+        result.stats.downloaded, 0,
+        "the preceding cycle already established both album copies"
+    );
+    assert!(!result.stats.sync_token_blocked);
 
-    let stored = inner
+    let reopened = state::SqliteStateDb::open(&download_dir.path().join("state.db"))
+        .await
+        .unwrap();
+    let stored = reopened
         .get_downloaded_page(0, 10)
         .await
         .expect("read downloaded rows");
     let row = stored.first().expect("the asset stays downloaded");
-    let sidecar = std::fs::read_to_string(
-        download_dir
-            .path()
-            .join(run_cycle_expected_date_dir())
-            .join("photo.jpg.xmp"),
-    )
-    .expect("the drain writes a sidecar");
-
+    let finalized_paths: Vec<String> = reopened
+        .acquire_lock("read finalized metadata destinations")
+        .unwrap()
+        .prepare("SELECT local_path FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-master-PrimarySync' AND version_size='original' ORDER BY local_path")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
     assert_eq!(
-        drains.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "the passes must share one drain, so a single writer owns the file"
-    );
-    assert_eq!(
-        sidecar.contains("<xmp:Rating>5</xmp:Rating>"),
-        row.metadata.rating == Some(5),
-        "the sidecar must hold the snapshot the row settled on: {sidecar}"
+        finalized_paths.len(),
+        2,
+        "both album copies remain independent"
     );
     assert!(
-        inner
+        finalized_paths
+            .iter()
+            .any(|path| std::path::Path::new(path) == media_path)
+    );
+    for path in &finalized_paths {
+        let sidecar = std::fs::read_to_string(format!("{path}.xmp"))
+            .expect("the drain writes every finalized copy's sidecar");
+        let retirements: i64 = reopened
+            .acquire_lock("read per-path metadata completions")
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_retirements WHERE path=?1",
+                [path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            retirements, 1,
+            "one writer retires each physical path: {path}"
+        );
+        assert_eq!(
+            sidecar.contains("<xmp:Rating>5</xmp:Rating>"),
+            row.metadata.rating == Some(5),
+            "each sidecar must hold the durable snapshot: {sidecar}"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+    assert!(
+        reopened
             .get_metadata_retry_markers()
             .await
             .expect("read markers")
             .is_empty(),
         "no marker may survive a completed drain"
     );
+    assert_eq!(std::fs::read(media_path).unwrap(), before);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
 
 /// #707 review: a forwarded download writes the snapshot it was planned
@@ -2088,22 +2500,21 @@ async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row(
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn run_cycle_download_does_not_retire_a_marker_raised_for_newer_metadata() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, ResponseTemplate};
-
     let server = crate::start_wiremock_or_skip!();
     let config = make_run_cycle_config();
-    let inner = make_state_db();
     let download_dir = tempfile::tempdir().expect("download tempdir");
-    seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
+    let inner = open_owned_cycle_db(&download_dir.path().join("state.db")).await;
+    let (mut page, media_path) = admit_metadata_child(&inner, download_dir.path(), &server).await;
+    let before = std::fs::read(&media_path).unwrap();
 
+    let frozen_hash = inner.get_downloaded_page(0, 10).await.unwrap()[0]
+        .metadata
+        .metadata_hash
+        .clone();
     // The row stays downloaded but its file is gone, so the media task is
     // forwarded rather than skipped as already on disk.
-    let media_path = download_dir
-        .path()
-        .join(run_cycle_expected_date_dir())
-        .join("photo.jpg");
-    std::fs::remove_file(&media_path).expect("remove the media file");
+    let retained = download_dir.path().join("retained-original.jpg");
+    std::fs::rename(&media_path, &retained).expect("retain the missing destination's bytes");
 
     let mut newer = state::AssetMetadata {
         is_favorite: true,
@@ -2111,42 +2522,32 @@ async fn run_cycle_download_does_not_retire_a_marker_raised_for_newer_metadata()
         ..state::AssetMetadata::default()
     };
     newer.refresh_hash();
-    let db: Arc<dyn download::DownloadStore> = Arc::new(
-        FailingMetadataSetDb::without_set_failure(
-            Arc::clone(&inner),
-            "__unused_metadata_message__",
+    {
+        let conn = inner
+            .acquire_lock("inject concurrent metadata edit at native publication")
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE metadata_race(hash TEXT NOT NULL, fired INTEGER NOT NULL);",
         )
-        .with_refresh_on_mark_downloaded(newer),
-    );
-
-    let body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
-    Mock::given(method("GET"))
-        .and(path("/photo.jpg"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(body)
-                .insert_header("content-type", "image/jpeg"),
+        .unwrap();
+        conn.execute(
+            "INSERT INTO metadata_race VALUES(?1,0)",
+            [newer.metadata_hash.as_deref().unwrap()],
         )
-        .mount(&server)
-        .await;
-
-    let album = make_full_album_with_session(
-        "PrimarySync",
-        crate::test_helpers::MockPhotosSession::new()
-            .ok(album_count_response(1))
-            .ok(full_album_page_with_download(
-                "PrimarySync",
-                "master-PrimarySync",
-                "zone-tok-new",
-                &format!("{}/photo.jpg", server.uri()),
-                body.len() as u64,
-                // The provider reports the stored version, so the media
-                // task is forwarded only because the file is missing. A
-                // different checksum would make this a new version and
-                // return the row to pending, which is a separate flow.
-                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-            )),
-    );
+        .unwrap();
+        conn.execute_batch("CREATE TRIGGER refresh_during_publication AFTER UPDATE OF verified_media ON provider_active_destinations
+        WHEN NEW.library='PrimarySync' AND NEW.asset_id='asset-master-PrimarySync' AND NEW.version_size='original' AND OLD.verified_media=0 AND NEW.verified_media=1 AND (SELECT fired FROM metadata_race)=0
+        BEGIN
+          UPDATE metadata_race SET fired=1;
+          UPDATE assets SET is_favorite=1,rating=5,metadata_hash=(SELECT hash FROM metadata_race),metadata_write_failed_at=1
+            WHERE library=NEW.library AND id=NEW.asset_id AND version_size=NEW.version_size;
+          UPDATE asset_metadata_paths SET metadata_write_failed_at=1
+            WHERE library=NEW.library AND id=NEW.asset_id AND version_size=NEW.version_size;
+        END;").unwrap();
+    }
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
+    page["syncToken"] = serde_json::json!("metadata-redownload");
+    let album = make_owned_metadata_album(&inner, "PrimarySync", page);
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
     let states = vec![&lib_state];
@@ -2164,7 +2565,6 @@ async fn run_cycle_download_does_not_retire_a_marker_raised_for_newer_metadata()
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -2173,7 +2573,19 @@ async fn run_cycle_download_does_not_retire_a_marker_raised_for_newer_metadata()
     .await
     .expect("run cycle");
 
-    let row = inner
+    let reopened = state::SqliteStateDb::open(&download_dir.path().join("state.db"))
+        .await
+        .unwrap();
+    let fired: i64 = reopened
+        .acquire_lock("assert native race ran")
+        .unwrap()
+        .query_row("SELECT fired FROM metadata_race", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(fired, 1);
+    assert_eq!(std::fs::read(&retained).unwrap(), before);
+    assert_eq!(std::fs::read(&media_path).unwrap(), before);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    let row = reopened
         .get_downloaded_page(0, 10)
         .await
         .expect("read downloaded rows")
@@ -2192,9 +2604,39 @@ async fn run_cycle_download_does_not_retire_a_marker_raised_for_newer_metadata()
     let sidecar = std::fs::read_to_string(published.with_file_name(sidecar_name))
         .expect("sidecar written next to the media file");
     assert!(
-        sidecar.contains("<xmp:Rating>5</xmp:Rating>"),
-        "the file must end on the snapshot the row holds: {sidecar}"
+        !sidecar.contains("<xmp:Rating>5</xmp:Rating>"),
+        "the newer row must not replace the frozen publication intent: {sidecar}"
     );
+    assert_eq!(row.metadata.metadata_hash, newer.metadata_hash);
+    let retained_marker: (Option<i64>, Option<i64>) = reopened
+        .acquire_lock("read the newer durable metadata marker")
+        .unwrap()
+        .query_row(
+            "SELECT a.metadata_write_failed_at,p.metadata_write_failed_at
+             FROM assets a JOIN asset_metadata_paths p USING(library,id,version_size)
+             WHERE a.library='PrimarySync' AND a.id='asset-master-PrimarySync'
+               AND a.version_size='original' AND p.local_path=?1",
+            [published.to_str().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(retained_marker, (Some(1), Some(1)));
+    let native_hashes: Vec<Option<String>> = reopened
+        .acquire_lock("read frozen native metadata intent")
+        .unwrap()
+        .prepare(
+            "SELECT metadata_hash FROM provider_active_destinations
+             WHERE library='PrimarySync' AND asset_id='asset-master-PrimarySync'
+               AND version_size='original' AND admitted=1 AND verified_media=1",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(!native_hashes.is_empty());
+    assert!(native_hashes.iter().all(|hash| hash == &frozen_hash));
+    assert_ne!(frozen_hash, newer.metadata_hash);
 }
 
 /// #707 review: deferring the drain moved it outside the pipeline, which
@@ -2210,22 +2652,32 @@ async fn run_cycle_full_enumeration_writes_no_metadata_in_read_only_modes() {
             download::DownloadReporting::hidden(),
         ),
     ] {
-        let inner = make_state_db();
+        let server = crate::start_wiremock_or_skip!();
         let download_dir = tempfile::tempdir().expect("download tempdir");
-        seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
+        let inner = open_owned_cycle_db(&download_dir.path().join("state.db")).await;
+        let (page, media_path) = admit_metadata_child(&inner, download_dir.path(), &server).await;
+        let before = std::fs::read(&media_path).unwrap();
         inner
-            .record_metadata_write_failure("PrimarySync", "master-PrimarySync", "original")
+            .record_metadata_write_failure("PrimarySync", "asset-master-PrimarySync", "original")
             .await
             .expect("queue a rewrite");
 
-        run_full_enumeration_metadata_cycle(&inner, download_dir.path(), false, controls).await;
+        let markers_before = inner.get_metadata_retry_markers().await.unwrap();
+        assert_eq!(markers_before.len(), 1);
+        assert_eq!(
+            inner
+                .get_pending_metadata_rewrites_page(None, 0, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        run_full_enumeration_metadata_cycle(&inner, download_dir.path(), page, false, controls)
+            .await;
 
         assert!(
-            !download_dir
-                .path()
-                .join(run_cycle_expected_date_dir())
-                .join("photo.jpg.xmp")
-                .exists(),
+            !std::path::Path::new(&format!("{}.xmp", media_path.display())).exists(),
             "a read-only run must not write a sidecar"
         );
         assert!(
@@ -2236,6 +2688,12 @@ async fn run_cycle_full_enumeration_writes_no_metadata_in_read_only_modes() {
                 .is_empty(),
             "a read-only run must not retire the marker"
         );
+        assert_eq!(
+            inner.get_metadata_retry_markers().await.unwrap(),
+            markers_before
+        );
+        assert_eq!(std::fs::read(media_path).unwrap(), before);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }
 
@@ -2244,69 +2702,12 @@ async fn run_cycle_full_enumeration_writes_no_metadata_in_read_only_modes() {
 /// stop the zone checkpoint from being stored.
 #[tokio::test]
 async fn run_cycle_full_enumeration_metadata_refresh_failure_preserves_zone_checkpoint() {
-    let config = make_run_cycle_config();
-    let inner = make_state_db();
-    // No seeded zone token, so the cycle runs a full enumeration.
-    let download_dir = tempfile::tempdir().expect("download tempdir");
-    seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
-
-    let db: Arc<dyn download::DownloadStore> = Arc::new(
-        FailingMetadataSetDb::without_set_failure(
-            Arc::clone(&inner),
-            "simulated provider metadata write failure",
-        )
-        .with_refresh_downloaded_metadata_failure(),
-    );
-    let page = run_cycle_favourited_asset_page();
-    let album = make_full_album_with_session(
-        "PrimarySync",
-        crate::test_helpers::MockPhotosSession::new()
-            .ok(album_count_response(1))
-            .ok(page),
-    );
-    let lib_state =
-        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
-    let states = vec![&lib_state];
-    let build_download_config = make_run_cycle_download_config_builder_with_options(
-        download_dir.path(),
-        Arc::clone(&db),
-        RunCycleDownloadConfigOptions {
-            media: media_without_photo_downloads(),
-            ..RunCycleDownloadConfigOptions::default()
-        },
-    );
-    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-
-    let result = run_cycle(
-        &states,
-        &config,
-        Some(db.as_ref()),
-        false,
-        &build_download_config,
-        download::DownloadControls::download_hidden(),
-        &shared_session,
-        &CancellationToken::new(),
-    )
-    .await
-    .expect("run cycle");
-
-    assert_eq!(
-        result.stats.full_enumeration_reason,
-        Some(download::FullEnumerationReason::NoStoredToken),
-        "this regression must exercise the full-enumeration path"
-    );
-    assert!(
-        result.stats.state_write_failures > 0,
-        "the full-enumeration producer must report the failed refresh as non-durable state"
-    );
-    assert_eq!(
-        inner
-            .get_metadata("sync_token:PrimarySync")
-            .await
-            .expect("read zone token"),
-        None,
-        "a failed provider metadata refresh must not store a zone checkpoint"
-    );
+    Box::pin(exercise_selected_metadata_update(
+        SelectedMetadataFault::StateWrite,
+        1,
+        SelectedMetadataRoute::Full,
+    ))
+    .await;
 }
 
 #[tokio::test]
@@ -2359,6 +2760,7 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
             body: String,
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<serde_json::Value> {
+            let request: serde_json::Value = serde_json::from_str(&body)?;
             let lookup = url.contains("/records/lookup?");
             let changes = url.contains("/changes/zone?");
             let query = url.contains("/records/query?");
@@ -2368,7 +2770,10 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
             if query {
                 self.queries.fetch_add(1, Ordering::SeqCst);
             }
-            if matches!(self.stage, Stage::Full | Stage::FullPerPass) && changes {
+            if matches!(self.stage, Stage::Full | Stage::FullPerPass)
+                && changes
+                && request["zones"][0]["syncToken"] != "zone-after"
+            {
                 return Err(crate::icloud::photos::SyncTokenError::InvalidToken {
                     reason: "test requires full enumeration".into(),
                 }
@@ -2389,18 +2794,32 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
                 .into());
             }
             if lookup {
-                return Ok(serde_json::json!({"records": self.records}));
+                let names = request["records"].as_array().unwrap();
+                let records: Vec<_> = self
+                    .records
+                    .iter()
+                    .filter(|record| {
+                        names
+                            .iter()
+                            .any(|name| name["recordName"] == record["recordName"])
+                    })
+                    .collect();
+                return Ok(serde_json::json!({"records": records}));
             }
             if changes {
-                let records = match self.stage {
-                    Stage::AssetPair => vec![self.records[1].clone()],
-                    Stage::AssetIdentity => {
-                        let mut child = self.records[1].clone();
-                        child["fields"].as_object_mut().unwrap().remove("masterRef");
-                        vec![child]
+                let records = if request["zones"][0]["syncToken"] == "zone-after" {
+                    Vec::new()
+                } else {
+                    match self.stage {
+                        Stage::AssetPair => vec![self.records[1].clone()],
+                        Stage::AssetIdentity => {
+                            let mut child = self.records[1].clone();
+                            child["fields"].as_object_mut().unwrap().remove("masterRef");
+                            vec![child]
+                        }
+                        Stage::LegacyCapture => self.records.clone(),
+                        _ => Vec::new(),
                     }
-                    Stage::LegacyCapture => self.records.clone(),
-                    _ => Vec::new(),
                 };
                 return Ok(serde_json::json!({"zones": [{
                     "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
@@ -2441,19 +2860,10 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
         Stage::AssetIdentity,
     ] {
         for status in [401, 403, 421] {
-            for recent in [None, Some(10)] {
-                // A bounded full inventory deliberately cannot advance its checkpoint.
-                if matches!(stage, Stage::Full | Stage::FullPerPass) && recent.is_some() {
-                    continue;
-                }
-                let mut config = make_run_cycle_config();
-                config.filters.recent = recent;
+            {
+                let config = make_run_cycle_config();
                 let dir = tempfile::tempdir().unwrap();
-                let inner = Arc::new(
-                    state::SqliteStateDb::open(&dir.path().join("state.db"))
-                        .await
-                        .unwrap(),
-                );
+                let inner = open_owned_cycle_db(&dir.path().join("state.db")).await;
                 let db = inner.clone() as Arc<dyn download::DownloadStore>;
                 let media_dir = dir.path().join("media");
                 seed_run_cycle_metadata_drift_asset(&db, &media_dir).await;
@@ -2497,8 +2907,10 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
                 let failing = Arc::new(AtomicBool::new(true));
                 let queries = Arc::new(AtomicUsize::new(0));
                 let lookups = Arc::new(AtomicUsize::new(0));
-                let album = make_full_album_with_boxed_session(
+                let album = make_owned_cycle_album(
+                    &inner,
                     "PrimarySync",
+                    "private",
                     Box::new(RecoverySession {
                         stage,
                         status,
@@ -2522,20 +2934,46 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
                     RunCycleDownloadConfigOptions {
                         media: media_without_photo_downloads(),
                         per_pass_paths: stage == Stage::FullPerPass,
-                        recent,
                         ..RunCycleDownloadConfigOptions::default()
                     },
                 );
                 let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+                let mut capture_lookups = 0;
                 for cycle in 0..3 {
                     if cycle > 0 {
                         failing.store(false, Ordering::SeqCst);
                     }
+                    let capture = if capture_pending {
+                        let lookups_before = lookups.load(Ordering::SeqCst);
+                        let (repair, failures) =
+                            repair_historical_capture(&inner, "PrimarySync", &library.plan.passes)
+                                .await;
+                        capture_lookups += lookups.load(Ordering::SeqCst) - lookups_before;
+                        if cycle == 0 {
+                            assert!(
+                                failures > 0,
+                                "explicit maintenance must execute the session fault"
+                            );
+                            assert!(repair.sync_token_blocked);
+                            assert_eq!(
+                                inner
+                                    .get_metadata("sync_token:PrimarySync")
+                                    .await
+                                    .unwrap()
+                                    .as_deref(),
+                                Some("zone-before")
+                            );
+                            assert_eq!(snapshot_files(&media_dir), before);
+                            continue;
+                        }
+                        Some(repair)
+                    } else {
+                        None
+                    };
                     let result = run_cycle(
                         &[&library],
                         &config,
                         Some(db.as_ref()),
-                        false,
                         &builder,
                         download::DownloadControls::download_hidden(),
                         &shared_session,
@@ -2546,7 +2984,7 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
                     assert_eq!(
                         result.session_expired,
                         cycle == 0,
-                        "{stage:?} HTTP {status} recent={recent:?} cycle={cycle}"
+                        "{stage:?} HTTP {status} cycle={cycle}"
                     );
                     assert_eq!(
                         inner
@@ -2566,12 +3004,10 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
                         "provider recovery must not change local media"
                     );
                     assert_eq!(result.stats.downloaded, 0);
-                    if recent.is_none()
-                        && matches!(
-                            stage,
-                            Stage::Incremental | Stage::AssetPair | Stage::AssetIdentity
-                        )
-                    {
+                    if matches!(
+                        stage,
+                        Stage::Incremental | Stage::AssetPair | Stage::AssetIdentity
+                    ) {
                         let summary = inner.get_summary().await.unwrap();
                         let status = crate::commands::backup_status_line(&summary);
                         assert_eq!(summary.last_sync_interrupted, cycle == 0);
@@ -2628,10 +3064,10 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
                         assert_eq!(result.failed_count, 0);
                         if capture_pending {
                             assert_eq!(
-                                result.stats.metadata_capture_refreshed,
+                                capture.as_ref().unwrap().metadata_capture_refreshed,
                                 usize::from(cycle == 1)
                             );
-                            assert_eq!(result.stats.metadata_capture_remaining, 0);
+                            assert_eq!(capture.as_ref().unwrap().metadata_capture_remaining, 0);
                             assert!(
                                 inner.get_downloaded_page(0, 1).await.unwrap()[0]
                                     .metadata
@@ -2641,7 +3077,7 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
                     }
                 }
                 if stage == Stage::Capture {
-                    assert_eq!(lookups.load(Ordering::SeqCst), 2);
+                    assert_eq!(capture_lookups, 2);
                 }
             }
         }
@@ -2707,7 +3143,7 @@ async fn sparse_deletion_batches_survive_restart_and_preserve_failed_state() {
             Box::new(self.clone())
         }
     }
-    for recent in [None, Some(10)] {
+    {
         for replay in [false, true] {
             for changing_snapshot in [false, true] {
                 let count = 101;
@@ -2715,7 +3151,7 @@ async fn sparse_deletion_batches_survive_restart_and_preserve_failed_state() {
                 let media = directory.path().join("media");
                 let database = directory.path().join("state.db");
                 {
-                    let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                    let inner = open_owned_cycle_db(&database).await;
                     let db = inner.clone() as Arc<dyn download::DownloadStore>;
                     seed_run_cycle_metadata_drift_asset(&db, &media).await;
                     inner.set_metadata_capture_revision_for_test(
@@ -2757,16 +3193,17 @@ async fn sparse_deletion_batches_survive_restart_and_preserve_failed_state() {
                 }
                 let sentinel = media.join("keep.bin");
                 std::fs::write(&sentinel, b"unchanged private media").unwrap();
-                let mut config = make_run_cycle_config();
-                config.filters.recent = recent;
+                let config = make_run_cycle_config();
                 let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
                 let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let snapshot = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let library = make_run_cycle_library_state_with_album(
+                let mut library = make_run_cycle_library_state_with_album(
                     "PrimarySync",
                     "sync_token:PrimarySync",
-                    make_full_album_with_boxed_session(
+                    make_owned_cycle_album(
+                        &open_owned_cycle_db(&database).await,
                         "PrimarySync",
+                        "private",
                         Box::new(DeletedSession {
                             lookups: lookups.clone(),
                             replay,
@@ -2778,30 +3215,31 @@ async fn sparse_deletion_batches_survive_restart_and_preserve_failed_state() {
                 );
                 for cycle in 0..4 {
                     snapshot.store(cycle.min(2), std::sync::atomic::Ordering::Relaxed);
-                    let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
-                    let db: Arc<dyn download::DownloadStore> = if cycle == 1 {
-                        let mut failing = FailingMetadataSetDb::without_set_failure(
-                            inner.clone(),
-                            "injected cached deletion state failure",
-                        );
-                        failing.fail_source_delete = true;
-                        Arc::new(failing)
-                    } else {
-                        inner.clone()
-                    };
+                    let inner = open_owned_cycle_db(&database).await;
+                    bind_metadata_capture(
+                        &inner,
+                        "PrimarySync",
+                        "private",
+                        &mut library.plan.passes[0].album,
+                    );
+                    let conn = rusqlite::Connection::open(&database).unwrap();
+                    conn.execute_batch("DROP TRIGGER IF EXISTS fail_cached_sparse_retirement")
+                        .unwrap();
+                    if cycle == 1 {
+                        conn.execute_batch("CREATE TRIGGER fail_cached_sparse_retirement BEFORE DELETE ON unresolved_sparse_identities
+                            WHEN OLD.library='PrimarySync' BEGIN SELECT RAISE(ABORT,'injected cached deletion state failure'); END;").unwrap();
+                    }
+                    drop(conn);
+                    let db: Arc<dyn download::DownloadStore> = inner.clone();
                     let builder = make_run_cycle_download_config_builder_with_options(
                         &media,
                         db.clone(),
-                        RunCycleDownloadConfigOptions {
-                            recent,
-                            ..RunCycleDownloadConfigOptions::default()
-                        },
+                        RunCycleDownloadConfigOptions::default(),
                     );
                     let result = run_cycle(
                         &[&library],
                         &config,
                         Some(db.as_ref()),
-                        false,
                         &builder,
                         download::DownloadControls::download_hidden(),
                         &shared_session,
@@ -2824,7 +3262,7 @@ async fn sparse_deletion_batches_survive_restart_and_preserve_failed_state() {
                             .unwrap()
                             .as_deref(),
                         Some(expected_token),
-                        "recent={recent:?} replay={replay} changing_snapshot={changing_snapshot} cycle={cycle}"
+                        "replay={replay} changing_snapshot={changing_snapshot} cycle={cycle}"
                     );
                     assert_eq!(
                         inner.sparse_identities("PrimarySync").await.unwrap().len(),
@@ -2929,7 +3367,7 @@ async fn sparse_deletion_validation_preserves_restored_or_unproven_sources() {
             Box::new(self.clone())
         }
     }
-    for recent in [None, Some(10)] {
+    {
         for change in [
             ValidationChange::Restored,
             ValidationChange::Incomplete,
@@ -2939,7 +3377,7 @@ async fn sparse_deletion_validation_preserves_restored_or_unproven_sources() {
             let media = directory.path().join("media");
             let database = directory.path().join("state.db");
             {
-                let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                let inner = open_owned_cycle_db(&database).await;
                 let db = inner.clone() as Arc<dyn download::DownloadStore>;
                 seed_run_cycle_metadata_drift_asset(&db, &media).await;
                 inner.set_metadata_capture_revision_for_test(
@@ -2973,8 +3411,7 @@ async fn sparse_deletion_validation_preserves_restored_or_unproven_sources() {
             }
             let sentinel = media.join("keep.bin");
             std::fs::write(&sentinel, b"unchanged media").unwrap();
-            let mut config = make_run_cycle_config();
-            config.filters.recent = recent;
+            let config = make_run_cycle_config();
             let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
             let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let validations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2984,14 +3421,16 @@ async fn sparse_deletion_validation_preserves_restored_or_unproven_sources() {
                 4
             };
             for cycle in 0..cycles {
-                let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                let inner = open_owned_cycle_db(&database).await;
                 let db = inner.clone() as Arc<dyn download::DownloadStore>;
                 let shutdown = CancellationToken::new();
                 let library = make_run_cycle_library_state_with_album(
                     "PrimarySync",
                     "sync_token:PrimarySync",
-                    make_full_album_with_boxed_session(
+                    make_owned_cycle_album(
+                        &inner,
                         "PrimarySync",
+                        "private",
                         Box::new(ValidationSession {
                             change,
                             cycle,
@@ -3004,16 +3443,12 @@ async fn sparse_deletion_validation_preserves_restored_or_unproven_sources() {
                 let builder = make_run_cycle_download_config_builder_with_options(
                     &media,
                     db.clone(),
-                    RunCycleDownloadConfigOptions {
-                        recent,
-                        ..RunCycleDownloadConfigOptions::default()
-                    },
+                    RunCycleDownloadConfigOptions::default(),
                 );
                 let result = run_cycle(
                     &[&library],
                     &config,
                     Some(db.as_ref()),
-                    false,
                     &builder,
                     download::DownloadControls::download_hidden(),
                     &shared_session,
@@ -3027,7 +3462,7 @@ async fn sparse_deletion_validation_preserves_restored_or_unproven_sources() {
                         .unwrap()
                         .as_deref(),
                     Some(if cycle < 2 { "before" } else { "after-2" }),
-                    "{recent:?} {change:?} cycle {cycle}"
+                    "{change:?} cycle {cycle}"
                 );
                 let retained = db.sparse_identities("PrimarySync").await.unwrap();
                 assert_eq!(retained.len(), if cycle < 2 { 101 } else { 0 });
@@ -3087,6 +3522,7 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
     struct RecoveredSession {
         records: serde_json::Value,
         lookups: Arc<std::sync::atomic::AtomicUsize>,
+        cancel_after_observation: Option<CancellationToken>,
     }
     #[async_trait::async_trait]
     impl crate::icloud::photos::PhotosSession for RecoveredSession {
@@ -3100,6 +3536,12 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
             if let Some(page) =
                 sparse_fixture_inventory(url, &request, self.records.as_array().unwrap())
             {
+                if url.contains("/records/query?")
+                    && page["records"].as_array().is_some_and(Vec::is_empty)
+                    && let Some(cancel) = &self.cancel_after_observation
+                {
+                    cancel.cancel();
+                }
                 return Ok(page);
             }
             if url.contains("/changes/zone?") {
@@ -3117,17 +3559,33 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
                 .map(|record| record["recordName"].as_str().unwrap())
                 .collect();
             names.sort_unstable();
-            assert_eq!(names, ["asset-recovered", "recovered"]);
+            assert!(
+                matches!(
+                    names.as_slice(),
+                    ["asset-recovered"] | ["recovered"] | ["asset-recovered", "recovered"]
+                ),
+                "only the current child and its exact source may be confirmed: {names:?}"
+            );
             self.lookups
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(serde_json::json!({"records":self.records}))
+            if let Some(cancel) = &self.cancel_after_observation {
+                cancel.cancel();
+            }
+            let records: Vec<_> = self
+                .records
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|record| names.contains(&record["recordName"].as_str().unwrap()))
+                .collect();
+            Ok(serde_json::json!({"records":records}))
         }
         fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
             Box::new(self.clone())
         }
     }
 
-    for recent in [None, Some(10)] {
+    {
         for interrupted in [false, true] {
             let server = crate::start_wiremock_or_skip!();
             let bytes =
@@ -3156,7 +3614,7 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
                 r#"[1,"unverified-target","SharedSync-absent","private-owner"]"#.into(),
             );
             {
-                let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                let db = open_owned_cycle_db(&database).await;
                 seed_run_cycle_metadata_drift_asset(
                     &(db.clone() as Arc<dyn download::DownloadStore>),
                     &media,
@@ -3193,51 +3651,60 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
             }
             let sentinel = media.join("keep-private.bin");
             std::fs::write(&sentinel, b"keep these bytes").unwrap();
-            let mut config = make_run_cycle_config();
-            config.filters.recent = recent;
+            let config = make_run_cycle_config();
             let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
             let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut completed_requests = 0;
             for cycle in 0..3 {
-                let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                let inner = open_owned_cycle_db(&database).await;
                 let cancel = CancellationToken::new();
-                let db: Arc<dyn download::DownloadStore> = if cycle == 0 {
-                    let failing = FailingMetadataSetDb::without_set_failure(
-                        inner.clone(),
-                        "injected sparse recovery state failure",
-                    );
-                    Arc::new(if interrupted {
-                        failing.with_cancel_on_upsert(cancel.clone())
-                    } else {
-                        failing.with_upsert_seen_failure()
-                    })
-                } else {
-                    inner.clone()
-                };
+                let conn = rusqlite::Connection::open(&database).unwrap();
+                conn.execute_batch("DROP TRIGGER IF EXISTS fail_sparse_selected_upsert")
+                    .unwrap();
+                if cycle == 0 && !interrupted {
+                    conn.execute_batch(
+                        "CREATE TRIGGER fail_sparse_selected_upsert BEFORE INSERT ON assets
+                        WHEN NEW.library='PrimarySync' AND NEW.id='asset-recovered'
+                        BEGIN SELECT RAISE(ABORT,'injected sparse recovery state failure'); END;",
+                    )
+                    .unwrap();
+                }
+                drop(conn);
+                let db: Arc<dyn download::DownloadStore> = inner.clone();
                 let primary = make_run_cycle_library_state_with_album(
                     "PrimarySync",
                     "sync_token:PrimarySync",
-                    make_full_album_with_boxed_session(
+                    make_owned_cycle_album(
+                        &inner,
                         "PrimarySync",
+                        "private",
                         Box::new(RecoveredSession {
                             records: records.clone(),
                             lookups: lookups.clone(),
+                            cancel_after_observation: (cycle == 0 && interrupted)
+                                .then(|| cancel.clone()),
                         }),
                     ),
                 );
                 let builder = make_run_cycle_download_config_builder_with_options(
                     &media,
                     db.clone(),
-                    RunCycleDownloadConfigOptions {
-                        recent,
-                        ..RunCycleDownloadConfigOptions::default()
-                    },
+                    RunCycleDownloadConfigOptions::default(),
                 );
+                let lookups_before = lookups.load(std::sync::atomic::Ordering::Relaxed);
+                let sparse_hydration = usize::from(
+                    !inner
+                        .sparse_identities("PrimarySync")
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                );
+                let retained_confirmation = usize::from(inner.acquire_lock("bound retained confirmation phases").unwrap()
+                    .query_row("SELECT EXISTS(SELECT 1 FROM provider_active_generations WHERE checkpoint_ready=0)", [], |row| row.get::<_, bool>(0)).unwrap());
                 let result = run_cycle(
                     &[&primary],
                     &config,
                     Some(db.as_ref()),
-                    false,
                     &builder,
                     download::DownloadControls::download_hidden(),
                     &shared_session,
@@ -3246,6 +3713,16 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
                 .await
                 .unwrap();
                 assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep these bytes");
+                assert!(
+                    lookups.load(std::sync::atomic::Ordering::Relaxed) - lookups_before
+                        <= 2 * (1
+                            + sparse_hydration
+                            + retained_confirmation
+                            + result.stats.same_cycle_recovery_attempts),
+                    "each sparse hydration, current admission, and retained confirmation gets at most one child/source pair: cycle={cycle}, interrupted={interrupted}, lookups={}, stats={:?}",
+                    lookups.load(std::sync::atomic::Ordering::Relaxed) - lookups_before,
+                    result.stats
+                );
                 assert_eq!(
                     inner
                         .get_metadata("sync_token:PrimarySync")
@@ -3253,7 +3730,7 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
                         .unwrap()
                         .as_deref(),
                     Some(if cycle == 0 { "before" } else { "after" }),
-                    "recent={recent:?} interrupted={interrupted} cycle={cycle}"
+                    "interrupted={interrupted} cycle={cycle}"
                 );
                 assert_eq!(
                     inner.sparse_identities("PrimarySync").await.unwrap().len(),
@@ -3288,7 +3765,10 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
                     }
                 }
             }
-            assert_eq!(lookups.load(std::sync::atomic::Ordering::Relaxed), 2);
+            assert!(
+                lookups.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+                "recovery confirms both selected identities"
+            );
             server.verify().await;
         }
     }
@@ -3324,7 +3804,7 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
             let original_bytes = vec![0u8; 1024];
             std::fs::write(&media_path, &original_bytes).unwrap();
             {
-                let db = state::SqliteStateDb::open(&db_path).await.unwrap();
+                let db = open_owned_cycle_db(&db_path).await;
                 let record = crate::test_helpers::TestAssetRecord::new(MASTER)
                     .library(ZONE)
                     .filename("legacy.jpg")
@@ -3348,6 +3828,15 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                 .unwrap();
                 for child in [CHILD] {
                     db.upsert_asset_master_mapping(ZONE, child, MASTER)
+                        .await
+                        .unwrap();
+                }
+                if with_sibling {
+                    // This smart-folder selection cannot establish complete
+                    // family membership, especially for a visible sibling.
+                    // Seed the competing historical identity that makes the
+                    // legacy receipt ambiguous independently of current scope.
+                    db.upsert_asset_master_mapping(ZONE, "valid-sibling", MASTER)
                         .await
                         .unwrap();
                 }
@@ -3405,19 +3894,22 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                     obj_type: Arc::from("CPLAssetHiddenByAssetDate"),
                     query_filter: None,
                     page_size: 100,
-                    zone_id: Arc::new(json!({"zoneName": ZONE})),
+                    zone_id: Arc::new(
+                        json!({"zoneName": ZONE, "ownerRecordName": "_defaultOwner"}),
+                    ),
                     retry_config: retry::RetryConfig::default(),
                     container_id: None,
                     cross_zone_sources: Vec::new(),
                 },
                 Box::new(crate::sync_loop::test_support::MutableCaptureSession {
+                    token: "zone-tok-new",
                     zone: ZONE,
                     cancel_after_lookup: None,
                     records: Arc::clone(&provider_records),
                     repair_requests: Arc::clone(&repair_requests),
                 }),
             );
-            let lib_state = make_run_cycle_library_state_with_passes(
+            let mut lib_state = make_run_cycle_library_state_with_passes(
                 ZONE,
                 TOKEN_KEY,
                 vec![crate::commands::AlbumPass {
@@ -3436,7 +3928,7 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                 // commit the catalogue refresh or its capture receipt.
                 if cycle == 2 && !with_sibling && !valid_epoch {
                     rusqlite::Connection::open(&db_path).unwrap().execute_batch(
-                        "CREATE TRIGGER fail_capture_refresh BEFORE UPDATE OF created_at ON assets BEGIN SELECT RAISE(ABORT, 'injected capture refresh failure'); END;"
+                        "CREATE TRIGGER fail_capture_refresh BEFORE UPDATE OF created_at ON assets WHEN OLD.id='master-hidden' BEGIN SELECT RAISE(ABORT, 'injected capture refresh failure'); END;"
                     ).unwrap();
                 }
                 if cycle == 3 && !with_sibling && !valid_epoch {
@@ -3450,7 +3942,19 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                         json!({"value": RUN_CYCLE_ASSET_DATE_MS, "type": "TIMESTAMP"});
                 }
                 let recovered = !with_sibling && (valid_epoch || cycle >= 3);
-                let inner = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
+                let inner = open_owned_cycle_db(&db_path).await;
+                bind_metadata_capture(&inner, ZONE, "shared", &mut lib_state.plan.passes[0].album);
+                let before_lookups = repair_requests.load(Ordering::SeqCst);
+                let (capture, _) =
+                    repair_historical_capture(&inner, ZONE, &lib_state.plan.passes).await;
+                let capture_lookups = repair_requests.load(Ordering::SeqCst) - before_lookups;
+                assert_eq!(capture.sync_token_blocked, !recovered);
+                if cycle == 2 && !with_sibling && !valid_epoch {
+                    assert_eq!(
+                        capture.metadata_capture_failures, 1,
+                        "native capture SQL fault executed"
+                    );
+                }
                 let db = Arc::clone(&inner) as Arc<dyn download::DownloadStore>;
                 let build_config = make_run_cycle_download_config_builder_with_options(
                     &media_dir,
@@ -3465,7 +3969,6 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                     &[&lib_state],
                     &config,
                     Some(db.as_ref()),
-                    false,
                     &build_config,
                     download::DownloadControls::download_hidden(),
                     &session,
@@ -3475,25 +3978,33 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                 .unwrap();
                 assert_eq!(
                     result.failed_count > 0,
-                    !recovered,
+                    !valid_epoch && cycle < 2,
                     "invalid={invalid:?}, sibling={with_sibling}, cycle={cycle}"
                 );
                 assert_eq!(result.stats.downloaded, 0);
                 assert_eq!(
-                    result.stats.metadata_capture_refreshed,
+                    capture.metadata_capture_refreshed,
                     usize::from(!with_sibling && if valid_epoch { cycle == 0 } else { cycle == 3 })
                 );
-                assert_eq!(
-                    result.stats.metadata_capture_remaining,
-                    u64::from(!recovered)
-                );
+                assert_eq!(capture.metadata_capture_remaining, u64::from(!recovered));
                 drop(build_config);
                 drop(db);
                 drop(inner);
                 let inner = state::SqliteStateDb::open(&db_path).await.unwrap();
+                if with_sibling {
+                    assert_eq!(
+                        inner
+                            .get_master_record_name_for_asset(ZONE, "valid-sibling")
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some(MASTER),
+                        "competing historical identity survives every reopen"
+                    );
+                }
                 assert_eq!(
                     inner.get_metadata(TOKEN_KEY).await.unwrap().as_deref(),
-                    Some(if recovered {
+                    Some(if valid_epoch || cycle >= 2 {
                         "zone-tok-new"
                     } else {
                         "zone-tok-prev"
@@ -3594,11 +4105,13 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                 assert_eq!(std::fs::read(&media_path).unwrap(), original_bytes);
                 assert_eq!(std::fs::read_dir(&media_dir).unwrap().count(), 1);
                 if recovered {
-                    let requests = repair_requests.load(Ordering::SeqCst);
-                    if let Some(previous) = completed_requests {
-                        assert_eq!(requests, previous);
+                    if completed_requests.is_some() {
+                        assert_eq!(
+                            capture_lookups, 0,
+                            "completed explicit repair has no historical followup lookup"
+                        );
                     }
-                    completed_requests = Some(requests);
+                    completed_requests = Some(capture_lookups);
                 }
             }
         }
@@ -3704,25 +4217,6 @@ async fn exercise_legacy_child_cycles_with_provenance(
     smart_only: bool,
     signature_bytes: Option<usize>,
 ) {
-    Box::pin(exercise_legacy_child_cycles_with_receipt_diagnostic(
-        fault,
-        child_counts,
-        hardlink_fault,
-        smart_only,
-        signature_bytes,
-        None,
-    ))
-    .await;
-}
-
-async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
-    fault: AmbiguousChildFault,
-    child_counts: &[usize],
-    hardlink_fault: Option<LegacyHardlinkFault>,
-    smart_only: bool,
-    signature_bytes: Option<usize>,
-    diagnostic: Option<Result<state::db::LegacyChildReceiptRefusal, &'static str>>,
-) {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -3737,7 +4231,11 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
         omit_hidden: bool,
         incomplete_inventory: bool,
         inventory_requests: Arc<std::sync::atomic::AtomicUsize>,
+        lookup_requests: Arc<std::sync::atomic::AtomicUsize>,
         quiet_token: Option<&'static str>,
+        cancel_after_page: Option<CancellationToken>,
+        replace_after_page: Vec<std::path::PathBuf>,
+        injected_faults: Arc<std::sync::atomic::AtomicUsize>,
     }
     #[async_trait::async_trait]
     impl crate::icloud::photos::PhotosSession for ChildSession {
@@ -3781,7 +4279,15 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                 return Ok(response);
             }
             if url.contains("/changes/zone?") {
-                let mut response = serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"after","moreComing":false,"records":self.records}]});
+                let records: Vec<_> = self
+                    .records
+                    .iter()
+                    .filter(|record| {
+                        !self.omit_hidden
+                            || record["fields"]["isHidden"]["value"] != serde_json::json!(1)
+                    })
+                    .collect();
+                let mut response = serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"after","moreComing":false,"records":records}]});
                 if self.incomplete_inventory {
                     response["zones"][0]
                         .as_object_mut()
@@ -3792,7 +4298,13 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
             }
             if url.contains("/records/query/batch?") {
                 return Ok(album_count_response(if self.complete {
-                    (self.records.len() - 1 - usize::from(self.omit_hidden)) as u64
+                    self.records
+                        .iter()
+                        .filter(|record| {
+                            record["recordType"] == "CPLAsset"
+                                && (!self.omit_hidden || record["fields"]["isHidden"]["value"] != 1)
+                        })
+                        .count() as u64
                 } else {
                     0
                 }));
@@ -3805,6 +4317,21 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     .find(|filter| filter["fieldName"] == "startRank")
                     .and_then(|filter| filter["fieldValue"]["value"].as_u64())
                     .unwrap_or(0);
+                if offset > 0 {
+                    if let Some(cancel) = &self.cancel_after_page {
+                        cancel.cancel();
+                        self.injected_faults
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    for path in &self.replace_after_page {
+                        let bytes = std::fs::read(path)?;
+                        let replacement = path.with_extension("replacement");
+                        std::fs::write(&replacement, bytes)?;
+                        std::fs::rename(replacement, path)?;
+                        self.injected_faults
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
                 let records = if self.complete && offset == 0 {
                     self.records
                         .iter()
@@ -3820,8 +4347,20 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                 return Ok(serde_json::json!({"records":records,"syncToken":"after"}));
             }
             assert!(url.contains("/records/lookup?"));
+            self.lookup_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let request: serde_json::Value = serde_json::from_str(&body)?;
             let names = request["records"].as_array().unwrap();
+            for name in names {
+                assert!(
+                    self.records.iter().any(|record| {
+                        name["recordName"] == record["recordName"]
+                            || name["recordName"]
+                                == record["fields"]["masterRef"]["value"]["recordName"]
+                    }),
+                    "lookup must belong to an observed current child or its source"
+                );
+            }
             let records: Vec<_> = self
                 .records
                 .iter()
@@ -3917,6 +4456,8 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
             for (index, name) in names.iter().enumerate() {
                 let mut child = page["records"][1].clone();
                 child["recordName"] = serde_json::json!(name);
+                child["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+                    serde_json::json!("_defaultOwner");
                 if smart_only {
                     child["fields"]["isHidden"] = serde_json::json!({"value":1});
                 }
@@ -3972,7 +4513,7 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                 std::fs::write(&collision, b"unrelated existing file").unwrap();
             }
             {
-                let inner = state::SqliteStateDb::open(&database).await.unwrap();
+                let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
                 let date =
                     chrono::DateTime::from_timestamp_millis(RUN_CYCLE_ASSET_DATE_MS).unwrap();
                 let mut metadata = state::AssetMetadata::default();
@@ -4042,6 +4583,17 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     .set_metadata("sync_token:PrimarySync", "before")
                     .await
                     .unwrap();
+                if preserving {
+                    // Current selection drift, not historical certificates,
+                    // requires the initial selected inventory and delta bridge.
+                    inner
+                        .set_metadata(
+                            crate::sync_cycle::ENUM_CONFIG_HASH_KEY,
+                            "previous-selection",
+                        )
+                        .await
+                        .unwrap();
+                }
                 inner
                     .begin_metadata_capture_revision(
                         "PrimarySync",
@@ -4104,6 +4656,7 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                         &hash,
                         Some(&hash),
                         false,
+                        &Default::default(),
                     )
                     .await
                     .unwrap();
@@ -4131,7 +4684,7 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
             );
             if matches!(fault, AmbiguousChildFault::PreserveCheckpointFailure) {
                 rusqlite::Connection::open(&database).unwrap().execute_batch(
-                    "CREATE TRIGGER fail_single_survivor_proof BEFORE INSERT ON unattributed_legacy_proofs BEGIN SELECT RAISE(ABORT,'injected checkpoint receipt failure'); END;"
+                    "CREATE TRIGGER fail_single_survivor_cursor BEFORE UPDATE ON metadata WHEN OLD.key='sync_token:PrimarySync' BEGIN SELECT RAISE(ABORT,'injected checkpoint cursor failure'); END;"
                 ).unwrap();
             }
             let receipt_sql = "SELECT * FROM assets WHERE id='legacy-master'";
@@ -4140,7 +4693,7 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                 "SELECT * FROM asset_metadata_capture_revisions WHERE asset_id='legacy-master'";
             let mapping_sql = "SELECT library,asset_record_name,master_record_name FROM asset_master_mappings ORDER BY asset_record_name";
             let receipt = rows(&database, receipt_sql);
-            let mut retry = rows(&database, retry_sql);
+            let retry = rows(&database, retry_sql);
             let revision = rows(&database, revision_sql);
             let mappings = rows(&database, mapping_sql);
             let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
@@ -4154,20 +4707,25 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                 "SELECT * FROM asset_metadata_paths WHERE id='legacy-master' ORDER BY local_path";
             let legacy_metadata_paths = rows(&database, legacy_metadata_paths_sql);
             let inventory_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let lookup_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let relocating = matches!(
                 fault,
                 AmbiguousChildFault::PreserveConfigChange
                     | AmbiguousChildFault::PreserveInventoryRecovery
             );
-            let fresh_source_recovery = matches!(fault, AmbiguousChildFault::PreserveStateWrite);
+            let fresh_source_recovery = matches!(
+                fault,
+                AmbiguousChildFault::StateWrite | AmbiguousChildFault::PreserveStateWrite
+            );
             let mut retained_unverified_outputs = Vec::new();
+            let mut missing_current_path = None;
             for cycle in 0..if relocating
                 || fresh_source_recovery
                 || matches!(fault, AmbiguousChildFault::PreserveHistoricalReplacement)
             {
-                4
+                5
             } else {
-                3
+                4
             } {
                 let mut config = make_run_cycle_config();
                 let allow_hardlinks = hardlink_fault.is_some()
@@ -4180,7 +4738,12 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                             )
                         ));
                 config.download.legacy_preservation_allow_hardlinks = allow_hardlinks;
-                let mut missing_current = None;
+                if relocating && cycle >= 2 {
+                    config.download.folder_structure = "relocated".into();
+                    config.download.folder_structure_albums = "relocated".into();
+                    config.download.folder_structure_smart_folders = "relocated".into();
+                }
+                let mut missing_current = missing_current_path.clone();
                 let mut current_aliases = std::collections::HashMap::new();
                 if cycle == 2
                     && let Some(hardlink_fault) = hardlink_fault
@@ -4237,9 +4800,9 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                             std::fs::remove_file(current).unwrap();
                             assert!(!current.exists(), "current receipt path must be absent");
                             missing_current = Some(current.clone());
-                            // A normal Full pass can repair missing Current evidence
-                            // before recertification. Refuse that repair here so the
-                            // actual checkpoint boundary must retain the missing-file hold.
+                            missing_current_path = missing_current.clone();
+                            // Use production drift detection below to wake ordinary
+                            // recovery. The HTTP refusal must retain actual retry work.
                             server.reset().await;
                             Mock::given(method("GET"))
                                 .and(path("/child.jpg"))
@@ -4250,18 +4813,6 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                         _ => {}
                     }
                 }
-                if cycle == 2 && fresh_source_recovery {
-                    // The first publication lost its verified-source transaction.
-                    // Retain those bytes and require an actual fresh download;
-                    // on-disk adoption alone must never invent provenance.
-                    let retained = dir.path().join("retained-unverified-publication");
-                    std::fs::create_dir(&retained).unwrap();
-                    for (index, (path, bytes)) in completed_outputs.iter().enumerate() {
-                        let saved = retained.join(index.to_string());
-                        std::fs::rename(path, &saved).unwrap();
-                        retained_unverified_outputs.push((saved, bytes.clone()));
-                    }
-                }
                 let original_before = hardlink_fault.map(|_| {
                     (
                         std::fs::read(&legacy_path).unwrap(),
@@ -4269,58 +4820,69 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     )
                 });
                 let requests_before = server.received_requests().await.unwrap().len();
-                let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+                if cycle == 1
+                    && sidecars
+                    && cfg!(feature = "xmp")
+                    && matches!(
+                        fault,
+                        AmbiguousChildFault::PreserveHistoricalClaim
+                            | AmbiguousChildFault::PreserveHistoricalReplacement
+                    )
+                {
+                    // Preserve the unowned sidecars after their first-cycle
+                    // veto, before permitting fresh selected metadata output.
+                    for index in 0..children {
+                        let path = destination.join(format!("independent-{index}.jpg.xmp"));
+                        let saved = dir.path().join(format!("retained-current-{index}.xmp"));
+                        let contents = std::fs::read(&path).unwrap();
+                        std::fs::rename(path, &saved).unwrap();
+                        retained_unverified_outputs.push((saved, contents));
+                    }
+                }
+                let lookups_before = lookup_requests.load(std::sync::atomic::Ordering::SeqCst);
+                let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
+                if cycle == 2 && missing_current.is_some() {
+                    let drift = crate::sync_loop::reconcile::run_bounded_local_drift_probe(
+                        inner.as_ref(),
+                        cycle,
+                    )
+                    .await;
+                    assert!(
+                        drift.marked_failed > 0,
+                        "missing current files must wake normal recovery"
+                    );
+                }
                 let cancel = CancellationToken::new();
-                let db: Arc<dyn download::DownloadStore> =
-                    if matches!(fault, AmbiguousChildFault::PreserveUnknownSource) {
-                        let mut unknown = FailingMetadataSetDb::without_set_failure(
-                            inner.clone(),
-                            "unknown source fixture",
-                        )
-                        .with_unknown_download_source();
-                        if let Some(result) = diagnostic {
-                            unknown = unknown.with_receipt_diagnostic(result);
-                        }
-                        Arc::new(unknown)
-                    } else if cycle == 0
-                        && matches!(fault, AmbiguousChildFault::PreserveHistoricalReplacement)
-                    {
-                        Arc::new(
-                            FailingMetadataSetDb::without_set_failure(
-                                inner.clone(),
-                                "historical namespace replacement",
-                            )
-                            .with_historical_current_replacement(),
-                        )
-                    } else if cycle == 0
-                        && matches!(
-                            fault,
-                            AmbiguousChildFault::Cancel
-                                | AmbiguousChildFault::StateWrite
-                                | AmbiguousChildFault::PreserveCancel
-                                | AmbiguousChildFault::PreserveStateWrite
-                        )
-                    {
-                        let failing = FailingMetadataSetDb::without_set_failure(
-                            inner.clone(),
-                            "injected #765 state failure",
-                        );
-                        Arc::new(
-                            if matches!(
-                                fault,
-                                AmbiguousChildFault::Cancel | AmbiguousChildFault::PreserveCancel
-                            ) {
-                                failing.with_cancel_on_upsert(cancel.clone())
-                            } else {
-                                failing.with_mark_downloaded_failure()
-                            },
-                        )
-                    } else {
-                        inner.clone()
-                    };
+                let conn = rusqlite::Connection::open(&database).unwrap();
+                conn.execute_batch("DROP TRIGGER IF EXISTS fail_legacy_child_download")
+                    .unwrap();
+                if cycle == 0
+                    && matches!(
+                        fault,
+                        AmbiguousChildFault::StateWrite | AmbiguousChildFault::PreserveStateWrite
+                    )
+                {
+                    conn.execute_batch(
+                        "CREATE TRIGGER fail_legacy_child_download BEFORE UPDATE OF status ON assets
+                         WHEN NEW.status='downloaded' AND NEW.id!='legacy-master'
+                         BEGIN SELECT RAISE(ABORT,'injected child download finalization failure'); END;",
+                    )
+                    .unwrap();
+                }
+                drop(conn);
+                let db: Arc<dyn download::DownloadStore> = inner.clone();
+                let injected_faults = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let provider = ChildSession {
-                    records: records.clone(),
-                    complete: preserving,
+                    // A selected child with an unavailable master is unresolved
+                    // provider identity, not a successful unverified download.
+                    records: if children == 0 {
+                        Vec::new()
+                    } else if matches!(fault, AmbiguousChildFault::PreserveUnknownSource) {
+                        records[1..].to_vec()
+                    } else {
+                        records.clone()
+                    },
+                    complete: true,
                     bridge_debt: matches!(fault, AmbiguousChildFault::PreserveBridgeDebt),
                     paginated: matches!(fault, AmbiguousChildFault::PreservePaginatedHidden),
                     omit_hidden: matches!(fault, AmbiguousChildFault::PreserveHiddenUnselected),
@@ -4330,6 +4892,23 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     ) || (cycle == 0
                         && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery)),
                     inventory_requests: Arc::clone(&inventory_requests),
+                    lookup_requests: Arc::clone(&lookup_requests),
+                    injected_faults: injected_faults.clone(),
+                    cancel_after_page: (cycle == 0
+                        && matches!(
+                            fault,
+                            AmbiguousChildFault::Cancel | AmbiguousChildFault::PreserveCancel
+                        ))
+                    .then(|| cancel.clone()),
+                    replace_after_page: if cycle == 0
+                        && matches!(fault, AmbiguousChildFault::PreserveHistoricalReplacement)
+                    {
+                        (0..children)
+                            .map(|index| destination.join(format!("independent-{index}.jpg")))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
                     quiet_token: if matches!(fault, AmbiguousChildFault::PreserveMissingDelta) {
                         None
                     } else if matches!(fault, AmbiguousChildFault::PreserveBlankDelta) {
@@ -4345,7 +4924,12 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                 let mut primary = make_run_cycle_library_state_with_album(
                     "PrimarySync",
                     "sync_token:PrimarySync",
-                    make_full_album_with_boxed_session("PrimarySync", Box::new(provider.clone())),
+                    crate::sync_loop::test_support::make_owned_cycle_album(
+                        &inner,
+                        "PrimarySync",
+                        "private",
+                        Box::new(provider.clone()),
+                    ),
                 );
                 if preserving {
                     primary.library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
@@ -4354,6 +4938,11 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     );
                 }
                 if smart_only {
+                    let (capture, _, _) = primary.plan.passes[0]
+                        .album
+                        .owned_selection_scope()
+                        .unwrap()
+                        .expect("owned fixture selection");
                     primary.plan.passes[0].kind = crate::commands::PassKind::SmartFolder;
                     primary.pass_scope.include_smart_folders = true;
                     primary.pass_scope.include_unfiled = false;
@@ -4367,13 +4956,18 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                             obj_type: Arc::from("CPLAssetHiddenByAssetDate"),
                             query_filter: None,
                             page_size: 100,
-                            zone_id: Arc::new(serde_json::json!({"zoneName":"PrimarySync"})),
+                            zone_id: Arc::new(
+                                serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                            ),
                             retry_config: crate::retry::RetryConfig::default(),
                             container_id: None,
                             cross_zone_sources: Vec::new(),
                         },
                         Box::new(provider.clone()),
                     );
+                    primary.plan.passes[0]
+                        .album
+                        .set_shadow_capture(capture, Arc::from("private"));
                 }
                 let base_builder = make_run_cycle_download_config_builder_with_options(
                     &media,
@@ -4396,51 +4990,6 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     }
                     built
                 };
-                if hardlink_fault.is_some() {
-                    let probe = builder(
-                        download::SyncMode::Full,
-                        Arc::new(rustc_hash::FxHashSet::default()),
-                        Arc::new(download::AssetGroupings::default()),
-                        Arc::from("PrimarySync"),
-                    );
-                    let policy = serde_json::json!([
-                        1,
-                        state::METADATA_CAPTURE_REVISION,
-                        download::sync_coverage_fingerprint_json(
-                            &config,
-                            "icloud",
-                            1,
-                            &["PrimarySync".to_owned()],
-                            &download::compute_config_hash(&config),
-                            &download::hash_download_config(&probe)
-                        )
-                        .unwrap(),
-                        format!("{:?}", probe.metadata),
-                        config.runtime.refresh_metadata,
-                        config.runtime.repair_capture_timestamps,
-                        config.runtime.repair_truncated
-                    ]);
-                    let trusted_hash =
-                        crate::sync_cycle::hash_legacy_preservation_policy(&policy, true);
-                    let strict_hash =
-                        crate::sync_cycle::hash_legacy_preservation_policy(&policy, false);
-                    assert_ne!(
-                        trusted_hash, strict_hash,
-                        "trust flag must qualify a separate legacy proof policy"
-                    );
-                    if cycle == 2 {
-                        let hashes = rows(
-                            &database,
-                            "SELECT config_hash FROM unattributed_legacy_proofs",
-                        );
-                        if !hashes.is_empty() {
-                            assert!(
-                                hashes.iter().all(|row| row[0]
-                                    == rusqlite::types::Value::Text(trusted_hash.clone()))
-                            );
-                        }
-                    }
-                }
                 let warning_path = dir.path().join(format!("cycle-{cycle}.log"));
                 let subscriber = tracing_subscriber::fmt()
                     .with_ansi(false)
@@ -4455,7 +5004,6 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     &[&primary],
                     &config,
                     Some(db.as_ref()),
-                    false,
                     &builder,
                     download::DownloadControls::download_hidden(),
                     &shared_session,
@@ -4463,11 +5011,73 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                 )
                 .with_subscriber(subscriber)
                 .await;
-                if cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveHistoricalReplacement)
+                if cycle == 0
+                    && matches!(
+                        fault,
+                        AmbiguousChildFault::Cancel
+                            | AmbiguousChildFault::PreserveCancel
+                            | AmbiguousChildFault::PreserveHistoricalReplacement
+                    )
                 {
                     assert!(
-                        result.is_err(),
-                        "held current namespace must reject preparation"
+                        injected_faults.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                        "provider transition must exercise the configured fault"
+                    );
+                }
+                if cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveHistoricalReplacement)
+                {
+                    // Namespace churn carries no authority to adopt historical
+                    // originals. The common oracle below checks both receipts.
+                    for index in 0..children {
+                        assert_eq!(
+                            std::fs::read(destination.join(format!("independent-{index}.jpg")))
+                                .unwrap(),
+                            bytes
+                        );
+                    }
+                    assert_eq!(
+                        server.received_requests().await.unwrap().len(),
+                        requests_before
+                    );
+                }
+                if cycle >= 2
+                    && hardlink_fault.is_some_and(|fault| fault != LegacyHardlinkFault::Quiet)
+                {
+                    let original_journal = match hardlink_fault {
+                        #[cfg(target_os = "linux")]
+                        Some(LegacyHardlinkFault::OriginalJournal) => true,
+                        _ => false,
+                    };
+                    if original_journal {
+                        assert!(
+                            result.as_ref().unwrap_err().to_string().contains(
+                                "Replacement recovery intersects protected legacy evidence"
+                            )
+                        );
+                    }
+                    let result = if original_journal {
+                        None
+                    } else {
+                        Some(result.as_ref().unwrap())
+                    };
+                    if missing_current.is_some() {
+                        let result = result.unwrap();
+                        assert!(
+                            result.failed_count > 0,
+                            "failed current repair remains unfinished"
+                        );
+                        assert!(inner.get_summary().await.unwrap().failed > 0);
+                    } else if let Some(result) = result {
+                        assert_eq!(
+                            result.failed_count, 0,
+                            "historical change is not current work"
+                        );
+                        assert!(!result.stats.sync_token_blocked);
+                    }
+                    assert_eq!(
+                        result.map_or(0, |result| result.stats.downloaded),
+                        0,
+                        "historical changes must not publish new outputs"
                     );
                     assert!(
                         inner
@@ -4476,90 +5086,17 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                             .unwrap()
                             .is_empty()
                     );
-                    assert_eq!(rows(&database, receipt_sql), receipt);
-                    assert_eq!(rows(&database, retry_sql), retry);
-                    assert_eq!(rows(&database, revision_sql), revision);
-                    assert_eq!(rows(&database, mapping_sql), mappings);
-                    assert_eq!(
-                        rows(&database, legacy_metadata_paths_sql),
-                        legacy_metadata_paths
-                    );
-                    assert_eq!(
-                        rows(
-                            &database,
-                            "SELECT * FROM asset_metadata_paths WHERE id!='legacy-master' AND local_checksum='historical-local' ORDER BY id"
-                        ),
-                        historical_child_receipts
-                    );
-                    assert!(
-                        inner
-                            .get_legacy_master_state_owners()
-                            .await
-                            .unwrap()
-                            .is_empty()
-                    );
                     assert_eq!(
                         inner
                             .get_metadata("sync_token:PrimarySync")
                             .await
                             .unwrap()
                             .as_deref(),
-                        Some("before")
-                    );
-                    assert_eq!(std::fs::read(&legacy_path).unwrap(), bytes);
-                    assert_eq!(
-                        std::fs::read(&legacy_xmp).unwrap(),
-                        b"legacy sidecar: never adopt or replace"
-                    );
-                    for index in 0..children {
-                        assert_eq!(
-                            std::fs::read(destination.join(format!("independent-{index}.jpg")))
-                                .unwrap(),
-                            bytes
-                        );
-                    }
-                    for (path, bytes) in &completed_outputs {
-                        assert_eq!(&std::fs::read(path).unwrap(), bytes);
-                    }
-                    assert_eq!(
-                        server.received_requests().await.unwrap().len(),
-                        requests_before
-                    );
-                    continue;
-                }
-                if cycle >= 2
-                    && hardlink_fault.is_some_and(|fault| fault != LegacyHardlinkFault::Quiet)
-                {
-                    if let Ok(result) = &result {
-                        assert!(
-                            result.stats.sync_token_blocked,
-                            "trust fault must retain the checkpoint: {hardlink_fault:?}"
-                        );
-                        assert_eq!(
-                            result.stats.downloaded, 0,
-                            "held qualification must not publish new outputs"
-                        );
-                    }
-                    if matches!(
-                        hardlink_fault,
-                        Some(
-                            LegacyHardlinkFault::Disable | LegacyHardlinkFault::DisableCurrentOnly
-                        )
-                    ) {
-                        assert_eq!(
-                            inner.legacy_preservations("PrimarySync").await.unwrap()[0]
-                                .active_generation,
-                            None,
-                            "disabling trust must deactivate the formerly trusted proof"
-                        );
-                    }
-                    assert_eq!(
-                        inner
-                            .get_metadata("sync_token:PrimarySync")
-                            .await
-                            .unwrap()
-                            .as_deref(),
-                        Some("after")
+                        Some(if missing_current.is_some() || original_journal {
+                            "after"
+                        } else {
+                            "later"
+                        })
                     );
                     assert_eq!(rows(&database, receipt_sql), receipt);
                     assert_eq!(rows(&database, retry_sql), retry);
@@ -4587,9 +5124,9 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                         &database,
                         "SELECT * FROM unattributed_legacy_proofs ORDER BY generation",
                     );
-                    assert!(
-                        retained_proofs.iter().all(|proof| proofs.contains(proof)),
-                        "old proof history must survive failed active revalidation"
+                    assert_eq!(
+                        retained_proofs, proofs,
+                        "historical proof bytes are unchanged"
                     );
                     let (original, sidecar) = original_before.unwrap();
                     assert_eq!(std::fs::read(&legacy_path).unwrap(), original);
@@ -4607,12 +5144,7 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                             proofs, retained_proofs,
                             "missing evidence must not mint a proof"
                         );
-                        assert_eq!(
-                            inner.legacy_preservations("PrimarySync").await.unwrap()[0]
-                                .active_generation,
-                            None,
-                            "missing Current evidence must invalidate the old active proof"
-                        );
+                        assert!(result.unwrap().stats.sync_token_blocked);
                     } else {
                         assert_eq!(
                             server.received_requests().await.unwrap().len(),
@@ -4627,6 +5159,15 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                             "external Current alias bytes must remain intact"
                         );
                     }
+                    for (path, expected) in &completed_outputs {
+                        if missing_current.as_ref() != Some(path) {
+                            assert_eq!(
+                                &std::fs::read(path).unwrap(),
+                                expected,
+                                "refused recovery preserves completed current files"
+                            );
+                        }
+                    }
                     assert!(
                         inner
                             .get_legacy_master_state_owners()
@@ -4636,7 +5177,102 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     );
                     continue;
                 }
+                if matches!(
+                    fault,
+                    AmbiguousChildFault::PreserveMissingDelta
+                        | AmbiguousChildFault::PreserveBlankDelta
+                ) {
+                    let error = format!("{:#}", result.unwrap_err());
+                    assert!(
+                        error.contains("Invalid changes/zone page shape")
+                            || error == "Missing changes/zone successor",
+                        "{error}"
+                    );
+                    let reopened = state::SqliteStateDb::open(&database).await.unwrap();
+                    assert_eq!(
+                        reopened
+                            .get_metadata("sync_token:PrimarySync")
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some("before")
+                    );
+                    assert_eq!(rows(&database, receipt_sql), receipt);
+                    assert_eq!(rows(&database, retry_sql), retry);
+                    assert_eq!(rows(&database, revision_sql), revision);
+                    assert_eq!(rows(&database, mapping_sql), mappings);
+                    assert_eq!(
+                        rows(&database, legacy_metadata_paths_sql),
+                        legacy_metadata_paths
+                    );
+                    assert!(rows(&database, "SELECT * FROM unattributed_legacy_proofs").is_empty());
+                    assert!(
+                        reopened
+                            .get_metadata(&format!(
+                                "{}PrimarySync",
+                                crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
+                            ))
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "missing successor is not an expired cursor"
+                    );
+                    assert!(
+                        reopened
+                            .get_legacy_master_state_owners()
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert_eq!(std::fs::read(&legacy_path).unwrap(), bytes);
+                    assert_eq!(
+                        std::fs::read(&legacy_xmp).unwrap(),
+                        b"legacy sidecar: never adopt or replace"
+                    );
+                    let downloaded = reopened.get_downloaded_page(0, 20).await.unwrap();
+                    assert_eq!(downloaded.len(), 1 + names.len());
+                    let mut paths = std::collections::HashSet::from([legacy_path.clone()]);
+                    for name in &names {
+                        let current = downloaded
+                            .iter()
+                            .find(|row| row.id.as_ref() == name)
+                            .expect("selected child published before rejected bridge");
+                        let path = current.local_path.as_ref().unwrap();
+                        assert!(paths.insert(path.clone()), "independent selected path");
+                        assert_eq!(std::fs::read(path).unwrap(), bytes);
+                        let source: Option<String> = rusqlite::Connection::open(&database).unwrap()
+                            .query_row("SELECT source_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id=?1 AND version_size='original' AND local_path=?2",
+                                rusqlite::params![name, path.to_str().unwrap()], |row| row.get(0)).unwrap();
+                        assert_eq!(
+                            source,
+                            Some(data_encoding::HEXLOWER.encode(&Sha256::digest(bytes)))
+                        );
+                        #[cfg(feature = "xmp")]
+                        if sidecars {
+                            let sidecar =
+                                std::fs::read_to_string(format!("{}.xmp", path.display())).unwrap();
+                            assert!(sidecar.parse::<xmp_toolkit::XmpMeta>().is_ok());
+                        }
+                        if cycle == 0 {
+                            completed_outputs.insert(path.clone(), bytes.to_vec());
+                        } else {
+                            assert_eq!(completed_outputs.get(path), Some(&bytes.to_vec()));
+                        }
+                    }
+                    let requests = server.received_requests().await.unwrap().len();
+                    if cycle == 0 {
+                        assert_eq!(requests, names.len());
+                        completed_requests = requests;
+                    } else {
+                        assert_eq!(
+                            requests, completed_requests,
+                            "invalid successor never repeats completed media"
+                        );
+                    }
+                    continue;
+                }
                 let result = result.unwrap();
+                let persisted = state::SqliteStateDb::open(&database).await.unwrap();
                 if hardlink_fault.is_some() {
                     assert_eq!(
                         rows(&database, legacy_metadata_paths_sql),
@@ -4664,20 +5300,8 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                 }
                 if matches!(fault, AmbiguousChildFault::PreserveSharedOriginal) {
                     let log = std::fs::read_to_string(&warning_path).unwrap();
-                    let warning = log
-                        .lines()
-                        .find(|line| {
-                            line.contains("Legacy preservation candidates remain unresolved")
-                        })
-                        .expect("shared-link candidate warning");
-                    assert!(warning.contains("stage="));
-                    assert!(warning.contains("preparation"));
-                    assert!(warning.contains("invalid_original_files=1"));
-                    assert!(warning.contains("shared_file_links=1"));
-                    assert!(warning.contains("no_current_child=0"));
-                    assert!(warning.contains("deferred_candidates=0"));
-                    assert!(!warning.contains("legacy-master"));
-                    assert!(!warning.contains("photo.jpg"));
+                    assert!(!log.contains("legacy-master"));
+                    assert!(!log.contains("photo.jpg"));
                 }
                 let label = format!(
                     "fault={fault:?} children={children} sidecars={sidecars} cycle={cycle}"
@@ -4694,8 +5318,8 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                         "alias {label}"
                     );
                     assert!(
-                        result.stats.sync_token_blocked,
-                        "shared original hold {label}"
+                        !result.stats.sync_token_blocked,
+                        "historical alias is not selected debt {label}"
                     );
                     assert_eq!(
                         result.stats.unattributed_legacy_assets, 0,
@@ -4750,14 +5374,6 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     historical_child_receipts,
                     "historical child receipts {label}"
                 );
-                if cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveFreshRetry) {
-                    retry = rows(&database, retry_sql);
-                    assert_eq!(
-                        retry.len(),
-                        1,
-                        "first capture failure creates durable retry {label}"
-                    );
-                }
                 assert_eq!(rows(&database, retry_sql), retry, "retry {label}");
                 assert_eq!(rows(&database, revision_sql), revision, "revision {label}");
                 assert_eq!(
@@ -4773,41 +5389,37 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                         .is_empty(),
                     "no guessed owner {label}"
                 );
-                let source_evidence_ready = match fault {
-                    AmbiguousChildFault::PreserveMissingDelta
-                    | AmbiguousChildFault::PreserveBlankDelta => false,
-                    AmbiguousChildFault::PreserveFreshRetry => cycle > 0,
-                    AmbiguousChildFault::PreserveInventoryRecovery
-                    | AmbiguousChildFault::PreserveStateWrite => cycle >= 2,
-                    _ => true,
-                };
-                let activated = preserving
-                    && !matches!(fault, AmbiguousChildFault::PreserveUnknownSource)
-                    && source_evidence_ready
-                    && children > 0
-                    && !matches!(
+                let selected_fault = cycle == 0
+                    && matches!(
                         fault,
-                        AmbiguousChildFault::PreserveIncompleteInventory
-                            | AmbiguousChildFault::PreserveSharedOriginal
-                    )
-                    && !(cycle == 0
-                        && matches!(fault, AmbiguousChildFault::PreserveCheckpointFailure))
-                    && !matches!(fault, AmbiguousChildFault::PreserveHiddenUnselected)
-                    && (!matches!(fault, AmbiguousChildFault::PreserveBridgeDebt)
-                        || (cfg!(feature = "xmp") && sidecars && cycle > 0))
-                    && !(cycle == 0
-                        && matches!(
-                            fault,
-                            AmbiguousChildFault::PreserveCancel
-                                | AmbiguousChildFault::PreserveStateWrite
-                        ));
+                        AmbiguousChildFault::Cancel
+                            | AmbiguousChildFault::PreserveCancel
+                            | AmbiguousChildFault::StateWrite
+                            | AmbiguousChildFault::PreserveStateWrite
+                            | AmbiguousChildFault::PreserveCheckpointFailure
+                    );
+                let unknown_source = matches!(fault, AmbiguousChildFault::PreserveUnknownSource);
+                let checkpoint_write_failure =
+                    cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveCheckpointFailure);
+                let unowned_current_sidecar = cycle == 0
+                    && sidecars
+                    && cfg!(feature = "xmp")
+                    && matches!(
+                        fault,
+                        AmbiguousChildFault::PreserveHistoricalClaim
+                            | AmbiguousChildFault::PreserveHistoricalReplacement
+                    );
+                // Only current selection/source failures can veto this cursor.
+                // Historical retry deadlines and preparation are preserved evidence.
+                let current_complete =
+                    !selected_fault && !unknown_source && !unowned_current_sidecar;
                 assert_eq!(
-                    inner
+                    persisted
                         .get_metadata("sync_token:PrimarySync")
                         .await
                         .unwrap()
                         .as_deref(),
-                    Some(if activated {
+                    Some(if current_complete {
                         if smart_only {
                             "delta-after"
                         } else if hardlink_fault.is_some() && cycle >= 2 {
@@ -4821,133 +5433,66 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     "checkpoint {label}: {:?}",
                     result.stats
                 );
-                if matches!(
-                    fault,
-                    AmbiguousChildFault::PreserveMissingDelta
-                        | AmbiguousChildFault::PreserveBlankDelta
-                ) {
+                assert_eq!(
+                    result.stats.sync_token_blocked,
+                    !current_complete && !checkpoint_write_failure,
+                    "current checkpoint gate {label}"
+                );
+                if checkpoint_write_failure {
                     assert_eq!(
-                        result.stats.sync_token_blocked_reason,
-                        Some("inventory_delta_bridge_failed")
+                        result.stats.state_write_failures, 1,
+                        "checkpoint SQL fault executed {label}"
                     );
-                    assert!(rows(&database, "SELECT * FROM unattributed_legacy_proofs").is_empty());
+                    assert_eq!(
+                        result.failed_count, 1,
+                        "checkpoint storage failure reported once {label}"
+                    );
+                }
+                if unowned_current_sidecar {
                     assert!(
-                        inner
-                            .get_metadata(&format!(
-                                "{}PrimarySync",
-                                crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
-                            ))
-                            .await
-                            .unwrap()
-                            .is_none(),
-                        "missing successor is not evidence of an expired cursor"
+                        result.stats.exif_failures > 0,
+                        "unowned sidecar veto exercised {label}"
                     );
                 }
-                if preserving && result.stats.unattributed_legacy_pending > 0 {
-                    assert!(
-                        result.failed_count > 0,
-                        "pending certification must fail the cycle {label}"
-                    );
-                    assert!(!result.can_advance_database_checkpoint());
-                    // Cancellation/session expiration retain their higher-priority
-                    // status, but pending proof can never report success.
-                    assert_ne!(
-                        crate::cycle_reporter::classify_cycle(
-                            &result.stats,
-                            result.failed_count,
-                            result.session_expired
-                        ),
-                        crate::cycle_reporter::CycleStatus::Success
-                    );
+                // Without the writer these files are preservation evidence,
+                // not unsatisfied output obligations or checkpoint blockers.
+                if unowned_current_sidecar
+                    || (!cfg!(feature = "xmp")
+                        && sidecars
+                        && matches!(
+                            fault,
+                            AmbiguousChildFault::PreserveHistoricalClaim
+                                | AmbiguousChildFault::PreserveHistoricalReplacement
+                        ))
+                {
+                    for index in 0..children {
+                        assert_eq!(
+                            std::fs::read(destination.join(format!("independent-{index}.jpg.xmp")))
+                                .unwrap(),
+                            b"independent current sidecar"
+                        );
+                    }
                 }
-                if matches!(
-                    fault,
-                    AmbiguousChildFault::PreserveHiddenUnselected
-                        | AmbiguousChildFault::PreserveUnknownSource
-                ) {
-                    let warning = std::fs::read_to_string(&warning_path).unwrap();
-                    assert!(warning.contains("legacy_certification_refusal_v1"));
-                    assert!(warning.contains("child_receipt_missing"));
-                    assert!(warning.contains("legacy_receipt_prerequisite_v1"));
-                    let expected = if matches!(fault, AmbiguousChildFault::PreserveUnknownSource) {
-                        diagnostic
-                            .unwrap_or(Ok(state::db::LegacyChildReceiptRefusal::SourceMissing))
-                            .unwrap_or(state::db::LegacyChildReceiptRefusal::Unavailable)
-                            .label()
-                    } else {
-                        "child_not_ready"
-                    };
-                    assert!(warning.contains(&format!("prerequisite=\"{expected}\"")));
-                    assert!(!warning.contains("private receipt database failure"));
-                    assert!(!warning.contains("child-0-unique"));
-                }
-                if activated {
+                assert!(
+                    inner
+                        .legacy_preservations("PrimarySync")
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "historical evidence must not create certification work {label}"
+                );
+                assert!(rows(&database, "SELECT * FROM unattributed_legacy_proofs").is_empty());
+                if current_complete {
                     assert!(
                         !result.stats.identity_incomplete,
                         "preservation is separate from provider identity {label}"
                     );
-                    assert_eq!(
-                        inner.legacy_preservations("PrimarySync").await.unwrap()[0]
-                            .active_generation,
-                        Some(
-                            if matches!(fault, AmbiguousChildFault::PreserveConfigChange)
-                                && cycle >= 2
-                            {
-                                2
-                            } else {
-                                1
-                            }
-                        ),
-                        "active generation {label}"
-                    );
-                    if cycle >= 2 && !((relocating || fresh_source_recovery) && cycle == 2) {
+                    if cycle >= 2 && !(relocating && cycle == 2) {
                         assert!(
                             result.stats.full_enumeration_reason.is_none(),
                             "unchanged cycle should remain incremental {label}"
                         );
                     }
-                    assert_eq!(
-                        result.stats.unattributed_legacy_assets, 1,
-                        "attribution count {label}"
-                    );
-                    assert_eq!(
-                        result.stats.unattributed_legacy_pending, 0,
-                        "current proof count {label}"
-                    );
-                } else if preserving
-                    && (children == 0
-                        || matches!(
-                            fault,
-                            AmbiguousChildFault::PreserveIncompleteInventory
-                                | AmbiguousChildFault::PreserveSharedOriginal
-                        )
-                        || (cycle < 2
-                            && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
-                        || (cycle == 0
-                            && matches!(
-                                fault,
-                                AmbiguousChildFault::PreserveFreshRetry
-                                    | AmbiguousChildFault::PreserveHistoricalClaim
-                                    | AmbiguousChildFault::PreserveHistoricalReplacement
-                            )))
-                {
-                    assert!(
-                        inner
-                            .legacy_preservations("PrimarySync")
-                            .await
-                            .unwrap()
-                            .is_empty(),
-                        "no incomplete preparation {label}"
-                    );
-                } else if preserving {
-                    assert_eq!(
-                        inner.legacy_preservations("PrimarySync").await.unwrap()[0]
-                            .active_generation,
-                        None,
-                        "prepared hold {label}"
-                    );
-                } else {
-                    assert!(result.stats.identity_incomplete, "hold {label}");
                 }
                 if cycle == 0
                     && matches!(
@@ -4962,19 +5507,29 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                         result.stats.interrupted || result.stats.state_write_failures > 0,
                         "fault exercised {label}"
                     );
-                } else if matches!(
-                    fault,
-                    AmbiguousChildFault::PreserveIncompleteInventory
-                        | AmbiguousChildFault::PreserveSharedOriginal
-                ) || (cycle < 2
-                    && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
-                    || (cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveFreshRetry))
-                {
-                    assert_eq!(result.stats.downloaded, 0, "incomplete inventory {label}");
+                } else if unknown_source {
+                    assert!(
+                        result.stats.sync_token_blocked,
+                        "unknown selected master {label}"
+                    );
                     assert_eq!(inner.get_downloaded_page(0, 20).await.unwrap().len(), 1);
-                    assert!(result.stats.sync_token_blocked, "incomplete hold {label}");
+                    assert_eq!(result.stats.downloaded, 0);
+                    assert_eq!(server.received_requests().await.unwrap().len(), 0);
+                    assert_eq!(
+                        rows(&database, legacy_metadata_paths_sql),
+                        legacy_metadata_paths,
+                        "unknown identity cannot invent historical source provenance {label}"
+                    );
+                    for name in &names {
+                        let retained: i64 = rusqlite::Connection::open(&database).unwrap()
+                            .query_row("SELECT COUNT(*) FROM provider_selection_rank_records r JOIN provider_selection_rank_pages p ON p.id=r.page_id JOIN provider_active_generations g ON g.id=p.generation WHERE r.record_name=?1 AND g.checkpoint_ready=0", [name], |row| row.get(0)).unwrap();
+                        assert!(
+                            retained > 0,
+                            "unpaired selected child retains its exact incomplete inventory evidence {label}: {name}"
+                        );
+                    }
                 } else {
-                    let downloaded = inner.get_downloaded_page(0, 20).await.unwrap();
+                    let downloaded = persisted.get_downloaded_page(0, 20).await.unwrap();
                     let mut paths = std::collections::HashSet::new();
                     let mut outputs = std::collections::HashMap::new();
                     paths.insert(legacy_path.clone());
@@ -4998,6 +5553,23 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                             "child aliases another receipt {name} {label}: {path:?}"
                         );
                         assert_eq!(std::fs::read(path).unwrap(), bytes, "child bytes {label}");
+                        let source: Option<String> = rusqlite::Connection::open(&database)
+                            .unwrap()
+                            .query_row(
+                                "SELECT source_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id=?1 AND version_size='original' AND local_path=?2",
+                                rusqlite::params![name, path.to_str().unwrap()],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            source.as_deref(),
+                            Some(
+                                data_encoding::HEXLOWER
+                                    .encode(&Sha256::digest(bytes))
+                                    .as_str()
+                            ),
+                            "current publication retains verified source {name} {label}"
+                        );
                         outputs.insert(path.clone(), std::fs::read(path).unwrap());
                         if matches!(fault, AmbiguousChildFault::PreserveCompanion) {
                             let companion = downloaded
@@ -5042,11 +5614,9 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                                     "prior child copy retained {label}"
                                 );
                             }
-                            assert!(
-                                outputs
-                                    .keys()
-                                    .all(|path| path.starts_with(media.join("relocated"))),
-                                "new current paths {label}"
+                            assert_eq!(
+                                outputs, completed_outputs,
+                                "path preference changes retain already published destinations {label}"
                             );
                             completed_outputs = outputs;
                         } else {
@@ -5061,20 +5631,20 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     );
                     rusqlite::Connection::open(&database)
                         .unwrap()
-                        .execute_batch("DROP TRIGGER fail_single_survivor_proof;")
+                        .execute_batch("DROP TRIGGER fail_single_survivor_cursor;")
                         .unwrap();
                 }
                 if matches!(fault, AmbiguousChildFault::PreserveIncompleteInventory) {
                     assert_eq!(
                         inventory_requests.load(std::sync::atomic::Ordering::SeqCst),
-                        1,
-                        "reopened failed discovery is deferred with the hold intact {label}"
+                        0,
+                        "historical preparation must not start an inventory {label}"
                     );
                 } else if matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery) {
                     assert_eq!(
                         inventory_requests.load(std::sync::atomic::Ordering::SeqCst),
-                        if cycle < 2 { 1 } else { 3 },
-                        "changed configuration permits fresh preparation and certification {label}"
+                        0,
+                        "configuration drift enumerates selected queries, not historical preparation {label}"
                     );
                 }
                 if cycle == 0
@@ -5095,23 +5665,37 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                         .unwrap();
                 }
                 let requests = server.received_requests().await.unwrap().len();
-                if cycle == 1
-                    && !matches!(
+                if cycle == 1 {
+                    if matches!(
                         fault,
-                        AmbiguousChildFault::PreserveIncompleteInventory
-                            | AmbiguousChildFault::PreserveInventoryRecovery
-                            | AmbiguousChildFault::PreserveSharedOriginal
-                    )
-                {
-                    assert!(
-                        requests
-                            >= names.len()
-                                - usize::from(matches!(
-                                    fault,
-                                    AmbiguousChildFault::PreserveHiddenUnselected
-                                )),
-                        "fresh child downloads {label}"
-                    );
+                        AmbiguousChildFault::PreserveHistoricalClaim
+                            | AmbiguousChildFault::PreserveHistoricalReplacement
+                    ) {
+                        assert_eq!(
+                            requests, 0,
+                            "verified independent child copies are reused {label}"
+                        );
+                        let conn = rusqlite::Connection::open(&database).unwrap();
+                        for (index, child) in names.iter().enumerate() {
+                            let expected = destination.join(format!("independent-{index}.jpg"));
+                            assert_eq!(std::fs::read(&expected).unwrap(), bytes);
+                            let recorded: String = conn.query_row(
+                                "SELECT local_path FROM assets WHERE library='PrimarySync' AND id=?1 AND version_size='original'",
+                                [child], |row| row.get(0),
+                            ).unwrap();
+                            assert_eq!(std::path::PathBuf::from(recorded), expected);
+                        }
+                    } else if !unknown_source {
+                        assert!(
+                            requests
+                                >= names.len()
+                                    - usize::from(matches!(
+                                        fault,
+                                        AmbiguousChildFault::PreserveHiddenUnselected
+                                    )),
+                            "fresh child downloads {label}"
+                        );
+                    }
                     completed_requests = requests;
                 }
                 if cycle == 2 && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery) {
@@ -5121,6 +5705,26 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     );
                     completed_requests = requests;
                 }
+                if cycle == 0 && fresh_source_recovery {
+                    // Keep failed publications intact outside the selected
+                    // destination so recovery must obtain verified source bytes.
+                    let retained = dir.path().join("retained-unverified-publication");
+                    std::fs::create_dir(&retained).unwrap();
+                    for entry in std::fs::read_dir(&destination).unwrap() {
+                        let path = entry.unwrap().path();
+                        if path == legacy_path || path == legacy_xmp || !path.is_file() {
+                            continue;
+                        }
+                        let bytes = std::fs::read(&path).unwrap();
+                        let saved = retained.join(path.file_name().unwrap());
+                        std::fs::rename(&path, &saved).unwrap();
+                        retained_unverified_outputs.push((saved, bytes));
+                    }
+                    assert!(
+                        !retained_unverified_outputs.is_empty(),
+                        "fault follows real publication {label}"
+                    );
+                }
                 for (path, bytes) in &retained_unverified_outputs {
                     assert_eq!(
                         &std::fs::read(path).unwrap(),
@@ -5128,25 +5732,21 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                         "retained failed publication {label}"
                     );
                 }
-                if cycle == 2 && fresh_source_recovery {
-                    assert!(
-                        requests > completed_requests,
-                        "fresh verified recovery request {label}"
-                    );
-                    assert!(
-                        result.stats.downloaded > 0,
-                        "fresh verified recovery download {label}"
-                    );
-                    completed_requests = requests;
-                }
                 if cycle >= 2
                     && !(cycle == 2
-                        && (fresh_source_recovery
-                            || matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery)))
+                        && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
                 {
                     assert_eq!(requests, completed_requests, "steady network {label}");
                     if !(relocating && cycle == 2) {
                         assert_eq!(result.stats.downloaded, 0, "steady download {label}");
+                        if !unknown_source {
+                            assert!(
+                                lookup_requests.load(std::sync::atomic::Ordering::SeqCst)
+                                    - lookups_before
+                                    <= 2 * names.len(),
+                                "only bounded current-child source confirmation is permitted {label}"
+                            );
+                        }
                     }
                 }
             }
@@ -5368,7 +5968,7 @@ async fn run_cycle_legacy_hardlink_opt_in_original_and_current_qualify_after_reo
 }
 
 #[tokio::test]
-async fn run_cycle_legacy_hardlink_opt_in_disable_revalidates_original_and_current_only() {
+async fn run_cycle_legacy_hardlink_opt_in_disable_preserves_prepared_history_and_current_copies() {
     for fault in [
         LegacyHardlinkFault::Disable,
         LegacyHardlinkFault::DisableCurrentOnly,
@@ -5484,7 +6084,7 @@ async fn run_cycle_legacy_opaque_mmcs_checkpoint_failure_stays_atomic() {
 }
 
 #[tokio::test]
-async fn run_cycle_legacy_opaque_mmcs_unknown_source_stays_held() {
+async fn run_cycle_legacy_opaque_mmcs_unknown_source_stays_unverified() {
     for smart_only in [false, true] {
         Box::pin(exercise_legacy_child_cycles_with_provenance(
             AmbiguousChildFault::PreserveUnknownSource,
@@ -5492,25 +6092,6 @@ async fn run_cycle_legacy_opaque_mmcs_unknown_source_stays_held() {
             None,
             smart_only,
             Some(21),
-        ))
-        .await;
-    }
-}
-
-#[tokio::test]
-async fn run_cycle_legacy_receipt_diagnostic_never_grants_progress() {
-    for diagnostic in [
-        Err("private receipt database failure"),
-        Ok(state::db::LegacyChildReceiptRefusal::Unavailable),
-        Ok(state::db::LegacyChildReceiptRefusal::StateChanged),
-    ] {
-        Box::pin(exercise_legacy_child_cycles_with_receipt_diagnostic(
-            AmbiguousChildFault::PreserveUnknownSource,
-            &[1],
-            None,
-            true,
-            Some(21),
-            Some(diagnostic),
         ))
         .await;
     }

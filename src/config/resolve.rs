@@ -6,9 +6,10 @@ use super::paths::{
     resolve_password_command, resolve_password_file, validate_download_dir,
 };
 use super::runtime::{
-    AuthConfig, Config, DownloadSettings, FilterConfig, ImportConfig, MediaKind, MediaSelection,
-    MetadataConfig, NotificationConfig, PhotoConfig, ReportConfig, ResolvedRetryConfig,
-    RuntimeConfig, ServerConfig, UiConfig, WatchConfig, parse_created_date_filter,
+    AuthConfig, Config, DownloadSettings, FilterConfig, ImportConfig, MediaExclusion,
+    MediaSelection, MetadataConfig, NotificationConfig, PhotoConfig, ReportConfig,
+    ResolvedRetryConfig, RuntimeConfig, ServerConfig, UiConfig, WatchConfig,
+    parse_created_date_filter,
 };
 use super::templates::{
     DEFAULT_FOLDER_STRUCTURE_ALBUMS, DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS, TemplateKind,
@@ -33,18 +34,11 @@ pub(crate) struct SyncConfigOverrides {
     pub albums: Vec<String>,
     pub smart_folders: Vec<String>,
     pub unfiled: Option<bool>,
-    pub filename_exclude: Vec<String>,
     pub libraries: Vec<String>,
-    pub resolution: Option<PhotoResolution>,
-    pub live_resolution: Option<LivePhotoResolution>,
-    pub edited: Option<bool>,
-    pub alternative: Option<bool>,
     pub threads: Option<u16>,
     pub bandwidth_limit: Option<u64>,
     pub skip_videos: Option<bool>,
     pub skip_photos: Option<bool>,
-    pub live_photo_mode: Option<LivePhotoMode>,
-    pub force_resolution: Option<bool>,
     pub folder_structure: Option<String>,
     pub folder_structure_albums: Option<String>,
     pub folder_structure_smart_folders: Option<String>,
@@ -59,7 +53,6 @@ pub(crate) struct SyncConfigOverrides {
     pub watch_with_interval: Option<u64>,
     pub keep_unicode_in_filenames: Option<bool>,
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
-    pub raw_policy: Option<RawPolicy>,
     pub file_match_policy: Option<FileMatchPolicy>,
     pub max_retries: Option<u32>,
     pub temp_suffix: Option<String>,
@@ -70,7 +63,6 @@ pub(crate) struct SyncConfigOverrides {
     pub report_json: Option<PathBuf>,
     pub http_port: Option<u16>,
     pub http_bind: Option<std::net::IpAddr>,
-    pub max_download_attempts: Option<u32>,
 }
 
 // ── Application Config ──────────────────────────────────────────────
@@ -97,26 +89,22 @@ pub(crate) fn resolve_media_selection(
     skip_videos_override: Option<bool>,
     skip_photos_override: Option<bool>,
 ) -> anyhow::Result<MediaSelection> {
-    let mut selection = if let Some(kinds) = toml_filters.and_then(|f| f.media.as_ref()) {
-        anyhow::ensure!(!kinds.is_empty(), "[filters].media cannot be empty.");
+    let mut selection = if let Some(kinds) = toml_filters.and_then(|f| f.exclude.as_ref()) {
         let mut seen = BTreeSet::new();
-        let mut selection = MediaSelection {
-            photos: false,
-            videos: false,
-            live_photos: false,
-        };
+        let mut selection = MediaSelection::all();
         for kind in kinds {
             anyhow::ensure!(
                 seen.insert(*kind),
-                "[filters].media contains duplicate `{}`.",
-                media_kind_name(*kind)
+                "[filters].exclude contains duplicate `{}`.",
+                kind.as_str()
             );
             match kind {
-                MediaKind::Photos => selection.photos = true,
-                MediaKind::Videos => selection.videos = true,
-                MediaKind::LivePhotos => selection.live_photos = true,
+                MediaExclusion::Photos => selection.photos = false,
+                MediaExclusion::Videos => selection.videos = false,
+                MediaExclusion::LivePhotoStills | MediaExclusion::LivePhotoVideos => {}
             }
         }
+        selection.live_photos = MediaExclusion::live_mode(kinds) != LivePhotoMode::Skip;
         selection
     } else {
         MediaSelection::all()
@@ -131,18 +119,10 @@ pub(crate) fn resolve_media_selection(
 
     anyhow::ensure!(
         selection.photos || selection.videos || selection.live_photos,
-        "[filters].media must select at least one media category."
+        "[filters].exclude must leave at least one media component selected."
     );
 
     Ok(selection)
-}
-
-const fn media_kind_name(kind: MediaKind) -> &'static str {
-    match kind {
-        MediaKind::Photos => "photos",
-        MediaKind::Videos => "videos",
-        MediaKind::LivePhotos => "live-photos",
-    }
 }
 
 /// Default for `Selection.unfiled` when the user did not pass `--unfiled`
@@ -194,15 +174,8 @@ pub(crate) struct PathDerivationCliArgs {
     pub folder_structure: Option<String>,
     pub folder_structure_albums: Option<String>,
     pub folder_structure_smart_folders: Option<String>,
-    pub resolution: Option<PhotoResolution>,
-    pub live_photo_mode: Option<LivePhotoMode>,
-    pub live_resolution: Option<LivePhotoResolution>,
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
-    pub edited: Option<bool>,
-    pub alternative: Option<bool>,
-    pub raw_policy: Option<RawPolicy>,
     pub file_match_policy: Option<FileMatchPolicy>,
-    pub force_resolution: Option<bool>,
     pub keep_unicode_in_filenames: Option<bool>,
 }
 
@@ -212,15 +185,8 @@ impl PathDerivationCliArgs {
             folder_structure: overrides.folder_structure.clone(),
             folder_structure_albums: overrides.folder_structure_albums.clone(),
             folder_structure_smart_folders: overrides.folder_structure_smart_folders.clone(),
-            resolution: overrides.resolution,
-            live_photo_mode: overrides.live_photo_mode,
-            live_resolution: overrides.live_resolution,
             live_photo_mov_filename_policy: overrides.live_photo_mov_filename_policy,
-            edited: overrides.edited,
-            alternative: overrides.alternative,
-            raw_policy: overrides.raw_policy,
             file_match_policy: overrides.file_match_policy,
-            force_resolution: overrides.force_resolution,
             keep_unicode_in_filenames: overrides.keep_unicode_in_filenames,
         }
     }
@@ -271,53 +237,35 @@ pub(crate) fn resolve_path_derivation_fields(
         toml_dl.and_then(|d| d.folder_structure_smart_folders.as_ref()),
         DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS.to_string(),
     );
-    let resolution = resolve(
-        cli.resolution,
-        toml_photos.and_then(|p| p.resolution),
-        PhotoResolution::Original,
-    );
-    let live_resolution = resolve(
-        cli.live_resolution,
-        toml_photos.and_then(|p| p.live_resolution),
-        LivePhotoResolution::Original,
-    );
-    let live_photo_mode = resolve(
-        cli.live_photo_mode,
-        toml_photos.and_then(|p| p.live_photo_mode),
-        LivePhotoMode::Both,
-    );
+    let resolution = PhotoResolution::Original;
+    let live_resolution = LivePhotoResolution::Original;
+    let exclusions = toml
+        .and_then(|t| t.filters.as_ref())
+        .and_then(|f| f.exclude.as_deref())
+        .unwrap_or_default();
+    let live_photo_mode = MediaExclusion::live_mode(exclusions);
     let live_photo_mov_filename_policy = resolve(
         cli.live_photo_mov_filename_policy,
         toml_photos.and_then(|p| p.live_photo_mov_filename_policy),
         LivePhotoMovFilenamePolicy::Suffix,
     );
-    let edited = resolve_flag(cli.edited, toml_photos.and_then(|p| p.edited));
-    let edited_naming = toml_photos
-        .and_then(|p| p.edited_naming)
-        .unwrap_or_default();
-    anyhow::ensure!(
-        edited_naming != crate::types::EditedNaming::Primary || edited,
-        "[photos].edited_naming = \"primary\" requires [photos].edited = true."
-    );
-    let alternative = resolve_flag(cli.alternative, toml_photos.and_then(|p| p.alternative));
-    anyhow::ensure!(
-        resolution != PhotoResolution::None || edited || alternative,
-        "[photos].resolution = \"none\" requires [photos].edited = true or [photos].alternative = true."
-    );
-    let raw_policy = resolve(
-        cli.raw_policy,
-        toml_photos.and_then(|p| p.raw_policy),
-        RawPolicy::AsIs,
-    );
+    let edited = true;
+    let edited_naming = if toml_photos
+        .and_then(|p| p.edited_as_primary)
+        .unwrap_or(false)
+    {
+        crate::types::EditedNaming::Primary
+    } else {
+        crate::types::EditedNaming::Suffix
+    };
+    let alternative = true;
+    let raw_policy = RawPolicy::AsIs;
     let file_match_policy = resolve(
         cli.file_match_policy,
         toml_photos.and_then(|p| p.file_match_policy),
         FileMatchPolicy::NameSizeDedupWithSuffix,
     );
-    let force_resolution = resolve_flag(
-        cli.force_resolution,
-        toml_photos.and_then(|p| p.force_resolution),
-    );
+    let force_resolution = true;
     let keep_unicode_in_filenames = resolve_flag(
         cli.keep_unicode_in_filenames,
         toml_photos.and_then(|p| p.keep_unicode_in_filenames),
@@ -478,6 +426,10 @@ impl Config {
         friendly_request: Option<bool>,
     ) -> anyhow::Result<Self> {
         let toml_auth = toml.and_then(|t| t.auth.as_ref());
+        anyhow::ensure!(
+            !sync.repair_truncated,
+            "--repair-truncated cannot distinguish damage from local edits. Use `kei reconcile --inspect-path PATH` and confirm that destination's fingerprint with --confirm-damage, then run `kei sync`."
+        );
 
         // `[auth].password` is no longer accepted. Plaintext passwords in config
         // files are a standing security risk; kei ships a credential store
@@ -657,15 +609,6 @@ impl Config {
             max_retries <= 100,
             "[download.retry].per_transfer must be 100 or less, got {max_retries}."
         );
-        // Lifetime cap on download attempts per asset (0 disables). CLI >
-        // TOML > 10, matching every other resolved value. The runtime
-        // skip check in download::pipeline::process_asset short-circuits
-        // when this is 0, so 0 is a valid (cap-off) sentinel.
-        let max_download_attempts = resolve(
-            overrides.max_download_attempts,
-            toml_retry.and_then(|r| r.per_asset),
-            10,
-        );
         let retry_delay_secs = smart_retry_delay(max_retries);
 
         // Filters
@@ -700,62 +643,13 @@ impl Config {
             libraries: library_selector.clone(),
             unfiled: unfiled_override.unwrap_or_else(unfiled_default),
         };
-        let filename_exclude_strs = resolve_vec(
-            overrides.filename_exclude,
-            toml_filters.and_then(|f| f.filename_exclude.clone()),
-        );
-        // Compile glob patterns once during build
-        let filename_exclude: Vec<glob::Pattern> = filename_exclude_strs
-            .iter()
-            .map(|p| {
-                glob::Pattern::new(p)
-                    .map_err(|e| anyhow::anyhow!("Invalid --filename-exclude pattern '{p}': {e}"))
-            })
-            .collect::<anyhow::Result<_>>()?;
-        let persistent_recent = toml_filters.and_then(|f| f.recent);
-        let recent_raw = sync.recent.or(persistent_recent);
-        let persistent_recent_scope = toml_filters.and_then(|f| f.recent_scope);
-        let recent_scope = sync
-            .recent_scope
-            .or(persistent_recent_scope)
-            .unwrap_or_default();
-        let recent_scope_was_set = sync.recent_scope.is_some() || persistent_recent_scope.is_some();
         let persistent_skip_created_before =
             toml_filters.and_then(|f| f.skip_created_before.clone());
         let persistent_skip_created_after = toml_filters.and_then(|f| f.skip_created_after.clone());
-        let explicit_skip_created_before_str = sync
+        let skip_created_before_str = sync
             .skip_created_before
             .or_else(|| persistent_skip_created_before.clone());
 
-        // Split the RecentLimit: Count(n) is a post-enumeration cap held on
-        // config.recent. Days(n) translates into a skip_created_before cutoff
-        // since "last N days" = "skip everything created before N days ago".
-        // Reject combining the two forms on the same invocation so user
-        // intent stays unambiguous.
-        let (recent, recent_days) = match recent_raw {
-            None => (None, None),
-            Some(crate::cli::RecentLimit::Count(n)) => (Some(n), None),
-            Some(crate::cli::RecentLimit::Days(n)) => {
-                anyhow::ensure!(
-                    explicit_skip_created_before_str.is_none(),
-                    "`--recent {n}d` and `--skip-created-before` do the same thing. Pick one."
-                );
-                (None, Some(n))
-            }
-        };
-        anyhow::ensure!(
-            recent_raw.is_some() || !recent_scope_was_set,
-            "`recent_scope` only applies when `recent` is set."
-        );
-        anyhow::ensure!(
-            !matches!(recent_raw, Some(crate::cli::RecentLimit::Days(_))) || !recent_scope_was_set,
-            "`recent_scope` only applies to count-form `recent` values, not `Nd` day windows."
-        );
-        let skip_created_before_str = if let Some(n) = recent_days {
-            Some(format!("{n}d"))
-        } else {
-            explicit_skip_created_before_str
-        };
         let skip_created_after_str = sync
             .skip_created_after
             .or_else(|| persistent_skip_created_after.clone());
@@ -763,11 +657,13 @@ impl Config {
         let skip_created_before = skip_created_before_str
             .as_deref()
             .map(parse_created_date_filter)
-            .transpose()?;
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("skip_created_before / --skip-created-before: {e}"))?;
         let skip_created_after = skip_created_after_str
             .as_deref()
             .map(parse_created_date_filter)
-            .transpose()?;
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("skip_created_after / --skip-created-after: {e}"))?;
 
         if let (Some(before), Some(after)) = (&skip_created_before, &skip_created_after)
             && before.is_strictly_after(*after)
@@ -847,16 +743,6 @@ impl Config {
             },
         };
 
-        if !media.photos
-            && !media.videos
-            && media.live_photos
-            && live_photo_mode == LivePhotoMode::Skip
-        {
-            anyhow::bail!(
-                "[filters].media selects only live photos, but [photos].live_photo_mode = \"skip\" would download nothing. Enable photos or videos, or change live_photo_mode."
-            );
-        }
-
         Ok(Self {
             auth: AuthConfig {
                 username,
@@ -872,7 +758,6 @@ impl Config {
                 folder_structure,
                 folder_structure_albums,
                 folder_structure_smart_folders,
-                filename_exclude,
                 temp_suffix,
                 legacy_preservation_allow_hardlinks: toml_dl
                     .and_then(|download| download.legacy_preservation_allow_hardlinks)
@@ -886,10 +771,6 @@ impl Config {
                 media,
                 skip_created_before,
                 skip_created_after,
-                recent,
-                recent_scope,
-                persistent_recent,
-                persistent_recent_scope,
                 persistent_skip_created_before,
                 persistent_skip_created_after,
                 skip_videos,
@@ -911,7 +792,6 @@ impl Config {
             retry: ResolvedRetryConfig {
                 max_retries,
                 retry_delay_secs,
-                max_download_attempts,
             },
             watch: WatchConfig {
                 interval: watch_with_interval,
@@ -938,6 +818,9 @@ impl Config {
             },
             metadata: MetadataConfig {
                 set_exif_datetime,
+                set_exif_orientation: toml_metadata
+                    .and_then(|m| m.set_exif_orientation)
+                    .unwrap_or(false),
                 set_exif_rating,
                 set_exif_gps,
                 set_exif_description,
@@ -945,6 +828,14 @@ impl Config {
                 embed_xmp,
                 #[cfg(feature = "xmp")]
                 xmp_sidecar,
+                #[cfg(feature = "xmp")]
+                include_albums: toml_metadata
+                    .and_then(|m| m.include_albums)
+                    .unwrap_or(false),
+                #[cfg(feature = "xmp")]
+                include_people: toml_metadata
+                    .and_then(|m| m.include_people)
+                    .unwrap_or(false),
             },
             import: ImportConfig {
                 strict: toml_import.and_then(|i| i.strict).unwrap_or(false),
@@ -983,53 +874,61 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn edited_naming_is_opt_in_and_requires_edited_selection() {
-        for (text, expected) in [
-            ("", crate::types::EditedNaming::Suffix),
-            (
-                "[photos]\nedited=true\nedited_naming='primary'",
-                crate::types::EditedNaming::Primary,
-            ),
-            (
-                "[photos]\nedited=true\nedited_naming='suffix'",
-                crate::types::EditedNaming::Suffix,
-            ),
-        ] {
-            let parsed: TomlConfig = toml::from_str(text).unwrap();
-            let config = Config::build(
-                &default_globals(),
-                &default_password(),
-                default_sync(),
-                Some(&parsed),
-            )
-            .unwrap();
-            assert_eq!(config.photos.edited_naming, expected);
-            let serialized = config
-                .to_toml()
-                .photos
-                .and_then(|photos| photos.edited_naming);
-            assert_eq!(
-                serialized,
-                (expected == crate::types::EditedNaming::Primary).then_some(expected)
-            );
-        }
-        let parsed: TomlConfig = toml::from_str("[photos]\nedited_naming='primary'").unwrap();
-        let error = Config::build(
+    fn new_config_uses_suffix_and_rejects_retired_naming() {
+        let config = Config::build(
             &default_globals(),
             &default_password(),
             default_sync(),
-            Some(&parsed),
+            None,
         )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("requires [photos].edited = true")
+        .unwrap();
+        assert_eq!(
+            config.photos.edited_naming,
+            crate::types::EditedNaming::Suffix
         );
         assert!(
-            toml::from_str::<TomlConfig>("[photos]\nedited=true\nedited_naming='anything'")
-                .is_err()
+            !toml::to_string(&config.to_toml())
+                .unwrap()
+                .contains("edited_naming")
         );
+        for naming in ["primary", "suffix", "anything"] {
+            assert!(
+                toml::from_str::<TomlConfig>(&format!("[photos]\nedited_naming='{naming}'"))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn edited_as_primary_controls_effective_edited_naming() {
+        use crate::types::EditedNaming;
+        for (input, expected) in [
+            ("", EditedNaming::Suffix),
+            ("[photos]\nedited_as_primary = false", EditedNaming::Suffix),
+            ("[photos]\nedited_as_primary = true", EditedNaming::Primary),
+        ] {
+            let toml: TomlConfig = toml::from_str(input).unwrap();
+            let cfg = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&toml),
+            )
+            .unwrap();
+            assert_eq!(cfg.photos.edited_naming, expected, "input: {input}");
+            let fields =
+                resolve_path_derivation_fields(PathDerivationCliArgs::default(), Some(&toml))
+                    .unwrap();
+            assert_eq!(fields.edited_naming, expected, "input: {input}");
+        }
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.photos.edited_naming, EditedNaming::Suffix);
     }
 
     #[test]
@@ -1577,7 +1476,7 @@ mod tests {
             set_exif_datetime = true
 
             [filters]
-            media = ["photos", "live-photos"]
+            exclude = ["videos"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
@@ -1643,7 +1542,7 @@ mod tests {
     fn test_build_cli_flag_overrides_toml_false() {
         let toml_str = r#"
             [filters]
-            media = ["photos", "videos", "live-photos"]
+            exclude = []
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
@@ -1656,7 +1555,7 @@ mod tests {
     fn test_build_cli_false_overrides_toml_true() {
         let toml_str = r#"
             [filters]
-            media = ["photos", "live-photos"]
+            exclude = ["videos"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
@@ -2191,7 +2090,6 @@ mod tests {
         assert!(!cfg.filters.skip_videos);
         assert!(!cfg.filters.skip_photos);
         assert_eq!(cfg.photos.live_photo_mode, LivePhotoMode::Both);
-        assert!(cfg.filters.recent.is_none());
         assert!(cfg.filters.skip_created_before.is_none());
         assert!(cfg.filters.skip_created_after.is_none());
         // Photos
@@ -2209,7 +2107,7 @@ mod tests {
             cfg.photos.file_match_policy,
             FileMatchPolicy::NameSizeDedupWithSuffix
         ));
-        assert!(!cfg.photos.force_resolution);
+        assert!(cfg.photos.force_resolution);
         assert!(!cfg.photos.keep_unicode_in_filenames);
         // Watch
         assert!(cfg.watch.interval.is_none());
@@ -2337,152 +2235,13 @@ mod tests {
         assert_eq!(cfg.retry.max_retries, 10);
     }
     #[test]
-    fn test_build_max_download_attempts_default() {
-        // Neither CLI nor TOML set: hardcoded fallback of 10 fires.
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(cfg.retry.max_download_attempts, 10);
-    }
-    #[test]
-    fn test_build_max_download_attempts_from_toml() {
-        // TOML-only: resolved value matches the TOML setting.
-        let toml_str = r#"
-            [download.retry]
-            per_asset = 25
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.retry.max_download_attempts, 25);
-    }
-    #[test]
-    fn test_build_max_download_attempts_cli_overrides_toml() {
-        // CLI flag wins over TOML, mirroring every other resolved value.
-        let toml_str = r#"
-            [download.retry]
-            per_asset = 25
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.max_download_attempts = Some(7);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.retry.max_download_attempts, 7);
-    }
-    #[test]
-    fn test_build_max_download_attempts_zero_disables_cap() {
-        // `0` is the documented "disable the cap" sentinel; resolution
-        // must accept it through TOML the same as through CLI.
-        let toml_str = r#"
-            [download.retry]
-            per_asset = 0
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.retry.max_download_attempts, 0);
-    }
-    #[test]
-    fn test_build_resolution_cli_overrides_toml() {
-        let toml_str = r#"
-            [photos]
-            resolution = "thumb"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.resolution = Some(PhotoResolution::Medium);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert!(matches!(cfg.photos.resolution, PhotoResolution::Medium));
-    }
-    #[test]
-    fn test_build_resolution_from_toml() {
-        let toml_str = r#"
-            [photos]
-            resolution = "thumb"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert!(matches!(cfg.photos.resolution, PhotoResolution::Thumb));
-    }
-    #[test]
-    fn test_build_live_resolution_cli_overrides_toml() {
-        let toml_str = r#"
-            [photos]
-            live_resolution = "thumb"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.live_resolution = Some(LivePhotoResolution::Medium);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert!(matches!(
-            cfg.photos.live_resolution,
-            LivePhotoResolution::Medium
-        ));
-    }
-    #[test]
-    fn test_build_live_resolution_from_toml() {
-        let toml_str = r#"
-            [photos]
-            live_resolution = "thumb"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert!(matches!(
-            cfg.photos.live_resolution,
-            LivePhotoResolution::Thumb
-        ));
-    }
-    #[test]
-    fn test_build_edited_keeps_live_resolution_default() {
-        let mut sync = default_sync();
-        sync.config_overrides.resolution = Some(PhotoResolution::Original);
-        sync.config_overrides.edited = Some(true);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert!(matches!(
-            cfg.photos.live_resolution,
-            LivePhotoResolution::Original
-        ));
-    }
-    #[test]
-    fn test_build_live_resolution_explicit_overrides_edited_default() {
-        let mut sync = default_sync();
-        sync.config_overrides.resolution = Some(PhotoResolution::Original);
-        sync.config_overrides.edited = Some(true);
-        sync.config_overrides.live_resolution = Some(LivePhotoResolution::Original);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert!(matches!(
-            cfg.photos.live_resolution,
-            LivePhotoResolution::Original
-        ));
+    fn retired_lifetime_retry_config_refuses_before_resolution() {
+        for value in ["0", "10", "25", "\"invalid\""] {
+            let error =
+                toml::from_str::<TomlConfig>(&format!("[download.retry]\nper_asset = {value}\n"))
+                    .unwrap_err();
+            assert!(error.to_string().contains("unknown field `per_asset`"));
+        }
     }
     #[test]
     fn test_build_mov_filename_policy_cli_overrides_toml() {
@@ -2519,19 +2278,6 @@ mod tests {
             cfg.photos.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Original
         ));
-    }
-    #[test]
-    fn test_build_raw_policy_cli_overrides_toml() {
-        let toml_str = r#"
-            [photos]
-            raw_policy = "prefer-raw"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.raw_policy = Some(RawPolicy::PreferJpeg);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert!(matches!(cfg.photos.raw_policy, RawPolicy::PreferJpeg));
     }
     #[test]
     fn test_build_file_match_policy_cli_overrides_toml() {
@@ -2587,38 +2333,19 @@ mod tests {
             pd.file_match_policy,
             FileMatchPolicy::NameSizeDedupWithSuffix
         );
-        assert!(!pd.force_resolution);
+        assert!(pd.force_resolution);
         assert!(!pd.keep_unicode_in_filenames);
     }
-    /// `edited = true` is additive in v0.20: it does not rewrite the
-    /// primary or live-photo resolution. Adjusted stills and videos are
-    /// selected later as extra renditions by the download filter.
     #[test]
-    fn resolve_path_derivation_edited_keeps_live_resolution_default() {
-        let cli = PathDerivationCliArgs {
-            resolution: Some(PhotoResolution::Original),
-            edited: Some(true),
-            ..Default::default()
-        };
-        let pd = resolve_path_derivation_fields(cli, None).unwrap();
+    fn resolve_path_derivation_includes_full_resolution_renditions() {
+        let pd = resolve_path_derivation_fields(PathDerivationCliArgs::default(), None).unwrap();
+        assert!(pd.edited && pd.alternative && pd.force_resolution);
         assert_eq!(pd.resolution, PhotoResolution::Original);
         assert_eq!(
             pd.live_resolution,
             LivePhotoResolution::Original,
             "edited extras must not rewrite live_resolution"
         );
-    }
-    /// Explicit live resolution still wins when edited extras are enabled.
-    #[test]
-    fn resolve_path_derivation_explicit_live_resolution_beats_toml() {
-        let cli = PathDerivationCliArgs {
-            resolution: Some(PhotoResolution::Original),
-            edited: Some(true),
-            live_resolution: Some(LivePhotoResolution::Original),
-            ..Default::default()
-        };
-        let pd = resolve_path_derivation_fields(cli, None).unwrap();
-        assert_eq!(pd.live_resolution, LivePhotoResolution::Original);
     }
     /// CLI > TOML > default. The resolver short-circuits on the first
     /// `Some`; this confirms we don't double-resolve and accidentally
@@ -2628,21 +2355,14 @@ mod tests {
         let toml: TomlConfig = toml::from_str(
             r#"
             [photos]
-            resolution = "original"
-            edited = true
             file_match_policy = "name-id7"
-            force_resolution = true
             keep_unicode_in_filenames = true
-            raw_policy = "prefer-raw"
             "#,
         )
         .unwrap();
         let cli = PathDerivationCliArgs {
-            resolution: Some(PhotoResolution::Original),
             file_match_policy: Some(FileMatchPolicy::NameSizeDedupWithSuffix),
-            force_resolution: Some(false),
             keep_unicode_in_filenames: Some(false),
-            raw_policy: Some(RawPolicy::AsIs),
             ..Default::default()
         };
         let pd = resolve_path_derivation_fields(cli, Some(&toml)).unwrap();
@@ -2651,7 +2371,7 @@ mod tests {
             pd.file_match_policy,
             FileMatchPolicy::NameSizeDedupWithSuffix
         );
-        assert!(!pd.force_resolution);
+        assert!(pd.force_resolution);
         assert!(!pd.keep_unicode_in_filenames);
         assert_eq!(pd.raw_policy, RawPolicy::AsIs);
     }
@@ -2664,17 +2384,13 @@ mod tests {
             folder_structure_albums = "{album}/toml"
             folder_structure_smart_folders = "{smart-folder}/toml"
 
-            [photos]
-            resolution = "medium"
-            live_photo_mode = "skip"
-            live_resolution = "thumb"
-            raw_policy = "prefer-raw"
+            [filters]
+            exclude = ["live-photo-videos"]
             "#,
         )
         .unwrap();
         let mut sync = default_sync();
         sync.config_overrides.folder_structure_albums = Some("{album}/cli".to_string());
-        sync.config_overrides.live_photo_mode = Some(LivePhotoMode::ImageOnly);
 
         let cfg =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
@@ -2685,10 +2401,10 @@ mod tests {
             cfg.download.folder_structure_smart_folders,
             "{smart-folder}/toml"
         );
-        assert_eq!(cfg.photos.resolution, PhotoResolution::Medium);
+        assert_eq!(cfg.photos.resolution, PhotoResolution::Original);
         assert_eq!(cfg.photos.live_photo_mode, LivePhotoMode::ImageOnly);
-        assert_eq!(cfg.photos.live_resolution, LivePhotoResolution::Thumb);
-        assert_eq!(cfg.photos.raw_policy, RawPolicy::PreferRaw);
+        assert_eq!(cfg.photos.live_resolution, LivePhotoResolution::Original);
+        assert_eq!(cfg.photos.raw_policy, RawPolicy::AsIs);
     }
     /// TOML wins when the CLI is silent. Pin this so anyone refactoring
     /// the resolver doesn't accidentally swallow TOML defaults.
@@ -2699,10 +2415,9 @@ mod tests {
             [download]
             folder_structure = "%Y/%m"
 
+            [filters]
+            exclude = ["live-photo-stills", "live-photo-videos"]
             [photos]
-            resolution = "original"
-            edited = true
-            live_photo_mode = "skip"
             file_match_policy = "name-id7"
             "#,
         )
@@ -2718,19 +2433,14 @@ mod tests {
     }
     #[test]
     fn resolve_path_derivation_rejects_resolution_none_without_extras() {
-        let toml: TomlConfig = toml::from_str(
+        let error = toml::from_str::<TomlConfig>(
             r#"
             [photos]
             resolution = "none"
             "#,
         )
-        .unwrap();
-        let err = resolve_path_derivation_fields(PathDerivationCliArgs::default(), Some(&toml))
-            .expect_err("resolution none needs an extra");
-        assert!(
-            err.to_string().contains("requires [photos].edited"),
-            "unexpected error: {err}"
-        );
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field `resolution`"));
     }
     #[test]
     fn test_build_all_boolean_flags_from_toml() {
@@ -2745,11 +2455,9 @@ mod tests {
             progress_bar = false
 
             [filters]
-            media = ["photos", "live-photos"]
+            exclude = ["videos", "live-photo-stills", "live-photo-videos"]
 
             [photos]
-            live_photo_mode = "skip"
-            force_resolution = true
             keep_unicode_in_filenames = true
 
             [watch]
@@ -2773,6 +2481,36 @@ mod tests {
         assert!(cfg.watch.notify_systemd);
     }
     #[test]
+    fn orientation_is_an_independent_explicit_opt_in() {
+        for (text, expected) in [
+            ("", false),
+            (
+                "[metadata]\nset_exif_datetime=true\nset_exif_gps=true",
+                false,
+            ),
+            ("[metadata]\nset_exif_orientation=false", false),
+            ("[metadata]\nset_exif_orientation=true", true),
+        ] {
+            let input: TomlConfig = toml::from_str(text).unwrap();
+            let config = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&input),
+            )
+            .unwrap();
+            assert_eq!(config.metadata.set_exif_orientation, expected);
+        }
+        let config = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert!(!config.metadata.set_exif_orientation);
+    }
+    #[test]
     fn test_build_all_boolean_flags_cli_overrides() {
         // Programmatic skip overrides still feed the same media owner type
         // for tests and internal call sites.
@@ -2780,11 +2518,12 @@ mod tests {
         sync.config_overrides.set_exif_datetime = Some(true);
         sync.no_progress_bar = true;
         sync.config_overrides.skip_videos = Some(true);
-        sync.config_overrides.live_photo_mode = Some(LivePhotoMode::Skip);
-        sync.config_overrides.force_resolution = Some(true);
         sync.config_overrides.keep_unicode_in_filenames = Some(true);
         sync.config_overrides.notify_systemd = Some(true);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nexclude=['live-photo-stills','live-photo-videos']").unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(cfg.metadata.set_exif_datetime);
         assert!(cfg.download.no_progress_bar);
         assert!(cfg.filters.skip_videos);
@@ -2798,7 +2537,7 @@ mod tests {
     fn test_build_boolean_flags_false_in_toml_stays_false() {
         let toml_str = r#"
             [filters]
-            media = ["photos", "videos", "live-photos"]
+            exclude = []
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
@@ -2950,68 +2689,22 @@ mod tests {
         assert!(cfg.report.json.is_none());
     }
     #[test]
-    fn test_build_recent_cli_overrides_toml() {
-        let toml_str = r#"
-            [filters]
-            recent = 500
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Count(100));
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.filters.recent, Some(100));
-    }
-    #[test]
-    fn test_build_recent_from_toml() {
-        let toml_str = r#"
-            [filters]
-            recent = 500
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.filters.recent, Some(500));
-        assert_eq!(cfg.filters.recent_scope, crate::cli::RecentScope::Global);
-    }
-    #[test]
-    fn test_build_recent_scope_cli_overrides_toml() {
-        let toml_str = r#"
-            [filters]
-            recent = 500
-            recent_scope = "per-filter"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Count(100));
-        sync.recent_scope = Some(crate::cli::RecentScope::Global);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.filters.recent, Some(100));
-        assert_eq!(cfg.filters.recent_scope, crate::cli::RecentScope::Global);
-    }
-    #[test]
-    fn test_build_recent_scope_from_toml() {
-        let toml_str = r#"
-            [filters]
-            recent = 500
-            recent_scope = "per-filter"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.filters.recent, Some(500));
-        assert_eq!(cfg.filters.recent_scope, crate::cli::RecentScope::PerFilter);
+    fn retired_count_inputs_fail_before_resolution() {
+        for setting in [
+            "recent = 500",
+            "recent = \"100\"",
+            "recent = \"14d\"",
+            "recent_scope = \"global\"",
+            "recent_scope = \"per-filter\"",
+        ] {
+            let body = format!("[filters]\n{setting}\nskip_created_before = \"2025-01-01\"\n");
+            assert!(
+                toml::from_str::<TomlConfig>(&body)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown field `recent")
+            );
+        }
     }
     #[test]
     fn test_build_skip_dates_cli_overrides_toml() {
@@ -3038,24 +2731,19 @@ mod tests {
         );
     }
     #[test]
-    fn test_build_skip_dates_interval_syntax_from_toml() {
-        let toml_str = r#"
-            [filters]
-            skip_created_before = "30d"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        let CreatedDateFilter::Instant(before) = cfg.filters.skip_created_before.unwrap() else {
-            panic!("day interval must resolve to an instant");
-        };
-        let expected = chrono::Utc::now() - chrono::Duration::days(30);
-        assert!((before - expected).num_seconds().abs() < 2);
+    fn test_toml_skip_dates_reject_relative_syntax_before_resolution() {
+        for key in ["skip_created_before", "skip_created_after"] {
+            let err = toml::from_str::<TomlConfig>(&format!("[filters]\n{key} = \"30d\"\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("filters.{key}")), "{err}");
+            assert!(
+                err.contains("Relative date windows are no longer supported"),
+                "{err}"
+            );
+            assert!(err.contains("Remove this date limit"), "{err}");
+            assert!(err.contains("YYYY-MM-DD"), "{err}");
+        }
     }
     #[test]
     fn test_build_invalid_date_from_toml_errors() {
@@ -3100,16 +2788,11 @@ mod tests {
             [filters]
             libraries = ["SharedSync-FULL"]
             albums = ["Album1"]
-            media = ["photos", "live-photos"]
-            recent = 50
+            exclude = ["videos"]
 
             [photos]
-            resolution = "medium"
-            live_resolution = "thumb"
             live_photo_mov_filename_policy = "original"
-            raw_policy = "prefer-jpeg"
             file_match_policy = "name-id7"
-            force_resolution = true
 
             [watch]
             interval = 900
@@ -3142,17 +2825,16 @@ mod tests {
         );
         assert_album_raw(&cfg, &["Album1"]);
         assert!(cfg.filters.skip_videos);
-        assert_eq!(cfg.filters.recent, Some(50));
-        assert!(matches!(cfg.photos.resolution, PhotoResolution::Medium));
+        assert!(matches!(cfg.photos.resolution, PhotoResolution::Original));
         assert!(matches!(
             cfg.photos.live_resolution,
-            LivePhotoResolution::Thumb
+            LivePhotoResolution::Original
         ));
         assert!(matches!(
             cfg.photos.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Original
         ));
-        assert!(matches!(cfg.photos.raw_policy, RawPolicy::PreferJpeg));
+        assert!(matches!(cfg.photos.raw_policy, RawPolicy::AsIs));
         assert!(matches!(
             cfg.photos.file_match_policy,
             FileMatchPolicy::NameId7
@@ -3172,6 +2854,7 @@ mod tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let globals = GlobalArgs {
+            config_source: Default::default(),
             username: None,
             domain: None,
             data_dir: None,
@@ -3192,6 +2875,7 @@ mod tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let globals = GlobalArgs {
+            config_source: Default::default(),
             username: Some("cli@example.com".to_string()),
             domain: Some(Domain::Com),
             data_dir: Some("/cli/data".to_string()),
@@ -3217,6 +2901,7 @@ mod tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let globals = GlobalArgs {
+            config_source: Default::default(),
             username: None,
             domain: None,
             data_dir: None,
@@ -3231,6 +2916,7 @@ mod tests {
     #[test]
     fn test_resolve_auth_defaults_when_both_absent() {
         let globals = GlobalArgs {
+            config_source: Default::default(),
             username: None,
             domain: None,
             data_dir: None,
@@ -3516,6 +3202,7 @@ mod tests {
     #[test]
     fn test_config_build_captures_toml_friendly_true() {
         let toml_input = TomlConfig {
+            config_version: Some(1),
             data_dir: None,
             log_level: None,
             auth: None,
@@ -3551,6 +3238,7 @@ mod tests {
     #[test]
     fn test_config_build_captures_toml_friendly_false() {
         let toml_input = TomlConfig {
+            config_version: Some(1),
             data_dir: None,
             log_level: None,
             auth: None,
@@ -3633,10 +3321,9 @@ mod tests {
         );
     }
     #[test]
-    fn test_live_photo_mode_cli_overrides_toml() {
-        let mut sync = default_sync();
-        sync.config_overrides.live_photo_mode = Some(LivePhotoMode::ImageOnly);
-        let toml_str = "[photos]\nlive_photo_mode = \"skip\"\n";
+    fn test_live_photo_video_exclusion_keeps_stills() {
+        let sync = default_sync();
+        let toml_str = "[filters]\nexclude = ['live-photo-videos']\n";
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
@@ -3644,7 +3331,7 @@ mod tests {
     }
     #[test]
     fn test_live_photo_mode_from_toml() {
-        let toml_str = "[photos]\nlive_photo_mode = \"video-only\"\n";
+        let toml_str = "[filters]\nexclude = ['live-photo-stills']\n";
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
@@ -3658,30 +3345,12 @@ mod tests {
     #[test]
     fn test_filename_exclude_from_toml() {
         let toml_str = "[filters]\nfilename_exclude = [\"*.AAE\", \"*.TMP\"]\n";
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        let patterns: Vec<&str> = cfg
-            .download
-            .filename_exclude
-            .iter()
-            .map(|p| p.as_str())
-            .collect();
-        assert_eq!(patterns, vec!["*.AAE", "*.TMP"]);
+        assert!(toml::from_str::<TomlConfig>(toml_str).is_err());
     }
     #[test]
     fn test_filename_exclude_invalid_glob_rejected() {
-        let mut sync = default_sync();
-        sync.config_overrides.filename_exclude = vec!["[invalid".to_string()];
-        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("Invalid --filename-exclude pattern")
+            toml::from_str::<TomlConfig>("[filters]\nfilename_exclude = ['[invalid']").is_err()
         );
     }
     fn assert_sf_named(
@@ -3951,41 +3620,6 @@ mod tests {
         );
     }
     #[test]
-    fn test_filename_exclude_cli_overrides_toml() {
-        let mut sync = default_sync();
-        sync.config_overrides.filename_exclude = vec!["*.AAE".to_string()];
-        let toml_str = "[filters]\nfilename_exclude = [\"*.TMP\"]\n";
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        let patterns: Vec<&str> = cfg
-            .download
-            .filename_exclude
-            .iter()
-            .map(|p| p.as_str())
-            .collect();
-        assert_eq!(patterns, vec!["*.AAE"]);
-    }
-    #[test]
-    fn test_filename_exclude_falls_back_to_toml() {
-        let toml_str = "[filters]\nfilename_exclude = [\"*.TMP\"]\n";
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        let patterns: Vec<&str> = cfg
-            .download
-            .filename_exclude
-            .iter()
-            .map(|p| p.as_str())
-            .collect();
-        assert_eq!(patterns, vec!["*.TMP"]);
-    }
-    #[test]
     fn resolve_library_defaults_to_primary_only() {
         let sel = resolve_library_selector(vec![], None).unwrap();
         assert_eq!(sel, crate::selection::LibrarySelector::default());
@@ -4145,97 +3779,71 @@ mod tests {
         assert_eq!(cfg.download.threads_num, 16);
     }
     #[test]
-    fn test_build_recent_count_populates_recent_field() {
+    fn test_build_relative_skip_created_before_rejected() {
         let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Count(100));
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.filters.recent, Some(100));
-        assert!(
-            cfg.filters.skip_created_before.is_none(),
-            "Count form must not touch skip_created_before"
-        );
-    }
-    #[test]
-    fn test_build_recent_days_populates_skip_created_before() {
-        let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Days(30));
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert!(
-            cfg.filters.recent.is_none(),
-            "Days form must not populate recent (count-only field)"
-        );
-        assert!(
-            cfg.filters.skip_created_before.is_some(),
-            "Days form must populate skip_created_before cutoff"
-        );
-        // The cutoff should be ~30 days ago; give it a wide window to avoid
-        // flakiness on slow CI.
-        let CreatedDateFilter::Instant(cutoff) = cfg.filters.skip_created_before.unwrap() else {
-            panic!("recent day window must resolve to an instant");
-        };
-        let now = chrono::Utc::now();
-        let delta = now.signed_duration_since(cutoff);
-        assert!(
-            delta.num_days() >= 29 && delta.num_days() <= 31,
-            "cutoff should be ~30 days ago; got {} days",
-            delta.num_days()
-        );
-    }
-    #[test]
-    fn test_build_recent_days_conflicts_with_skip_created_before() {
-        let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Days(30));
-        sync.skip_created_before = Some("2024-01-01".to_string());
+        sync.skip_created_before = Some("30d".to_string());
         let err = Config::build(&default_globals(), &default_password(), sync, None)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--recent 30d"), "{err}");
-        assert!(err.contains("--skip-created-before"), "{err}");
-        assert!(err.contains("Pick one"), "{err}");
+        assert!(
+            err.contains("skip_created_before / --skip-created-before"),
+            "{err}"
+        );
+        assert!(
+            err.contains("Relative date windows are no longer supported"),
+            "{err}"
+        );
+        assert!(err.contains("YYYY-MM-DD"), "{err}");
     }
     #[test]
-    fn test_build_recent_count_orthogonal_with_skip_created_before() {
-        // Count and skip_created_before are orthogonal - take the N most
-        // recent assets, filtered to those after the cutoff.
+    fn test_build_relative_skip_created_after_rejected_with_fixed_lower_bound() {
         let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Count(100));
+        sync.skip_created_before = Some("2024-01-01".to_string());
+        sync.skip_created_after = Some("30d".to_string());
+        let err = Config::build(&default_globals(), &default_password(), sync, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("skip_created_after / --skip-created-after"),
+            "{err}"
+        );
+        assert!(
+            err.contains("Relative date windows are no longer supported"),
+            "{err}"
+        );
+        assert!(err.contains("YYYY-MM-DD"), "{err}");
+    }
+    #[test]
+    fn test_build_fixed_skip_created_before() {
+        let mut sync = default_sync();
         sync.skip_created_before = Some("2024-01-01".to_string());
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.filters.recent, Some(100));
         assert!(cfg.filters.skip_created_before.is_some());
     }
     #[test]
-    fn test_build_recent_days_from_toml() {
+    fn test_toml_relative_recent_rejected_even_with_fixed_date_bound() {
         let toml_str = r#"
             [filters]
             recent = "14d"
+            skip_created_before = "2024-01-01"
         "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert!(cfg.filters.recent.is_none());
-        assert!(cfg.filters.skip_created_before.is_some());
+        let err = toml::from_str::<TomlConfig>(toml_str)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `recent`"), "{err}");
     }
     #[test]
-    fn test_build_recent_count_from_toml_integer() {
+    fn test_retired_count_from_toml_integer() {
         let toml_str = r#"
             [filters]
             recent = 250
         "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.filters.recent, Some(250));
+        assert!(
+            toml::from_str::<TomlConfig>(toml_str)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field `recent`")
+        );
     }
     #[test]
     fn test_build_recent_scope_without_recent_rejected() {
@@ -4243,60 +3851,46 @@ mod tests {
             [filters]
             recent_scope = "per-filter"
         "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let err = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap_err()
-        .to_string();
+        let err = toml::from_str::<TomlConfig>(toml_str)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("recent_scope"), "{err}");
         assert!(err.contains("recent"), "{err}");
     }
     #[test]
-    fn test_build_recent_scope_with_days_rejected() {
+    fn test_toml_relative_recent_rejected_before_scope_resolution() {
         let toml_str = r#"
             [filters]
             recent = "14d"
             recent_scope = "per-filter"
         "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let err = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("recent_scope"), "{err}");
-        assert!(err.contains("count-form"), "{err}");
+        let err = toml::from_str::<TomlConfig>(toml_str)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `recent`"), "{err}");
     }
     #[test]
-    fn test_build_recent_days_conflicts_with_toml_skip_created_before() {
-        // CLI Days form should also conflict with a TOML skip_created_before.
+    fn test_build_toml_fixed_skip_created_before() {
         let toml_str = r#"
             [filters]
             skip_created_before = "2024-01-01"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Days(7));
-        let err = Config::build(&default_globals(), &default_password(), sync, Some(&toml))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--recent 7d"), "{err}");
+        let sync = default_sync();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        assert_eq!(
+            cfg.filters.skip_created_before,
+            Some(CreatedDateFilter::CaptureDate(
+                NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()
+            ))
+        );
     }
     #[test]
-    fn test_build_live_photos_only_with_live_skip_rejected() {
+    fn test_build_excluding_all_components_rejected() {
         let toml_str = r#"
             [filters]
-            media = ["live-photos"]
-
-            [photos]
-            live_photo_mode = "skip"
+            exclude = ["photos", "videos", "live-photo-stills", "live-photo-videos"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let err = Config::build(
@@ -4308,36 +3902,19 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("would download nothing"),
+            err.contains("at least one media component"),
             "error should explain the outcome; got: {err}"
         );
         assert!(
-            err.contains("live_photo_mode"),
+            err.contains("exclude"),
             "error should name the conflicting field; got: {err}"
         );
-    }
-    #[test]
-    fn test_build_empty_media_rejected() {
-        let toml_str = r#"
-            [filters]
-            media = []
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let err = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("[filters].media cannot be empty"), "{err}");
     }
     #[test]
     fn test_build_duplicate_media_rejected() {
         let toml_str = r#"
             [filters]
-            media = ["photos", "photos"]
+            exclude = ["photos", "photos"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let err = Config::build(
@@ -4363,16 +3940,17 @@ mod tests {
         let mut sync = default_sync();
         sync.config_overrides.skip_videos = Some(true);
         sync.config_overrides.skip_photos = Some(true);
-        sync.config_overrides.live_photo_mode = Some(LivePhotoMode::Skip);
-        let err = Config::build(&default_globals(), &default_password(), sync, None)
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nexclude=['live-photo-stills','live-photo-videos']").unwrap();
+        let err = Config::build(&default_globals(), &default_password(), sync, Some(&toml))
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("would download nothing"),
+            err.contains("at least one media component"),
             "error should explain the outcome; got: {err}"
         );
         assert!(
-            err.contains("live_photo_mode"),
+            err.contains("exclude"),
             "error should name the conflicting field; got: {err}"
         );
     }
@@ -4381,8 +3959,9 @@ mod tests {
         let mut sync = default_sync();
         sync.config_overrides.skip_videos = Some(true);
         sync.config_overrides.skip_photos = Some(true);
-        sync.config_overrides.live_photo_mode = Some(LivePhotoMode::ImageOnly);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig = toml::from_str("[filters]\nexclude=['live-photo-videos']").unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.filters.media.to_kinds(), vec![MediaKind::LivePhotos]);
         assert_eq!(cfg.photos.live_photo_mode, LivePhotoMode::ImageOnly);
     }
@@ -4394,8 +3973,9 @@ mod tests {
         let mut sync = default_sync();
         sync.config_overrides.skip_videos = Some(true);
         sync.config_overrides.skip_photos = Some(true);
-        sync.config_overrides.live_photo_mode = Some(LivePhotoMode::VideoOnly);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig = toml::from_str("[filters]\nexclude=['live-photo-stills']").unwrap();
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(cfg.filters.skip_videos);
         assert!(cfg.filters.skip_photos);
         assert_eq!(cfg.photos.live_photo_mode, LivePhotoMode::VideoOnly);
@@ -4408,7 +3988,6 @@ mod tests {
         let mut sync = default_sync();
         sync.config_overrides.skip_videos = Some(true);
         sync.config_overrides.skip_photos = Some(true);
-        sync.config_overrides.live_photo_mode = Some(LivePhotoMode::Both);
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.photos.live_photo_mode, LivePhotoMode::Both);
     }
@@ -4432,7 +4011,7 @@ mod tests {
     fn test_build_media_from_toml() {
         let toml_str = r#"
             [filters]
-            media = ["videos", "live-photos"]
+            exclude = ["photos"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(

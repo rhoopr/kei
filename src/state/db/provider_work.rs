@@ -1,32 +1,51 @@
-//! Bounded current-generation admission; receipts do not own checkpoints.
+//! Preserve publication guards for historical catalog admissions.
 
+use super::rows::encode_asset_date;
+use crate::state::{AssetRecord, error::StateError};
+use rusqlite::params;
+
+// Retained only to construct and exercise pre-retirement databases. Production
+// scheduling uses current-selection destinations and never writes these receipts.
+#[cfg(test)]
 use chrono::Utc;
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+#[cfg(test)]
+use rusqlite::{OptionalExtension, TransactionBehavior};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
-use super::asset_writes::upsert_asset_row;
-use super::membership::refresh_asset_album_groupings_tx;
-use super::provider_inbox::{CapturedPageId, StoredPage, load_page};
-use super::rows::encode_asset_date;
-use super::{SqliteStateDb, account};
-use crate::state::{AssetRecord, error::StateError};
+#[cfg(test)]
+use crate::state::db::asset_writes::upsert_asset_row;
+#[cfg(test)]
+use crate::state::db::membership::refresh_asset_album_groupings_tx;
+#[cfg(test)]
+use crate::state::db::provider_inbox::{CapturedPageId, StoredPage, load_page};
+#[cfg(test)]
+use crate::state::db::{SqliteStateDb, account};
+#[cfg(test)]
 use crate::support::{StorageComponent, StorageOutcome};
 
+#[cfg(test)]
 pub(crate) const MAX_WORK_BYTES: u64 = 512 * 1024 * 1024;
 // Match the existing ambiguous-metadata retry cadence. This is an operational
 // deadline, not retirement or proof of absence. A new source/config is due now.
+#[cfg(test)]
 const INITIAL_RETRY_SECONDS: i64 = 60 * 60;
+#[cfg(test)]
 const MAX_RETRY_SECONDS: i64 = 24 * INITIAL_RETRY_SECONDS;
 
+#[cfg(test)]
 const DUE_SOURCE_SQL: &str = "SELECT c.page_id,c.ordinal FROM provider_catalog_records c JOIN provider_shadow_pages p ON p.id=c.page_id JOIN provider_catalog_pages projected ON projected.page_id=c.page_id AND projected.projector_version=1 AND projected.body_hash=p.body_hash WHERE p.scope=?1 AND c.kind='asset' AND c.deleted=0 AND NOT EXISTS(SELECT 1 FROM provider_work_receipts w WHERE w.page_id=c.page_id AND w.ordinal=c.ordinal AND w.config_hash=?2 AND w.state='admitted') AND NOT EXISTS(SELECT 1 FROM provider_work_retries r WHERE r.page_id=c.page_id AND r.ordinal=c.ordinal AND r.config_hash=?2 AND r.next_retry_at>?3)";
 
+#[cfg(test)]
 const MAX_WORK_PLAN_BYTES: u64 = 16 * 1024 * 1024;
 
+#[cfg(test)]
 pub(crate) struct WorkSource {
     pub(crate) page: StoredPage,
     pub(crate) ordinal: i64,
 }
 
+#[cfg(test)]
 pub(crate) struct WorkPlan {
     pub(crate) source: WorkSource,
     pub(crate) scope: String,
@@ -39,6 +58,7 @@ pub(crate) struct WorkPlan {
     pub(crate) reason: &'static str,
 }
 
+#[cfg(test)]
 #[must_use]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum WorkAdmission {
@@ -46,6 +66,7 @@ pub(crate) enum WorkAdmission {
     Deferred,
 }
 
+#[cfg(test)]
 struct WorkReceipt {
     confirmation_hash: String,
     state: String,
@@ -65,6 +86,7 @@ struct WorkReceipt {
 /// current work: it only reuses the original receipt key and raw bytes as the
 /// charged representative. Candidate bodies are classified one at a time, so
 /// no whole-store or whole-source body set is materialized.
+#[cfg(test)]
 fn equivalent_receipt(
     tx: &rusqlite::Transaction<'_>,
     plan: &WorkPlan,
@@ -132,6 +154,7 @@ fn equivalent_receipt(
     Ok(found)
 }
 
+#[cfg(test)]
 fn record_matches(
     conn: &rusqlite::Connection,
     record: &AssetRecord,
@@ -144,6 +167,7 @@ fn record_matches(
     ).optional()?)
 }
 
+#[cfg(test)]
 impl SqliteStateDb {
     /// Only current-config due source work or unfinished exact-generation
     /// download obligations wake the existing watch/queue owners.
@@ -372,7 +396,6 @@ impl SqliteStateDb {
         }).await
     }
 }
-
 // Additional paths keep their independent publication receipts. A canonical
 // downloaded row does not complete a failed or prepared publication elsewhere.
 const UNFINISHED_GENERATION: &str = "a.checksum=w.checksum AND a.size_bytes=w.size_bytes AND a.metadata_hash IS w.metadata_hash AND (a.status IN ('pending','failed') OR a.metadata_write_failed_at IS NOT NULL OR a.capture_repair_metadata_hash IS NOT NULL OR a.capture_repair_output_checksum IS NOT NULL OR a.capture_repair_output_size IS NOT NULL OR EXISTS(SELECT 1 FROM asset_metadata_paths p WHERE p.library=a.library AND p.id=a.id AND p.version_size=a.version_size AND p.provider_checksum=a.checksum AND (p.metadata_write_failed_at IS NOT NULL OR p.capture_repair_metadata_hash IS NOT NULL OR p.capture_repair_output_checksum IS NOT NULL OR p.capture_repair_output_size IS NOT NULL)))";

@@ -9,10 +9,12 @@ use crate::{config, download, health};
 pub(super) fn merge_refresh_tail_outcome(
     cycle_result: &mut crate::sync_cycle::CycleResult,
     failed: usize,
+    storage_failed: bool,
     interrupted: bool,
 ) {
     cycle_result.failed_count = cycle_result.failed_count.saturating_add(failed);
     cycle_result.stats.failed = cycle_result.stats.failed.saturating_add(failed);
+    cycle_result.stats.storage_failed |= storage_failed;
     cycle_result.stats.interrupted |= interrupted;
 }
 

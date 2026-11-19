@@ -112,6 +112,7 @@ async fn embed_path_preserves_unverified_host_local_timestamp() {
         write_embed_metadata(
             &photo_path,
             None,
+            None,
             Arc::new(MetadataPayload {
                 timezone_offset: Some(39_600),
                 ..MetadataPayload::default()
@@ -151,6 +152,7 @@ async fn embed_path_repairs_host_local_timestamp_and_offset_together() {
         write_embed_metadata(
             &photo_path,
             None,
+            None,
             Arc::new(MetadataPayload {
                 timezone_offset: Some(39_600),
                 ..MetadataPayload::default()
@@ -161,7 +163,7 @@ async fn embed_path_repairs_host_local_timestamp_and_offset_together() {
             ".metadata-test",
         )
         .await,
-        EmbedWriteResult::Applied(Some(_))
+        EmbedWriteResult::Applied(Some(_), _)
     ));
 
     let after = crate::download::metadata::probe_exif(&photo_path).unwrap();
@@ -172,6 +174,7 @@ async fn embed_path_repairs_host_local_timestamp_and_offset_together() {
         matches!(
             write_embed_metadata(
                 &photo_path,
+                None,
                 None,
                 Arc::new(MetadataPayload {
                     timezone_offset: Some(39_600),
@@ -212,6 +215,7 @@ async fn embed_path_replaces_orphaned_offset_before_writing_timestamp() {
         write_embed_metadata(
             &photo_path,
             None,
+            None,
             Arc::new(MetadataPayload {
                 timezone_offset: Some(39_600),
                 ..MetadataPayload::default()
@@ -222,7 +226,7 @@ async fn embed_path_replaces_orphaned_offset_before_writing_timestamp() {
             ".metadata-test",
         )
         .await,
-        EmbedWriteResult::Applied(Some(_))
+        EmbedWriteResult::Applied(Some(_), _)
     ));
 
     let after = crate::download::metadata::probe_exif(&photo_path).unwrap();
@@ -232,6 +236,28 @@ async fn embed_path_replaces_orphaned_offset_before_writing_timestamp() {
 
 #[tokio::test]
 async fn production_metadata_plan_and_io_error_are_safe_support_evidence() {
+    // The support recorder and tracing callsite registry are process-global.
+    // Keep this persisted-evidence proof isolated from concurrent writer tests.
+    const CHILD: &str = "KEI_METADATA_PLAN_SUPPORT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "download::metadata_rewrite::embedded::tests::production_metadata_plan_and_io_error_are_safe_support_evidence",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated evidence test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return;
+    }
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::layer::SubscriberExt;
     let dir = tempfile::tempdir().unwrap();
@@ -242,6 +268,7 @@ async fn production_metadata_plan_and_io_error_are_safe_support_evidence() {
     let created = chrono::DateTime::parse_from_rfc3339("2026-10-10T10:20:30.123+00:00").unwrap();
     let result = super::prepare_embed_metadata(
         &path,
+        None,
         None,
         Arc::new(MetadataPayload::default()),
         created,
@@ -260,7 +287,12 @@ async fn production_metadata_plan_and_io_error_are_safe_support_evidence() {
     let plan = evidence
         .iter()
         .find(|v| v["kind"] == "support_metadata_v1" && v["fields"]["source_fractional"] == true)
-        .unwrap();
+        .unwrap_or_else(|| {
+            panic!(
+                "missing plan evidence: {}",
+                std::fs::read_to_string(&history).unwrap()
+            )
+        });
     assert_eq!(plan["fields"]["planned_fractional"], false);
     assert!(evidence.iter().any(|v| v["kind"] == "support_task_error_v1"
         && v["fields"]["stage"] == "metadata_prepare"

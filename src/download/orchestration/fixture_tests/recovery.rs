@@ -7,7 +7,7 @@ use crate::download::DownloadOutcome;
 use crate::download::paths::DirCache;
 
 use super::support::Harness;
-use super::{cycle, fixture, pass};
+use super::{fixture, pass};
 
 #[tokio::test]
 async fn bundled_import_media_filter_roundtrip() {
@@ -67,7 +67,7 @@ async fn bundled_import_media_filter_roundtrip() {
         assert_eq!(stats.filtered, 1);
         h.reopen().await;
         for _ in 0..2 {
-            let result = cycle(&h.config, records.clone()).await;
+            let result = h.cycle(records.clone()).await;
             assert!(
                 matches!(result.outcome, DownloadOutcome::Success),
                 "{result:?}"
@@ -144,12 +144,14 @@ async fn bundled_partial_failure_recovers_after_restart() {
     Mock::given(method("GET"))
         .and(path("/failure"))
         .respond_with(ResponseTemplate::new(503))
+        // Authenticated current lookup supplies the bounded URL-refresh attempt.
+        // Both attempts fail; destination work must survive for the next cycle.
         .expect(2)
         .mount(&h.server)
         .await;
     records.extend(bad);
     assert!(h.db().get_downloaded_page(0, 10).await.unwrap().is_empty());
-    let result = cycle(&h.config, records.clone()).await;
+    let result = h.cycle(records.clone()).await;
     assert!(
         matches!(
             result.outcome,
@@ -162,7 +164,10 @@ async fn bundled_partial_failure_recovers_after_restart() {
     let good = h.config.directory.join("Good.JPG");
     let modified = std::fs::metadata(&good).unwrap().modified().unwrap();
     h.reopen().await;
-    assert_eq!(h.db().get_failed().await.unwrap().len(), 1);
+    let failed = h.db().get_failed().await.unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].id.as_ref(), "asset-bad");
+    assert!(!h.config.directory.join("Retry.JPG").exists());
     h.server.verify().await;
     h.server.reset().await;
     Mock::given(method("GET"))
@@ -171,8 +176,8 @@ async fn bundled_partial_failure_recovers_after_restart() {
         .expect(1)
         .mount(&h.server)
         .await;
-    for downloaded in [1, 0] {
-        let result = cycle(&h.config, records.clone()).await;
+    for downloaded in [1, 0, 0] {
+        let result = h.cycle(records.clone()).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{result:?}"
@@ -217,7 +222,7 @@ async fn bundled_no_overwrite_preserves_existing_media() {
         .directory
         .join(format!("Photo-{}.JPG", source.len()));
     for downloaded in [1, 0] {
-        let result = cycle(&h.config, records.clone()).await;
+        let result = h.cycle(records.clone()).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{result:?}"
@@ -268,7 +273,7 @@ async fn bundled_interruption_retries_after_restart() {
         .await;
     let token = CancellationToken::new();
     let config = Arc::new(h.config.clone());
-    let passes = vec![pass(records.clone())];
+    let passes = vec![h.pass("", records.clone())];
     let child_token = token.clone();
     let worker = async move {
         super::download_photos_with_sync(

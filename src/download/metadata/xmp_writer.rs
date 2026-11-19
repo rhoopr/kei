@@ -61,18 +61,51 @@ pub(super) fn prepare_metadata_xmp_toolkit(
     }
 
     validate_movie_metadata_layout(&tmp_path)?;
-    let result: Result<()> = (|| {
+    if write.orientation.is_some() {
+        anyhow::ensure!(
+            super::probe::original_orientation_missing(&tmp_path)?,
+            "Orientation omission is no longer proven"
+        );
+    }
+    let clearing = write.clear_embedded != Default::default();
+    let native_before = if clearing
+        || write.description.is_some()
+        || write.prior_embedded.native_description.is_some()
+        || write.gps.is_some()
+        || write.clear_embedded.gps.iter().any(Option::is_some)
+        || write.prior_embedded.native_gps.iter().any(Option::is_some)
+    {
+        native_gps(&tmp_path)?
+    } else {
+        None
+    };
+    let result: Result<(
+        crate::state::types::EmbeddedMetadataFields,
+        crate::state::types::EmbeddedMetadataFields,
+    )> = (|| {
         let mut file = XmpFile::new().context("Could not create XMP handle")?;
         file.open_file(
             &tmp_path,
-            OpenFileOptions::default().for_update().use_smart_handler(),
+            // Smart handlers reconcile XMP deletions into native TIFF, IPTC,
+            // and container fields. Those namespaces have independent owners.
+            // Packet-only updates leave all companions untouched; below we
+            // clear only native properties with their own matching write proof.
+            if clearing {
+                OpenFileOptions::default()
+                    .for_update()
+                    .use_packet_scanning()
+            } else {
+                OpenFileOptions::default().for_update().use_smart_handler()
+            },
         )
         .with_context(|| format!("Could not open {} for XMP update", tmp_path.display()))?;
 
         let mut meta = file
             .xmp()
             .unwrap_or_else(|| XmpMeta::new().unwrap_or_default());
+        let before = super::xmp_fields::embedded_fields(&meta);
         apply_to_xmp(&mut meta, write)?;
+        let after = super::xmp_fields::embedded_fields(&meta);
 
         if !file.can_put_xmp(&meta) {
             anyhow::bail!(
@@ -84,10 +117,51 @@ pub(super) fn prepare_metadata_xmp_toolkit(
             .with_context(|| format!("Could not write XMP metadata into {}", tmp_path.display()))?;
         file.try_close()
             .with_context(|| format!("Could not close {} after XMP update", tmp_path.display()))?;
-        Ok(())
+        Ok((before, after))
     })();
 
-    result?;
+    let (mut before, mut after) = result?;
+    if let Some((file_type, original)) = native_before {
+        native_companion_values(&original, &mut before);
+        if clearing {
+            let bytes = std::fs::read(&tmp_path)?;
+            let mut native = little_exif::metadata::Metadata::new_from_vec(&bytes, file_type)?;
+            let mut removed = false;
+            for ((tag, prior), actual) in original
+                .iter()
+                .zip(
+                    write
+                        .clear_embedded
+                        .native_gps
+                        .iter()
+                        .chain(std::iter::once(&write.clear_embedded.native_description)),
+                )
+                .zip(
+                    before
+                        .native_gps
+                        .iter()
+                        .chain(std::iter::once(&before.native_description)),
+                )
+            {
+                if let Some(tag) = tag
+                    && prior.is_some()
+                    && prior == actual
+                {
+                    native.remove_tag(tag.clone());
+                    removed = true;
+                }
+            }
+            if removed {
+                let mut bytes = bytes;
+                native.write_to_vec(&mut bytes, file_type)?;
+                std::fs::write(&tmp_path, bytes)?;
+            }
+        }
+        if let Some((_, tags)) = native_gps(&tmp_path)? {
+            native_companion_values(&tags, &mut after);
+        }
+    }
+    let embedded_fields = write.ownership_after(&before, &after);
     let temp = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -106,10 +180,76 @@ pub(super) fn prepare_metadata_xmp_toolkit(
         .with_context(|| format!("Could not fingerprint {}", tmp_path.display()))?
         .fingerprint;
     Ok(PreparedMetadataFile {
+        required_mtime: None,
+        embedded_fields: Box::new(embedded_fields),
         guard,
         expected_input: expected,
         expected_output: output,
     })
+}
+
+fn native_gps(
+    path: &Path,
+) -> Result<
+    Option<(
+        little_exif::filetype::FileExtension,
+        [Option<little_exif::exif_tag::ExifTag>; 7],
+    )>,
+> {
+    use little_exif::{exif_tag::ExifTag, filetype::FileExtension, metadata::Metadata};
+    use std::io::Read;
+    let mut source = std::fs::File::open(path)?;
+    let mut head = [0; 12];
+    let count = source.read(&mut head)?;
+    let head = head.get(..count).unwrap_or_default();
+    let kind = if head.starts_with(&[0xff, 0xd8, 0xff]) {
+        FileExtension::JPEG
+    } else if head.starts_with(b"II*\0") || head.starts_with(b"MM\0*") {
+        FileExtension::TIFF
+    } else if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        FileExtension::PNG {
+            as_zTXt_chunk: false,
+        }
+    } else {
+        return Ok(None);
+    };
+    let mut bytes = head.to_vec();
+    source.read_to_end(&mut bytes)?;
+    let native = match Metadata::new_from_vec(&bytes, kind) {
+        Ok(native) => native,
+        Err(error) if error.to_string().contains("No EXIF data found") => Metadata::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let tags = [
+        ExifTag::GPSLatitude(vec![]),
+        ExifTag::GPSLongitude(vec![]),
+        ExifTag::GPSAltitude(vec![]),
+        ExifTag::GPSLatitudeRef(String::new()),
+        ExifTag::GPSLongitudeRef(String::new()),
+        ExifTag::GPSAltitudeRef(vec![]),
+        ExifTag::ImageDescription(String::new()),
+    ];
+    Ok(Some((
+        kind,
+        tags.map(|tag| native.get_tag(&tag).next().cloned()),
+    )))
+}
+
+fn native_companion_values(
+    tags: &[Option<little_exif::exif_tag::ExifTag>; 7],
+    fields: &mut crate::state::types::EmbeddedMetadataFields,
+) {
+    for (value, tag) in fields
+        .native_gps
+        .iter_mut()
+        .chain(std::iter::once(&mut fields.native_description))
+        .zip(tags)
+    {
+        *value = tag.as_ref().map(|tag| {
+            data_encoding::HEXLOWER
+                .encode(&tag.value_as_u8_vec(&little_exif::endian::Endian::Little))
+        });
+    }
 }
 
 /// The toolkit assumes every nested `meta` has a four-byte FullBox prefix.

@@ -34,7 +34,7 @@ pub(super) fn write_sync_config(config_path: &std::path::Path, download_dir: &st
     std::fs::write(
         config_path,
         format!(
-            "[download]\ndirectory = {}\n",
+            "config_version = 1\n[download]\ndirectory = {}\n",
             common::toml_string(download_dir)
         ),
     )
@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 36;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 44;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -149,7 +149,9 @@ CREATE TABLE IF NOT EXISTS provider_active_destinations (
  verified_media INTEGER NOT NULL DEFAULT 0 CHECK(verified_media IN (0,1)),
  verified_metadata INTEGER NOT NULL DEFAULT 0 CHECK(verified_metadata IN (0,1)),
  local_checksum TEXT, source_checksum TEXT, grouping_hash TEXT, intent_hash TEXT, progress_hash TEXT,
- prepared_checksum TEXT, prepared_size INTEGER, prepared_hash TEXT,
+  prepared_checksum TEXT, prepared_size INTEGER, prepared_hash TEXT,
+  current_publication INTEGER NOT NULL DEFAULT 0 CHECK(current_publication IN (0,1)),
+  preserved_local BLOB, embedded_metadata_receipt TEXT, confirmed_repair BLOB,
  CHECK((prepared_checksum IS NULL AND prepared_size IS NULL AND prepared_hash IS NULL)
     OR (prepared_checksum IS NOT NULL AND prepared_size IS NOT NULL AND prepared_hash IS NOT NULL
         AND length(prepared_checksum)=64 AND prepared_size>=0 AND length(prepared_hash)=64)),
@@ -157,6 +159,7 @@ CREATE TABLE IF NOT EXISTS provider_active_destinations (
  FOREIGN KEY(generation,pass_key,child) REFERENCES provider_active_decisions(generation,pass_key,child)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_active_destination_identity ON provider_active_destinations(library,asset_id,version_size,admitted,verified_media,verified_metadata);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_current_native_publication ON provider_active_destinations(library,path) WHERE current_publication=1;
 
 CREATE TABLE IF NOT EXISTS provider_selection_generations (
     id TEXT PRIMARY KEY,
@@ -219,6 +222,10 @@ CREATE TABLE IF NOT EXISTS provider_shadow_records (
     deleted INTEGER NOT NULL CHECK(deleted IN (0,1)),
     PRIMARY KEY(page_id,ordinal)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS provider_finished_changes (
+    page_id INTEGER PRIMARY KEY REFERENCES provider_shadow_pages(id),
+    receipt TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
     scope TEXT PRIMARY KEY,
     page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id)
@@ -346,6 +353,7 @@ CREATE TABLE IF NOT EXISTS asset_metadata_paths (
     capture_repair_metadata_hash TEXT,
     capture_repair_output_checksum TEXT,
     capture_repair_output_size INTEGER,
+    embedded_metadata_receipt TEXT,
     PRIMARY KEY (library, id, version_size, local_path)
 );
 CREATE INDEX IF NOT EXISTS idx_asset_metadata_paths_retry
@@ -455,6 +463,7 @@ CREATE INDEX IF NOT EXISTS idx_asset_metadata_paths_retry
             pass_kind TEXT NOT NULL,
             is_deleted INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL,
+            directory_binding BLOB,
             PRIMARY KEY (library, container_id)
         );
 
@@ -725,6 +734,8 @@ CREATE INDEX IF NOT EXISTS primary_layout_binding_owner ON primary_layout_bindin
 CREATE INDEX IF NOT EXISTS primary_layout_claim_owner ON primary_layout_claims(library,child);
 CREATE INDEX IF NOT EXISTS primary_layout_pending_library ON primary_layout_operations(source_library,phase);
 ").unwrap();
+    conn.execute_batch(include_str!("../../src/state/historical_deletion.sql"))
+        .unwrap();
     conn.pragma_update(None, "user_version", HELPER_SCHEMA_VERSION)
         .unwrap();
     conn
@@ -767,7 +778,7 @@ pub(super) fn write_fake_two_factor_config(
     std::fs::write(
         &config_path,
         format!(
-            "[auth]\nusername = {}\npassword_file = {}\n\n[download]\ndirectory = {}\n",
+            "config_version = 1\n[auth]\nusername = {}\npassword_file = {}\n\n[download]\ndirectory = {}\n",
             common::toml_string(username),
             common::toml_string(&password_file.to_string_lossy()),
             common::toml_string(&download_dir.to_string_lossy()),
@@ -793,7 +804,7 @@ pub(super) fn sync_cmd_for_config_body(body: &str) -> assert_cmd::Command {
     std::fs::write(
         &config_path,
         format!(
-            "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = {}\n{body}",
+            "config_version = 1\n[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = {}\n{body}",
             common::toml_string(dl_dir.path().to_str().unwrap())
         ),
     )

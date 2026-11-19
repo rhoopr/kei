@@ -15,6 +15,39 @@ use crate::icloud::photos::PhotoAsset;
 use crate::icloud::photos::session::PhotosSession;
 use crate::state::types::{AssetMetadata, AssetRecord, MediaType, VersionSizeKey};
 
+/// Check exact saved cursor bytes before and after fresh-start retirement.
+/// A retired cursor must be preserved as evidence and absent from live state.
+pub(crate) fn assert_checkpoint_evidence(conn: &rusqlite::Connection, key: &str, expected: &str) {
+    let retired: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='historical_v030_checkpoints')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let table = if retired {
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM metadata WHERE key=?1", [key], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        "historical_v030_checkpoints"
+    } else {
+        "metadata"
+    };
+    assert_eq!(
+        conn.query_row(
+            &format!("SELECT value FROM {table} WHERE key=?1"),
+            [key],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        expected
+    );
+}
+
 /// Synthetic QuickTime track metadata without an ISO FullBox prefix.
 #[cfg(feature = "xmp")]
 pub(crate) fn bare_track_meta_movie() -> Vec<u8> {
@@ -834,6 +867,17 @@ impl DynamicRecentPhotosSession {
     pub fn emitted_ids(&self) -> Vec<String> {
         self.emitted_ids.lock().expect("emitted ids lock").clone()
     }
+
+    fn records_at(&self, index: usize) -> Vec<Value> {
+        let mut records = mock_photo_records_for_zone_with_filename(
+            &self.ids[index],
+            &self.zone,
+            &format!("{}-{index:04}.jpg", self.filename_prefix),
+        );
+        records[1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+            json!("_defaultOwner");
+        records
+    }
 }
 
 #[async_trait::async_trait]
@@ -844,10 +888,35 @@ impl PhotosSession for DynamicRecentPhotosSession {
         body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
+        if url.contains("/changes/zone?") {
+            return Ok(
+                json!({"zones":[{"zoneID":{"zoneName":self.zone.as_ref(),"ownerRecordName":"_defaultOwner"},"syncToken":self.token.as_ref(),"moreComing":false,"records":[]}]}),
+            );
+        }
         if url.contains("/internal/records/query/batch") {
             return Ok(json!({
                 "batch": [{"records": [{"fields": {"itemCount": {"value": self.ids.len() as u64}}}]}]
             }));
+        }
+
+        if url.contains("/records/lookup?") {
+            let request: Value = serde_json::from_str(&body)?;
+            let mut records = Vec::new();
+            for wanted in request["records"].as_array().expect("lookup records") {
+                let name = wanted["recordName"].as_str().expect("lookup record name");
+                let found = self.ids.iter().enumerate().find_map(|(index, id)| {
+                    (name == id || name == format!("asset-{id}")).then(|| {
+                        self.records_at(index)
+                            .into_iter()
+                            .find(|record| record["recordName"] == name)
+                            .unwrap()
+                    })
+                });
+                records.push(found.unwrap_or_else(
+                    || json!({"recordName":name,"serverErrorCode":"UNKNOWN_ITEM"}),
+                ));
+            }
+            return Ok(json!({"records":records}));
         }
 
         if !url.contains("/records/query?") {
@@ -893,11 +962,7 @@ impl PhotosSession for DynamicRecentPhotosSession {
         for index in start..end {
             let id = &self.ids[index];
             emitted.push(id.clone());
-            records.extend(mock_photo_records_for_zone_with_filename(
-                id,
-                &self.zone,
-                &format!("{}-{index:04}.jpg", self.filename_prefix),
-            ));
+            records.extend(self.records_at(index));
         }
         drop(emitted);
 

@@ -17,6 +17,57 @@ pub(crate) enum MediaKind {
     LivePhotos,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum MediaExclusion {
+    Photos,
+    Videos,
+    LivePhotoStills,
+    LivePhotoVideos,
+}
+
+impl MediaExclusion {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Photos => "photos",
+            Self::Videos => "videos",
+            Self::LivePhotoStills => "live-photo-stills",
+            Self::LivePhotoVideos => "live-photo-videos",
+        }
+    }
+    pub(crate) fn live_mode(exclusions: &[Self]) -> LivePhotoMode {
+        match (
+            exclusions.contains(&Self::LivePhotoStills),
+            exclusions.contains(&Self::LivePhotoVideos),
+        ) {
+            (false, false) => LivePhotoMode::Both,
+            (false, true) => LivePhotoMode::ImageOnly,
+            (true, false) => LivePhotoMode::VideoOnly,
+            (true, true) => LivePhotoMode::Skip,
+        }
+    }
+
+    pub(crate) fn from_selection(media: MediaSelection, live: LivePhotoMode) -> Vec<Self> {
+        [
+            (!media.photos, Self::Photos),
+            (!media.videos, Self::Videos),
+            (
+                !media.live_photos
+                    || matches!(live, LivePhotoMode::Skip | LivePhotoMode::VideoOnly),
+                Self::LivePhotoStills,
+            ),
+            (
+                !media.live_photos
+                    || matches!(live, LivePhotoMode::Skip | LivePhotoMode::ImageOnly),
+                Self::LivePhotoVideos,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(excluded, kind)| excluded.then_some(kind))
+        .collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MediaSelection {
     pub photos: bool,
@@ -80,7 +131,6 @@ pub struct DownloadSettings {
     pub folder_structure: String,
     pub folder_structure_albums: String,
     pub folder_structure_smart_folders: String,
-    pub filename_exclude: Vec<glob::Pattern>,
     pub temp_suffix: String,
     pub legacy_preservation_allow_hardlinks: bool,
     pub threads_num: u16,
@@ -94,10 +144,6 @@ pub struct FilterConfig {
     pub media: MediaSelection,
     pub skip_created_before: Option<CreatedDateFilter>,
     pub skip_created_after: Option<CreatedDateFilter>,
-    pub recent: Option<u32>,
-    pub recent_scope: crate::cli::RecentScope,
-    pub persistent_recent: Option<crate::cli::RecentLimit>,
-    pub persistent_recent_scope: Option<crate::cli::RecentScope>,
     pub persistent_skip_created_before: Option<String>,
     pub persistent_skip_created_after: Option<String>,
     pub skip_videos: bool,
@@ -218,8 +264,7 @@ impl FilterConfig {
     /// selected libraries, so a `--refresh-metadata` repair cannot revisit
     /// every downloaded asset in scope.
     pub(crate) fn narrows_enumeration(&self) -> bool {
-        self.recent.is_some()
-            || self.skip_created_before.is_some()
+        self.skip_created_before.is_some()
             || self.skip_created_after.is_some()
             || !self.media.is_all()
             || self.selection.albums_explicit
@@ -247,7 +292,6 @@ pub struct PhotoConfig {
 pub struct ResolvedRetryConfig {
     pub max_retries: u32,
     pub retry_delay_secs: u64,
-    pub max_download_attempts: u32,
 }
 
 #[derive(Debug)]
@@ -283,15 +327,23 @@ pub struct UiConfig {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MetadataConfig {
     pub set_exif_datetime: bool,
+    /// Fill absent orientation only for checksum-qualified, untransformed originals.
+    pub set_exif_orientation: bool,
     pub set_exif_rating: bool,
     pub set_exif_gps: bool,
     pub set_exif_description: bool,
-    /// Embed the full XMP packet into the file bytes on supported formats.
+    /// Embed standard title and keyword fields on supported formats.
     #[cfg(feature = "xmp")]
     pub embed_xmp: bool,
     /// Write a `.xmp` sidecar file next to each downloaded media file.
     #[cfg(feature = "xmp")]
     pub xmp_sidecar: bool,
+    /// Include album names in embedded or sidecar keywords.
+    #[cfg(feature = "xmp")]
+    pub include_albums: bool,
+    /// Include named people in embedded or sidecar metadata.
+    #[cfg(feature = "xmp")]
+    pub include_people: bool,
 }
 
 #[derive(Debug)]
@@ -348,16 +400,12 @@ impl std::fmt::Debug for Config {
     }
 }
 
-/// Parse a date-only capture boundary, host-local datetime, or relative interval.
+/// Parse a fixed date-only capture boundary or host-local datetime.
 pub(crate) fn parse_created_date_filter(s: &str) -> anyhow::Result<CreatedDateFilter> {
-    if let Some(days_str) = s.strip_suffix('d')
-        && let Ok(days) = days_str.parse::<u64>()
-    {
-        let days = i64::try_from(days)
-            .map_err(|_e| anyhow::anyhow!("Date interval '{s}' is too large"))?;
-        return Ok(CreatedDateFilter::Instant(
-            Utc::now() - chrono::Duration::days(days),
-        ));
+    if s.ends_with('d') {
+        anyhow::bail!(
+            "Relative date windows are no longer supported. Remove this date limit from [filters] or omit its CLI flag, or replace it with a fixed date (YYYY-MM-DD) or host-local datetime (YYYY-MM-DDTHH:MM:SS)."
+        );
     }
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         return Ok(CreatedDateFilter::CaptureDate(date));
@@ -368,7 +416,7 @@ pub(crate) fn parse_created_date_filter(s: &str) -> anyhow::Result<CreatedDateFi
         return Ok(CreatedDateFilter::Instant(local.with_timezone(&Utc)));
     }
     anyhow::bail!(
-        "Could not parse '{s}' as a date. Use a date like 2025-01-02, a datetime like 2025-01-02T14:30:00, or an interval like 20d."
+        "Could not parse '{s}' as a date. Use a fixed date like 2025-01-02 or a host-local datetime like 2025-01-02T14:30:00, or remove this date limit."
     )
 }
 
@@ -469,15 +517,23 @@ mod tests {
         );
     }
     #[test]
-    fn test_parse_interval_days() {
-        let before = Utc::now();
-        let CreatedDateFilter::Instant(dt) = parse_created_date_filter("10d").unwrap() else {
-            panic!("relative interval must resolve to an instant");
-        };
-        let after = Utc::now();
-        let expected = before - chrono::Duration::days(10);
-        assert!(dt >= expected - chrono::Duration::seconds(1));
-        assert!(dt <= after - chrono::Duration::days(10) + chrono::Duration::seconds(1));
+    fn test_parse_relative_days_rejected_with_resolution() {
+        for value in ["10d", "0d", "999999999999999999999d"] {
+            let err = parse_created_date_filter(value).unwrap_err().to_string();
+            assert!(
+                err.contains("Relative date windows are no longer supported"),
+                "{err}"
+            );
+            assert!(
+                err.contains("Remove this date limit from [filters] or omit its CLI flag"),
+                "{err}"
+            );
+            assert!(err.contains("YYYY-MM-DD"), "{err}");
+            assert!(
+                err.contains("host-local datetime (YYYY-MM-DDTHH:MM:SS)"),
+                "{err}"
+            );
+        }
     }
     #[test]
     fn test_parse_invalid_date() {
@@ -501,16 +557,8 @@ mod tests {
         assert!(!cfg.filters.narrows_enumeration());
     }
     #[test]
-    fn narrows_enumeration_true_for_recent() {
-        let toml: TomlConfig = toml::from_str("[filters]\nrecent = 500\n").unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert!(cfg.filters.narrows_enumeration());
+    fn retired_count_cannot_create_runtime_policy() {
+        assert!(toml::from_str::<TomlConfig>("[filters]\nrecent = 500\n").is_err());
     }
     #[test]
     fn narrows_enumeration_true_for_date_window() {
@@ -527,7 +575,10 @@ mod tests {
     }
     #[test]
     fn narrows_enumeration_true_for_media_subset() {
-        let toml: TomlConfig = toml::from_str("[filters]\nmedia = [\"photos\"]\n").unwrap();
+        let toml: TomlConfig = toml::from_str(
+            "[filters]\nexclude = ['videos', 'live-photo-stills', 'live-photo-videos']\n",
+        )
+        .unwrap();
         let cfg = Config::build(
             &default_globals(),
             &default_password(),

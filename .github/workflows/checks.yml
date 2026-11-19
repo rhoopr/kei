@@ -206,9 +206,8 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Check live wiki command documentation
         run: |
-          git clone --depth=1 https://github.com/rhoopr/kei.wiki.git /tmp/kei-wiki
-          cargo build --bin kei
-          scripts/check-wiki-commands.sh target/debug/kei /tmp/kei-wiki
+          git clone --depth=1 https://github.com/rhoopr/kei.wiki.git "$RUNNER_TEMP/kei-wiki"
+          scripts/check-wiki-commands.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/kei-wiki"
       - run: cargo doc --no-deps --all-features
 
   catalogs:
@@ -287,7 +286,7 @@ jobs:
             just = "1.50.0"
       - name: Run coverage
         run: |
-          cargo llvm-cov --all-features --no-report -- --skip download::orchestration::queue_projection::tests::private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes
+          cargo llvm-cov --all-features --no-report -- --skip download::orchestration::queue_projection::tests::private_600_independent_album_writers_finish_through_reseeds_without_repeated_writes
           # Human-readable report for the Actions log
           cargo llvm-cov report
           # Structured data for parsing - cargo-llvm-cov's text format is
@@ -335,7 +334,7 @@ jobs:
             just = "1.50.0"
       - name: Run coverage
         run: |
-          cargo llvm-cov --all-features --no-report -- --skip download::orchestration::queue_projection::tests::private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes
+          cargo llvm-cov --all-features --no-report -- --skip download::orchestration::queue_projection::tests::private_600_independent_album_writers_finish_through_reseeds_without_repeated_writes
           cargo llvm-cov report --json --output-path base_coverage.json
           cargo llvm-cov report --lcov --output-path base_coverage.lcov
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

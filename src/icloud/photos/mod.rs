@@ -25,16 +25,20 @@ pub use album::PhotoAlbum;
 #[cfg(test)]
 pub use album::PhotoAlbumConfig;
 pub(crate) use album::ProviderLookupError;
+#[cfg(test)]
 pub(crate) use album::catalog_observed_page;
+pub(crate) use album::classify_legacy_inventory_error;
 pub(crate) use album::work::{current_asset, same_selected_facts};
-pub(crate) use album::{CompleteLegacyInventory, classify_legacy_inventory_error};
 pub(crate) use album::{
     ProviderRecordId, RecordLookupRequest, RecordResolution, RecordResolutionBatch,
 };
 pub use asset::{PhotoAsset, VersionsMap};
 pub use library::PhotoLibrary;
 pub(crate) use library::{PRIMARY_ZONE_NAME, is_shared_zone};
-pub(crate) use projection::plan_retained;
+pub(crate) use projection::{
+    change_records, confirmation_contains_record, plain_primary_tombstone, plan_retained,
+    validate_empty_poll,
+};
 pub use session::{PhotosSession, SyncTokenError};
 
 use std::collections::HashMap;
@@ -48,9 +52,9 @@ use crate::icloud::photos::cloudkit::ChangesDatabaseResponse;
 use crate::icloud::photos::queries::encode_params;
 use crate::retry::RetryConfig;
 
-// Syntax alone grants no authority. Callers require validated private discovery
-// and a recognized indexing response for the exact selected primary scope.
-fn has_explicit_owner(owner: Option<&Value>) -> bool {
+// Syntax alone grants no authority. Callers bind this owner to authenticated
+// discovery or durable source evidence and validate the exact selected scope.
+pub(crate) fn has_explicit_owner(owner: Option<&Value>) -> bool {
     owner
         .and_then(Value::as_str)
         .is_some_and(|owner| !owner.trim().is_empty())
@@ -541,7 +545,7 @@ impl PhotosService {
     }
 }
 
-pub(crate) use album::selection_capture::validated_rank_page;
+pub(crate) use album::selection_capture::{selection_membership_child, validated_selection_page};
 
 #[cfg(test)]
 mod tests {

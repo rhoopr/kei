@@ -26,9 +26,12 @@ pub(crate) async fn run_verify(
         return Ok(());
     }
 
-    let db =
-        state::SqliteStateDb::open_owned(&db_path, &super::super::get_account_owner(globals, toml))
-            .await?;
+    let db = state::SqliteStateDb::open_owned_with_config(
+        &db_path,
+        &super::super::get_account_owner(globals, toml),
+        &globals.config_source,
+    )
+    .await?;
     let summary = db.get_summary().await?;
 
     println!("Verifying {} downloaded assets...", summary.downloaded);
@@ -76,7 +79,11 @@ pub(crate) async fn run_verify(
                             Ok(true) => verified += 1,
                             Ok(false) => {
                                 if printed_issues < LISTING_CAP {
-                                    println!("CORRUPTED: {} ({})", local_path.display(), asset.id);
+                                    println!(
+                                        "DIFFERENT: {} ({}) - may be an intentional edit",
+                                        local_path.display(),
+                                        asset.id
+                                    );
                                     printed_issues += 1;
                                 }
                                 corrupted += 1;
@@ -120,12 +127,12 @@ pub(crate) async fn run_verify(
     println!("  Verified:  {verified}");
     println!("  Missing:   {missing}");
     if args.checksums {
-        println!("  Corrupted: {corrupted}");
+        println!("  Different or unreadable: {corrupted}");
     }
 
     if missing > 0 || corrupted > 0 {
         anyhow::bail!(
-            "Verification found {missing} missing files and {corrupted} corrupted files."
+            "Verification found {missing} missing files and {corrupted} different or unreadable files. Use `kei reconcile --inspect-path PATH` to inspect an exact managed destination."
         );
     }
 

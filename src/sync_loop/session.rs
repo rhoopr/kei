@@ -99,6 +99,10 @@ async fn reauth_after_session_error(
     is_watch_mode: bool,
     input_mode: crate::InputMode,
 ) -> anyhow::Result<auth::AuthResult> {
+    anyhow::ensure!(
+        !config.runtime.dry_run,
+        "Preview authentication expired; refresh authentication before retrying the preview"
+    );
     let expected_generation = if let Some((ss, ps)) = live {
         let session = ss.read().await;
         let generation = session.generation();
@@ -207,6 +211,10 @@ async fn prepare_mid_cycle_reauth(
     shared_session: &auth::SharedSession,
     config: &config::Config,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !config.runtime.dry_run,
+        "Preview authentication expired; refresh authentication before retrying the preview"
+    );
     clear_validation_cache_for_reauth(
         &config.auth.cookie_directory,
         &config.auth.username,
@@ -253,6 +261,11 @@ async fn authenticate_sync_session(
         config.ui.personality_mode,
         input_mode,
         expected_generation,
+        if config.runtime.dry_run {
+            auth::AuthPersistence::ReadOnly
+        } else {
+            auth::AuthPersistence::Writable
+        },
     )
     .await
 }
@@ -390,6 +403,9 @@ pub(super) async fn authenticate_initial_session(
     input_mode: crate::InputMode,
 ) -> anyhow::Result<auth::AuthResult> {
     let is_watch_mode = config.watch.interval.is_some();
+    if config.runtime.dry_run {
+        return authenticate_sync_session(config, password_provider, input_mode, None).await;
+    }
     match authenticate_sync_session(config, password_provider, input_mode, None).await {
         Ok(result) => Ok(result),
         Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {

@@ -11,7 +11,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use crate::download::{DownloadConfig, DownloadOutcome};
 use crate::state::SqliteStateDb;
 
-use super::{SyncMode, cycle, fixture, records, sha256};
+use super::{SyncMode, fixture, open_fixture_db, records, selected_cycle, sha256};
 
 pub(super) struct Harness {
     _dir: TempDir,
@@ -25,7 +25,7 @@ impl Harness {
     pub async fn new() -> Self {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("state.db");
-        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let db = open_fixture_db(&db_path).await;
         let mut config = DownloadConfig::test_default();
         config.directory = Arc::from(dir.path().join("media"));
         config.folder_structure = String::new();
@@ -49,7 +49,7 @@ impl Harness {
     pub async fn reopen(&mut self) {
         self.config.state_db = None;
         drop(self.db.take());
-        let db = Arc::new(SqliteStateDb::open(&self.db_path).await.unwrap());
+        let db = open_fixture_db(&self.db_path).await;
         self.config.state_db = Some(db.clone());
         self.db = Some(db);
     }
@@ -63,6 +63,22 @@ impl Harness {
             .mount(&self.server)
             .await;
         json!({"value": {"downloadURL": format!("{}/{endpoint}", self.server.uri()), "size": bytes.len(), "fileChecksum": base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes))}})
+    }
+
+    pub async fn cycle(&self, records: Vec<Value>) -> crate::download::SyncResult {
+        selected_cycle(&self.config, self.db.as_ref().unwrap(), records).await
+    }
+
+    pub fn pass(&self, name: &str, records: Vec<Value>) -> crate::commands::AlbumPass {
+        super::selected_pass(self.db.as_ref().unwrap(), name, records)
+    }
+
+    pub fn pass_with_session(
+        &self,
+        name: &str,
+        session: Box<dyn crate::icloud::photos::PhotosSession>,
+    ) -> crate::commands::AlbumPass {
+        super::selected_pass_with_session(self.db.as_ref().unwrap(), name, session)
     }
 
     pub async fn asset(
@@ -126,7 +142,7 @@ impl Harness {
     }
 
     pub async fn stable(&mut self, records: Vec<Value>, expected: &[(&str, &str)]) {
-        let result = cycle(&self.config, records.clone()).await;
+        let result = self.cycle(records.clone()).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{result:?}"
@@ -134,7 +150,7 @@ impl Harness {
         assert_eq!(result.stats.downloaded, expected.len());
         self.assert_files(expected).await;
         self.reopen().await;
-        let result = cycle(&self.config, records).await;
+        let result = self.cycle(records).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{result:?}"

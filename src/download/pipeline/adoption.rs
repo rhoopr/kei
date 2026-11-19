@@ -19,7 +19,9 @@ use crate::state::{AssetRecord, VersionSizeKey};
 use super::task::capture_repair_requested;
 
 mod current_publication;
+pub(in crate::download) use current_publication::recover_confirmed_publication;
 pub(in crate::download) use current_publication::recover_current_pending_publication;
+pub(in crate::download) use current_publication::recover_selected_reserved_publication;
 
 pub(super) fn effective_asset_library<'a>(
     asset: &'a PhotoAsset,
@@ -155,18 +157,8 @@ pub(in crate::download) fn mark_reserved_pending_task(
         .get(task.library.as_ref())
         .and_then(|assets| assets.get(task.asset_id.as_ref()))
         .is_some_and(|versions| versions.contains(task.version_size.as_str()));
-    if pending
-        && !planner
-            .cross_parent_retry_destinations(
-                &task.library,
-                &task.asset_id,
-                task.version_size,
-                &task.checksum,
-                task.size,
-            )?
-            .is_empty()
-    {
-        task.pending_cross_parent_root = Some(Arc::new(config.directory.to_path_buf()));
+    if pending {
+        planner.bind_pending_destination_proof(task, &config.directory)?;
     }
     Ok(())
 }
@@ -407,17 +399,24 @@ pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
     // reserved sibling was published but finalization failed. Its immutable
     // content-specific reservation and verified bytes permit adoption; the old
     // recorded file still cannot stand in for the new provider generation.
+    let mut has_reserved_destination = false;
     for task in planned_tasks.iter().filter(|task| {
         task.version_size == evidence.version_size
             && task.checksum.as_ref() == evidence.checksum
             && task.size == evidence.size
     }) {
-        if task_planner.has_durable_destination(task)
-            && let Some(adoption) =
+        if task_planner.has_durable_destination(task) {
+            has_reserved_destination = true;
+            if let Some(adoption) =
                 adopt_pending_task_path(db, config, asset, task_planner, task, None).await
-        {
-            return Ok(adoption.into());
+            {
+                return Ok(adoption.into());
+            }
         }
+    }
+    // An older catalog copy is not completion of this selected reservation.
+    if has_reserved_destination {
+        return Ok(PendingRetryAdoption::NotFound);
     }
     if matches!(evidence.local_path, PendingRetryLocalPath::Historical) {
         return Ok(PendingRetryAdoption::NotFound);
@@ -538,6 +537,13 @@ async fn adopt_cross_parent_pending_file(
     for saved_destination in destinations {
         let destination =
             crate::fs_util::reserved_path_under_root(&config.directory, saved_destination)?;
+        // Selection paths use component-normalized spellings. Keep the receipt
+        // on that same exact path when an equivalent root contains `.`.
+        let destination = if config.selection_run.is_some() {
+            destination.components().collect::<PathBuf>()
+        } else {
+            destination
+        };
         let destination = &destination;
         anyhow::ensure!(
             crate::download::legacy_preservation::current_path_is_independent(db, destination)
@@ -638,6 +644,12 @@ pub(super) async fn adopt_pending_on_disk_task(
     task_planner: &mut TaskPlanner,
     task: &DownloadTask,
 ) -> Result<Option<PendingOnDiskAdoption>> {
+    // Current selection already reused any independently verified publication.
+    // A remaining task needs exact destination finalization; rendition-wide
+    // size/hash adoption cannot complete its durable destination obligation.
+    if config.selection_run.is_some() {
+        return Ok(None);
+    }
     let Some(db) = state_db else {
         return Ok(None);
     };
@@ -1090,6 +1102,13 @@ pub(in crate::download) async fn state_confirmed_current_path_exists(
     task: &DownloadTask,
     task_planner: &mut TaskPlanner,
 ) -> Option<PathBuf> {
+    let matches_destination = |path: &std::path::Path| {
+        !config
+            .selection_run
+            .as_ref()
+            .is_some_and(|run| run.independent_album(config))
+            || path == task.download_path
+    };
     if let Some(recorded_file) =
         ctx.downloaded_file(&task.library, &task.asset_id, task.version_size)
         && let Some(path) = recorded_current_path_exists(
@@ -1100,12 +1119,14 @@ pub(in crate::download) async fn state_confirmed_current_path_exists(
             recorded_file,
         )
         .await
+        && matches_destination(&path)
     {
         return Some(path);
     }
     task_planner
         .verified_downloaded_path(asset, config, task.version_size)
         .await
+        .filter(|path| matches_destination(path))
 }
 #[cfg(test)]
 mod tests;

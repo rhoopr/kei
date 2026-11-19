@@ -35,7 +35,7 @@ It supports large libraries, Shared Libraries, albums, Live Photos, RAW files an
   before deciding. If you want to keep ADP enabled, stop here: kei cannot back up
   that library. Web access alone does not make ADP compatible.
 
-Already have an `icloudpd` archive? Start with [Migrating from icloudpd](docs/migration-from-icloudpd.md), including the import preview and path checks, before pointing kei at it. For an existing kei install, read [Upgrade and compatibility](docs/v0.26.0-upgrade.md) before opening its state.
+Already have an `icloudpd` archive? Start with [Migrating from icloudpd](docs/migration-from-icloudpd.md), including the import preview and path checks, before pointing kei at it. If you already run kei, follow the [v0.30 upgrade checklist](docs/v0.30-upgrade.md) before opening your backup with this build.
 
 ## Choose your installation route
 
@@ -63,20 +63,20 @@ For a new installation on your computer, run:
 kei config setup
 ```
 
-Choose an empty destination such as `~/Photos/kei-first-backup`, your main library, and **Manually when needed**. Leave date and recent-item limits unset for now. Check the selected albums, file types and destination folders before saving. At **Want to kick off your first sync right now?**, answer **no** so you can try a small backup first. The default answer, **yes**, immediately runs one sync using your saved choices.
+Choose an empty destination such as `~/Photos/kei-first-backup`, your main library, and **Manually when needed**. Save a small fixed capture-date range containing photos you recognize. Check the selected albums, file types and destination folders before saving. At **Want to kick off your first sync right now?**, answer **no** so you can check the range before starting. The default answer, **yes**, immediately runs one sync using your saved choices.
 
 If you choose watch mode instead, the setup wizard still runs only once. Later `kei sync` commands can use the repeat interval you saved.
 
-The setup wizard saves your settings in `~/.config/kei/config.toml` and offers to save your login details. If it creates an environment file, follow the printed instructions to load it before the next command. Then try a small backup:
+The setup wizard saves your settings in `~/.config/kei/config.toml` and offers to save your login details. If it creates an environment file, follow the printed instructions to load it before the next command. Then try a small backup. Replace both example dates below with your own small range; the dates are inclusive and use each photo's capture-local calendar date:
 
 ```sh
-kei sync --recent 10
+kei sync --skip-created-before 2025-01-01 --skip-created-after 2025-01-07
 kei status
 ```
 
 Approve the sign-in prompt on your trusted Apple device and enter the six-digit code when asked.
 
-`--recent 10` considers up to ten recent photo or video items in each selected library before applying filters. The number of downloaded files can differ: album copies, Live Photo videos and additional versions can produce more files, while filters or failed downloads can leave fewer. This is only a sample of your library.
+The range limits capture dates, not file count. Album copies, Live Photo videos and additional versions can produce several files per item. A busy date range can still download many files. This is only a sample of your library.
 
 ### Check the result
 
@@ -86,17 +86,21 @@ Approve the sign-in prompt on your trusted Apple device and enter the six-digit 
 
 Photos are saved in the folder set by `[download].directory`. Settings, saved logins and kei's record of your backup normally live under `~/.config/kei`. If you use a custom configuration file, kei normally keeps its state beside that file; `data_dir` or `KEI_DATA_DIR` can change this location. Keep the state as well as your photos and videos.
 
-By default, kei downloads originals and the videos that accompany Live Photos. Select edited versions and other versions, including RAW, explicitly if you want them. See [example.config.toml](example.config.toml).
+By default, kei downloads available full-resolution originals, current edits and RAW/JPEG renditions, including both Live Photo components. Use `[filters].exclude` to omit ordinary photos, ordinary videos, Live Photo stills or Live Photo videos. Existing configurations need an [explicit rendition-policy migration](docs/rendition-policy-migration.md). See [example.config.toml](example.config.toml).
 
 <a id="expand-the-backup"></a>
 
 ## Run your normal backup
 
-Once the small backup looks right, run `kei sync` without `--recent` to use your saved choices. Check those settings first: any saved date or recent-item limits still apply, and the setup wizard can select all available libraries, including Shared Libraries. Check albums, smart folders, photos outside albums, edited versions and RAW options before treating the result as a full backup.
+Album selectors in `[filters].albums` match provider names before filesystem sanitization. `albums = ["Trips"]` selects every album named `Trips`; `albums = ["Family/Trips"]` selects that qualified album path. Exclusions use the same rules, so `albums = ["all", "!Trips"]` excludes every matching leaf. The `{album}` template token preserves the folder hierarchy, with each path component sanitized separately. Unknown selectors and ambiguous qualified paths fail.
 
-As an alternative to the wizard, a minimal config is:
+Once the small backup looks right, review your saved choices before expanding them. Widen or remove the saved date bounds only when you want to include more dates. `kei sync` without date flags uses the saved bounds, so it can still repeat only the sample. The setup wizard can select all available libraries, including Shared Libraries. Check albums, smart folders, photos outside albums and component exclusions before treating the result as a full backup.
+
+As an alternative to the wizard, a minimal config for this development branch is below. Released v0.26 builds use the [v0.26 instructions](https://github.com/rhoopr/kei/blob/v0.26.0/README.md) and do not accept `config_version`.
 
 ```toml
+config_version = 1
+
 [auth]
 username = "you@example.com"
 
@@ -104,7 +108,9 @@ username = "you@example.com"
 directory = "~/Photos/iCloud"
 ```
 
-This uses your primary library, all its regular albums, and photos and videos outside those albums. Keep settings you want to reuse in the configuration file. To limit one run to the last 30 days, use `kei sync --recent 30d`.
+This has no date limit: it selects your primary library, all its regular albums, and photos and videos outside those albums. Save your chosen date bounds if you still want only a sample. To limit one run, use `kei sync --skip-created-before 2025-01-01 --skip-created-after 2025-01-07`, replacing both example dates with your own range. Both dates are inclusive.
+
+Sync and service mode no longer accept `--recent`, `--recent-scope`, or `[filters].recent` / `recent_scope`. Remove both saved keys and any old flags. To keep sync bounded, choose fixed `skip_created_before` / `skip_created_after` dates instead; relative values such as `30d` are also rejected. These errors explain the supported replacement and stop before authentication or state/media changes, even when a CLI value would override a retired saved setting. Kei does not rewrite your config or silently expand the selection. The separate `import-existing --recent 100` sampling option still accepts positive counts; import does not gain date filtering.
 
 For a daily unattended run, add this table to your existing config:
 
@@ -125,23 +131,26 @@ For a bug or confusing result, open an [issue](https://github.com/rhoopr/kei/iss
 
 Some repair commands change kei's saved state or replace files. Read [Backup maintenance](docs/backup-maintenance.md) first. Don't delete state or conflicting files just to clear a warning. When preserving older files, kei normally refuses files with hardlinks, where several paths refer to the same file. The [hardlink waiver](docs/backup-maintenance.md#legacy-preservation-and-hardlinks) allows this case, but a change through one path can affect the others. It does not prevent kei from writing to files.
 
+Historical legacy coverage certificates are no longer required for current sync or process health. Their stored counters remain visible, and unresolved historical attribution can still mean `Backup status: unsafe` without failing an otherwise successful current sync. The old `reconcile trust-legacy-files plan/apply` commands refuse without changing state or media; use `kei sync` instead. Ownership, protected files and current retry work remain guarded. See [historical legacy evidence](docs/backup-maintenance.md#historical-legacy-evidence) for the distinction and remaining limits.
+
 ## What kei gives you
 
 - Downloads several files at once, resumes interrupted transfers, and checks downloaded data before marking a file complete.
 - Saves ordinary photo and video files without needing an Apple Photos library, arranged by album and date as you choose.
-- Supports Shared Libraries, Live Photos, and optional edited and other versions, including RAW.
+- Supports Shared Libraries, Live Photos, current edits and available RAW/JPEG renditions.
 - Runs once or on a schedule, in Docker or as a background service on Linux, macOS or Windows.
 - Provides progress reports, troubleshooting tools, file lists, backup checks, repair commands and import of existing files.
 
-Kei automatically saves photo information in its own database. Writing that information into media files or separate XMP files requires you to enable it. See [Metadata output](docs/metadata.md) for supported formats, cases where kei won't write, and options for repairing timestamps.
+Kei automatically saves photo information in its own database. Setup enables standard embedded metadata through explicit saved settings. Existing omitted settings and runs without a config keep metadata output disabled. Sidecars, album names and people remain optional. See [Metadata output](docs/metadata.md) for supported formats, update permissions and timestamp repair.
 
 ## Docs
 
 - [Install](https://github.com/rhoopr/kei/wiki/Install)
-- [Upgrade and compatibility](docs/v0.26.0-upgrade.md)
+- [Upgrade and compatibility](docs/v0.30-upgrade.md)
 - [Account state migration](docs/account-state-migration.md)
 - [Backup maintenance](docs/backup-maintenance.md)
 - [Metadata output](docs/metadata.md)
+- [Choose which rendition gets the original filename](docs/edited-primary.md)
 - [Configuration](https://github.com/rhoopr/kei/wiki/Configuration)
 - [Docker](https://github.com/rhoopr/kei/wiki/Docker)
 - [Service mode](https://github.com/rhoopr/kei/wiki/Service)

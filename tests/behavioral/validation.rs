@@ -11,12 +11,13 @@ fn repair_help_explains_one_shot_scope_and_datetime_requirement() {
         let output = clean_cmd().args(command).output().expect("run help");
         assert!(output.status.success());
         let help = String::from_utf8(output.stdout).expect("UTF-8 help");
-        assert_eq!(help.matches("Use with sync, not service run.").count(), 2);
+        assert_eq!(help.matches("Use with sync, not service run.").count(), 1);
         assert_eq!(
             help.matches("A configured watch interval is ignored")
                 .count(),
-            2
+            1
         );
+        assert!(help.contains("reconcile --inspect-path and --confirm-damage"));
         assert!(help.contains("metadata.set_exif_datetime = true"));
     }
 }
@@ -38,7 +39,7 @@ fn maintenance_refresh_example_accepts_complete_sweep() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let report_path = dir.path().join("report.json");
-        std::fs::write(
+        common::write_versioned_config(
             &config_path,
             format!(
                 "[auth]\nusername = \"offline-refresh@example.com\"\n[download]\ndirectory = {}\n{}\n[report]\njson = {}\n",
@@ -175,7 +176,7 @@ fn import_existing_requires_directory() {
 fn import_existing_rejects_nonexistent_directory() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config,
         "[download]\ndirectory = \"/does/not/exist/anywhere\"\n",
     )
@@ -335,9 +336,9 @@ fn domain_invalid_rejected() {
 }
 
 #[test]
-fn dry_run_and_retry_failed_conflict() {
+fn dry_run_does_not_bypass_retired_retry_failed_refusal() {
     let dir = tempfile::tempdir().unwrap();
-    // clap-level conflicts_with should reject this
+    // Refuse during parsing before state or authentication startup.
     clean_cmd()
         .env("KEI_DATA_DIR", dir.path())
         .args(["sync", "--dry-run", "--retry-failed"])

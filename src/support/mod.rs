@@ -9,9 +9,7 @@ mod privacy;
 pub(crate) mod token_equivalence;
 
 pub(crate) use history::{
-    CompactionSummary, MigrationFailure, StorageComponent, StorageOutcome, begin, complete,
-    observe, observe_scoped, record_storage, record_transport_compaction,
-    record_transport_compaction_failure,
+    StorageComponent, StorageOutcome, begin, complete, observe, observe_scoped, record_storage,
 };
 pub(crate) use privacy::fixed_label;
 
@@ -71,16 +69,10 @@ pub(crate) fn runtime_configuration(config: &crate::config::Config) -> Value {
                 crate::types::LivePhotoMode::Skip => "skip",
             }),
         );
-        map.insert(
-            "filename_exclusions".into(),
-            json!(config.download.filename_exclude.len()),
-        );
+        map.insert("filename_exclusions".into(), json!(0));
         map.insert("watch_interval_secs".into(), json!(config.watch.interval));
         map.insert("per_transfer".into(), json!(config.retry.max_retries));
-        map.insert(
-            "per_asset".into(),
-            json!(config.retry.max_download_attempts),
-        );
+        map.insert("per_asset".into(), json!(0));
         map.insert(
             "legacy_preservation_allow_hardlinks".into(),
             json!(config.download.legacy_preservation_allow_hardlinks),
@@ -96,10 +88,7 @@ pub(crate) fn runtime_configuration(config: &crate::config::Config) -> Value {
                     || config.filters.skip_created_after.is_some()
             ),
         );
-        map.insert(
-            "recent_limit_present".into(),
-            json!(config.filters.recent.is_some()),
-        );
+        map.insert("recent_limit_present".into(), json!(false));
         map.insert(
             "report_configured".into(),
             json!(config.report.json.is_some()),
@@ -153,6 +142,7 @@ pub(crate) fn runtime_configuration(config: &crate::config::Config) -> Value {
 }
 
 fn configuration(toml: Option<&crate::config::TomlConfig>, explicit: bool) -> Value {
+    let metadata = toml.and_then(|t| t.metadata.as_ref());
     let filters = toml.and_then(|t| t.filters.as_ref());
     let download = toml.and_then(|t| t.download.as_ref());
     let auth = toml.and_then(|t| t.auth.as_ref());
@@ -167,10 +157,19 @@ fn configuration(toml: Option<&crate::config::TomlConfig>, explicit: bool) -> Va
         "album_selectors": filters.and_then(|f| f.albums.as_ref()).map_or(0, Vec::len),
         "smart_folder_selectors": filters.and_then(|f| f.smart_folders.as_ref()).map_or(0, Vec::len),
         "library_selectors": filters.and_then(|f| f.libraries.as_ref()).map_or(0, Vec::len),
-        "filename_exclusions": filters.and_then(|f| f.filename_exclude.as_ref()).map_or(0, Vec::len),
+        "filename_exclusions": 0,
+        "resolution": "original",
+        "live_resolution": "original",
+        "edited": true,
+        "alternative": true,
+        "force_resolution": true,
+        "raw_policy": "as-is",
+        "live_photo_mode": crate::config::MediaExclusion::live_mode(
+            filters.and_then(|f| f.exclude.as_deref()).unwrap_or_default()
+        ),
         "unfiled": filters.and_then(|f| f.unfiled).unwrap_or(true),
         "date_filter_present": filters.is_some_and(|f| f.skip_created_before.is_some() || f.skip_created_after.is_some()),
-        "recent_limit_present": filters.is_some_and(|f| f.recent.is_some()),
+        "recent_limit_present": false,
         "threads": download.and_then(|d| d.threads).unwrap_or(3),
         "legacy_preservation_allow_hardlinks": download.and_then(|d| d.legacy_preservation_allow_hardlinks).unwrap_or(false),
         "watch_interval_secs": watch.and_then(|w| w.interval),
@@ -182,7 +181,23 @@ fn configuration(toml: Option<&crate::config::TomlConfig>, explicit: bool) -> Va
         "album_template_custom": download.is_some_and(|d| d.folder_structure_albums.is_some()),
         "smart_template_custom": download.is_some_and(|d| d.folder_structure_smart_folders.is_some()),
         "xmp_feature": cfg!(feature = "xmp"),
+        "set_exif_datetime": metadata.and_then(|m| m.set_exif_datetime).unwrap_or(false),
+        "set_exif_orientation": metadata.and_then(|m| m.set_exif_orientation).unwrap_or(false),
+        "set_exif_rating": metadata.and_then(|m| m.set_exif_rating).unwrap_or(false),
+        "set_exif_gps": metadata.and_then(|m| m.set_exif_gps).unwrap_or(false),
+        "set_exif_description": metadata.and_then(|m| m.set_exif_description).unwrap_or(false),
     });
+    #[cfg(feature = "xmp")]
+    if let Some(map) = value.as_object_mut() {
+        for (key, enabled) in [
+            ("embed_xmp", metadata.and_then(|m| m.embed_xmp)),
+            ("xmp_sidecar", metadata.and_then(|m| m.xmp_sidecar)),
+            ("include_albums", metadata.and_then(|m| m.include_albums)),
+            ("include_people", metadata.and_then(|m| m.include_people)),
+        ] {
+            map.insert(key.into(), json!(enabled.unwrap_or(false)));
+        }
+    }
     // Input enums are already parsed into typed values, but the wire contract
     // remains an explicit projection rather than serializing the TOML object.
     if let Some(photos) = toml.and_then(|t| t.photos.as_ref())

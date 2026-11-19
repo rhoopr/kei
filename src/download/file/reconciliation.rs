@@ -219,6 +219,18 @@ fn copy_local_file_no_replace_blocking(
         PublishResult::Published => Some(part_identity),
         PublishResult::DestinationExists => None,
     };
+    #[cfg(target_os = "linux")]
+    if publication == PublishResult::Published {
+        // The no-replace fallback can leave two names for this exact owned
+        // temporary inode. Retire only that verified link before a managed
+        // layout measures its independent preservation copy.
+        super::replacement_recovery::finish_owned_prepared_link(
+            &part_path,
+            &destination,
+            source_fingerprint,
+            part_identity,
+        )?;
+    }
     if part_path.entry_exists()? {
         tracing::warn!(target: "kei::download::file",path = %part_path.path().display(), "Retaining reconciliation temporary file for manual inspection");
     }

@@ -54,13 +54,7 @@ fn import_config(data_dir: &Path, dir: &Path, download_extra: &str) -> std::path
     common::live_selection::write_live_config(data_dir, "state-auth-import", &body)
 }
 
-fn sync_cmd(
-    username: &str,
-    password: &str,
-    cookie_dir: &Path,
-    dir: &Path,
-    recent: u32,
-) -> assert_cmd::Command {
+fn sync_cmd(username: &str, password: &str, cookie_dir: &Path, dir: &Path) -> assert_cmd::Command {
     // data/live-selection.toml selects one bounded primary-library pass
     // with albums = ["none"] and unfiled = true. These state tests do not
     // need album passes or shared-library fixtures.
@@ -70,8 +64,6 @@ fn sync_cmd(
         .env("KEI_DATA_DIR", cookie_dir);
     cmd.args([
         "sync",
-        "--recent",
-        &recent.to_string(),
         "--password",
         password,
         "--config",
@@ -125,9 +117,9 @@ fn import_cmd(
     cmd
 }
 
-/// Like [`sync_cmd`] but for `--retry-failed` runs. Uses the same bounded
-/// primary-library selection to exercise retry state transitions.
-fn retry_failed_cmd(
+/// Run ordinary sync with the same bounded primary-library selection to
+/// exercise automatic retry state transitions.
+fn recovery_sync_cmd(
     username: &str,
     password: &str,
     cookie_dir: &Path,
@@ -139,7 +131,6 @@ fn retry_failed_cmd(
         .env("KEI_DATA_DIR", cookie_dir);
     cmd.args([
         "sync",
-        "--retry-failed",
         "--password",
         password,
         "--config",
@@ -178,7 +169,7 @@ fn status_after_sync_shows_counts() {
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -211,7 +202,7 @@ fn reset_state_deletes_db_after_sync() {
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -244,7 +235,7 @@ fn reset_state_without_yes_does_not_delete() {
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -286,7 +277,7 @@ fn verify_after_sync_reports_results() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
             .assert();
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -317,7 +308,7 @@ fn verify_checksums_after_sync() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
             .assert();
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -345,7 +336,7 @@ fn verify_detects_missing_files() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
             .assert();
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -385,7 +376,7 @@ fn verify_checksums_detects_corruption() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
             .assert();
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -400,7 +391,8 @@ fn verify_checksums_detects_corruption() {
             .assert()
             .failure()
             .stdout(
-                predicate::str::contains("CORRUPTED").and(predicate::str::contains("Corrupted:")),
+                predicate::str::contains("DIFFERENT")
+                    .and(predicate::str::contains("Different or unreadable:")),
             );
     });
 }
@@ -447,7 +439,7 @@ fn import_existing_matches_synced_files() {
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -517,8 +509,6 @@ fn import_existing_custom_folder_structure() {
             .env("KEI_DATA_DIR", &cookie_dir)
             .args([
                 "sync",
-                "--recent",
-                "1",
                 "--password",
                 &password,
                 "--config",
@@ -563,55 +553,54 @@ fn import_existing_custom_folder_structure() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-//  RETRY-FAILED
+//  AUTOMATIC RETRY THROUGH ORDINARY SYNC
 // ══════════════════════════════════════════════════════════════════════════
 
 #[test]
 #[ignore]
-fn retry_failed_after_successful_sync_is_noop() {
+fn normal_sync_after_successful_sync_does_not_download_again() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
 
-        let assertion = retry_failed_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .timeout(std::time::Duration::from_secs(60))
+        let files = common::walkdir(download_dir.path());
+        assert!(!files.is_empty());
+        let assertion = recovery_sync_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
 
         let stderr = String::from_utf8_lossy(&assertion.get_output().stderr);
         assert!(
-            stderr.contains("No failed assets to retry"),
-            "retry-failed after successful sync should report no failures, stderr:\n{stderr}"
+            stderr.contains("No new photos to download")
+                || stderr.contains("All incremental assets already downloaded")
+                || stderr.contains("0 downloaded"),
+            "ordinary sync must not redownload completed files: {stderr}"
         );
+        assert_eq!(common::walkdir(download_dir.path()).len(), files.len());
     });
 }
 
 #[test]
 #[ignore]
-fn retry_failed_with_no_db_succeeds() {
+fn normal_sync_initializes_a_fresh_destination() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        let output = retry_failed_cmd(&username, &password, &cookie_dir, download_dir.path())
+        recovery_sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
-            .success()
-            .get_output()
-            .clone();
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("No failed assets to retry"),
-            "retry-failed with no DB should report nothing to retry, stderr:\n{stderr}"
-        );
+            .success();
+        assert!(!common::walkdir(download_dir.path()).is_empty());
+        assert!(db_file_count(cookie_dir.as_path()) > 0);
     });
 }
 
@@ -654,7 +643,6 @@ fn dry_run_does_not_create_state_db() {
             &password,
             isolated_cookies.path(),
             download_dir.path(),
-            2,
         )
         .args(["--dry-run"])
         .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
@@ -692,7 +680,7 @@ fn reset_sync_token_forces_full_enumeration() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
         // First sync to populate sync tokens
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
+        sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -710,7 +698,7 @@ fn reset_sync_token_forces_full_enumeration() {
             .stdout(predicate::str::contains("Cleared sync tokens"));
 
         // Second sync should do full enumeration (no stored token)
-        let output = sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
+        let output = sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .args(["--log-level", "debug"])
             .timeout(Duration::from_secs(TIMEOUT_SYNC))
             .output()

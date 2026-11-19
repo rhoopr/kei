@@ -64,6 +64,16 @@ pub(crate) fn expand_named_token(
     format_str.replace(token, &safe_name)
 }
 
+/// Expand verified album ancestry, sanitizing each provider component separately.
+pub(crate) fn expand_album_components(folder_structure: &str, components: &[String]) -> String {
+    let safe_path = components
+        .iter()
+        .map(|component| sanitize_path_component(component).replace('%', "%%"))
+        .collect::<Vec<_>>()
+        .join("/");
+    strip_python_wrapper(folder_structure).replace(TOKEN_ALBUM, &safe_path)
+}
+
 /// Path-friendly form of a CloudKit zone name. Returns the input unchanged
 /// for the primary library (`PrimarySync`) and any non-shared zone, and
 /// truncates `SharedSync-<UUID>` to `SharedSync-<8 chars>` so on-disk

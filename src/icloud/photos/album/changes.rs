@@ -78,6 +78,12 @@ impl ValidatedChangesPage {
             "Changes/zone record failed"
         );
         let zone_scope = zone_id.clone();
+        anyhow::ensure!(
+            zone.get("syncToken")
+                .and_then(Value::as_str)
+                .is_some_and(|token| !token.trim().is_empty()),
+            crate::icloud::photos::error::MissingZoneSuccessor
+        );
         let response: ChangesZoneResponse = serde_json::from_value(response)
             .map_err(|_invalid_shape| anyhow::anyhow!("Invalid changes/zone page shape"))?;
         let zone = response
@@ -85,10 +91,6 @@ impl ValidatedChangesPage {
             .into_iter()
             .next()
             .context("Missing changes/zone result")?;
-        anyhow::ensure!(
-            !zone.sync_token.trim().is_empty(),
-            "Missing changes/zone successor"
-        );
         Ok(Self {
             zone_scope,
             records: zone.records,
@@ -192,6 +194,44 @@ pub(crate) fn catalog_observed_page(
     page.observed_page(body, scope.to_owned(), request_cursor)
 }
 
+/// Validate original album-owner membership observations before durable capture.
+/// The top-level records view lets the existing source store index either query
+/// shape while retaining the untouched original response bytes.
+pub(super) fn validated_membership_page(request: &Value, body: &[u8]) -> anyhow::Result<Value> {
+    let zones = request
+        .get("zones")
+        .and_then(Value::as_array)
+        .filter(|zones| zones.len() == 1)
+        .context("Invalid membership request scope")?;
+    let zone = zones
+        .first()
+        .context("Missing membership request scope")?
+        .get("zoneID")
+        .context("Missing membership request zone")?;
+    anyhow::ensure!(
+        super::super::has_explicit_owner(zone.get("ownerRecordName")),
+        "Unsupported membership owner"
+    );
+    let mut response = super::super::changes_json::parse(body)?;
+    let parsed = ValidatedChangesPage::parse(response.clone(), zone)?;
+    anyhow::ensure!(
+        parsed
+            .records
+            .iter()
+            .all(|record| !record.record_name.trim().is_empty()),
+        "Missing membership source identity"
+    );
+    let records = response
+        .pointer("/zones/0/records")
+        .context("Missing membership records")?
+        .clone();
+    response
+        .as_object_mut()
+        .context("Invalid membership response")?
+        .insert("records".to_owned(), records);
+    Ok(response)
+}
+
 impl PhotoAlbum {
     pub(super) async fn scan_changes_zone<F>(&self, mut on_record: F) -> anyhow::Result<()>
     where
@@ -208,17 +248,38 @@ impl PhotoAlbum {
         loop {
             hydration_progress::page_started();
             let body = build_changes_zone_request(&self.zone_id, current_token.as_deref(), 200);
-            let response = session::retry_post(
-                self.session.as_ref(),
-                &url,
-                &body.to_string(),
-                &[("Content-type", "text/plain")],
-                &self.retry_config,
-            )
-            .await?;
+            let (response, original) = if self.rank_capture.is_some() {
+                let original = session::retry_post_changes_body(
+                    self.session.as_ref(),
+                    &url,
+                    &body.to_string(),
+                    &[("Content-type", "text/plain")],
+                    &self.retry_config,
+                )
+                .await?;
+                (
+                    super::super::changes_json::parse(&original)?,
+                    Some(original),
+                )
+            } else {
+                (
+                    session::retry_post(
+                        self.session.as_ref(),
+                        &url,
+                        &body.to_string(),
+                        &[("Content-type", "text/plain")],
+                        &self.retry_config,
+                    )
+                    .await?,
+                    None,
+                )
+            };
 
             let zone_result = ValidatedChangesPage::parse(response, &self.zone_id)?;
             zone_result.check_continuation(&mut visited)?;
+            if let (Some(capture), Some(original)) = (&self.rank_capture, original) {
+                capture.capture(body, original).await?;
+            }
 
             hydration_progress::page_received(zone_result.records.len());
             current_token = Some(zone_result.sync_token);
@@ -301,9 +362,16 @@ impl PhotoAlbum {
     pub(super) fn stream_changes(
         &self,
         sync_token: &str,
-    ) -> (ChangeStream, tokio::sync::oneshot::Receiver<String>) {
+    ) -> (
+        ChangeStream,
+        tokio::sync::oneshot::Receiver<String>,
+        tokio::sync::oneshot::Receiver<bool>,
+    ) {
         let (tx, rx) = mpsc::channel::<anyhow::Result<ChangeEvent>>(200);
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+        // Delivered only after terminal EOF and successful event delivery. The
+        // legacy token channel also returns last-good cursors on early closure.
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
 
         let session = self.session.clone_box();
         let service_endpoint = Arc::clone(&self.service_endpoint);
@@ -317,6 +385,7 @@ impl PhotoAlbum {
         tokio::spawn(async move {
             let mut buffer = DeltaRecordBuffer::new();
             let mut current_token = initial_token;
+            let mut raw_records_observed = false;
             let mut visited = FxHashSet::from_iter([current_token.clone()]);
             let shadow_error = |error| {
                 super::super::error::classify_shadow_page_error(error, shadow_capture.is_some())
@@ -372,6 +441,9 @@ impl PhotoAlbum {
                     break Some(shadow_error(error));
                 }
 
+                // Unknown record types can disappear during pairing. Observe
+                // the validated raw page, not the resulting ChangeEvents.
+                raw_records_observed |= !zone_result.records.is_empty();
                 if let Some((capture, database)) = &shadow_capture {
                     let page = capture
                         .scope(database, &zone_result.zone_scope)
@@ -433,6 +505,8 @@ impl PhotoAlbum {
 
             if let Some(e) = stream_error {
                 let _ = tx.send(Err(e)).await;
+            } else if !tx.is_closed() {
+                let _ = completion_tx.send(raw_records_observed);
             }
 
             let _ = token_tx.send(current_token);
@@ -441,6 +515,7 @@ impl PhotoAlbum {
         (
             Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
             token_rx,
+            completion_rx,
         )
     }
 }
@@ -449,6 +524,35 @@ impl PhotoAlbum {
 // typed-error assertions. The test paths remain changes::tests::<test_name>.
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn terminal_raw_observation_precedes_pairing_and_dropped_receiver_is_not_eof() {
+        use tokio_stream::StreamExt;
+        for records in [
+            Vec::new(),
+            vec![serde_json::json!({
+                "recordName":"future-record","recordType":"FutureRankMutation","fields":{}
+            })],
+        ] {
+            let expected_raw = !records.is_empty();
+            let album = make_album_with_session(
+                100,
+                Box::new(MockPhotosSession::new().ok(json!({
+                    "zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+                        "records":records,"syncToken":"terminal","moreComing":false}]
+                }))),
+            );
+            let (stream, token, completion) = album.changes_stream_with_completion("prior");
+            assert!(stream.collect::<Vec<_>>().await.is_empty());
+            assert_eq!(completion.await.unwrap(), expected_raw);
+            assert_eq!(token.await.unwrap(), "terminal");
+        }
+        let album = make_album_with_session(100, Box::new(MockPhotosSession::new()));
+        let (stream, token, completion) = album.changes_stream_with_completion("last-good");
+        drop(stream);
+        assert_eq!(token.await.unwrap(), "last-good");
+        assert!(completion.await.is_err());
+    }
+
     use super::{CancellationToken, FxHashSet, ProviderRecordId, Value};
     use crate::icloud::photos::session::PhotosSession;
     use std::sync::{Arc, Mutex};

@@ -11,6 +11,74 @@ use super::super::test_support::{
 use super::retain_legacy_added_date;
 use super::{DownloadContext, count_value_map_entries, count_version_set_entries};
 
+#[tokio::test]
+async fn selected_truncation_repair_requires_exact_version_path_and_option() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("owned.jpg");
+    std::fs::write(&path, b"complete media").unwrap();
+    let db = crate::state::SqliteStateDb::open_in_memory().unwrap();
+    let record = crate::test_helpers::TestAssetRecord::new("owned")
+        .checksum("provider-version")
+        .size(14)
+        .build();
+    db.upsert_seen(&record).await.unwrap();
+    let local = crate::download::file::compute_sha256(&path).await.unwrap();
+    db.mark_downloaded(
+        "PrimarySync",
+        "owned",
+        "original",
+        &path,
+        &local,
+        Some(&local),
+    )
+    .await
+    .unwrap();
+    std::fs::write(&path, b"cut").unwrap();
+    db.mark_failed(
+        "PrimarySync",
+        "owned",
+        "original",
+        crate::commands::reconcile::FILE_TRUNCATED_REASON,
+    )
+    .await
+    .unwrap();
+    let context = DownloadContext::load(&db).await;
+    let mut config = super::super::test_support::test_config();
+    config.directory = Arc::from(dir.path());
+    let mut task = super::super::test_support::retry_test_task(
+        "owned",
+        VersionSizeKey::Original,
+        path.to_str().unwrap(),
+    );
+    task.checksum = "provider-version".into();
+    task.size = 14;
+    for case in ["disabled", "provider-change", "different-path", "exact"] {
+        let mut candidate = task.clone();
+        config.repair_truncated = case != "disabled";
+        if case == "provider-change" {
+            candidate.checksum = "new-version".into();
+        }
+        if case == "different-path" {
+            candidate.download_path = dir.path().join("sibling.jpg");
+        }
+        context
+            .bind_selected_truncation_repair(&mut candidate, &config)
+            .await
+            .unwrap();
+        assert_eq!(
+            candidate.replacement_fingerprint.is_some(),
+            case == "exact",
+            "{case}"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), b"cut");
+    assert_eq!(
+        db.get_failed().await.unwrap().len(),
+        1,
+        "loading repair proof must not reset durable failure"
+    );
+}
+
 #[test]
 fn test_should_download_fast_trust_state_returns_false() {
     let mut ctx = DownloadContext::default();
@@ -449,36 +517,6 @@ fn test_should_download_fast_different_version_size() {
 }
 
 #[test]
-fn test_download_context_known_ids_populated_for_retry_only() {
-    // Simulate retry-only mode: known_ids is populated
-    let mut ctx = DownloadContext::default();
-    ctx.known_ids
-        .entry("PrimarySync".into())
-        .or_default()
-        .insert("known_asset".into());
-
-    // A known asset that's not in downloaded_ids needs download
-    assert_eq!(
-        ctx.should_download_fast(
-            "PrimarySync",
-            "known_asset",
-            VersionSizeKey::Original,
-            "ck",
-            true
-        ),
-        Some(true)
-    );
-    // The known_ids set is used externally to decide whether to skip new assets;
-    // verify the set membership works
-    assert!(ctx.is_known("PrimarySync", "known_asset"));
-    assert!(!ctx.is_known("PrimarySync", "new_asset"));
-    assert!(
-        !ctx.is_known("SharedSync-AAAA", "known_asset"),
-        "retry-only known IDs are library-scoped"
-    );
-}
-
-#[test]
 fn download_context_detects_downloaded_rows_missing_metadata_hashes() {
     let mut ctx = DownloadContext::default();
     ctx.downloaded_ids
@@ -614,48 +652,6 @@ fn should_download_fast_no_checksum_trust_false_returns_none() {
             false
         ),
         None
-    );
-}
-
-// ── Gap: DownloadContext attempt_counts used by producer ──────────
-
-#[test]
-fn download_context_attempt_counts_track_per_asset() {
-    let mut ctx = DownloadContext::default();
-    ctx.attempt_counts
-        .entry("PrimarySync".into())
-        .or_default()
-        .insert("asset_high".into(), 15);
-    ctx.attempt_counts
-        .entry("PrimarySync".into())
-        .or_default()
-        .insert("asset_low".into(), 2);
-    ctx.attempt_counts
-        .entry("SharedSync-AAAA".into())
-        .or_default()
-        .insert("asset_high".into(), 1);
-
-    // Simulate the producer's retry-exhaustion check
-    let max_attempts = 10u32;
-    assert!(
-        ctx.attempt_count("PrimarySync", "asset_high")
-            .is_some_and(|c| c >= max_attempts),
-        "asset_high should exceed max_download_attempts"
-    );
-    assert!(
-        ctx.attempt_count("PrimarySync", "asset_low")
-            .is_none_or(|c| c < max_attempts),
-        "asset_low should not exceed max_download_attempts"
-    );
-    assert!(
-        ctx.attempt_count("SharedSync-AAAA", "asset_high")
-            .is_none_or(|c| c < max_attempts),
-        "same asset id in another library should not inherit primary attempts"
-    );
-    assert!(
-        ctx.attempt_count("PrimarySync", "asset_never_failed")
-            .is_none(),
-        "unknown asset should not be in attempt_counts"
     );
 }
 
@@ -818,39 +814,5 @@ fn should_download_fast_multiple_versions_independent() {
         ),
         Some(true),
         "changed MOV checksum should trigger re-download"
-    );
-}
-
-// ── Gap: retry_only mode filters new assets ──────────────────────
-
-#[test]
-fn download_context_retry_only_known_ids_filtering() {
-    let mut ctx = DownloadContext::default();
-    ctx.known_ids
-        .entry("PrimarySync".into())
-        .or_default()
-        .insert("previously_synced".into());
-
-    // Known asset: should_download_fast returns Some(true) (it needs
-    // download because it's not in downloaded_ids)
-    assert_eq!(
-        ctx.should_download_fast(
-            "PrimarySync",
-            "previously_synced",
-            VersionSizeKey::Original,
-            "ck",
-            true
-        ),
-        Some(true)
-    );
-    // The producer checks known_ids separately before forwarding:
-    assert!(ctx.is_known("PrimarySync", "previously_synced"));
-    assert!(
-        !ctx.is_known("PrimarySync", "brand_new_asset"),
-        "new asset should not be in known_ids in retry_only mode"
-    );
-    assert!(
-        !ctx.is_known("SharedSync-AAAA", "previously_synced"),
-        "same asset id in another library should stay retry-only-new"
     );
 }

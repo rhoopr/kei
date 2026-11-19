@@ -11,7 +11,7 @@ use crate::download::metadata_rewrite::CaptureTimestampRepair;
 use crate::download::pipeline::{
     AUTH_ERROR_THRESHOLD, MetadataFlags, PassConfig, run_download_pass,
 };
-use crate::download::retry::{PendingRetryPlan, build_pending_retry_download_tasks};
+use crate::download::retry::{PendingRetryPlan, build_pending_retry_download_tasks_excluding};
 use crate::icloud::photos::ProviderRecordId;
 
 use super::config::DownloadConfig;
@@ -19,9 +19,7 @@ use super::models::{
     CheckpointEvidence, DownloadControls, DownloadOutcome, PENDING_RETRY_UNMATCHED_REASON,
     SyncResult, SyncStats, merge_download_outcomes,
 };
-use super::url_refresh::{
-    build_incremental_expired_url_retry_tasks, merge_expired_url_retry_result,
-};
+use super::url_refresh::refresh_expired_download_pass;
 
 async fn run_targeted_recovery_pass(
     download_client: &Client,
@@ -29,13 +27,15 @@ async fn run_targeted_recovery_pass(
     config: &Arc<DownloadConfig>,
     controls: DownloadControls,
     shutdown_token: CancellationToken,
+    excluded: &rustc_hash::FxHashSet<crate::download::retry::PendingRetryTarget>,
 ) -> Result<SyncResult> {
     let started = Instant::now();
-    let plan = build_pending_retry_download_tasks(
+    let plan = build_pending_retry_download_tasks_excluding(
         passes,
         config,
         controls.run_mode,
         shutdown_token.clone(),
+        excluded,
     )
     .await?;
     let PendingRetryPlan {
@@ -114,58 +114,9 @@ async fn run_targeted_recovery_pass(
         bandwidth_limiter: config.bandwidth_limiter.clone(),
         library: Arc::clone(&config.library),
     };
-    let mut provider_auth_errors = 0usize;
-    let mut pass_result = run_download_pass(pass_config, tasks).await;
-    if pass_result.url_expired
-        && pass_result.auth_errors < AUTH_ERROR_THRESHOLD
-        && provider_auth_errors == 0
-        && pass_result.state_write_failures == 0
-        && !shutdown_token.is_cancelled()
-    {
-        let expired_retry_candidates = pass_result.expired_tasks.clone();
-        let retry_plan = build_incremental_expired_url_retry_tasks(
-            passes,
-            &retry_sources,
-            &expired_retry_candidates,
-            shutdown_token.clone(),
-        )
-        .await;
-        provider_auth_errors += retry_plan.provider_auth_errors;
-        pass_result.rate_limit_observations += retry_plan.rate_limit_observations;
-        let retry_tasks = retry_plan.tasks;
-        if !retry_tasks.is_empty() {
-            let retry_task_count = retry_tasks.len();
-            tracing::info!(
-                count = retry_task_count,
-                "Retrying tasks after targeted pending URL refresh"
-            );
-            let retry_pass_config = PassConfig {
-                prior_auth_errors: pass_result.auth_errors,
-                url_obtained_at: retry_plan.url_obtained_at,
-                client: download_client,
-                retry_config: &config.retry,
-                metadata: MetadataFlags::from(config.as_ref()),
-                mark_capture_repair_after_download: matches!(
-                    config.capture_timestamp_repair,
-                    CaptureTimestampRepair::ReplaceWithCaptureLocal
-                ),
-                concurrency: config.concurrent_downloads,
-                reporting: controls.reporting,
-                temp_suffix: Arc::clone(&config.temp_suffix),
-                shutdown_token: shutdown_token.clone(),
-                state_db: config.state_db.clone(),
-                rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                bandwidth_limiter: config.bandwidth_limiter.clone(),
-                library: Arc::clone(&config.library),
-            };
-            let retry_result = run_download_pass(retry_pass_config, retry_tasks).await;
-            merge_expired_url_retry_result(
-                &mut pass_result,
-                expired_retry_candidates,
-                retry_result,
-            );
-        }
-    }
+    let mut pass_result = run_download_pass(pass_config.clone(), tasks).await;
+    let provider_auth_errors =
+        refresh_expired_download_pass(passes, &retry_sources, pass_config, &mut pass_result).await;
     let failed = pass_result.failed.len();
     if failed > 0 {
         for task in &pass_result.failed {
@@ -179,6 +130,7 @@ async fn run_targeted_recovery_pass(
         .collect();
 
     let checkpoint = CheckpointEvidence {
+        storage_failed: pass_result.storage_failed,
         identity_incomplete,
         state_write_failures: pass_result.state_write_failures,
         interrupted: shutdown_token.is_cancelled()
@@ -212,6 +164,8 @@ async fn run_targeted_recovery_pass(
     };
     checkpoint.project(&mut stats);
     Ok(SyncResult {
+        deferred_album_snapshots: Vec::new(),
+        retry_exclusions: Default::default(),
         outcome,
         sync_token: None,
         stats,
@@ -247,6 +201,8 @@ fn pending_retry_no_download_result(
     };
     checkpoint.project(&mut stats);
     SyncResult {
+        deferred_album_snapshots: Vec::new(),
+        retry_exclusions: Default::default(),
         outcome,
         sync_token: None,
         stats,
@@ -264,8 +220,24 @@ pub(super) async fn append_targeted_recovery_to_sync_result(
     shutdown_token: CancellationToken,
     mut sync_result: SyncResult,
 ) -> Result<SyncResult> {
-    if !matches!(sync_result.outcome, DownloadOutcome::Success)
+    // Partial transfer failure can coexist with independent pending progress.
+    // Other failures, including publication holds without exact task outcomes,
+    // retain the existing recovery hold. Never infer coverage from row status.
+    let recovery_safe = match sync_result.outcome {
+        DownloadOutcome::Success => true,
+        DownloadOutcome::PartialFailure { failed_count } => {
+            failed_count > 0
+                && failed_count == sync_result.retry_exclusions.len()
+                && !sync_result.checkpoint.sync_token_blocked
+                && !sync_result.checkpoint.identity_incomplete
+                && !sync_result.checkpoint.enumeration_incomplete
+                && sync_result.checkpoint.enumeration_errors == 0
+        }
+        DownloadOutcome::SessionExpired { .. } => false,
+    };
+    if !recovery_safe
         || sync_result.checkpoint.interrupted
+        || sync_result.checkpoint.state_write_failures > 0
         || shutdown_token.is_cancelled()
     {
         return Ok(sync_result);
@@ -277,6 +249,7 @@ pub(super) async fn append_targeted_recovery_to_sync_result(
         config,
         controls,
         shutdown_token.clone(),
+        &sync_result.retry_exclusions,
     )
     .await
     {

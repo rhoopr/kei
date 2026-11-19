@@ -234,7 +234,15 @@ pub(crate) async fn run_doctor(
     let mut checks = Vec::new();
     checks.push(check_config_parse(config_load_error.as_deref()));
     checks.push(check_download_dir(toml));
-    checks.push(check_state_db(&username, &cookie_dir, domain.as_str()).await);
+    checks.push(
+        check_state_db(
+            &username,
+            &cookie_dir,
+            domain.as_str(),
+            &globals.config_source,
+        )
+        .await,
+    );
     checks.push(check_session_presence(
         &username,
         &cookie_dir,
@@ -321,7 +329,12 @@ fn check_download_dir(toml: Option<&config::TomlConfig>) -> DoctorCheck {
     }
 }
 
-async fn check_state_db(username: &str, cookie_dir: &Path, realm: &str) -> DoctorCheck {
+async fn check_state_db(
+    username: &str,
+    cookie_dir: &Path,
+    realm: &str,
+    source: &config::ConfigSource,
+) -> DoctorCheck {
     let Some(path) = state_db_path(username, cookie_dir, realm) else {
         return DoctorCheck {
             name: "state_db",
@@ -343,9 +356,10 @@ async fn check_state_db(username: &str, cookie_dir: &Path, realm: &str) -> Docto
             message: format!("state DB does not exist yet: {}", path.display()),
         };
     }
-    let summary = match state::SqliteStateDb::open_owned(
+    let summary = match state::SqliteStateDb::open_owned_with_config(
         &path,
         &state::db::account::AccountOwner::configured(username, realm),
+        source,
     )
     .await
     {
@@ -608,7 +622,13 @@ mod tests {
         .await
         .expect("create state db");
 
-        let check = check_state_db(username, dir.path(), "com").await;
+        let check = check_state_db(
+            username,
+            dir.path(),
+            "com",
+            &config::ConfigSource::Unavailable,
+        )
+        .await;
 
         assert_eq!(check.name, "state_db");
         assert_eq!(check.status, CheckStatus::Ok);

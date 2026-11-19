@@ -10,11 +10,11 @@ pub(crate) mod reconcile;
 mod reset;
 mod service;
 mod status;
-mod trusted_legacy;
 mod verify;
 
 pub(crate) use config_cmd::run_config_show;
 pub(crate) use doctor::run_doctor;
+pub(crate) use import::adopt_startup_archive;
 pub(crate) use import::run_import_existing;
 #[cfg(test)]
 pub(crate) use import::{ImportRunOptions, import_assets};
@@ -27,7 +27,7 @@ pub(crate) use reconcile::run_reconcile;
 pub(crate) use reset::{run_reset_session, run_reset_state, run_reset_sync_token};
 pub(crate) use service::{
     AlbumPass, AlbumPlan, CollectionContext, MAX_REAUTH_ATTEMPTS, PassKind, PassScope,
-    attempt_reauth, build_collection_context, build_photos_params, collection_libraries,
+    attempt_reauth, build_collection_context_for_sync, build_photos_params, collection_libraries,
     init_photos_service, pass_scope_for_zone, resolve_cross_zone_libraries_for_album_hydration,
     resolve_libraries, resolve_passes_for_scope, wait_and_retry_2fa, zone_name_set,
 };

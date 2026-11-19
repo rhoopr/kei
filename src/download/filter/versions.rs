@@ -1,4 +1,4 @@
-//! Borrowed version selection, RAW alignment, companions, and metadata version keys.
+//! Borrowed rendition selection and historical resource identity recovery.
 
 use std::sync::Arc;
 
@@ -9,45 +9,21 @@ use crate::types::{AssetItemType, AssetVersionSize, LivePhotoMode, RawPolicy};
 
 use super::config::PathDerivationSource;
 
-/// Borrowed view over a `VersionsMap` with an optional virtual swap of
-/// the keys at two indices. Lets [`apply_raw_policy`] relabel the
-/// `Original` / `Alternative` slots without cloning the version list.
+/// Borrowed provider renditions with their original keys intact.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::download) struct VersionsView<'a> {
     versions: &'a VersionsMap,
-    /// `(orig_idx, alt_idx)` when the keys at those indices should be
-    /// presented swapped; iteration yields `Alternative` at `orig_idx`
-    /// and `Original` at `alt_idx`. `None` means iterate as-is.
-    swap: Option<(usize, usize)>,
 }
 
 impl<'a> VersionsView<'a> {
     fn borrowed(versions: &'a VersionsMap) -> Self {
-        Self {
-            versions,
-            swap: None,
-        }
-    }
-
-    fn swapped(versions: &'a VersionsMap, orig_idx: usize, alt_idx: usize) -> Self {
-        Self {
-            versions,
-            swap: Some((orig_idx, alt_idx)),
-        }
+        Self { versions }
     }
 
     pub(in crate::download) fn iter(
         &self,
     ) -> impl Iterator<Item = (AssetVersionSize, &'a AssetVersion)> + 'a + use<'a> {
-        let swap = self.swap;
-        self.versions.iter().enumerate().map(move |(idx, (k, v))| {
-            let key = match swap {
-                Some((orig, _)) if idx == orig => AssetVersionSize::Alternative,
-                Some((_, alt)) if idx == alt => AssetVersionSize::Original,
-                _ => *k,
-            };
-            (key, v)
-        })
+        self.versions.iter().map(|(key, version)| (*key, version))
     }
 
     pub(in crate::download) fn get(&self, key: AssetVersionSize) -> Option<&'a AssetVersion> {
@@ -55,49 +31,12 @@ impl<'a> VersionsView<'a> {
     }
 }
 
-/// Apply the RAW alignment policy by virtually swapping Original and
-/// Alternative versions when appropriate, matching Python's
-/// `apply_raw_policy()`. Returns a borrowed view over the original map
-/// regardless of swap outcome.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "orig_idx / alt_idx come from `enumerate()` over `versions`; \
-              indexing back into `versions` is in-bounds by construction"
-)]
-pub(super) fn apply_raw_policy(versions: &VersionsMap, policy: RawPolicy) -> VersionsView<'_> {
-    if policy == RawPolicy::AsIs {
-        return VersionsView::borrowed(versions);
-    }
-
-    let (orig_idx, alt_idx) =
-        versions
-            .iter()
-            .enumerate()
-            .fold((None, None), |(orig, alt), (idx, (k, _))| match k {
-                AssetVersionSize::Original => (Some(idx), alt),
-                AssetVersionSize::Alternative => (orig, Some(idx)),
-                _ => (orig, alt),
-            });
-
-    let Some(alt_idx) = alt_idx else {
-        return VersionsView::borrowed(versions);
-    };
-
-    let should_swap = match policy {
-        RawPolicy::PreferRaw => versions[alt_idx].1.asset_type.contains("raw"),
-        RawPolicy::PreferJpeg => {
-            orig_idx.is_some_and(|idx| versions[idx].1.asset_type.contains("raw"))
-        }
-        RawPolicy::AsIs => false,
-    };
-
-    match (should_swap, orig_idx) {
-        (true, Some(orig_idx)) => VersionsView::swapped(versions, orig_idx, alt_idx),
-        _ => VersionsView::borrowed(versions),
-    }
+/// Legacy in-memory preferences cannot relabel newly selected resources.
+pub(super) fn apply_raw_policy(versions: &VersionsMap, _policy: RawPolicy) -> VersionsView<'_> {
+    VersionsView::borrowed(versions)
 }
 
-/// Task keys follow RAW policy; provider metadata keys never do.
+/// Newly selected task keys are provider metadata keys.
 pub(crate) fn metadata_for_selected_version(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &(impl PathDerivationSource + ?Sized),
@@ -106,26 +45,39 @@ pub(crate) fn metadata_for_selected_version(
     asset.metadata_arc(provider_version_for_selected(asset, config, version))
 }
 
-/// Freeze the provider rendition behind a logical task key at selection time.
-/// RAW preference may virtually relabel Original and Alternative, while
-/// provider resource and metadata keys retain their original meaning.
+/// Newly selected renditions retain provider identity.
 pub(crate) fn provider_version_for_selected(
-    asset: &crate::icloud::photos::PhotoAsset,
-    config: &(impl PathDerivationSource + ?Sized),
+    _asset: &crate::icloud::photos::PhotoAsset,
+    _config: &(impl PathDerivationSource + ?Sized),
     version: VersionSizeKey,
 ) -> VersionSizeKey {
-    if apply_raw_policy(asset.versions(), config.raw_policy())
-        .swap
-        .is_some()
-    {
-        match version {
-            VersionSizeKey::Original => VersionSizeKey::Alternative,
-            VersionSizeKey::Alternative => VersionSizeKey::Original,
-            _ => version,
-        }
-    } else {
-        version
-    }
+    version
+}
+
+/// Recover a frozen task's provider key without replaying today's RAW policy.
+/// Only original/alternative keys could historically be relabeled. Ambiguous
+/// resource evidence cannot authorize refreshing either sibling's URL.
+#[must_use]
+pub(crate) fn provider_version_for_frozen_resource(
+    asset: &crate::icloud::photos::PhotoAsset,
+    version: VersionSizeKey,
+    checksum: &str,
+    size: u64,
+) -> Option<VersionSizeKey> {
+    let mut matches = asset.versions().iter().filter_map(|(key, resource)| {
+        let key = VersionSizeKey::from(*key);
+        let eligible = if matches!(
+            version,
+            VersionSizeKey::Original | VersionSizeKey::Alternative
+        ) {
+            matches!(key, VersionSizeKey::Original | VersionSizeKey::Alternative)
+        } else {
+            key == version
+        };
+        (eligible && resource.checksum.as_ref() == checksum && resource.size == size).then_some(key)
+    });
+    let selected = matches.next()?;
+    matches.next().is_none().then_some(selected)
 }
 
 /// Historical original/alternative keys may have been swapped by RAW policy.
@@ -173,7 +125,9 @@ pub(in crate::download) fn extract_skip_candidates<'a>(
             version.checksum.as_ref(),
         ));
     }
-    if let Some((version, effective_size)) = select_edited_extra(config, &versions, &seen_urls) {
+    if let Some((version, effective_size)) =
+        select_edited_extra(asset, config, &versions, &seen_urls)
+    {
         seen_urls.push(version.url.as_ref());
         result.push((
             VersionSizeKey::from(effective_size),
@@ -226,22 +180,22 @@ pub(super) fn select_primary<'a>(
     {
         return None;
     }
-    let requested = config.resolution().to_asset_version_size()?;
-    let get_version = |key: &AssetVersionSize| versions.get(*key);
-    version_with_fallback(
-        &get_version,
-        requested,
-        AssetVersionSize::Original,
-        config.force_resolution(),
-    )
+    let key = AssetVersionSize::Original;
+    versions.get(key).map(|version| (version, key))
 }
 
 pub(super) fn select_edited_extra<'a>(
+    asset: &crate::icloud::photos::PhotoAsset,
     config: &(impl PathDerivationSource + ?Sized),
     versions: &VersionsView<'a>,
     seen_urls: &[&str],
 ) -> Option<(&'a AssetVersion, AssetVersionSize)> {
-    if !config.edited() {
+    if asset.is_live_photo()
+        && matches!(
+            config.live_photo_mode(),
+            LivePhotoMode::Skip | LivePhotoMode::VideoOnly
+        )
+    {
         return None;
     }
     let key = AssetVersionSize::Adjusted;
@@ -255,7 +209,11 @@ pub(super) fn select_live_edited_extra<'a>(
     versions: &VersionsView<'a>,
     seen_urls: &[&str],
 ) -> Option<(&'a AssetVersion, AssetVersionSize)> {
-    if !config.edited() || !asset.is_live_photo() || asset.item_type() != Some(AssetItemType::Image)
+    if !matches!(
+        config.live_photo_mode(),
+        LivePhotoMode::Both | LivePhotoMode::VideoOnly
+    ) || !asset.is_live_photo()
+        || asset.item_type() != Some(AssetItemType::Image)
     {
         return None;
     }
@@ -270,7 +228,12 @@ pub(super) fn select_alternative_extra<'a>(
     versions: &VersionsView<'a>,
     seen_urls: &[&str],
 ) -> Option<(&'a AssetVersion, AssetVersionSize)> {
-    if !config.alternative() || asset.is_live_photo() {
+    if asset.is_live_photo()
+        && matches!(
+            config.live_photo_mode(),
+            LivePhotoMode::Skip | LivePhotoMode::VideoOnly
+        )
+    {
         return None;
     }
     let version = versions.get(AssetVersionSize::Alternative)?;
@@ -289,35 +252,12 @@ pub(super) fn select_mov_companion<'a>(
     ) {
         return None;
     }
-    if asset.item_type() != Some(AssetItemType::Image) {
+    if !asset.is_live_photo() || asset.item_type() != Some(AssetItemType::Image) {
         return None;
     }
-    let get_version = |key: &AssetVersionSize| versions.get(*key);
-    let selected = version_with_fallback(
-        &get_version,
-        config.live_resolution(),
-        AssetVersionSize::LiveOriginal,
-        config.force_resolution(),
-    )?;
-    (!url_seen(selected.0, seen_urls)).then_some(selected)
-}
-
-/// Look up a version by key, falling back to `fallback_key` when the requested
-/// size is unavailable (unless `force_resolution` is set). Shared by both
-/// `extract_skip_candidates` and `filter_asset_to_tasks`.
-fn version_with_fallback<'a>(
-    get_version: &dyn Fn(&AssetVersionSize) -> Option<&'a AssetVersion>,
-    requested: AssetVersionSize,
-    fallback: AssetVersionSize,
-    force_resolution: bool,
-) -> Option<(&'a AssetVersion, AssetVersionSize)> {
-    match get_version(&requested) {
-        Some(v) => Some((v, requested)),
-        None if requested != fallback && !force_resolution => {
-            get_version(&fallback).map(|v| (v, fallback))
-        }
-        _ => None,
-    }
+    let key = AssetVersionSize::LiveOriginal;
+    let version = versions.get(key)?;
+    (!url_seen(version, seen_urls)).then_some((version, key))
 }
 
 #[cfg(test)]
@@ -330,10 +270,73 @@ mod tests {
     use crate::types::{AssetVersionSize, LivePhotoMode, RawPolicy};
 
     use super::super::test_support::{
-        exclude_aae_filenames, photo_asset_with_original_and_alternative, plain_photo_asset,
-        skip_live_photos, test_config, test_live_photo_asset,
+        photo_asset_with_original_and_alternative, plain_photo_asset, skip_live_photos,
+        test_config, test_live_photo_asset,
     };
     use super::{VersionsView, apply_raw_policy, extract_skip_candidates, metadata_capture};
+
+    #[test]
+    fn frozen_raw_retry_requires_unique_checksum_and_size_without_policy() {
+        for (alt_checksum, alt_size, expected) in [
+            ("raw", 2000, Some(VersionSizeKey::Alternative)),
+            ("changed", 2000, None),
+            ("raw", 2001, None),
+        ] {
+            let asset = TestPhotoAsset::new("FROZEN_RAW")
+                .orig_checksum("jpeg")
+                .orig_size(1000)
+                .alt_version(
+                    "https://p01.icloud-content.com/raw",
+                    alt_checksum,
+                    alt_size,
+                    "com.adobe.raw-image",
+                )
+                .build();
+            assert_eq!(
+                super::provider_version_for_frozen_resource(
+                    &asset,
+                    VersionSizeKey::Original,
+                    "raw",
+                    2000
+                ),
+                expected
+            );
+            assert_eq!(
+                super::provider_version_for_frozen_resource(
+                    &asset,
+                    VersionSizeKey::Alternative,
+                    "jpeg",
+                    1000
+                ),
+                Some(VersionSizeKey::Original)
+            );
+            assert_eq!(
+                super::provider_version_for_frozen_resource(
+                    &asset,
+                    VersionSizeKey::Adjusted,
+                    "jpeg",
+                    1000
+                ),
+                None
+            );
+        }
+        let ambiguous = TestPhotoAsset::new("AMBIGUOUS_RAW")
+            .orig_checksum("shared")
+            .orig_size(1000)
+            .alt_version(
+                "https://p01.icloud-content.com/raw",
+                "shared",
+                1000,
+                "com.adobe.raw-image",
+            )
+            .build();
+        for key in [VersionSizeKey::Original, VersionSizeKey::Alternative] {
+            assert_eq!(
+                super::provider_version_for_frozen_resource(&ambiguous, key, "shared", 1000),
+                None
+            );
+        }
+    }
 
     // ── extract_skip_candidates tests ──────────────────────────────
 
@@ -500,36 +503,36 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_policy_prefer_raw_swaps_when_alt_is_raw() {
+    fn retired_raw_preference_keeps_provider_keys() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
         let versions = apply_raw_policy(asset.versions(), RawPolicy::PreferRaw);
-        // Alternative was RAW → swap: Original now has alt URL
+        // Original retains its provider identity even when the sibling is RAW.
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
-            "https://p01.icloud-content.com/alt"
+            "https://p01.icloud-content.com/orig"
         );
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Alternative)
                 .unwrap()
                 .url,
-            "https://p01.icloud-content.com/orig"
+            "https://p01.icloud-content.com/alt"
         );
     }
 
     #[test]
-    fn test_raw_policy_prefer_jpeg_swaps_when_orig_is_raw() {
+    fn retired_jpeg_preference_keeps_provider_keys() {
         let asset = photo_asset_with_original_and_alternative("com.adobe.raw-image", "public.jpeg");
         let versions = apply_raw_policy(asset.versions(), RawPolicy::PreferJpeg);
-        // Original was RAW → swap: Alternative now has orig URL
+        // A RAW original remains the original.
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
-            "https://p01.icloud-content.com/alt"
+            "https://p01.icloud-content.com/orig"
         );
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Alternative)
                 .unwrap()
                 .url,
-            "https://p01.icloud-content.com/orig"
+            "https://p01.icloud-content.com/alt"
         );
     }
 
@@ -564,10 +567,7 @@ mod tests {
         assert!(!has_ver(&versions, AssetVersionSize::Alternative));
     }
 
-    /// On a swap, `iter()` must preserve the underlying `VersionsMap`
-    /// element order — only the keys at the two swap slots flip. If a
-    /// future refactor reorders elements (e.g. surfacing `Original`
-    /// first regardless of position), this fails loudly.
+    /// Iteration preserves both provider keys and provider order.
     #[test]
     fn raw_policy_view_iter_order_matches_underlying_map() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
@@ -576,13 +576,9 @@ mod tests {
         let elements: Vec<(AssetVersionSize, &str)> =
             view.iter().map(|(k, v)| (k, v.url.as_ref())).collect();
         assert_eq!(elements.len(), 2);
-        // Slot 0 (originally Original) reads as Alternative, still
-        // pointing at orig_url.
-        assert_eq!(elements[0].0, AssetVersionSize::Alternative);
+        assert_eq!(elements[0].0, AssetVersionSize::Original);
         assert_eq!(elements[0].1, "https://p01.icloud-content.com/orig");
-        // Slot 1 (originally Alternative) reads as Original, still
-        // pointing at alt_url.
-        assert_eq!(elements[1].0, AssetVersionSize::Original);
+        assert_eq!(elements[1].0, AssetVersionSize::Alternative);
         assert_eq!(elements[1].1, "https://p01.icloud-content.com/alt");
     }
 
@@ -641,25 +637,25 @@ mod tests {
                 expected: &[(VersionSizeKey::LiveOriginal, "mov_ck")],
             },
             SkipCandidateCase {
-                name: "missing medium resolution falls back to original",
+                name: "legacy medium preference still selects original",
                 asset: plain_photo_asset,
                 configure: medium_resolution_with_fallback,
                 expected: &[(VersionSizeKey::Original, "abc123")],
             },
             SkipCandidateCase {
-                name: "force medium resolution prevents fallback",
+                name: "legacy forced medium preference still selects original",
                 asset: plain_photo_asset,
                 configure: medium_resolution_without_fallback,
-                expected: &[],
-            },
-            SkipCandidateCase {
-                name: "filename exclude no-match still emits original",
-                asset: plain_photo_asset,
-                configure: exclude_aae_filenames,
                 expected: &[(VersionSizeKey::Original, "abc123")],
             },
             SkipCandidateCase {
-                name: "missing live adjusted falls back to live original",
+                name: "ordinary filename emits original",
+                asset: plain_photo_asset,
+                configure: |_| {},
+                expected: &[(VersionSizeKey::Original, "abc123")],
+            },
+            SkipCandidateCase {
+                name: "missing live edit keeps original",
                 asset: test_live_photo_asset,
                 configure: live_adjusted_with_fallback,
                 expected: &[
@@ -668,10 +664,13 @@ mod tests {
                 ],
             },
             SkipCandidateCase {
-                name: "force live adjusted prevents mov fallback",
+                name: "legacy forced live edit keeps original",
                 asset: test_live_photo_asset,
                 configure: live_adjusted_without_fallback,
-                expected: &[(VersionSizeKey::Original, "heic_ck")],
+                expected: &[
+                    (VersionSizeKey::Original, "heic_ck"),
+                    (VersionSizeKey::LiveOriginal, "mov_ck"),
+                ],
             },
         ];
 

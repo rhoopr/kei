@@ -28,6 +28,14 @@ struct ReconciliationOwner {
     version_size: VersionSizeKey,
 }
 
+/// Authenticated retained-generation evidence for this destination pass.
+pub(super) struct SelectionPathEvidence<'a> {
+    pub db: &'a crate::state::SqliteStateDb,
+    pub owner: &'a crate::state::db::account::AccountOwner,
+    pub scope: &'a str,
+    pub pass_key: &'a str,
+}
+
 #[derive(Clone, Copy)]
 enum ReservedReplay {
     RequestedDirectory,
@@ -250,7 +258,109 @@ impl TaskPlanner {
         }
     }
 
-    /// Accept only a current-content receipt in this pass's filename family.
+    /// Retain published same-pass destinations across template changes. Other
+    /// passes remain reuse candidates only within the requested filename family.
+    pub(super) async fn recorded_selection_path(
+        &self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        derived: &super::filter::DerivedPath,
+        derived_paths: &[super::filter::DerivedPath],
+        evidence: &SelectionPathEvidence<'_>,
+    ) -> Result<Option<std::path::PathBuf>> {
+        if let Some(path) = evidence
+            .db
+            .established_selection_path(
+                evidence.owner.clone(),
+                evidence.scope.to_owned(),
+                evidence.pass_key.to_owned(),
+                asset.asset_record_name().to_owned(),
+                asset.id().to_owned(),
+                derived.version_size.as_str().to_owned(),
+            )
+            .await?
+            && let Ok(path) =
+                crate::fs_util::reserved_path_under_root(&config.directory, &path.to_path())
+            && path.extension() == derived.path.extension()
+            && self.retry_path_allowed(
+                asset.source_zone().unwrap_or(&config.library),
+                asset.state_id(),
+                derived.version_size,
+                &derived.checksum,
+                derived.size,
+                &path,
+            )
+            && super::legacy_preservation::current_path_is_independent(evidence.db, &path).await?
+        {
+            return Ok(Some(path));
+        }
+        let candidates = evidence
+            .db
+            .verified_selection_paths(
+                evidence.owner.clone(),
+                evidence.scope.to_owned(),
+                evidence.pass_key.to_owned(),
+                asset.asset_record_name().to_owned(),
+                asset.id().to_owned(),
+                derived.version_size.as_str().to_owned(),
+                (derived.checksum.to_string(), derived.size),
+            )
+            .await?;
+        for (previous_key, candidate) in candidates {
+            let path = candidate.to_path();
+            if previous_key == evidence.pass_key
+                && tokio::fs::symlink_metadata(&path)
+                    .await
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                && let Ok(path) = crate::fs_util::reserved_path_under_root(&config.directory, &path)
+                && self.retry_path_allowed(
+                    asset.source_zone().unwrap_or(&config.library),
+                    asset.state_id(),
+                    derived.version_size,
+                    &derived.checksum,
+                    derived.size,
+                    &path,
+                )
+                && super::legacy_preservation::current_path_is_independent(evidence.db, &path)
+                    .await?
+            {
+                return Ok(Some(path));
+            }
+            if (previous_key == evidence.pass_key
+                || super::filter::stored_path_matches_download_family(
+                    asset.state_id(),
+                    derived,
+                    derived_paths,
+                    config,
+                    &path,
+                ))
+                && let Ok(fingerprint) =
+                    super::file::fingerprint_downloaded_path(&config.directory, &path).await
+                && evidence
+                    .db
+                    .selection_path_matches_local(
+                        evidence.owner.clone(),
+                        evidence.scope.to_owned(),
+                        evidence.pass_key.to_owned(),
+                        (
+                            asset.asset_record_name().to_owned(),
+                            asset.source_zone().unwrap_or(&config.library).to_owned(),
+                        ),
+                        candidate,
+                        (
+                            data_encoding::HEXLOWER.encode(&fingerprint.sha256),
+                            fingerprint.size,
+                        ),
+                    )
+                    .await?
+            {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Accept a current-content receipt in this pass's directory or filename family.
     /// Additional copies and legacy numbered companions require exact local hashes.
     pub(super) async fn verified_downloaded_path(
         &self,
@@ -293,14 +403,18 @@ impl TaskPlanner {
             {
                 continue;
             }
+            // A recorded rendition may keep its filename within this pass's
+            // directory when the provider renames it. Content-generation,
+            // exclusive ownership and local-receipt checks still apply below.
             if record.checksum != derived.checksum.as_ref()
-                || !super::filter::stored_path_matches_download_family(
-                    asset.state_id(),
-                    derived,
-                    &derived_paths,
-                    config,
-                    path,
-                )
+                || !(path.parent() == derived.path.parent()
+                    || super::filter::stored_path_matches_download_family(
+                        asset.state_id(),
+                        derived,
+                        &derived_paths,
+                        config,
+                        path,
+                    ))
                 || !self.retry_path_allowed(
                     &owner.library,
                     &owner.asset_id,
@@ -510,6 +624,46 @@ impl TaskPlanner {
             .await
     }
 
+    /// Current selection may reuse an exact reserved destination across folders.
+    /// Reservation ownership, content and root confinement remain mandatory.
+    pub(super) async fn plan_selected_asset(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+    ) -> Result<AssetTaskPlan> {
+        let mut plan = self.plan_pending_retry_asset(asset, config).await?;
+        if !self.managed_plan
+            && plan.filter_reason.is_none()
+            && config
+                .selection_run
+                .as_ref()
+                .is_some_and(|run| run.independent_album(config))
+        {
+            // Equal-sized peer files may suppress ordinary tasks. Selection
+            // still has to verify its own frozen destination before skipping.
+            let candidates = filter_asset_to_tasks(
+                asset,
+                config,
+                &mut FxHashMap::default(),
+                &mut self.dir_cache,
+                PathPlanningMode::Reconciliation,
+            )?;
+            for task in candidates {
+                if !plan
+                    .tasks
+                    .iter()
+                    .any(|planned| planned.version_size == task.version_size)
+                {
+                    plan.tasks.push(task);
+                }
+            }
+        }
+        if matches!(self.path_mode, PathPlanningMode::Download) && !self.managed_plan {
+            self.relocate_protected_tasks(&mut plan, config).await?;
+        }
+        Ok(plan)
+    }
+
     async fn plan_download_asset_with_replay(
         &mut self,
         asset: &PhotoAsset,
@@ -659,6 +813,28 @@ impl TaskPlanner {
                 task.size,
                 &task.download_path,
             )
+    }
+
+    /// Carry cross-directory finalization proof only for a caller-confirmed
+    /// pending task whose current content has saved destination reservations.
+    pub(super) fn bind_pending_destination_proof(
+        &self,
+        task: &mut DownloadTask,
+        root: &Path,
+    ) -> Result<()> {
+        if !self
+            .cross_parent_retry_destinations(
+                &task.library,
+                &task.asset_id,
+                task.version_size,
+                &task.checksum,
+                task.size,
+            )?
+            .is_empty()
+        {
+            task.pending_cross_parent_root = Some(Arc::new(root.to_path_buf()));
+        }
+        Ok(())
     }
 
     /// Inspect every saved alias before a pass can fall back to size-only adoption.
@@ -1060,6 +1236,54 @@ impl TaskPlanner {
         }
     }
 
+    /// A pass-qualified sibling is a new physical obligation, never adoption
+    /// of another album's file. Existing same-pass destinations are resolved
+    /// before this method; unfamiliar occupied siblings remain untouched.
+    pub(super) async fn independent_album_path(
+        &mut self,
+        requested: &Path,
+        pass_key: &str,
+        config: &DownloadConfig,
+    ) -> Result<std::path::PathBuf> {
+        let parent = requested
+            .parent()
+            .context("Album destination has no parent")?;
+        let filename = requested
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("Album destination has no filename")?;
+        const MAX_ALBUM_PATH_CANDIDATES: u64 = 64;
+        for ordinal in 1..=MAX_ALBUM_PATH_CANDIDATES {
+            let qualifier = if ordinal == 1 {
+                format!("-{pass_key}")
+            } else {
+                format!("-{pass_key}-{ordinal}")
+            };
+            // Retain the full pass qualifier even at the filename byte limit.
+            let name = paths::role_filename(filename, &qualifier, "");
+            let candidate =
+                crate::fs_util::reserved_path_under_root(&config.directory, &parent.join(name))?;
+            let key = self.path_mode.key(&candidate)?;
+            if self.claimed_paths.contains_key(key.as_ref())
+                || self.reconciliation.path_owners.contains_key(&key)
+                || config
+                    .selection_run
+                    .as_ref()
+                    .context("Album destination has no selection")?
+                    .album_path_claimed(config, &candidate)
+                    .await?
+            {
+                continue;
+            }
+            match tokio::fs::symlink_metadata(&candidate).await {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        anyhow::bail!("No unoccupied independent album destination within collision budget")
+    }
+
     fn retry_claim_available(&self, task: &DownloadTask, path: &Path) -> bool {
         self.retry_path_allowed(
             &task.library,
@@ -1076,7 +1300,63 @@ impl TaskPlanner {
         })
     }
 
-    pub(super) fn retain_retry_claim(&mut self, task: &DownloadTask) -> Result<()> {
+    /// Choose and claim a pending task's destination in the same owner as fresh
+    /// planning. A refused path leaves its durable retry target unresolved.
+    #[must_use = "Only an accepted destination may be queued for retry"]
+    pub(super) async fn retain_pending_destination(
+        &mut self,
+        mut task: DownloadTask,
+        config: &DownloadConfig,
+        evidence: Option<&super::retry::PendingRetryEvidence>,
+    ) -> Result<Option<DownloadTask>> {
+        if let Some(evidence) = evidence
+            && let Some(local_path) = evidence.local_path_under(&config.directory)
+            && (!self.has_durable_destination(&task) || task.download_path == local_path)
+            && self.retry_path_allowed(
+                &task.library,
+                &task.asset_id,
+                task.version_size,
+                &task.checksum,
+                task.size,
+                local_path,
+            )
+        {
+            if evidence.matches_provider_version(&task)
+                && let Some(fingerprint) = evidence
+                    .truncated_repair_fingerprint(config.repair_truncated)
+                    .await?
+            {
+                if !self.bind_reserved_destination(&mut task, local_path).await {
+                    tracing::warn!(
+                        asset_id = %task.asset_id,
+                        version_size = %task.version_size.as_str(),
+                        path = %local_path.display(),
+                        "Could not reserve the recorded truncated path; retaining pending work"
+                    );
+                    return Ok(None);
+                }
+                task.replacement_fingerprint = Some(Arc::new(
+                    super::file::FinalPublication::ReplaceTruncated(fingerprint),
+                ));
+            } else {
+                let Some(retry_path) = self.resolve_recorded_retry_path(local_path, &task).await
+                else {
+                    tracing::warn!(
+                        asset_id = %task.asset_id,
+                        version_size = %task.version_size.as_str(),
+                        path = %local_path.display(),
+                        "Could not choose a safe sibling for the recorded retry path; retaining pending work"
+                    );
+                    return Ok(None);
+                };
+                task.download_path = retry_path;
+            }
+        }
+        self.retain_retry_claim(&task)?;
+        Ok(Some(task))
+    }
+
+    fn retain_retry_claim(&mut self, task: &DownloadTask) -> Result<()> {
         if !matches!(self.path_mode, PathPlanningMode::Download) {
             self.add_reconciliation_claim(
                 ReconciliationOwner {
@@ -1091,10 +1371,12 @@ impl TaskPlanner {
         Ok(())
     }
 
-    pub(super) async fn claim_recorded_repair_path(
+    /// Bind a task only after its exact destination claim succeeds.
+    #[must_use]
+    pub(super) async fn bind_reserved_destination(
         &mut self,
+        task: &mut DownloadTask,
         recorded_path: &Path,
-        task: &DownloadTask,
     ) -> bool {
         let Ok(planned) = self.path_mode.key(&task.download_path) else {
             return false;
@@ -1113,10 +1395,11 @@ impl TaskPlanner {
         }
         self.prepare_path_parent(recorded_path).await;
         self.claimed_paths.insert(recorded, task.size);
+        task.download_path = recorded_path.to_path_buf();
         true
     }
 
-    pub(super) async fn resolve_recorded_retry_path(
+    async fn resolve_recorded_retry_path(
         &mut self,
         recorded_path: &Path,
         task: &DownloadTask,
@@ -1247,11 +1530,18 @@ pub(super) fn pending_record_for_task(
         task.size,
         media_type,
     )
-    .with_metadata_arc(super::filter::metadata_for_selected_version(
-        asset,
-        config,
-        task.version_size,
-    ))
+    .with_metadata_arc(
+        super::filter::provider_version_for_frozen_resource(
+            asset,
+            task.version_size,
+            &task.checksum,
+            task.size,
+        )
+        .map_or_else(
+            || super::filter::metadata_for_selected_version(asset, config, task.version_size),
+            |provider| asset.metadata_arc(provider),
+        ),
+    )
 }
 
 /// Persist the durable CloudKit identifier bridge used to resolve future
@@ -1437,12 +1727,13 @@ mod tests {
             .find(|path| path.version_size.is_live_photo_motion())
             .unwrap();
         std::fs::remove_file(&motion.path).unwrap();
-        config.filename_exclude = vec![glob::Pattern::new("*").unwrap()].into();
+        config.skip_created_before =
+            Some(crate::config::parse_created_date_filter("2099-01-01").unwrap());
         let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
         let filtered = planner.plan_download_asset(&asset, &config).await.unwrap();
         assert!(matches!(
             filtered.filter_reason,
-            Some(FilterReason::Filename)
+            Some(FilterReason::DateRange)
         ));
         assert_eq!(
             planner
@@ -1451,7 +1742,7 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
-        config.filename_exclude = Arc::from([]);
+        config.skip_created_before = None;
         let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
         assert_eq!(
             planner
@@ -1523,17 +1814,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planner_applies_filename_date_media_and_unfiled_exclusions() {
+    async fn planner_applies_date_media_and_unfiled_exclusions() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(tmp.path());
-        config.filename_exclude = Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
-        let asset = TestPhotoAsset::new("FILTERED_NAME")
-            .filename("IMG_0001.AAE")
-            .build();
-        let mut planner = TaskPlanner::new();
-        let plan = planner.plan_asset(&asset, &config).await;
-        assert_eq!(plan.filter_reason, Some(FilterReason::Filename));
-
         let mut config = test_config(tmp.path());
         config.media.photos = false;
         let asset = TestPhotoAsset::new("FILTERED_MEDIA").build();

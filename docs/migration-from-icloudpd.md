@@ -4,6 +4,12 @@ This guide is for moving a Python [icloudpd](https://github.com/icloud-photos-do
 
 Import is not automatic deduplication. Kei must match a local file to the file it expects from iCloud. Files it cannot match may be downloaded again under a different name or folder.
 
+### Development upgrade note
+
+The v0.26.0 instructions below describe that release. The current development branch removes sync/service `--recent` and `--recent-scope`, `[filters].recent` / `recent_scope`, and relative `Nd` values in either date bound. Before using that branch, remove both retired saved keys and flags. To keep sync bounded, choose fixed `skip_created_before` / `skip_created_after` dates instead. For example, `kei sync --skip-created-before 2025-01-01 --skip-created-after 2025-01-07` selects an inclusive capture-local calendar-date range; replace both dates with your own range.
+
+Kei rejects retired settings before authentication or sync-state/media changes, even if a CLI override supplies a fixed date. Errors explain removal and supported fixed-date selection. Kei does not rewrite your config, silently expand it or guess a boundary from the current date. Only `import-existing --recent 100` retains positive-count sampling; import does not gain date filtering. The development schema is 39, so keep a matched pre-upgrade backup rather than trying to reopen upgraded state with v0.26.0.
+
 ## Before you start
 
 - Stop icloudpd, kei and any other programs writing to the archive. Pause scheduled runs.
@@ -134,20 +140,22 @@ Always check the preview: collisions and existing ownership records can still pr
 
 ### Live photos, RAW, and sizes
 
-Match the file versions your Python setup downloaded. For example:
+Kei selects available full-resolution originals, current edits and RAW/JPEG
+renditions for each included component. Both Live Photo components are included
+by default. For example, to omit Live Photo videos:
 
 ```toml
-[photos]
-resolution = "original"
-live_photo_mode = "both"
-live_resolution = "original"
-live_photo_mov_filename_policy = "suffix"
-raw_policy = "as-is"
+[filters]
+exclude = ["live-photo-videos"]
 ```
 
-Edited and alternative versions, including RAW, need the corresponding settings. See [example.config.toml](../example.config.toml) for the available choices.
+Medium and thumbnail previews are not imported as originals. Missing selected
+renditions can be downloaded by a later sync. Existing kei configurations need
+the [rendition-policy migration](rendition-policy-migration.md), including the
+top-level `config_version = 1` marker. See
+[example.config.toml](../example.config.toml) for supported settings.
 
-You can try a smaller import with `--recent 100`. Import accepts a count, not a date window: `--recent 30d` works only with sync.
+You can try a smaller import with `--recent 100`. Import accepts a count, not a date window. Sync uses fixed capture-date bounds; rolling windows such as `--recent 30d` are no longer supported.
 
 ### Libraries and albums
 
@@ -210,17 +218,17 @@ For all settings, see [example.config.toml](../example.config.toml) and [Configu
 | `--list-libraries` | `kei list libraries` | The old flag was removed in v0.20. |
 | `--cookie-directory` | `data_dir` | The old flag was removed in v0.20. New default is `~/.config/kei`; `KEI_DATA_DIR` still works for automation. |
 | `--folder-structure "{:%Y/%m/%d}"` | `[download].folder_structure = "%Y/%m/%d"` | Python wrapper syntax is still accepted. Use `folder_structure_albums` and `folder_structure_smart_folders` for albums and smart folders. |
-| `--size original` | `[photos].resolution = "original"` | Values: `original`, `medium`, `thumb`, `none`. Use `edited = true` for edited versions and `alternative = true` for other versions, including RAW. |
+| `--size original` | Full-resolution selection is fixed | Included components select originals, current edits and available RAW/JPEG renditions. Medium and thumbnail restrictions are retired. |
 | `--threads-num` | `[download].threads` | Default is 10. With `[download].bandwidth_limit` and no explicit thread count, default drops to 1. |
-| `--skip-videos`, `--skip-photos` | `[filters].media` | Use `media = ["photos", "live-photos"]` to skip videos, or `media = ["videos", "live-photos"]` to skip normal photos. |
-| `--skip-live-photos` | `[photos].live_photo_mode = "skip"` | The old flag was removed in v0.20. |
-| `--recent 100` | `--recent 100` | Count form works for sync and import. |
-| `--recent 30d` | `--recent 30d` for sync | Import rejects the days form. |
+| `--skip-videos`, `--skip-photos` | `[filters].exclude` | Use `exclude = ["videos"]` to skip ordinary videos, or `exclude = ["photos"]` to skip ordinary photos. |
+| `--skip-live-photos` | `[filters].exclude = ["live-photo-stills", "live-photo-videos"]` | Both components are excluded independently of ordinary photos and videos. |
+| `--recent 100` | `kei import-existing --recent 100` | Import-only sampling. Sync count limits are retired. |
+| `--recent 30d` | Fixed sync date bounds | Choose explicit `skip_created_before` and `skip_created_after` dates. Rolling windows are retired. |
 | `--set-exif-datetime` | `[metadata].set_exif_datetime = true` | kei also has EXIF rating, GPS, and description settings. |
 | `--keep-unicode-in-filenames` | `[photos].keep_unicode_in_filenames = true` | Set this before import. |
 | `--live-photo-mov-filename-policy` | `[photos].live_photo_mov_filename_policy` | `suffix` or `original`. |
 | `--file-match-policy` | `[photos].file_match_policy` | `name-size-dedup-with-suffix` or `name-id7`. |
-| `--align-raw` | `[photos].raw_policy` | `as-is`, `prefer-raw`, or `prefer-jpeg`. |
+| `--align-raw` | Provider rendition identities are retained | RAW/JPEG alignment preferences are retired. Available full-resolution siblings are selected together. |
 | `--domain` | `[auth].domain` | `com` or `cn`. |
 | `--watch-with-interval` | `[watch].interval`; Docker uses `kei service run` | Save the repeat interval in the configuration and use the service commands. |
 | `--log-level` | `--log-level` or `log_level` | `debug`, `info`, `warn`, `error`. |
@@ -247,6 +255,8 @@ the same way.
 
 ## Useful kei-only options
 
+Filename-based selection is no longer supported. Remove `[filters].filename_exclude` from an existing config after reviewing the expanded selection. Use libraries, albums, smart folders or fixed capture-date bounds to restrict sync. A config containing the retired key is rejected before sync writes state or media.
+
 | Option or command | What it does |
 |---|---|
 | `kei config setup` | Interactive config wizard. |
@@ -259,12 +269,11 @@ the same way.
 | `[filters].libraries` | Select primary, shared, all, named, or excluded iCloud libraries. |
 | `[filters].smart_folders` | Sync Favorites, Screenshots, Hidden, Recently Deleted, and other Apple smart folders across visible libraries when explicitly set. |
 | `[filters].unfiled = false` | Skip photos and videos outside user albums. |
-| `[filters].filename_exclude` | Skip files by glob, such as `*.AAE` or `Screenshot*`. |
 | `[download].bandwidth_limit` | Limit total download speed, for example `10M` or `1.5Mi`. |
 | `[metadata].set_exif_rating`, `.set_exif_gps`, `.set_exif_description` | Write more iCloud metadata into downloaded media. |
 | `[metadata].embed_xmp`, `[metadata].xmp_sidecar` | Embed XMP or write `.xmp` sidecars. |
 | `[download.retry].per_transfer` | Retry downloads inside one transfer. Default is 3. |
-| `[download.retry].per_asset` | Cap lifetime attempts per asset. Default is 10; 0 disables the cap. |
+| Retired `[download.retry].per_asset` | Remove this setting. Unfinished work remains retryable across sync cycles; `per_transfer` bounds retries within a transfer. |
 | `[download].temp_suffix` | Temp file suffix for partial downloads. Default is `.kei-tmp`. |
 | `[report].json` | Save the latest sync report as a JSON file. |
 | `[server].bind`, `[server].port` | Serve `/healthz` and `/metrics` during watch mode. |

@@ -357,6 +357,41 @@ impl<'a> IncrementalDeltaState<'a> {
 
     pub(super) fn observe_event(&mut self, event: &ChangeEvent) {
         self.summary.total_events += 1;
+        let membership = &mut self.summary.membership;
+        membership.incomplete |= event.token_unsafe_reason.is_some()
+            && matches!(
+                event.record_type.as_deref(),
+                Some("CPLContainerRelation" | "CPLAlbum")
+            );
+        if let Some(relation) = &event.relation {
+            membership.relations.insert(
+                (
+                    relation.container_id.to_string(),
+                    relation.asset_record_name.to_string(),
+                ),
+                relation.is_deleted,
+            );
+        } else if let Some(album) = &event.album {
+            membership
+                .containers
+                .insert(album.container_id.to_string(), album.is_deleted);
+        } else if matches!(
+            event.reason,
+            ChangeReason::SoftDeleted | ChangeReason::HardDeleted
+        ) {
+            membership
+                .deleted_photos
+                .insert(event.record_name.to_string());
+            if let Some(master) = &event.master_record_name {
+                membership.deleted_photos.insert(master.to_string());
+            }
+            if let Some(asset) = &event.asset {
+                membership
+                    .deleted_photos
+                    .insert(asset.asset_record_name().to_owned());
+                membership.deleted_photos.insert(asset.id().to_owned());
+            }
+        }
         if let Some(reason) = event.token_unsafe_reason {
             self.summary.token_unsafe_reason.get_or_insert(reason);
         }
@@ -443,15 +478,29 @@ impl<'a> IncrementalDeltaState<'a> {
 
     pub(super) fn record_completion(&mut self, token: Option<String>) {
         self.summary.sync_token = token;
+        if self.summary.sync_token.is_none() {
+            self.summary.raw_records_observed = None;
+        }
     }
 }
 
 #[derive(Debug, Default)]
+pub(super) struct MembershipDelta {
+    pub(super) incomplete: bool,
+    // Last explicit fact in the complete ordered delta, never acted on mid-page.
+    pub(super) relations: FxHashMap<(String, String), bool>,
+    pub(super) containers: FxHashMap<String, bool>,
+    pub(super) deleted_photos: FxHashSet<String>,
+}
+
+#[derive(Debug, Default)]
 pub(super) struct IncrementalDeltaSummary {
+    pub(super) membership: Box<MembershipDelta>,
     pub(super) sparse_target_stats: crate::download::SyncStats,
     pub(super) sparse_identity_proofs: Vec<SparseIdentityProof>,
     pub(super) identity_incomplete: bool,
     pub(super) sync_token: Option<String>,
+    pub(super) raw_records_observed: Option<bool>,
     pub(super) token_unsafe_reason: Option<&'static str>,
     pub(super) created_count: u64,
     pub(super) soft_deleted_count: u64,
@@ -668,6 +717,14 @@ impl IncrementalDeltaSummary {
             ChangeReason::Hidden => {
                 self.hidden_count += 1;
                 tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
+                if config.selection_context.is_some() {
+                    // Hidden deltas carry identity evidence, not necessarily a
+                    // usable capture date or a confirmed current child. Native
+                    // selection projects the complete snapshot after admission;
+                    // a flag-only update here can mutate an unowned historical
+                    // master or partially apply an otherwise refused snapshot.
+                    return;
+                }
                 if let Some(db) = &config.state_db {
                     let update = SourceStateUpdate::Hidden;
                     let (result, state_key) =

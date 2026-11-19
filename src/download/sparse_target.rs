@@ -241,6 +241,7 @@ pub(crate) async fn recover(
     stats.failed += result.failed.len();
     stats.exif_failures += result.exif_failures;
     stats.state_write_failures += result.state_write_failures;
+    stats.storage_failed |= result.storage_failed;
     stats.bytes_downloaded += result.bytes_downloaded;
     stats.disk_bytes_written += result.disk_bytes_written;
     stats.photos_downloaded += result.photos_downloaded;

@@ -61,6 +61,7 @@ pub(super) use prepared::PreparedMetadataFile;
     reason = "preserve the existing facade type path in non-test builds"
 )]
 pub(super) use probe::HeifNativeCaptureTime;
+pub(in crate::download) use probe::original_orientation_missing;
 pub(crate) use probe::{ExifProbe, probe_exif};
 #[cfg(feature = "xmp")]
 pub(crate) use sidecar::write_sidecar;

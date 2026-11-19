@@ -29,6 +29,8 @@ struct ManifestRow {
     media_type: String,
     status: String,
     albums: Vec<String>,
+    is_deleted: bool,
+    deleted_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     preserved_files: Vec<crate::state::db::primary_layout::PreservedManifestFile>,
 }
@@ -52,6 +54,8 @@ impl From<ManifestAssetRow> for ManifestRow {
             media_type: row.media_type,
             status: row.status,
             albums: row.albums,
+            is_deleted: row.is_deleted,
+            deleted_at: row.deleted_at,
             preserved_files: row.preserved_files,
         }
     }
@@ -127,6 +131,8 @@ fn render_csv(rows: &[ManifestRow]) -> anyhow::Result<String> {
         "media_type",
         "status",
         "albums",
+        "is_deleted",
+        "deleted_at",
     ];
 
     let mut out = String::new();
@@ -146,6 +152,8 @@ fn render_csv(rows: &[ManifestRow]) -> anyhow::Result<String> {
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_default();
         let last_seen_at = row.last_seen_at.to_rfc3339();
+        let is_deleted = row.is_deleted.to_string();
+        let deleted_at = row.deleted_at.map(|dt| dt.to_rfc3339()).unwrap_or_default();
         let mut fields = vec![
             row.library.as_str(),
             row.asset_id.as_str(),
@@ -163,6 +171,8 @@ fn render_csv(rows: &[ManifestRow]) -> anyhow::Result<String> {
             row.media_type.as_str(),
             row.status.as_str(),
             albums.as_str(),
+            is_deleted.as_str(),
+            deleted_at.as_str(),
         ];
         let preserved_files = serde_json::to_string(&row.preserved_files)?;
         if has_preserved_files {
@@ -268,6 +278,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manifest_keeps_soft_deleted_rows_and_reports_deletion_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("manifest.db");
+        let db = SqliteStateDb::open(&db_path).await.expect("open state");
+        let local_path = dir.path().join("photos").join("deleted.jpg");
+        let deleted_record = TestAssetRecord::new("DELETED_DOWNLOADED")
+            .filename("deleted.jpg")
+            .checksum("deleted-remote-sha")
+            .size(21)
+            .build();
+        db.upsert_seen(&deleted_record).await.expect("insert asset");
+        db.mark_downloaded(
+            "PrimarySync",
+            "DELETED_DOWNLOADED",
+            "original",
+            &local_path,
+            "deleted-local-sha",
+            None,
+        )
+        .await
+        .expect("mark downloaded");
+        let missing_timestamp = TestAssetRecord::new("DELETED_NO_TIMESTAMP")
+            .filename("missing.jpg")
+            .checksum("missing-remote-sha")
+            .build();
+        db.upsert_seen(&missing_timestamp)
+            .await
+            .expect("insert missing asset");
+        let deleted_at = Utc.with_ymd_and_hms(2024, 2, 3, 4, 5, 6).unwrap();
+        db.mark_soft_deleted("PrimarySync", "DELETED_DOWNLOADED", Some(deleted_at))
+            .await
+            .expect("soft delete downloaded");
+        db.mark_soft_deleted("PrimarySync", "DELETED_NO_TIMESTAMP", None)
+            .await
+            .expect("soft delete without timestamp");
+        drop(db);
+
+        let rows = load_manifest_rows(&db_path).await.expect("manifest rows");
+
+        assert_eq!(rows.len(), 2, "soft-deleted rows remain in the manifest");
+        let downloaded = rows
+            .iter()
+            .find(|row| row.asset_id == "DELETED_DOWNLOADED")
+            .expect("downloaded row");
+        assert_eq!(downloaded.status, "downloaded");
+        assert!(downloaded.is_deleted);
+        assert_eq!(downloaded.deleted_at, Some(deleted_at));
+        assert!(downloaded.local_path.is_some());
+        let missing = rows
+            .iter()
+            .find(|row| row.asset_id == "DELETED_NO_TIMESTAMP")
+            .expect("missing-timestamp row");
+        assert_eq!(missing.status, "pending");
+        assert!(missing.is_deleted);
+        assert_eq!(missing.deleted_at, None);
+
+        let json = serde_json::to_value(&rows).expect("json");
+        let downloaded_json = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["asset_id"] == "DELETED_DOWNLOADED")
+            .expect("downloaded json row");
+        assert_eq!(downloaded_json["is_deleted"], serde_json::json!(true));
+        assert_eq!(
+            downloaded_json["deleted_at"],
+            serde_json::json!("2024-02-03T04:05:06Z")
+        );
+        let missing_json = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["asset_id"] == "DELETED_NO_TIMESTAMP")
+            .expect("missing json row");
+        assert_eq!(missing_json["is_deleted"], serde_json::json!(true));
+        assert!(missing_json["deleted_at"].is_null());
+
+        let csv = render_csv(&rows).expect("csv");
+        let header = csv.lines().next().unwrap();
+        assert!(header.ends_with(",is_deleted,deleted_at"));
+        assert_eq!(header.split(',').count(), 18);
+        let missing_line = csv
+            .lines()
+            .find(|line| line.starts_with("PrimarySync,DELETED_NO_TIMESTAMP,"))
+            .expect("missing csv row");
+        assert!(missing_line.ends_with(",pending,[],true,"));
+    }
+
+    #[tokio::test]
     async fn tactical_manifest_keeps_library_id_version_and_album_identity() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("manifest.db");
@@ -369,6 +468,8 @@ mod tests {
             media_type: "photo".to_string(),
             status: "pending".to_string(),
             albums: vec!["Family".to_string(), "Vacation, 2024".to_string()],
+            is_deleted: false,
+            deleted_at: None,
             preserved_files: Vec::new(),
         }];
 
@@ -377,12 +478,21 @@ mod tests {
         assert!(csv.contains("\"ASSET,1\""));
         assert!(csv.contains("\"quote\"\"photo.jpg\""));
         assert!(csv.contains("\"[\"\"Family\"\",\"\"Vacation, 2024\"\"]\""));
-        assert_eq!(csv.lines().next().unwrap().split(',').count(), 16);
+        assert_eq!(csv.lines().next().unwrap().split(',').count(), 18);
+        assert!(
+            csv.lines()
+                .next()
+                .unwrap()
+                .ends_with(",is_deleted,deleted_at")
+        );
+        assert!(csv.lines().nth(1).unwrap().ends_with(",false,"));
         assert!(
             serde_json::to_value(&rows).unwrap()[0]
                 .get("preserved_files")
                 .is_none()
         );
+        rows[0].is_deleted = true;
+        rows[0].deleted_at = Some(Utc.with_ymd_and_hms(2024, 1, 4, 3, 4, 5).unwrap());
         rows[0]
             .preserved_files
             .push(crate::state::db::primary_layout::PreservedManifestFile {
@@ -400,6 +510,11 @@ mod tests {
                 size_bytes: 42,
             });
         let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[0]["is_deleted"], serde_json::json!(true));
+        assert_eq!(
+            json[0]["deleted_at"],
+            serde_json::json!("2024-01-04T03:04:05Z")
+        );
         assert_eq!(
             json[0]["preserved_files"][0]["native_path"],
             serde_json::json!({"encoding":"utf8","path":"/photos/.kei-history/old.jpg"})
@@ -410,7 +525,8 @@ mod tests {
         );
         let csv = render_csv(&rows).unwrap();
         assert!(csv.lines().next().unwrap().ends_with(",preserved_files"));
-        assert_eq!(csv.lines().next().unwrap().split(',').count(), 17);
+        assert_eq!(csv.lines().next().unwrap().split(',').count(), 19);
+        assert!(csv.contains(",true,2024-01-04T03:04:05+00:00,"));
         assert!(csv.contains("earlier-provider-checksum"));
     }
 }
