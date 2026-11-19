@@ -2755,6 +2755,10 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
         .expect(0)
         .mount(&server)
         .await;
+    // Integrity inspection refuses symlink ancestors, including macOS /var.
+    #[cfg(target_os = "macos")]
+    let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    #[cfg(not(target_os = "macos"))]
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let account = seed(root, ACCOUNTS[0], "A", &server.uri());
@@ -3019,8 +3023,8 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
         );
     }
     assert_eq!(std::fs::read(&account.media).unwrap(), old_bytes);
-    let target = media_root.join("B/private-0.JPG");
-    let peer = media_root.join("A/private-0.JPG");
+    let target = media_root.join("B").join("private-0.JPG");
+    let peer = media_root.join("A").join("private-0.JPG");
     // The service portion used watch mode. Repair commands below are one-shot.
     std::fs::write(&account.config, &config).unwrap();
     std::fs::write(&target, b"confirmed damaged bytes").unwrap();

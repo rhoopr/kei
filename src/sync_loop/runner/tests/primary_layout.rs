@@ -2179,7 +2179,12 @@ async fn album_directory_projection_preserves_independent_selected_owner() {
     )
     .await;
     assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
-    let old = root.path().join("media/2023/Old/IMG_0501.JPG");
+    let old = root
+        .path()
+        .join("media")
+        .join("2023")
+        .join("Old")
+        .join("IMG_0501.JPG");
     let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
     let album_path: String = conn.query_row("SELECT w.compat_path FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation JOIN json_each(CAST(g.specification AS TEXT),'$.profile.passes') p ON json_extract(p.value,'$.key')=w.pass_key WHERE w.current_publication=1 AND json_extract(p.value,'$.kind')='Album'", [], |row| row.get(0)).unwrap();
     drop(conn);

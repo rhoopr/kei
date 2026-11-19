@@ -622,19 +622,17 @@ async fn album_directory_mixed_projection_retains_independent_smart_copy() {
         .await;
         assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
         let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-        let paths: Vec<String> = conn.prepare("SELECT DISTINCT compat_path FROM provider_active_destinations WHERE current_publication=1 ORDER BY compat_path").unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
-        assert!(
-            paths.iter().any(|path| path.contains("/2023/Old/")),
-            "{paths:?}"
-        );
+        let paths: Vec<std::path::PathBuf> = conn.prepare("SELECT DISTINCT compat_path FROM provider_active_destinations WHERE current_publication=1 ORDER BY compat_path").unwrap().query_map([], |row| row.get::<_, String>(0).map(std::path::PathBuf::from)).unwrap().collect::<Result<_,_>>().unwrap();
+        let has_parent = |parent: &str| {
+            let directory = root.path().join("media/2023").join(parent);
+            paths.iter().any(|path| path.parent() == Some(&directory))
+        };
+        assert!(has_parent("Old"), "{paths:?}");
         if name == "New" {
-            assert!(
-                paths.iter().any(|path| path.contains("/2023/New/")),
-                "{paths:?}"
-            );
+            assert!(has_parent("New"), "{paths:?}");
         }
         for path in paths {
-            assert_bytes(std::path::Path::new(&path), ORIGINAL);
+            assert_bytes(&path, ORIGINAL);
         }
     }
 }

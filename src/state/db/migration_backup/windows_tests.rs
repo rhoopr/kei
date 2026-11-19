@@ -69,20 +69,24 @@ fn assert_history(conn: &Connection) {
             .unwrap(),
         [0, 255, 7]
     );
-    for (key, expected) in [
-        ("sync_token:PrimarySync", "original-cursor"),
-        ("historical-receipt", "exact historical bytes"),
-    ] {
-        assert_eq!(
-            conn.query_row::<String, _, _>(
-                "SELECT value FROM metadata WHERE key=?1",
-                [key],
-                |row| row.get(0)
-            )
-            .unwrap(),
-            expected
-        );
-    }
+    // The backup snapshot keeps the checkpoint in metadata; the owned upgrade
+    // retires it byte-for-byte into historical_v030_checkpoints. Accept only
+    // those two proven locations, as the Unix tests do.
+    crate::test_helpers::assert_checkpoint_evidence(
+        conn,
+        "sync_token:PrimarySync",
+        "original-cursor",
+    );
+    // Not checkpoint-shaped, so the upgrade leaves it in metadata either way.
+    assert_eq!(
+        conn.query_row::<String, _, _>(
+            "SELECT value FROM metadata WHERE key='historical-receipt'",
+            [],
+            |row| row.get(0)
+        )
+        .unwrap(),
+        "exact historical bytes"
+    );
     assert_eq!(
         conn.query_row::<String, _, _>("SELECT status FROM assets WHERE id='retry'", [], |row| row
             .get(0))

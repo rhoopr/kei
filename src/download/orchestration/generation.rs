@@ -230,7 +230,11 @@ pub(crate) async fn context(
                     .strip_prefix(&parent)?
                     .to_str()
                     .context("Album directory requires a UTF-8 relative path")?;
-                album_directories.insert(container.to_owned(), name.replace('%', "%%"));
+                // Folder templates use '/' between components on every platform.
+                let template = name
+                    .replace(std::path::MAIN_SEPARATOR, "/")
+                    .replace('%', "%%");
+                album_directories.insert(container.to_owned(), template);
             }
         }
         if let Some((previous, previous_scope, previous_zone)) = &qualified {

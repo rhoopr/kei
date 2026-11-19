@@ -308,8 +308,8 @@ async fn departure_preserves_peer(naming: crate::types::EditedNaming) {
         let child = records[1]["recordName"].as_str().unwrap().to_owned();
         let mut provider = provider(records, vec!["A", "B"]);
         cycle_with_naming(root.path(), provider.clone(), true, true, naming).await;
-        let a = root.path().join("media/A/IMG_0501.JPG");
-        let b = root.path().join("media/B/IMG_0501.JPG");
+        let a = root.path().join("media").join("A").join("IMG_0501.JPG");
+        let b = root.path().join("media").join("B").join("IMG_0501.JPG");
         assert_bytes(&a, ORIGINAL);
         assert_bytes(&b, ORIGINAL);
         let receipts = native_publication_receipts(root.path());
@@ -370,20 +370,11 @@ async fn departure_preserves_peer(naming: crate::types::EditedNaming) {
             }
         );
         if native {
-            assert_eq!(
-                db_count(
-                    root.path(),
-                    "SELECT COUNT(*) FROM provider_active_destinations WHERE current_publication=1 AND replace(compat_path,char(92),'/') LIKE '%/A/%'"
-                ),
-                0
-            );
-            assert_eq!(
-                db_count(
-                    root.path(),
-                    "SELECT COUNT(*) FROM provider_active_destinations WHERE current_publication=1 AND replace(compat_path,char(92),'/') LIKE '%/B/%'"
-                ),
-                1
-            );
+            let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+            for (path, expected) in [(&a, 0), (&b, 1)] {
+                let count: i64 = conn.query_row("SELECT COUNT(*) FROM provider_active_destinations WHERE current_publication=1 AND compat_path=?1", [path.to_str().unwrap()], |row| row.get(0)).unwrap();
+                assert_eq!(count, expected, "{}", path.display());
+            }
         }
         let operations = db_count(
             root.path(),
@@ -611,7 +602,8 @@ async fn membership_preserved_local_matching_bytes_never_authorize_retirement() 
     )
     .await;
     let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-    let (generation, key, path, checksum): (String,String,String,String) = conn.query_row("SELECT generation,pass_key,path,local_checksum FROM provider_active_destinations WHERE current_publication=1 AND replace(compat_path,char(92),'/') LIKE '%/A/%'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+    let selected = root.path().join("media").join("A").join("IMG_0501.JPG");
+    let (generation, key, path, checksum): (String,String,String,String) = conn.query_row("SELECT generation,pass_key,path,local_checksum FROM provider_active_destinations WHERE current_publication=1 AND compat_path=?1", [selected.to_str().unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
     drop(conn);
     let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &fixture_owner())
         .await
@@ -649,10 +641,7 @@ async fn membership_preserved_local_matching_bytes_never_authorize_retirement() 
             0
         );
         assert_eq!(
-            db_count(
-                root.path(),
-                "SELECT COUNT(*) FROM provider_active_destinations WHERE replace(compat_path,char(92),'/') LIKE '%/A/%' AND preserved_local IS NOT NULL AND current_publication=0 AND verified_media=0 AND source_checksum IS NULL"
-            ),
+            rusqlite::Connection::open(root.path().join("state.db")).unwrap().query_row("SELECT COUNT(*) FROM provider_active_destinations WHERE compat_path=?1 AND preserved_local IS NOT NULL AND current_publication=0 AND verified_media=0 AND source_checksum IS NULL", [selected.to_str().unwrap()], |row| row.get::<_,i64>(0)).unwrap(),
             1
         );
         provider.pages = vec![Vec::new()];
