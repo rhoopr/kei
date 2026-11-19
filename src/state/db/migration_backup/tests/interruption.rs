@@ -106,12 +106,20 @@ async fn owned_migration_backup_direct_inbox_retirement_bounds_live_file_and_wal
 async fn owned_migration_backup_inbox_cleanup_and_compaction_recover_from_process_death() {
     for point in [
         "schema-migration-before-commit",
+        "schema-backup-retiring",
+        "schema-backup-removed",
         "inbox-during-vacuum",
         "inbox-vacuum-committed",
     ] {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        drop(large_inbox(root, 44));
+        let fixture = large_inbox(root, 44);
+        if point == "schema-backup-removed" {
+            fixture
+                .pragma_update(None, "journal_mode", "DELETE")
+                .unwrap();
+        }
+        drop(fixture);
         let path = root.join("state.db");
         let before = path.metadata().unwrap().len();
         let source = config(root);
@@ -119,6 +127,16 @@ async fn owned_migration_backup_inbox_cleanup_and_compaction_recover_from_proces
         child.0.kill().unwrap();
         assert_eq!(child.0.wait().unwrap().signal(), Some(9));
         let inspected = account::open_read_only(&path).unwrap();
+        if point == "schema-backup-removed" {
+            assert!(bundles(root).is_empty());
+            assert_eq!(
+                inspected
+                    .pragma_query_value::<String, _>(None, "journal_mode", |row| row.get(0))
+                    .unwrap(),
+                "wal"
+            );
+            assert_eq!(inspected.query_row::<i64,_,_>("SELECT count(*) FROM metadata WHERE key='schema_upgrade_temporary_bundle_v1'", [], |row| row.get(0)).unwrap(), 1);
+        }
         let cleanup_committed = point != "schema-migration-before-commit";
         assert_history(&inspected);
         assert_eq!(
@@ -167,7 +185,7 @@ async fn owned_migration_backup_inbox_cleanup_and_compaction_recover_from_proces
             }
         }
         assert!(before - path.metadata().unwrap().len() >= LEGACY_RESPONSE as u64);
-        assert_eq!(bundles(root).len(), if cleanup_committed { 1 } else { 2 });
+        assert_eq!(bundles(root).len(), usize::from(!cleanup_committed));
     }
 }
 
@@ -236,12 +254,14 @@ async fn owned_migration_backup_process_death_recovers_and_excludes_competing_wr
                     .unwrap();
             assert_history(&reopened.acquire_lock("recovered migration").unwrap());
         }
-        assert_eq!(bundles(root).len(), if committed { 1 } else { 2 });
-        assert_eq!(
-            std::fs::read(prior[0].join("state.db")).ok(),
-            prior_database,
-            "{point}: interrupted evidence must not be reused or overwritten"
-        );
+        assert_eq!(bundles(root).len(), usize::from(!committed));
+        if !committed {
+            assert_eq!(
+                std::fs::read(prior[0].join("state.db")).ok(),
+                prior_database,
+                "{point}: precommit evidence must not be reused or overwritten"
+            );
+        }
         for bundle in bundles(root)
             .iter()
             .filter(|bundle| bundle.join("manifest.json").exists())
@@ -432,7 +452,7 @@ async fn owned_migration_backup_delete_spill_process_death_refuses_then_restores
             schema::SCHEMA_VERSION
         );
     }
-    assert_eq!(bundles(root).len(), 2);
+    assert_eq!(bundles(root), saved);
     for (path, bytes) in evidence {
         let path =
             if path == root.join("state.db") || path == journal || path == root.join("custom.toml")

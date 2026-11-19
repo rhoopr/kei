@@ -143,7 +143,19 @@ impl SqliteStateDb {
                     expected: schema::SCHEMA_VERSION,
                 });
             }
+            let mut backup_retired = version < migration_backup::retirement::FIRST_SCHEMA
+                || migration_backup::retirement::finish(&mut conn, &cloned_path, &owner)?;
             if version < schema::SCHEMA_VERSION {
+                // The verified commit must outlive retirement of its rollback copy.
+                conn.pragma_update(None, "synchronous", "EXTRA")?;
+                // A subsequent release may encounter unfinished housekeeping
+                // from a previous, already committed schema upgrade.
+                if !backup_retired {
+                    return Err(StateError::Invariant {
+                        operation: "starting schema migration",
+                        detail: "previous upgrade's temporary bundle still needs cleanup".into(),
+                    });
+                }
                 let tx = conn
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(StateError::MigrationLock)?;
@@ -154,17 +166,20 @@ impl SqliteStateDb {
                 } else {
                     None
                 };
-                if let Some(backup) = &backup {
-                    tracing::info!(path = %backup.display(), "Pre-migration state/config backup saved; see restore.txt before restoring");
+                if let Some((backup, _)) = &backup {
+                    tracing::info!(path = %backup.display(), "Temporary migration backup saved until upgrade verification");
                 }
                 let migrated = schema::migrate(&tx).and_then(|()| {
+                    if let Some((_, receipt)) = &backup {
+                        receipt.record(&tx)?;
+                    }
                     #[cfg(all(test, target_os = "linux"))]
                     crate::test_helpers::process_death_point("schema-migration-before-commit");
                     tx.commit().map_err(StateError::Migration)
                 });
                 if let Err(source) = migrated {
                     return Err(match backup {
-                        Some(backup) => StateError::BackedUpMigration {
+                        Some((backup, _)) => StateError::BackedUpMigration {
                             backup,
                             source: Box::new(source),
                         },
@@ -173,9 +188,12 @@ impl SqliteStateDb {
                 }
                 #[cfg(all(test, target_os = "linux"))]
                 crate::test_helpers::process_death_point("schema-migration-committed");
+                backup_retired = migration_backup::retirement::finish(&mut conn, &cloned_path, &owner)?;
             }
             conn.pragma_update(None, "journal_mode", "WAL")?;
-            inbox_compaction::retry(&mut conn, &cloned_path)?;
+            if backup_retired {
+                inbox_compaction::retry(&mut conn, &cloned_path)?;
+            }
             conn.pragma_update(None, "synchronous", "NORMAL")?;
             conn.set_db_config(
                 rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,

@@ -120,7 +120,7 @@ fn bundles(root: &Path, state: BundleState) -> Vec<PathBuf> {
 }
 
 #[tokio::test]
-async fn owned_migration_backup_windows_wal_config_restore_and_quiet_reopens() {
+async fn owned_migration_backup_windows_verified_upgrade_removes_temporary_bundle() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let source = seed(root, 35);
@@ -129,42 +129,28 @@ async fn owned_migration_backup_windows_wal_config_restore_and_quiet_reopens() {
         .1;
     let config = std::fs::read(root.join("custom.toml")).unwrap();
     assert!(std::fs::metadata(root.join("state.db-wal")).unwrap().len() > 0);
+    // The verified upgrade deletes its own bundle, so retain exact pre-upgrade
+    // WAL content in a fixture copy before the production open.
+    let snapshot = crate::test_helpers::snapshot_database(&root.join("state.db"));
+    assert_history(&snapshot);
+    assert_eq!(schema::get_schema_version(&snapshot).unwrap(), 35);
+    assert_eq!(
+        snapshot
+            .pragma_query_value::<String, _>(None, "journal_mode", |row| row.get(0))
+            .unwrap(),
+        "delete"
+    );
     drop(
         SqliteStateDb::open_owned_with_config(&root.join("state.db"), &owner(), &context)
             .await
             .unwrap(),
     );
-    let complete = bundles(root, Complete);
-    assert_eq!(complete.len(), 1);
+    assert!(
+        bundles(root, Complete).is_empty(),
+        "a successful verified upgrade must remove its own temporary bundle"
+    );
     assert!(bundles(root, Partial).is_empty());
-    let bundle = &complete[0];
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
-    assert_eq!(manifest["native_path_encoding"], "windows_utf16le_hex");
-    assert_eq!(manifest["schema_version"], 35);
-    assert_eq!(
-        manifest["database_sha256"],
-        super::digest(&bundle.join("state.db")).unwrap()
-    );
-    assert_eq!(std::fs::read(bundle.join("config.toml")).unwrap(), config);
-    let restore = tempfile::tempdir().unwrap();
-    std::fs::copy(bundle.join("state.db"), restore.path().join("restored.db")).unwrap();
-    std::fs::copy(
-        bundle.join("config.toml"),
-        restore.path().join("restored.toml"),
-    )
-    .unwrap();
-    let restored = Connection::open(restore.path().join("restored.db")).unwrap();
-    assert_history(&restored);
-    assert_eq!(schema::get_schema_version(&restored).unwrap(), 35);
-    assert_eq!(
-        restored
-            .pragma_query_value::<String, _>(None, "journal_mode", |row| row.get(0))
-            .unwrap(),
-        "delete"
-    );
-    assert!(!restore.path().join("restored.db-wal").exists());
-    load_toml_config_with_source(&restore.path().join("restored.toml"), true).unwrap();
+    drop(snapshot);
     drop(source);
     for _ in 0..2 {
         let reopened = SqliteStateDb::open_owned_with_config(
@@ -175,8 +161,14 @@ async fn owned_migration_backup_windows_wal_config_restore_and_quiet_reopens() {
         .await
         .unwrap();
         assert_history(&reopened.acquire_lock("quiet Windows reopen").unwrap());
-        assert_eq!(bundles(root, Complete).len(), 1);
+        assert!(bundles(root, Complete).is_empty());
+        assert!(bundles(root, Partial).is_empty());
     }
+    assert_eq!(
+        std::fs::read(root.join("custom.toml")).unwrap(),
+        config,
+        "the deleted bundle must not alter the loaded config source"
+    );
     assert_eq!(
         std::fs::read(root.join("kept.jpg")).unwrap(),
         b"existing media"
@@ -213,14 +205,18 @@ async fn owned_migration_backup_windows_storage_failure_retains_partial_then_rec
                 .await
                 .unwrap(),
         );
+        assert!(
+            bundles(root, Complete).is_empty(),
+            "each successful verified upgrade removes only its own bundle"
+        );
+        assert_eq!(
+            bundles(root, Partial),
+            partial,
+            "the interrupted partial bundle is prior evidence and stays untouched"
+        );
     }
-    assert_eq!(bundles(root, Complete).len(), 1);
+    assert_eq!(bundles(root, Complete).len(), 0);
     assert_eq!(std::fs::read(partial[0].join("state.db")).unwrap(), bytes);
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(bundles(root, Complete)[0].join("manifest.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(manifest["config"]["kind"], "absent");
 }
 
 #[test]
@@ -263,6 +259,34 @@ async fn owned_migration_backup_windows_late_failure_rolls_back_wal_and_delete_t
         };
         assert!(backup.join("manifest.json").is_file());
         assert!(bundles(root, Partial).is_empty());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(backup.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["native_path_encoding"], "windows_utf16le_hex");
+        assert_eq!(manifest["schema_version"], 34);
+        assert_eq!(
+            manifest["database_sha256"],
+            super::digest(&backup.join("state.db")).unwrap()
+        );
+        assert_eq!(std::fs::read(backup.join("config.toml")).unwrap(), config);
+        let restore = tempfile::tempdir().unwrap();
+        std::fs::copy(backup.join("state.db"), restore.path().join("restored.db")).unwrap();
+        std::fs::copy(
+            backup.join("config.toml"),
+            restore.path().join("restored.toml"),
+        )
+        .unwrap();
+        let restored = Connection::open(restore.path().join("restored.db")).unwrap();
+        assert_history(&restored);
+        assert_eq!(schema::get_schema_version(&restored).unwrap(), 34);
+        assert_eq!(
+            restored
+                .pragma_query_value::<String, _>(None, "journal_mode", |row| row.get(0))
+                .unwrap(),
+            "delete"
+        );
+        assert!(!restore.path().join("restored.db-wal").exists());
+        load_toml_config_with_source(&restore.path().join("restored.toml"), true).unwrap();
+        drop(restored);
         assert_eq!(schema::get_schema_version(&conn).unwrap(), 34);
         assert_history(&conn);
         assert_eq!(
@@ -311,7 +335,12 @@ async fn owned_migration_backup_windows_late_failure_rolls_back_wal_and_delete_t
                 schema::SCHEMA_VERSION
             );
         }
-        assert_eq!(bundles(root, Complete).len(), 2);
+        assert_eq!(
+            bundles(root, Complete).len(),
+            1,
+            "{mode}: the failed-migration bundle is untouched and the successful upgrade removes its own"
+        );
+        assert!(bundles(root, Partial).is_empty());
         assert_eq!(std::fs::read(backup.join("state.db")).unwrap(), saved);
         assert_eq!(std::fs::read(root.join("custom.toml")).unwrap(), config);
         assert_eq!(
@@ -387,8 +416,8 @@ async fn owned_migration_backup_windows_stage_substitution_refuses_migration_the
     }
     assert_eq!(
         bundles(root, Complete).len(),
-        2,
-        "one fresh real backup, no repeated quiet backups"
+        1,
+        "the substituted foreign bundle is prior evidence; the successful upgrade removes its own"
     );
     assert_eq!(
         std::fs::read(preserved.join("state.db")).unwrap(),
@@ -511,7 +540,16 @@ async fn owned_migration_backup_windows_process_termination_preserves_partial_an
                     .unwrap();
             assert_history(&reopened.acquire_lock("Windows restart recovery").unwrap());
         }
-        assert_eq!(bundles(root, Complete).len(), 1 + usize::from(published));
+        assert_eq!(
+            bundles(root, Complete).len(),
+            usize::from(published),
+            "{point}: a successful verified upgrade removes only its own bundle"
+        );
+        assert_eq!(
+            bundles(root, Partial).len(),
+            usize::from(!published),
+            "{point}: the interrupted stage is prior evidence and stays untouched"
+        );
         assert_eq!(
             std::fs::read(root.join("kept.jpg")).unwrap(),
             b"existing media"

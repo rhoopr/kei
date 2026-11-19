@@ -3,7 +3,9 @@ use crate::icloud::photos::inbox::ShadowCapture;
 use crate::icloud::photos::session::PhotosSession;
 use crate::state::SqliteStateDb;
 use crate::state::db::account::AccountOwner;
-use crate::test_helpers::{assert_no_retired_inbox_archive, single_recovery_bundle_connection};
+use crate::test_helpers::{
+    assert_no_retired_inbox_archive, assert_no_temporary_backup_bundles, snapshot_database,
+};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -167,9 +169,12 @@ async fn shadow_source_payload_roundtrip_preserves_history_and_current_replay_pa
         .unwrap();
     drop(bound);
     drop(db);
+    // The successful upgrade removes its own temporary bundle, so capture the
+    // exact pre-upgrade fixture before the first reopen.
+    let original = snapshot_database(&path);
     for _ in 0..2 {
         let db = open(&path).await;
-        let original = single_recovery_bundle_connection(directory.path());
+        assert_no_temporary_backup_bundles(directory.path());
         let stored: Vec<u8> = original
             .query_row("SELECT body FROM provider_shadow_pages", [], |row| {
                 row.get(0)

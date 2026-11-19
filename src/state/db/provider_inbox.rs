@@ -355,7 +355,7 @@ impl SqliteStateDb {
 mod tests {
     use super::{CapturedPageId, ObservedPage, SourceIdentity, StoredPage, load_page};
     use crate::state::db::account::AccountOwner;
-    use crate::test_helpers::{assert_no_retired_inbox_archive, single_recovery_bundle_connection};
+    use crate::test_helpers::{assert_no_retired_inbox_archive, snapshot_database};
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
 
@@ -625,6 +625,9 @@ mod tests {
                 UPDATE provider_shadow_pages SET body=X'' WHERE id=2;").unwrap();
             alias_rows(&conn, "provider_transport_aliases")
         };
+        // A successful upgrade removes its own temporary bundle. Capture the
+        // exact pre-upgrade database before the production open instead.
+        let original = snapshot_database(&path);
         for cycle in 0..3 {
             let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
                 .await
@@ -653,7 +656,6 @@ mod tests {
             );
             assert!(alias_rows(&conn, "provider_transport_aliases").is_empty());
             assert_no_retired_inbox_archive(&conn);
-            let original = single_recovery_bundle_connection(directory.path());
             assert_eq!(
                 original
                     .query_row::<Vec<u8>, _, _>(
@@ -779,6 +781,8 @@ mod tests {
             );
             id
         };
+        // The upgrade's own temporary bundle is deleted on success.
+        let original = snapshot_database(&path);
         let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
             .await
             .unwrap();
@@ -808,7 +812,6 @@ mod tests {
             "an unprovable projection must not gain an alias or index"
         );
         assert_no_retired_inbox_archive(&conn);
-        let original = single_recovery_bundle_connection(directory.path());
         let (
             body,
             body_hash,
@@ -860,6 +863,8 @@ mod tests {
                 )
                 .unwrap()
             };
+            // Exact evidence must come from before the successful upgrade.
+            let original = snapshot_database(&path);
             let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
                 .await
                 .unwrap();
@@ -877,7 +882,6 @@ mod tests {
                 "{sql}"
             );
             assert_no_retired_inbox_archive(&conn);
-            let original = single_recovery_bundle_connection(directory.path());
             let archived: Vec<u8> = original
                 .query_row(
                     "SELECT body FROM provider_shadow_pages WHERE id=2",
@@ -911,12 +915,13 @@ mod tests {
         assert_eq!(before.0, 35);
         assert_eq!(u64::try_from(before.1).unwrap(), budget);
 
+        // The successful upgrade removes its own temporary bundle.
+        let original = snapshot_database(&path);
         let db = std::sync::Arc::new(
             crate::state::SqliteStateDb::open_owned(&path, &owner)
                 .await
                 .unwrap(),
         );
-        let original = single_recovery_bundle_connection(directory.path());
         let mut capture = crate::icloud::photos::inbox::ShadowCapture::new(
             db.clone(),
             owner.clone(),
