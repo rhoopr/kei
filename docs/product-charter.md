@@ -80,8 +80,4 @@ provider expansion, destination work, UI, and deletion workflows are later.
 
 ## Roadmap source of truth
 
-The public roadmap lives in [docs/roadmap.md](roadmap.md). Versioned GitHub
-milestones and issues track committed release work. The `later` milestone
-categorizes deferred work without promising a release. GitHub Discussions are
-for discovery, RFCs, and user feedback. `.scratch/` files are retained research
-and planning notes, not public product truth.
+[GitHub milestones](https://github.com/rhoopr/kei/milestones) and their issues track committed release work. The `later` milestone groups deferred work without promising a release.
