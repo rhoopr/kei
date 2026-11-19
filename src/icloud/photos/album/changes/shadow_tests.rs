@@ -3,6 +3,9 @@ use crate::icloud::photos::inbox::ShadowCapture;
 use crate::icloud::photos::session::PhotosSession;
 use crate::state::SqliteStateDb;
 use crate::state::db::account::AccountOwner;
+use crate::test_helpers::{
+    assert_no_retired_inbox_archive, assert_no_temporary_backup_bundles, snapshot_database,
+};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -166,23 +169,24 @@ async fn shadow_source_payload_roundtrip_preserves_history_and_current_replay_pa
         .unwrap();
     drop(bound);
     drop(db);
+    // The successful upgrade removes its own temporary bundle, so capture the
+    // exact pre-upgrade fixture before the first reopen.
+    let original = snapshot_database(&path);
     for _ in 0..2 {
         let db = open(&path).await;
-        let stored: Vec<u8> = db
-            .acquire_lock("independent raw replay")
-            .unwrap()
-            .query_row(
-                "SELECT body FROM historical_v030_provider_shadow_pages",
-                [],
-                |row| row.get(0),
-            )
+        assert_no_temporary_backup_bundles(directory.path());
+        let stored: Vec<u8> = original
+            .query_row("SELECT body FROM provider_shadow_pages", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(stored, body);
         assert!(String::from_utf8_lossy(&stored).contains("9007199254740993.0"));
         {
             let conn = db.acquire_lock("scope and ordinal facts").unwrap();
-            let (scope, request, successor, account, provider): (String,String,String,String,String) = conn.query_row(
-                "SELECT scope,request_cursor,successor,account_key,provider_key FROM historical_v030_provider_shadow_pages", [],
+            assert_no_retired_inbox_archive(&conn);
+            let (scope, request, successor, account, provider): (String,String,String,String,String) = original.query_row(
+                "SELECT scope,request_cursor,successor,account_key,provider_key FROM provider_shadow_pages", [],
                 |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
             let scope: Value = serde_json::from_str(&scope).unwrap();
             assert_eq!(scope["realm"], "com");
@@ -196,7 +200,7 @@ async fn shadow_source_payload_roundtrip_preserves_history_and_current_replay_pa
             );
             assert!(account.starts_with("account-v1-"));
             assert_eq!(provider.len(), 64);
-            let mut query = conn.prepare("SELECT ordinal,record_name,record_type,deleted FROM historical_v030_provider_shadow_records ORDER BY ordinal").unwrap();
+            let mut query = original.prepare("SELECT ordinal,record_name,record_type,deleted FROM provider_shadow_records ORDER BY ordinal").unwrap();
             let identities: Vec<(i64, String, Option<String>, bool)> = query
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                 .unwrap()

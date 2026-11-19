@@ -498,7 +498,7 @@ fn seed_restore(root: &Path, account: &Account, server: &str) -> Account {
 
 #[cfg(any(unix, windows))]
 fn migration_backup_bundles(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    std::fs::read_dir(root)
+    let (mut saved, mut incomplete): (Vec<_>, Vec<_>) = std::fs::read_dir(root)
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| {
@@ -513,7 +513,92 @@ fn migration_backup_bundles(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
                     .extension()
                     .is_none_or(|extension| extension != "partial")
                 && path.join("manifest.json").is_file()
+        });
+    saved.sort();
+    incomplete.sort();
+    (saved, incomplete)
+}
+
+/// This release's temporary bundles, complete or interrupted. A successful
+/// verified upgrade removes its own; failures and prior releases leave theirs.
+#[cfg(any(unix, windows))]
+fn temporary_backup_bundles(root: &Path) -> Vec<PathBuf> {
+    let mut bundles = std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with(".kei-schema-backup-tmp-")
+            })
         })
+        .collect::<Vec<_>>();
+    bundles.sort();
+    bundles
+}
+
+/// Seed an older durable recovery bundle. The new policy must never discover,
+/// modify, or delete bundles it did not create for this upgrade.
+#[cfg(any(unix, windows))]
+fn seed_prior_backup(root: &Path) -> PathBuf {
+    let bundle = root.join(".kei-schema-backup-prior-evidence");
+    std::fs::create_dir(&bundle).unwrap();
+    std::fs::write(bundle.join("manifest.json"), br#"{"format":1}"#).unwrap();
+    std::fs::write(bundle.join("state.db"), b"prior recovery database").unwrap();
+    std::fs::write(bundle.join("restore.txt"), b"prior restore instructions").unwrap();
+    bundle
+}
+
+#[cfg(any(unix, windows))]
+fn bundle_files(bundle: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files = std::fs::read_dir(bundle)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
+#[cfg(any(unix, windows))]
+fn file_digest(path: &Path) -> String {
+    format!("{:x}", Sha256::digest(std::fs::read(path).unwrap()))
+}
+
+#[cfg(any(unix, windows))]
+fn assert_verification_failure(args: &[&str], out: &std::process::Output) {
+    let message = "Could not verify the upgraded state database";
+    if args.first() == Some(&"doctor") {
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let state = report
+            .get("checks")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .find(|check| check.get("name").and_then(Value::as_str) == Some("state_db"))
+            .unwrap();
+        assert_eq!(
+            state.get("status").and_then(Value::as_str),
+            Some("error"),
+            "{args:?}: {state}"
+        );
+        assert!(
+            state
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains(message)
+                    || (text.starts_with("state DB read failed at ")
+                        && text.ends_with(": <redacted>"))),
+            "{args:?}: {state}"
+        );
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?}: {stderr}");
+        assert!(stderr.contains(message), "{args:?}: {stderr}");
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -542,7 +627,8 @@ fn migration_backup_discovery_requires_final_directory_and_manifest() {
 
 #[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn migration_backup_every_writable_cli_path_preserves_matching_config_and_wal_history() {
+async fn migration_backup_every_writable_cli_path_removes_its_own_bundle_and_keeps_prior_evidence()
+{
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(OfflinePhotos)
@@ -587,73 +673,141 @@ async fn migration_backup_every_writable_cli_path_preserves_matching_config_and_
                 .len()
                 > 0
         );
+        // An unknown child of a missing parent commits with foreign-key
+        // enforcement off, then fails post-commit verification. The retained
+        // bundle is the exact pre-command state and loaded config.
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             CREATE TABLE verify_parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE verify_child(id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES verify_parent(id));
+             INSERT INTO verify_child(id,parent_id) VALUES (1, 99);
+             PRAGMA foreign_keys=ON;",
+        )
+        .unwrap();
         let before = state(&account.path);
-        migration_command(root, &account, args).await;
+        let prior = seed_prior_backup(root);
+        let prior_files = bundle_files(&prior);
+        let failed = command(root, &account, args);
+        assert_verification_failure(args, &failed);
+        assert_eq!(
+            conn.query_row::<i32, _, _>("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+            super::HELPER_SCHEMA_VERSION,
+            "{args:?}: the migration commits before verification"
+        );
         let (saved, incomplete) = migration_backup_bundles(root);
         assert!(
             incomplete.is_empty(),
             "{args:?}: incomplete bundles: {incomplete:?}"
         );
+        let retained = temporary_backup_bundles(root);
         assert_eq!(
-            saved.len(),
+            retained.len(),
             1,
-            "{args:?}: must reach the shared backup boundary"
+            "{args:?}: verification failure retains its exact snapshot"
         );
-        let bundle = &saved[0];
-        assert!(bundle.join("manifest.json").exists());
+        let retained = retained[0].clone();
+        let mut expected = vec![prior.clone(), retained.clone()];
+        expected.sort();
+        assert_eq!(saved, expected);
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(retained.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["schema_version"], 35);
+        assert_eq!(manifest["config"]["kind"], "file");
         assert_eq!(
-            std::fs::read(bundle.join("config.toml")).unwrap(),
+            std::fs::read(retained.join("config.toml")).unwrap(),
             config_bytes,
-            "{args:?}: actual --config source"
+            "{args:?}: exact loaded --config source"
         );
         assert_eq!(
-            state(&bundle.join("state.db")),
+            manifest["config"]["sha256"],
+            file_digest(&retained.join("config.toml"))
+        );
+        assert_eq!(
+            manifest["database_sha256"],
+            file_digest(&retained.join("state.db"))
+        );
+        #[cfg(unix)]
+        assert_eq!(manifest["native_path_encoding"], "unix_bytes_hex");
+        #[cfg(windows)]
+        assert_eq!(manifest["native_path_encoding"], "windows_utf16le_hex");
+        assert!(!retained.join("state.db-wal").exists());
+        {
+            let snapshot = Connection::open_with_flags(
+                retained.join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            assert_eq!(
+                snapshot
+                    .query_row::<i32, _, _>("PRAGMA user_version", [], |row| row.get(0))
+                    .unwrap(),
+                35
+            );
+            assert_eq!(
+                snapshot
+                    .query_row::<Vec<u8>, _, _>("SELECT payload FROM future_unknown", [], |row| row
+                        .get(0))
+                    .unwrap(),
+                [0, 255, 7]
+            );
+        }
+        assert_eq!(
+            state(&retained.join("state.db")),
             before,
-            "{args:?}: pre-command receipts and history"
+            "{args:?}: exact pre-command receipts, history and WAL content"
         );
-        let snapshot = Connection::open(bundle.join("state.db")).unwrap();
-        assert_eq!(
-            snapshot
-                .query_row::<i32, _, _>("PRAGMA user_version", [], |row| row.get(0))
-                .unwrap(),
-            35
+        // Remove only the injected verification fault and rerun the same route.
+        Connection::open(&account.path)
+            .unwrap()
+            .execute_batch("DROP TABLE verify_child; DROP TABLE verify_parent;")
+            .unwrap();
+        migration_command(root, &account, args).await;
+        assert!(
+            temporary_backup_bundles(root).is_empty(),
+            "{args:?}: the verified retry removes its own temporary bundle"
+        );
+        assert!(!retained.exists());
+        let (reopened, incomplete) = migration_backup_bundles(root);
+        assert!(
+            incomplete.is_empty(),
+            "{args:?}: incomplete bundles: {incomplete:?}"
         );
         assert_eq!(
-            snapshot
-                .query_row::<Vec<u8>, _, _>("SELECT payload FROM future_unknown", [], |row| row
-                    .get(0))
-                .unwrap(),
-            [0, 255, 7]
+            reopened,
+            std::slice::from_ref(&prior),
+            "{args:?}: only the prior recovery bundle remains"
         );
-        assert!(!bundle.join("state.db-wal").exists());
-        let snapshot_bytes = std::fs::read(bundle.join("state.db")).unwrap();
         assert_eq!(
-            conn.query_row::<i32, _, _>("PRAGMA user_version", [], |row| row.get(0))
-                .unwrap(),
-            super::HELPER_SCHEMA_VERSION
+            bundle_files(&prior),
+            prior_files,
+            "{args:?}: prior recovery evidence must stay untouched"
+        );
+        assert_eq!(
+            std::fs::read(&account.config).unwrap(),
+            config_bytes,
+            "{args:?}: the exact --config source is unchanged"
+        );
+        assert_eq!(
+            std::fs::read(&account.media).unwrap(),
+            b"known media belonging only to account A"
         );
         for _ in 0..2 {
             migration_command(root, &account, args).await;
+            assert!(temporary_backup_bundles(root).is_empty());
             let (reopened, incomplete) = migration_backup_bundles(root);
             assert!(
                 incomplete.is_empty(),
                 "{args:?}: incomplete bundles: {incomplete:?}"
             );
             assert_eq!(
-                reopened.len(),
-                1,
-                "{args:?}: quiet reopens do not back up again"
+                reopened,
+                std::slice::from_ref(&prior),
+                "{args:?}: quiet reopens neither back up again nor touch prior evidence"
             );
-            assert_eq!(
-                std::fs::read(bundle.join("state.db")).unwrap(),
-                snapshot_bytes
-            );
+            assert_eq!(bundle_files(&prior), prior_files);
         }
-        assert_eq!(std::fs::read(&account.config).unwrap(), config_bytes);
-        assert_eq!(
-            std::fs::read(&account.media).unwrap(),
-            b"known media belonging only to account A"
-        );
     }
 }
 
@@ -664,7 +818,12 @@ fn migration_backup_no_file_context_stays_absent_until_retained_state_is_backed_
     let root = directory.path();
     let account = seed(root, ACCOUNTS[0], "A", "http://127.0.0.1:1");
     let conn = Connection::open(&account.path).unwrap();
-    conn.execute_batch("DROP TABLE provider_transport_aliases; DROP TABLE provider_transport_canonical; PRAGMA user_version=35;").unwrap();
+    // Fail the schema-44 deletion-check migration with a conflicting fixture
+    // table so the startup bundle is retained for exact inspection.
+    conn.execute_batch("DROP TABLE provider_transport_aliases; DROP TABLE provider_transport_canonical;
+        DROP TRIGGER IF EXISTS historical_deletion_observed; DROP TRIGGER IF EXISTS historical_deletion_inserted;
+        DROP INDEX IF EXISTS historical_deletion_due; DROP TABLE historical_deletion_checks;
+        PRAGMA user_version=35; CREATE TABLE historical_deletion_checks(fake TEXT);").unwrap();
     std::fs::remove_file(&account.config).unwrap();
     let original = std::fs::read(&account.path).unwrap();
     let refused = command(root, &account, &["sync"]);
@@ -677,21 +836,42 @@ fn migration_backup_no_file_context_stays_absent_until_retained_state_is_backed_
     assert_eq!(std::fs::read(&account.path).unwrap(), original);
     let (saved, incomplete) = migration_backup_bundles(root);
     assert!(saved.is_empty() && incomplete.is_empty());
-    success(&command(root, &account, &["status"]));
+    // A failed migration never records the retirement receipt, so its complete
+    // bundle remains as the exact pre-upgrade config-absence evidence.
+    let failed = command(root, &account, &["status"]);
+    assert!(!failed.status.success());
     let (saved, incomplete) = migration_backup_bundles(root);
     assert!(incomplete.is_empty(), "incomplete bundles: {incomplete:?}");
     assert_eq!(saved.len(), 1);
-    let bundle = &saved[0];
+    let bundle = saved[0].clone();
     let manifest: Value =
         serde_json::from_slice(&std::fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest["config"]["kind"], "absent");
     assert!(!bundle.join("config.toml").exists());
     assert!(!account.config.exists());
+    let failed_files = bundle_files(&bundle);
+    // Remove only the injected conflict. The next successful upgrade removes
+    // its own bundle and leaves the failed one untouched.
+    Connection::open(&account.path)
+        .unwrap()
+        .execute_batch("DROP TABLE historical_deletion_checks")
+        .unwrap();
+    success(&command(root, &account, &["status"]));
+    let (retained, incomplete) = migration_backup_bundles(root);
+    assert_eq!(retained, std::slice::from_ref(&bundle));
+    assert!(incomplete.is_empty(), "incomplete bundles: {incomplete:?}");
+    assert_eq!(bundle_files(&bundle), failed_files);
+    assert_eq!(
+        temporary_backup_bundles(root),
+        std::slice::from_ref(&bundle)
+    );
+    assert!(!account.config.exists());
     for _ in 0..2 {
         success(&command(root, &account, &["status"]));
         let (reopened, incomplete) = migration_backup_bundles(root);
-        assert_eq!(reopened, saved);
+        assert_eq!(reopened, std::slice::from_ref(&bundle));
         assert!(incomplete.is_empty(), "incomplete bundles: {incomplete:?}");
+        assert_eq!(bundle_files(&bundle), failed_files);
         assert!(!account.config.exists());
     }
 }

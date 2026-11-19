@@ -20,7 +20,7 @@ For a specific component, see the [module index](architecture/module-index.md). 
 
 ## Main flows
 
-**Startup.** Dispatch resolves configuration before opening account-owned state. `src/config/paths.rs` discovers one application root so a new XDG setting cannot silently split existing credentials and state. Ambiguous roots fail closed. Linux service installation records the resolved config path and path overrides. See [startup, account ownership, and schema backups](architecture/startup.md).
+**Startup.** Dispatch resolves configuration before opening account-owned state. `src/config/paths.rs` discovers one application root so a new XDG setting cannot silently split existing credentials and state. Ambiguous roots fail closed. Linux service installation records the resolved config path and path overrides. The writable state opener verifies schema upgrades and retires their temporary backups before post-upgrade inbox compaction. See [startup, account ownership, and schema backups](architecture/startup.md).
 
 **Sync.** The runner resolves the session, libraries, and pass plans. Each cycle dispatches work per library, evaluates source progress per zone, and reports the result to watch control. A cursor records where to resume; the retained inbox holds source observations; destination receipts record local work. None substitutes for the others. See [provider capture and destination replay](architecture/provider-replay.md) and [checkpoint decisions and enumeration](architecture/checkpoints.md).
 

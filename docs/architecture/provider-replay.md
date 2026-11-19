@@ -75,7 +75,7 @@ projection recovers on the next equivalent observation.
 
 The transport-index schema step creates and validates its tables without compacting historical bodies. Schema 38 retires historical pages before that step; the legacy compaction algorithm, dependency-validation checks and telemetry event path have been removed. Historical diagnostic fields remain readable. New cycles record `not_observed`, zero event counts and unknown byte-reclaim totals. Current capture still uses the canonical index to avoid repeated equivalent observations.
 
-Current page loading has one raw-byte path: it validates the stored owner, continuation flag, size bound, SHA-256 and ordinal identities. Current capture verifies exact or provider-classified equivalent raw observations against that loaded page. Historical alias records and their representative bytes remain in the upgrade snapshots; they have no runtime readers or writers. The empty legacy-alias table remains in the schema for compatibility with existing schema shapes.
+Current page loading has one raw-byte path: it validates the stored owner, continuation flag, size bound, SHA-256 and ordinal identities. Current capture verifies exact or provider-classified equivalent raw observations against that loaded page. Historical alias records remain in the live upgrade snapshots. Their original response bytes are retired after [upgrade verification](startup.md#owned-schema-upgrade-backups). Neither has a runtime replay consumer. The empty legacy-alias table remains in the schema for compatibility with existing schema shapes.
 
 A shadow receipt is only the last observed page, and replay can move it back. It
 is not a coverage frontier, materialization receipt or verified filesystem

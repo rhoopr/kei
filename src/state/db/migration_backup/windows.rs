@@ -42,6 +42,10 @@ pub(super) struct Stage {
 }
 
 impl Stage {
+    pub(super) fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
     pub(super) fn publish(&mut self, published: &Path) -> io::Result<()> {
         let destination = self.confinement.sibling(published)?;
         // Open the rename-compatible handle while the original no-delete handle

@@ -106,6 +106,14 @@ pub enum StateError {
         #[source]
         source: Box<StateError>,
     },
+    #[error(
+        "Could not verify the upgraded state database; the temporary recovery bundle at {backup} has not been retired: {source}"
+    )]
+    UpgradeVerification {
+        backup: PathBuf,
+        #[source]
+        source: anyhow::Error,
+    },
 
     /// Failed to create the parent directory for the database file.
     ///

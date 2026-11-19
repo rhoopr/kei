@@ -215,6 +215,11 @@ pub(crate) struct ConfinedPath {
     parent_identity: FileIdentity,
 }
 
+pub(crate) enum RemovalKind {
+    File,
+    EmptyDirectory,
+}
+
 impl ConfinedPath {
     pub(crate) fn open(
         root: &Path,
@@ -550,6 +555,52 @@ impl ConfinedPath {
         #[cfg(windows)]
         {
             Ok(())
+        }
+    }
+
+    /// Remove a known leaf (or an empty directory), never a subtree.
+    pub(crate) fn remove_verified(
+        &self,
+        expected: FileIdentity,
+        kind: RemovalKind,
+    ) -> std::io::Result<()> {
+        if self.entry_identity()? != expected {
+            return Err(confined_identity_changed_error(&self.path));
+        }
+        #[cfg(unix)]
+        {
+            let flags = match kind {
+                RemovalKind::EmptyDirectory => libc::AT_REMOVEDIR,
+                RemovalKind::File => 0,
+            };
+            // SAFETY: the retained parent descriptor and NUL-terminated leaf
+            // remain live. unlinkat never follows the leaf or removes a tree.
+            if unsafe { libc::unlinkat(self.parent_fd(), self.name_cstr().as_ptr(), flags) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+                FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+            let flags = FILE_FLAG_OPEN_REPARSE_POINT
+                | match kind {
+                    RemovalKind::EmptyDirectory => FILE_FLAG_BACKUP_SEMANTICS,
+                    RemovalKind::File => 0,
+                };
+            let file = std::fs::OpenOptions::new()
+                .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+                .custom_flags(flags)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&self.path)?;
+            if file_identity(&file)? != expected {
+                return Err(confined_identity_changed_error(&self.path));
+            }
+            delete_windows_handle(&file)
         }
     }
 
@@ -891,29 +942,34 @@ impl ConfinedRegularFile {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Storage::FileSystem::{
-                FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
-            };
-
-            let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
-            // SAFETY: the file handle is live and was opened with DELETE
-            // access. `disposition` has the layout and size required by
-            // FileDispositionInfo and outlives the call.
-            let result = unsafe {
-                SetFileInformationByHandle(
-                    self.file.as_raw_handle() as isize,
-                    FileDispositionInfo,
-                    std::ptr::from_ref(&disposition).cast(),
-                    std::mem::size_of_val(&disposition) as u32,
-                )
-            };
-            if result != 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
+            delete_windows_handle(&self.file)
         }
+    }
+}
+
+#[cfg(windows)]
+fn delete_windows_handle(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    // SAFETY: the file handle is live and was opened with DELETE
+    // access. `disposition` has the layout and size required by
+    // FileDispositionInfo and outlives the call.
+    let result = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as isize,
+            FileDispositionInfo,
+            std::ptr::from_ref(&disposition).cast(),
+            std::mem::size_of_val(&disposition) as u32,
+        )
+    };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 

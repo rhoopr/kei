@@ -2,9 +2,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 
 use super::{publish_manifest, write_bundle};
 use crate::config::{ConfigSource, load_toml_config_with_source};
+use crate::state::db::provider_inbox::{CapturedPageId, load_page};
 use crate::state::{SqliteStateDb, db::account, error::StateError, schema};
 
 static IO_FAULT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
@@ -111,24 +113,216 @@ fn config(root: &Path) -> ConfigSource {
     load_toml_config_with_source(&path, true).unwrap().1
 }
 
+const LEGACY_RESPONSE: usize = 12 * 1024 * 1024;
+
+fn verification_fault(conn: &Connection) {
+    conn.execute_batch("PRAGMA foreign_keys=OFF; CREATE TABLE verify_parent(id INTEGER PRIMARY KEY);
+        CREATE TABLE verify_child(id INTEGER REFERENCES verify_parent); INSERT INTO verify_child VALUES(1);
+        PRAGMA foreign_keys=ON;").unwrap();
+}
+
+fn large_inbox(root: &Path, version: i32) -> Connection {
+    let conn = old_database(root, version);
+    conn.execute(
+        "INSERT INTO provider_shadow_pages SELECT 1,account_key,provider_key,'scope',
+         'original-cursor','next',0,'legacy hash',?1,length(?1),1 FROM account_owner",
+        [vec![0xa5_u8; LEGACY_RESPONSE]],
+    )
+    .unwrap();
+    if version == 44 {
+        conn.execute_batch(
+            "CREATE TABLE historical_v030_provider_shadow_pages AS SELECT * FROM provider_shadow_pages;
+             CREATE TABLE historical_v030_provider_shadow_records AS SELECT * FROM provider_shadow_records;
+             CREATE TABLE historical_v030_provider_shadow_receipts AS SELECT * FROM provider_shadow_receipts;
+             CREATE TABLE historical_v030_provider_shadow_pages_extra AS SELECT payload FROM future_unknown;",
+        ).unwrap();
+        let current = b"{\"records\":[]}";
+        conn.execute(
+            "UPDATE provider_shadow_pages SET body=?1, body_hash=?2",
+            rusqlite::params![current, format!("{:x}", Sha256::digest(current))],
+        )
+        .unwrap();
+        conn.execute_batch("INSERT INTO provider_catalog_pages SELECT id,1,body_hash,0,0,0,96 FROM provider_shadow_pages").unwrap();
+    }
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    conn
+}
+
+#[tokio::test]
+async fn owned_migration_backup_busy_inbox_compaction_defers_without_blocking_sync_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer = large_inbox(dir.path(), 44);
+    peer.execute_batch("BEGIN; SELECT 1 FROM provider_shadow_pages")
+        .unwrap();
+    let path = dir.path().join("state.db");
+    let before = path.metadata().unwrap().len();
+    let source = config(dir.path());
+    let db = SqliteStateDb::open_owned_with_config(&path, &owner(), &source)
+        .await
+        .unwrap();
+    assert!(
+        db.get_metadata(schema::INBOX_COMPACTION_PENDING)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        bundles(dir.path()).is_empty(),
+        "verification releases the backup even while compaction is blocked"
+    );
+    db.set_metadata("sync_progress", "continued").await.unwrap();
+    drop(db);
+    drop(peer);
+    let db = SqliteStateDb::open_owned_with_config(&path, &owner(), &source)
+        .await
+        .unwrap();
+    assert!(
+        db.get_metadata(schema::INBOX_COMPACTION_PENDING)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        db.get_metadata("sync_progress").await.unwrap().as_deref(),
+        Some("continued")
+    );
+    // Successful maintenance must release its exclusive lock before sync.
+    let reader = account::open_read_only(&path).unwrap();
+    assert_history(&reader);
+    drop(reader);
+    drop(db);
+    assert!(before - path.metadata().unwrap().len() >= LEGACY_RESPONSE as u64);
+}
+
+#[tokio::test]
+async fn owned_migration_backup_large_inbox_reclaims_file_and_retains_response() {
+    for version in [36, 44] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let fixture = large_inbox(dir.path(), version);
+        verification_fault(&fixture);
+        fixture
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        drop(fixture);
+        let before = path.metadata().unwrap().len();
+        let source = config(dir.path());
+        let refused = SqliteStateDb::open_owned_with_config(&path, &owner(), &source).await;
+        assert!(
+            matches!(refused, Err(StateError::UpgradeVerification { .. })),
+            "{refused:?}"
+        );
+        let backups = bundles(dir.path());
+        assert_eq!(backups.len(), 1);
+        let backup_path = backups[0].join("state.db");
+        let backup_bytes = backup_path.metadata().unwrap().len();
+        {
+            let backup = account::open_read_only(&backup_path).unwrap();
+            let table = if version == 36 {
+                "provider_shadow_pages"
+            } else {
+                "historical_v030_provider_shadow_pages"
+            };
+            assert_eq!(
+                backup
+                    .query_row::<Vec<u8>, _, _>(&format!("SELECT body FROM {table}"), [], |r| r
+                        .get(0))
+                    .unwrap(),
+                vec![0xa5; LEGACY_RESPONSE]
+            );
+        }
+        Connection::open(&path)
+            .unwrap()
+            .execute("INSERT INTO verify_parent VALUES(1)", [])
+            .unwrap();
+        let db = SqliteStateDb::open_owned_with_config(&path, &owner(), &source)
+            .await
+            .unwrap();
+        if version == 44 {
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("original-cursor")
+            );
+            let work = db.get_pending().await.unwrap();
+            assert_eq!(work.len(), 1);
+            assert_eq!(&*work[0].id, "retry");
+            let conn = db.acquire_lock("current and historical evidence").unwrap();
+            let stored = load_page(&conn, CapturedPageId(1), 1024).unwrap();
+            assert_eq!(
+                conn.query_row::<String, _, _>(
+                    "SELECT body_hash FROM provider_catalog_pages WHERE page_id=1",
+                    [],
+                    |r| r.get(0)
+                )
+                .unwrap(),
+                stored.observation_hash
+            );
+            let resumed = stored.page;
+            assert_eq!(resumed.request_cursor, "original-cursor");
+            assert_eq!(resumed.successor, "next");
+            assert_eq!(resumed.body, br#"{"records":[]}"#);
+            assert_eq!(
+                conn.query_row::<Vec<u8>, _, _>(
+                    "SELECT payload FROM historical_v030_provider_shadow_pages_extra",
+                    [],
+                    |r| r.get(0)
+                )
+                .unwrap(),
+                [0, 255, 7]
+            );
+        }
+        {
+            let conn = db.acquire_lock("verify cleanup").unwrap();
+            assert_history(&conn);
+            crate::test_helpers::assert_no_retired_inbox_archive(&conn);
+            assert_eq!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM metadata WHERE key='schema_upgrade_temporary_bundle_v1'",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                0
+            );
+        }
+        drop(db);
+        let after = path.metadata().unwrap().len();
+        assert!(bundles(dir.path()).is_empty());
+        eprintln!(
+            "schema {version}: state.db {before} -> {after} bytes; temporary snapshot {backup_bytes} bytes; retained bundle 0 bytes"
+        );
+        // The direct path also installs the intervening schemas. Allow their
+        // pages while requiring at least 11 MiB of net physical reclamation.
+        assert!(before - after >= 11 * 1024 * 1024);
+    }
+}
+
 #[tokio::test]
 async fn owned_migration_backup_captures_wal_and_exact_loaded_config_then_restores_independently() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let conn = old_database(root, 35);
+    verification_fault(&conn);
     let source = config(root);
     let bytes = std::fs::read(root.join("custom.toml")).unwrap();
     // Back up the input actually used, not a later unrelated edit on disk.
     std::fs::write(root.join("custom.toml"), b"# changed after startup\n").unwrap();
     assert!(std::fs::metadata(root.join("state.db-wal")).unwrap().len() > 0);
-    let opened = SqliteStateDb::open_owned_with_config(&root.join("state.db"), &owner(), &source)
-        .await
-        .unwrap();
+    let refused =
+        SqliteStateDb::open_owned_with_config(&root.join("state.db"), &owner(), &source).await;
+    assert!(
+        matches!(refused, Err(StateError::UpgradeVerification { .. })),
+        "{refused:?}"
+    );
     assert_eq!(
-        schema::get_schema_version(&opened.acquire_lock("check migrated").unwrap()).unwrap(),
+        schema::get_schema_version(&conn).unwrap(),
         schema::SCHEMA_VERSION
     );
-    assert_history(&opened.acquire_lock("check history").unwrap());
+    assert_history(&conn);
     let saved = bundles(root);
     assert_eq!(saved.len(), 1);
     let bundle = &saved[0];
@@ -184,8 +378,8 @@ async fn owned_migration_backup_captures_wal_and_exact_loaded_config_then_restor
             .0
             .is_some()
     );
-    let saved_bytes = std::fs::read(bundle.join("state.db")).unwrap();
-    drop(opened);
+    conn.execute("INSERT INTO verify_parent VALUES(1)", [])
+        .unwrap();
     drop(conn);
     for _ in 0..2 {
         let opened = SqliteStateDb::open_owned_with_config(
@@ -196,8 +390,7 @@ async fn owned_migration_backup_captures_wal_and_exact_loaded_config_then_restor
         .await
         .unwrap();
         assert_history(&opened.acquire_lock("quiet reopen").unwrap());
-        assert_eq!(bundles(root).len(), 1);
-        assert_eq!(std::fs::read(bundle.join("state.db")).unwrap(), saved_bytes);
+        assert!(bundles(root).is_empty());
     }
     assert_eq!(std::fs::read(root.join("kept.jpg")).unwrap(), b"kept media");
     assert_eq!(
@@ -270,8 +463,107 @@ async fn owned_migration_backup_failure_preserves_source_wal_version_and_journal
                     .unwrap(),
             );
         }
-        assert_eq!(bundles(root).len(), 2);
+        assert_eq!(bundles(root), incomplete);
     }
+}
+
+#[tokio::test]
+async fn owned_migration_backup_missing_retirement_receipt_rolls_back_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let conn = old_database(root, 44);
+    conn.execute_batch(
+        "CREATE TRIGGER deny_receipt BEFORE INSERT ON metadata
+         WHEN NEW.key='schema_upgrade_temporary_bundle_v1' BEGIN SELECT RAISE(IGNORE); END;",
+    )
+    .unwrap();
+    let result =
+        SqliteStateDb::open_owned_with_config(&root.join("state.db"), &owner(), &config(root))
+            .await;
+    assert!(
+        matches!(result, Err(StateError::BackedUpMigration { .. })),
+        "{result:?}"
+    );
+    assert_eq!(schema::get_schema_version(&conn).unwrap(), 44);
+    assert_history(&conn);
+    let retained = bundles(root);
+    assert_eq!(retained.len(), 1);
+    assert!(retained[0].join("manifest.json").is_file());
+}
+
+#[tokio::test]
+async fn owned_migration_backup_retirement_refuses_copies_substitution_and_extra_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let path = root.join("state.db");
+    let conn = old_database(root, 35);
+    verification_fault(&conn);
+    let source = config(root);
+    let result = SqliteStateDb::open_owned_with_config(&path, &owner(), &source).await;
+    let Err(StateError::UpgradeVerification { backup, .. }) = result else {
+        panic!("bad foreign key must retain the backup and refuse startup")
+    };
+    conn.execute("INSERT INTO verify_parent VALUES(1)", [])
+        .unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    drop(conn);
+    let copy = root.join("copied.db");
+    std::fs::copy(&path, &copy).unwrap();
+    drop(
+        SqliteStateDb::open_owned_with_config(&copy, &owner(), &source)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        backup.join("manifest.json").exists(),
+        "copy cannot retire the original's bundle"
+    );
+
+    let original = root.join("saved-original");
+    std::fs::rename(&backup, &original).unwrap();
+    std::os::unix::fs::symlink(&original, &backup).unwrap();
+    drop(
+        SqliteStateDb::open_owned_with_config(&path, &owner(), &source)
+            .await
+            .unwrap(),
+    );
+    assert!(original.join("manifest.json").is_file());
+    assert!(backup.is_symlink());
+    std::fs::remove_file(&backup).unwrap();
+    std::fs::rename(&original, &backup).unwrap();
+
+    std::fs::write(backup.join("personal.txt"), b"keep").unwrap();
+    drop(
+        SqliteStateDb::open_owned_with_config(&path, &owner(), &source)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(std::fs::read(backup.join("personal.txt")).unwrap(), b"keep");
+    assert!(
+        backup.join("manifest.json").is_file(),
+        "refuse before deleting any member"
+    );
+    std::fs::remove_file(backup.join("personal.txt")).unwrap();
+    std::fs::rename(backup.join("config.toml"), root.join("original-config")).unwrap();
+    std::fs::write(backup.join("config.toml"), b"new config").unwrap();
+    drop(
+        SqliteStateDb::open_owned_with_config(&path, &owner(), &source)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        std::fs::read(backup.join("config.toml")).unwrap(),
+        b"new config"
+    );
+    assert!(backup.join("state.db").is_file());
+    std::fs::rename(root.join("original-config"), backup.join("config.toml")).unwrap();
+    drop(
+        SqliteStateDb::open_owned_with_config(&path, &owner(), &source)
+            .await
+            .unwrap(),
+    );
+    assert!(!backup.exists());
 }
 
 #[tokio::test]
@@ -298,7 +590,7 @@ async fn owned_migration_backup_lock_refusal_preserves_history_then_recovers() {
                 .unwrap(),
         );
     }
-    assert_eq!(bundles(root).len(), 1);
+    assert!(bundles(root).is_empty());
 }
 
 #[tokio::test]
@@ -353,7 +645,7 @@ async fn owned_migration_backup_retains_absence_and_rolls_back_all_steps_on_late
                 .unwrap(),
         );
     }
-    assert_eq!(bundles(root).len(), 2);
+    assert_eq!(bundles(root), saved);
     assert_eq!(std::fs::read(saved[0].join("state.db")).unwrap(), prior);
 }
 

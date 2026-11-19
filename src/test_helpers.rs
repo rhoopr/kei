@@ -6,6 +6,7 @@
 pub(crate) mod allocation;
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -46,6 +47,119 @@ pub(crate) fn assert_checkpoint_evidence(conn: &rusqlite::Connection, key: &str,
         .unwrap(),
         expected
     );
+}
+
+/// Directories created by this release's temporary upgrade bundle.
+///
+/// A successful verified upgrade removes its own directory. Failures,
+/// interruptions, and prior-release bundles remain for diagnosis.
+pub(crate) fn temporary_backup_bundles(root: &Path) -> Vec<PathBuf> {
+    bundle_paths(root)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".kei-schema-backup-tmp-"))
+        })
+        .collect()
+}
+
+/// A successful verified upgrade must not leave this release's bundle behind.
+pub(crate) fn assert_no_temporary_backup_bundles(root: &Path) {
+    let remaining = temporary_backup_bundles(root);
+    assert!(
+        remaining.is_empty(),
+        "successful upgrade left temporary bundles under {}: {remaining:?}",
+        root.display()
+    );
+}
+
+/// Copy `path` through SQLite's backup API before a production open, then
+/// return the self-contained copy. A successful upgrade deletes its own
+/// temporary bundle, so callers needing exact pre-upgrade evidence must
+/// snapshot the fixture first.
+pub(crate) fn snapshot_database(path: &Path) -> rusqlite::Connection {
+    let snapshot = path.with_file_name(format!("pre-upgrade-snapshot-{}.db", uuid::Uuid::new_v4()));
+    let destination = {
+        let source = rusqlite::Connection::open(path).unwrap();
+        let mut destination = rusqlite::Connection::open(&snapshot).unwrap();
+        {
+            let backup = rusqlite::backup::Backup::new(&source, &mut destination).unwrap();
+            match backup.step(-1).unwrap() {
+                rusqlite::backup::StepResult::Done => {}
+                other => panic!("snapshot backup did not complete: {other:?}"),
+            }
+        }
+        destination
+    };
+    // The backup copies the source database header, including WAL mode. Fold
+    // that into the snapshot so callers need no companion files.
+    let mode: String = destination
+        .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    destination
+}
+
+fn bundle_paths(root: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".kei-schema-backup-"))
+        })
+        .collect()
+}
+
+/// Complete recovery bundles under `root`, opened read-only.
+///
+/// After a successful upgrade only retained failure or prior-release bundles
+/// remain. Bundle name UUIDs are not chronology; callers with more than one
+/// bundle must verify every snapshot rather than treating the first as the
+/// latest.
+pub(crate) fn recovery_bundle_connections(root: &Path) -> Vec<rusqlite::Connection> {
+    let mut bundles = bundle_paths(root)
+        .into_iter()
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .extension()
+                    .is_none_or(|extension| extension != "partial")
+                && path.join("manifest.json").is_file()
+        })
+        .collect::<Vec<_>>();
+    bundles.sort();
+    bundles
+        .into_iter()
+        .map(|bundle| {
+            rusqlite::Connection::open_with_flags(
+                bundle.join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+pub(crate) fn assert_no_retired_inbox_archive(conn: &rusqlite::Connection) {
+    for table in [
+        "historical_v030_provider_shadow_pages",
+        "historical_v030_provider_shadow_records",
+        "historical_v030_provider_shadow_receipts",
+    ] {
+        assert!(
+            !conn
+                .query_row::<bool, _, _>(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            "{table} must not be copied into the live database"
+        );
+    }
 }
 
 /// Synthetic QuickTime track metadata without an ISO FullBox prefix.

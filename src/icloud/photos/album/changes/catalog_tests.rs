@@ -5,6 +5,10 @@ use crate::icloud::photos::album::test_support::{
     changes_asset, changes_master, make_album_with_session,
 };
 use crate::state::SqliteStateDb;
+use crate::test_helpers::{
+    assert_no_retired_inbox_archive, assert_no_temporary_backup_bundles,
+    recovery_bundle_connections, snapshot_database,
+};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -115,16 +119,20 @@ async fn catalog_projection_fresh_start_rebuilds_current_sources_through_two_qui
     );
     db.acquire_lock("synthetic schema29 pending source").unwrap().execute_batch("DROP TABLE provider_selection_sources; DROP TABLE provider_work_obligations; DROP TABLE provider_work_retries; DROP TABLE provider_work_receipts; DROP TABLE provider_catalog_pages; DROP TABLE provider_catalog_debt; DROP TABLE provider_catalog_references; DROP TABLE provider_catalog_records; PRAGMA user_version=29;").unwrap();
     drop(db);
+    // A successful upgrade removes its own temporary bundle; capture the exact
+    // schema-29 source before the first production reopen.
+    let pre_upgrade = snapshot_database(&path);
     let mut frozen = None;
     for cycle in 0..2 {
         let db = open(&path).await;
+        assert_no_temporary_backup_bundles(directory.path());
         if cycle == 0 {
             assert_eq!(counts(&db), [0, 0, 0, 0]);
+            assert_no_retired_inbox_archive(&db.acquire_lock("live inbox archive").unwrap());
             assert_eq!(
-                db.acquire_lock("retired raw source")
-                    .unwrap()
+                pre_upgrade
                     .query_row::<Vec<u8>, _, _>(
-                        "SELECT body FROM historical_v030_provider_shadow_pages",
+                        "SELECT body FROM provider_shadow_pages",
                         [],
                         |row| row.get(0)
                     )
@@ -512,6 +520,12 @@ async fn catalog_projection_migration_conflict_preserves_schema29_source_and_unk
         .unwrap()
         .execute_batch("DROP TABLE provider_catalog_pages")
         .unwrap();
+    let prior = recovery_bundle_connections(directory.path());
+    assert_eq!(
+        prior.len(),
+        2,
+        "both failed migrations must retain their complete bundle"
+    );
     for _ in 0..2 {
         let db = open(&path).await;
         capture(&db)
@@ -519,17 +533,26 @@ async fn catalog_projection_migration_conflict_preserves_schema29_source_and_unk
             .await
             .unwrap();
         assert_eq!(counts(&db), [0, 0, 0, 0]);
+        assert_no_retired_inbox_archive(&db.acquire_lock("live inbox archive").unwrap());
+        let retained = recovery_bundle_connections(directory.path());
         assert_eq!(
-            db.acquire_lock("retired source bytes")
-                .unwrap()
-                .query_row::<Vec<u8>, _, _>(
-                    "SELECT body FROM historical_v030_provider_shadow_pages",
-                    [],
-                    |row| row.get(0)
-                )
-                .unwrap(),
-            original
+            retained.len(),
+            prior.len(),
+            "a successful upgrade removes only its own temporary bundle"
         );
+        for snapshot in &retained {
+            assert_eq!(
+                snapshot
+                    .query_row::<Vec<u8>, _, _>(
+                        "SELECT body FROM provider_shadow_pages",
+                        [],
+                        |row| { row.get(0) }
+                    )
+                    .unwrap(),
+                original,
+                "prior failed-migration bundles must retain the pre-upgrade source"
+            );
+        }
         unchanged(&db, &media).await;
     }
 }

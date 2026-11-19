@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 #[cfg(any(unix, windows))]
 use rusqlite::Connection;
 
+pub(super) mod retirement;
 #[cfg(windows)]
 mod windows;
 
 #[cfg(windows)]
 type PreparedBundle = windows::Stage;
 #[cfg(unix)]
-type PreparedBundle = ();
+type PreparedBundle = std::fs::File;
 
 use crate::config::ConfigSource;
 use crate::state::error::StateError;
@@ -20,7 +21,7 @@ pub(super) fn create(
     path: &Path,
     source: &ConfigSource,
     version: i32,
-) -> Result<PathBuf, StateError> {
+) -> Result<(PathBuf, retirement::Receipt), StateError> {
     if matches!(source, ConfigSource::Unavailable) {
         return Err(StateError::MigrationConfigUnavailable);
     }
@@ -35,7 +36,14 @@ pub(super) fn create(
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let bundle = parent.join(format!(".kei-schema-backup-{}", uuid::Uuid::new_v4()));
+        #[cfg(unix)]
+        let parent = parent
+            .canonicalize()
+            .map_err(|source| StateError::TempPath {
+                path: parent.to_owned(),
+                source,
+            })?;
+        let bundle = parent.join(format!("{}{}", retirement::PREFIX, uuid::Uuid::new_v4()));
         #[cfg(unix)]
         let stage = bundle.clone();
         #[cfg(windows)]
@@ -49,7 +57,7 @@ pub(super) fn create(
             })
         };
         #[cfg(unix)]
-        prepare()?;
+        let prepared = prepare()?;
         #[cfg(windows)]
         let mut prepared = prepare()?;
         #[cfg(windows)]
@@ -61,7 +69,23 @@ pub(super) fn create(
             })?;
         #[cfg(all(test, windows))]
         windows_tests::interruption_point("schema-backup-published");
-        Ok(bundle)
+        #[cfg(windows)]
+        let directory = prepared.identity();
+        #[cfg(unix)]
+        let directory = crate::fs_util::file_identity(&prepared).map_err(|source| {
+            StateError::MigrationBackup {
+                path: bundle.clone(),
+                source,
+            }
+        })?;
+        let receipt =
+            retirement::Receipt::capture(path, &bundle, source, directory).map_err(|error| {
+                StateError::MigrationBackup {
+                    path: bundle.clone(),
+                    source: std::io::Error::other(error),
+                }
+            })?;
+        Ok((bundle, receipt))
     }
 }
 
@@ -75,10 +99,17 @@ fn write_bundle(
     // Exclusive directory creation, not create_dir_all: never reuse a partial
     // bundle, follow a pre-existing link, or overwrite prior recovery evidence.
     #[cfg(unix)]
-    {
+    let directory_guard = {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new().mode(0o700).create(bundle)?;
-    }
+        let parent = bundle.parent().unwrap_or(Path::new("."));
+        crate::fs_util::ConfinedPath::open(
+            parent,
+            bundle,
+            crate::fs_util::ConfinedParents::Existing,
+        )?
+        .open_directory()?
+    };
     #[cfg(windows)]
     let directory_guard = windows::create_private_dir(bundle)?;
     #[cfg(all(test, target_os = "linux"))]
@@ -174,14 +205,7 @@ fn write_bundle(
     windows_tests::interruption_point("schema-backup-staged");
     #[cfg(all(test, target_os = "linux"))]
     crate::test_helpers::process_death_point("schema-backup-published");
-    #[cfg(unix)]
-    {
-        Ok(())
-    }
-    #[cfg(windows)]
-    {
-        Ok(directory_guard)
-    }
+    Ok(directory_guard)
 }
 
 #[cfg(windows)]
@@ -256,6 +280,7 @@ fn digest(path: &Path) -> std::io::Result<String> {
 
 #[cfg(any(unix, windows))]
 const RESTORE: &str = "Pre-migration state/config recovery\n\n\
+This is a temporary upgrade bundle. After verifying the committed upgrade, kei removes its bundle. Keep an independent matched backup if you need rollback after successful verification.\n\
 Only a final bundle containing manifest.json is complete. A directory ending in .partial is incomplete even when it contains a manifest. Ignore incomplete bundles.\n\
 Stop every kei process and state writer before restoration. Keep this bundle unchanged.\n\
 Verify the original database path and the SHA-256 values for state.db and (when present) config.toml in manifest.json. Keep account ownership validation enabled; a backup for another account or database path must not be used.\n\
