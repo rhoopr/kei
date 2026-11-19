@@ -9,11 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+See the [v0.30 upgrade checklist](docs/v0.30-upgrade.md) before opening an existing backup with this branch.
+
 ### Changed
 
 - Retired `sync --retry-failed`. The flag now fails before startup with guidance to run ordinary `kei sync`, which retries unfinished destinations alongside current selected work. Pending state and files remain untouched by the refusal.
 - Removed sync/service count selection (`--recent`, `--recent-scope` and `[filters].recent` / `recent_scope`). Retired settings fail before authentication or state/media changes with removal and fixed-date guidance. Relative `Nd` date bounds are also rejected. Import-only `import-existing --recent N` retains positive-count sampling.
-- Advanced SQLite state to schema 37. Old recent-selection receipt keys seed one-time current inventory requests without changing their original bytes. Guarded replay, current selected inventory and a raw-empty terminal replay qualify retirement; busy intervals and failed work retry in later cycles. This does not establish a provider snapshot or resolve independent recovery holds.
+- Advanced SQLite state to schema 44. Upgrades from count-limited sync request a current inventory. Sync also checks eligible historical downloads for provider-confirmed deletions and records the result without removing local files. These checks do not block current downloads.
+- Required existing configs to opt into the new rendition selection with `config_version = 1`. Selected items now include available originals, current edits and RAW/JPEG renditions. See the [config migration steps](docs/rendition-policy-migration.md) before changing the version marker.
+- Added `kei reconcile --inspect-path` and `--confirm-damage` to queue replacement of one inspected destination on the next selected sync. Other copies remain intact.
 - Retired legacy coverage certification as a sync, checkpoint and health requirement. Preserved records, paths, certificates and trust declarations remain stored; certificate gaps no longer force repeated inventories or fail otherwise successful current cycles. Historical counters remain visible, but `unattributed_legacy_pending` now counts records without a stored certificate at their recorded generation rather than pending sync work. `Backup status: unsafe` still distinguishes unproven historical completeness from process health. Current identity, retry, metadata and publication guards remain in force; this retirement adds no schema migration or file rewrite.
 - Retired `reconcile trust-legacy-files plan/apply` through early refusal with guidance to run `kei sync`. The command spellings remain in help, but create no plans or declarations and leave existing state and media unchanged.
 

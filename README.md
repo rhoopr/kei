@@ -35,7 +35,7 @@ It supports large libraries, Shared Libraries, albums, Live Photos, RAW files an
   before deciding. If you want to keep ADP enabled, stop here: kei cannot back up
   that library. Web access alone does not make ADP compatible.
 
-Already have an `icloudpd` archive? Start with [Migrating from icloudpd](docs/migration-from-icloudpd.md), including the import preview and path checks, before pointing kei at it. For an existing kei install, read [Upgrade and compatibility](docs/v0.26.0-upgrade.md) before opening its state.
+Already have an `icloudpd` archive? Start with [Migrating from icloudpd](docs/migration-from-icloudpd.md), including the import preview and path checks, before pointing kei at it. If you already run kei, follow the [v0.30 upgrade checklist](docs/v0.30-upgrade.md) before opening your backup with this build.
 
 ## Choose your installation route
 
@@ -146,10 +146,11 @@ Kei automatically saves photo information in its own database. Setup enables sta
 ## Docs
 
 - [Install](https://github.com/rhoopr/kei/wiki/Install)
-- [Upgrade and compatibility](docs/v0.26.0-upgrade.md)
+- [Upgrade and compatibility](docs/v0.30-upgrade.md)
 - [Account state migration](docs/account-state-migration.md)
 - [Backup maintenance](docs/backup-maintenance.md)
 - [Metadata output](docs/metadata.md)
+- [Choose which rendition gets the original filename](docs/edited-primary.md)
 - [Configuration](https://github.com/rhoopr/kei/wiki/Configuration)
 - [Docker](https://github.com/rhoopr/kei/wiki/Docker)
 - [Service mode](https://github.com/rhoopr/kei/wiki/Service)

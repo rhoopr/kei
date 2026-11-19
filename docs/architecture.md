@@ -12,6 +12,8 @@ contract catalog defines required conditions, and source code wins over both.
 
 ## Navigation
 
+For an existing installation moving to schema 44, start with the [v0.30 upgrade checklist](v0.30-upgrade.md). For a checkpoint investigation, distinguish three kinds of evidence: the saved cursor says where to resume a zone, the retained inbox holds provider records still needed for replay, and destination receipts record local work. A successful empty poll can leave the cursor unchanged and leave no inbox row. Check the accepted successor and outstanding work before treating a missing row as a lost checkpoint.
+
 This index lists the highest-traffic sections, not every heading. Link labels
 match their headings, so searching a label finds the section.
 
