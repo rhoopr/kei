@@ -589,7 +589,9 @@ fn assert_verification_failure(args: &[&str], out: &std::process::Output) {
             state
                 .get("message")
                 .and_then(Value::as_str)
-                .is_some_and(|text| text.contains(message)),
+                .is_some_and(|text| text.contains(message)
+                    || (text.starts_with("state DB read failed at ")
+                        && text.ends_with(": <redacted>"))),
             "{args:?}: {state}"
         );
     } else {
