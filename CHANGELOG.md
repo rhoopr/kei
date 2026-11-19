@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.30.0-beta.1] - 2026-11-18
 
-See the [v0.30 upgrade checklist](docs/v0.30-upgrade.md) before opening an existing backup with this beta.
+See the [v0.30 upgrade checklist](docs/upgrade.md) before opening an existing backup with this beta.
 
 ### Changed
 
@@ -40,7 +40,7 @@ See the [v0.30 upgrade checklist](docs/v0.30-upgrade.md) before opening an exist
 
 ### Changed
 
-- SQLite schema advances from 35 to 36. Eligible compaction retains recovery-relevant evidence and provenance, but no longer retains every superseded URL or reconstructible redundant response body. Stop all writers and preserve a matched cold backup before upgrading. Older binaries cannot read schema 36; rollback requires the complete matched pre-upgrade state and media. See [v0.26.0 upgrade guidance](docs/v0.26.0-upgrade.md).
+- SQLite schema advances from 35 to 36. Eligible compaction retains recovery-relevant evidence and provenance, but no longer retains every superseded URL or reconstructible redundant response body. Stop all writers and preserve a matched cold backup before upgrading. Older binaries cannot read schema 36; rollback requires the complete matched pre-upgrade state and media. See [v0.26.0 upgrade guidance](https://github.com/rhoopr/kei/blob/v0.26.0/docs/v0.26.0-upgrade.md).
 
 ### Known limitations
 
@@ -81,7 +81,7 @@ See the [v0.30 upgrade checklist](docs/v0.30-upgrade.md) before opening an exist
 
 ### Known limitations
 
-- Missing or unknown indexing responses fail closed. Bounded, interrupted, failed, or uncommitted reconciliation keeps the hold. Managed layouts wait during RUNNING; full selected coverage and successful protected materialization are required after FINISHED. See [v0.25.2 upgrade guidance](docs/v0.25.2-upgrade.md).
+- Missing or unknown indexing responses fail closed. Bounded, interrupted, failed, or uncommitted reconciliation keeps the hold. Managed layouts wait during RUNNING; full selected coverage and successful protected materialization are required after FINISHED. See [v0.25.2 upgrade guidance](https://github.com/rhoopr/kei/blob/v0.25.2/docs/v0.25.2-upgrade.md).
 
 ## [0.25.1] - 2026-10-13
 
@@ -92,7 +92,7 @@ See the [v0.30 upgrade checklist](docs/v0.30-upgrade.md) before opening an exist
 
 ### Changed
 
-- SQLite schema advances from 34 to 35 for managed layout and history receipts. Stop all writers and take a matched cold backup of configuration/state and media/sidecars before upgrading. v0.25.0 cannot read schema 35; rollback requires the matched old set and old binary. See [v0.25.1 upgrade guidance](docs/v0.25.1-upgrade.md).
+- SQLite schema advances from 34 to 35 for managed layout and history receipts. Stop all writers and take a matched cold backup of configuration/state and media/sidecars before upgrading. v0.25.0 cannot read schema 35; rollback requires the matched old set and old binary. See [v0.25.1 upgrade guidance](https://github.com/rhoopr/kei/blob/v0.25.1/docs/v0.25.1-upgrade.md).
 
 ### Fixed
 
@@ -105,7 +105,7 @@ See the [v0.30 upgrade checklist](docs/v0.30-upgrade.md) before opening an exist
 
 ### Known limitations
 
-- Embedded metadata rewriting can damage existing metadata structures in some MOV files. [#947](https://github.com/rhoopr/kei/issues/947) remains open; [#948](https://github.com/rhoopr/kei/pull/948) is not included. For libraries containing MOV files, disable all in-file metadata write options; sidecars remain available. See the [verified configuration workaround](docs/v0.25.1-upgrade.md#mov-metadata-workaround). Existing damage is not automatically repaired.
+- Embedded metadata rewriting can damage existing metadata structures in some MOV files. [#947](https://github.com/rhoopr/kei/issues/947) remains open; [#948](https://github.com/rhoopr/kei/pull/948) is not included. For libraries containing MOV files, disable all in-file metadata write options; sidecars remain available. See the [verified configuration workaround](https://github.com/rhoopr/kei/blob/v0.25.1/docs/v0.25.1-upgrade.md#mov-metadata-workaround). Existing damage is not automatically repaired.
 - Provider indexing/restart behavior, unsupported identity and checkpoint recovery, legacy attribution, physical NFS/NAS behavior, and representative HEIF memory bounds remain scoped limitations. Passing source tests does not establish every private-library recovery or downstream Immich pairing behavior.
 
 ## [0.25.0] - 2026-10-07
@@ -944,7 +944,7 @@ See [the issue-linked limitations](https://github.com/rhoopr/kei/blob/v0.24.0/do
 
 ## [0.13.0] - 2026-05-02
 
-Selection and folder-structure flag redesign. `--exclude-album` becomes `--album '!NAME'`. New `--smart-folder` and `--unfiled` per-category flags. `--library` now repeatable. Per-category `--folder-structure-{albums,smart-folders}` templates with their own defaults. Multi-library scope with `{library}` in any template. State DB schema migrates to v9 (per-zone primary key on `assets`, `asset_albums`, and `asset_people`) on first sync. Old shapes worked with deprecation warnings through v0.19 and were removed in v0.20. Current migration guide: [docs/v0.20-migration.md](docs/v0.20-migration.md). ([#215], [#288])
+Selection and folder-structure flag redesign. `--exclude-album` becomes `--album '!NAME'`. New `--smart-folder` and `--unfiled` per-category flags. `--library` now repeatable. Per-category `--folder-structure-{albums,smart-folders}` templates with their own defaults. Multi-library scope with `{library}` in any template. State DB schema migrates to v9 (per-zone primary key on `assets`, `asset_albums`, and `asset_people`) on first sync. Old shapes worked with deprecation warnings through v0.19 and were removed in v0.20. Current migration guide: [docs/v0.20-migration.md](https://github.com/rhoopr/kei/blob/v0.20.0/docs/v0.20-migration.md). ([#215], [#288])
 
 ### Added
 

@@ -147,8 +147,6 @@ still require explicit policy decisions before dependent stages.
 
 Provider-discovered work is admitted by the [current selection and destination owner](#private-selection-and-destination-replay). Historical catalog receipts, retry deadlines, and raw evidence remain readable. They cannot admit work or wake the watch loop.
 
-For databases with older receipts, see the [historical catalog admission format](catalog-compatibility.md).
-
 ## Selection generation shadow
 
 The schema-33 tables `provider_selection_generations`, `provider_selection_sources`, `provider_selection_decisions` and `provider_selection_destinations` remain as historical evidence. Schema 38 archives prior rows at the fresh-start boundary. Their observational writer, manifest replay and capacity gate have been removed. Current provider confirmation and task planning feed active destination admission. The later catalog admission writer `project_provider_work` also compiles only in historical-database tests.

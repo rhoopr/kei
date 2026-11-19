@@ -19,7 +19,7 @@ It supports large libraries, Shared Libraries, albums, Live Photos, RAW files an
 > [!WARNING]
 > kei is pre-release software. Minor versions may contain breaking changes.
 > 
-> Read the [update guide](docs/v0.26.0-upgrade.md) and [changelog](CHANGELOG.md) before updating.
+> Read the [upgrade checklist for your version](docs/upgrade.md) and [changelog](CHANGELOG.md) before updating.
 
 ## Before you install
 
@@ -35,7 +35,7 @@ It supports large libraries, Shared Libraries, albums, Live Photos, RAW files an
   before deciding. If you want to keep ADP enabled, stop here: kei cannot back up
   that library. Web access alone does not make ADP compatible.
 
-Already have an `icloudpd` archive? Start with [Migrating from icloudpd](docs/migration-from-icloudpd.md), including the import preview and path checks, before pointing kei at it. If you already run kei, follow the [v0.30 upgrade checklist](docs/v0.30-upgrade.md) before opening your backup with this build.
+Already have an `icloudpd` archive? Start with [Migrating from icloudpd](docs/migration-from-icloudpd.md), including the import preview and path checks, before pointing kei at it.
 
 ## Choose your installation route
 
@@ -154,7 +154,7 @@ Kei automatically saves photo information in its own database. Setup enables sta
 ## Docs
 
 - [Install](https://github.com/rhoopr/kei/wiki/Install)
-- [Upgrade and compatibility](docs/v0.30-upgrade.md)
+- [Upgrade and compatibility](docs/upgrade.md)
 - [Account state migration](docs/account-state-migration.md)
 - [Backup maintenance](docs/backup-maintenance.md)
 - [Metadata output](docs/metadata.md)
@@ -168,7 +168,7 @@ Kei automatically saves photo information in its own database. Setup enables sta
 - [Doctor](https://github.com/rhoopr/kei/wiki/Doctor)
 - [Manifest export](https://github.com/rhoopr/kei/wiki/Manifest)
 - [Product charter](docs/product-charter.md)
-- [Roadmap](docs/roadmap.md)
+- [Planned work](https://github.com/rhoopr/kei/milestones)
 
 Report bugs or confusing behavior in [Issues](https://github.com/rhoopr/kei/issues).
 

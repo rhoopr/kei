@@ -16,14 +16,14 @@ Kei rejects retired settings before authentication or sync-state/media changes, 
 - Make a separate backup of the photos, videos, accompanying metadata files and any existing kei configuration and state. Copy the complete state directory while kei is stopped, including database companion files. Keep the backup unchanged.
 - Use the same Apple Account and iCloud region as the original download. Keep different accounts' configuration and state separate. Check the [sign-in requirements](../README.md#before-you-install), including the Advanced Data Protection restriction.
 - Kei cannot use Python's `~/.pyicloud` cookies. Sign in with kei using your Apple Account password and trusted-device verification code. Kei saves its own session for later runs.
-- If you already use kei, read the [v0.26.0 update guide](v0.26.0-upgrade.md) first. Opening existing state can update it automatically, even during an import preview.
+- If you already use kei, read the [v0.26.0 update guide](https://github.com/rhoopr/kei/blob/v0.26.0/docs/v0.26.0-upgrade.md) first. Opening existing state can update it automatically, even during an import preview.
 - Don't let the setup wizard start an immediate sync against your existing archive. If you use the wizard, answer **no** when it offers to start syncing.
 
 Install [v0.26.0](https://github.com/rhoopr/kei/releases/tag/v0.26.0). For Docker, use `ghcr.io/rhoopr/kei:0.26.0` and the [Docker instructions below](#docker-migration).
 
 ## If you're coming from old `icloudpd-rs`
 
-An old kei or icloudpd-rs database needs different handling from a Python photo folder. Preserve the original setup and follow [account-state adoption](account-state-migration.md) and the [older-version update instructions](v0.25-upgrade.md#back-up-and-adopt-existing-state).
+An old kei or icloudpd-rs database needs different handling from a Python photo folder. Preserve the original setup and follow [account-state adoption](account-state-migration.md).
 
 Do not copy or rename old authentication files into kei's current session directory. Older guides showed cookie-copy commands that no longer apply. Current kei needs its own login, and adopting old state requires confirming that it belongs to the configured account. Don't confirm ownership if it is uncertain.
 

@@ -196,7 +196,7 @@ or rendition evidence becomes eligible immediately. Status reports unresolved
 identities and deferred retries separately from failed repair attempts.
 Deferral keeps the capture revision and checkpoint pending; it is not recovery.
 
-The current development branch uses schema 42; stable v0.26.0 uses schema 36. Existing configs also require the [rendition-policy migration](rendition-policy-migration.md) before ordinary commands can proceed. Even `kei status` can migrate an owned database after config validation. Stop all workers and take a matched cold backup of configuration/state, SQLite companions and media/sidecars before upgrading. Older binaries cannot open a newer schema. Rollback requires the complete matched old set and retained old binary. Do not reset state or lower its schema version. See the [v0.26.0 upgrade guide](v0.26.0-upgrade.md) for that release's backup and restoration procedure.
+Before running even `kei status` with a newer binary, follow the [upgrade checklist](upgrade.md). Opening an owned database can migrate it.
 
 Kei marks unresolved asset identity cycles incomplete. Status
 remains unsafe across restarts and successful syncs in other libraries until

@@ -43,7 +43,7 @@ Capture dates use Apple's usable per-asset offset; otherwise they use host-local
 rendering. Date-only filters compare that calendar date. Datetime and relative
 interval filters compare an instant. Capture/addition milliseconds are retained
 in the catalogue and supported sidecar output, not newly written as native EXIF
-subseconds. See [compatibility](v0.24-upgrade.md#fractional-timestamps).
+subseconds.
 
 Ordinary datetime output preserves native timestamps. When safe, it adds a
 matching offset or fills a missing timestamp. Replacing an existing timestamp
@@ -74,8 +74,6 @@ A media download can succeed while its metadata write fails and remains pending.
 Inspect metadata failures, not only downloaded/failed counts. This safe writer
 prevents the old corruption path; it does not detect or restore every historically
 damaged container. Capture-timestamp repair is not general HEIF repair.
-
-Released v0.25.3 still buffers whole files and can amplify memory use under concurrent writes. Main after [#978](https://github.com/rhoopr/kei/commit/8d6e04b725e9af3f8c95b5d4ba9d7c6c886592f2) streams unchanged HEIF ranges and bounds retained control data; this change is absent from v0.25.3. No universal process-memory ceiling or physical filesystem qualification is established by either description. Supported-layout, fingerprint and publication checks still apply. Historical [v0.24 validation](v0.24-validation.md) describes that release candidate only.
 
 ## Sidecar ownership and convergence
 
