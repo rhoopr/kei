@@ -291,6 +291,35 @@ A file may be safe on disk while its state write is still a cycle failure. Do
 not weaken deferred state-write handling or infer that a visible final file
 means the database transition succeeded.
 
+### Network filesystems
+
+A download directory may be on an NFS export when the export supports hard
+links and one kei client uses that directory. `data_dir` holds SQLite state,
+cookies and credentials and stays on local disk or block storage, never on the
+download export.
+
+NFS rejects `RENAME_NOREPLACE`, so no-overwrite publication links the verified
+`.part` and then retires its name. An export without hard links fails
+publication with an error that names hard-link support and keeps the `.part`
+file. Unlinking a file whose descriptor is still open leaves an NFS `.nfsXXXX`
+link and a second link count, so the owner closes every handle it holds before
+unlinking a temporary name. The hard-link refusal is unchanged.
+
+Alias retirement moves a managed primary into a private slot with a plain
+rename when `RENAME_NOREPLACE` is unsupported. The slot is a private name kei
+created and has never used.
+
+Moves between public names, including album directory transitions, user-entry
+moves and their restores, keep the no-replace rename where the filesystem
+supports it. NFS rejects that flag, so the owner falls back by entry type. A
+directory claims the destination with an exclusive empty directory that only
+its own plain rename may replace; a failed rename removes that claim only while
+it still has the identity the claim created. A regular file is hard-linked to
+the destination, and the source name is removed only after the destination is
+verified to hold that same identity. A foreign writer that replaces the
+destination between the link and the removal therefore keeps the moved bytes
+under its own name instead of losing them.
+
 ## Destination reconciliation
 
 Schema 25 stores local reconciliation destination choices in
