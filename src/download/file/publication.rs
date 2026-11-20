@@ -6,7 +6,7 @@ use anyhow::Context;
 use tokio::fs;
 
 use super::fingerprint::fingerprint_regular_file;
-use super::platform::{PublishResult, publish_part_no_replace};
+use super::platform::{PartName, PublishResult, publish_part_no_replace_keeping_link};
 use super::replacement::{FinalPublication, replace_file_if_unchanged};
 
 #[derive(Debug, thiserror::Error)]
@@ -32,39 +32,47 @@ pub(in crate::download) async fn rename_part_to_final(
     part_path: &Path,
     final_path: &Path,
 ) -> anyhow::Result<()> {
-    publish_part_to_final(part_path, final_path, FinalPublication::NoReplace)
-        .await
-        .map(|_| ())
+    let (_, part) =
+        publish_part_to_final(part_path, final_path, FinalPublication::NoReplace).await?;
+    #[cfg(unix)]
+    if part == PartName::Linked {
+        super::platform::retire_linked_part(part_path).await;
+    }
+    #[cfg(not(unix))]
+    let _ = part;
+    Ok(())
 }
 
 /// Publish a verified `.part` file according to the task's explicit policy.
+///
+/// Link publication reports [`PartName::Linked`]: the caller owns the verified
+/// handle on the `.part`, so it must close it and then retire the name.
 pub(in crate::download) async fn publish_part_to_final(
     part_path: &Path,
     final_path: &Path,
     publication: FinalPublication,
-) -> anyhow::Result<PublicationOutcome> {
+) -> anyhow::Result<(PublicationOutcome, PartName)> {
     if let FinalPublication::ReplaceTruncated(expected) = publication {
-        return replace_file_if_unchanged(part_path, final_path, expected)
-            .await
-            .map(|()| PublicationOutcome::Installed);
+        replace_file_if_unchanged(part_path, final_path, expected).await?;
+        return Ok((PublicationOutcome::Installed, PartName::Gone));
     }
     if let FinalPublication::ReplaceLocal {
         fingerprint,
         modified,
     } = publication
     {
-        return super::replacement::replace_local_file_if_unchanged(
+        super::replacement::replace_local_file_if_unchanged(
             part_path,
             final_path,
             fingerprint,
             modified,
         )
-        .await
-        .map(|()| PublicationOutcome::Installed);
+        .await?;
+        return Ok((PublicationOutcome::Installed, PartName::Gone));
     }
 
-    match publish_part_no_replace(part_path, final_path).await {
-        Ok(PublishResult::Published) => {
+    match publish_part_no_replace_keeping_link(part_path, final_path).await {
+        Ok((PublishResult::Published, part)) => {
             // ext4 default `data=ordered` does not guarantee directory
             // entry durability after `rename` returns Ok: a power loss
             // between rename and the kernel committing the dir block
@@ -72,9 +80,9 @@ pub(in crate::download) async fn publish_part_to_final(
             // fsync the parent so the worst case is one redundant
             // re-download next sync, not silent loss.
             crate::fs_util::fsync_parent_dir_async_best_effort(final_path).await;
-            Ok(PublicationOutcome::Installed)
+            Ok((PublicationOutcome::Installed, part))
         }
-        Ok(PublishResult::DestinationExists) => {
+        Ok((PublishResult::DestinationExists, _)) => {
             // CONTRACT: FILE_PUBLISH_NO_OVERWRITE
             let part_fingerprint = fingerprint_regular_file(part_path)
                 .await
@@ -100,7 +108,7 @@ pub(in crate::download) async fn publish_part_to_final(
                     part_path.display()
                 )
             })?;
-            Ok(PublicationOutcome::IdenticalExisting)
+            Ok((PublicationOutcome::IdenticalExisting, PartName::Gone))
         }
         Err(e) => Err(e).with_context(|| {
             format!(
@@ -126,12 +134,19 @@ mod tests {
         let final_path = dir.path().join("photo.jpg");
         tokio::fs::write(&part, b"image data").await.unwrap();
 
-        assert_eq!(
+        let (outcome, part_name) =
             publish_part_to_final(&part, &final_path, FinalPublication::NoReplace)
                 .await
-                .unwrap(),
-            PublicationOutcome::Installed
-        );
+                .unwrap();
+        assert_eq!(outcome, PublicationOutcome::Installed);
+        // The publisher reports a linked `.part` for the caller to retire, after
+        // the caller has released its own handle on the file.
+        #[cfg(unix)]
+        if part_name == super::PartName::Linked {
+            super::super::platform::retire_linked_part(&part).await;
+        }
+        #[cfg(not(unix))]
+        let _ = part_name;
 
         assert!(!part.exists());
         assert!(final_path.exists());
@@ -149,12 +164,10 @@ mod tests {
         // Should succeed without replacing the existing final file. On Linux,
         // plain rename(old, new) would overwrite `photo.jpg`; the publish path
         // must use no-overwrite semantics before cleaning the redundant .part.
-        assert_eq!(
-            publish_part_to_final(&part, &final_path, FinalPublication::NoReplace)
-                .await
-                .unwrap(),
-            PublicationOutcome::IdenticalExisting
-        );
+        let (outcome, _) = publish_part_to_final(&part, &final_path, FinalPublication::NoReplace)
+            .await
+            .unwrap();
+        assert_eq!(outcome, PublicationOutcome::IdenticalExisting);
 
         assert!(!part.exists(), ".part should not remain");
         assert!(final_path.exists(), "final file should exist");

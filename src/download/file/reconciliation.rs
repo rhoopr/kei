@@ -200,6 +200,8 @@ fn copy_local_file_no_replace_blocking(
             == source_fingerprint,
         "Local path reconciliation checksum mismatch"
     );
+    // Publication may unlink this name, so release the handle first.
+    drop(part);
     source_file.rewind()?;
     anyhow::ensure!(
         file_identity(&source.validate_identity(source_identity)?)? == source_identity
@@ -216,7 +218,15 @@ fn copy_local_file_no_replace_blocking(
     let publication = publish_reconciliation_part_blocking(&part_path, &destination)?;
     after_publication();
     let expected_identity = match publication {
-        PublishResult::Published => Some(part_identity),
+        PublishResult::Published => {
+            super::retire_published_temp_link(
+                &part_path,
+                &destination,
+                source_fingerprint,
+                part_identity,
+            )?;
+            Some(part_identity)
+        }
         PublishResult::DestinationExists => None,
     };
     #[cfg(target_os = "linux")]
@@ -654,5 +664,48 @@ mod tests {
             1
         );
         assert_eq!(std::fs::read(&source).unwrap(), b"media");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_copy_publishes_exactly_one_name(root: &std::path::Path) {
+        use std::os::unix::fs::MetadataExt;
+
+        let source = root.join("source.jpg");
+        let destination = root.join("nested/destination.jpg");
+        std::fs::write(&source, b"media").unwrap();
+        let copy = copy_local_file_no_replace_blocking(
+            root,
+            &source,
+            &destination,
+            ".part",
+            |_| {},
+            || {},
+        )
+        .unwrap()
+        .unwrap();
+        copy.validate_blocking().unwrap();
+        assert_eq!(std::fs::metadata(&destination).unwrap().nlink(), 1);
+        let names: Vec<_> = std::fs::read_dir(destination.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["destination.jpg"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn link_fallback_publication_retires_its_temporary_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let _fallback = super::super::platform::ForcedLinkFallback::new(dir.path());
+        assert_copy_publishes_exactly_one_name(dir.path());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nfs_reconciliation_copy_publishes_exactly_one_name() {
+        let Some(dir) = crate::test_helpers::nfs_test_dir("nfs_reconciliation_copy") else {
+            return;
+        };
+        assert_copy_publishes_exactly_one_name(dir.path());
     }
 }
