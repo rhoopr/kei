@@ -331,6 +331,7 @@ struct PartialSyncError(usize);
 enum ExitClassification {
     Partial,
     Auth,
+    TwoFactor,
     TerminalAuth,
     Other,
 }
@@ -339,7 +340,7 @@ impl ExitClassification {
     const fn exit_code(self) -> u8 {
         match self {
             Self::Partial => EXIT_PARTIAL,
-            Self::Auth => EXIT_AUTH,
+            Self::Auth | Self::TwoFactor => EXIT_AUTH,
             Self::TerminalAuth => EXIT_TERMINAL_AUTH,
             Self::Other => 1,
         }
@@ -358,7 +359,7 @@ fn classify_exit_error(e: &anyhow::Error) -> ExitClassification {
     if e.downcast_ref::<auth::error::AuthError>()
         .is_some_and(auth::error::AuthError::is_two_factor_required)
     {
-        ExitClassification::Auth
+        ExitClassification::TwoFactor
     } else if e
         .downcast_ref::<auth::error::AuthError>()
         .is_some_and(auth::error::AuthError::is_terminal_apple_auth)
@@ -713,9 +714,7 @@ pub fn main_inner() -> ExitCode {
                 )]
                 {
                     eprintln!("Error: {e:#}");
-                    if e.downcast_ref::<auth::error::AuthError>()
-                        .is_some_and(auth::error::AuthError::is_two_factor_required)
-                    {
+                    if classification == ExitClassification::TwoFactor {
                         eprintln!(
                             "{}",
                             cli::two_factor_instructions(recovery_config.as_deref())
@@ -1877,7 +1876,7 @@ mod tests {
     fn classify_exit_error_two_factor_required_uses_auth_failure() {
         let e: anyhow::Error = auth::error::AuthError::TwoFactorRequired.into();
         let c = classify_exit_error(&e);
-        assert_eq!(c, ExitClassification::Auth);
+        assert_eq!(c, ExitClassification::TwoFactor);
         assert_eq!(c.exit_code(), EXIT_AUTH);
         assert!(c.should_log());
     }
@@ -1965,7 +1964,7 @@ mod tests {
             .context("during startup");
         assert_eq!(
             classify_exit_error(&e),
-            ExitClassification::Auth,
+            ExitClassification::TwoFactor,
             "context-wrapped 2FA-required must keep the documented auth exit code"
         );
 
@@ -1996,7 +1995,7 @@ mod tests {
         assert_eq!(
             sorted.len(),
             codes.len(),
-            "every exit classification must map to a distinct code; got {codes:?}"
+            "documented partial, auth, terminal-auth and generic exit codes must be distinct; got {codes:?}"
         );
     }
 }

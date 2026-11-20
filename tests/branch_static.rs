@@ -1962,12 +1962,14 @@ fn roundtrip_gate_documents_heuristic_limits_and_bypass_rationale() {
 }
 
 #[test]
-fn bug_report_template_requires_web_access_and_redaction() {
+fn bug_report_template_accepts_local_reports_and_keeps_redaction_guidance() {
     let bug = repo_file(".github/ISSUE_TEMPLATE/bug_report.yml");
 
     for expected in [
-        "I have confirmed that ADP is disabled",
-        "required: true",
+        "ADP disabled and web access enabled",
+        "ADP enabled or web access disabled",
+        "Local-only issue / not applicable",
+        "- Unsure",
         "Redact Apple IDs, passwords, session cookies, bearer tokens, webhook URLs",
     ] {
         assert!(
