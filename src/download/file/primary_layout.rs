@@ -289,6 +289,7 @@ pub(in crate::download) struct ManagedPrimaryAuthorization {
     preserved_path: PathBuf,
     preserved: LayoutFingerprint,
     modified: Option<std::time::SystemTime>,
+    publication_time: bool,
 }
 
 impl ManagedPrimaryAuthorization {
@@ -310,6 +311,7 @@ impl ManagedPrimaryAuthorization {
             preserved_path: path,
             preserved,
             modified: None,
+            publication_time: true,
         })
     }
 
@@ -319,6 +321,12 @@ impl ManagedPrimaryAuthorization {
         modified: Option<std::time::SystemTime>,
     ) -> Self {
         self.modified = modified;
+        self
+    }
+
+    #[must_use]
+    pub(in crate::download) fn with_publication_time(mut self, publication_time: bool) -> Self {
+        self.publication_time = publication_time;
         self
     }
 }
@@ -361,12 +369,15 @@ pub(in crate::download) async fn publish(
             anyhow::ensure!(snapshot_confined(&part)?.as_ref()==Some(&new) && snapshot_confined(&destination)?.as_ref()==Some(&auth.expected),"Retained primary publication input changed");
             // A replacement must read as changed to consumers that detect changes by mtime:
             // a prepared mtime newer than its predecessor (the edit time) is kept, else
-            // the publication time is used. A preserved local copy keeps its recorded mtime.
-            if auth.modified.is_none() {
+            // a publication time past the predecessor is used. A preserved local copy
+            // keeps its recorded mtime.
+            if auth.publication_time {
                 let predecessor=destination.open_regular()?.metadata()?.modified()?;
                 let prepared_file=part.validate_for_metadata(new.identity)?;
                 if prepared_file.metadata()?.modified()?<=predecessor {
-                    set_modified_file(&prepared_file,std::time::SystemTime::now())?;
+                    // A two-second floor clears whole-second and FAT two-second truncation.
+                    let floor=predecessor.checked_add(std::time::Duration::from_secs(2)).unwrap_or_else(std::time::SystemTime::now);
+                    set_modified_file(&prepared_file,std::time::SystemTime::now().max(floor))?;
                 }
                 drop(prepared_file);
                 anyhow::ensure!(snapshot_confined(&part)?.as_ref()==Some(&new),"Prepared primary layout bytes changed");
