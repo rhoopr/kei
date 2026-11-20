@@ -1,0 +1,107 @@
+name: PR baseline
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+
+permissions:
+  contents: read
+
+# One validation at a time per PR. A new push, reopen, retarget, or edit
+# cancels the obsolete baseline and runs the current checkout afresh.
+concurrency:
+  group: pr-baseline-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_STABLE_TOOLCHAIN: "1.94.1"
+  RUST_NIGHTLY_TOOLCHAIN: "nightly-2026-05-15"
+  # Treat any compiler warning as an error to keep the codebase warning-free
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  # Formatting plus the workflow/script lint and Python guard tests that must
+  # stay identical between the PR baseline and protected CI.
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+          components: rustfmt
+      - run: cargo fmt --all --check
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.8.10
+          sha256: 1f5e8795d24073904ef20ba70c1250ad6389d8c5672226d152e0ed24909ba72f
+          mise_toml: |
+            [tools]
+            actionlint = "1.7.12"
+            ruff = "0.16.3"
+            shellcheck = "0.11.0"
+            shfmt = "3.13.1"
+      - name: Workflow and script lint
+        run: bash scripts/ci/lint.sh
+      - name: Contract traceability
+        run: python3 scripts/check-contracts
+      - name: Workflow hardening
+        run: python3 .github/scripts/check_workflow_hardening.py
+      - name: CI Python tests
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+
+  # Full static analysis with the same locked feature surface as the release
+  # gate, but without building or running the wider test matrix.
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+          components: clippy
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  # Match the protected workflow's dependency cache for the library test harness.
+  smoke:
+    name: Sync safety
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: test
+          save-if: false
+      - name: Run offline sync-safety suite
+        run: bash scripts/ci/pr-smoke.sh
+
+  # Single required check. Fails unless every baseline job succeeded.
+  ci:
+    name: CI
+    if: always()
+    needs: [quality, clippy, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Require quality, clippy, and smoke
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci/gate.py quality clippy smoke

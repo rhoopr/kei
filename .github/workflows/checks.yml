@@ -17,41 +17,10 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 jobs:
-  # Detects which categories of files changed in the PR. Downstream jobs
-  # gate on these outputs to skip when irrelevant. The policy separates
-  # Python/advisory maintenance, Rust check tooling, and qualification inputs.
-  # Always-on workflow and Python tests also cover script-only PRs.
-  # Pushes to main run all non-PR-only checks.
-  detect:
-    name: Detect changes
-    runs-on: ubuntu-latest
-    outputs:
-      code: ${{ steps.filter.outputs.code }}
-      cargo: ${{ steps.filter.outputs.cargo }}
-      stress: ${{ steps.filter.outputs.stress }}
-      platform: ${{ steps.filter.outputs.platform }}
-      coverage: ${{ steps.filter.outputs.coverage }}
-      unused: ${{ steps.filter.outputs.unused }}
-      required: ${{ steps.filter.outputs.required }}
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          fetch-depth: 0
-      - id: filter
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          EVENT_NAME: ${{ github.event_name }}
-          HEAVY: ${{ inputs.heavy }}
-          LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}
-          FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
-        run: python3 scripts/ci/policy.py
-
   # Enforces consistent code style across the project
   # Fails if any code isn't formatted with rustfmt
   fmt:
     name: Format
-    needs: detect
-    if: needs.detect.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -65,8 +34,6 @@ jobs:
   # round-trip test. Mirrors `just gate`'s check-roundtrip-gate.sh.
   roundtrip:
     name: Roundtrip gate
-    needs: detect
-    if: needs.detect.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -78,8 +45,6 @@ jobs:
   # Acts as an additional layer of static analysis beyond the compiler
   clippy:
     name: Clippy
-    needs: detect
-    if: needs.detect.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -98,8 +63,6 @@ jobs:
   # make sure we also catch runtime regressions, not just compile breaks.
   test_no_default:
     name: Test (no-default-features)
-    needs: detect
-    if: needs.detect.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -124,8 +87,6 @@ jobs:
   # fail-fast: false ensures all platforms run even if one fails
   test:
     name: Test (${{ matrix.os }})
-    needs: detect
-    if: needs.detect.outputs.code == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -158,7 +119,6 @@ jobs:
           "TEMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Complete offline suite
-        if: runner.os == 'Linux' || needs.detect.outputs.platform == 'true'
         run: cargo test --locked --all-features
         env:
           # ExifTool is the independent reader for the HEIF item-map writer.
@@ -176,9 +136,6 @@ jobs:
           path: ignored-tests.txt
           if-no-files-found: error
           retention-days: 14
-      - name: Platform build and smoke
-        if: runner.os != 'Linux' && needs.detect.outputs.platform != 'true'
-        run: cargo test --locked --all-features --test cli --test media_fixtures --test service_cli --test service_linux --test service_macos --test service_windows --test service_status
       - name: Check ignored stress test remains selectable
         if: runner.os == 'Linux'
         run: bash scripts/test-copies-stress.sh --check
@@ -186,8 +143,6 @@ jobs:
   # One full scale run, independent of the regular platform/feature matrices.
   copies-stress:
     name: Copies stress
-    needs: detect
-    if: needs.detect.outputs.stress == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -203,8 +158,6 @@ jobs:
   # Important for maintaining quality docs, especially for published crates
   docs:
     name: Docs
-    needs: detect
-    if: needs.detect.outputs.code == 'true'
     runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: "-Dwarnings"
@@ -223,8 +176,6 @@ jobs:
 
   catalogs:
     name: Safety contracts and scenario catalogs
-    needs: detect
-    if: needs.detect.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -243,8 +194,7 @@ jobs:
   # Requires nightly because cargo-udeps uses unstable features
   unused-deps:
     name: Unused Dependencies
-    needs: detect
-    if: needs.detect.outputs.unused == 'true'
+    if: inputs.heavy || vars.CI_LIGHT_PR_ENABLED != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -259,8 +209,6 @@ jobs:
   # Ensures reproducible builds and prevents "works on my machine" issues
   lockfile:
     name: Lockfile
-    needs: detect
-    if: needs.detect.outputs.cargo == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -273,8 +221,7 @@ jobs:
   # Output artifact feeds into the Coverage aggregator job.
   coverage-head:
     name: Coverage (head)
-    needs: detect
-    if: needs.detect.outputs.coverage == 'true'
+    if: inputs.heavy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -318,8 +265,7 @@ jobs:
   # the delta - it doesn't block the PR.
   coverage-base:
     name: Coverage (base)
-    needs: detect
-    if: github.event_name == 'pull_request' && needs.detect.outputs.coverage == 'true'
+    if: github.event_name == 'pull_request' && inputs.heavy
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -537,8 +483,6 @@ jobs:
   # Catches known security vulnerabilities in your dependency tree
   security:
     name: Security Audit
-    needs: detect
-    if: needs.detect.outputs.cargo == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -546,9 +490,7 @@ jobs:
       # Ignore list + rationale: .cargo/audit.toml.
       - run: cargo audit --deny warnings
 
-  # Validate the contract catalog even on docs-only PRs. Guard the Actions
-  # supply-chain hardening rules that keep PRs
-  # from reintroducing mutable action refs or privileged manual publishes.
+  # Check the contract catalog and guard against mutable action refs and privileged manual publishes.
   workflow-hardening:
     name: Workflow hardening
     runs-on: ubuntu-latest
@@ -578,20 +520,7 @@ jobs:
             shellcheck = "0.11.0"
             shfmt = "3.13.1"
       - name: Check shell and Python helper syntax
-        run: |
-          set -euo pipefail
-          mapfile -t shell_files < <(find scripts tests/shell docker -maxdepth 3 -type f \( -name '*.sh' -o -name 'entrypoint.sh' \) -print | sort)
-          mapfile -t python_files < <(find scripts .github/scripts -maxdepth 3 -type f -name '*.py' -print | sort)
-          python_files+=(scripts/check-contracts)
-          for shell_file in "${shell_files[@]}"; do
-            bash -n "$shell_file"
-          done
-          mkdir -p /tmp/codex/kei/pycache
-          PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile "${python_files[@]}"
-          shellcheck -x -P tests/shell:scripts:scripts/full-test "${shell_files[@]}"
-          shfmt -d "${shell_files[@]}"
-          ruff check "${python_files[@]}"
-          actionlint .github/workflows/*.yml
+        run: bash scripts/ci/lint.sh
 
   # Catches spelling mistakes in code, comments, and documentation
   # Small thing but helps maintain a professional codebase. Always runs
@@ -603,13 +532,11 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: crate-ci/typos@5374cbf686e897b15713110e233094e2874de7ef # master
 
-  # Single required check. Only explicitly unrouted jobs may be skipped.
-  # The branch ruleset should require this name and nothing else.
+  # Main and qualification callers require every job selected for that profile.
   ci:
     name: Shared checks result
     if: always()
     needs:
-      - detect
       - fmt
       - roundtrip
       - clippy
@@ -630,17 +557,9 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - name: Require every routed check
+      - name: Require all checks selected for main or qualification
         env:
           NEEDS: ${{ toJSON(needs) }}
-          REQUIRED: ${{ needs.detect.outputs.required }}
-        run: |
-          python3 - <<'PYTHON'
-          import json, os, sys
-          sys.path.insert(0, "scripts/ci")
-          from gate import check
-          required = json.loads(os.environ["REQUIRED"])
-          if not required:
-              raise SystemExit("missing required-check policy")
-          check(json.loads(os.environ["NEEDS"]), required)
-          PYTHON
+          HEAVY: ${{ inputs.heavy }}
+          LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}
+        run: python3 scripts/ci/policy.py

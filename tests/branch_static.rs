@@ -1402,7 +1402,7 @@ fn run_tooling_shell(body: &str, fail_call: &str) -> (Output, Vec<String>) {
     let pycache = tempfile::tempdir().unwrap_or_else(|e| panic!("tooling pycache: {e}"));
     for directory in [
         "bin",
-        "scripts",
+        "scripts/ci",
         "tests/shell",
         "docker",
         ".github/scripts",
@@ -1449,8 +1449,12 @@ fi
     }
     let log = temp.path().join("calls");
     std::fs::write(&log, "").unwrap();
+    // Keep BASH_SOURCE in its real location for CI scripts that resolve the repository root.
+    let script = temp.path().join("scripts/ci/tool-under-test");
+    std::fs::write(&script, body).unwrap();
     let output = Command::new("/bin/bash")
-        .args(["-euo", "pipefail", "-c", body])
+        .args(["-euo", "pipefail"])
+        .arg(script)
         .current_dir(temp.path())
         .env(
             "PATH",
@@ -1490,7 +1494,8 @@ fn local_gate_includes_script_and_workflow_lint_recipes() {
         .split_once("\n  typos:")
         .unwrap()
         .0;
-    let ci_shell = shell_block(ci_lint, "        run: |\n", "          ");
+    assert!(ci_lint.contains("run: bash scripts/ci/lint.sh"));
+    let ci_shell = repo_file("scripts/ci/lint.sh");
     let shell_files = "docker/entrypoint.sh\tscripts/check-roundtrip-gate.sh\tscripts/space name.sh\ttests/shell/example.sh";
     let python_files =
         ".github/scripts/check_workflow_hardening.py\tscripts/helper.py\tscripts/check-contracts";
@@ -1594,7 +1599,7 @@ fn aggregate_ci_depends_on_no_default_feature_gate() {
         .expect("CI aggregate job must exist");
     assert!(
         aggregate.contains("      - test_no_default\n"),
-        "aggregate CI job must require test_no_default so branch protection sees no-default failures"
+        "shared checks must require no-default-feature tests on main and in qualification"
     );
 }
 
@@ -1604,7 +1609,12 @@ fn rust_ci_runs_on_main_push_without_pr_only_coverage() {
     assert!(repo_file(".github/workflows/ci.yml").contains("  push:\n    branches: [main]"));
     assert!(ci.contains("  workflow_call:"));
     assert!(ci.contains("LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}"));
-    assert!(ci.contains("if: needs.detect.outputs.coverage == 'true'"));
+    assert!(
+        ci.split_once("  coverage-head:\n")
+            .unwrap()
+            .1
+            .contains("if: inputs.heavy")
+    );
     assert!(ci.contains("      - coverage-head\n"));
     assert!(
         !ci.split_once("  ci:\n")
@@ -1616,7 +1626,7 @@ fn rust_ci_runs_on_main_push_without_pr_only_coverage() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn copies_stress_routes_relevant_changes_and_explicit_events() {
+fn copies_stress_runs_in_main_and_qualification_checks() {
     // Exercise the real routing and fail-closed gate owners, including CLI
     // invocation, rather than duplicating their policy in this harness.
     let output = Command::new("python3")
@@ -1635,7 +1645,7 @@ fn copies_stress_routes_relevant_changes_and_explicit_events() {
     assert!(output.status.success(), "{output:?}");
     let ci = repo_file(".github/workflows/checks.yml");
     assert!(ci.contains("run: python3 scripts/ci/policy.py"));
-    assert!(ci.contains("if: needs.detect.outputs.stress == 'true'"));
+    assert!(!ci.contains("needs.detect"));
     assert!(ci.contains("      - copies-stress\n"));
     assert!(repo_file(".github/workflows/ci.yml").contains("  workflow_dispatch:\n"));
     assert!(!ci.contains("  schedule:\n"));
@@ -1751,14 +1761,14 @@ fn release_homebrew_downloads_fail_fast_and_verify_checksums() {
 }
 
 #[test]
-fn service_smoke_is_routed_once_through_required_ci() {
+fn service_smoke_is_required_in_heavy_qualification() {
     let service_smoke = repo_file(".github/workflows/service-smoke.yml");
-    let ci = repo_file(".github/workflows/ci.yml");
+    let qualification = repo_file(".github/workflows/qualification.yml");
     assert!(service_smoke.contains("  workflow_call:"));
     assert!(!service_smoke.contains("  pull_request:"));
-    assert!(ci.contains("needs: [plan, checks, service, qualification]"));
-    assert!(ci.contains("needs.plan.outputs.service == 'true'"));
-    assert!(ci.contains("required += [\"service\"]"));
+    assert!(qualification.contains("uses: ./.github/workflows/service-smoke.yml"));
+    assert!(qualification.contains("needs: [quality, artifacts, service, specialized]"));
+    assert!(qualification.contains("gate.py quality artifacts service specialized"));
 }
 
 #[test]

@@ -8,8 +8,7 @@
 
 ## Test workflow
 
-Local iteration uses focused tests. Hosted PR CI owns complete offline and
-platform validation; do not repeat those suites locally by default. Run live
+Local iteration uses focused tests. Every PR runs the Linux baseline; pushes to main run complete offline and platform tests. Run live
 provider and real host-service checks only when relevant and authorized.
 `KEI_FULL_TEST_REAL_SERVICE=1 just release-local` collects the local release
 prerequisites without replaying hosted offline checks. `just full-test` remains
@@ -141,21 +140,7 @@ the catalog and one passing execution; `--check` validates only the catalog.
 The regular Linux CI test job checks this catalog so a rename, lost ignore
 marker, or feature change cannot silently remove the stress proof.
 
-`Copies stress` runs once with all features on Linux for changes to its
-runtime owners: download, state, Photos provider, sync, configuration, retry,
-selection, filesystem/shared types, command service types, media fixtures,
-and the queue-projection fixture. Other unit-test modules and outer CLI,
-command, and authentication paths do not select the large case alone. Shared
-runtime files remain conservative: a diagnostic change in Photos session or
-hydration code still selects stress. The compact fixtures remain mandatory.
-See [PR routing](../docs/ci.md#pr-routing) for the filename tradeoff and actual
-#984/#985 regression cases.
-
-Main pushes, explicit full/heavy routes, manual qualification, and daily
-Nightly qualification retain stress regardless of paths. Release qualification
-also runs it before publication. The shared fail-closed `CI` gate requires
-stress whenever routing selects it; scheduled qualification uses its separate
-concurrency group. Run the explicit stress command for local scale diagnosis.
+`Copies stress` runs once with all features on Linux on main pushes and during heavy qualification. The [PR baseline](../docs/ci.md#pr-baseline) runs the compact copies/reseed fixture as part of the sync-safety suite. Run the explicit stress command for local scale diagnosis.
 CI coverage and `just cov patch` explicitly skip the test on head and base,
 including an older base
 that has not marked it ignored. The no-default build lacks XMP and does not
