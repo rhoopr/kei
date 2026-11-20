@@ -2,7 +2,8 @@ name: Nightly qualification
 
 on:
   schedule:
-    - cron: "23 7 * * *"
+    - cron: "5 0 * * *"
+      timezone: America/New_York
   workflow_dispatch:
 
 permissions:
