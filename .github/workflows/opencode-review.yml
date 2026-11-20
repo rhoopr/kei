@@ -94,7 +94,9 @@ jobs:
 
   # Pin identities once so both reviewers inspect the same issue and main.
   issue-pin:
-    if: github.event_name == 'issues' && github.event.action == 'opened'
+    if: >-
+      github.event_name == 'issues' && github.event.action == 'opened' &&
+      github.event.issue.user.type == 'User' && github.event.issue.user.login != github.repository_owner
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     permissions:

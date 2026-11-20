@@ -1580,6 +1580,7 @@ class IssueWorkflowTests(unittest.TestCase):
         self.assertIn("    timeout-minutes: 15\n", reader)
         self.assertIn("    timeout-minutes: 5\n", publisher)
         self.assertIn("github.event.action == 'opened'", pin)
+        self.assertIn("github.event.issue.user.type == 'User' && github.event.issue.user.login != github.repository_owner", pin)
         self.assertIn("fail-fast: false", reader)
         self.assertIn("fail-fast: false", publisher)
         self.assertIn("kind: [product, code]", reader)
