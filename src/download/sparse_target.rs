@@ -54,7 +54,7 @@ async fn receipts(
     target: &SelectedSparseTarget,
     asset: &PhotoAsset,
     cancel: &CancellationToken,
-) -> anyhow::Result<Option<SparseTargetState>> {
+) -> Result<Option<SparseTargetState>, &'static str> {
     let config = &target.config;
     let Some(db) = &config.state_db else {
         return Ok(None);
@@ -66,12 +66,27 @@ async fn receipts(
             asset.id(),
             target.scan.as_deref(),
         )
-        .await?
+        .await
+        .map_err(|_error| "target_file_unverified")?
     {
         Ok(state) => state,
         Err(SparseTargetHold::ReceiptUnqualified) => return Ok(None),
-        Err(hold) => return Err(hold.into()),
+        Err(SparseTargetHold::MembershipUnobserved) => return Err("target_membership_unobserved"),
+        Err(SparseTargetHold::PairUnresolved) => return Err("target_pair_unresolved"),
     };
+    verify_receipts(target, asset, cancel, before, db.as_ref())
+        .await
+        .map_err(|_error| "target_file_unverified")
+}
+
+async fn verify_receipts(
+    target: &SelectedSparseTarget,
+    asset: &PhotoAsset,
+    cancel: &CancellationToken,
+    before: SparseTargetState,
+    db: &dyn super::DownloadStore,
+) -> anyhow::Result<Option<SparseTargetState>> {
+    let config = &target.config;
     let versions = super::filter::extract_skip_candidates(asset, config.as_ref());
     if versions.is_empty() {
         return Ok(None);
@@ -297,15 +312,7 @@ pub(crate) async fn recover(
             outcome("partial", "target_receipt_ready");
             return Ok(Some(proof));
         }
-        Err(error) => {
-            return Ok(unsupported(
-                match error.downcast_ref::<SparseTargetHold>() {
-                    Some(SparseTargetHold::MembershipUnobserved) => "target_membership_unobserved",
-                    Some(SparseTargetHold::PairUnresolved) => "target_pair_unresolved",
-                    _ => "target_file_unverified",
-                },
-            ));
-        }
+        Err(reason) => return Ok(unsupported(reason)),
         Ok(None) if target.scan.is_some() => {
             return Ok(unsupported("target_selected_copies_unverified"));
         }
@@ -358,7 +365,7 @@ pub(crate) async fn recover(
             Ok(Some(proof))
         }
         Ok(None) => Ok(unsupported("target_receipt_unqualified")),
-        Err(_) => Ok(unsupported("target_file_unverified")),
+        Err(reason) => Ok(unsupported(reason)),
     }
 }
 
