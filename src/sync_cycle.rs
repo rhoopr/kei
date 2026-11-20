@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::auth;
 use crate::config;
 use crate::download;
+use crate::icloud::photos::PRIMARY_ZONE_NAME;
 use crate::state;
 
 /// Per-library state: zone name, sync token key, and resolved album plan.
@@ -1123,7 +1124,35 @@ async fn run_cycle_inner(
         .map(|library| library.zone_name.clone())
         .collect();
 
-    for lib_state in library_states.iter().copied() {
+    let scoped = |state: &LibraryState| {
+        config.filters.skip_created_before.is_some()
+            || config.filters.skip_created_after.is_some()
+            || !matches!(state.plan.passes.as_slice(),
+                [pass] if pass.kind == crate::commands::PassKind::Unfiled && pass.exclude_ids.is_empty())
+    };
+    let mut completed_scans = rustc_hash::FxHashMap::default();
+    let mut ordered_libraries = library_states.to_vec();
+    // Sparse private records in PrimarySync point into Shared libraries.
+    // Let their ordinary scoped queries and local writers finish first.
+    let collect_shared_scans = download_controls.run_mode.downloads_files()
+        && library_states
+            .iter()
+            .any(|state| state.zone_name == PRIMARY_ZONE_NAME && has_active_passes(state));
+    if collect_shared_scans {
+        ordered_libraries
+            .sort_by_key(|state| state.zone_name == PRIMARY_ZONE_NAME || !scoped(state));
+    }
+    let due_links: Vec<_> = if collect_shared_scans
+        && ordered_libraries
+            .iter()
+            .any(|state| state.zone_name != PRIMARY_ZONE_NAME && scoped(state))
+        && let Some(db) = state_db
+    {
+        download::sparse_target::due_primary_links(db).await?
+    } else {
+        Vec::new()
+    };
+    for lib_state in ordered_libraries {
         if shutdown_token.is_cancelled() {
             break;
         }
@@ -1481,6 +1510,14 @@ async fn run_cycle_inner(
         );
         Arc::make_mut(&mut download_config).inventory_reconciliation =
             inventory_request_at_start.is_some();
+        Arc::make_mut(&mut download_config).sparse_membership_due = !lib_state.plan_is_stale
+            && !indexing_reconciliation
+            && scoped(lib_state)
+            && lib_state.plan.passes.first().is_some_and(|pass| {
+                due_links
+                    .iter()
+                    .any(|link| pass.album.sparse_link_matches(link))
+            });
         // FINISHED is a prerequisite, not proof that this inventory remained
         // complete. Deletion-capable maintenance stays deferred until the
         // full scope and its final readiness check have qualified.
@@ -1500,19 +1537,18 @@ async fn run_cycle_inner(
             Arc::make_mut(&mut download_config).complete_path_selection = true;
         }
         let download_client = shared_session.read().await.download_client().clone();
-        // Only an unrestricted current full-library selection can admit an exact
-        // sparse target without inventing album/rank membership.
         let mut sparse_targets = Vec::new();
         if download_controls.run_mode.downloads_files() {
-            for target in library_states.iter().copied().filter(|target| {
-                target.zone_name != lib_state.zone_name
-                    && !target.plan_is_stale
-                    && target.plan.passes.len() == 1
-            }) {
+            for target in library_states
+                .iter()
+                .copied()
+                .filter(|target| target.zone_name != lib_state.zone_name && !target.plan_is_stale)
+            {
                 let Some(pass) = target.plan.passes.first() else {
                     continue;
                 };
-                if pass.kind != crate::commands::PassKind::Unfiled || !pass.exclude_ids.is_empty() {
+                let scan = completed_scans.get(&target.zone_name).cloned();
+                if scoped(target) && scan.is_none() {
                     continue;
                 }
                 #[cfg(feature = "xmp")]
@@ -1527,23 +1563,31 @@ async fn run_cycle_inner(
                 let target_groupings = Arc::new(download::AssetGroupings::default());
                 let target_config = build_download_config(
                     download::SyncMode::Full,
-                    Arc::clone(&pass.exclude_ids),
+                    Arc::default(),
                     target_groupings,
                     Arc::from(target.zone_name.as_str()),
                 );
-                if target_config.skip_created_before.is_some()
-                    || target_config.skip_created_after.is_some()
+                if (scan.is_none()
+                    && (target_config.skip_created_before.is_some()
+                        || target_config.skip_created_after.is_some()))
                     || target_config.edited_naming == crate::types::EditedNaming::Primary
                 {
                     continue;
                 }
-                let mut target_config = target_config.with_pass(pass);
-                // A full-library path label is not evidence of album membership.
-                target_config.album_name = None;
+                let target_config = if scan.is_some() {
+                    // The generation owns the destinations and exclusions for every pass.
+                    target_config
+                } else {
+                    let mut config = target_config.with_pass(pass);
+                    // A full-library path label is not evidence of album membership.
+                    config.album_name = None;
+                    Arc::new(config)
+                };
                 sparse_targets.push(download::sparse_target::SelectedSparseTarget {
+                    scan,
                     library: target.library.clone(),
                     album: pass.album.clone(),
-                    config: Arc::new(target_config),
+                    config: target_config,
                     client: download_client.clone(),
                     controls: download_controls,
                 });
@@ -1722,6 +1766,16 @@ async fn run_cycle_inner(
                     sync_result.outcome =
                         merge_download_outcomes(&sync_result.outcome, &bridge_result.outcome);
                     sync_result.accumulate(&bridge_result);
+                    // A later scan supersedes the inventory's membership proof.
+                    // Only a raw-empty bridge can leave that earlier proof current.
+                    if bridge_result.checkpoint.scanned_generation.is_some()
+                        || bridge_result.checkpoint.delta_raw_records_observed != Some(false)
+                    {
+                        sync_result
+                            .checkpoint
+                            .scanned_generation
+                            .clone_from(&bridge_result.checkpoint.scanned_generation);
+                    }
                     if bridge_result.checkpoint.retained_token_rejected
                         && !bridge_result.checkpoint.completed_delta_replay
                         && state_db.is_some()
@@ -2104,6 +2158,7 @@ async fn run_cycle_inner(
 
         let mut checkpoint_evidence = checkpoint_support_fields(&checkpoint_decision);
         let mut checkpoint_persistence = "no_state_db";
+        let mut zone_checkpoint_stored = false;
         match checkpoint_decision {
             SourceCheckpointDecision::Advance { token, basis } => {
                 crate::metrics::record_checkpoint_decision("advanced", basis.as_str());
@@ -2149,6 +2204,7 @@ async fn run_cycle_inner(
                             checkpoint_persistence = "failed";
                         } else {
                             checkpoint_persistence = "staged_reconciliation";
+                            zone_checkpoint_stored = true;
                         }
                     } else {
                         let mut metadata_updates = vec![(lib_state.sync_token_key.clone(), token)];
@@ -2196,6 +2252,7 @@ async fn run_cycle_inner(
                             checkpoint_persistence = "failed";
                         } else {
                             checkpoint_persistence = "stored";
+                            zone_checkpoint_stored = true;
                             if cycle_has_stale_plan && !lib_state.plan_is_stale {
                                 tracing::warn!(
                                     zone = %lib_state.zone_name,
@@ -2273,6 +2330,23 @@ async fn run_cycle_inner(
             }
         }
 
+        if zone_checkpoint_stored
+            && library_completed_without_errors
+            && sync_result.stats.failed == 0
+            && sync_result.stats.exif_failures == 0
+            && scoped(lib_state)
+            && !indexing_reconciliation
+            && !lib_state.plan_is_stale
+            && library_states
+                .iter()
+                .filter(|state| state.zone_name == lib_state.zone_name)
+                .count()
+                == 1
+            && let Some((scope, generation)) = sync_result.checkpoint.scanned_generation.take()
+            && scope == download::inventory_scope(&lib_state.plan.passes, &download_config)
+        {
+            completed_scans.insert(lib_state.zone_name.clone(), generation);
+        }
         if checkpoint_persistence == "failed" {
             sync_result.checkpoint.state_write_failures = sync_result
                 .checkpoint

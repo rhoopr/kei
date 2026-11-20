@@ -17,7 +17,7 @@ use super::asset_writes::upsert_asset_row;
 use super::contracts::PreservedLocal;
 use super::membership::refresh_asset_album_groupings_tx;
 use super::provider_selection::{SelectionDecision, SelectionDestination, SelectionOutcome};
-use super::rows::encode_asset_date;
+use super::rows::{decode_asset_date, encode_asset_date};
 use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
 
@@ -460,6 +460,111 @@ pub(crate) struct ActiveGeneration {
     pub(crate) sealed: bool,
     pub(crate) checkpoint_ready: bool,
     pub(crate) checkpoint_veto: Option<String>,
+}
+
+/// Destinations admitted by a specific, freshly scanned selection. Re-read
+/// their rank and publication receipts in the source checkpoint transaction.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SparseSelectedCopy {
+    pub(crate) created: chrono::DateTime<Utc>,
+    pub(crate) added: Option<chrono::DateTime<Utc>>,
+    pub(crate) version: String,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) provider_checksum: String,
+    pub(crate) metadata_hash: String,
+    pub(crate) local_checksum: String,
+    source_checksum: String,
+}
+
+pub(super) fn sparse_selected_copies(
+    conn: &Connection,
+    generation: &str,
+    library: &str,
+    child: &str,
+    master: &str,
+) -> Result<Result<Vec<SparseSelectedCopy>, super::SparseTargetHold>, StateError> {
+    use super::SparseTargetHold;
+    let root = load_generation(conn, generation)?;
+    if !root.sealed
+        || !root.checkpoint_ready
+        || root.spec.zone.get("zoneName").and_then(Value::as_str) != Some(library)
+        || basis(conn, &root.spec.scope)? != root.spec.basis
+        || conn.query_row("SELECT id FROM provider_active_generations WHERE scope=?1 ORDER BY created_at DESC,id DESC LIMIT 1",
+            [&root.spec.scope], |row| row.get::<_, String>(0))? != generation
+    {
+        return Ok(Err(SparseTargetHold::ReceiptUnqualified));
+    }
+    let mut keys = conn.prepare("SELECT pass_key FROM provider_active_decisions WHERE generation=?1 AND child=?2 ORDER BY pass_key")?;
+    let keys = keys
+        .query_map(params![generation, child], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut copies = Vec::new();
+    if !keys.is_empty()
+        && !super::legacy_preservation::child_publications_ready(
+            conn,
+            library,
+            child,
+            root.spec.metadata_enabled,
+        )?
+    {
+        return Ok(Err(SparseTargetHold::ReceiptUnqualified));
+    }
+    let mut pages = RankProofs::new(conn, &root);
+    let grouping = root
+        .spec
+        .metadata_enabled
+        .then(|| grouping_hash(conn, library, child))
+        .transpose()?;
+    for key in keys {
+        let manifest = load_decision_with_pages(conn, &root, &key, child, true, &mut pages)?;
+        if manifest.media_zone(&root) != &root.spec.zone {
+            continue;
+        }
+        let decision = manifest.decision;
+        if decision.master.as_deref().is_some_and(|id| id != master) {
+            return Ok(Err(SparseTargetHold::PairUnresolved));
+        }
+        if decision.outcome == SelectionOutcome::Excluded {
+            continue;
+        }
+        if decision.outcome != SelectionOutcome::Selected
+            || decision.master.as_deref() != Some(master)
+            || manifest.state_id != child
+            || decision.destinations.is_empty()
+        {
+            return Ok(Err(SparseTargetHold::PairUnresolved));
+        }
+        for dest in decision.destinations {
+            let receipt = conn.query_row("SELECT w.local_checksum,w.source_checksum,w.created_at,w.added_at FROM provider_active_destinations w
+                JOIN assets a ON a.library=w.library AND a.id=w.asset_id AND a.version_size=w.version_size
+                  AND a.checksum=w.checksum AND a.metadata_hash=w.metadata_hash AND a.size_bytes=w.size_bytes
+                  AND a.created_at IS w.created_at AND a.added_at IS w.added_at
+                WHERE w.generation=?1 AND w.pass_key=?2 AND w.child=?3 AND w.path=?4 AND w.version_size=?5
+                  AND w.admitted=1 AND w.verified_media=1 AND w.preserved_local IS NULL
+                  AND w.prepared_hash IS NULL AND (?6 IS NULL OR (w.verified_metadata=1 AND w.grouping_hash=?6))
+                  AND EXISTS (SELECT 1 FROM provider_active_destinations p
+                    WHERE p.current_publication=1 AND p.library=w.library AND p.asset_id=w.asset_id
+                      AND p.master=w.master AND p.path=w.path AND p.version_size=w.version_size
+                      AND p.checksum=w.checksum AND p.local_checksum=w.local_checksum
+                      AND p.source_checksum=w.source_checksum AND p.verified_media=1
+                      AND p.preserved_local IS NULL AND p.prepared_hash IS NULL)",
+                params![generation,key,child,dest.path.key()?,dest.version_size,grouping], |row| Ok((row.get(0)?,row.get(1)?, decode_asset_date(row.get(2)?,2)?, row.get::<_,Option<f64>>(3)?.map(|v| decode_asset_date(v,3)).transpose()?))).optional()?;
+            let Some((local_checksum, source_checksum, created, added)) = receipt else {
+                return Ok(Err(SparseTargetHold::ReceiptUnqualified));
+            };
+            copies.push(SparseSelectedCopy {
+                created,
+                added,
+                version: dest.version_size,
+                path: dest.path.to_path(),
+                provider_checksum: dest.checksum,
+                metadata_hash: dest.metadata_hash,
+                local_checksum,
+                source_checksum,
+            });
+        }
+    }
+    Ok(Ok(copies))
 }
 
 /// Shared selector handoff: exact published selector-to-container evidence.

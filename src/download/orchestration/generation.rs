@@ -1977,6 +1977,17 @@ pub(super) async fn inventory(
         result.sync_token = None;
         result.block_incremental_token("membership_layout_unresolved");
     }
+    if covered
+        && query_checkpoint_ready
+        && !result.checkpoint.sync_token_blocked
+        && result.stats.same_cycle_recovery_attempts == 0
+        && !config.provisional
+    {
+        result.checkpoint.scanned_generation = Some((
+            super::config::inventory_scope(passes, config),
+            run.root.id.clone(),
+        ));
+    }
     Ok(result)
 }
 
@@ -2538,9 +2549,9 @@ pub(super) async fn after_delta(
     }
     // Smart membership and foreign media facts are not covered by the owner's
     // zone delta. Refresh their current queries through the same inventory path.
-    let refresh_selection = passes
-        .iter()
-        .any(|pass| pass.kind == PassKind::SmartFolder || pass.album.has_cross_zone_hydration())
+    let refresh_selection = passes.iter().any(|pass| {
+            pass.kind == PassKind::SmartFolder || pass.album.has_cross_zone_hydration()
+        })
         || !delta.membership.relations.is_empty()
         || !delta.membership.containers.is_empty()
         || (config.primary_layout_active
@@ -2551,7 +2562,14 @@ pub(super) async fn after_delta(
                         .await?
                         .is_empty(),
                     None => false,
-                }));
+                }))
+        // A due source can refresh a completed target, but cannot restart
+        // a deferred target generation or bypass its local recovery work.
+        || (config.sparse_membership_due && !config.primary_layout_active
+            && root.as_ref().is_some_and(|root| root.sealed && root.checkpoint_ready)
+            && !context.capture.db.unfinished_selection_debt(
+                context.capture.owner.clone(), context.scope.clone(), context.config_hash.clone(),
+            ).await?);
     let mut selected = match root {
         Some(root)
             if !refresh_selection

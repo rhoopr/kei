@@ -210,6 +210,8 @@ pub(crate) struct InventoryMeasurement {
 #[derive(Debug, Default)]
 #[must_use]
 pub(crate) struct CheckpointEvidence {
+    /// Only the inventory owner can supply a freshly scanned selection root.
+    pub(crate) scanned_generation: Option<(super::config::InventoryScope, String)>,
     pub(crate) inventory_reconciliation_complete: bool,
     /// Every fresh ordered path-selection query
     /// reached proven EOF with usable unanimous tokens, but the selected work

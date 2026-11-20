@@ -1921,6 +1921,7 @@ mod wiremock_tests {
         let dir_arc: Arc<StdPath> = Arc::from(directory);
         DownloadConfig {
             sparse_targets: Arc::from([]),
+            sparse_membership_due: false,
             complete_path_selection: false,
             selection_context: None,
             selection_run: None,

@@ -480,6 +480,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             temp_suffix: Arc::clone(&cfg_temp_suffix),
             state_db: state_db.clone(),
             sparse_targets: Arc::from([]),
+            sparse_membership_due: false,
             complete_path_selection: false,
             selection_context: None,
             selection_run: None,

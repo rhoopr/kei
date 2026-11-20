@@ -134,6 +134,57 @@ async fn unresolved_identity_bypasses_watch_no_change_shortcut() {
 }
 
 #[tokio::test]
+async fn due_sparse_link_includes_its_selected_target_in_quiet_watch_cycles() {
+    use crate::state::SparseIdentityStore as _;
+    use crate::sync_loop::test_support::{
+        make_owned_cycle_album, make_run_cycle_library_state_with_album,
+    };
+    let db = Arc::new(state::SqliteStateDb::open_in_memory().unwrap());
+    let libraries = ["PrimarySync", "SharedSync-target", "SharedSync-other"].map(|zone| {
+        let album = make_owned_cycle_album(
+            &db,
+            zone,
+            "private",
+            Box::new(crate::test_helpers::MockPhotosSession::new()),
+        );
+        make_run_cycle_library_state_with_album(zone, "token", album)
+    });
+    let evidence =
+        state::SparseEvidence::new(r#"[1,"child","SharedSync-target","_defaultOwner"]"#.into());
+    let row = db
+        .observe_sparse_identity(
+            "PrimarySync",
+            &state::SparseSourceId::new("source"),
+            &evidence,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    for due in [true, false] {
+        if !due {
+            db.record_sparse_attempt(
+                &row,
+                state::SparseAttemptOutcome::Unresolved(evidence.clone()),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        }
+        let mut precheck = WatchPrecheck::SkipAll;
+        include_pending_local_work(
+            &mut precheck,
+            db.as_ref(),
+            &config::MetadataConfig::default(),
+            &libraries,
+        )
+        .await;
+        assert!(precheck.should_sync_zone("PrimarySync"));
+        assert_eq!(precheck.should_sync_zone("SharedSync-target"), due);
+        assert!(!precheck.should_sync_zone("SharedSync-other"));
+    }
+}
+
+#[tokio::test]
 async fn disabled_metadata_writers_leave_rewrite_marker_out_of_watch_work() {
     let db = state::SqliteStateDb::open_in_memory().expect("state db");
     seed_watch_metadata_work(
