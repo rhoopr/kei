@@ -33,7 +33,11 @@ pub(super) use fingerprint::fingerprint_open_file_snapshot_blocking;
 pub(crate) use fingerprint::imported_path_matches_receipt;
 pub(super) use fingerprint::{RetainedPendingFile, retain_pending_file};
 pub(super) use fingerprint::{fingerprint_downloaded_path, fingerprint_regular_file};
+#[cfg(all(test, feature = "xmp", target_os = "linux"))]
+pub(super) use platform::RECONCILIATION_RENAME_FAULT;
 pub(super) use publication::PublicationOutcome;
+#[cfg(all(feature = "xmp", target_os = "linux"))]
+pub(super) use replacement_recovery::finish_owned_prepared_link;
 
 /// Inspect confined regular bytes for an explicit integrity confirmation.
 pub(crate) async fn inspect_integrity_fingerprint(

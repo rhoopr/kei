@@ -570,7 +570,7 @@ pub(super) fn publish_confined(
 /// Resume only the exact temporary two-name link left by no-replace or the
 /// committed fallback journal. The layout's durable prepared receipt supplies
 /// custody, identity and bytes; unknown links never receive this authorization.
-pub(super) fn finish_owned_prepared_link(
+pub(in crate::download) fn finish_owned_prepared_link(
     part: &ConfinedPath,
     target: &ConfinedPath,
     expected: ExistingFileFingerprint,
