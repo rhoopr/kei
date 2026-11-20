@@ -62,9 +62,9 @@ download pipeline does not parse CloudKit records.
 
 - Follow the testing contract in `CONTRIBUTING.md`; investigate every failure
   before changing product code or calling it unrelated.
-- Run focused tests while iterating. Hosted PR CI owns the complete offline
-  gate; do not replay it locally by default. Run `just gate` for offline
-  diagnosis or when hosted CI is unavailable.
+- Run focused tests while iterating. PR CI runs the Linux baseline; main pushes
+  run the full offline suites. Run `just gate` for offline diagnosis or when
+  hosted CI is unavailable.
 - Local live-provider and real host-service checks are relevance-based and
   explicitly authorized. For release prerequisites, read `docs/ci.md`.
 - Finish with `cargo fmt --all --check` and
