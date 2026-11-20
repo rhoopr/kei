@@ -7,6 +7,12 @@ use tokio::fs;
 
 use crate::fs_util::ConfinedPath;
 
+#[cfg(all(test, feature = "xmp", target_os = "linux"))]
+thread_local! {
+    pub(in crate::download) static RECONCILIATION_RENAME_FAULT: std::cell::Cell<Option<fn(&Path)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 pub(super) fn fsync_parent_dir_best_effort_blocking(path: &Path) {
     if let Err(error) = crate::fs_util::fsync_parent_dir(path) {
         tracing::warn!(target: "kei::download::file",
@@ -132,6 +138,13 @@ fn renameat2_confined_blocking(
     final_path: &ConfinedPath,
     flags: libc::c_uint,
 ) -> std::io::Result<()> {
+    #[cfg(all(test, feature = "xmp"))]
+    if flags == libc::RENAME_NOREPLACE
+        && let Some(hook) = RECONCILIATION_RENAME_FAULT.take()
+    {
+        hook(final_path.path());
+        return Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
     // SAFETY: both directory descriptors and NUL-terminated names remain live,
     // and callers pass one documented renameat2 flag.
     let result = unsafe {
