@@ -269,9 +269,13 @@ os.execv(os.environ["REAL_GIT"], [os.environ["REAL_GIT"], *args])
     def test_docs_workflow_retains_candidate_rustdoc_and_one_live_clone(self):
         workflow = (ROOT / ".github/workflows/checks.yml").read_text().split("  docs:\n", 1)[1].split("\n  catalogs:", 1)[0]
         self.assertEqual(workflow.count("git clone"), 1)
+        self.assertIn("Check live wiki command documentation\n        if: inputs.heavy", workflow)
         self.assertIn('scripts/check-wiki-commands.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/kei-wiki"', workflow)
         self.assertIn("cargo doc --no-deps --all-features", workflow)
         self.assertNotIn("cargo build", workflow)
+        daily = (ROOT / ".github/workflows/daily-wiki.yml").read_text()
+        self.assertIn("  schedule:", daily)
+        self.assertIn('scripts/check-wiki-commands.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/kei-wiki"', daily)
 
 
 if __name__ == "__main__":

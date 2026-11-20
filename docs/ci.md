@@ -6,7 +6,7 @@
 
 | Job | What it checks |
 |-----|----------------|
-| Repository checks | Rust formatting, shell/Python/workflow lint, the safety contract catalog, workflow hardening and CI policy tests. |
+| Repository checks | Rust formatting, the serializer roundtrip diff against the PR event's base SHA, shell/Python/workflow lint, the safety contract catalog, workflow hardening and CI policy tests. |
 | Clippy | `cargo clippy --locked --all-targets --all-features -- -D warnings`. |
 | Sync safety | Two threads in one all-feature library harness run the transfer, checkpoint, bundled sync fixture, asset parsing, destination path, SQLite state/schema, import, filtering and selection groups, plus named safety contracts and a compact copies/reseed fixture. Run `bash scripts/ci/pr-smoke.sh` locally. Each group must contribute a passing test; the original three publication and retry cases must pass by name. |
 
@@ -16,7 +16,7 @@ Branch protection requires `CI`. It passes only when all three jobs succeed for 
 
 Pushes to `main` run the full Linux, macOS and Windows offline suites, Linux no-default-feature checks, copies stress, docs and dependency audit. To qualify a feature branch before merging, dispatch **Heavy qualification** for that branch. Qualification adds native service smoke, coverage, unused-dependency analysis, bounded fuzzing, optimized tests, five release archives and two container architectures. It lists ignored tests without running credentialed tests.
 
-Nightly and release use that same qualification workflow. Release also requires separate local evidence before publishing. For local development, run focused tests for the behavior you changed. `just gate` remains available for offline diagnosis.
+Heavy qualification also runs on Sundays at 03:23 UTC as a read-only release rehearsal. Release tags always rerun it on the release commit and require separate local evidence before publishing. Neither a nightly result nor a weekly rehearsal qualifies a different commit. For local development, run focused tests for the behavior you changed. `just gate` remains available for offline diagnosis.
 
 ## Local release prerequisites
 
@@ -52,11 +52,14 @@ Nightly results do not replace this requirement.
 
 ## Nightly operation
 
-When enabled, `Nightly qualification` runs on main at 07:23 UTC each day (03:23 EDT or
-02:23 EST). It runs even when the commit is unchanged, since dependencies and
-runner images can change. It has no publication permission. Manual dispatch on
-main uses the same route; manual Heavy qualification can test a feature branch
-without publishing or posting notifications.
+`Nightly qualification` runs on `main` at 07:23 UTC when enabled. A manual dispatch on `main` uses the same four independent jobs, pinned to the event SHA:
+
+- **Main push CI evidence:** require the latest `Rust CI` push run for that SHA and its shared checks result to have succeeded. A missing, running, cancelled or failed run is a gap; nightly reports it instead of replaying the platform matrix. If the push run was still running, rerun nightly after it finishes.
+- **Seeded fuzzing:** build every registered target and run each with its available seeds, including on an unchanged commit.
+- **RustSec audit:** check the locked dependencies against the current advisory database every day.
+- **Optimized library tests:** run the all-feature release-mode library suite unless a prior successful nightly on the same SHA actually ran and passed it. A skipped test step is not evidence. If no qualifying result is found in the bounded history, run the tests.
+
+All four jobs must succeed for the nightly incident reporter to signal recovery. Nightly does not build release candidates. The **Daily live wiki check** runs separately at 06:43 UTC and reports documentation drift on its own Actions run. Heavy qualification still checks the wiki before a release.
 
 When enabled, `Nightly freshness` checks at 19:23 UTC. A missing, failed, cancelled, or stale
 completed run opens one incident issue. Incidents carry `bug`, `@infra`, `@test`,
@@ -84,7 +87,7 @@ concurrency group, so incident updates stay serialized. Scheduled Actions can be
 delayed or disabled; this second schedule detects missing qualification runs but
 is not an external availability monitor for GitHub itself.
 
-Reports and candidate artifacts are retained for 14 days. PR, nightly, and
+Heavy qualification reports and candidate artifacts are retained for 14 days. PR, nightly, and
 release concurrency groups are separate. Nightly work cannot cancel a release.
 
 ## Advisory OpenCode review

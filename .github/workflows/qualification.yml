@@ -3,6 +3,8 @@ name: Heavy qualification
 on:
   workflow_call:
   workflow_dispatch:
+  schedule:
+    - cron: "23 3 * * 0"
 
 permissions:
   contents: read
@@ -49,17 +51,7 @@ jobs:
       - name: Install bounded fuzz runner
         run: cargo +1.94.1 install --locked cargo-fuzz --version 0.13.1
       - name: Fuzz every registered target with checked-in seeds
-        run: |
-          set -euo pipefail
-          cargo +nightly-2026-05-15 fuzz build
-          mapfile -t targets < <(cargo +nightly-2026-05-15 fuzz list)
-          test "${#targets[@]}" -gt 0
-          for target in "${targets[@]}"; do
-            mkdir -p "fuzz/corpus/$target"
-            seeds=()
-            if [[ -d "fuzz/seeds/$target" ]]; then seeds+=("fuzz/seeds/$target"); fi
-            cargo +nightly-2026-05-15 fuzz run "$target" "fuzz/corpus/$target" "${seeds[@]}" -- -max_total_time=10 -timeout=10
-          done
+        run: bash scripts/ci/seeded-fuzz.sh
       - name: Source-package and optimized regressions
         run: |
           set -euo pipefail
