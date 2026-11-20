@@ -33,6 +33,8 @@ class HardeningTests(unittest.TestCase):
                 ("checks.yml", "run: python3 scripts/check-contracts", "run: echo skipped contracts", "missing required routing/gate guard"),
                 ("ci.yml", "uses: ./.github/workflows/qualification.yml", "uses: ./.github/workflows/checks.yml", "missing qualification guard"),
                 ("nightly.yml", "contents: read", "contents: write", "publication credentials"),
+                ("nightly.yml", "gate.py broad fuzz audit optimized", "gate.py broad audit optimized", "missing qualification guard"),
+                ("pr.yml", "KEI_ROUNDTRIP_BASE: ${{ github.event.pull_request.base.sha }}", "KEI_ROUNDTRIP_BASE: origin/main", "missing qualification guard"),
             ]:
                 path = work / ".github/workflows" / name
                 original = path.read_text()
