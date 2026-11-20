@@ -4763,6 +4763,46 @@ async fn primary_layout_edit_first_download_keeps_capture_mtime() {
     );
 }
 
+#[tokio::test]
+async fn primary_layout_edit_revert_advances_a_future_predecessor() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("media").join("IMG_0501.JPG");
+    for (edit, bytes) in [(None, ORIGINAL), (Some(("edit-one", EDIT_ONE)), EDIT_ONE)] {
+        let (result, _) = cycle_options(
+            root.path(),
+            records(&server, edit),
+            false,
+            EditedNaming::Primary,
+            CycleOptions::default(),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert_bytes(&primary, bytes);
+    }
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&primary)
+        .unwrap()
+        .set_modified(future)
+        .unwrap();
+    let (revert, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert_eq!(revert.failed_count, 0, "{:?}", revert.stats);
+    assert_bytes(&primary, ORIGINAL);
+    assert!(
+        std::fs::metadata(&primary).unwrap().modified().unwrap() > future,
+        "a publication time must advance a future predecessor"
+    );
+}
+
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn primary_layout_preserves_sidecar_bytes_and_fences_old_metadata_queue() {

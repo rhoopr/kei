@@ -10962,6 +10962,7 @@ async fn completed_copy_recovery(scenario: IntegrityRecovery) {
     let mut requests_before_repair = initial_requests;
     let original_metadata = std::fs::metadata(&a).unwrap();
     drop(passes);
+    let mut damaged_mtime = None;
     if scenario != IntegrityRecovery::Missing {
         let mut damaged = if scenario == IntegrityRecovery::SameSize {
             media.to_vec()
@@ -10972,6 +10973,7 @@ async fn completed_copy_recovery(scenario: IntegrityRecovery) {
             *damaged.last_mut().unwrap() ^= 1;
         }
         std::fs::write(&b, &damaged).unwrap();
+        damaged_mtime = Some(std::fs::metadata(&b).unwrap().modified().unwrap());
         f = reopen_destination_fixture(f).await;
         let quiet_passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
         let quiet = crate::download::download_photos_with_sync(
@@ -11342,6 +11344,11 @@ async fn completed_copy_recovery(scenario: IntegrityRecovery) {
         assert_eq!(std::fs::read(&a).unwrap(), media);
         assert_eq!(std::fs::read(&b).unwrap(), media);
         if managed {
+            let damaged_mtime = damaged_mtime.expect("managed repair has a damaged predecessor");
+            assert!(
+                std::fs::metadata(&b).unwrap().modified().unwrap() > damaged_mtime,
+                "managed repair must advance the damaged predecessor's mtime"
+            );
             let preserved: Vec<Vec<u8>> =
                 f.db.acquire_lock("managed damaged input preservation")
                     .unwrap()
