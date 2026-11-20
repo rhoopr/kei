@@ -6,10 +6,39 @@ Run this with the same configuration and data directory as your sync process:
 kei support-export --output kei-support.json
 ```
 
-For Docker, use the existing container and mounted configuration:
+## First-backup Compose service
+
+Use the same Compose directory, project, image, mounts, and environment as your [first backup](docker-first-backup.md). Stop between sync cycles if possible and leave the stopped container in place:
 
 ```sh
-docker exec kei kei --config /config/config.toml support-export --output /config/kei-support.json
+docker compose stop kei
+```
+
+Check `docker compose ps -a kei` and the last lines of `docker compose logs kei`. If the process was killed during a cycle, mention the interruption in your report. Do not start another sync to improve the evidence.
+
+Use the same locally installed image as the stopped container. If you use a moving tag such as `latest`, compare `docker inspect --format '{{.Image}}' "$(docker compose ps -aq kei)"` with `docker image inspect --format '{{.Id}}' ghcr.io/rhoopr/kei:latest` (substitute your configured image). If they differ, pin the service image for the export to the stopped container's exact image before continuing.
+
+Choose a new output filename under the writable config mount. Replace `UID:GID` with the service's numeric PUID and PGID, or `0:0` for the default root setup. Run the binary directly to bypass ownership initialization:
+
+```sh
+docker compose run --rm --no-deps --pull never --user UID:GID --entrypoint /usr/local/bin/kei kei --config /config/config.toml support-export --output /config/kei-support.json
+```
+
+Review `./config/kei-support.json` locally before sharing it. Note the UTC time and restart the original container even if collection failed:
+
+```sh
+docker compose start kei
+docker compose logs --since 10m kei
+```
+
+After the next cycle, check `last_success_at` in `./config/health.json` (or `health.json` in your configured data directory). Look for a success newer than the restart and zero `consecutive_failures`. A running container or an old success timestamp doesn't confirm a new backup. For the daily service in the guide, check once each day that the success timestamp advanced, unless you have tested alerts for stale or failed cycles.
+
+## Other Docker installations
+
+For a named running container, use the numeric user that owns its state:
+
+```sh
+docker exec --user UID:GID kei kei --config /config/config.toml support-export --output /config/kei-support.json
 ```
 
 Fresh container launches also skip ownership initialization for this command,

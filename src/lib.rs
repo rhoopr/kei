@@ -685,7 +685,8 @@ pub fn main_inner() -> ExitCode {
         .build()
         .expect("Failed to create tokio runtime");
 
-    match rt.block_on(run(env_password, input_mode)) {
+    let mut recovery_config = None;
+    match rt.block_on(run(env_password, input_mode, &mut recovery_config)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             if let Some(parse_exit) = classify_cli_parse_exit(&e) {
@@ -712,9 +713,20 @@ pub fn main_inner() -> ExitCode {
                 )]
                 {
                     eprintln!("Error: {e:#}");
+                    if e.downcast_ref::<auth::error::AuthError>()
+                        .is_some_and(auth::error::AuthError::is_two_factor_required)
+                    {
+                        eprintln!(
+                            "{}",
+                            cli::two_factor_instructions(recovery_config.as_deref())
+                        );
+                    }
                     if classification.should_suggest_diagnostics() {
                         eprintln!();
-                        eprintln!("Run `kei doctor --json` for a redacted diagnostic report.");
+                        eprintln!(
+                            "Run `{}` for a redacted diagnostic report.",
+                            cli::command_for_config("doctor --json", recovery_config.as_deref())
+                        );
                         eprintln!("Report bugs: https://github.com/rhoopr/kei/issues");
                     }
                 }
@@ -724,7 +736,11 @@ pub fn main_inner() -> ExitCode {
     }
 }
 
-async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Result<()> {
+async fn run(
+    env_password: Option<String>,
+    input_mode: InputMode,
+    recovery_config: &mut Option<PathBuf>,
+) -> anyhow::Result<()> {
     let cli = cli::parse_cli_with_sources(std::env::args_os()).map_err(|e| anyhow::anyhow!(e))?;
     // Export has its own input path: no runtime config construction, logging,
     // credentials, service hooks, or network-capable command dispatch.
@@ -737,7 +753,18 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
         return inventory_diagnostic::run(&config::bootstrap_config(cli.config.as_deref())?.0)
             .await;
     }
+    // Diagnostics can be shared with support. Don't echo a private config path
+    // in their stderr fallback after the command has redacted its report.
+    if !matches!(cli.command, cli::Command::Doctor(_)) {
+        *recovery_config = cli.config.as_deref().map(config::expand_tilde);
+    }
     let config = load_startup_config(&cli)?;
+    if let Command::Config {
+        action: cli::ConfigAction::Setup { output: Some(path) },
+    } = &cli.command
+    {
+        *recovery_config = Some(config::expand_tilde(path));
+    }
     let output = resolve_startup_output(&cli, config.toml.as_ref());
 
     // Keep the guard until dispatch returns so fast commands drain their logs.
@@ -1232,6 +1259,7 @@ mod tests {
         let err = load_startup_config(&cli).err().unwrap().to_string();
         assert!(err.contains("Failed to parse config file"));
         cli.command = Command::Doctor(cli::DoctorArgs {
+            has_env_password: false,
             missing_reference_inventory: false,
             json: true,
             live: false,

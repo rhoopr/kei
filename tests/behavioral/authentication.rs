@@ -51,10 +51,10 @@ fn password_set_headless_without_source_fails_before_prompt() {
         .failure()
         .stderr(predicate::str::contains("stdin is not a terminal"))
         .stderr(predicate::str::contains(
-            "kei password --password-file <PATH> set",
+            "password --password-file <PATH> set",
         ))
         .stderr(predicate::str::contains(
-            "kei password --password-command <COMMAND> set",
+            "password --password-command <COMMAND> set",
         ));
 }
 
@@ -62,15 +62,24 @@ fn password_set_headless_without_source_fails_before_prompt() {
 fn assert_foreground_two_factor_failure(command: &str) {
     let dir = tempfile::tempdir().unwrap();
     let config_path = write_fake_two_factor_config(dir.path(), "test@example.com");
+    let custom = dir.path().join("account's backup.toml");
+    std::fs::rename(config_path, &custom).unwrap();
+    let quoted = custom
+        .to_string_lossy()
+        .replace('\'', if cfg!(windows) { "''" } else { "'\\''" });
 
     clean_cmd()
         .env("KEI_DATA_DIR", dir.path().join("data"))
         .env("KEI_UNSTABLE_FAKE_TWO_FACTOR_REQUIRED_FOR_TESTS", "1")
-        .args([command, "--config", config_path.to_str().unwrap()])
+        .args([command, "--config", custom.to_str().unwrap()])
         .assert()
         .code(3)
-        .stderr(predicate::str::contains("kei login get-code"))
-        .stderr(predicate::str::contains("kei login submit-code <CODE>"));
+        .stderr(predicate::str::contains(format!(
+            "kei --config '{quoted}' login get-code"
+        )))
+        .stderr(predicate::str::contains(format!(
+            "kei --config '{quoted}' login submit-code <CODE>"
+        )));
 }
 
 #[cfg(debug_assertions)]
@@ -199,7 +208,49 @@ fn password_clear_on_empty_store_errors() {
         .args(["password", "clear"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("No stored credential"));
+        .stderr(
+            predicate::str::contains("No stored credential")
+                .or(predicate::str::contains("removal incomplete")
+                    .and(predicate::str::contains("encrypted-file: absent"))),
+        );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn password_clear_preserves_partial_result_when_keyring_is_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("input");
+    std::fs::write(&file, "fixture-secret").unwrap();
+    let cmd = || {
+        let mut cmd = clean_cmd();
+        cmd.env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}/absent", dir.path().display()),
+        )
+        .env("ICLOUD_USERNAME", "offline@fixture.invalid")
+        .env("KEI_DATA_DIR", dir.path());
+        cmd
+    };
+    cmd()
+        .args(["password", "--password-file"])
+        .arg(&file)
+        .arg("set")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("encrypted-file"));
+    cmd()
+        .args(["password", "clear"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("encrypted-file: deleted"))
+        .stderr(predicate::str::contains("keyring: unavailable"))
+        .stderr(predicate::str::contains("fixture-secret").not());
+    cmd()
+        .args(["password", "clear"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("encrypted-file: absent"))
+        .stderr(predicate::str::contains("keyring: unavailable"));
 }
 
 #[test]
@@ -292,7 +343,7 @@ fn reset_session_removes_session_files_and_keeps_bystanders() {
         "stdout should report removed files: {stdout}"
     );
     assert!(
-        stdout.contains("kei login"),
+        stdout.contains("kei --config '") && stdout.contains("' login`"),
         "stdout should point at `kei login`: {stdout}"
     );
 

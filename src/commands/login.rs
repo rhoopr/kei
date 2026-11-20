@@ -47,7 +47,10 @@ pub(crate) async fn run_login(
             })
             .await?;
             println!("2FA code requested. Check your trusted devices, then run:");
-            println!("  kei login submit-code <CODE>");
+            println!(
+                "  {}",
+                cli::command_for_config("login submit-code <CODE>", globals.config_source.path())
+            );
         }
         Some(cli::LoginCommand::SubmitCode { code }) => {
             let result = retry_on_lock_contention(|| {

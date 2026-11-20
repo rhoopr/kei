@@ -116,7 +116,6 @@ waiting service resumes from the saved session. See
 Do not run a second sync against the same state while the service is active.
 
 See [Docker reference](https://github.com/rhoopr/kei/wiki/Docker) for monitoring,
-secrets, and version tags, and [Support export](support-export.md) for reviewed
-offline diagnostics. Pin a release tag for intentional upgrades and read
+secrets, and version tags. To collect offline diagnostics from this service, follow the [Compose stop, export, and restart procedure](support-export.md#first-backup-compose-service). Pin a release tag for intentional upgrades and read
 [Upgrade and compatibility](upgrade.md) before changing versions. Source
 on `main`, Docker `latest`, and Homebrew can be at different versions.

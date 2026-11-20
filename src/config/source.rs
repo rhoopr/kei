@@ -26,6 +26,15 @@ impl std::fmt::Debug for ConfigSource {
     }
 }
 
+impl ConfigSource {
+    pub(crate) fn path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::File { path, .. } | Self::Absent { path } => Some(path),
+            Self::Unavailable => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ConfigSource;

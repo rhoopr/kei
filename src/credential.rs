@@ -108,11 +108,7 @@ impl CredentialStore {
 
     /// Delete stored credentials from all backends.
     pub(crate) fn delete(&self) -> Result<()> {
-        finish_delete(
-            &self.username,
-            self.keyring_delete_outcome(),
-            self.file_delete_outcome(),
-        )
+        finish_delete(self.keyring_delete_outcome(), self.file_delete_outcome())
     }
 
     /// Check whether a credential exists in any backend (keyring or file).
@@ -284,16 +280,10 @@ impl CredentialStore {
 
     fn file_delete_outcome(&self) -> DeleteOutcome {
         let cred_path = self.credential_file_path();
-        if !cred_path.exists() {
-            return DeleteOutcome::NotFound;
-        }
         match std::fs::remove_file(&cred_path) {
             Ok(()) => DeleteOutcome::Deleted,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => DeleteOutcome::NotFound,
-            Err(e) => DeleteOutcome::Failed(anyhow::anyhow!(e).context(format!(
-                "Could not delete credential file {}",
-                cred_path.display()
-            ))),
+            Err(e) => DeleteOutcome::Failed(e.into()),
         }
     }
 }
@@ -301,71 +291,32 @@ impl CredentialStore {
 fn keyring_delete_error_outcome(error: keyring::Error) -> DeleteOutcome {
     match error {
         keyring::Error::NoEntry => DeleteOutcome::NotFound,
-        keyring::Error::PlatformFailure(e) if is_keyring_platform_unavailable(e.as_ref()) => {
-            tracing::debug!(
-                error = %e,
-                "Keyring unavailable during credential deletion; treating it as absent"
-            );
-            DeleteOutcome::NotFound
+        keyring::Error::PlatformFailure(_) | keyring::Error::NoStorageAccess(_) => {
+            DeleteOutcome::Failed(anyhow::anyhow!(
+                "unavailable or locked; removal unconfirmed"
+            ))
         }
-        e => DeleteOutcome::Failed(
-            anyhow::anyhow!(e).context("Could not delete the OS keyring credential"),
+        _ => DeleteOutcome::Failed(anyhow::anyhow!("removal unconfirmed")),
+    }
+}
+
+fn finish_delete(keyring: DeleteOutcome, encrypted_file: DeleteOutcome) -> Result<()> {
+    let describe = |outcome: DeleteOutcome| match outcome {
+        DeleteOutcome::Deleted => "deleted".to_string(),
+        DeleteOutcome::NotFound => "absent".to_string(),
+        DeleteOutcome::Failed(e) => e.to_string(),
+    };
+    match (&keyring, &encrypted_file) {
+        (DeleteOutcome::Failed(_), _) | (_, DeleteOutcome::Failed(_)) => anyhow::bail!(
+            "Credential removal incomplete. keyring: {}; encrypted-file: {}.",
+            describe(keyring),
+            describe(encrypted_file)
         ),
-    }
-}
-
-fn is_keyring_platform_unavailable(error: &(dyn std::error::Error + Send + Sync)) -> bool {
-    let message = error.to_string();
-    message.contains("org.freedesktop.secrets")
-        || message.contains("The name is not activatable")
-        || (message.contains("Failed to connect")
-            && message.contains("/run/user/")
-            && message.contains("/bus"))
-}
-
-fn finish_delete(
-    username: &str,
-    keyring: DeleteOutcome,
-    encrypted_file: DeleteOutcome,
-) -> Result<()> {
-    let mut deleted = Vec::new();
-    let mut failed = Vec::new();
-
-    match keyring {
-        DeleteOutcome::Deleted => deleted.push("keyring"),
-        DeleteOutcome::NotFound => {}
-        DeleteOutcome::Failed(e) => failed.push(("keyring", e)),
-    }
-    match encrypted_file {
-        DeleteOutcome::Deleted => deleted.push("encrypted-file"),
-        DeleteOutcome::NotFound => {}
-        DeleteOutcome::Failed(e) => failed.push(("encrypted-file", e)),
-    }
-
-    if failed.is_empty() {
-        if deleted.is_empty() {
-            anyhow::bail!("No stored credential was found for {username}.");
+        (DeleteOutcome::NotFound, DeleteOutcome::NotFound) => {
+            anyhow::bail!("No stored credential was found.")
         }
-        return Ok(());
+        _ => Ok(()),
     }
-
-    let failed_names = failed
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let details = failed
-        .into_iter()
-        .map(|(name, err)| format!("{name}: {err:#}"))
-        .collect::<Vec<_>>()
-        .join("; ");
-    if deleted.is_empty() {
-        anyhow::bail!("Could not delete credential from {failed_names}: {details}");
-    }
-    anyhow::bail!(
-        "Credential was deleted from {}, but kei could not delete it from {failed_names}: {details}",
-        deleted.join(", ")
-    );
 }
 
 /// Atomically write data to a file with 0o600 permissions (synchronous).
@@ -494,30 +445,25 @@ mod tests {
         ];
 
         for (label, keyring, file) in cases {
-            finish_delete("user@example.com", keyring, file)
+            finish_delete(keyring, file)
                 .unwrap_or_else(|err| panic!("{label} must be treated as success: {err}"));
         }
 
         let partial = finish_delete(
-            "user@example.com",
             DeleteOutcome::Failed(anyhow::anyhow!("keyring locked")),
             DeleteOutcome::Deleted,
         )
         .unwrap_err()
         .to_string();
         assert!(
-            partial.contains("deleted from encrypted-file")
-                && partial.contains("could not delete it from keyring"),
+            partial.contains("encrypted-file: deleted")
+                && partial.contains("keyring: keyring locked"),
             "partial delete must preserve which backend succeeded and which failed: {partial}"
         );
 
-        let missing = finish_delete(
-            "user@example.com",
-            DeleteOutcome::NotFound,
-            DeleteOutcome::NotFound,
-        )
-        .unwrap_err()
-        .to_string();
+        let missing = finish_delete(DeleteOutcome::NotFound, DeleteOutcome::NotFound)
+            .unwrap_err()
+            .to_string();
         assert!(
             missing.contains("No stored credential was found"),
             "two missing backends must not be treated as file-only success: {missing}"
@@ -526,12 +472,7 @@ mod tests {
 
     #[test]
     fn delete_outcome_both_missing_reports_no_stored_credential() {
-        let err = finish_delete(
-            "user@example.com",
-            DeleteOutcome::NotFound,
-            DeleteOutcome::NotFound,
-        )
-        .unwrap_err();
+        let err = finish_delete(DeleteOutcome::NotFound, DeleteOutcome::NotFound).unwrap_err();
         assert!(
             err.to_string().contains("No stored credential was found"),
             "expected no-credential error, got: {err}"
@@ -541,14 +482,13 @@ mod tests {
     #[test]
     fn delete_outcome_deleted_plus_failure_reports_partial_backend() {
         let err = finish_delete(
-            "user@example.com",
             DeleteOutcome::Deleted,
             DeleteOutcome::Failed(anyhow::anyhow!("permission denied")),
         )
         .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("could not delete it from encrypted-file"),
+            msg.contains("encrypted-file: permission denied") && msg.contains("keyring: deleted"),
             "partial failure must name the failed backend: {msg}"
         );
     }
@@ -556,7 +496,6 @@ mod tests {
     #[test]
     fn delete_outcome_failure_without_delete_names_backend() {
         let err = finish_delete(
-            "user@example.com",
             DeleteOutcome::Failed(anyhow::anyhow!("keyring locked")),
             DeleteOutcome::NotFound,
         )
@@ -569,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_secret_service_delete_is_not_found() {
+    fn unavailable_secret_service_delete_is_unconfirmed() {
         for message in [
             "DBus error: The name org.freedesktop.secrets was not provided by any .service files",
             "DBus error: The name is not activatable",
@@ -578,8 +517,8 @@ mod tests {
                 std::io::Error::other(message),
             )));
             assert!(
-                matches!(outcome, DeleteOutcome::NotFound),
-                "headless Secret Service delete should behave like an absent keyring"
+                matches!(outcome, DeleteOutcome::Failed(_)),
+                "an unavailable Secret Service cannot confirm absence"
             );
         }
     }
@@ -717,7 +656,8 @@ mod tests {
         let delete_result = store.delete();
         if let Err(err) = delete_result {
             assert!(
-                err.to_string().contains("partially failed") && err.to_string().contains("keyring"),
+                err.to_string().contains("removal incomplete")
+                    && err.to_string().contains("encrypted-file: deleted"),
                 "headless keyring failures should surface as partial deletion, got: {err}"
             );
             assert!(

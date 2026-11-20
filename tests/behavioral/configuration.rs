@@ -570,7 +570,10 @@ fn config_toml_password_field_rejected() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("`[auth].password`"))
-        .stderr(predicate::str::contains("kei password set"));
+        .stderr(predicate::str::contains(format!(
+            "kei --config '{}' password set",
+            config_path.display()
+        )));
 }
 
 // On Windows, `--password-command` / `[auth] password_command` is rejected
@@ -944,11 +947,11 @@ fn startup_logging_precedence_reaches_sync_dispatch() {
         );
         // The fake 2FA hook is deliberately absent from release builds.
         let auth_error = if cfg!(debug_assertions) {
-            "kei login get-code"
+            format!("kei --config '{}' login get-code", config_path.display())
         } else {
-            "No password was available"
+            "No password was available".to_string()
         };
-        assert!(stderr.contains(auth_error), "{stderr}");
+        assert!(stderr.contains(&auth_error), "{stderr}");
     }
 }
 

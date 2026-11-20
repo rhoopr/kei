@@ -3020,19 +3020,26 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
                             })
                         );
                         assert_eq!(summary.last_sync_enumeration_errors, u64::from(cycle == 0));
+                        const SCOPE: &str = "Scope: recorded local state only; this does not establish iCloud completeness or verify local media checksums.";
                         if cycle == 0 {
                             assert_eq!(
                                 status,
                                 if matches!(stage, Stage::AssetPair | Stage::AssetIdentity) {
-                                    "Backup status: unsafe - unresolved asset identity in 1 provider zone; checkpoint replay is required; last sync was interrupted; 1 enumeration error occurred in the last sync"
+                                    format!(
+                                        "Backup record: unresolved asset identity in 1 provider zone; checkpoint replay is required; last sync was interrupted; 1 enumeration error occurred in the last sync\n  {SCOPE}"
+                                    )
                                 } else {
-                                    "Backup status: unsafe - last sync was interrupted; 1 enumeration error occurred in the last sync"
+                                    format!(
+                                        "Backup record: last sync was interrupted; 1 enumeration error occurred in the last sync\n  {SCOPE}"
+                                    )
                                 }
                             );
                         } else {
                             assert_eq!(
                                 status,
-                                "Backup status: safe - last sync completed and no pending or failed assets are recorded"
+                                format!(
+                                    "Backup record: last sync completed and no pending or failed assets are recorded\n  {SCOPE}"
+                                )
                             );
                         }
                     }

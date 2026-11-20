@@ -306,7 +306,8 @@ pub(crate) async fn run_reconcile(
             db.confirm_integrity_damage(inspected, (checksum, size))
                 .await?;
             println!(
-                "Confirmed damage queued for this destination. Run `kei sync` to attempt repair."
+                "Confirmed damage queued for this destination. Run `{}` to attempt repair.",
+                cli::command_for_config("sync", globals.config_source.path())
             );
             if replacing {
                 println!("Replaced the previous pending damage confirmation.");
@@ -438,7 +439,11 @@ pub(crate) async fn run_reconcile(
     if counts.damaged > 0 {
         println!("  Shorter:  {}", counts.damaged);
         println!(
-            "Inspect changed copies with `kei reconcile --inspect-path PATH`; shorter size alone does not authorize replacement."
+            "Inspect changed copies with `{}`; shorter size alone does not authorize replacement.",
+            cli::command_for_config(
+                "reconcile --inspect-path PATH",
+                globals.config_source.path()
+            )
         );
     }
     if counts.no_path > 0 {
