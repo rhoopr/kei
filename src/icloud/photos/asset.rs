@@ -269,6 +269,7 @@ pub struct PhotoAsset {
     // pipeline's metadata-hash comparisons) can share the same
     // allocation via refcount bumps. Immutable after construction.
     asset_metadata: Arc<AssetMetadata>,
+    hidden_membership: Option<bool>,
     rendition_facts: Arc<[(VersionSizeKey, RenditionMetadata)]>,
     versions: VersionsMap,
     malformed_resources: Arc<[MalformedResource]>,
@@ -278,6 +279,21 @@ pub struct PhotoAsset {
     adjusted_still_modified: Option<DateTime<Utc>>,
     // Small enum (1 byte)
     item_type_val: Option<AssetItemType>,
+}
+
+fn hidden_membership(fields: &Value) -> Option<bool> {
+    let field = fields.get("isHidden")?;
+    if field
+        .get("type")
+        .is_some_and(|ty| !matches!(ty.as_str(), Some("INT64" | "NUMBER_INT64")))
+    {
+        return None;
+    }
+    match field.get("value")?.as_i64()? {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
 }
 
 /// Decode filename from `CloudKit`'s `filenameEnc` field.
@@ -629,6 +645,7 @@ impl PhotoAsset {
             asset_record_name,
             state_record_name: None,
             source_zone: None,
+            hidden_membership: hidden_membership(&asset_fields),
             filename,
             asset_metadata,
             rendition_facts,
@@ -708,6 +725,7 @@ impl PhotoAsset {
             asset_record_name: Arc::from(asset.record_name.as_str()),
             state_record_name: None,
             source_zone,
+            hidden_membership: hidden_membership(&asset.fields),
             filename,
             adjusted_still_modified,
             asset_metadata,
@@ -723,6 +741,10 @@ impl PhotoAsset {
     /// Metadata extracted at construction time.
     pub fn metadata(&self) -> &AssetMetadata {
         &self.asset_metadata
+    }
+
+    pub(crate) fn hidden_membership(&self) -> Option<bool> {
+        self.hidden_membership
     }
 
     /// Project the selected provider rendition. Unsupported keys retain
@@ -1278,6 +1300,20 @@ impl Drop for DeltaRecordBuffer {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sparse_hidden_membership_requires_an_explicit_binary_flag() {
+        for (field, expected) in [
+            (json!({"value": 0}), Some(false)),
+            (json!({"type":"INT64","value":1}), Some(true)),
+            (json!({"type":"STRING","value":0}), None),
+            (json!({"value":"0"}), None),
+            (json!({"value":2}), None),
+            (json!(null), None),
+        ] {
+            assert_eq!(hidden_membership(&json!({"isHidden": field})), expected);
+        }
+    }
 
     #[test]
     fn sparse_share_evidence_is_preserved_without_guessing_a_master() {

@@ -3,7 +3,7 @@ use crate::download::{DownloadConfig, DownloadControls};
 use crate::icloud::photos::asset::{SparseShareEvidence, SparseShareLink};
 use crate::icloud::photos::{PhotoAlbum, PhotoAsset, PhotoLibrary, RecordResolution};
 use crate::state::{
-    db::{SparseTargetHold, SparseTargetState},
+    db::{SparseTargetHold, SparseTargetProof, SparseTargetState},
     error::StateError,
 };
 use std::sync::Arc;
@@ -30,12 +30,18 @@ pub(crate) async fn due_primary_links(
 
 #[derive(Clone)]
 pub(crate) struct SelectedSparseTarget {
+    pub(crate) hidden_only: bool,
     pub(crate) scan: Option<String>,
     pub(crate) library: PhotoLibrary,
     pub(crate) album: PhotoAlbum,
     pub(crate) config: Arc<DownloadConfig>,
     pub(crate) client: reqwest::Client,
     pub(crate) controls: DownloadControls,
+}
+impl SelectedSparseTarget {
+    fn requires_metadata_receipts(&self) -> bool {
+        !self.hidden_only || super::metadata_rewrite::writers_enabled(&self.config.metadata)
+    }
 }
 fn outcome(decision: &'static str, reason: &'static str) {
     tracing::info!(
@@ -46,15 +52,30 @@ fn outcome(decision: &'static str, reason: &'static str) {
         "Sparse target decision; source checkpoint still requires complete proof"
     );
 }
-fn unsupported(reason: &'static str) -> Option<SparseTargetState> {
+fn unsupported<T>(reason: &'static str) -> Option<T> {
     outcome("unsupported", reason);
     None
+}
+enum ReceiptFailure {
+    NotObserved,
+    PairUnresolved,
+    FileUnverified,
+}
+
+impl ReceiptFailure {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::NotObserved => "target_membership_unobserved",
+            Self::PairUnresolved => "target_pair_unresolved",
+            Self::FileUnverified => "target_file_unverified",
+        }
+    }
 }
 async fn receipts(
     target: &SelectedSparseTarget,
     asset: &PhotoAsset,
     cancel: &CancellationToken,
-) -> Result<Option<SparseTargetState>, &'static str> {
+) -> Result<Option<SparseTargetState>, ReceiptFailure> {
     let config = &target.config;
     let Some(db) = &config.state_db else {
         return Ok(None);
@@ -65,18 +86,19 @@ async fn receipts(
             asset.asset_record_name(),
             asset.id(),
             target.scan.as_deref(),
+            target.requires_metadata_receipts(),
         )
         .await
-        .map_err(|_error| "target_file_unverified")?
+        .map_err(|_error| ReceiptFailure::FileUnverified)?
     {
         Ok(state) => state,
         Err(SparseTargetHold::ReceiptUnqualified) => return Ok(None),
-        Err(SparseTargetHold::MembershipUnobserved) => return Err("target_membership_unobserved"),
-        Err(SparseTargetHold::PairUnresolved) => return Err("target_pair_unresolved"),
+        Err(SparseTargetHold::MembershipUnobserved) => return Err(ReceiptFailure::NotObserved),
+        Err(SparseTargetHold::PairUnresolved) => return Err(ReceiptFailure::PairUnresolved),
     };
     verify_receipts(target, asset, cancel, before, db.as_ref())
         .await
-        .map_err(|_error| "target_file_unverified")
+        .map_err(|_error| ReceiptFailure::FileUnverified)
 }
 
 async fn verify_receipts(
@@ -92,8 +114,12 @@ async fn verify_receipts(
         return Ok(None);
     }
     let rows = if target.scan.is_none() {
-        db.legacy_child_receipts(&config.library, asset.asset_record_name())
-            .await?
+        db.qualified_child_receipts(
+            &config.library,
+            asset.asset_record_name(),
+            target.requires_metadata_receipts(),
+        )
+        .await?
     } else {
         Vec::new()
     };
@@ -161,6 +187,21 @@ async fn verify_receipts(
             let (Some(path), Some(local)) = (&row.local_path, row.local_checksum.as_deref()) else {
                 return Ok(None);
             };
+            if target.hidden_only {
+                let paths = super::filter::derive_expected_paths(asset, config.as_ref());
+                if !paths.iter().any(|p| {
+                    p.version_size == version
+                        && super::filter::stored_path_matches_current_collision_family(
+                            asset.asset_record_name(),
+                            p,
+                            &paths,
+                            config,
+                            path,
+                        )
+                }) {
+                    return Ok(None);
+                }
+            }
             copies.push((path, local));
         }
     }
@@ -216,6 +257,7 @@ async fn verify_receipts(
                 asset.asset_record_name(),
                 asset.id(),
                 target.scan.as_deref(),
+                target.requires_metadata_receipts(),
             )
             .await?
             .as_ref()
@@ -260,7 +302,7 @@ pub(crate) async fn recover(
     config: &DownloadConfig,
     cancel: &CancellationToken,
     stats: &mut crate::download::SyncStats,
-) -> anyhow::Result<Option<SparseTargetState>> {
+) -> anyhow::Result<Option<SparseTargetProof>> {
     let SparseShareEvidence::Linked(link) = evidence else {
         return Ok(unsupported("target_scope_unqualified"));
     };
@@ -298,34 +340,80 @@ pub(crate) async fn recover(
         RecordResolution::TransientFailure(error) => return Err(error.into()),
         _ => return Ok(unsupported("target_pair_unresolved")),
     };
+    let child = asset.asset_record_name_arc();
+    let asset = asset
+        .with_state_record_name(child)
+        .with_source_zone(Arc::clone(&target.config.library));
+    let outside_hidden = target.hidden_only && asset.hidden_membership() == Some(false);
     if (asset.metadata().is_hidden && target.scan.is_none())
         || asset.metadata().is_deleted
         || cancel.is_cancelled()
-        || super::filter::is_asset_filtered(&asset, target.config.as_ref()).is_some()
         || asset.asset_record_name() == asset.id()
-        || super::filter::extract_skip_candidates(&asset, target.config.as_ref()).is_empty()
+        || (!outside_hidden
+            && (super::filter::is_asset_filtered(&asset, target.config.as_ref()).is_some()
+                || super::filter::extract_skip_candidates(&asset, target.config.as_ref())
+                    .is_empty()))
     {
         return Ok(unsupported("target_policy_unsupported"));
     }
     match receipts(target, &asset, cancel).await {
         Ok(Some(proof)) => {
+            if outside_hidden {
+                return Ok(unsupported("target_membership_unobserved"));
+            }
             outcome("partial", "target_receipt_ready");
-            return Ok(Some(proof));
+            return Ok(Some(SparseTargetProof::Selected(proof)));
         }
-        Err(reason) => return Ok(unsupported(reason)),
+        Err(ReceiptFailure::NotObserved) if target.hidden_only => {
+            let Some(scan) = &target.scan else {
+                return Ok(unsupported("target_selection_evidence_missing"));
+            };
+            let direct_proof = |selected| SparseTargetProof::DirectHidden {
+                child: asset.asset_record_name().into(),
+                master: asset.id().into(),
+                library: target.config.library.to_string(),
+                scan: scan.clone(),
+                selected,
+            };
+            match asset.hidden_membership() {
+                Some(false) => {
+                    outcome("partial", "target_explicitly_not_hidden");
+                    return Ok(Some(direct_proof(None)));
+                }
+                None => return Ok(unsupported("target_membership_unobserved")),
+                Some(true) => {}
+            }
+            let direct = SelectedSparseTarget {
+                scan: None,
+                ..target.clone()
+            };
+            let selected = match receipts(&direct, &asset, cancel).await {
+                Ok(Some(proof)) => Some(proof),
+                Ok(None) => materialize(&direct, &asset, cancel, stats).await?,
+                Err(reason) => return Ok(unsupported(reason.diagnostic())),
+            };
+            return Ok(selected.map(|proof| direct_proof(Some(proof))));
+        }
+        Err(reason) => return Ok(unsupported(reason.diagnostic())),
         Ok(None) if target.scan.is_some() => {
             return Ok(unsupported("target_selected_copies_unverified"));
         }
         Ok(None) => {}
     }
-    let child = Arc::from(asset.asset_record_name());
-    let asset = asset
-        .with_state_record_name(child)
-        .with_source_zone(Arc::clone(&target.config.library));
-    let verify_asset = asset.clone();
+    Ok(materialize(target, &asset, cancel, stats)
+        .await?
+        .map(SparseTargetProof::Selected))
+}
+
+async fn materialize(
+    target: &SelectedSparseTarget,
+    asset: &PhotoAsset,
+    cancel: &CancellationToken,
+    stats: &mut crate::download::SyncStats,
+) -> anyhow::Result<Option<SparseTargetState>> {
     let result = super::pipeline::stream_and_download_from_stream(
         &target.client,
-        futures_util::stream::iter(vec![Ok(asset)]),
+        futures_util::stream::iter(vec![Ok(asset.clone())]),
         &target.config,
         target.controls,
         1,
@@ -359,13 +447,13 @@ pub(crate) async fn recover(
         outcome("partial", "target_materialization_failed");
         return Ok(None);
     }
-    match receipts(target, &verify_asset, cancel).await {
+    match receipts(target, asset, cancel).await {
         Ok(Some(proof)) => {
             outcome("partial", "target_receipt_ready");
             Ok(Some(proof))
         }
         Ok(None) => Ok(unsupported("target_receipt_unqualified")),
-        Err(reason) => Ok(unsupported(reason)),
+        Err(reason) => Ok(unsupported(reason.diagnostic())),
     }
 }
 

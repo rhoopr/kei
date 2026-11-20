@@ -1574,7 +1574,14 @@ async fn run_cycle_inner(
                 {
                     continue;
                 }
-                let target_config = if scan.is_some() {
+                let hidden_only = scan.is_some()
+                    && target.plan.passes.len() == 1
+                    && pass.kind == crate::commands::PassKind::SmartFolder
+                    && pass.exclude_ids.is_empty()
+                    && pass.album.is_hidden_query();
+                let target_config = if hidden_only {
+                    Arc::new(target_config.with_pass(pass))
+                } else if scan.is_some() {
                     // The generation owns the destinations and exclusions for every pass.
                     target_config
                 } else {
@@ -1584,6 +1591,7 @@ async fn run_cycle_inner(
                     Arc::new(config)
                 };
                 sparse_targets.push(download::sparse_target::SelectedSparseTarget {
+                    hidden_only,
                     scan,
                     library: target.library.clone(),
                     album: pass.album.clone(),

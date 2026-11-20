@@ -1594,12 +1594,14 @@ impl MetadataRewriteStore for SqliteStateDb {
     > {
         SqliteStateDb::legacy_child_provenance(self, library, id, rendition).await
     }
-    async fn legacy_child_receipts(
+    async fn qualified_child_receipts(
         &self,
         library: &str,
         id: &str,
+        requires_metadata: bool,
     ) -> Result<Vec<crate::state::AssetRecord>, crate::state::error::StateError> {
-        SqliteStateDb::legacy_child_receipts(self, library, id).await
+        self.qualified_child_receipts(library, id, requires_metadata)
+            .await
     }
     async fn legacy_preparation_snapshots(
         &self,
