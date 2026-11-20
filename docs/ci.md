@@ -52,7 +52,7 @@ Nightly results do not replace this requirement.
 
 ## Nightly operation
 
-`Nightly qualification` runs on `main` at 07:23 UTC when enabled. A manual dispatch on `main` uses the same four independent jobs, pinned to the event SHA:
+`Nightly qualification` runs on `main` at 12:05 a.m. New York time every day. A manual dispatch on `main` uses the same four independent jobs, pinned to the event SHA:
 
 - **Main push CI evidence:** require the latest `Rust CI` push run for that SHA and its shared checks result to have succeeded. A missing, running, cancelled or failed run is a gap; nightly reports it instead of replaying the platform matrix. If the push run was still running, rerun nightly after it finishes.
 - **Seeded fuzzing:** build every registered target and run each with its available seeds, including on an unchanged commit.
@@ -61,8 +61,9 @@ Nightly results do not replace this requirement.
 
 All four jobs must succeed for the nightly incident reporter to signal recovery. Nightly does not build release candidates. The **Daily live wiki check** runs separately at 06:43 UTC and reports documentation drift on its own Actions run. Heavy qualification still checks the wiki before a release.
 
-When enabled, `Nightly freshness` checks at 19:23 UTC. A missing, failed, cancelled, or stale
-completed run opens one incident issue. Incidents carry `bug`, `@infra`, `@test`,
+`Nightly freshness` checks at 2:05 a.m. New York time. It inspects the newest scheduled or manually dispatched nightly on `main`. That run must have been created since the most recent 12:05 a.m. slot and finished successfully. A missing run, a still-running job, a failure, or yesterday's success cannot pass. Both schedules follow the local clock; when the spring transition skips the 2 a.m. hour, GitHub advances the check to 3 a.m.
+
+An unhealthy check opens one incident issue. Incidents carry `bug`, `@infra`, `@test`,
 and `nightly fail` labels. Missing labels are added to an existing incident
 without replacing its other labels; the reporter creates `nightly fail` if needed.
 
@@ -81,8 +82,7 @@ After a qualification run has completed, the missing identity includes that run,
 so closing a missing incident before a later recovery does not hide a new
 missing episode.
 Suppression changes notifications only; the checks still report failure.
-Recovery adds a comment and closes the incident. A completed run must have
-started within 36 hours. Both notification jobs share the `nightly-incident`
+Recovery adds a comment and closes the incident. Both notification jobs share the `nightly-incident`
 concurrency group, so incident updates stay serialized. Scheduled Actions can be
 delayed or disabled; this second schedule detects missing qualification runs but
 is not an external availability monitor for GitHub itself.

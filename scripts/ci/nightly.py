@@ -8,11 +8,12 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 MARKER = "<!-- kei-nightly-qualification -->"
 RECORDS_HEADER = "Recorded findings:"
 FOOTER = "Release qualification remains independent and must pass on the release commit."
-MAX_AGE = timedelta(hours=36)
+NIGHTLY_ZONE = ZoneInfo("America/New_York")
 INCIDENT_LABELS = ("bug", "@infra", "@test", "nightly fail")
 INCIDENT_AUTHOR = "github-actions[bot]"
 MISSING_IDENTITY = "missing completed run"
@@ -71,22 +72,25 @@ def health(runs: list[dict], now: datetime, last_completed: dict | None = None) 
         if run.get("head_branch") == "main"
         and run.get("event") in {"schedule", "workflow_dispatch"}
     ]
-    completed = [run for run in eligible if run.get("status") == "completed"]
-    if not completed:
+    if not eligible:
         return Finding(
-            "No completed nightly qualification is available.", "", missing_identity(last_completed)
+            "No nightly qualification is available.", "", missing_identity(last_completed)
         )
-    latest = completed[0]
+    latest = max(eligible, key=lambda run: (run["created_at"], run["id"]))
     started = datetime.fromisoformat(latest["created_at"].replace("Z", "+00:00"))
-    if now - started > MAX_AGE or started > now:
+    local_now = now.astimezone(NIGHTLY_ZONE)
+    slot = local_now.replace(hour=0, minute=5, second=0, microsecond=0)
+    if local_now < slot:
+        slot -= timedelta(days=1)
+    if started < slot or started > now:
         return Finding(
-            "Nightly qualification is stale (no completed run started within 36 hours).",
+            f"Nightly qualification is stale (expected a run since {slot.isoformat()}).",
             latest["html_url"],
             f"stale run {latest['id']}",
         )
-    if latest.get("conclusion") != "success":
+    if latest.get("status") != "completed" or latest.get("conclusion") != "success":
         return Finding(
-            f"Nightly qualification concluded {latest.get('conclusion', 'unknown')}.",
+            f"Latest nightly qualification: {latest.get('conclusion') or latest.get('status', 'unknown')}.",
             latest["html_url"],
             run_identity(latest["id"], latest.get("run_attempt", 1)),
         )
