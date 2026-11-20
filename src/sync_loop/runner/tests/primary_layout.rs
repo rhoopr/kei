@@ -61,7 +61,7 @@ fn second_date_records(server: &MockServer) -> Vec<Value> {
     second[0]["fields"]["filenameEnc"]["value"] = json!("IMG_0502.JPG");
     second[1]["recordName"] = json!("asset-502");
     second[1]["fields"]["masterRef"]["value"]["recordName"] = json!("502");
-    second[1]["fields"]["assetDate"]["value"] = json!(1731628800000_i64);
+    second[1]["fields"]["assetDate"]["value"] = json!(1_731_628_800_125_i64);
     second
 }
 fn records_at(uri: &str, edit: Option<(&str, &[u8])>) -> Vec<Value> {
@@ -2347,7 +2347,7 @@ async fn album_directory_projection_template_changes_apply_only_to_future_files(
 
 #[tokio::test]
 async fn album_directory_per_file_projection_handles_dates_and_embedded_tokens() {
-    for template in ["%Y/{album}/%m", "%Y/photos-{album}-selected/%m"] {
+    for template in ["%Y/{album}/%m-%3f", "%Y/photos-{album}-selected/%m"] {
         let server = server().await;
         let root = tempfile::tempdir().unwrap();
         let mut provider = records(&server, None);
