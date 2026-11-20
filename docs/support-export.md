@@ -31,7 +31,15 @@ docker compose start kei
 docker compose logs --since 10m kei
 ```
 
-After the next cycle, check `last_success_at` in `./config/health.json` (or `health.json` in your configured data directory). Look for a success newer than the restart and zero `consecutive_failures`. A running container or an old success timestamp doesn't confirm a new backup. For the daily service in the guide, check once each day that the success timestamp advanced, unless you have tested alerts for stale or failed cycles.
+After the next cycle, check the recorded backup result with the same `UID:GID` as the export:
+
+```sh
+docker compose exec --user UID:GID kei kei --config /config/config.toml status
+```
+
+Look for `Last sync completed` later than the restart. Check the last sync for errors or interruption and the `Pending` and `Failed` asset counts for unfinished work. If a cycle is still running, check again after it finishes. If the logs say kei skipped a cycle because no selected library changed, the last completion time can stay unchanged.
+
+Use `last_success_at` and `consecutive_failures` in `./config/health.json` (or your configured data directory) to monitor process health. On development builds a partial backup can still advance `last_success_at` and leave `consecutive_failures` at zero. For the daily service, check both health and the recorded backup result each day unless you have tested alerts for stale cycles and incomplete backups.
 
 ## Other Docker installations
 

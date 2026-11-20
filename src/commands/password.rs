@@ -28,7 +28,8 @@ pub(crate) fn run_password(
 
     match action {
         cli::PasswordAction::Set => {
-            let input = password_set_input(pw, toml, input_mode, globals.config_source.path())?;
+            let input =
+                password_set_input(pw, toml, input_mode, globals.config_source.recovery_path())?;
             let backend = store.store(input.expose_secret())?;
             println!("Password stored in {} backend.", backend.as_str());
         }

@@ -49,7 +49,10 @@ pub(crate) async fn run_login(
             println!("2FA code requested. Check your trusted devices, then run:");
             println!(
                 "  {}",
-                cli::command_for_config("login submit-code <CODE>", globals.config_source.path())
+                cli::command_for_config(
+                    "login submit-code <CODE>",
+                    globals.config_source.recovery_path()
+                )
             );
         }
         Some(cli::LoginCommand::SubmitCode { code }) => {

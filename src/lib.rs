@@ -861,7 +861,7 @@ fn load_startup_config(cli: &cli::Cli) -> anyhow::Result<StartupConfig> {
         !config_path.exists() && config_path.parent().is_some_and(std::path::Path::is_dir);
     let config_required = config_explicitly_set && !can_auto_create;
     let is_doctor_command = matches!(cli.command, cli::Command::Doctor(_));
-    let (toml_config, source, toml_config_error) =
+    let (toml_config, mut source, toml_config_error) =
         match config::load_toml_config_with_source(&config_path, config_required) {
             Ok((config, source)) => (config, source, None),
             Err(e) if is_doctor_command => {
@@ -869,6 +869,14 @@ fn load_startup_config(cli: &cli::Cli) -> anyhow::Result<StartupConfig> {
             }
             Err(e) => return Err(e),
         };
+
+    if let config::ConfigSource::Absent {
+        explicitly_selected,
+        ..
+    } = &mut source
+    {
+        *explicitly_selected = config_explicitly_set;
+    }
 
     Ok(StartupConfig {
         source,

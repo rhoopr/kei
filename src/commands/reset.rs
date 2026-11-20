@@ -34,7 +34,7 @@ pub(crate) async fn run_reset_state(
         if !input_mode.can_prompt() {
             anyhow::bail!(
                 "`{}` needs `--yes` when stdin is not a terminal. The state database was not deleted.",
-                cli::command_for_config("reset state", globals.config_source.path())
+                cli::command_for_config("reset state", globals.config_source.recovery_path())
             );
         }
         println!("This will delete the state database at:");
@@ -89,7 +89,7 @@ pub(crate) async fn run_reset_sync_token(
         if !input_mode.can_prompt() {
             anyhow::bail!(
                 "`{}` needs `--yes` when stdin is not a terminal. The next sync will re-enumerate every asset, which can take a long time on a large library.",
-                cli::command_for_config("reset sync-token", globals.config_source.path())
+                cli::command_for_config("reset sync-token", globals.config_source.recovery_path())
             );
         }
         println!("This will clear stored sync tokens at:");
@@ -172,7 +172,7 @@ pub(crate) async fn run_reset_session(
         if !std::io::stdin().is_terminal() {
             anyhow::bail!(
                 "`{}` needs `--yes` when stdin is not a terminal. This discards the local session and trust tokens, and the next login will require password authentication and 2FA again.",
-                cli::command_for_config("reset session", globals.config_source.path())
+                cli::command_for_config("reset session", globals.config_source.recovery_path())
             );
         }
         println!("This will discard the local iCloud session (including trust tokens):");
@@ -198,7 +198,7 @@ pub(crate) async fn run_reset_session(
     }
     println!(
         "Session reset. Run `{}` to authenticate again.",
-        cli::command_for_config("login", globals.config_source.path())
+        cli::command_for_config("login", globals.config_source.recovery_path())
     );
 
     Ok(())

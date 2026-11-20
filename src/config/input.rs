@@ -261,6 +261,7 @@ pub(crate) fn load_toml_config_with_source(
             None,
             super::ConfigSource::Absent {
                 path: std::path::absolute(path)?,
+                explicitly_selected: false,
             },
         )),
         Err(e) => Err(e).context(format!("Could not read config file {}", path.display()))?,

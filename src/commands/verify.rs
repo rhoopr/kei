@@ -163,7 +163,7 @@ pub(crate) async fn run_verify(
         println!();
         println!(
             "Scope: checked recorded local paths only. Checksums were not compared. Run `{}` to compare recorded SHA-256 values; files without a recorded checksum remain unchecked.",
-            cli::command_for_config("verify --checksums", globals.config_source.path())
+            cli::command_for_config("verify --checksums", globals.config_source.recovery_path())
         );
     }
 
@@ -172,7 +172,7 @@ pub(crate) async fn run_verify(
             "Verification found {missing} missing files, {different} files with a different checksum, and {unreadable} unreadable paths. Use `{}` to inspect an exact managed destination.",
             cli::command_for_config(
                 "reconcile --inspect-path PATH",
-                globals.config_source.path()
+                globals.config_source.recovery_path()
             )
         );
     }

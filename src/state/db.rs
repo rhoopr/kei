@@ -110,6 +110,7 @@ impl SqliteStateDb {
             owner,
             &crate::config::ConfigSource::Absent {
                 path: PathBuf::from("test-no-config.toml"),
+                explicitly_selected: false,
             },
         )
         .await

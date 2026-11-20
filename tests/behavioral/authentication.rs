@@ -58,6 +58,41 @@ fn password_set_headless_without_source_fails_before_prompt() {
         ));
 }
 
+#[cfg(unix)]
+#[test]
+fn password_set_recovery_distinguishes_implicit_and_explicit_absent_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let explicit = dir.path().join("chosen.toml");
+    let command = || {
+        let mut cmd = clean_cmd();
+        cmd.env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join(".config"))
+            .env("ICLOUD_USERNAME", "fixture@example.invalid")
+            .env("KEI_DATA_DIR", dir.path().join("data"))
+            .env_remove("KEI_PASSWORD_FILE")
+            .env_remove("KEI_PASSWORD_COMMAND")
+            .args(["password", "set"]);
+        cmd
+    };
+    command()
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "`kei password --password-file <PATH> set`",
+        ));
+    command()
+        .arg("--config")
+        .arg(&explicit)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "`kei --config '{}' password --password-file <PATH> set`",
+            explicit.display()
+        )));
+    assert!(!explicit.exists());
+    assert!(!dir.path().join(".config/kei").exists());
+}
+
 #[cfg(debug_assertions)]
 fn assert_foreground_two_factor_failure(command: &str) {
     let dir = tempfile::tempdir().unwrap();
@@ -311,6 +346,8 @@ fn reset_session_removes_session_files_and_keeps_bystanders() {
     // assert_cmd pipes stdin, so this also covers `--yes` under non-TTY:
     // the guard only fires on the missing-flag path, not in scripted use.
     let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("account.toml");
+    common::write_versioned_config(&config, "").unwrap();
     let username = "test@example.com";
     let slug = sanitize_username(username);
 
@@ -332,6 +369,8 @@ fn reset_session_removes_session_files_and_keeps_bystanders() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .arg("--config")
+        .arg(&config)
         .args(["reset", "session", "--yes"])
         .assert()
         .success()

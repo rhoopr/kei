@@ -84,7 +84,7 @@ pub(crate) async fn run_migrate_state(
     println!(
         "Legacy state adopted into {}. All legacy files are preserved. Legacy encrypted credentials are not copied; re-save them with `{}` if needed.",
         destination.display(),
-        cli::command_for_config("password set", globals.config_source.path())
+        cli::command_for_config("password set", globals.config_source.recovery_path())
     );
     Ok(())
 }

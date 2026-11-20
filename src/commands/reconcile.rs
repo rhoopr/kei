@@ -307,7 +307,7 @@ pub(crate) async fn run_reconcile(
                 .await?;
             println!(
                 "Confirmed damage queued for this destination. Run `{}` to attempt repair.",
-                cli::command_for_config("sync", globals.config_source.path())
+                cli::command_for_config("sync", globals.config_source.recovery_path())
             );
             if replacing {
                 println!("Replaced the previous pending damage confirmation.");
@@ -442,7 +442,7 @@ pub(crate) async fn run_reconcile(
             "Inspect changed copies with `{}`; shorter size alone does not authorize replacement.",
             cli::command_for_config(
                 "reconcile --inspect-path PATH",
-                globals.config_source.path()
+                globals.config_source.recovery_path()
             )
         );
     }
