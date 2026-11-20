@@ -126,7 +126,19 @@ pub(crate) struct SparseIdentityProof {
     library: String,
     source: SparseSourceId,
     generation: SparseGeneration,
-    target: Option<SparseTargetState>,
+    target: Option<SparseTargetProof>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum SparseTargetProof {
+    Selected(SparseTargetState),
+    DirectHidden {
+        library: String,
+        child: String,
+        master: String,
+        scan: String,
+        selected: Option<SparseTargetState>,
+    },
 }
 
 #[derive(Clone)]
@@ -135,6 +147,7 @@ pub(crate) struct SparseTargetState {
     child: String,
     master: String,
     evidence: String,
+    requires_metadata: bool,
     pub(crate) copies: Vec<super::provider_generations::SparseSelectedCopy>,
     generation: Option<String>,
     validate_files: Option<Arc<SparseFileValidation>>,
@@ -157,6 +170,7 @@ impl PartialEq for SparseTargetState {
             && self.child == other.child
             && self.master == other.master
             && self.evidence == other.evidence
+            && self.requires_metadata == other.requires_metadata
             && self.generation == other.generation
             && self.copies == other.copies
     }
@@ -169,7 +183,7 @@ impl SparseTargetState {
     }
 }
 impl SparseIdentityProof {
-    pub(crate) fn with_target(mut self, target: SparseTargetState) -> Self {
+    pub(crate) fn with_target(mut self, target: SparseTargetProof) -> Self {
         self.target = Some(target);
         self
     }
@@ -197,6 +211,7 @@ pub(crate) trait SparseIdentityStore: Send + Sync {
         _child: &str,
         _master: &str,
         _generation: Option<&str>,
+        _requires_metadata: bool,
     ) -> Result<Result<SparseTargetState, SparseTargetHold>, StateError> {
         Ok(Err(SparseTargetHold::ReceiptUnqualified))
     }
@@ -310,12 +325,20 @@ impl SparseIdentityStore for SqliteStateDb {
         child: &str,
         master: &str,
         generation: Option<&str>,
+        requires_metadata: bool,
     ) -> Result<Result<SparseTargetState, SparseTargetHold>, StateError> {
         let (library, child, master) = (library.to_owned(), child.to_owned(), master.to_owned());
         let generation = generation.map(str::to_owned);
         self.with_conn("sparse_target_state", move |conn| {
             let tx = conn.unchecked_transaction()?;
-            let proof = target_state(&tx, &library, &child, &master, generation.as_deref())?;
+            let proof = target_state(
+                &tx,
+                &library,
+                &child,
+                &master,
+                generation.as_deref(),
+                requires_metadata,
+            )?;
             tx.commit()?;
             Ok(proof)
         })
@@ -411,6 +434,7 @@ fn target_state(
     child: &str,
     master: &str,
     generation: Option<&str>,
+    requires_metadata: bool,
 ) -> Result<Result<SparseTargetState, SparseTargetHold>, StateError> {
     let copies = if let Some(id) = generation {
         match super::provider_generations::sparse_selected_copies(conn, id, library, child, master)?
@@ -427,7 +451,12 @@ fn target_state(
         params![library, child, master], |row| row.get(0))?;
     if !mapped
         || (generation.is_none()
-            && !super::legacy_preservation::child_receipts_ready(conn, library, child)?)
+            && !super::legacy_preservation::child_publications_ready(
+                conn,
+                library,
+                child,
+                requires_metadata,
+            )?)
     {
         return Ok(Err(SparseTargetHold::ReceiptUnqualified));
     }
@@ -449,6 +478,7 @@ fn target_state(
         child: child.into(),
         master: master.into(),
         evidence,
+        requires_metadata,
         copies,
         generation: generation.map(str::to_owned),
         validate_files: None,
@@ -530,20 +560,40 @@ pub(super) fn clear_proven(
                     && proof.generation == current.generation
             })
             .ok_or_else(|| invariant("checkpoint lacks current sparse identity proof"))?;
-        if let Some(target) = &proof.target
+        let target = match &proof.target {
+            Some(SparseTargetProof::DirectHidden {
+                library,
+                child,
+                master,
+                scan,
+                selected,
+            }) => {
+                if !matches!(
+                    super::provider_generations::sparse_selected_copies(tx, scan, library, child, master)?,
+                    Ok(copies) if copies.is_empty()
+                ) {
+                    return Err(invariant("direct Hidden selection changed"));
+                }
+                selected.as_ref()
+            }
+            Some(SparseTargetProof::Selected(target)) => Some(target),
+            None => None,
+        };
+        if let Some(target) = target
             && target_state(
                 tx,
                 &target.library,
                 &target.child,
                 &target.master,
                 target.generation.as_deref(),
+                target.requires_metadata,
             )?
             .as_ref()
                 != Ok(target)
         {
             return Err(invariant("sparse target receipt state changed"));
         }
-        if let Some(target) = &proof.target {
+        if let Some(target) = target {
             target
                 .validate_files
                 .as_ref()
@@ -613,7 +663,7 @@ mod tests {
         let stable = Arc::new(AtomicBool::new(true));
         let check = Arc::clone(&stable);
         let target = db
-            .sparse_target_state("SharedSync", "target", "master", None)
+            .sparse_target_state("SharedSync", "target", "master", None, true)
             .await
             .unwrap()
             .unwrap()
@@ -624,7 +674,9 @@ mod tests {
                     Err(super::invariant("synthetic file proof drift"))
                 }
             }));
-        let proof = identity.proof().with_target(target);
+        let proof = identity
+            .proof()
+            .with_target(super::SparseTargetProof::Selected(target));
         let transition = || CheckpointTransition {
             album_snapshots: Vec::new(),
             expected_metadata: Vec::new(),

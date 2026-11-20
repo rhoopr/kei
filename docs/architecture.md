@@ -24,7 +24,7 @@ For a specific component, see the [module index](architecture/module-index.md). 
 
 **Sync.** The runner resolves the session, libraries, and pass plans. Each cycle dispatches work per library, evaluates source progress per zone, and reports the result to watch control. A cursor records where to resume; the retained inbox holds source observations; destination receipts record local work. None substitutes for the others. See [provider capture and destination replay](architecture/provider-replay.md) and [checkpoint decisions and enumeration](architecture/checkpoints.md).
 
-A sparse change in PrimarySync can depend on a scoped Shared scan from the same cycle. The source checkpoint requires the exact selected identity and verified files for every admitted destination in that scan.
+A sparse change in PrimarySync can depend on a scoped Shared scan from the same cycle. If a Hidden-only scan has no decision for the exact Shared asset, its current `isHidden` field can establish membership. Every selected destination still requires a verified local copy before the source checkpoint advances.
 
 **Local delivery.** The planner selects a destination. The pipeline writes and verifies a `.part`, publishes the file, syncs the parent directory, and finalizes durable state. Import uses the shared path rules and verifies an existing file before adoption. Unresolved work needs durable retry evidence. See [publication, reconciliation, and import](architecture/publication.md).
 

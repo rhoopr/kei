@@ -650,6 +650,9 @@ enum ScopedProof {
     Present,
     /// The lookup succeeds, but the selected scan never observes the child.
     AbsentFromScan,
+    ExplicitlyVisible,
+    MissingHiddenFlag,
+    NewHidden,
     /// The scan observes one master while the current lookup reports another.
     AmbiguousMaster,
     /// The sparse link names an owner that is not the selected Shared owner.
@@ -747,6 +750,16 @@ async fn sparse_scoped_hidden_and_album_scan_proves_only_the_exact_shared_target
                     ScopedProof::WrongOwner,
                     ScopedProof::MissingAdditionalCopy,
                 ]
+            } else if plan == ScopedPlan::Hidden {
+                &[
+                    ScopedProof::Present,
+                    ScopedProof::AbsentFromScan,
+                    ScopedProof::ExplicitlyVisible,
+                    ScopedProof::MissingHiddenFlag,
+                    ScopedProof::NewHidden,
+                    ScopedProof::AmbiguousMaster,
+                    ScopedProof::WrongOwner,
+                ]
             } else {
                 &[
                     ScopedProof::Present,
@@ -789,12 +802,18 @@ async fn sparse_scoped_hidden_and_album_scan_proves_only_the_exact_shared_target
                         &checksum,
                     )
                 };
-                let scanned = if proof == ScopedProof::AbsentFromScan {
+                let scanned = if matches!(
+                    proof,
+                    ScopedProof::AbsentFromScan
+                        | ScopedProof::ExplicitlyVisible
+                        | ScopedProof::MissingHiddenFlag
+                        | ScopedProof::NewHidden
+                ) {
                     Vec::new()
                 } else {
                     target()
                 };
-                let looked_up = if proof == ScopedProof::AmbiguousMaster {
+                let mut looked_up = if proof == ScopedProof::AmbiguousMaster {
                     target_pair(
                         "SharedSync-test",
                         "asset-target",
@@ -807,6 +826,19 @@ async fn sparse_scoped_hidden_and_album_scan_proves_only_the_exact_shared_target
                     )
                 } else {
                     target()
+                };
+                if proof == ScopedProof::ExplicitlyVisible {
+                    looked_up[1]["fields"]["isHidden"]["value"] = json!(0);
+                } else if proof == ScopedProof::MissingHiddenFlag {
+                    looked_up[1]["fields"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("isHidden");
+                }
+                let seed_downloads = if proof == ScopedProof::NewHidden {
+                    0
+                } else {
+                    expected_copies
                 };
                 let directory = tempfile::tempdir().unwrap();
                 let database = directory.path().join("state.db");
@@ -821,7 +853,7 @@ async fn sparse_scoped_hidden_and_album_scan_proves_only_the_exact_shared_target
                 let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
                 let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
                 let db: Arc<dyn download::DownloadStore> = inner.clone();
-                let builder = make_run_cycle_download_config_builder_with_options(
+                let base_builder = make_run_cycle_download_config_builder_with_options(
                     &media,
                     db.clone(),
                     RunCycleDownloadConfigOptions {
@@ -829,6 +861,12 @@ async fn sparse_scoped_hidden_and_album_scan_proves_only_the_exact_shared_target
                         ..Default::default()
                     },
                 );
+                let builder = |mode, excluded, groups, library| {
+                    let mut config = base_builder(mode, excluded, groups, library);
+                    Arc::make_mut(&mut config).folder_structure_smart_folders =
+                        Arc::from("selected/{smart-folder}");
+                    config
+                };
                 let run = inner.start_sync_run().await.unwrap();
                 inner
                     .complete_sync_run(run, &state::SyncRunStats::default())
@@ -865,7 +903,14 @@ async fn sparse_scoped_hidden_and_album_scan_proves_only_the_exact_shared_target
                         quiet: true,
                         unrelated: false,
                         records: Vec::new(),
-                        scan: Some(plan_scan_passes(plan, target())),
+                        scan: Some(plan_scan_passes(
+                            plan,
+                            if seed_downloads == 0 {
+                                Vec::new()
+                            } else {
+                                target()
+                            },
+                        )),
                         lookup_records: Some(target()),
                         scan_queries: None,
                         remove_on_lookup: None,
@@ -886,20 +931,20 @@ async fn sparse_scoped_hidden_and_album_scan_proves_only_the_exact_shared_target
                 .await
                 .unwrap();
                 assert_eq!(
-                    prior.stats.downloaded, expected_copies,
+                    prior.stats.downloaded, seed_downloads,
                     "the prior scoped scan must establish every required copy: plan={plan:?} proof={proof:?}: {prior:?}"
                 );
                 let seeded_requests = server.received_requests().await.unwrap_or_default();
                 assert_eq!(
                     target_gets(&seeded_requests),
-                    expected_copies,
+                    seed_downloads,
                     "seeding must transfer each distinct selected path once: plan={plan:?} proof={proof:?}"
                 );
                 let mut seeded_files = media_files(&media);
                 seeded_files.sort();
                 assert_eq!(
                     seeded_files.len(),
-                    expected_copies,
+                    seed_downloads,
                     "seeding must leave one file per selected path: plan={plan:?} proof={proof:?} files={seeded_files:?}"
                 );
                 for path in &seeded_files {
@@ -1070,6 +1115,10 @@ async fn sparse_scoped_hidden_and_album_scan_proves_only_the_exact_shared_target
                     );
                 } else {
                     assert_eq!(files_after.len(), expected_copies);
+                    if proof == ScopedProof::NewHidden {
+                        assert!(files_after[0].starts_with(media.join("selected/Hidden")));
+                        assert_eq!(std::fs::read(&files_after[0]).unwrap(), bytes);
+                    }
                     for path in &seeded_files {
                         assert_eq!(
                             std::fs::read(path).unwrap().as_slice(),
@@ -1080,15 +1129,23 @@ async fn sparse_scoped_hidden_and_album_scan_proves_only_the_exact_shared_target
                 }
                 assert_eq!(
                     result.stats.downloaded,
-                    0,
+                    usize::from(proof == ScopedProof::NewHidden),
                     "verified-copy recovery must not issue a new media GET: plan={plan:?} shared_first={shared_first} proof={proof:?}: {result:?}; target_calls={}",
                     target_calls.load(Ordering::SeqCst)
                 );
                 let identities = inner.sparse_identities("PrimarySync").await.unwrap();
-                if proof == ScopedProof::Present {
+                if proof == ScopedProof::Present
+                    || (plan == ScopedPlan::Hidden
+                        && matches!(
+                            proof,
+                            ScopedProof::ExplicitlyVisible
+                                | ScopedProof::AbsentFromScan
+                                | ScopedProof::NewHidden
+                        ))
+                {
                     assert!(
                         !result.stats.identity_incomplete,
-                        "an exact selected scan must finish the source proof: {result:?}; target_calls={}",
+                        "eligible target must finish the source proof: {plan:?}, {proof:?}: {result:?}; target_calls={}",
                         target_calls.load(Ordering::SeqCst)
                     );
                     assert_eq!(

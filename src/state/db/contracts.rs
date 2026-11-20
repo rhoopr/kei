@@ -1049,10 +1049,11 @@ pub trait MetadataRewriteStore: Send + Sync {
     ) -> Result<Option<super::trusted_legacy::LegacyReceiptProvenance>, StateError> {
         Ok(None)
     }
-    async fn legacy_child_receipts(
+    async fn qualified_child_receipts(
         &self,
         _library: &str,
         _id: &str,
+        _requires_metadata: bool,
     ) -> Result<Vec<AssetRecord>, StateError> {
         Err(StateError::Invariant {
             operation: "legacy_child_receipts",

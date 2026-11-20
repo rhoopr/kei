@@ -345,15 +345,16 @@ impl SqliteStateDb {
     /// Reconciliation reservations are naming evidence, not pending work, and
     /// remain in the preparation dependency snapshot. Receipt eligibility alone
     /// does not establish current completion or checkpoint permission.
-    pub(crate) async fn legacy_child_receipts(
+    pub(crate) async fn qualified_child_receipts(
         &self,
         library: &str,
         id: &str,
+        requires_metadata: bool,
     ) -> Result<Vec<crate::state::AssetRecord>, StateError> {
         let library = library.to_owned();
         let id = id.to_owned();
         self.with_conn("legacy_child_receipts", move |conn| {
-            let ready = child_receipts_ready(conn, &library, &id)?;
+            let ready = child_publications_ready(conn, &library, &id, requires_metadata)?;
             if !ready {
                 return Ok(Vec::new());
             }
@@ -380,6 +381,15 @@ impl SqliteStateDb {
             Ok(accepted)
         })
         .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn legacy_child_receipts(
+        &self,
+        library: &str,
+        id: &str,
+    ) -> Result<Vec<crate::state::AssetRecord>, StateError> {
+        self.qualified_child_receipts(library, id, true).await
     }
 
     pub(crate) async fn legacy_preparation_snapshots(

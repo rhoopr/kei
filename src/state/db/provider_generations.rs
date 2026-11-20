@@ -498,15 +498,17 @@ pub(super) fn sparse_selected_copies(
     let keys = keys
         .query_map(params![generation, child], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
+    // Only a missing decision permits a direct Hidden membership lookup.
+    if keys.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
     let mut copies = Vec::new();
-    if !keys.is_empty()
-        && !super::legacy_preservation::child_publications_ready(
-            conn,
-            library,
-            child,
-            root.spec.metadata_enabled,
-        )?
-    {
+    if !super::legacy_preservation::child_publications_ready(
+        conn,
+        library,
+        child,
+        root.spec.metadata_enabled,
+    )? {
         return Ok(Err(SparseTargetHold::ReceiptUnqualified));
     }
     let mut pages = RankProofs::new(conn, &root);
@@ -563,6 +565,9 @@ pub(super) fn sparse_selected_copies(
                 source_checksum,
             });
         }
+    }
+    if copies.is_empty() {
+        return Ok(Err(SparseTargetHold::ReceiptUnqualified));
     }
     Ok(Ok(copies))
 }

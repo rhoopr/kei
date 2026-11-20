@@ -518,6 +518,7 @@ fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
                         | "target_selection_evidence_missing"
                         | "target_selected_copies_unverified"
                         | "target_membership_unobserved"
+                        | "target_explicitly_not_hidden"
                         | "target_scope_unqualified"
                         | "target_pair_unresolved"
                         | "target_policy_unsupported"
