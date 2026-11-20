@@ -3,10 +3,12 @@
   for cloud-hosted photos and videos.</h1>
 
 <p align="center">
+  <a href="https://github.com/rhoopr/kei/actions/workflows/ci.yml?query=branch%3Amain+event%3Apush"><img src="https://img.shields.io/github/actions/workflow/status/rhoopr/kei/ci.yml?branch=main&amp;event=push&amp;label=Main&amp;logo=github" alt="Main CI"></a>
+  <a href="https://github.com/rhoopr/kei/actions/workflows/nightly.yml?query=branch%3Amain+event%3Aschedule"><img src="https://img.shields.io/github/actions/workflow/status/rhoopr/kei/nightly.yml?branch=main&amp;event=schedule&amp;label=Nightly&amp;logo=github" alt="Scheduled nightly qualification"></a>
+  <a href="https://github.com/rhoopr/kei/actions/workflows/qualification.yml?query=branch%3Amain+event%3Aschedule"><img src="https://img.shields.io/github/actions/workflow/status/rhoopr/kei/qualification.yml?branch=main&amp;event=schedule&amp;label=Weekly&amp;logo=github" alt="Scheduled weekly heavy qualification"></a><br>
   <a href="https://github.com/rhoopr/kei/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/Rust_MSRV-1.91%2B-dea584?logo=rust" alt="Rust MSRV 1.91+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/rhoopr/kei?color=8b959e" alt="License: MIT"></a>
-  <a href="https://github.com/rhoopr/kei/releases"><img src="https://img.shields.io/github/v/release/rhoopr/kei?color=blue&label=version" alt="Version"></a>
-  <a href="https://github.com/rhoopr/kei/actions/workflows/docker.yml"><img src="https://img.shields.io/github/actions/workflow/status/rhoopr/kei/docker.yml?branch=main&label=build&logo=github" alt="Build"></a><br>
+  <a href="https://github.com/rhoopr/kei/releases"><img src="https://img.shields.io/github/v/release/rhoopr/kei?color=blue&label=version" alt="Version"></a><br>
   <a href="https://github.com/rhoopr/homebrew-kei"><img src="https://img.shields.io/badge/homebrew-tap-FBB040?logo=homebrew" alt="Homebrew"></a>
   <a href="https://github.com/rhoopr/kei/releases"><img src="https://img.shields.io/github/downloads/rhoopr/kei/total?logo=github&label=downloads" alt="Downloads"></a>
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a>
