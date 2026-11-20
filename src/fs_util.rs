@@ -309,6 +309,15 @@ impl ConfinedPath {
     /// Identity of the entry itself, including a user-owned symbolic link.
     pub(crate) fn entry_identity(&self) -> std::io::Result<FileIdentity> {
         self.validate_namespace()?;
+        let identity = self.retained_entry_identity()?;
+        self.validate_namespace()?;
+        Ok(identity)
+    }
+
+    /// Identity of the entry inside the retained parent, without rewalking the
+    /// configured root. A caller that already holds the parent capability keeps
+    /// it across an ancestor directory move.
+    pub(crate) fn retained_entry_identity(&self) -> std::io::Result<FileIdentity> {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -343,7 +352,6 @@ impl ConfinedPath {
                     .try_into()
                     .map_err(|_error| std::io::Error::other("invalid inode identity"))?,
             };
-            self.validate_namespace()?;
             Ok(identity)
         }
         #[cfg(windows)]

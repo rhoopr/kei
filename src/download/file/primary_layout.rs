@@ -92,12 +92,12 @@ pub(in crate::download) async fn rename_album_directory(
                     crate::fs_util::file_identity(&directory)? == identity,
                     "Album directory identity changed before rename"
                 );
-                super::platform::move_layout_confined(&source, &destination)?;
+                super::platform::move_noreplace_confined(&source, &destination)?;
                 let installed = destination.open_directory()?;
                 if crate::fs_util::file_identity(&installed)? != identity {
                     // Preserve a substituted entry by restoring only into the
                     // still-empty old slot. Neither operation replaces bytes.
-                    super::platform::move_layout_confined(&destination, &source)?;
+                    super::platform::move_noreplace_confined(&destination, &source)?;
                     anyhow::bail!("Album directory changed during rename");
                 }
             }
@@ -204,9 +204,9 @@ pub(in crate::download) async fn move_album_user_entry(
                     identity == entry.identity,
                     "User album entry changed identity"
                 );
-                super::platform::move_layout_confined(&source, &target)?;
+                super::platform::move_noreplace_confined(&source, &target)?;
                 if target.entry_identity()? != entry.identity {
-                    super::platform::move_layout_confined(&target, &source)?;
+                    super::platform::move_noreplace_confined(&target, &source)?;
                     anyhow::bail!("User album entry changed during movement");
                 }
             }
@@ -570,7 +570,8 @@ fn restore_retirement(entries: &[RetirementEntry]) {
         if entry.destination.entry_exists().unwrap_or(false)
             && !entry.source.entry_exists().unwrap_or(true)
         {
-            let restored = super::platform::move_layout_confined(&entry.destination, &entry.source);
+            let restored =
+                super::platform::move_noreplace_confined(&entry.destination, &entry.source);
             let durable = entry
                 .source
                 .sync_parent()
@@ -776,6 +777,192 @@ mod tests {
             return;
         };
         assert_retire_moves_alias_to_its_private_slot(dir.path()).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_album_directory_move_round_trips(root: &std::path::Path) {
+        use super::rename_album_directory;
+        use crate::fs_util::{ConfinedParents, ConfinedPath};
+
+        let current = root.join("media/Old");
+        let next = root.join("media/New");
+        std::fs::create_dir_all(current.join("user")).unwrap();
+        std::fs::write(current.join("user/note.txt"), b"user bytes").unwrap();
+        let identity = ConfinedPath::open(root, &current, ConfinedParents::Existing)
+            .unwrap()
+            .entry_identity()
+            .unwrap();
+        rename_album_directory(root, &current, &next, identity)
+            .await
+            .unwrap();
+        assert!(!current.exists());
+        assert_eq!(
+            std::fs::read(next.join("user/note.txt")).unwrap(),
+            b"user bytes"
+        );
+        assert_eq!(
+            ConfinedPath::open(root, &next, ConfinedParents::Existing)
+                .unwrap()
+                .entry_identity()
+                .unwrap(),
+            identity
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("media")).unwrap().count(),
+            1,
+            "the move leaves exactly one directory name"
+        );
+        rename_album_directory(root, &next, &current, identity)
+            .await
+            .unwrap();
+        assert!(!next.exists());
+        assert_eq!(
+            std::fs::read(current.join("user/note.txt")).unwrap(),
+            b"user bytes"
+        );
+        assert_eq!(
+            ConfinedPath::open(root, &current, ConfinedParents::Existing)
+                .unwrap()
+                .entry_identity()
+                .unwrap(),
+            identity
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("media")).unwrap().count(),
+            1,
+            "the restore leaves exactly one directory name"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn album_directory_move_claims_and_verifies_when_noreplace_is_unsupported() {
+        let root = tempfile::tempdir().unwrap();
+        let _fallback = super::super::platform::ForcedLinkFallback::new(root.path());
+        assert_album_directory_move_round_trips(root.path()).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn nfs_album_directory_move_round_trips_on_the_export() {
+        let Some(root) = crate::test_helpers::nfs_test_dir("nfs_album_directory_move") else {
+            return;
+        };
+        assert_album_directory_move_round_trips(root.path()).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn album_directory_move_refuses_an_occupied_destination_when_noreplace_is_unsupported() {
+        use super::rename_album_directory;
+        use crate::fs_util::{ConfinedParents, ConfinedPath};
+
+        let root = tempfile::tempdir().unwrap();
+        let _fallback = super::super::platform::ForcedLinkFallback::new(root.path());
+        let current = root.path().join("media/Old");
+        let next = root.path().join("media/New");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(current.join("photo.jpg"), b"owned media").unwrap();
+        std::fs::create_dir(&next).unwrap();
+        std::fs::write(next.join("foreign.txt"), b"foreign bytes").unwrap();
+        let identity = ConfinedPath::open(root.path(), &current, ConfinedParents::Existing)
+            .unwrap()
+            .entry_identity()
+            .unwrap();
+        assert!(
+            rename_album_directory(root.path(), &current, &next, identity)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(current.join("photo.jpg")).unwrap(),
+            b"owned media"
+        );
+        assert_eq!(
+            std::fs::read(next.join("foreign.txt")).unwrap(),
+            b"foreign bytes"
+        );
+        assert_eq!(
+            std::fs::read_dir(&next).unwrap().count(),
+            1,
+            "the occupied destination is untouched"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn album_user_entry_move_links_and_verifies_when_noreplace_is_unsupported() {
+        use super::move_album_user_entry;
+        use crate::fs_util::{ConfinedParents, ConfinedPath};
+        use crate::state::db::primary_layout::directory::AlbumUserEntry;
+        use crate::state::db::provider_selection::SelectionPath;
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let _fallback = super::super::platform::ForcedLinkFallback::new(root.path());
+        let current = root.path().join("media/Old");
+        let next = root.path().join("media/New");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(&next).unwrap();
+        std::fs::write(current.join("note.txt"), b"user bytes").unwrap();
+        let source = ConfinedPath::open(
+            root.path(),
+            &current.join("note.txt"),
+            ConfinedParents::Existing,
+        )
+        .unwrap();
+        let identity = source.entry_identity().unwrap();
+        let entry = AlbumUserEntry {
+            path: SelectionPath::from_path(source.path()),
+            identity,
+        };
+        move_album_user_entry(root.path(), &entry, &next.join("note.txt"))
+            .await
+            .unwrap();
+        assert!(!current.join("note.txt").exists());
+        assert_eq!(std::fs::read(next.join("note.txt")).unwrap(), b"user bytes");
+        assert_eq!(
+            ConfinedPath::open(
+                root.path(),
+                &next.join("note.txt"),
+                ConfinedParents::Existing
+            )
+            .unwrap()
+            .entry_identity()
+            .unwrap(),
+            identity
+        );
+        assert_eq!(
+            std::fs::metadata(next.join("note.txt")).unwrap().nlink(),
+            1,
+            "the moved file keeps one name"
+        );
+        assert_eq!(std::fs::read_dir(&current).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&next).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retirement_restore_links_and_verifies_when_noreplace_is_unsupported() {
+        use super::restore_retirement;
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let _fallback = super::super::platform::ForcedLinkFallback::new(root.path());
+        let media = root.path().join("photo.jpg");
+        let retired = root.path().join("private/retired");
+        std::fs::create_dir(root.path().join("private")).unwrap();
+        std::fs::write(&retired, b"saved media").unwrap();
+        let expected = snapshot_blocking(root.path(), &retired).unwrap();
+        let entries = [RetirementEntry::open(root.path(), &media, &retired, expected).unwrap()];
+        restore_retirement(&entries);
+        assert!(!retired.exists());
+        assert_eq!(std::fs::read(&media).unwrap(), b"saved media");
+        assert_eq!(
+            std::fs::metadata(&media).unwrap().nlink(),
+            1,
+            "the restored entry keeps one name"
+        );
     }
 
     #[tokio::test]

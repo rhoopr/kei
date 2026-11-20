@@ -6,6 +6,8 @@ use std::path::Path;
 use tokio::fs;
 
 use crate::fs_util::ConfinedPath;
+#[cfg(target_os = "linux")]
+use crate::fs_util::RemovalKind;
 
 #[cfg(all(test, feature = "xmp", target_os = "linux"))]
 thread_local! {
@@ -110,11 +112,70 @@ pub(in crate::download) fn move_layout_confined(
     }
 }
 
+/// Move between public names. A filesystem with `RENAME_NOREPLACE` keeps the
+/// atomic no-replace rename, so no foreign entry can be replaced unnoticed.
+///
+/// NFS rejects that flag, so the fallback publishes the source entry under the
+/// destination name and proves that name before removing the source. Removing
+/// the source first would destroy the only bytes when a foreign writer replaces
+/// the destination in between.
+pub(in crate::download) fn move_noreplace_confined(
+    source: &ConfinedPath,
+    destination: &ConfinedPath,
+) -> std::io::Result<()> {
+    let moved = move_layout_confined(source, destination);
+    #[cfg(target_os = "linux")]
+    if let Err(error) = &moved
+        && is_renameat2_unsupported(error)
+    {
+        return move_noreplace_without_renameat2(source, destination);
+    }
+    moved
+}
+
+/// A directory is claimed with an exclusive empty directory that only our own
+/// rename may replace. A file is linked first, and its source name is removed
+/// only once the destination is verified to hold that same entry.
+#[cfg(target_os = "linux")]
+fn move_noreplace_without_renameat2(
+    source: &ConfinedPath,
+    destination: &ConfinedPath,
+) -> std::io::Result<()> {
+    match source.open_directory() {
+        Ok(_) => {
+            let claim = destination.create_new_directory()?;
+            let claimed = crate::fs_util::file_identity(&claim)?;
+            match renameat2_confined_blocking(source, destination, 0) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // A foreign writer may own the name by now; keep its entry
+                    // and remove only the empty claim this call created.
+                    let _ = destination.remove_verified(claimed, RemovalKind::EmptyDirectory);
+                    Err(error)
+                }
+            }
+        }
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {
+            // The retained parents are the authority: an ancestor may have moved
+            // since these paths were opened.
+            let identity = source.retained_entry_identity()?;
+            hard_link_confined(source, destination)?;
+            if destination.retained_entry_identity()? != identity {
+                return Err(std::io::Error::other(
+                    "Move destination no longer holds the moved entry",
+                ));
+            }
+            source.remove_verified(identity, RemovalKind::File)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Move an obsolete alias into a private retirement slot: a unique name this
 /// process creates and has never used, so there is no foreign entry to replace.
 /// A filesystem without `RENAME_NOREPLACE` (NFS) therefore gets a plain rename,
 /// as `replacement_recovery::move_to_owned_slot` does for journal slots. Never
-/// use this to restore a public name; that keeps `move_layout_confined`.
+/// use this to restore a public name; that keeps `move_noreplace_confined`.
 pub(in crate::download) fn retire_layout_confined(
     source: &ConfinedPath,
     slot: &ConfinedPath,
