@@ -28,10 +28,11 @@ use super::models::{
     sync_token_blocked_explanation, sync_token_blocked_source,
 };
 use super::selection::{
-    build_pass_configs_resolving_deferred_excludes, build_pass_configs_with_download_concurrency,
-    deferred_unfiled_index, should_record_album_snapshots,
+    build_pass_configs_resolving_deferred_excludes, deferred_unfiled_index,
+    should_record_album_snapshots,
 };
 
+mod first_attempt;
 mod token_diagnostics;
 
 const MAX_SAME_CYCLE_CHECKPOINT_RECOVERY_ROUNDS: usize = 1;
@@ -905,10 +906,6 @@ pub(super) async fn download_photos_full_with_token_policy(
         }
         _ => None,
     };
-    let mut deferred_album_snapshots = Vec::new();
-    let record_album_snapshots = should_record_album_snapshots(passes, config, controls);
-    let needs_per_pass = config.requires_per_pass_paths() || record_album_snapshots;
-
     // Mark every unique zone as in-progress so an interrupted full
     // enumeration leaves a trail the next startup can surface to the
     // operator. Clears once the enumeration returns normally.
@@ -929,422 +926,31 @@ pub(super) async fn download_photos_full_with_token_policy(
     }
 
     let pass_count_plan = build_pass_count_plan(passes, config, controls).await;
-    let pass_counts = pass_count_plan.display_counts;
-    let pass_stream_counts = pass_count_plan.stream_total_counts;
-    let mut pagination_counts = pass_counts.clone();
-    let mut exact_total = pass_count_plan.exact_total;
-    let mut pagination_count_deduction = 0u64;
+    let attempt = first_attempt::FirstAttempt::plan(passes, config, controls, &pass_count_plan);
     let len_errors = pass_count_plan.len_errors;
-    let display_total = pass_counts.iter().sum();
-    let deferred_unfiled = deferred_unfiled_index(passes);
-    // A plan with only the library-wide unfiled pass has no album pass to
-    // anchor `deferred_unfiled`, so it needs its own progress heartbeat.
-    let unfiled_only = matches!(passes, [pass] if pass.kind == crate::commands::PassKind::Unfiled);
     let bounds_truncated = Arc::new(AtomicBool::new(false));
     let strict_empty_tail_errors = (config.complete_path_selection
         || config.skip_created_before.is_none())
         && !controls.run_mode.only_print_filenames()
         && !controls.run_mode.is_dry_run();
 
-    // Pass-specific path mode still needs one derived config per pass so
-    // `{album}` / `{smart-folder}` / `{library}` expand correctly, but the
-    // CloudKit streams are independent. Run those pass streams concurrently
-    // instead of serializing round trips across albums. Download workers are
-    // divided across active pass pipelines so real downloads do not multiply
-    // the user-selected `[download].threads` by the number of albums.
     let mut token_diagnostics = token_diagnostics::TokenDiagnostics::new(passes, &config.library);
-    let initial_order = token_diagnostics.initial_order.clone();
-    let (mut streaming_result, token_receivers) = if needs_per_pass {
-        let mut combined_result = StreamingResult {
-            // Enumeration is "complete" only when every pass finished
-            // its stream cleanly. Start optimistic; flip to false on the
-            // first pass that ended early (shutdown, channel-close, or
-            // panic) so the marker stays set and the next startup logs
-            // the interruption.
-            enumeration_complete: !passes.is_empty(),
-            ..StreamingResult::default()
-        };
-        let pass_parallelism = passes.len().min(config.concurrent_downloads).max(1);
-        // Round down so every set of active passes, including replacement
-        // passes, fits the total worker budget. Leave the remainder unused
-        // rather than introducing a second worker-admission mechanism.
-        let per_pass_download_concurrency = (config.concurrent_downloads / pass_parallelism).max(1);
-        let pass_configs = build_pass_configs_with_download_concurrency(
-            passes,
+    let first_attempt::ObservedAttempt {
+        streaming: mut streaming_result,
+        receivers: token_receivers,
+        snapshots: deferred_album_snapshots,
+        exact_total,
+    } = attempt
+        .run(first_attempt::InitialStreams {
+            client: download_client,
             config,
-            per_pass_download_concurrency,
-        );
-        let shared_download_ctx = if controls.run_mode.is_dry_run() {
-            None
-        } else {
-            Some(preload_download_context(config).await)
-        };
-
-        // Build per-pass labels for the album divider. Friendly multi-pass
-        // syncs print a done line (✓) above the bar after each album
-        // completes. Single-pass and off-mode syncs skip the divider.
-        let pass_labels: Vec<(&str, u64)> = passes
-            .iter()
-            .zip(&pass_counts)
-            .map(|(pass, &count)| {
-                let label: &str = pass.album.name.as_ref();
-                let label = if label.is_empty() { "unfiled" } else { label };
-                (label, count)
-            })
-            .collect();
-        let divider = crate::personality::album_divider::AlbumDivider::new(
-            controls.reporting.personality_mode,
-            &pass_labels,
-        );
-
-        let deferred_ids = deferred_unfiled
-            .map(|_| Arc::new(std::sync::Mutex::new(FxHashSet::<String>::default())));
-
-        let non_unfiled_results = stream::iter(
-            passes
-                .iter()
-                .enumerate()
-                .zip(&pass_counts)
-                .zip(&pass_stream_counts)
-                .zip(pass_configs.iter().cloned())
-                .filter(|((((index, _pass), _count), _total_count), _config)| {
-                    Some(*index) != deferred_unfiled
-                }),
-        )
-        .map(
-            |((((pass_index, pass), &count), total_count), pass_config)| {
-                let shutdown_token = shutdown_token.clone();
-                let download_client = download_client.clone();
-                let deferred_ids = deferred_ids.clone();
-                let download_ctx = shared_download_ctx.clone();
-                let bounds_truncated = Arc::clone(&bounds_truncated);
-                let initial_order = initial_order.clone();
-                async move {
-                    let album_snapshot = if record_album_snapshots {
-                        AlbumSnapshotRecorder::start_for_pass(
-                            config.state_db.clone(),
-                            pass,
-                            config.enum_config_hash.as_deref(),
-                        )
-                        .await?
-                    } else {
-                        None
-                    };
-                    let (stream, token_rx) = open_photo_stream_for_controls(
-                        &pass.album,
-                        None,
-                        *total_count,
-                        config.concurrent_downloads,
-                        pass_config.concurrent_downloads,
-                        controls,
-                        strict_empty_tail_errors,
-                    );
-                    let stream = filter_stream_to_enumeration_bounds(
-                        stream,
-                        config,
-                        Arc::clone(&bounds_truncated),
-                        shutdown_token.clone(),
-                    );
-
-                    let stream = initial_order.wrap(stream, pass_index);
-                    let stream = if unfiled_only {
-                        track_unfiled_heartbeat(
-                            stream,
-                            progress_library_label(pass.album.zone_name()),
-                            *total_count,
-                            "Unfiled",
-                            shutdown_token.clone(),
-                        )
-                    } else {
-                        stream
-                    };
-                    if pass.kind == crate::commands::PassKind::Album
-                        && let Some(deferred_ids) = deferred_ids
-                    {
-                        let stream = stream.map(move |item| {
-                            if let Ok(asset) = &item
-                                && let Ok(mut ids) = deferred_ids.lock()
-                            {
-                                ids.insert(asset.asset_record_name().to_string());
-                            }
-                            item
-                        });
-                        return run_full_pass_stream(
-                            download_client,
-                            stream,
-                            token_rx,
-                            pass_config,
-                            FullPassStreamOptions {
-                                pass_index,
-                                controls,
-                                count,
-                                kind: pass.kind,
-                                shutdown_token,
-                                download_ctx: download_ctx.clone(),
-                                album_snapshot,
-                            },
-                        )
-                        .await;
-                    }
-
-                    run_full_pass_stream(
-                        download_client,
-                        stream,
-                        token_rx,
-                        pass_config,
-                        FullPassStreamOptions {
-                            pass_index,
-                            controls,
-                            count,
-                            kind: pass.kind,
-                            shutdown_token,
-                            download_ctx,
-                            album_snapshot,
-                        },
-                    )
-                    .await
-                }
-            },
-        )
-        .buffer_unordered(pass_parallelism)
-        .collect::<Vec<Result<PerPassStreamingResult>>>();
-
-        let pass_results = non_unfiled_results.await;
-
-        let mut token_receivers = Vec::with_capacity(passes.len());
-        let mut deferred_exclusions_complete = true;
-        for pass_result in pass_results {
-            let PerPassStreamingResult {
-                deferred_album_snapshot,
-                pass_index,
-                kind,
-                label,
-                count,
-                elapsed,
-                token_rx,
-                result,
-            } = pass_result?;
-            deferred_album_snapshots.extend(deferred_album_snapshot);
-
-            if deferred_unfiled.is_some()
-                && kind == crate::commands::PassKind::Album
-                && (result.enumeration_errors > 0 || !result.enumeration_complete)
-            {
-                deferred_exclusions_complete = false;
-            }
-            if deferred_unfiled.is_some()
-                && kind == crate::commands::PassKind::Album
-                && count > 0
-                && result.assets_seen == 0
-                && result.enumeration_errors == 0
-                && result.enumeration_complete
-            {
-                // A deferred-unfiled run has one library-wide stream that can
-                // cover assets counted by album-side passes. If an album pass
-                // contributes a count but no records to this cycle, keeping
-                // that count in the summed pagination total compares
-                // pass-count bookkeeping against producer-observed records and
-                // creates a false shortfall.
-                pagination_count_deduction = pagination_count_deduction.saturating_add(count);
-            }
-
-            token_receivers.push(PassTokenReceiver {
-                pass: PassKey {
-                    index: pass_index,
-                    kind,
-                    label: label.clone(),
-                },
-                receiver: token_rx,
-                enumeration_complete: result.enumeration_complete && result.enumeration_errors == 0,
-            });
-            let downloaded_u64 = u64::try_from(result.downloaded).unwrap_or(u64::MAX);
-            divider.mark_done(&label, downloaded_u64, count, elapsed);
-
-            merge_streaming_result(&mut combined_result, result);
-        }
-
-        if let Some(index) = deferred_unfiled {
-            if deferred_exclusions_complete {
-                let excluded_ids = deferred_ids
-                    .as_ref()
-                    .and_then(|ids| ids.lock().ok().map(|guard| guard.clone()))
-                    .unwrap_or_default();
-                if let (Some(pass), Some(pass_config)) =
-                    (passes.get(index), pass_configs.get(index).cloned())
-                {
-                    let stream_total_count = pass_stream_counts.get(index).copied().flatten();
-                    let (stream, token_rx) = open_photo_stream_for_controls(
-                        &pass.album,
-                        None,
-                        stream_total_count,
-                        config.concurrent_downloads,
-                        pass_config.concurrent_downloads,
-                        controls,
-                        strict_empty_tail_errors,
-                    );
-                    let library = progress_library_label(pass.album.zone_name());
-                    let stream = filter_stream_to_enumeration_bounds(
-                        stream,
-                        config,
-                        Arc::clone(&bounds_truncated),
-                        shutdown_token.clone(),
-                    );
-                    let stream = track_unfiled_heartbeat(
-                        stream,
-                        library,
-                        stream_total_count,
-                        "Deferred unfiled",
-                        shutdown_token.clone(),
-                    )
-                    .filter(move |item| {
-                        let keep = item.as_ref().map_or(true, |asset| {
-                            !excluded_ids.contains(asset.asset_record_name())
-                        });
-                        std::future::ready(keep)
-                    });
-                    let stream = initial_order.wrap(Box::pin(stream), index);
-                    let pass_result = run_full_pass_stream(
-                        download_client.clone(),
-                        stream,
-                        token_rx,
-                        pass_config,
-                        FullPassStreamOptions {
-                            pass_index: index,
-                            controls,
-                            count: pass_counts.get(index).copied().unwrap_or(0),
-                            kind: crate::commands::PassKind::Unfiled,
-                            shutdown_token: shutdown_token.clone(),
-                            download_ctx: shared_download_ctx.clone(),
-                            album_snapshot: None,
-                        },
-                    )
-                    .await?;
-                    let filtered_count = pass_result.result.assets_seen;
-                    if let Some(slot) = pagination_counts.get_mut(index) {
-                        *slot = filtered_count;
-                    }
-                    let downloaded_u64 =
-                        u64::try_from(pass_result.result.downloaded).unwrap_or(u64::MAX);
-                    divider.mark_done(
-                        &pass_result.label,
-                        downloaded_u64,
-                        pass_result.count,
-                        pass_result.elapsed,
-                    );
-                    token_receivers.push(PassTokenReceiver {
-                        pass: PassKey {
-                            index: pass_result.pass_index,
-                            kind: pass_result.kind,
-                            label: pass_result.label.clone(),
-                        },
-                        receiver: pass_result.token_rx,
-                        enumeration_complete: pass_result.result.enumeration_complete
-                            && pass_result.result.enumeration_errors == 0,
-                    });
-                    merge_streaming_result(&mut combined_result, pass_result.result);
-                }
-            } else {
-                combined_result.enumeration_complete = false;
-            }
-        }
-        divider.finish();
-
-        (combined_result, token_receivers)
-    } else {
-        let merged_exclude_ids = passes
-            .first()
-            .map(|p| Arc::clone(&p.exclude_ids))
-            .unwrap_or_else(|| Arc::new(FxHashSet::default()));
-        let merged_config = if Arc::ptr_eq(&merged_exclude_ids, &config.exclude_asset_ids) {
-            Arc::clone(config)
-        } else {
-            Arc::new(config.with_exclude_ids(merged_exclude_ids))
-        };
-        let mut token_receivers = Vec::with_capacity(passes.len());
-        let streams: Vec<_> = passes
-            .iter()
-            .enumerate()
-            .zip(&pass_stream_counts)
-            .map(|((pass_index, pass), total_count)| {
-                let (stream, token_rx) = open_photo_stream_for_controls(
-                    &pass.album,
-                    None,
-                    *total_count,
-                    config.concurrent_downloads,
-                    config.concurrent_downloads,
-                    controls,
-                    strict_empty_tail_errors,
-                );
-                let label = if pass.album.name.is_empty() {
-                    "unfiled".to_string()
-                } else {
-                    pass.album.name.to_string()
-                };
-                token_receivers.push(PassTokenReceiver {
-                    pass: PassKey {
-                        index: pass_index,
-                        kind: pass.kind,
-                        label,
-                    },
-                    receiver: token_rx,
-                    enumeration_complete: true,
-                });
-                initial_order.wrap(
-                    filter_stream_to_enumeration_bounds(
-                        stream,
-                        config,
-                        Arc::clone(&bounds_truncated),
-                        shutdown_token.clone(),
-                    ),
-                    pass_index,
-                )
-            })
-            .collect();
-
-        let combined: DownloadPhotoStream = if unfiled_only {
-            let library = passes
-                .first()
-                .map(|pass| progress_library_label(pass.album.zone_name()))
-                .unwrap_or("Other");
-            track_unfiled_heartbeat(
-                Box::pin(stream::select_all(streams)),
-                library,
-                pass_stream_counts.first().copied().flatten(),
-                "Unfiled",
-                shutdown_token.clone(),
-            )
-        } else {
-            Box::pin(stream::select_all(streams))
-        };
-        // Merged-stream branch already runs as a single call, so it creates
-        // one bar internally; no shared-bar plumbing needed.
-        let result = stream_full_inventory(
-            download_client,
-            combined,
-            &merged_config,
             controls,
-            display_total,
-            shutdown_token.clone(),
-            StreamRuntime::new(None, None).deferring_metadata_drain(),
-        )
+            shutdown: &shutdown_token,
+            order: &token_diagnostics.initial_order,
+            truncated: &bounds_truncated,
+            strict_empty_tail_errors,
+        })
         .await?;
-
-        (result, token_receivers)
-    };
-
-    // Count-probe failures stay diagnostic unless the primary records/query
-    // stream also proves unsafe. Do not fold them into `enumeration_errors`
-    // or force `enumeration_complete = false`; otherwise a flaky count
-    // endpoint can trap users in repeated full enumeration after CloudKit
-    // delivered a naturally drained stream and a usable token.
-    if exact_total.is_some() {
-        exact_total = Some(
-            pagination_counts
-                .iter()
-                .sum::<u64>()
-                .saturating_sub(pagination_count_deduction),
-        );
-    }
     let api_total_at_start = if len_errors == 0
         && config.skip_created_before.is_none()
         && !controls.run_mode.only_print_filenames()
@@ -1576,7 +1182,11 @@ pub(super) async fn download_photos_full_with_token_policy(
                         recovery_enumeration_complete = false;
                         continue;
                     };
-                    let total_count = pass_stream_counts.get(pass_key.index).copied().flatten();
+                    let total_count = pass_count_plan
+                        .stream_total_counts
+                        .get(pass_key.index)
+                        .copied()
+                        .flatten();
                     let (stream, token_rx) = open_photo_stream_for_controls(
                         &pass.album,
                         None,
@@ -1603,7 +1213,11 @@ pub(super) async fn download_photos_full_with_token_policy(
                         FullPassStreamOptions {
                             pass_index: pass_key.index,
                             controls,
-                            count: pass_counts.get(pass_key.index).copied().unwrap_or(0),
+                            count: pass_count_plan
+                                .display_counts
+                                .get(pass_key.index)
+                                .copied()
+                                .unwrap_or(0),
                             kind: pass.kind,
                             shutdown_token: shutdown_token.clone(),
                             download_ctx: None,
@@ -1790,7 +1404,8 @@ pub(super) async fn download_photos_full_with_token_policy(
     let enumeration_complete = streaming_result.enumeration_complete;
     let enumeration_errors = streaming_result.enumeration_errors;
     let tail_probes = if config.skip_created_before.is_none() {
-        pass_stream_counts
+        pass_count_plan
+            .stream_total_counts
             .iter()
             .filter(|count| count.is_some())
             .count()

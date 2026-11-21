@@ -26,21 +26,6 @@ pub(super) fn build_pass_configs(
         .collect()
 }
 
-pub(super) fn build_pass_configs_with_download_concurrency(
-    passes: &[crate::commands::AlbumPass],
-    base: &DownloadConfig,
-    per_pass_download_concurrency: usize,
-) -> Vec<Arc<DownloadConfig>> {
-    passes
-        .iter()
-        .map(|pass| {
-            let mut config = base.with_pass(pass);
-            config.concurrent_downloads = per_pass_download_concurrency.max(1);
-            Arc::new(config)
-        })
-        .collect()
-}
-
 #[cfg(test)]
 fn incremental_requires_full_enumeration(passes: &[crate::commands::AlbumPass]) -> bool {
     passes
