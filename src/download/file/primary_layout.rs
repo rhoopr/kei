@@ -22,7 +22,7 @@ pub(in crate::download) async fn keep_modified(
     path: &Path,
     modified: std::time::SystemTime,
 ) -> Result<()> {
-    set_modified(root, path, modified, true).await
+    set_modified(root, path, modified, None, true).await
 }
 
 /// A provider time need not round-trip on every filesystem. Keep the nearest
@@ -32,21 +32,36 @@ pub(in crate::download) async fn keep_provider_modified(
     root: &Path,
     path: &Path,
     modified: std::time::SystemTime,
+    expected: crate::fs_util::FileIdentity,
 ) -> Result<()> {
-    set_modified(root, path, modified, false).await
+    set_modified(root, path, modified, Some(expected), false).await
 }
 
 async fn set_modified(
     root: &Path,
     path: &Path,
     modified: std::time::SystemTime,
+    expected: Option<crate::fs_util::FileIdentity>,
     strict: bool,
 ) -> Result<()> {
     let (root, path) = (root.to_owned(), path.to_owned());
     tokio::task::spawn_blocking(move || {
         let confined = ConfinedPath::open(&root, &path, ConfinedParents::Existing)?;
         let file = confined.open_regular()?;
-        let identity = crate::fs_util::file_identity(&file)?;
+        let identity = match expected {
+            Some(expected) => {
+                anyhow::ensure!(
+                    crate::fs_util::file_link_count(&file)? == 1,
+                    "Primary layout refuses hardlinked media or sidecars"
+                );
+                anyhow::ensure!(
+                    crate::fs_util::file_identity(&file)? == expected,
+                    "Prepared primary changed before its time was set"
+                );
+                expected
+            }
+            None => crate::fs_util::file_identity(&file)?,
+        };
         let file = confined.validate_for_metadata(identity)?;
         file.set_modified(modified)?;
         if file.metadata()?.modified()? != modified {
@@ -331,7 +346,10 @@ impl ManagedPrimaryAuthorization {
     }
 }
 
-fn set_modified_file(file: &std::fs::File, time: std::time::SystemTime) -> Result<()> {
+fn set_modified_file(
+    file: &std::fs::File,
+    time: std::time::SystemTime,
+) -> Result<std::time::SystemTime> {
     file.set_times(
         std::fs::FileTimes::new()
             .set_modified(time)
@@ -339,7 +357,7 @@ fn set_modified_file(file: &std::fs::File, time: std::time::SystemTime) -> Resul
     )?;
     #[cfg(not(windows))]
     file.sync_all()?;
-    Ok(())
+    Ok(file.metadata()?.modified()?)
 }
 
 pub(in crate::download) async fn publish(
@@ -377,7 +395,8 @@ pub(in crate::download) async fn publish(
                 if prepared_file.metadata()?.modified()?<=predecessor {
                     // A two-second floor clears whole-second and FAT two-second truncation.
                     let floor=predecessor.checked_add(std::time::Duration::from_secs(2)).unwrap_or_else(std::time::SystemTime::now);
-                    set_modified_file(&prepared_file,std::time::SystemTime::now().max(floor))?;
+                    let stored=set_modified_file(&prepared_file,std::time::SystemTime::now().max(floor))?;
+                    anyhow::ensure!(stored>predecessor,"Cannot store a publication time newer than the predecessor");
                 }
                 drop(prepared_file);
                 anyhow::ensure!(snapshot_confined(&part)?.as_ref()==Some(&new),"Prepared primary layout bytes changed");

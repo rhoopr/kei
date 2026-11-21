@@ -1798,6 +1798,7 @@ async fn prepare(
                     &config.directory,
                     &stage,
                     edited_at.into(),
+                    prepared.fingerprint.identity,
                 )
                 .await?;
             }

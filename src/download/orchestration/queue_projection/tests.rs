@@ -9740,6 +9740,7 @@ async fn completed_copy_recovery(scenario: IntegrityRecovery) {
     );
     let mut requests_before_repair = initial_requests;
     let original_metadata = std::fs::metadata(&a).unwrap();
+    let capture_mtime = std::fs::metadata(&b).unwrap().modified().unwrap();
     drop(passes);
     let mut damaged_mtime = None;
     if scenario != IntegrityRecovery::Missing {
@@ -9752,7 +9753,13 @@ async fn completed_copy_recovery(scenario: IntegrityRecovery) {
             *damaged.last_mut().unwrap() ^= 1;
         }
         std::fs::write(&b, &damaged).unwrap();
-        damaged_mtime = Some(std::fs::metadata(&b).unwrap().modified().unwrap());
+        std::fs::File::options()
+            .write(true)
+            .open(&b)
+            .unwrap()
+            .set_modified(capture_mtime)
+            .unwrap();
+        damaged_mtime = Some(capture_mtime);
         f = reopen_destination_fixture(f).await;
         let quiet_passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
         let quiet = crate::download::download_photos_with_sync(
