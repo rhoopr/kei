@@ -452,7 +452,7 @@ const ITEM_TYPE_EXTENSIONS: &[(&str, &str)] = &[
     ("com.sony.arw-raw-image", "ARW"),
     ("com.fuji.raw-image", "RAF"),
     ("com.panasonic.rw2-raw-image", "RW2"),
-    ("com.nikon.nrw-raw-image", "NRF"),
+    ("com.nikon.nrw-raw-image", "NRW"),
     ("com.pentax.raw-image", "PEF"),
     ("com.nikon.raw-image", "NEF"),
     ("com.olympus.raw-image", "ORF"),
@@ -554,7 +554,11 @@ pub(crate) fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) ->
     use sha2::{Digest, Sha256};
     use std::fmt::Write;
     let hash = Sha256::digest(asset_id.as_bytes());
-    let ext = item_type_extension(asset_type);
+    // Fallback-only mappings must not rewrite provider-supplied names.
+    let ext = match asset_type {
+        "public.mpeg-4" => "mp4",
+        _ => item_type_extension(asset_type),
+    };
     let mut result = String::with_capacity(12 + 1 + ext.len());
     for b in hash.iter().take(6) {
         let _ = Write::write_fmt(&mut result, format_args!("{b:02x}"));
