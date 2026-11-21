@@ -22,7 +22,6 @@ kei_require_release_binary
 kei_preflight_selection || exit 1
 
 IMAGE="$(kei_docker_image)"
-COOKIES="$(kei_cookie_dir)"
 USER_SLUG="$(kei_user_slug)"
 kei_check_init
 
@@ -47,10 +46,7 @@ docker_cleanup() {
 }
 trap docker_cleanup EXIT
 
-cp "$COOKIES/"* "$DOCKER_CONFIG/" 2>/dev/null
-cp "$COOKIES/".* "$DOCKER_CONFIG/" 2>/dev/null
-# Strip lock files so the container doesn't conflict with the host kei.
-rm -f "$DOCKER_CONFIG/"*.lock "$DOCKER_CONFIG/.lock"
+kei_copy_session_without_state "$DOCKER_CONFIG"
 
 sync_config="$(kei_write_sync_config "$DOCKER_CONFIG" "/photos")"
 cp "$sync_config" "$DOCKER_CONFIG/config.toml"

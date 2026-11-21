@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.30.0-beta.2] - 2026-11-21
+
+See the [v0.30 upgrade checklist](docs/upgrade.md) before opening an existing backup with this beta.
+
+### Changed
+
+- `verify` distinguished checksum matches from unchecked, missing, changed, and unreadable files. `status` clarified what recorded sync progress proves.
+- Setup made the first sync opt-in after saving the config. Cancelling setup discarded the answers.
+- Sync reported progress while scanning unfiled photos and preserved metadata verification across syncs.
+- Schema 46 let large selections resume past the former 512 MiB limit and reclaimed stored enumeration data after work completed.
+
+### Fixed
+
+- Fixed album sync planning for fractional capture dates and recovery when album tokens disagreed after indexing.
+- Resolved sparse Shared Library changes and Hidden-only selections using the selected library scan.
+- Fixed Nikon NRW filenames and fallback names for MPEG-4 files.
+- Honored `XDG_CONFIG_HOME` without splitting existing state across directories.
+
+Thanks to @zyl71 for removing an obsolete dependency audit exception (#1100).
+
 ## [0.30.0-beta.1] - 2026-11-18
 
 See the [v0.30 upgrade checklist](docs/upgrade.md) before opening an existing backup with this beta.
