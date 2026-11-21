@@ -19,14 +19,6 @@ ignore = [
     # Advisory: https://rustsec.org/advisories/RUSTSEC-2024-0436
     "RUSTSEC-2024-0436",
 
-    # `rand 0.9.2` unsound with a custom logger. kei's direct
-    # rand=0.10.1 is unaffected; the 0.9.2 copy reaches us only
-    # transitively via reqwest -> quinn -> quinn-proto.
-    # Remove this ignore once reqwest's QUIC stack no longer pulls rand
-    # 0.9.2, or if kei starts using a custom rand logger.
-    # Advisory: https://rustsec.org/advisories/RUSTSEC-2026-0097
-    "RUSTSEC-2026-0097",
-
     # `quick-xml` reaches kei through plist and little_exif. plist has not
     # released a version on quick-xml >= 0.41 yet, and little_exif still pins
     # an older quick-xml line. The vulnerable XML parser paths are not used for
