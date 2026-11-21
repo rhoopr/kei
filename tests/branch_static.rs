@@ -2028,8 +2028,8 @@ fn audit_ignores_carry_removal_triggers() {
     let audit = repo_file(".cargo/audit.toml");
 
     for expected in [
+        "https://github.com/rhoopr/kei/issues/1066 removes chrono from the tree",
         "Remove this ignore once little_exif drops paste",
-        "Remove this ignore once reqwest's QUIC stack no longer pulls rand",
         "Remove these ignores once plist and little_exif can both resolve",
     ] {
         assert!(
