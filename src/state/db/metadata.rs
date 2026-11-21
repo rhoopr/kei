@@ -1469,7 +1469,7 @@ impl MetadataRewriteStore for SqliteStateDb {
                 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND embedded_metadata_receipt=?5
                 AND (local_checksum IS NULL OR local_checksum IN (?6,?7))
                 AND provider_checksum=(SELECT checksum FROM assets WHERE library=?1 AND id=?2 AND version_size=?3)",rusqlite::params![library,id,version,path.to_str(),raw,input,output])?;
-            if changed+selected == 0 { return Err(StateError::ProviderWorkConflict); }
+            if changed+selected == 0 { return Err(StateError::ProviderWorkConflict("embedded_receipt_changed")); }
             // Preserve every retry/intent marker: the recovered bytes belong to
             // the previous write, not necessarily today's provider metadata.
             tx.execute("UPDATE assets SET local_checksum=?6 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND (local_checksum IS NULL OR local_checksum IN (?5,?6))",rusqlite::params![library,id,version,path.to_str(),input,output])?;
@@ -1543,7 +1543,7 @@ impl MetadataRewriteStore for SqliteStateDb {
             if let Some(selected) = &selected {
                 changed += tx.execute("UPDATE provider_active_destinations SET embedded_metadata_receipt=?5 WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND admitted=1 AND local_checksum IN (?6,?7) AND generation=?8 AND pass_key=?9 AND child=?10", rusqlite::params![library,id,version,key,raw,input,output,selected.generation,selected.pass_key,selected.child])?;
             }
-            if changed == 0 { return Err(StateError::ProviderWorkConflict); }
+            if changed == 0 { return Err(StateError::ProviderWorkConflict("embedded_receipt_changed")); }
             tx.commit()?; Ok(())
         }).await
     }

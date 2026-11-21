@@ -211,6 +211,89 @@ async fn library(
     library
 }
 
+async fn library_with_album_token(
+    source: &IndexingSession,
+    db: &Arc<state::SqliteStateDb>,
+    token: &'static str,
+) -> crate::sync_cycle::LibraryState {
+    let mut selected = library(source, db).await;
+    let mut album = source.clone();
+    album.query_token = token;
+    selected.plan.passes.insert(
+        0,
+        crate::commands::AlbumPass {
+            kind: crate::commands::PassKind::Album,
+            album: library(&album, db)
+                .await
+                .library
+                .albums()
+                .await
+                .unwrap()
+                .remove("A")
+                .unwrap()
+                .pop()
+                .unwrap(),
+            exclude_ids: Arc::default(),
+        },
+    );
+    selected.pass_scope.include_albums = true;
+    selected
+}
+
+#[tokio::test]
+async fn cursorless_split_tokens_require_a_fresh_unanimous_scan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = make_run_cycle_config();
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let media = tmp.path().join("media");
+    std::fs::create_dir(&media).unwrap();
+    for round in 0..3 {
+        let db = indexing_db(&tmp.path().join("state.db")).await;
+        let source = provider("FINISHED", &[], "");
+        let token = if round == 0 {
+            "split"
+        } else {
+            source.query_token
+        };
+        let selected = library_with_album_token(&source, &db, token).await;
+        let store: Arc<dyn download::DownloadStore> = db.clone();
+        let build = make_run_cycle_download_config_builder(&media, store.clone());
+        let result = run_cycle(
+            &[&selected],
+            &config,
+            Some(store.as_ref()),
+            &build,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let cursor = db.get_metadata(CURSOR).await.unwrap();
+        match round {
+            0 => {
+                assert_eq!(cursor, None);
+                assert_eq!(result.stats.same_cycle_recovery_attempts, 1);
+                assert!(!result.can_advance_database_checkpoint());
+            }
+            1 => {
+                assert!(source.queries.load(Ordering::SeqCst) > 0);
+                assert_eq!(
+                    cursor.as_deref(),
+                    Some("query-candidate"),
+                    "{:?}",
+                    result.stats
+                );
+            }
+            _ => {
+                assert_eq!(source.queries.load(Ordering::SeqCst), 0);
+                assert_eq!(*source.changes.lock().unwrap(), ["query-candidate"]);
+                assert!(result.can_advance_database_checkpoint());
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn indexing_split_pass_tokens_require_quiet_inventory_then_replay_retained_cursor() {
     let root = tempfile::tempdir().unwrap();
@@ -242,31 +325,12 @@ async fn indexing_split_pass_tokens_require_quiet_inventory_then_replay_retained
         } else if round == 2 {
             source.interrupt = Some(cancel.clone());
         }
-        let mut selected = library(&source, &db).await;
-        let mut album = source.clone();
-        album.query_token = if matches!(round, 1 | 4) {
+        let token = if matches!(round, 1 | 4) {
             ""
         } else {
             "other-query"
         };
-        selected.plan.passes.insert(
-            0,
-            crate::commands::AlbumPass {
-                kind: crate::commands::PassKind::Album,
-                album: library(&album, &db)
-                    .await
-                    .library
-                    .albums()
-                    .await
-                    .unwrap()
-                    .remove("A")
-                    .unwrap()
-                    .pop()
-                    .unwrap(),
-                exclude_ids: Arc::default(),
-            },
-        );
-        selected.pass_scope.include_albums = true;
+        let selected = library_with_album_token(&source, &db, token).await;
         let store: Arc<dyn download::DownloadStore> = db.clone();
         let build = make_run_cycle_download_config_builder(&media, store.clone());
         let result = run_cycle(

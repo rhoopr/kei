@@ -42,6 +42,8 @@ Selection evidence limits apply to individual writes and validation operations. 
 
 Writable sync may retire raw enumeration responses only after verifying the selection seal and finding no unfinished identity, destination, metadata, or repair work. Compact rank proofs preserve the original seal and source links.
 
+A new selection filters previous metadata writers by scope, configuration and destination inputs before reading files. It hashes the installed media and any configured XMP packet before opening the SQLite write transaction. Reuse requires matching hashes, frozen grouping and effective capture offset. At commit, kei checks both retained file identities. On Unix it also checks the inode change times sampled before hashing. On Windows the retained handles exclude writes and replacement. If kei cannot verify either file, the destination and its aliases stay pending for the ordinary writer. Reuse does not confer publication ownership. Prepared writes, preserved local files, managed layouts and explicit refresh or repair keep their existing recovery paths.
+
 File publication must preserve existing media unless replacement has exact authorization. Metadata writers must verify their input before replacement. A failed write leaves enough evidence to retry without overwriting a concurrent edit.
 
 Keep secrets and provider identifiers out of logs and reports. See [diagnostic evidence](architecture/support.md) for redaction, offline collection, and interpretation limits.

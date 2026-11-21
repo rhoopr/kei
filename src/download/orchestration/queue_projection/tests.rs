@@ -1,6 +1,8 @@
 #![cfg(test)]
 
 mod current_debt;
+#[cfg(all(unix, feature = "xmp"))]
+mod writer_reuse;
 
 use super::{admit_retained_work, config_hash, has_due_retained_work};
 use crate::commands::{AlbumPass, PassKind};
@@ -1119,13 +1121,17 @@ async fn queue_projection_original_receipt_replay_and_shared_admission_never_reg
     stale.checksum = OLD.into();
     assert!(matches!(
         f.db.upsert_seen(&stale).await,
-        Err(crate::state::error::StateError::ProviderWorkConflict)
+        Err(crate::state::error::StateError::ProviderWorkConflict(
+            "unfinished_asset_changed"
+        ))
     ));
     let mut oversized = record.clone();
     oversized.size_bytes = u64::MAX;
     assert!(matches!(
         f.db.upsert_seen(&oversized).await,
-        Err(crate::state::error::StateError::ProviderWorkConflict)
+        Err(crate::state::error::StateError::ProviderWorkConflict(
+            "unfinished_asset_changed"
+        ))
     ));
     let mut stale_metadata = record.clone();
     let mut metadata = stale_metadata.metadata.as_ref().clone();
@@ -1134,7 +1140,9 @@ async fn queue_projection_original_receipt_replay_and_shared_admission_never_reg
     stale_metadata.metadata = Arc::new(metadata);
     assert!(matches!(
         f.db.upsert_seen(&stale_metadata).await,
-        Err(crate::state::error::StateError::ProviderWorkConflict)
+        Err(crate::state::error::StateError::ProviderWorkConflict(
+            "unfinished_asset_changed"
+        ))
     ));
     assert_eq!(f.queue(), baseline);
     let plan = f.plan().await;
@@ -1734,7 +1742,9 @@ async fn queue_projection_mapping_and_metadata_fences_cover_independent_publicat
         assert!(matches!(
             f.db.upsert_asset_master_mapping("PrimarySync", "asset-m", "new-master")
                 .await,
-            Err(crate::state::error::StateError::ProviderWorkConflict)
+            Err(crate::state::error::StateError::ProviderWorkConflict(
+                "unfinished_mapping_changed"
+            ))
         ));
         assert_eq!(
             f.db.get_master_record_name_for_asset("PrimarySync", "asset-m")
@@ -1758,7 +1768,9 @@ async fn queue_projection_mapping_and_metadata_fences_cover_independent_publicat
             .await;
         assert!(matches!(
             result,
-            Err(crate::state::error::StateError::ProviderWorkConflict)
+            Err(crate::state::error::StateError::ProviderWorkConflict(
+                "unfinished_metadata_changed"
+            ))
         ));
         assert_eq!(f.queue(), baseline);
         assert_eq!(std::fs::read(media).unwrap(), b"original-published-bytes");
@@ -3597,7 +3609,9 @@ async fn concurrent_album_admission_cannot_freeze_one_physical_destination_twice
             .iter()
             .filter(|result| matches!(
                 result,
-                Err(crate::state::error::StateError::ProviderWorkConflict)
+                Err(crate::state::error::StateError::ProviderWorkConflict(
+                    "album_path_claimed"
+                ))
             ))
             .count(),
         1
@@ -3731,7 +3745,9 @@ async fn confirmed_deferred_copy_rechecks_ownership_before_admission() {
                 MAX_GENERATION_BYTES
             )
             .await,
-            Err(crate::state::error::StateError::ProviderWorkConflict)
+            Err(crate::state::error::StateError::ProviderWorkConflict(
+                "album_path_claimed"
+            ))
         ));
         assert_eq!(snapshot(&f.db), frozen);
         assert_eq!(
@@ -6826,6 +6842,7 @@ async fn private_selection_rank_retirement_rolls_back_then_reopens_schema_45() {
                 .unwrap();
         assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_selection_rank_pages WHERE retired_proof_hash IS NOT NULL", [], |r| r.get(0)).unwrap(), 0);
         conn.execute_batch("DROP TRIGGER stop_retirement; DROP INDEX idx_selection_rank_unretired;
+            DROP INDEX idx_verified_writer_output; ALTER TABLE provider_active_destinations DROP COLUMN writer_output_proof;
             ALTER TABLE provider_selection_rank_pages DROP COLUMN retired_proof_hash; PRAGMA user_version=45;").unwrap();
         conn.query_row(
             "SELECT id FROM provider_active_generations WHERE sealed=1 AND checkpoint_ready=1",
@@ -6836,6 +6853,8 @@ async fn private_selection_rank_retirement_rolls_back_then_reopens_schema_45() {
     };
     let before = page_bodies(&f.db, &settled);
     f = reopen_destination_fixture(f).await;
+    assert!(f.db.acquire_lock("upgrade cannot certify historical metadata").unwrap().query_row::<bool,_,_>(
+        "SELECT count(*)>0 AND count(writer_output_proof)=0 FROM provider_active_destinations",[],|r|r.get(0)).unwrap());
     let result = crate::download::download_photos_with_sync(
         &client,
         std::slice::from_ref(&f.pass),
@@ -7528,6 +7547,66 @@ async fn private_independent_writers_exceed_budget_then_finish_across_reseeds() 
 
 #[cfg(feature = "xmp")]
 async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
+    writer_reseed_cycles(writers, cycles, false).await;
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn reseeded_writer_rejects_changed_packet_and_grouping() {
+    Box::pin(writer_reseed_cycles(2, 2, true)).await;
+}
+
+#[tokio::test]
+async fn embedded_writer_finishes_during_reseeding_without_sidecars() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let media = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    Mock::given(method("GET"))
+        .and(path("/embedded"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media.as_slice()))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("copies");
+    f.config.metadata.set_exif_datetime = true;
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/embedded",server.uri()),"size":media.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media))});
+    for round in 0..3 {
+        if round > 0 {
+            f = reopen_destination_fixture(f).await;
+        }
+        f.capture(
+            vec![json!({"recordName":format!("opaque-{round}"),"recordType":"FutureOpaque"})],
+            &format!("embedded-{round}"),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let passes = [destination_pass(&f, "A"), destination_pass(&f, "B")];
+        let result = crate::download::orchestration::generation::TEST_METADATA_WRITER_BUDGET
+            .scope(
+                1,
+                crate::download::download_photos_with_sync(
+                    &client,
+                    &passes,
+                    Arc::new(f.config.clone()),
+                    controls(),
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.stats.downloaded, if round == 0 { 2 } else { 0 });
+        assert_eq!(f.count("provider_active_generations"), round + 1);
+        let pending:i64=f.db.acquire_lock("check all writer generations").unwrap().query_row("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_metadata=0",[],|r|r.get(0)).unwrap();
+        assert_eq!(pending, i64::from(round == 0), "round {round}");
+        assert_eq!(result.stats.selected_work_remaining, round == 0);
+    }
+}
+
+#[cfg(feature = "xmp")]
+async fn writer_reseed_cycles(writers: usize, cycles: usize, change_outputs: bool) {
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -7561,19 +7640,41 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
         if cycle > 0 {
             f = reopen_destination_fixture(f).await;
         }
+        if change_outputs && cycle == 1 {
+            let conn =
+                f.db.acquire_lock("change writer inputs after reopen")
+                    .unwrap();
+            let path:String=conn.query_row("SELECT path FROM provider_active_destinations WHERE asset_id='asset-writer-000' ORDER BY path LIMIT 1",[],|r|r.get(0)).unwrap();
+            let path = serde_json::from_str::<SelectionPath>(&path)
+                .unwrap()
+                .to_path();
+            let mut packet = path.into_os_string();
+            packet.push(".xmp");
+            assert!(std::path::Path::new(&packet).is_file());
+            std::fs::write(packet, b"external packet").unwrap();
+            conn.execute("INSERT INTO asset_people(library,asset_id,person_name) VALUES('PrimarySync','asset-writer-001','changed')",[]).unwrap();
+        }
         if cycle < 3 {
             f.capture(vec![json!({"recordName":format!("future-writer-{cycle}"),"recordType":"FutureOpaque","payload":[0,255,9]})],&format!("writer-basis-{cycle}")).await;
         }
         let before_calls = f.session.calls.load(Ordering::SeqCst);
         let before_ranks = f.session.rank_calls.load(Ordering::SeqCst);
-        let result = crate::download::download_photos_with_sync(
-            &reqwest::Client::new(),
-            &[destination_pass(&f, "A"), destination_pass(&f, "B")],
+        let client = reqwest::Client::new();
+        let passes = [destination_pass(&f, "A"), destination_pass(&f, "B")];
+        let sync = crate::download::download_photos_with_sync(
+            &client,
+            &passes,
             Arc::new(f.config.clone()),
             controls(),
             CancellationToken::new(),
-        )
-        .await
+        );
+        let result = if change_outputs && cycle == 1 {
+            crate::download::orchestration::generation::TEST_METADATA_WRITER_BUDGET
+                .scope(0, sync)
+                .await
+        } else {
+            sync.await
+        }
         .unwrap();
         assert_eq!(
             result.stats.downloaded,
@@ -7600,6 +7701,17 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
                 current_generation = Some(generation);
             }
             known_generations = generations;
+            if change_outputs && cycle == 1 {
+                let verified:Vec<String>=conn.prepare("SELECT asset_id FROM provider_active_destinations WHERE generation=?1 AND verified_metadata=1 ORDER BY asset_id").unwrap().query_map([&current_generation],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+                assert_eq!(
+                    verified,
+                    ["asset-writer-000"],
+                    "only the other unchanged album copy can inherit completion"
+                );
+                assert!(result.stats.selected_work_remaining);
+                assert!(result.checkpoint.sync_token_blocked);
+                return;
+            }
             assert_eq!(conn.query_row::<(i64,i64),_,_>("SELECT count(DISTINCT path),count(*) FROM provider_active_destinations WHERE verified_media=1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap(),(i64::try_from(2*writers).unwrap(),i64::try_from(2*writers*(cycle.min(2)+1)).unwrap()));
             assert_eq!(
                 conn.query_row::<i64, _, _>(
@@ -7608,12 +7720,13 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
                     |r| r.get(0)
                 )
                 .unwrap(),
-                if cycle < 3 {
-                    i64::try_from((2 * writers).saturating_sub(budget)).unwrap()
-                } else {
-                    0
-                },
-                "cycle {cycle}: current destinations respect the writer budget and finish after an unchanged cycle; historical rows are not replayed"
+                i64::try_from((2 * writers).saturating_sub((cycle + 1) * budget)).unwrap(),
+                "cycle {cycle}: unchanged destinations must finish even during reseeding"
+            );
+            assert_eq!(
+                result.stats.selected_work_remaining,
+                (cycle + 1) * budget < 2 * writers,
+                "historical metadata debt must drain with the current destinations"
             );
         }
         let paths: Vec<_> = {
@@ -7662,11 +7775,7 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
                 .iter()
                 .filter(|(_, (_, _, complete))| *complete)
                 .count(),
-            if cycle < 3 {
-                (2 * writers).min(budget)
-            } else {
-                2 * writers
-            }
+            (2 * writers).min((cycle + 1) * budget)
         );
         stable = Some(files);
         if cycle >= if 2 * writers > budget { 4 } else { 3 } {

@@ -1281,6 +1281,7 @@ async fn historical_selected_metadata_receipt_cannot_override_current_unknown_ow
     let pending = PendingMetadataRewrite {
         asset,
         selection_receipt: Some(SelectionMetadataReceipt {
+            writer_output: None,
             generation,
             pass_key,
             child,

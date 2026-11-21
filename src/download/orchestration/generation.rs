@@ -1253,7 +1253,7 @@ impl SelectionRun {
                 .await;
             match projected {
                 Ok(projection) => break projection,
-                Err(crate::state::error::StateError::ProviderWorkConflict)
+                Err(error @ crate::state::error::StateError::ProviderWorkConflict(_))
                     if !retried_collision
                         && previous
                             .as_ref()
@@ -1281,7 +1281,9 @@ impl SelectionRun {
                             changed = true;
                         }
                     }
-                    anyhow::ensure!(changed, "Selected destination admission conflict");
+                    if !changed {
+                        return Err(error.into());
+                    }
                     retried_collision = true;
                 }
                 Err(error) => return Err(error.into()),
@@ -1997,6 +1999,7 @@ const METADATA_WRITER_BUDGET: usize = 500;
 tokio::task_local! {
     // Scoped to one fixture future, so parallel tests retain production limits.
     pub(super) static TEST_METADATA_WRITER_BUDGET: usize;
+    pub(super) static TEST_AFTER_WRITER_SNAPSHOT: fn(&std::path::Path);
 }
 
 fn metadata_writer_limits() -> (usize, usize) {
@@ -2036,6 +2039,12 @@ async fn metadata_tail(
     let flags = crate::download::pipeline::MetadataFlags::from(config);
     if !flags.has_any_write() {
         return Ok(MetadataTailOutcome::default());
+    }
+    if !config.primary_layout_active
+        && !config.refresh_metadata
+        && config.capture_timestamp_repair == crate::download::CaptureTimestampRepair::Preserve
+    {
+        reuse_writer_outputs(config, cancel, context, generation, flags).await?;
     }
     let mut offset = context
         .capture
@@ -2160,6 +2169,73 @@ async fn metadata_tail(
         failed: priority.failed.saturating_add(result.failed),
         storage_failed: priority.storage_failed || result.storage_failed,
     })
+}
+
+async fn reuse_writer_outputs(
+    config: &DownloadConfig,
+    cancel: &CancellationToken,
+    context: &SelectionContext,
+    generation: &str,
+    flags: crate::download::pipeline::MetadataFlags,
+) -> Result<()> {
+    use crate::state::db::provider_generations::{WriterKey, WriterOutput};
+    let db = &context.capture.db;
+    let owner = &context.capture.owner;
+    let mut after = WriterKey::default();
+    while !cancel.is_cancelled() {
+        let page = db
+            .writer_output_candidates(owner.clone(), generation.to_owned(), after)
+            .await?;
+        let Some(last) = page.last() else { break };
+        after = last.clone();
+        for key in page {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            let path = key.native_path()?;
+            // Missing, changed or unreadable files go through the ordinary bounded writer.
+            let Ok(media) =
+                crate::download::file::WriterSnapshot::read(&config.directory, &path).await
+            else {
+                continue;
+            };
+            let sidecar = if flags.contains(crate::download::pipeline::MetadataFlags::XMP_SIDECAR) {
+                let mut sidecar = path.as_os_str().to_owned();
+                sidecar.push(".xmp");
+                let Ok(packet) = crate::download::file::WriterSnapshot::read(
+                    &config.directory,
+                    std::path::Path::new(&sidecar),
+                )
+                .await
+                else {
+                    continue;
+                };
+                Some(packet)
+            } else {
+                None
+            };
+            #[cfg(test)]
+            let _ = TEST_AFTER_WRITER_SNAPSHOT.try_with(|edit| edit(&path));
+            let packet = sidecar.as_ref().map_or(WriterOutput::EmbeddedOnly, |file| {
+                WriterOutput::Sidecar(file.sha256)
+            });
+            db.reuse_writer_output(
+                owner.clone(),
+                generation.to_owned(),
+                key,
+                data_encoding::HEXLOWER.encode(&media.sha256),
+                packet,
+                move || {
+                    sidecar
+                        .as_ref()
+                        .is_none_or(|file| file.still_matches().is_ok())
+                        && media.still_matches().is_ok()
+                },
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn recover_retained(

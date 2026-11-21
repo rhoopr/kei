@@ -14,6 +14,7 @@ use super::sidecar::write_sidecar_metadata;
 use crate::download::filter::MetadataPayload;
 use crate::download::{DownloadConfig, DownloadContext};
 use crate::icloud::photos::PhotoAsset;
+use crate::state::db::provider_generations::WriterOutput;
 use crate::state::db::{CaptureRepairReceipt, MetadataRewriteCompletion, MetadataRewriteQueue};
 use crate::state::{MembershipStore, MetadataRewriteStore, VersionSizeKey};
 use std::collections::{HashMap, HashSet};
@@ -756,6 +757,21 @@ where
 
         #[cfg(feature = "xmp")]
         if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
+            // Only certify a packet that was planned from the recorded media bytes.
+            // In particular, a sidecar-only retry need not own the media itself.
+            let certified_input = if pending_for_finish.selection_receipt.is_some() {
+                match final_fingerprint {
+                    Some(output) => Some(output),
+                    None => crate::download::file::fingerprint_regular_file(&path)
+                        .await
+                        .ok()
+                        .filter(|measured| {
+                            Some(fingerprint_checksum(*measured)) == record.local_checksum
+                        }),
+                }
+            } else {
+                None
+            };
             let sidecar = write_sidecar_metadata(
                 &path,
                 Arc::clone(&payload),
@@ -765,6 +781,17 @@ where
             )
             .await;
             outcome.sidecar_failed = sidecar.failed;
+            if let Some(receipt) = pending_for_finish.selection_receipt.as_mut()
+                && let Some(before) = certified_input
+                && let Some(packet) = sidecar.output
+                && crate::download::file::fingerprint_regular_file(&path)
+                    .await
+                    .ok()
+                    == Some(before)
+            {
+                receipt.writer_output =
+                    Some((WriterOutput::Sidecar(packet), *created_local.offset()));
+            }
             storage_failed |= sidecar.storage_failed;
         }
 
@@ -813,6 +840,13 @@ where
         }
 
         let ordinary_complete = !outcome.any_failed() && !recovered_capture_only;
+        if !metadata_flags.contains(MetadataFlags::XMP_SIDECAR)
+            && ordinary_complete
+            && final_fingerprint.is_some()
+            && let Some(receipt) = pending_for_finish.selection_receipt.as_mut()
+        {
+            receipt.writer_output = Some((WriterOutput::EmbeddedOnly, *created_local.offset()));
+        }
         if let Some(preserved) = preserved_local {
             let current_time = tokio::fs::metadata(&path)
                 .await

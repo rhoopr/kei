@@ -25,9 +25,9 @@ pub enum StateError {
     )]
     ProviderWorkInvalid,
     #[error(
-        "Provider generation conflicts with unfinished projected work; retaining the original obligation."
+        "Provider generation conflicts with unfinished projected work ({0}); retaining the original obligation."
     )]
-    ProviderWorkConflict,
+    ProviderWorkConflict(&'static str),
     #[error(
         "Provider catalog projection is full; retaining captured observations and the current checkpoint. No automatic pruning is permitted."
     )]

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use chrono::DateTime;
+use futures_util::StreamExt;
 use reqwest::Client;
 use rustc_hash::FxHashSet;
 use serde_json::{Value, json};
@@ -34,10 +35,10 @@ use super::super::test_support::{
     test_config,
 };
 use super::{
-    DEFERRED_UNFILED_HEARTBEAT_ASSETS, PaginationShortfall, PassTokenObservation, PassTokenResult,
-    TokenGap, ZoneTokenEvidence, build_pass_count_plan, classify_pagination_shortfall,
-    classify_zone_token_evidence, download_photos_full_with_token, fold_pass_count_results,
-    should_skip_pass_count_fetch,
+    DEFERRED_UNFILED_HEARTBEAT_ASSETS, DEFERRED_UNFILED_HEARTBEAT_INTERVAL, PaginationShortfall,
+    PassTokenObservation, PassTokenResult, TokenGap, ZoneTokenEvidence, build_pass_count_plan,
+    classify_pagination_shortfall, classify_zone_token_evidence, download_photos_full_with_token,
+    fold_pass_count_results, should_skip_pass_count_fetch,
 };
 
 #[derive(Clone)]
@@ -45,6 +46,33 @@ struct ConcurrentRecordsSession {
     in_flight_records_queries: Arc<AtomicUsize>,
     max_in_flight_records_queries: Arc<AtomicUsize>,
     records_delay: Duration,
+}
+
+/// Delays every records/query page so a paused-clock test can observe the
+/// heartbeat while the provider stream is stalled.
+#[derive(Clone)]
+struct StalledQuerySession {
+    inner: DynamicRecentPhotosSession,
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for StalledQuerySession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        if url.contains("/records/query?") {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.inner.post(url, body, headers).await
+    }
+
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
 }
 
 impl ConcurrentRecordsSession {
@@ -1262,43 +1290,187 @@ async fn full_sync_deferred_unfiled_logs_heartbeat_and_completion() {
     );
 }
 
-#[tokio::test]
-async fn full_sync_unfiled_only_does_not_log_deferred_unfiled_heartbeat() {
+#[tokio::test(start_paused = true)]
+async fn full_sync_unfiled_only_logs_heartbeat_and_completion() {
+    // Tracing's shared callsite interest races with parallel untraced passes.
+    // Keep every structured assertion, but give this capture a fresh process.
+    const CHILD: &str = "KEI_TEST_UNFILED_ONLY_HEARTBEAT_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "download::orchestration::full::tests::full_sync_unfiled_only_logs_heartbeat_and_completion", "--test-threads=1"])
+            .env(CHILD,"1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    // Cover both stream branches: per-pass paths (test_config defaults) and
+    // the merged literal-path branch. Shared zones carry provider
+    // identifiers, so their progress label must be the fixed "Shared".
+    for (merged_stream, zone, expected_library) in [
+        (false, "PrimarySync", "PrimarySync"),
+        (true, "PrimarySync", "PrimarySync"),
+        (false, "SharedSync-PRIVATE-1234", "Shared"),
+        (true, "SharedSync-PRIVATE-1234", "Shared"),
+    ] {
+        let (capture, _guard) = TracingCapture::install();
+        let unfiled_count = 2;
+        let session = StalledQuerySession {
+            inner: DynamicRecentPhotosSession::from_ids(recent_ids(
+                "unfiled-only-heartbeat",
+                unfiled_count,
+            ))
+            .with_zone(zone)
+            .with_filename_prefix("unfiled-only-heartbeat")
+            .with_token("zone-token"),
+            delay: DEFERRED_UNFILED_HEARTBEAT_INTERVAL + Duration::from_secs(1),
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(zone, "", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 2;
+        if merged_stream {
+            let literal = config.folder_structure.clone();
+            config.folder_structure_albums = Arc::from(literal.as_str());
+            config.folder_structure_smart_folders = Arc::from(literal.as_str());
+        }
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::dry_run_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dry-run full sync should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        let events = capture.events();
+        let start = events
+            .iter()
+            .find(|event| event.message() == Some("Unfiled enumeration started"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing unfiled-only start event (merged={merged_stream}, zone={zone}): {events:?}"
+                )
+            });
+        assert_eq!(start.field("library"), Some(expected_library));
+        assert_eq!(start.field("pass_type"), Some("unfiled"));
+        assert_eq!(start.field("assets_enumerated"), Some("0"));
+
+        let progress = events
+            .iter()
+            .find(|event| event.message() == Some("Unfiled enumeration progress"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing unfiled-only progress event (merged={merged_stream}, zone={zone}): {events:?}"
+                )
+            });
+        assert_eq!(progress.field("library"), Some(expected_library));
+        assert_eq!(progress.field("pass_type"), Some("unfiled"));
+        assert_eq!(
+            progress.field("assets_enumerated"),
+            Some("0"),
+            "the first tick should arrive while the provider stream is stalled \
+             (merged={merged_stream}, zone={zone})"
+        );
+        assert!(
+            progress
+                .field("expected_assets")
+                .is_some_and(|value| value.contains(&unfiled_count.to_string())),
+            "progress event should include expected asset count: {progress:?}"
+        );
+        assert!(
+            progress.field("elapsed").is_some(),
+            "progress event should include elapsed time: {progress:?}"
+        );
+        assert!(
+            !progress
+                .message()
+                .is_some_and(|message| message.contains("Deferred")),
+            "unfiled-only progress must not claim to be deferred: {progress:?}"
+        );
+
+        let complete = events
+            .iter()
+            .find(|event| event.message() == Some("Unfiled enumeration complete"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing unfiled-only completion event (merged={merged_stream}, zone={zone}): {events:?}"
+                )
+            });
+        assert_eq!(complete.field("library"), Some(expected_library));
+        assert_eq!(
+            complete.field("assets_enumerated"),
+            Some(unfiled_count.to_string().as_str())
+        );
+        if zone.starts_with("SharedSync-") {
+            for event in [start, progress, complete] {
+                assert!(
+                    event
+                        .fields
+                        .values()
+                        .all(|value| !value.contains("PRIVATE-1234")),
+                    "heartbeat events must not leak the raw shared zone name: {event:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unfiled_progress_library_label_hides_provider_zone_identifiers() {
+    assert_eq!(super::progress_library_label("PrimarySync"), "PrimarySync");
+    assert_eq!(
+        super::progress_library_label("SharedSync-PRIVATE-1234"),
+        "Shared"
+    );
+    assert_eq!(super::progress_library_label("OtherZone"), "Other");
+}
+
+#[tokio::test(start_paused = true)]
+async fn unfiled_heartbeat_stops_logging_on_cancellation_and_drop() {
     let (capture, _guard) = TracingCapture::install();
-    let unfiled_session = DynamicRecentPhotosSession::from_ids(recent_ids(
-        "unfiled-only-heartbeat",
-        DEFERRED_UNFILED_HEARTBEAT_ASSETS + 1,
-    ))
-    .with_filename_prefix("unfiled-only-heartbeat")
-    .with_token("zone-token");
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session("PrimarySync", "", Box::new(unfiled_session)),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
+    let shutdown = CancellationToken::new();
+    let task_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move {
+        let stream: super::DownloadPhotoStream = Box::pin(futures_util::stream::pending());
+        let mut stream =
+            super::track_unfiled_heartbeat(stream, "Shared", Some(1), "Unfiled", task_shutdown);
+        while stream.next().await.is_some() {}
+    });
 
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.concurrent_downloads = 10;
-
-    let result = download_photos_full_with_token(
-        &Client::new(),
-        &passes,
-        &Arc::new(config),
-        DownloadControls::dry_run_hidden(),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("dry-run full sync should succeed");
-
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    let events = capture.events();
+    tokio::task::yield_now().await;
     assert!(
-        !events.iter().any(|event| event
-            .message()
-            .is_some_and(|message| message.starts_with("Deferred unfiled enumeration"))),
-        "unfiled-only sync should not emit deferred unfiled heartbeat events: {events:?}"
+        !capture.contains_event(|event| event.message() == Some("Unfiled enumeration progress")),
+        "heartbeat must wait for the interval"
+    );
+
+    shutdown.cancel();
+    tokio::task::yield_now().await;
+    tokio::time::advance(DEFERRED_UNFILED_HEARTBEAT_INTERVAL * 2).await;
+    tokio::task::yield_now().await;
+    task.abort();
+    let _ = task.await;
+
+    assert!(
+        !capture.contains_event(|event| event.message() == Some("Unfiled enumeration progress")),
+        "cancelled heartbeat must not log progress"
+    );
+    assert!(
+        !capture.contains_event(|event| event.message() == Some("Unfiled enumeration complete")),
+        "dropped or cancelled stream must not claim completion"
     );
 }
 
