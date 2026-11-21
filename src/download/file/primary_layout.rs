@@ -22,17 +22,59 @@ pub(in crate::download) async fn keep_modified(
     path: &Path,
     modified: std::time::SystemTime,
 ) -> Result<()> {
+    set_modified(root, path, modified, None, true).await
+}
+
+/// A provider time need not round-trip on every filesystem. Keep the nearest
+/// representable value and let the publication-time fallback in `publish`
+/// make a truncated value observable.
+pub(in crate::download) async fn keep_provider_modified(
+    root: &Path,
+    path: &Path,
+    modified: std::time::SystemTime,
+    expected: crate::fs_util::FileIdentity,
+) -> Result<()> {
+    set_modified(root, path, modified, Some(expected), false).await
+}
+
+async fn set_modified(
+    root: &Path,
+    path: &Path,
+    modified: std::time::SystemTime,
+    expected: Option<crate::fs_util::FileIdentity>,
+    strict: bool,
+) -> Result<()> {
     let (root, path) = (root.to_owned(), path.to_owned());
     tokio::task::spawn_blocking(move || {
         let confined = ConfinedPath::open(&root, &path, ConfinedParents::Existing)?;
         let file = confined.open_regular()?;
-        let identity = crate::fs_util::file_identity(&file)?;
+        let identity = match expected {
+            Some(expected) => {
+                anyhow::ensure!(
+                    crate::fs_util::file_link_count(&file)? == 1,
+                    "Primary layout refuses hardlinked media or sidecars"
+                );
+                anyhow::ensure!(
+                    crate::fs_util::file_identity(&file)? == expected,
+                    "Prepared primary changed before its time was set"
+                );
+                expected
+            }
+            None => crate::fs_util::file_identity(&file)?,
+        };
         let file = confined.validate_for_metadata(identity)?;
         file.set_modified(modified)?;
-        anyhow::ensure!(
-            file.metadata()?.modified()? == modified,
-            "Layout output cannot retain local modification time"
-        );
+        if file.metadata()?.modified()? != modified {
+            anyhow::ensure!(
+                !strict,
+                "Layout output cannot retain local modification time"
+            );
+            tracing::warn!(
+                target: "kei::download::file",
+                path = %confined.path().display(),
+                "Filesystem cannot represent the provider edit time exactly; keeping the nearest representable mtime"
+            );
+        }
         #[cfg(not(windows))]
         file.sync_all()?;
         confined.validate_identity(identity)?;
@@ -262,6 +304,7 @@ pub(in crate::download) struct ManagedPrimaryAuthorization {
     preserved_path: PathBuf,
     preserved: LayoutFingerprint,
     modified: Option<std::time::SystemTime>,
+    publication_time: bool,
 }
 
 impl ManagedPrimaryAuthorization {
@@ -283,6 +326,7 @@ impl ManagedPrimaryAuthorization {
             preserved_path: path,
             preserved,
             modified: None,
+            publication_time: true,
         })
     }
 
@@ -294,6 +338,26 @@ impl ManagedPrimaryAuthorization {
         self.modified = modified;
         self
     }
+
+    #[must_use]
+    pub(in crate::download) fn with_publication_time(mut self, publication_time: bool) -> Self {
+        self.publication_time = publication_time;
+        self
+    }
+}
+
+fn set_modified_file(
+    file: &std::fs::File,
+    time: std::time::SystemTime,
+) -> Result<std::time::SystemTime> {
+    file.set_times(
+        std::fs::FileTimes::new()
+            .set_modified(time)
+            .set_accessed(time),
+    )?;
+    #[cfg(not(windows))]
+    file.sync_all()?;
+    Ok(file.metadata()?.modified()?)
 }
 
 pub(in crate::download) async fn publish(
@@ -321,6 +385,22 @@ pub(in crate::download) async fn publish(
             // CONTRACT: FILE_PUBLISH_NO_OVERWRITE
             let _operation=auth.operation;
             anyhow::ensure!(snapshot_confined(&part)?.as_ref()==Some(&new) && snapshot_confined(&destination)?.as_ref()==Some(&auth.expected),"Retained primary publication input changed");
+            // A replacement must read as changed to consumers that detect changes by mtime:
+            // a prepared mtime newer than its predecessor (the edit time) is kept, else
+            // a publication time past the predecessor is used. A preserved local copy
+            // keeps its recorded mtime.
+            if auth.publication_time {
+                let predecessor=destination.open_regular()?.metadata()?.modified()?;
+                let prepared_file=part.validate_for_metadata(new.identity)?;
+                if prepared_file.metadata()?.modified()?<=predecessor {
+                    // A two-second floor clears whole-second and FAT two-second truncation.
+                    let floor=predecessor.checked_add(std::time::Duration::from_secs(2)).unwrap_or_else(std::time::SystemTime::now);
+                    let stored=set_modified_file(&prepared_file,std::time::SystemTime::now().max(floor))?;
+                    anyhow::ensure!(stored>predecessor,"Cannot store a publication time newer than the predecessor");
+                }
+                drop(prepared_file);
+                anyhow::ensure!(snapshot_confined(&part)?.as_ref()==Some(&new),"Prepared primary layout bytes changed");
+            }
             #[cfg(unix)]
             {
                 #[cfg(all(test,target_os="linux"))]

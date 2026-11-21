@@ -1788,6 +1788,20 @@ async fn prepare(
                 data_encoding::HEXLOWER.encode(&prepared.fingerprint.sha256) == checksum,
                 "Prepared primary checksum changed"
             );
+            // Only a replacement of an owned path needs to read as changed; a first
+            // publication keeps the capture mtime written by the download. Set the
+            // provider time only after the prepared checksum is verified.
+            if member.old.is_some()
+                && let Some(edited_at) = asset.media_modified_at(expected.version_size)
+            {
+                file::primary_layout::keep_provider_modified(
+                    &config.directory,
+                    &stage,
+                    edited_at.into(),
+                    prepared.fingerprint.identity,
+                )
+                .await?;
+            }
             outcome.downloaded += 1;
             if task.media_type.is_photo_like() {
                 outcome.photos_downloaded += 1;
@@ -1977,7 +1991,8 @@ pub(in crate::download) async fn finish(
                             preserved.path.to_path(),
                             preserved.fingerprint.clone(),
                         )?
-                        .with_modified(old.local_modified.map(Into::into)),
+                        .with_modified(old.local_modified.map(Into::into))
+                        .with_publication_time(!prepared.local_preserved),
                     )
                 } else {
                     None
