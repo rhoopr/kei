@@ -918,34 +918,20 @@ impl std::fmt::Display for PhotoAsset {
 
 /// Classify a `CloudKit` record from `changes/zone` into a `ChangeReason`.
 ///
-/// Detection logic (from empirical API testing):
-/// - `record.deleted == Some(true)` --> `HardDeleted` (purged, recordType unknown)
-/// - `fields.isDeleted.value == 1` --> `SoftDeleted` (trashed, recoverable)
-/// - `fields.isHidden.value == 1` --> Hidden
-/// - Otherwise --> Modified (caller checks state DB for Created/Restored/Unhidden)
-///
-/// Note: "Restored" and "Unhidden" require knowledge of previous state, which this
-/// function does NOT have. Those cases return `Modified`; the caller (download pipeline)
-/// should check the state DB to distinguish them.
+/// Hard deletion takes precedence over trash, then hidden status. Otherwise
+/// return `Created`: distinguishing new, restored, and unhidden records requires
+/// the caller's prior state.
 pub(crate) fn classify_change_reason(record: &Record) -> ChangeReason {
     // Hard delete: record.deleted == true
     if record.deleted == Some(true) {
         return ChangeReason::HardDeleted;
     }
 
-    // Soft delete: fields.isDeleted.value == 1
-    if let Some(is_deleted) = record.fields.get("isDeleted")
-        && let Some(val) = is_deleted.get("value")
-        && val.as_i64() == Some(1)
-    {
+    if metadata::change_flag_is_set(&record.fields, "isDeleted") {
         return ChangeReason::SoftDeleted;
     }
 
-    // Hidden: fields.isHidden.value == 1
-    if let Some(is_hidden) = record.fields.get("isHidden")
-        && let Some(val) = is_hidden.get("value")
-        && val.as_i64() == Some(1)
-    {
+    if metadata::change_flag_is_set(&record.fields, "isHidden") {
         return ChangeReason::Hidden;
     }
 
@@ -2252,6 +2238,38 @@ mod tests {
     fn test_classify_normal_record() {
         let record = make_record("CPLAsset", json!({}), Some(false));
         assert_eq!(classify_change_reason(&record), ChangeReason::Created);
+    }
+
+    #[test]
+    fn classify_change_flags_agree_with_asset_metadata() {
+        for (value, asserted) in [
+            (json!(true), true),
+            (json!(1), true),
+            (json!(false), false),
+            (json!(0), false),
+            (json!(2), false),
+            (json!("true"), false),
+        ] {
+            for (field, reason) in [
+                ("isDeleted", ChangeReason::SoftDeleted),
+                ("isHidden", ChangeReason::Hidden),
+            ] {
+                let record = make_record("CPLAsset", json!({(field): {"value": value}}), None);
+                let meta = metadata::extract(&json!({}), &record.fields);
+                assert_eq!(meta.is_deleted, asserted && field == "isDeleted");
+                assert_eq!(meta.is_hidden, asserted && field == "isHidden");
+                let expected = if asserted {
+                    reason
+                } else {
+                    ChangeReason::Created
+                };
+                assert_eq!(
+                    classify_change_reason(&record),
+                    expected,
+                    "{field}: {value}"
+                );
+            }
+        }
     }
 
     #[test]

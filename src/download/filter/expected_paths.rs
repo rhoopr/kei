@@ -1645,6 +1645,24 @@ mod tests {
     }
 
     #[test]
+    fn expected_paths_nikon_nrw_and_mpeg4_filenames() {
+        for (uti, filename, expected) in [
+            ("com.nikon.nrw-raw-image", "DSC_0001.nrw", "DSC_0001.NRW"),
+            ("public.mpeg-4", "", "7489920a5790.mp4"),
+            ("public.mpeg-4", "clip.m4v", "clip.m4v"),
+        ] {
+            let asset = TestPhotoAsset::new("VIDEO_1090")
+                .item_type(uti)
+                .orig_file_type(uti)
+                .filename(filename)
+                .build();
+            let paths = expected_paths_for(&asset, &test_config());
+            assert_eq!(paths.len(), 1);
+            assert!(paths[0].path.ends_with(expected), "{:?}", paths[0].path);
+        }
+    }
+
+    #[test]
     fn expected_paths_no_versions_returns_empty() {
         // Build a minimal asset with no resOriginalRes — all version lookups
         // fail, expected_paths_for returns empty (caller skips).
