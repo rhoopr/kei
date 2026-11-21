@@ -28,6 +28,8 @@ For a specific component, see the [module index](architecture/module-index.md). 
 
 A sparse change in PrimarySync can depend on a scoped Shared scan from the same cycle. If a Hidden-only scan has no decision for the exact Shared asset, its current `isHidden` field can establish membership. Every selected destination still requires a verified local copy before the source checkpoint advances.
 
+After indexing finishes, a quiet zone change feed can establish coverage across disagreeing album query tokens. Qualification retains the trusted cursor for replay. See [checkpoint decisions and enumeration](architecture/checkpoints.md).
+
 **Local delivery.** The planner selects a destination. The pipeline writes and verifies a `.part`, publishes the file, syncs the parent directory, and finalizes durable state. Import uses the shared path rules and verifies an existing file before adoption. Unresolved work needs durable retry evidence. See [publication, reconciliation, and import](architecture/publication.md).
 
 **Metadata.** An enabled setting authorizes later updates to its managed fields. Omitted version-1 settings and no-config runs keep writers disabled. Capture-timestamp replacement requires explicit repair. Immediate and queued writes share the stable-input and ownership requirements. See [metadata write boundaries](architecture/metadata.md).

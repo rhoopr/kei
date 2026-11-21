@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use super::config::{DownloadConfig, hash_download_config};
+use super::config::{DownloadConfig, IndexingWindow, hash_download_config};
 use super::delta::{IncrementalDeltaSummary, MembershipDelta};
 use super::models::{
     DownloadControls, DownloadOutcome, SyncResult, SyncStats,
@@ -2523,17 +2523,17 @@ pub(super) async fn after_delta(
         delta_result.block_incremental_token("membership_delta_incomplete");
         return Ok(delta_result);
     }
+    let delta_safe = !delta_result.checkpoint.sync_token_blocked
+        && !delta_result.checkpoint.identity_incomplete
+        && !delta_result.checkpoint.interrupted
+        && delta_result.checkpoint.state_write_failures == 0;
     if config.inventory_reconciliation {
         // The dispatcher already owns exactly one current inventory between
         // these two delta passes. Do not start another implicit generation scan
         // or replay here. Its durable request and retained source cursor remain
         // until full selected coverage plus a raw-empty replay qualify; a
         // changed replay cannot advance past newly observed unadmitted work.
-        if !delta_result.checkpoint.sync_token_blocked
-            && !delta_result.checkpoint.identity_incomplete
-            && !delta_result.checkpoint.interrupted
-            && delta_result.checkpoint.state_write_failures == 0
-        {
+        if delta_safe {
             delta_result.sync_token = delta.sync_token.clone();
             *context
                 .inventory_membership_delta
@@ -2570,9 +2570,18 @@ pub(super) async fn after_delta(
             && !context.capture.db.unfinished_selection_debt(
                 context.capture.owner.clone(), context.scope.clone(), context.config_hash.clone(),
             ).await?);
+    let indexing_replay = matches!(
+        config.indexing_inventory_cursor,
+        Some(IndexingWindow::AwaitReplay)
+    );
+    let retry_mismatch = indexing_replay
+        && root.as_ref().is_some_and(|root| {
+            root.checkpoint_veto.as_deref() == Some("icloud_sync_token_mismatch")
+        });
     let mut selected = match root {
         Some(root)
             if !refresh_selection
+                && !retry_mismatch
                 && (root.sealed
                     || context
                         .capture
@@ -2582,7 +2591,18 @@ pub(super) async fn after_delta(
         {
             replay(client, passes, config, controls, cancel.clone(), root).await?
         }
-        _ => inventory(client, passes, config, controls, cancel.clone()).await?,
+        _ => {
+            let mut config = Arc::clone(config);
+            if indexing_replay
+                && delta_safe
+                && delta_result.checkpoint.completed_delta_replay
+                && let Some(cursor) = &delta.sync_token
+            {
+                Arc::make_mut(&mut config).indexing_inventory_cursor =
+                    Some(IndexingWindow::ReplayedTo(cursor.clone()));
+            }
+            inventory(client, passes, &config, controls, cancel.clone()).await?
+        }
     };
     selected.outcome = merge_download_outcomes(&selected.outcome, &delta_result.outcome);
     selected.accumulate(&delta_result);

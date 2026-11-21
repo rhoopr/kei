@@ -19,7 +19,7 @@ use crate::download::pipeline::{
 };
 use crate::icloud::photos::PhotoAsset;
 
-use super::config::{DownloadConfig, inventory_scope};
+use super::config::{DownloadConfig, IndexingWindow, inventory_scope};
 use super::context::{DownloadContext, preload_download_context};
 use super::models::{
     DATE_BOUNDED_FULL_ENUMERATION_REASON, DownloadControls, DownloadStore, FullEnumerationReason,
@@ -848,6 +848,20 @@ pub(super) async fn download_photos_full_with_token_policy(
     repair_token_gaps: bool,
 ) -> Result<SyncResult> {
     let started = Instant::now();
+    // Observe only: applying a delta here could retire membership while the
+    // indexing inventory is still provisional. Replay from `prior` remains due.
+    let indexing_boundary = match (&config.indexing_inventory_cursor, passes.first()) {
+        (Some(IndexingWindow::ObserveFrom(prior)), Some(source)) => source
+            .album
+            .indexing_boundary(prior, &shutdown_token)
+            .await
+            .ok()
+            .map(|(start, _)| (&source.album, prior, start)),
+        (Some(IndexingWindow::ReplayedTo(cursor)), Some(source)) => {
+            Some((&source.album, cursor, cursor.clone()))
+        }
+        _ => None,
+    };
     let mut deferred_album_snapshots = Vec::new();
     let record_album_snapshots = should_record_album_snapshots(passes, config, controls);
     let needs_per_pass = config.requires_per_pass_paths() || record_album_snapshots;
@@ -1420,17 +1434,35 @@ pub(super) async fn download_photos_full_with_token_policy(
         );
         match initial_evidence {
             ZoneTokenEvidence::Complete { token } => Some(token),
-            ZoneTokenEvidence::Recoverable { passes, reason } if !repair_token_gaps => {
-                checkpoint_retry_passes = passes;
-                token_block_reason = Some(match reason {
-                    TokenGap::ReceiverDropped => "kei_internal_token_receiver_dropped",
-                    TokenGap::Blank => "icloud_blank_sync_token",
-                    TokenGap::Mismatch => "icloud_sync_token_mismatch",
-                    TokenGap::Missing | TokenGap::EnumerationIncomplete => {
-                        "icloud_sync_token_missing"
-                    }
-                });
-                None
+            ZoneTokenEvidence::Recoverable {
+                passes: retry,
+                reason,
+            } if !repair_token_gaps
+                || (indexing_boundary.is_some() && matches!(reason, TokenGap::Mismatch)) =>
+            {
+                if matches!(reason, TokenGap::Mismatch)
+                    && observations.len() == passes.len()
+                    && let Some((source, prior, start)) = indexing_boundary
+                    && matches!(
+                        source.indexing_boundary(&start, &shutdown_token).await,
+                        Ok((_, false))
+                    )
+                {
+                    // Every pass reached EOF and the zone stayed quiet. Use only
+                    // the original replay point, never an observation cursor.
+                    Some(prior.to_owned())
+                } else {
+                    checkpoint_retry_passes = retry;
+                    token_block_reason = Some(match reason {
+                        TokenGap::ReceiverDropped => "kei_internal_token_receiver_dropped",
+                        TokenGap::Blank => "icloud_blank_sync_token",
+                        TokenGap::Mismatch => "icloud_sync_token_mismatch",
+                        TokenGap::Missing | TokenGap::EnumerationIncomplete => {
+                            "icloud_sync_token_missing"
+                        }
+                    });
+                    None
+                }
             }
             ZoneTokenEvidence::Recoverable {
                 reason,

@@ -36,6 +36,8 @@ failed work and discovers previously omitted assets. The held full-query path co
 maintenance, album snapshot completion, and the retained-token bridge even when
 its initial probe reports `FINISHED`.
 
+For an ordinary unbounded inventory whose passes all use the same zone feed, kei can qualify a token mismatch without choosing a query token. It reads from the trusted cursor to terminal EOF before listing. If every pass reaches EOF with a nonblank token but the tokens differ, it reads again from the first read's successor. That second read must finish without any raw records, including records that produce no asset event. Both reads are observational. The old cursor stays in place for the later replay that applies changes.
+
 Complete natural EOF, successful local work, a fresh FINISHED scope, and a final
 FINISHED probe qualify that inventory. One fenced transaction removes
 `indexing_reconciliation_required:<zone>` and writes
@@ -45,6 +47,8 @@ source deletions. Replay presence, including an unknown future payload, bypasses
 the watch database shortcut across reopen. Only normal checkpoint promotion
 removes replay debt, including aggregate config-drift promotion. Rejection of
 the retained cursor preserves the existing checkpoint gates.
+
+If replay needs a fresh album inventory, its completed delta supplies the starting boundary. A quiet terminal read can qualify that inventory, but only the applied delta's successor can advance the cursor. If the zone changes during that scan, the next replay retries the inventory instead of reusing its failed token proof.
 
 Bounded coverage, interruption, failed transfers or
 metadata, stale scope, missing proof, state-write failure, and readiness
