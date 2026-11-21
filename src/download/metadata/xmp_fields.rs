@@ -245,10 +245,76 @@ pub(super) fn apply_to_xmp(
     meta: &mut XmpMeta,
     write: &MetadataWrite,
 ) -> xmp_toolkit::XmpResult<()> {
+    let current = embedded_fields(meta);
+    for ((path, prior), actual) in [
+        Some("GPSLatitude"),
+        Some("GPSLongitude"),
+        Some("GPSAltitude"),
+        None,
+        None,
+        Some("GPSAltitudeRef"),
+    ]
+    .into_iter()
+    .zip(&write.clear_embedded.gps)
+    .zip(&current.gps)
+    {
+        if let Some(path) = path
+            && prior.is_some()
+            && prior == actual
+        {
+            meta.delete_property(xmp_ns::EXIF, path)?;
+        }
+    }
+    for (prior, actual, field) in [
+        (
+            &write.clear_embedded.rating,
+            &current.rating,
+            ManagedXmpField::Rating,
+        ),
+        (
+            &write.clear_embedded.description,
+            &current.description,
+            ManagedXmpField::Description,
+        ),
+        (
+            &write.clear_embedded.title,
+            &current.title,
+            ManagedXmpField::Title,
+        ),
+    ] {
+        if prior.is_some() && prior == actual {
+            field.delete(meta)?;
+        }
+    }
+    for (prior, actual, field) in [
+        (
+            &write.clear_embedded.keywords,
+            &current.keywords,
+            ManagedXmpField::Keywords,
+        ),
+        (
+            &write.clear_embedded.people,
+            &current.people,
+            ManagedXmpField::People,
+        ),
+    ] {
+        if prior.is_some() && prior == actual {
+            field.delete(meta)?;
+        }
+    }
     if write.clear_datetime_offsets {
         for path in ["OffsetTimeOriginal", "OffsetTimeDigitized", "OffsetTime"] {
             meta.delete_property(EXIF_EX_XMP_NS, path)?;
         }
+    }
+    if let Some(orientation) = write.orientation.filter(|value| (1..=8).contains(value))
+        && !meta.contains_property(xmp_ns::TIFF, "Orientation")
+    {
+        meta.set_property_i32(
+            xmp_ns::TIFF,
+            "Orientation",
+            &XmpValue::new(i32::from(orientation)),
+        )?;
     }
     if let Some(dt) = &write.datetime {
         // Embedded plans use EXIF form; sidecar plans already carry unzoned ISO 8601.
@@ -388,6 +454,43 @@ pub(super) fn apply_to_xmp(
     }
 
     Ok(())
+}
+
+pub(super) fn embedded_fields(meta: &XmpMeta) -> crate::state::types::EmbeddedMetadataFields {
+    let default_text = |name| {
+        XmpMeta::compose_lang_selector(xmp_ns::DC, name, "x-default")
+            .ok()
+            .and_then(|path| meta.property(xmp_ns::DC, &path))
+            .map(|value| value.value)
+    };
+    let array = |namespace, path| {
+        meta.contains_property(namespace, path).then(|| {
+            meta.property_array(namespace, path)
+                .map(|item| item.value)
+                .collect()
+        })
+    };
+    crate::state::types::EmbeddedMetadataFields {
+        gps: [
+            Some("GPSLatitude"),
+            Some("GPSLongitude"),
+            Some("GPSAltitude"),
+            None,
+            None,
+            Some("GPSAltitudeRef"),
+        ]
+        .map(|path| {
+            path.and_then(|path| meta.property(xmp_ns::EXIF, path).map(|value| value.value))
+        }),
+        rating: meta
+            .property(xmp_ns::XMP, "Rating")
+            .map(|value| value.value),
+        description: default_text("description"),
+        title: default_text("title"),
+        keywords: array(xmp_ns::DC, "subject"),
+        people: array(xmp_ns::IPTC_EXT, "PersonInImage"),
+        ..Default::default()
+    }
 }
 
 /// Build a standalone XMP packet from a bundle of fields. Thin convenience

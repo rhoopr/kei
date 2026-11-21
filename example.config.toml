@@ -1,7 +1,9 @@
 # Complete kei config dictionary.
 #
-# Copy this file to ~/.config/kei/config.toml, or mount it at
-# /config/config.toml in Docker, then edit account and path values.
+# Save as config.toml in $XDG_CONFIG_HOME/kei for a fresh install with an
+# absolute XDG_CONFIG_HOME, or ~/.config/kei otherwise. An existing legacy
+# directory is retained. If both exist, select config and data paths explicitly.
+# In Docker, mount this file at /config/config.toml.
 #
 # Each option block lists:
 # - Option: TOML key name
@@ -12,11 +14,17 @@
 # Options whose default value is unset stay commented so copying this file does
 # not accidentally enable a feature, write to a path, or use a secret source.
 
+# Option: config_version
+# Default value: required in existing config files
+# Valid values: 1
+# Description: Accepts full-resolution rendition selection. Review exclusions and remove retired restrictions before upgrading an existing config.
+config_version = 1
+
 # Option: data_dir
-# Default value: parent directory of the resolved config file; Docker sets KEI_DATA_DIR=/config
+# Default value: cookies/ under the discovered kei directory; KEI_DATA_DIR overrides this option (Docker uses /config)
 # Valid values: filesystem path; ~ expands to your home directory
 # Description: Stores sessions, state DBs, credentials, health data, and cookies.
-# data_dir = "~/.config/kei"
+# data_dir = "/mnt/kei-state"
 
 # Option: log_level
 # Default value: info
@@ -110,12 +118,6 @@ legacy_preservation_allow_hardlinks = false
 # Description: Retries inside a single transfer. The initial retry delay is derived from this value.
 per_transfer = 3
 
-# Option: download.retry.per_asset
-# Default value: 10
-# Valid values: integer 0 or greater; 0 disables the cap
-# Description: Cap on recorded rendition attempts during a run; retry preparation resets eligible failed and stale pending counts on later runs.
-per_asset = 10
-
 [filters]
 # Option: filters.libraries
 # Default value: ["primary"]
@@ -141,102 +143,36 @@ smart_folders = ["none"]
 # Description: When true, also syncs photos that are not in a user album.
 unfiled = true
 
-# Option: filters.media
-# Default value: ["photos", "videos", "live-photos"]
-# Valid values: non-empty array containing photos, videos, live-photos
-# Description: Selects media categories before download planning.
-media = ["photos", "videos", "live-photos"]
-
-# Option: filters.filename_exclude
+# Option: filters.exclude
 # Default value: []
-# Valid values: array of glob patterns, for example ["*.AAE", "Screenshot*"]
-# Description: Skips candidate files whose derived filename matches any pattern.
-filename_exclude = []
-
-# Option: filters.recent
-# Default value: unset
-# Valid values: positive integer count such as 100, or day window string such as "30d"
-# Description: Permanently limits sync to recent assets. Count form is a candidate cap; day form maps to skip_created_before.
-# recent = 100
-
-# Option: filters.recent_scope
-# Default value: global
-# Valid values: global, per-filter
-# Description: Controls where count-form recent applies. Only valid when recent is set to a count.
-# recent_scope = "global"
+# Valid values: array containing photos, videos, live-photo-stills, live-photo-videos; leave at least one component selected
+# Description: Excludes components. Selected components include available full-resolution originals, current edits and RAW/JPEG renditions.
+exclude = []
 
 # Option: filters.skip_created_before
 # Default value: unset
-# Valid values: YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, or day interval such as 30d
-# Description: Skips assets created before this cutoff. Date-only values compare the capture-local calendar date; explicit datetimes and relative intervals compare the instant.
+# Valid values: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
+# Description: Skips assets created before this fixed cutoff. Date-only values compare the capture-local calendar date; host-local datetimes compare the instant. Remove this setting for no lower bound.
 # skip_created_before = "2024-01-01"
 
 # Option: filters.skip_created_after
 # Default value: unset
-# Valid values: YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, or day interval such as 7d
-# Description: Skips assets created after this cutoff. Date-only values compare the capture-local calendar date; explicit datetimes and relative intervals compare the instant.
+# Valid values: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
+# Description: Skips assets created after this fixed cutoff. Date-only values compare the capture-local calendar date; host-local datetimes compare the instant. Remove this setting for no upper bound.
 # skip_created_after = "2024-12-31"
 
 [photos]
-# Option: photos.resolution
-# Default value: original
-# Valid values: original, medium, thumb, none
-# Description: Primary still/video rendition to download. none requires edited or alternative to be true.
-resolution = "original"
-
-# Option: photos.live_resolution
-# Default value: original
-# Valid values: original, medium, thumb
-# Description: Live Photo MOV rendition to download when live-photo video is included.
-live_resolution = "original"
-
-# Option: photos.live_photo_mode
-# Default value: both
-# Valid values: both, image-only, video-only, skip
-# Description: Controls whether Live Photos download the still image, MOV, both, or neither.
-live_photo_mode = "both"
-
 # Option: photos.live_photo_mov_filename_policy
 # Default value: suffix
 # Valid values: suffix, original
 # Description: Names Live Photo MOV files with kei's paired suffix or Apple's original MOV name.
 live_photo_mov_filename_policy = "suffix"
 
-# Option: photos.edited
-# Default value: false
-# Valid values: true, false
-# Description: Also downloads adjusted or edited stills and videos when Apple provides them.
-edited = false
-
-# Option: photos.edited_naming
-# Default value: suffix
-# Valid values: suffix, primary
-# Description: primary requires edited=true; preserves owned originals and edit history before managing the ordinary filename. See docs/edited-primary.md.
-edited_naming = "suffix"
-
-# Option: photos.alternative
-# Default value: false
-# Valid values: true, false
-# Description: Also downloads alternative or RAW sibling resources when Apple provides them.
-alternative = false
-
-# Option: photos.raw_policy
-# Default value: as-is
-# Valid values: as-is, prefer-raw, prefer-jpeg
-# Description: Chooses how RAW+JPEG pairs are aligned when both forms are available.
-raw_policy = "as-is"
-
 # Option: photos.file_match_policy
 # Default value: name-size-dedup-with-suffix
 # Valid values: name-size-dedup-with-suffix, name-id7
 # Description: Controls path matching for import-existing and skip-existing decisions.
 file_match_policy = "name-size-dedup-with-suffix"
-
-# Option: photos.force_resolution
-# Default value: false
-# Valid values: true, false
-# Description: When true, skips assets missing the selected primary resolution instead of falling back.
-force_resolution = false
 
 # Option: photos.keep_unicode_in_filenames
 # Default value: false
@@ -245,11 +181,20 @@ force_resolution = false
 keep_unicode_in_filenames = false
 
 [metadata]
+# Omitted settings remain false in config_version 1. Setup explicitly enables
+# the standard embedded fields below; this reference keeps outputs disabled.
+# Enabling a field authorizes later updates to that field in kei-managed files.
 # Option: metadata.set_exif_datetime
 # Default value: false
 # Valid values: true, false
 # Description: Writes missing capture dates in supported embedded formats, including HEIF XMP with the xmp feature. Ordinary writes preserve native timestamps; explicit capture repair can replace them.
 set_exif_datetime = false
+
+# Option: metadata.set_exif_orientation
+# Default value: false; setup writes true explicitly
+# Valid values: true, false
+# Description: Fills absent orientation on checksum-qualified, untransformed original JPEG/TIFF files. Existing orientation and ambiguous renderings are preserved.
+set_exif_orientation = false
 
 # Option: metadata.set_exif_rating
 # Default value: false
@@ -272,7 +217,7 @@ set_exif_description = false
 # Option: metadata.embed_xmp
 # Default value: false
 # Valid values: true, false; available in default builds with the xmp feature
-# Description: Embeds XMP metadata in supported media files.
+# Description: Embeds standard title and source keywords. Rating, GPS and description use their own settings. Provider-internal fields are excluded.
 embed_xmp = false
 
 # Option: metadata.xmp_sidecar
@@ -280,6 +225,18 @@ embed_xmp = false
 # Valid values: true, false; available in default builds with the xmp feature
 # Description: Writes XMP sidecar files next to downloaded media.
 xmp_sidecar = false
+
+# Option: metadata.include_albums
+# Default value: false
+# Valid values: true, false; available in default builds with the xmp feature
+# Description: Adds album names to keywords when embed_xmp or xmp_sidecar is enabled.
+include_albums = false
+
+# Option: metadata.include_people
+# Default value: false
+# Valid values: true, false; available in default builds with the xmp feature
+# Description: Adds named people when embed_xmp or xmp_sidecar is enabled.
+include_people = false
 
 [watch]
 # Option: watch.interval

@@ -2,6 +2,7 @@
 
 use crate::download::DownloadConfig;
 use crate::download::filter::MetadataPayload;
+use crate::state::types::embedded_absence;
 use chrono::{DateTime, FixedOffset};
 
 /// Whether an explicitly requested metadata repair may replace an existing
@@ -19,26 +20,35 @@ bitflags::bitflags! {
     /// flow; individual flags gate which fields get embedded into the media file.
     ///
     /// `EMBED_XMP` enables the XMP-only fields that have no native EXIF equivalent
-    /// (title, keywords, people, hidden/archived, media subtype, burst id).
+    /// (title and keywords). Album names and people require separate opt-ins.
     /// `XMP_SIDECAR` is orthogonal - it writes a `.xmp` file next to the photo
     /// without touching the photo bytes.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-    pub(in crate::download) struct MetadataFlags: u8 {
+    pub(in crate::download) struct MetadataFlags: u16 {
         const DATETIME    = 1 << 0;
         const RATING      = 1 << 1;
         const GPS         = 1 << 2;
         const DESCRIPTION = 1 << 3;
         const EMBED_XMP   = 1 << 4;
         const XMP_SIDECAR = 1 << 5;
+        const INCLUDE_ALBUMS = 1 << 6;
+        const INCLUDE_PEOPLE = 1 << 7;
+        const ORIENTATION = 1 << 8;
     }
 }
 
 impl MetadataFlags {
+    /// Standard-field policy; version 1 bundled provider fields and groupings.
+    pub(in crate::download) const POLICY_REVISION: u8 = 4;
+
     /// Set of flags that drive the `.part`-and-modify-before-rename flow.
     /// Sidecar writes happen after the rename so `XMP_SIDECAR` is excluded.
-    /// Derived as `all() \ XMP_SIDECAR` so any future embed-style flag
-    /// added to this type is automatically picked up.
-    const EMBED_MASK: Self = Self::all().difference(Self::XMP_SIDECAR);
+    /// Enrichment choices alone do not authorize a write.
+    const EMBED_MASK: Self = Self::all().difference(
+        Self::XMP_SIDECAR
+            .union(Self::INCLUDE_ALBUMS)
+            .union(Self::INCLUDE_PEOPLE),
+    );
 
     /// Whether any flag needs the downloaded bytes to stay as a `.part` file
     /// for in-place metadata editing before the atomic rename.
@@ -47,11 +57,12 @@ impl MetadataFlags {
     }
 
     pub(in crate::download) fn has_any_write(self) -> bool {
-        !self.is_empty()
+        self.any_embed() || self.contains(Self::XMP_SIDECAR)
     }
 
     pub(super) fn uses_xmp_groupings(self) -> bool {
         self.intersects(Self::EMBED_XMP | Self::XMP_SIDECAR)
+            && self.intersects(Self::INCLUDE_ALBUMS | Self::INCLUDE_PEOPLE)
     }
 }
 
@@ -65,6 +76,7 @@ impl From<&crate::config::MetadataConfig> for MetadataFlags {
     fn from(metadata: &crate::config::MetadataConfig) -> Self {
         let mut flags = Self::empty();
         flags.set(Self::DATETIME, metadata.set_exif_datetime);
+        flags.set(Self::ORIENTATION, metadata.set_exif_orientation);
         flags.set(Self::RATING, metadata.set_exif_rating);
         flags.set(Self::GPS, metadata.set_exif_gps);
         flags.set(Self::DESCRIPTION, metadata.set_exif_description);
@@ -72,6 +84,10 @@ impl From<&crate::config::MetadataConfig> for MetadataFlags {
         {
             flags.set(Self::EMBED_XMP, metadata.embed_xmp);
             flags.set(Self::XMP_SIDECAR, metadata.xmp_sidecar);
+            if metadata.embed_xmp || metadata.xmp_sidecar {
+                flags.set(Self::INCLUDE_ALBUMS, metadata.include_albums);
+                flags.set(Self::INCLUDE_PEOPLE, metadata.include_people);
+            }
         }
         flags
     }
@@ -114,8 +130,8 @@ pub(super) fn offset_time_original(payload: &MetadataPayload) -> Option<String> 
 /// - offset: only alongside a timestamp this pass writes, or one the probe
 ///   proves already renders the capture-local instant.
 /// - rating / description: flag gate only - iCloud is the source of truth.
-/// - XMP-only fields (title, keywords, people, hidden/archived,
-///   media_subtype, burst_id): gated on the `EMBED_XMP` flag.
+/// - Title and keywords: gated on `EMBED_XMP`; people additionally require
+///   `INCLUDE_PEOPLE`. Payload construction gates album enrichment.
 #[cfg(test)]
 fn plan_metadata_write(
     flags: MetadataFlags,
@@ -140,6 +156,68 @@ pub(super) fn plan_metadata_write_with_repair(
     probe: &crate::download::metadata::ExifProbe,
 ) -> crate::download::metadata::MetadataWrite {
     let mut write = crate::download::metadata::MetadataWrite::default();
+    write.prior_embedded.clone_from(&payload.prior_embedded);
+    if flags.contains(MetadataFlags::GPS) && payload.observed_absent & embedded_absence::GPS != 0 {
+        write
+            .clear_embedded
+            .gps
+            .clone_from(&payload.prior_embedded.gps);
+        write
+            .clear_embedded
+            .native_gps
+            .clone_from(&payload.prior_embedded.native_gps);
+    }
+    if flags.contains(MetadataFlags::RATING)
+        && payload.observed_absent & embedded_absence::RATING != 0
+    {
+        write
+            .clear_embedded
+            .rating_percent
+            .clone_from(&payload.prior_embedded.rating_percent);
+        write
+            .clear_embedded
+            .rating
+            .clone_from(&payload.prior_embedded.rating);
+    }
+    if flags.contains(MetadataFlags::DESCRIPTION)
+        && payload.observed_absent & embedded_absence::DESCRIPTION != 0
+    {
+        write
+            .clear_embedded
+            .description
+            .clone_from(&payload.prior_embedded.description);
+        write
+            .clear_embedded
+            .native_description
+            .clone_from(&payload.prior_embedded.native_description);
+    }
+    if flags.contains(MetadataFlags::EMBED_XMP) {
+        if payload.observed_absent & embedded_absence::TITLE != 0 {
+            write
+                .clear_embedded
+                .title
+                .clone_from(&payload.prior_embedded.title);
+        }
+        if payload.observed_absent & embedded_absence::KEYWORDS != 0 && payload.keywords.is_empty()
+        {
+            write
+                .clear_embedded
+                .keywords
+                .clone_from(&payload.prior_embedded.keywords);
+        }
+        if flags.contains(MetadataFlags::INCLUDE_PEOPLE)
+            && payload.observed_absent & embedded_absence::PEOPLE != 0
+            && payload.people.is_empty()
+        {
+            write
+                .clear_embedded
+                .people
+                .clone_from(&payload.prior_embedded.people);
+        }
+    }
+    if flags.contains(MetadataFlags::ORIENTATION) && probe.orientation_missing {
+        write.orientation = payload.original_orientation;
+    }
 
     if flags.contains(MetadataFlags::DATETIME) {
         let offset_time_original = offset_time_original(payload);
@@ -178,18 +256,29 @@ pub(super) fn plan_metadata_write_with_repair(
     if flags.contains(MetadataFlags::GPS) && !probe.has_gps {
         write.gps = gps_from_payload(payload);
     }
-    if flags.contains(MetadataFlags::DESCRIPTION) {
-        write.description.clone_from(&payload.description);
+    if flags.contains(MetadataFlags::DESCRIPTION)
+        && payload.observed_absent & embedded_absence::DESCRIPTION == 0
+    {
+        write.description = payload
+            .description
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .or_else(|| payload.title.as_ref().filter(|value| !value.is_empty()))
+            .cloned();
     }
     #[cfg(feature = "xmp")]
     if flags.contains(MetadataFlags::EMBED_XMP) {
-        write.title.clone_from(&payload.title);
+        if payload.observed_absent & embedded_absence::TITLE == 0 {
+            write.title = payload
+                .title
+                .as_ref()
+                .filter(|value| !value.is_empty())
+                .cloned();
+        }
         write.keywords.clone_from(&payload.keywords);
-        write.people.clone_from(&payload.people);
-        write.is_hidden = payload.is_hidden;
-        write.is_archived = payload.is_archived;
-        write.media_subtype.clone_from(&payload.media_subtype);
-        write.burst_id.clone_from(&payload.burst_id);
+        if flags.contains(MetadataFlags::INCLUDE_PEOPLE) {
+            write.people.clone_from(&payload.people);
+        }
     }
 
     write

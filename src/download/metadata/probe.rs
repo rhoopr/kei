@@ -13,7 +13,6 @@ use anyhow::Context;
 use anyhow::Result;
 use chrono::{DateTime, FixedOffset, NaiveDateTime, Timelike};
 use little_exif::exif_tag::ExifTag;
-#[cfg(feature = "xmp")]
 use little_exif::filetype::FileExtension;
 use little_exif::metadata::Metadata;
 use std::path::Path;
@@ -41,6 +40,8 @@ pub(in crate::download) enum HeifNativeCaptureTime {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ExifProbe {
+    /// True only after a readable JPEG/TIFF probe proves no native or XMP orientation.
+    pub(crate) orientation_missing: bool,
     pub(crate) datetime_original: Option<String>,
     pub(crate) offset_time_original: Option<String>,
     pub(crate) has_other_datetime_offset: bool,
@@ -106,6 +107,66 @@ impl ExifProbe {
                 ))
             }
         }
+    }
+}
+
+/// Prove an orientation omission without treating failed/unsupported reads as absence.
+pub(in crate::download) fn original_orientation_missing(path: &Path) -> Result<bool> {
+    use std::io::Read;
+    const ORIENTATION_TAG: u16 = 0x0112;
+    const XMP_TAG: u16 = 0x02bc;
+    let mut source = std::fs::File::open(path)?;
+    let mut head = [0; 12];
+    let count = source.read(&mut head)?;
+    let head = head.get(..count).unwrap_or_default();
+    let file_type = if head.starts_with(&[0xff, 0xd8, 0xff]) {
+        FileExtension::JPEG
+    } else if head.starts_with(b"II*\0") || head.starts_with(b"MM\0*") {
+        FileExtension::TIFF
+    } else {
+        return Ok(false);
+    };
+    let mut bytes = head.to_vec();
+    source.read_to_end(&mut bytes)?;
+    let metadata = match Metadata::new_from_vec(&bytes, file_type) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if file_type == FileExtension::JPEG
+                && error.to_string().contains("No EXIF data found") =>
+        {
+            Metadata::new()
+        }
+        Err(_) => return Ok(false),
+    };
+    if (&metadata)
+        .into_iter()
+        .any(|tag| tag.as_u16() == ORIENTATION_TAG)
+    {
+        return Ok(false);
+    }
+    let has_xmp = (&metadata).into_iter().any(|tag| tag.as_u16() == XMP_TAG)
+        || [
+            b"http://ns.adobe.com/xap/1.0/".as_slice(),
+            b"http://ns.adobe.com/xmp/extension/".as_slice(),
+        ]
+        .iter()
+        .any(|marker| bytes.windows(marker.len()).any(|window| window == *marker));
+    if !has_xmp {
+        return Ok(true);
+    }
+    #[cfg(feature = "xmp")]
+    {
+        ensure_initialized();
+        let mut file = XmpFile::new()?;
+        file.open_file(path, OpenFileOptions::default().for_read())?;
+        Ok(file
+            .xmp()
+            .is_some_and(|meta| !meta.contains_property(xmp_ns::TIFF, "Orientation")))
+    }
+    #[cfg(not(feature = "xmp"))]
+    {
+        // Native-only builds cannot prove the contents of an XMP packet.
+        Ok(false)
     }
 }
 

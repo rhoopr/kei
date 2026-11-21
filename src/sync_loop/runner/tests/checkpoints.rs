@@ -3,18 +3,16 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::sync_cycle::{
-    ENUM_CONFIG_HASH_KEY, PENDING_ENUM_CONFIG_HASH_KEY, SYNC_TOKEN_PREFIX, determine_sync_mode,
-    run_cycle, should_store_sync_token, should_store_sync_token_for_cycle,
+    ENUM_CONFIG_HASH_KEY, PENDING_ENUM_CONFIG_HASH_KEY, determine_sync_mode, run_cycle,
+    should_store_sync_token, should_store_sync_token_for_cycle,
 };
 use crate::sync_loop::test_support::{
-    FailingMetadataSetDb, MetadataSetFailure, RunCycleDownloadConfigOptions, album_count_response,
-    full_album_page, full_album_page_with_download, make_empty_full_album,
-    make_full_album_with_boxed_session, make_full_album_with_session,
-    make_recording_run_cycle_download_config_builder, make_run_cycle_config,
-    make_run_cycle_download_config_builder, make_run_cycle_download_config_builder_with_options,
-    make_run_cycle_library_state, make_run_cycle_library_state_with_album,
+    RunCycleDownloadConfigOptions, album_count_response, full_album_page,
+    full_album_page_with_download, make_recording_run_cycle_download_config_builder,
+    make_run_cycle_config, make_run_cycle_download_config_builder,
+    make_run_cycle_download_config_builder_with_options, make_run_cycle_library_state_with_album,
     make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle, make_state_db,
-    media_without_photo_downloads, run_cycle_expected_date_dir, run_full_cycle_with_album,
+    media_without_photo_downloads, run_cycle_expected_date_dir,
 };
 use crate::{download, state};
 
@@ -28,29 +26,34 @@ impl crate::icloud::photos::PhotosSession for LegacyPendingDeleteSession {
     async fn post(
         &self,
         url: &str,
-        _body: String,
+        body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<serde_json::Value> {
         if url.contains("/changes/zone?") {
+            let body: serde_json::Value = serde_json::from_str(&body)?;
+            let records = if body["zones"][0]["syncToken"] == "zone-token-before-legacy-cleanup" {
+                vec![
+                    serde_json::json!({"recordName":self.master_record_name.as_ref(), "recordType":"CPLMaster", "deleted":true}),
+                ]
+            } else {
+                Vec::new()
+            };
             return Ok(serde_json::json!({
                 "zones": [{
                     "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
                     "syncToken": "zone-token-after-legacy-cleanup",
                     "moreComing": false,
-                    "records": []
+                    "records": records
                 }]
             }));
         }
         if url.contains("/records/lookup?") {
-            return Ok(serde_json::json!({
-                "records": [{
-                    "recordName": self.master_record_name.as_ref(),
-                    "serverErrorCode": "UNKNOWN_ITEM",
-                    "reason": "record not found"
-                }]
-            }));
+            anyhow::bail!("Historical pending state must not schedule a lookup");
         }
-        Ok(serde_json::json!({"records": []}))
+        if url.contains("/internal/records/query/batch") {
+            return Ok(album_count_response(0));
+        }
+        Ok(serde_json::json!({"records": [], "syncToken":"zone-token-after-legacy-cleanup"}))
     }
 
     fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
@@ -58,66 +61,25 @@ impl crate::icloud::photos::PhotosSession for LegacyPendingDeleteSession {
     }
 }
 
-fn make_one_photo_incremental_album_for_zone(
-    zone: &str,
-    zone_sync_token: &str,
-    download_url: &str,
-) -> crate::icloud::photos::PhotoAlbum {
-    make_one_photo_incremental_album_with_download(
-        zone,
-        zone_sync_token,
-        download_url,
-        1024,
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-    )
-}
-
-fn make_one_photo_incremental_album_with_download(
-    zone: &str,
-    zone_sync_token: &str,
-    download_url: &str,
-    size: u64,
-    checksum: &str,
-) -> crate::icloud::photos::PhotoAlbum {
-    use serde_json::json;
-    let page = full_album_page_with_download(
-        zone,
-        &format!("master-{zone}"),
-        zone_sync_token,
-        download_url,
-        size,
-        checksum,
-    );
-    let records = page
-        .get("records")
-        .expect("full album page records")
-        .clone();
-
-    make_full_album_with_session(
-        zone,
-        crate::test_helpers::MockPhotosSession::new().ok(json!({
-            "zones": [{
-                "zoneID": {"zoneName": zone, "ownerRecordName": "_defaultOwner"},
-                "syncToken": zone_sync_token,
-                "moreComing": false,
-                "records": records
-            }]
-        })),
-    )
-}
-
 #[tokio::test]
 async fn run_cycle_recent_exact_inventory_stores_zone_token() {
     let (capture, _guard) = crate::test_helpers::TracingCapture::install();
-    let mut config = make_run_cycle_config();
-    config.filters.recent = Some(40);
-    let db = make_state_db();
+    let config = make_run_cycle_config();
     let download_dir = tempfile::tempdir().expect("download tempdir");
+    let owned_db =
+        crate::sync_loop::test_support::open_owned_cycle_db(&download_dir.path().join("state.db"))
+            .await;
+    let db: Arc<dyn download::DownloadStore> = owned_db.clone();
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
     let session = crate::test_helpers::DynamicRecentPhotosSession::new(40)
         .with_filename_prefix("cycle-recent")
         .with_token("zone-tok-recent");
-    let album = make_full_album_with_boxed_session("PrimarySync", Box::new(session));
+    let album = crate::sync_loop::test_support::make_owned_cycle_album(
+        &owned_db,
+        "PrimarySync",
+        "private",
+        Box::new(session),
+    );
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
     let states = vec![&lib_state];
@@ -126,7 +88,6 @@ async fn run_cycle_recent_exact_inventory_stores_zone_token() {
         Arc::clone(&db),
         RunCycleDownloadConfigOptions {
             media: media_without_photo_downloads(),
-            recent: Some(40),
             ..RunCycleDownloadConfigOptions::default()
         },
     );
@@ -135,7 +96,6 @@ async fn run_cycle_recent_exact_inventory_stores_zone_token() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -172,13 +132,35 @@ async fn run_cycle_recent_exact_inventory_stores_zone_token() {
 #[tokio::test]
 async fn run_cycle_true_token_unsafe_condition_still_warns() {
     let (capture, _guard) = crate::test_helpers::TracingCapture::install();
-
-    let result = run_full_cycle_with_album(
-        make_empty_full_album(""),
-        false,
+    let directory = tempfile::tempdir().unwrap();
+    let inner =
+        crate::sync_loop::test_support::open_owned_cycle_db(&directory.path().join("state.db"))
+            .await;
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
+    let library = make_run_cycle_library_state_with_album(
+        "PrimarySync",
+        "sync_token:PrimarySync",
+        crate::sync_loop::test_support::make_owned_cycle_album(
+            &inner,
+            "PrimarySync",
+            "private",
+            Box::new(crate::test_helpers::DynamicRecentPhotosSession::new(0).with_token("")),
+        ),
+    );
+    let config = make_run_cycle_config();
+    let builder = make_run_cycle_download_config_builder(directory.path(), db.clone());
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let result = run_cycle(
+        &[&library],
+        &config,
+        Some(db.as_ref()),
+        &builder,
         download::DownloadControls::download_hidden(),
+        &shared,
+        &CancellationToken::new(),
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(result.failed_count, 0);
     assert!(result.stats.sync_token_blocked);
@@ -202,7 +184,11 @@ async fn run_cycle_true_token_unsafe_condition_still_warns() {
 #[tokio::test]
 async fn contract_malformed_required_asset_fields_block_checkpoint() {
     let config = make_run_cycle_config();
-    let db = make_state_db();
+    let download_dir = tempfile::tempdir().expect("download tempdir");
+    let inner =
+        crate::sync_loop::test_support::open_owned_cycle_db(&download_dir.path().join("state.db"))
+            .await;
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
     db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
         .expect("seed zone token");
@@ -213,15 +199,18 @@ async fn contract_malformed_required_asset_fields_block_checkpoint() {
     let mut page = full_album_page("PrimarySync", "", "zone-tok-new");
     page["records"][0]["recordName"] = serde_json::json!("");
     page["records"][1]["recordName"] = serde_json::json!("");
-    let album = make_full_album_with_session(
+    let album = crate::sync_loop::test_support::make_owned_cycle_album(
+        &inner,
         "PrimarySync",
-        crate::test_helpers::MockPhotosSession::new()
-            .ok(album_count_response(1))
-            .ok(page),
+        "private",
+        Box::new(
+            crate::test_helpers::MockPhotosSession::new()
+                .ok(album_count_response(1))
+                .ok(page),
+        ),
     );
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
-    let download_dir = tempfile::tempdir().expect("download tempdir");
     let build_download_config =
         make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
@@ -230,7 +219,6 @@ async fn contract_malformed_required_asset_fields_block_checkpoint() {
         &[&lib_state],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -255,15 +243,21 @@ async fn contract_malformed_required_asset_fields_block_checkpoint() {
 
 #[tokio::test]
 async fn watch_recent_exact_first_cycle_seeds_incremental_token() {
-    let mut config = make_run_cycle_config();
-    config.filters.recent = Some(20);
-    let db = make_state_db();
+    let config = make_run_cycle_config();
     let download_dir = tempfile::tempdir().expect("download tempdir");
+    let database = download_dir.path().join("state.db");
+    let owned_db = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
+    let db: Arc<dyn download::DownloadStore> = owned_db.clone();
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
     let session = crate::test_helpers::DynamicRecentPhotosSession::new(20)
         .with_filename_prefix("watch-recent")
         .with_token("zone-tok-watch");
-    let album = make_full_album_with_boxed_session("PrimarySync", Box::new(session));
+    let album = crate::sync_loop::test_support::make_owned_cycle_album(
+        &owned_db,
+        "PrimarySync",
+        "private",
+        Box::new(session.clone()),
+    );
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
     let states = vec![&lib_state];
@@ -272,7 +266,6 @@ async fn watch_recent_exact_first_cycle_seeds_incremental_token() {
         Arc::clone(&db),
         RunCycleDownloadConfigOptions {
             media: media_without_photo_downloads(),
-            recent: Some(20),
             ..RunCycleDownloadConfigOptions::default()
         },
     );
@@ -281,7 +274,6 @@ async fn watch_recent_exact_first_cycle_seeds_incremental_token() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -298,7 +290,6 @@ async fn watch_recent_exact_first_cycle_seeds_incremental_token() {
         Some("zone-tok-watch".to_owned())
     );
     let next_mode = determine_sync_mode(
-        false,
         1,
         Some(db.as_ref()),
         "sync_token:PrimarySync",
@@ -309,55 +300,97 @@ async fn watch_recent_exact_first_cycle_seeds_incremental_token() {
         matches!(next_mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "zone-tok-watch"),
         "a later watch cycle should use the token from proved recent EOF"
     );
+    let queries_after_first = session.offsets();
+    for _ in 0..2 {
+        let reopened = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
+        let db: Arc<dyn download::DownloadStore> = reopened.clone();
+        let album = crate::sync_loop::test_support::make_owned_cycle_album(
+            &reopened,
+            "PrimarySync",
+            "private",
+            Box::new(session.clone()),
+        );
+        let state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let builder = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            db.clone(),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+        let quiet = run_cycle(
+            &[&state],
+            &config,
+            Some(db.as_ref()),
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(quiet.failed_count, 0);
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_eq!(
+            session.offsets(),
+            queries_after_first,
+            "quiet cycles must not enumerate again"
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("zone-tok-watch")
+        );
+    }
 }
 
-/// Retry work is rehydrated independently from source enumeration, so a
-/// stored provider checkpoint remains usable during `--retry-failed`.
+/// Recovery work is independent from source enumeration.
 #[tokio::test]
-async fn determine_sync_mode_retry_failed_with_token_returns_incremental() {
+async fn determine_sync_mode_with_pending_failure_keeps_stored_token() {
     let db = make_state_db();
     let sync_token_key = "sync_token:PrimarySync";
-    // Pre-populate a stored token so we can verify it is ignored.
+    db.upsert_seen(&crate::test_helpers::TestAssetRecord::new("failed").build())
+        .await
+        .unwrap();
+    db.mark_failed("PrimarySync", "failed", "original", "transfer failed")
+        .await
+        .unwrap();
     db.set_metadata(sync_token_key, "stored-token-abc")
         .await
         .expect("set token");
 
-    let mode = determine_sync_mode(
-        true, // is_retry_failed
-        1,
-        Some(db.as_ref()),
-        sync_token_key,
-        "PrimarySync",
-    )
-    .await;
+    let mode = determine_sync_mode(1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
 
     assert!(
         matches!(mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "stored-token-abc"),
-        "retry-failed should keep source tracking incremental, got {mode:?}"
+        "pending failure should keep source tracking incremental, got {mode:?}"
     );
 }
 
-/// Retry-failed must neither consume nor clear the stored provider token.
+/// Mode selection must neither consume nor clear the stored provider token.
 #[tokio::test]
-async fn determine_sync_mode_retry_failed_does_not_consume_or_clear_stored_token() {
+async fn determine_sync_mode_does_not_consume_or_clear_stored_token() {
     let db = make_state_db();
     let sync_token_key = "sync_token:PrimarySync";
     db.set_metadata(sync_token_key, "stored-token-abc")
         .await
         .expect("set token");
 
-    let retry_mode =
-        determine_sync_mode(true, 1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
+    let retry_mode = determine_sync_mode(1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
     assert!(
         matches!(retry_mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "stored-token-abc"),
-        "retry-failed should use the stored token, got {retry_mode:?}"
+        "mode selection should use the stored token, got {retry_mode:?}"
     );
 
     let normal_mode =
-        determine_sync_mode(false, 1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
+        determine_sync_mode(1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
     assert!(
         matches!(normal_mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "stored-token-abc"),
-        "normal sync should still use the stored token after retry-failed, got {normal_mode:?}"
+        "repeated mode selection should still use the stored token, got {normal_mode:?}"
     );
 }
 
@@ -370,8 +403,7 @@ async fn determine_sync_mode_empty_stored_token_falls_back_to_full() {
         .await
         .expect("set empty token");
 
-    let mode =
-        determine_sync_mode(false, 1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
+    let mode = determine_sync_mode(1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
 
     assert!(
         matches!(mode, download::SyncMode::Full),
@@ -384,8 +416,7 @@ async fn determine_sync_mode_empty_stored_token_falls_back_to_full() {
     db.set_metadata(sync_token_key, "real-token")
         .await
         .expect("set real token");
-    let mode =
-        determine_sync_mode(false, 1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
+    let mode = determine_sync_mode(1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
     assert!(
         matches!(mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "real-token"),
         "non-empty token must yield Incremental with that token, got {mode:?}"
@@ -440,8 +471,7 @@ async fn determine_sync_mode_state_db_error_falls_back_to_full() {
 
     let db = FailingDb;
 
-    let mode =
-        determine_sync_mode(false, 1, Some(&db), "sync_token:PrimarySync", "PrimarySync").await;
+    let mode = determine_sync_mode(1, Some(&db), "sync_token:PrimarySync", "PrimarySync").await;
 
     assert!(
         matches!(mode, download::SyncMode::Full),
@@ -455,7 +485,6 @@ async fn determine_sync_mode_state_db_error_falls_back_to_full() {
 #[tokio::test]
 async fn determine_sync_mode_no_state_db_returns_full() {
     let mode = determine_sync_mode::<state::SqliteStateDb>(
-        false,
         1,
         None,
         "sync_token:PrimarySync",
@@ -571,11 +600,10 @@ fn sync_loop_stale_plan_combines_with_existing_gates() {
 async fn run_cycle_clean_zone_advances_despite_other_stale_plan() {
     let config = make_run_cycle_config();
     let state_dir = tempfile::tempdir().expect("state directory");
-    let db: Arc<dyn download::DownloadStore> = Arc::new(
-        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
-            .await
-            .expect("file-backed state"),
-    );
+    let inner =
+        crate::sync_loop::test_support::open_owned_cycle_db(&state_dir.path().join("state.db"))
+            .await;
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
     db.set_metadata("sync_token:PrimarySync", "primary-prev")
         .await
         .expect("seed primary token");
@@ -585,12 +613,31 @@ async fn run_cycle_clean_zone_advances_despite_other_stale_plan() {
     let download_dir = tempfile::tempdir().expect("download tempdir");
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
-    let clean_state =
-        make_run_cycle_library_state("PrimarySync", "sync_token:PrimarySync", "primary-new");
-    let mut stale_state = make_run_cycle_library_state(
+    let clean_state = make_run_cycle_library_state_with_album(
+        "PrimarySync",
+        "sync_token:PrimarySync",
+        crate::sync_loop::test_support::make_owned_cycle_album(
+            &inner,
+            "PrimarySync",
+            "private",
+            Box::new(
+                crate::test_helpers::DynamicRecentPhotosSession::new(0).with_token("primary-new"),
+            ),
+        ),
+    );
+    let mut stale_state = make_run_cycle_library_state_with_album(
         "SharedSync-TEST",
         "sync_token:SharedSync-TEST",
-        "shared-new",
+        crate::sync_loop::test_support::make_owned_cycle_album(
+            &inner,
+            "SharedSync-TEST",
+            "shared",
+            Box::new(
+                crate::test_helpers::DynamicRecentPhotosSession::new(0)
+                    .with_zone("SharedSync-TEST")
+                    .with_token("shared-new"),
+            ),
+        ),
     );
     stale_state.plan_is_stale = true;
     let states = vec![&clean_state, &stale_state];
@@ -601,7 +648,6 @@ async fn run_cycle_clean_zone_advances_despite_other_stale_plan() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -637,19 +683,28 @@ async fn run_cycle_clean_zone_advances_despite_other_stale_plan() {
 async fn run_cycle_stale_plan_blocks_database_precheck_token() {
     let config = make_run_cycle_config();
     let state_dir = tempfile::tempdir().expect("state directory");
-    let db: Arc<dyn download::DownloadStore> = Arc::new(
-        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
-            .await
-            .expect("file-backed state"),
-    );
+    let inner =
+        crate::sync_loop::test_support::open_owned_cycle_db(&state_dir.path().join("state.db"))
+            .await;
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
     db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
         .expect("seed zone token");
     let download_dir = tempfile::tempdir().expect("download tempdir");
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
-    let mut lib_state =
-        make_run_cycle_library_state("PrimarySync", "sync_token:PrimarySync", "zone-tok-new");
+    let mut lib_state = make_run_cycle_library_state_with_album(
+        "PrimarySync",
+        "sync_token:PrimarySync",
+        crate::sync_loop::test_support::make_owned_cycle_album(
+            &inner,
+            "PrimarySync",
+            "private",
+            Box::new(
+                crate::test_helpers::DynamicRecentPhotosSession::new(0).with_token("zone-tok-new"),
+            ),
+        ),
+    );
     lib_state.plan_is_stale = true;
     let states = vec![&lib_state];
     let build_download_config =
@@ -659,7 +714,6 @@ async fn run_cycle_stale_plan_blocks_database_precheck_token() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -687,21 +741,37 @@ async fn run_cycle_stale_plan_blocks_database_precheck_token() {
 #[tokio::test]
 async fn run_cycle_zone_token_write_failure_blocks_database_precheck_token() {
     let config = make_run_cycle_config();
-    let inner = make_state_db();
+    let download_dir = tempfile::tempdir().expect("download tempdir");
+    let database = download_dir.path().join("state.db");
+    let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
     inner
         .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
         .expect("seed zone token");
-    let db: Arc<dyn download::DownloadStore> = Arc::new(FailingMetadataSetDb::new(
-        Arc::clone(&inner),
-        MetadataSetFailure::Prefix(SYNC_TOKEN_PREFIX),
-        "simulated sync-token write failure",
-    ));
-    let download_dir = tempfile::tempdir().expect("download tempdir");
+    inner
+        .acquire_lock("inject cursor write failure")
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_zone_cursor BEFORE INSERT ON metadata
+         WHEN NEW.key = 'sync_token:PrimarySync'
+         BEGIN SELECT RAISE(ABORT, 'simulated sync-token write failure'); END;",
+        )
+        .unwrap();
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
-    let lib_state =
-        make_run_cycle_library_state("PrimarySync", "sync_token:PrimarySync", "zone-tok-new");
+    let lib_state = make_run_cycle_library_state_with_album(
+        "PrimarySync",
+        "sync_token:PrimarySync",
+        crate::sync_loop::test_support::make_owned_cycle_album(
+            &inner,
+            "PrimarySync",
+            "private",
+            Box::new(
+                crate::test_helpers::DynamicRecentPhotosSession::new(0).with_token("zone-tok-new"),
+            ),
+        ),
+    );
     let states = vec![&lib_state];
     let build_download_config =
         make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
@@ -710,7 +780,6 @@ async fn run_cycle_zone_token_write_failure_blocks_database_precheck_token() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -719,7 +788,8 @@ async fn run_cycle_zone_token_write_failure_blocks_database_precheck_token() {
     .await
     .expect("run cycle");
 
-    assert_eq!(result.failed_count, 0);
+    assert_eq!(result.failed_count, 1);
+    assert_eq!(result.stats.state_write_failures, 1);
     assert!(
         !result.db_sync_token_advance_safe,
         "database precheck token must not advance after a zone-token write failure"
@@ -733,6 +803,87 @@ async fn run_cycle_zone_token_write_failure_blocks_database_precheck_token() {
         Some("zone-tok-prev"),
         "failed zone-token write must leave old token in place for replay"
     );
+    drop(build_download_config);
+    drop(states);
+    drop(lib_state);
+    drop(db);
+    drop(inner);
+    for replay in 0..2 {
+        let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
+        if replay == 0 {
+            assert_eq!(
+                inner
+                    .get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("zone-tok-prev")
+            );
+            inner
+                .acquire_lock("remove cursor write failure")
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_zone_cursor")
+                .unwrap();
+        }
+        let db: Arc<dyn download::DownloadStore> = inner.clone();
+        let library = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            crate::sync_loop::test_support::make_owned_cycle_album(
+                &inner,
+                "PrimarySync",
+                "private",
+                Box::new(
+                    crate::test_helpers::DynamicRecentPhotosSession::new(0)
+                        .with_token("zone-tok-new"),
+                ),
+            ),
+        );
+        let builder = make_run_cycle_download_config_builder(download_dir.path(), db.clone());
+        let result = run_cycle(
+            &[&library],
+            &config,
+            Some(db.as_ref()),
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.stats.downloaded, 0);
+        assert!(result.db_sync_token_advance_safe);
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("zone-tok-new")
+        );
+    }
+}
+
+fn checkpoint_download_session(
+    master: &str,
+    token: &'static str,
+    url: &str,
+    size: u64,
+    checksum: &str,
+) -> crate::sync_loop::test_support::MutableCaptureSession {
+    let mut page = full_album_page_with_download("PrimarySync", master, token, url, size, checksum);
+    page["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+        serde_json::json!("_defaultOwner");
+    crate::sync_loop::test_support::MutableCaptureSession {
+        zone: "PrimarySync",
+        token,
+        cancel_after_lookup: None,
+        records: Arc::new(std::sync::Mutex::new(
+            page["records"].as_array().unwrap().clone(),
+        )),
+        repair_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }
 }
 
 #[tokio::test]
@@ -747,22 +898,22 @@ async fn run_cycle_published_file_state_write_failure_blocks_token() {
     let server = crate::start_wiremock_or_skip!();
     let config = make_run_cycle_config();
     let state_dir = tempfile::tempdir().expect("state directory");
-    let inner: Arc<dyn download::DownloadStore> = Arc::new(
-        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
-            .await
-            .expect("file-backed state"),
-    );
+    let inner =
+        crate::sync_loop::test_support::open_owned_cycle_db(&state_dir.path().join("state.db"))
+            .await;
     inner
         .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
         .expect("seed zone token");
-    let db: Arc<dyn download::DownloadStore> = Arc::new(
-        FailingMetadataSetDb::without_set_failure(
-            Arc::clone(&inner),
-            "simulated mark_downloaded failure",
+    inner
+        .acquire_lock("inject downloaded state failure")
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_downloaded BEFORE UPDATE ON assets WHEN NEW.status = 'downloaded'
+         BEGIN SELECT RAISE(ABORT, 'simulated mark_downloaded failure'); END;",
         )
-        .with_mark_downloaded_failure(),
-    );
+        .unwrap();
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
     let download_dir = tempfile::tempdir().expect("download tempdir");
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
@@ -780,18 +931,17 @@ async fn run_cycle_published_file_state_write_failure_blocks_token() {
         .mount(&server)
         .await;
 
-    let album = make_full_album_with_session(
+    let album = crate::sync_loop::test_support::make_owned_cycle_album(
+        &inner,
         "PrimarySync",
-        crate::test_helpers::MockPhotosSession::new()
-            .ok(album_count_response(1))
-            .ok(full_album_page_with_download(
-                "PrimarySync",
-                master_record_name,
-                "zone-tok-after-state-write-failure",
-                &format!("{}/photo.jpg", server.uri()),
-                body.len() as u64,
-                &checksum,
-            )),
+        "private",
+        Box::new(checkpoint_download_session(
+            master_record_name,
+            "zone-tok-after-state-write-failure",
+            &format!("{}/photo.jpg", server.uri()),
+            body.len() as u64,
+            &checksum,
+        )),
     );
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
@@ -803,7 +953,6 @@ async fn run_cycle_published_file_state_write_failure_blocks_token() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -878,31 +1027,28 @@ async fn run_cycle_album_membership_failure_preserves_and_replays_checkpoint() {
         .await;
 
     let config = make_run_cycle_config();
-    let inner = Arc::new(state::SqliteStateDb::open_in_memory().expect("state db"));
+    let state_dir = tempfile::tempdir().expect("state directory");
+    let inner =
+        crate::sync_loop::test_support::open_owned_cycle_db(&state_dir.path().join("state.db"))
+            .await;
     inner
         .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
         .expect("seed zone token");
     let db: Arc<dyn download::DownloadStore> = inner.clone();
     let download_dir = tempfile::tempdir().expect("download tempdir");
-    let media_path = download_dir.path().join("TestAlbum/cGhvdG8uanBn.JPG");
-    let page = full_album_page_with_download(
-        "PrimarySync",
+    let session = checkpoint_download_session(
         "master-PrimarySync",
         "zone-tok-new",
         &format!("{}/photo.jpg", server.uri()),
         body.len() as u64,
         &checksum,
     );
-    let album = make_full_album_with_session(
+    let album = crate::sync_loop::test_support::make_owned_cycle_album(
+        &inner,
         "PrimarySync",
-        crate::test_helpers::MockPhotosSession::new()
-            .ok(album_count_response(1))
-            .ok(page.clone())
-            .ok(album_count_response(1))
-            .ok(page.clone())
-            .ok(album_count_response(1))
-            .ok(page),
+        "private",
+        Box::new(session),
     );
     let lib_state = make_run_cycle_library_state_with_passes(
         "PrimarySync",
@@ -929,7 +1075,6 @@ async fn run_cycle_album_membership_failure_preserves_and_replays_checkpoint() {
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -938,18 +1083,30 @@ async fn run_cycle_album_membership_failure_preserves_and_replays_checkpoint() {
     .await
     .expect("run failed grouping cycle");
 
-    assert_eq!(failed.failed_count, 1, "cycle stats: {:?}", failed.stats);
+    assert_eq!(failed.failed_count, 2, "cycle stats: {:?}", failed.stats);
     assert_eq!(
         failed.stats.state_write_failures, 1,
         "cycle stats: {:?}",
         failed.stats
     );
-    assert_eq!(failed.stats.downloaded, 1);
-    assert_eq!(
-        std::fs::read(&media_path).expect("read landed media"),
-        body,
-        "the media must land even though grouping state is not durable"
-    );
+    assert!(failed.stats.identity_incomplete);
+    assert_eq!(failed.stats.failed, 0, "admission failed before transfer");
+    assert_eq!(failed.stats.downloaded, 0);
+    assert_eq!(failed.stats.bytes_downloaded, 0);
+    assert!(inner.get_downloaded_page(0, 10).await.unwrap().is_empty());
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let mut directories = vec![download_dir.path().to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            assert!(
+                entry.file_type().unwrap().is_dir(),
+                "grouping must become durable before any file is published: {:?}",
+                entry.path()
+            );
+            directories.push(entry.path());
+        }
+    }
     assert!(!failed.db_sync_token_advance_safe);
     assert_eq!(
         inner
@@ -969,12 +1126,12 @@ async fn run_cycle_album_membership_failure_preserves_and_replays_checkpoint() {
     );
 
     inner.allow_asset_album_writes_for_test();
+    let mut published_path = None;
     for cycle in 2..=3 {
         let recovered = run_cycle(
             &states,
             &config,
             Some(db.as_ref()),
-            false,
             &build_download_config,
             download::DownloadControls::download_hidden(),
             &shared_session,
@@ -985,10 +1142,26 @@ async fn run_cycle_album_membership_failure_preserves_and_replays_checkpoint() {
 
         assert_eq!(recovered.failed_count, 0);
         assert_eq!(recovered.stats.state_write_failures, 0);
+        assert!(!recovered.stats.identity_incomplete);
+        assert!(recovered.can_advance_database_checkpoint(), "{recovered:?}");
         assert_eq!(
-            recovered.stats.downloaded, 0,
-            "cycle {cycle} must not redownload landed media"
+            recovered.stats.downloaded,
+            usize::from(cycle == 2),
+            "publish once after grouping recovery, then remain quiet"
         );
+        let rows = inner.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id.as_ref(), "asset-master-PrimarySync");
+        let path = rows[0].local_path.as_ref().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), body);
+        if let Some(previous) = &published_path {
+            assert_eq!(
+                path, previous,
+                "quiet replay must retain the publication path"
+            );
+        }
+        published_path = Some(path.clone());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
         assert_eq!(
             inner
                 .get_all_asset_albums("PrimarySync")
@@ -999,6 +1172,14 @@ async fn run_cycle_album_membership_failure_preserves_and_replays_checkpoint() {
                 "TestAlbum".to_string()
             )],
             "cycle {cycle} must leave one idempotent relationship"
+        );
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("zone-tok-new")
         );
     }
     assert_eq!(
@@ -1011,14 +1192,15 @@ async fn run_cycle_album_membership_failure_preserves_and_replays_checkpoint() {
         "the checkpoint may advance after the grouping relationship is durable"
     );
     assert_eq!(
-        std::fs::read(&media_path).expect("read stable media"),
+        std::fs::read(published_path.unwrap()).expect("read stable media"),
         body,
         "grouping replay must not change landed media"
     );
+    server.verify().await;
 }
 
 #[tokio::test]
-async fn run_cycle_durable_expired_url_failure_advances_zone_checkpoint() {
+async fn run_cycle_durable_expired_url_failure_holds_zone_checkpoint_until_publication() {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -1028,28 +1210,32 @@ async fn run_cycle_durable_expired_url_failure_advances_zone_checkpoint() {
     Mock::given(method("GET"))
         .and(path("/expired.jpg"))
         .respond_with(ResponseTemplate::new(410))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
 
     let config = make_run_cycle_config();
     let state_dir = tempfile::tempdir().expect("state directory");
-    let db: Arc<dyn download::DownloadStore> = Arc::new(
-        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
-            .await
-            .expect("file-backed state"),
-    );
+    let database = state_dir.path().join("state.db");
+    let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
     db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
         .expect("seed zone token");
-    let body = b"expired-body";
+    let body = b"\xff\xd8\xff\xe0\x00\x10JFIF";
     let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
-    let album = make_one_photo_incremental_album_with_download(
-        "PrimarySync",
+    let session = checkpoint_download_session(
+        "master-expired",
         "zone-tok-next",
         &format!("{}/expired.jpg", server.uri()),
         body.len() as u64,
         &checksum,
+    );
+    let album = crate::sync_loop::test_support::make_owned_cycle_album(
+        &inner,
+        "PrimarySync",
+        "private",
+        Box::new(session.clone()),
     );
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
@@ -1062,7 +1248,6 @@ async fn run_cycle_durable_expired_url_failure_advances_zone_checkpoint() {
         &[&lib_state],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1079,10 +1264,68 @@ async fn run_cycle_durable_expired_url_failure_advances_zone_checkpoint() {
             .await
             .expect("read zone token")
             .as_deref(),
-        Some("zone-tok-next")
+        Some("zone-tok-prev")
     );
+    assert!(!result.can_advance_database_checkpoint());
     let summary = db.get_summary().await.expect("state summary");
     assert_eq!(summary.pending + summary.failed, 1);
+    server.verify().await;
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/expired.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    drop(build_download_config);
+    drop(lib_state);
+    drop(db);
+    drop(inner);
+    for cycle in 0..2 {
+        let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
+        let db: Arc<dyn download::DownloadStore> = inner.clone();
+        let library = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            crate::sync_loop::test_support::make_owned_cycle_album(
+                &inner,
+                "PrimarySync",
+                "private",
+                Box::new(session.clone()),
+            ),
+        );
+        let builder = make_run_cycle_download_config_builder(download_dir.path(), db.clone());
+        let result = run_cycle(
+            &[&library],
+            &config,
+            Some(db.as_ref()),
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failed_count, 0, "{result:?}");
+        assert_eq!(result.stats.downloaded, usize::from(cycle == 0));
+        assert!(result.can_advance_database_checkpoint(), "{result:?}");
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("zone-tok-next")
+        );
+        let rows = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+            body
+        );
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.pending + summary.failed, 0);
+    }
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -1102,30 +1345,36 @@ async fn run_cycle_expired_url_without_durable_retry_preserves_zone_checkpoint()
 
     let config = make_run_cycle_config();
     let state_dir = tempfile::tempdir().expect("state directory");
-    let inner: Arc<dyn download::DownloadStore> = Arc::new(
-        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
-            .await
-            .expect("file-backed state"),
-    );
+    let inner =
+        crate::sync_loop::test_support::open_owned_cycle_db(&state_dir.path().join("state.db"))
+            .await;
     inner
         .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
         .expect("seed zone token");
-    let db: Arc<dyn download::DownloadStore> = Arc::new(
-        FailingMetadataSetDb::without_set_failure(
-            Arc::clone(&inner),
-            "simulated pending-row write failure",
+    inner
+        .acquire_lock("inject pending state failure")
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_pending BEFORE INSERT ON assets
+         BEGIN SELECT RAISE(ABORT, 'simulated pending-row write failure'); END;",
         )
-        .with_upsert_seen_failure(),
-    );
+        .unwrap();
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
     let body = b"expired-body";
     let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
-    let album = make_one_photo_incremental_album_with_download(
-        "PrimarySync",
+    let session = checkpoint_download_session(
+        "master-expired",
         "zone-tok-next",
         &format!("{}/expired.jpg", server.uri()),
         body.len() as u64,
         &checksum,
+    );
+    let album = crate::sync_loop::test_support::make_owned_cycle_album(
+        &inner,
+        "PrimarySync",
+        "private",
+        Box::new(session),
     );
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
@@ -1138,7 +1387,6 @@ async fn run_cycle_expired_url_without_durable_retry_preserves_zone_checkpoint()
         &[&lib_state],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1147,8 +1395,23 @@ async fn run_cycle_expired_url_without_durable_retry_preserves_zone_checkpoint()
     .await
     .expect("expired URL cycle with failed pending-row write");
 
-    assert_eq!(result.failed_count, 1);
+    assert_eq!(
+        result.failed_count, 2,
+        "native state failure leaves selected admission deferred"
+    );
+    assert_eq!(
+        result.stats.failed, 0,
+        "no transfer starts before durable admission"
+    );
     assert_eq!(result.stats.state_write_failures, 1);
+    assert!(result.stats.identity_incomplete);
+    assert!(result.stats.sync_token_blocked);
+    assert_eq!(result.stats.downloaded, 0);
+    assert_eq!(result.stats.bytes_downloaded, 0);
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "failed retry admission must prevent the HTTP transfer"
+    );
     assert!(!result.db_sync_token_advance_safe);
     assert_eq!(
         inner
@@ -1161,10 +1424,14 @@ async fn run_cycle_expired_url_without_durable_retry_preserves_zone_checkpoint()
     );
     let summary = inner.get_summary().await.expect("state summary");
     assert_eq!(summary.pending + summary.failed, 0);
+    assert_eq!(summary.downloaded, 0);
+    assert!(inner.get_pending().await.unwrap().is_empty());
+    assert!(inner.get_failed().await.unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn run_cycle_durable_retry_survives_checkpoint_commit_failure() {
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -1174,29 +1441,42 @@ async fn run_cycle_durable_retry_survives_checkpoint_commit_failure() {
     Mock::given(method("GET"))
         .and(path("/expired.jpg"))
         .respond_with(ResponseTemplate::new(410))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
 
     let config = make_run_cycle_config();
-    let inner = make_state_db();
+    let state_dir = tempfile::tempdir().unwrap();
+    let database = state_dir.path().join("state.db");
+    let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
     inner
         .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
         .expect("seed zone token");
-    let db: Arc<dyn download::DownloadStore> = Arc::new(FailingMetadataSetDb::new(
-        Arc::clone(&inner),
-        MetadataSetFailure::Prefix(SYNC_TOKEN_PREFIX),
-        "simulated checkpoint commit failure",
-    ));
-    let body = b"expired-body";
+    inner
+        .acquire_lock("inject checkpoint failure")
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_zone_cursor BEFORE INSERT ON metadata
+         WHEN NEW.key = 'sync_token:PrimarySync'
+         BEGIN SELECT RAISE(ABORT, 'simulated checkpoint commit failure'); END;",
+        )
+        .unwrap();
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
+    let body = b"\xff\xd8\xff\xe0\x00\x10JFIF";
     let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
-    let album = make_one_photo_incremental_album_with_download(
-        "PrimarySync",
+    let session = checkpoint_download_session(
+        "master-expired",
         "zone-tok-next",
         &format!("{}/expired.jpg", server.uri()),
         body.len() as u64,
         &checksum,
+    );
+    let album = crate::sync_loop::test_support::make_owned_cycle_album(
+        &inner,
+        "PrimarySync",
+        "private",
+        Box::new(session.clone()),
     );
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
@@ -1209,7 +1489,6 @@ async fn run_cycle_durable_retry_survives_checkpoint_commit_failure() {
         &[&lib_state],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1235,17 +1514,97 @@ async fn run_cycle_durable_retry_survives_checkpoint_commit_failure() {
         1,
         "durable retry work must survive a failed checkpoint commit"
     );
+    server.verify().await;
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/expired.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    drop(build_download_config);
+    drop(lib_state);
+    drop(db);
+    drop(inner);
+    for cycle in 0..3 {
+        let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
+        let db: Arc<dyn download::DownloadStore> = inner.clone();
+        let library = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            crate::sync_loop::test_support::make_owned_cycle_album(
+                &inner,
+                "PrimarySync",
+                "private",
+                Box::new(session.clone()),
+            ),
+        );
+        let builder = make_run_cycle_download_config_builder(download_dir.path(), db.clone());
+        let result = run_cycle(
+            &[&library],
+            &config,
+            Some(db.as_ref()),
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failed_count, usize::from(cycle == 0), "{result:?}");
+        assert_eq!(result.stats.state_write_failures, usize::from(cycle == 0));
+        assert_eq!(result.stats.downloaded, usize::from(cycle == 0));
+        let rows = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+            body
+        );
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.pending + summary.failed, 0);
+        if cycle == 0 {
+            // Publication completed, so only the installed checkpoint fault can hold this cursor.
+            assert!(
+                capture.events().iter().any(|event| event
+                    .field("error")
+                    .is_some_and(|error| error.contains("simulated checkpoint commit failure"))),
+                "checkpoint trigger must actually fire after publication"
+            );
+            assert!(!result.can_advance_database_checkpoint(), "{result:?}");
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("zone-tok-prev")
+            );
+            inner
+                .acquire_lock("remove checkpoint failure")
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_zone_cursor;")
+                .unwrap();
+        } else {
+            assert!(result.can_advance_database_checkpoint(), "{result:?}");
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("zone-tok-next")
+            );
+        }
+    }
+    server.verify().await;
 }
 
 #[tokio::test]
 async fn run_cycle_failed_token_repair_preserves_prior_sqlite_checkpoint() {
     let config = make_run_cycle_config();
     let state_dir = tempfile::tempdir().expect("state directory");
-    let db: Arc<dyn download::DownloadStore> = Arc::new(
-        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
-            .await
-            .expect("file-backed state"),
-    );
+    let inner =
+        crate::sync_loop::test_support::open_owned_cycle_db(&state_dir.path().join("state.db"))
+            .await;
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
     db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
         .await
         .unwrap();
@@ -1257,7 +1616,12 @@ async fn run_cycle_failed_token_repair_preserves_prior_sqlite_checkpoint() {
     let lib_state = make_run_cycle_library_state_with_album(
         "PrimarySync",
         "sync_token:PrimarySync",
-        make_empty_full_album(""),
+        crate::sync_loop::test_support::make_owned_cycle_album(
+            &inner,
+            "PrimarySync",
+            "private",
+            Box::new(crate::test_helpers::DynamicRecentPhotosSession::new(0).with_token("")),
+        ),
     );
     let build_download_config =
         make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
@@ -1266,7 +1630,6 @@ async fn run_cycle_failed_token_repair_preserves_prior_sqlite_checkpoint() {
         &[&lib_state],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1303,7 +1666,10 @@ async fn run_cycle_failed_token_repair_preserves_prior_sqlite_checkpoint() {
 #[tokio::test]
 async fn run_cycle_legacy_pending_delete_self_heals_without_full_inventory() {
     let config = make_run_cycle_config();
-    let db = make_state_db();
+    let download_dir = tempfile::tempdir().expect("download tempdir");
+    let database = download_dir.path().join("state.db");
+    let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
     db.set_metadata("sync_token:PrimarySync", "zone-token-before-legacy-cleanup")
         .await
         .expect("seed zone token");
@@ -1315,15 +1681,16 @@ async fn run_cycle_legacy_pending_delete_self_heals_without_full_inventory() {
     )
     .await
     .expect("seed legacy pending row");
-    let album = make_full_album_with_boxed_session(
+    let album = crate::sync_loop::test_support::make_owned_cycle_album(
+        &inner,
         "PrimarySync",
+        "private",
         Box::new(LegacyPendingDeleteSession {
             master_record_name: Arc::from(master_record_name),
         }),
     );
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
-    let download_dir = tempfile::tempdir().expect("download tempdir");
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
     let observed_modes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let build_download_config = make_recording_run_cycle_download_config_builder(
@@ -1336,7 +1703,6 @@ async fn run_cycle_legacy_pending_delete_self_heals_without_full_inventory() {
         &[&lib_state],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1366,23 +1732,54 @@ async fn run_cycle_legacy_pending_delete_self_heals_without_full_inventory() {
     assert_eq!(summary.failed, 0);
     assert_eq!(summary.source_deleted, 1);
     assert_eq!(summary.awaiting_provider_verification, 0);
+    drop(build_download_config);
+    drop(lib_state);
+    drop(db);
+    drop(inner);
+    let reopened = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
+    assert_eq!(reopened.get_summary().await.unwrap().source_deleted, 1);
+    assert_eq!(
+        reopened
+            .get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("zone-token-after-legacy-cleanup")
+    );
 }
 
 #[tokio::test]
 async fn run_cycle_multi_zone_status_preserves_an_earlier_checkpoint_hold() {
     let config = make_run_cycle_config();
-    let db = make_state_db();
     let download_dir = tempfile::tempdir().expect("download tempdir");
+    let inner =
+        crate::sync_loop::test_support::open_owned_cycle_db(&download_dir.path().join("state.db"))
+            .await;
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
     let held = make_run_cycle_library_state_with_album(
         "PrimarySync",
         "sync_token:PrimarySync",
-        make_empty_full_album(""),
+        crate::sync_loop::test_support::make_owned_cycle_album(
+            &inner,
+            "PrimarySync",
+            "private",
+            Box::new(crate::test_helpers::DynamicRecentPhotosSession::new(0).with_token("")),
+        ),
     );
     let advanced = make_run_cycle_library_state_with_album(
         "SharedSync-TEST",
         "sync_token:SharedSync-TEST",
-        make_empty_full_album("shared-token"),
+        crate::sync_loop::test_support::make_owned_cycle_album(
+            &inner,
+            "SharedSync-TEST",
+            "shared",
+            Box::new(
+                crate::test_helpers::DynamicRecentPhotosSession::new(0)
+                    .with_zone("SharedSync-TEST")
+                    .with_token("shared-token"),
+            ),
+        ),
     );
     let build_download_config =
         make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
@@ -1391,7 +1788,6 @@ async fn run_cycle_multi_zone_status_preserves_an_earlier_checkpoint_hold() {
         &[&held, &advanced],
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1430,26 +1826,43 @@ async fn run_cycle_interrupted_incremental_download_blocks_sync_token_advance() 
         .mount(&server)
         .await;
     let config = make_run_cycle_config();
-    let inner = make_state_db();
+    let download_dir = tempfile::tempdir().expect("download tempdir");
+    let database = download_dir.path().join("state.db");
+    let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
     inner
         .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
         .await
         .expect("seed zone token");
     let shutdown_token = CancellationToken::new();
-    let db: Arc<dyn download::DownloadStore> = Arc::new(
-        FailingMetadataSetDb::without_set_failure(Arc::clone(&inner), "unused")
-            .with_cancel_on_upsert(shutdown_token.clone()),
-    );
-    let download_dir = tempfile::tempdir().expect("download tempdir");
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
+    let mut page = full_album_page_with_download(
+        "PrimarySync",
+        "master-cancelled",
+        "zone-tok-new",
+        &format!("{}/cancelled.jpg", server.uri()),
+        1024,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    page["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+        serde_json::json!("_defaultOwner");
     let lib_state = make_run_cycle_library_state_with_album(
         "PrimarySync",
         "sync_token:PrimarySync",
-        make_one_photo_incremental_album_for_zone(
+        crate::sync_loop::test_support::make_owned_cycle_album(
+            &inner,
             "PrimarySync",
-            "zone-tok-new",
-            &format!("{}/cancelled.jpg", server.uri()),
+            "private",
+            Box::new(crate::sync_loop::test_support::MutableCaptureSession {
+                zone: "PrimarySync",
+                token: "zone-tok-new",
+                cancel_after_lookup: Some(shutdown_token.clone()),
+                records: Arc::new(std::sync::Mutex::new(
+                    page["records"].as_array().unwrap().clone(),
+                )),
+                repair_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
         ),
     );
     let states = vec![&lib_state];
@@ -1460,7 +1873,6 @@ async fn run_cycle_interrupted_incremental_download_blocks_sync_token_advance() 
         &states,
         &config,
         Some(db.as_ref()),
-        false,
         &build_download_config,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1469,7 +1881,11 @@ async fn run_cycle_interrupted_incremental_download_blocks_sync_token_advance() 
     .await
     .expect("run cycle");
 
-    assert_eq!(result.failed_count, 0);
+    // Cancellation interrupts confirmation of one selected identity, before
+    // any transfer can fail or publish media.
+    assert_eq!(result.failed_count, 1, "{result:?}");
+    assert!(result.stats.identity_incomplete);
+    assert_eq!(result.stats.failed, 0);
     assert!(
         result.stats.interrupted,
         "cancellation before the download pass must be visible in cycle stats"
@@ -1495,6 +1911,22 @@ async fn run_cycle_interrupted_incremental_download_blocks_sync_token_advance() 
             .exists(),
         "test must not pass by completing the download before cancellation"
     );
+    assert!(inner.get_downloaded_page(0, 10).await.unwrap().is_empty());
+    server.verify().await;
+    drop(build_download_config);
+    drop(states);
+    drop(lib_state);
+    drop(db);
+    drop(inner);
+    let reopened = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
+    assert_eq!(
+        reopened
+            .get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("zone-tok-prev")
+    );
 }
 #[tokio::test]
 async fn checkpoint_pilot_holds_preserve_file_backed_state_across_cycles() {
@@ -1502,11 +1934,9 @@ async fn checkpoint_pilot_holds_preserve_file_backed_state_across_cycles() {
         let mut config = make_run_cycle_config();
         config.runtime.dry_run = hold == "dry_run";
         let state_dir = tempfile::tempdir().unwrap();
-        let db: Arc<dyn download::DownloadStore> = Arc::new(
-            state::SqliteStateDb::open(&state_dir.path().join("state.db"))
-                .await
-                .unwrap(),
-        );
+        let database = state_dir.path().join("state.db");
+        let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
+        let db: Arc<dyn download::DownloadStore> = inner.clone();
         db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
             .await
             .unwrap();
@@ -1517,29 +1947,41 @@ async fn checkpoint_pilot_holds_preserve_file_backed_state_across_cycles() {
         let existing_path = download_dir.path().join("unrelated.jpg");
         std::fs::write(&existing_path, b"existing media must not change").unwrap();
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-        let build_download_config =
-            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+        drop(db);
+        drop(inner);
         let controls = if config.runtime.dry_run {
             download::DownloadControls::dry_run_hidden()
         } else {
             download::DownloadControls::download_hidden()
         };
         for _ in 0..2 {
+            let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
+            let db: Arc<dyn download::DownloadStore> = inner.clone();
+            let build_download_config =
+                make_run_cycle_download_config_builder(download_dir.path(), db.clone());
             let mut library = make_run_cycle_library_state_with_album(
                 "PrimarySync",
                 "sync_token:PrimarySync",
-                make_empty_full_album(if hold == "missing_token" {
-                    ""
-                } else {
-                    "candidate-token"
-                }),
+                crate::sync_loop::test_support::make_owned_cycle_album(
+                    &inner,
+                    "PrimarySync",
+                    "private",
+                    Box::new(
+                        crate::test_helpers::DynamicRecentPhotosSession::new(0).with_token(
+                            if hold == "missing_token" {
+                                ""
+                            } else {
+                                "candidate-token"
+                            },
+                        ),
+                    ),
+                ),
             );
             library.plan_is_stale = hold == "stale_plan";
             let result = run_cycle(
                 &[&library],
                 &config,
                 Some(db.as_ref()),
-                false,
                 &build_download_config,
                 controls,
                 &shared_session,
@@ -1576,7 +2018,7 @@ async fn checkpoint_pilot_holds_preserve_file_backed_state_across_cycles() {
 }
 
 #[tokio::test]
-async fn full_checkpoint_pilot_advances_with_durable_transfer_failure() {
+async fn full_checkpoint_pilot_holds_durable_transfer_failure_until_publication() {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -1586,32 +2028,44 @@ async fn full_checkpoint_pilot_advances_with_durable_transfer_failure() {
     Mock::given(method("GET"))
         .and(path("/expired.jpg"))
         .respond_with(ResponseTemplate::new(410))
-        .expect(1)
+        // Initial transfer and the bounded current-record URL refresh.
+        .expect(2)
         .mount(&server)
         .await;
     let config = make_run_cycle_config();
     let state_dir = tempfile::tempdir().unwrap();
-    let db: Arc<dyn download::DownloadStore> = Arc::new(
-        state::SqliteStateDb::open(&state_dir.path().join("state.db"))
-            .await
-            .unwrap(),
-    );
+    let inner =
+        crate::sync_loop::test_support::open_owned_cycle_db(&state_dir.path().join("state.db"))
+            .await;
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
     let download_dir = tempfile::tempdir().unwrap();
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-    let body = b"expired-body";
+    let body = b"\xff\xd8\xff\xe0\x00\x10JFIF";
     let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
-    let album = make_full_album_with_session(
+    let mut page = full_album_page_with_download(
         "PrimarySync",
-        crate::test_helpers::MockPhotosSession::new()
-            .ok(album_count_response(1))
-            .ok(full_album_page_with_download(
-                "PrimarySync",
-                "master-full-expired",
-                "full-token",
-                &format!("{}/expired.jpg", server.uri()),
-                body.len() as u64,
-                &checksum,
-            )),
+        "master-full-expired",
+        "full-token",
+        &format!("{}/expired.jpg", server.uri()),
+        body.len() as u64,
+        &checksum,
+    );
+    page["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+        serde_json::json!("_defaultOwner");
+    let session = crate::sync_loop::test_support::MutableCaptureSession {
+        zone: "PrimarySync",
+        token: "full-token",
+        cancel_after_lookup: None,
+        records: Arc::new(std::sync::Mutex::new(
+            page["records"].as_array().unwrap().clone(),
+        )),
+        repair_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    let album = crate::sync_loop::test_support::make_owned_cycle_album(
+        &inner,
+        "PrimarySync",
+        "private",
+        Box::new(session.clone()),
     );
     let library =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
@@ -1620,7 +2074,6 @@ async fn full_checkpoint_pilot_advances_with_durable_transfer_failure() {
         &[&library],
         &config,
         Some(db.as_ref()),
-        false,
         &builder,
         download::DownloadControls::download_hidden(),
         &shared_session,
@@ -1636,11 +2089,71 @@ async fn full_checkpoint_pilot_advances_with_durable_transfer_failure() {
             .await
             .unwrap()
             .as_deref(),
-        Some("full-token")
+        None,
     );
     let summary = db.get_summary().await.unwrap();
     assert_eq!(summary.pending + summary.failed, 1);
     assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
+    server.verify().await;
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/expired.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    drop(builder);
+    drop(library);
+    drop(db);
+    drop(inner);
+    for cycle in 0..2 {
+        let inner =
+            crate::sync_loop::test_support::open_owned_cycle_db(&state_dir.path().join("state.db"))
+                .await;
+        let db: Arc<dyn download::DownloadStore> = inner.clone();
+        let library = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            crate::sync_loop::test_support::make_owned_cycle_album(
+                &inner,
+                "PrimarySync",
+                "private",
+                Box::new(session.clone()),
+            ),
+        );
+        let builder = make_run_cycle_download_config_builder(download_dir.path(), db.clone());
+        let result = run_cycle(
+            &[&library],
+            &config,
+            Some(db.as_ref()),
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
+        assert_eq!(result.stats.downloaded, usize::from(cycle == 0));
+        assert!(result.can_advance_database_checkpoint(), "{result:?}");
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("full-token")
+        );
+        let rows = inner.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+            body
+        );
+        assert_eq!(inner.get_summary().await.unwrap().pending, 0);
+        assert_eq!(inner.get_summary().await.unwrap().failed, 0);
+    }
+    server.verify().await;
 }
 
 #[derive(Clone)]
@@ -1682,8 +2195,10 @@ impl crate::icloud::photos::PhotosSession for ValidatedPageCycleSession {
                 ),
                 _ => (json!([]), "recovered", false),
             };
-            return Ok(json!({"zones": [{"zoneID": {"zoneName": "PrimarySync"},
-                "records": records, "syncToken": successor, "moreComing": more}]}));
+            return Ok(
+                json!({"zones": [{"zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                "records": records, "syncToken": successor, "moreComing": more}]}),
+            );
         }
         if url.contains("/records/lookup?") {
             return Ok(if self.phase < 2 {
@@ -1698,7 +2213,12 @@ impl crate::icloud::photos::PhotosSession for ValidatedPageCycleSession {
             anyhow::bail!("No authoritative fallback fixture");
         }
         if url.contains("/internal/records/query/batch?") {
-            return Ok(album_count_response(0));
+            return Ok(album_count_response(u64::from(self.phase == 1)));
+        }
+        if self.phase == 1 {
+            anyhow::bail!(
+                "Current inventory interrupted before selected membership was established"
+            );
         }
         Ok(json!({"records": [], "syncToken": if self.phase == 1 {"saved"} else {"recovered"}}))
     }
@@ -1717,7 +2237,7 @@ async fn run_cycle_rejected_zone_page_preserves_cursor_debt_and_media_across_res
         .await
         .unwrap();
     {
-        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        let db = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
         db.set_metadata("sync_token:PrimarySync", "saved")
             .await
             .unwrap();
@@ -1749,14 +2269,16 @@ async fn run_cycle_rejected_zone_page_preserves_cursor_debt_and_media_across_res
     }
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
     for phase in 0..4 {
-        let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
         let db: Arc<dyn download::DownloadStore> = inner.clone();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let library = make_run_cycle_library_state_with_album(
             "PrimarySync",
             "sync_token:PrimarySync",
-            make_full_album_with_boxed_session(
+            crate::sync_loop::test_support::make_owned_cycle_album(
+                &inner,
                 "PrimarySync",
+                "private",
                 Box::new(ValidatedPageCycleSession {
                     phase,
                     requests: requests.clone(),
@@ -1783,26 +2305,37 @@ async fn run_cycle_rejected_zone_page_preserves_cursor_debt_and_media_across_res
             &[&library],
             &config,
             Some(db.as_ref()),
-            false,
             &builder,
             download::DownloadControls::download_hidden(),
             &shared_session,
             &CancellationToken::new(),
         )
-        .await
-        .unwrap();
+        .await;
         let summary = inner.get_summary().await.unwrap();
         assert_eq!(
             tokio::fs::read(&media).await.unwrap(),
             b"historical media remains intact"
         );
         assert_eq!(summary.downloaded, 1, "phase {phase}");
-        assert_eq!(result.stats.downloaded, 0, "phase {phase}");
         let cursor = inner
             .get_metadata("sync_token:PrimarySync")
             .await
             .unwrap()
             .unwrap();
+        if phase == 0 {
+            let error = result.expect_err("authenticated capture must reject a foreign-zone page");
+            assert!(
+                format!("{error:#}").contains("Unexpected changes/zone scope"),
+                "{error:#}"
+            );
+            assert_eq!(cursor, "saved");
+            assert_eq!(summary.pending + summary.failed, 1);
+            assert_eq!(summary.source_deleted, 0);
+            assert_eq!(*requests.lock().unwrap(), ["saved", "accepted-page"]);
+            continue;
+        }
+        let result = result.unwrap();
+        assert_eq!(result.stats.downloaded, 0, "phase {phase}");
         if phase < 2 {
             assert_eq!(cursor, "saved", "phase {phase}");
             assert_eq!(
@@ -1820,9 +2353,6 @@ async fn run_cycle_rejected_zone_page_preserves_cursor_debt_and_media_across_res
             assert_eq!(summary.pending, 0);
             assert_eq!(summary.source_deleted, 1);
             assert!(result.db_sync_token_advance_safe, "phase {phase}");
-        }
-        if phase == 0 {
-            assert_eq!(*requests.lock().unwrap(), ["saved", "accepted-page"]);
         }
         if phase == 3 {
             assert!(result.stats.full_enumeration_reason.is_none());
@@ -1850,7 +2380,7 @@ impl crate::icloud::photos::PhotosSession for DownloadReplayPageSession {
         use serde_json::json;
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
         if url.contains("/changes/zone?") {
-            let token = body["zones"][0]["syncToken"].as_str().unwrap();
+            let token = body["zones"][0]["syncToken"].as_str().unwrap_or("");
             self.requests.lock().unwrap().push(format!("delta:{token}"));
             let (records, successor, more) = match (self.phase, token) {
                 (0, "saved") => (self.earlier.clone(), "accepted-page", true),
@@ -1866,14 +2396,38 @@ impl crate::icloud::photos::PhotosSession for DownloadReplayPageSession {
                 (2, "saved") => (self.earlier.clone(), "accepted-page", true),
                 (2, "accepted-page") => (self.debt.clone(), "recovered", false),
                 (3 | 4, "recovered") => (vec![], "recovered", false),
+                (1, "") => (vec![], "saved", false),
+                (2..=4, "") => (
+                    self.earlier.iter().chain(&self.debt).cloned().collect(),
+                    "recovered",
+                    false,
+                ),
                 _ => anyhow::bail!("Unexpected replay phase or cursor"),
             };
-            return Ok(json!({"zones": [{"zoneID": {"zoneName": "PrimarySync"},
-                "records": records, "syncToken": successor, "moreComing": more}]}));
+            return Ok(
+                json!({"zones": [{"zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                "records": records, "syncToken": successor, "moreComing": more}]}),
+            );
         }
         if url.contains("/records/lookup?") {
             self.requests.lock().unwrap().push("lookup".to_owned());
-            return Ok(json!({"records": if self.phase < 2 {vec![]} else {self.debt.clone()}}));
+            let records: Vec<_> = if self.phase < 2 {
+                Vec::new()
+            } else {
+                self.earlier
+                    .iter()
+                    .chain(&self.debt)
+                    .filter(|record| {
+                        body["records"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|requested| requested["recordName"] == record["recordName"])
+                    })
+                    .cloned()
+                    .collect()
+            };
+            return Ok(json!({"records": records}));
         }
         // A malformed delta must not be rescued by invented authoritative
         // inventory. Later recent-selection queries see the same valid work.
@@ -1884,7 +2438,14 @@ impl crate::icloud::photos::PhotosSession for DownloadReplayPageSession {
         }
         if url.contains("/records/query?") {
             self.requests.lock().unwrap().push("query".to_owned());
-            let records = if self.phase == 1 {
+            let offset = body["query"]["filterBy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                .unwrap_or(0);
+            let records = if self.phase == 1 || offset > 0 {
                 vec![]
             } else {
                 self.earlier.iter().chain(&self.debt).cloned().collect()
@@ -1932,6 +2493,8 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
             page["records"][0]["fields"]["filenameEnc"]["value"] = serde_json::json!(
                 base64::engine::general_purpose::STANDARD.encode(format!("{name}.jpg"))
             );
+            page["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+                serde_json::json!("_defaultOwner");
             page["records"].as_array().unwrap().clone()
         };
         let config = make_run_cycle_config();
@@ -1944,7 +2507,7 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
         tokio::fs::write(&historical, history_bytes).await.unwrap();
         let history_snapshot;
         {
-            let db = state::SqliteStateDb::open(&database).await.unwrap();
+            let db = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
             db.set_metadata("sync_token:PrimarySync", "saved")
                 .await
                 .unwrap();
@@ -1988,17 +2551,18 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
             history_snapshot = db.get_downloaded_page(0, 10).await.unwrap().remove(0);
         }
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-        let mut earlier_snapshot = None;
         let mut recovered_snapshot = None;
         for phase in 0..5 {
-            let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+            let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
             let db: Arc<dyn download::DownloadStore> = inner.clone();
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let library = make_run_cycle_library_state_with_album(
+            let mut library = make_run_cycle_library_state_with_album(
                 "PrimarySync",
                 "sync_token:PrimarySync",
-                make_full_album_with_boxed_session(
+                crate::sync_loop::test_support::make_owned_cycle_album(
+                    &inner,
                     "PrimarySync",
+                    "private",
                     Box::new(DownloadReplayPageSession {
                         phase,
                         earlier: records("earlier"),
@@ -2008,6 +2572,21 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
                     }),
                 ),
             );
+            if collecting {
+                // Multiple passes enter the production collecting strategy;
+                // the primary pass still selects every original input record.
+                let mut peer = library.plan.passes[0].clone();
+                peer.exclude_ids = Arc::new(
+                    [
+                        "asset-master-earlier".into(),
+                        "asset-master-debt".into(),
+                        "asset-master-rejected".into(),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+                library.plan.passes.push(peer);
+            }
             if phase == 1 {
                 let mut precheck = crate::sync_loop::precheck::WatchPrecheck::SkipAll;
                 crate::sync_loop::precheck::include_pending_local_work(
@@ -2022,29 +2601,33 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
             let builder = make_run_cycle_download_config_builder_with_options(
                 &media_dir,
                 db.clone(),
-                RunCycleDownloadConfigOptions {
-                    recent: collecting.then_some(10),
-                    ..RunCycleDownloadConfigOptions::default()
-                },
+                RunCycleDownloadConfigOptions::default(),
             );
             let result = run_cycle(
                 &[&library],
                 &config,
                 Some(db.as_ref()),
-                false,
                 &builder,
                 download::DownloadControls::download_hidden(),
                 &shared_session,
                 &CancellationToken::new(),
             )
-            .await
-            .unwrap();
+            .await;
+            let result = if phase == 0 {
+                assert!(
+                    result.is_err(),
+                    "rejected source page must propagate its refusal"
+                );
+                None
+            } else {
+                Some(result.unwrap())
+            };
             drop(builder);
             drop(db);
             drop(inner);
 
             // Read the committed outcomes through a new SQLite connection.
-            let db = state::SqliteStateDb::open(&database).await.unwrap();
+            let db = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
             let summary = db.get_summary().await.unwrap();
             let rows = db.get_downloaded_page(0, 10).await.unwrap();
             let history = rows
@@ -2083,41 +2666,51 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
             if phase < 2 {
                 assert_eq!(cursor, "saved", "collecting={collecting} phase={phase}");
                 assert_eq!(summary.pending + summary.failed, 1);
-                assert!(!result.can_advance_database_checkpoint());
-                assert_eq!(summary.downloaded, if collecting { 1 } else { 2 });
+                if let Some(result) = &result {
+                    assert_eq!(phase, 1);
+                    assert!(
+                        result.can_advance_database_checkpoint(),
+                        "empty current selection is complete: {result:?}"
+                    );
+                    assert_eq!(result.failed_count, 0);
+                    assert_eq!(result.stats.assets_seen, 0);
+                    assert_eq!(result.stats.downloaded, 0);
+                    assert!(!result.stats.identity_incomplete);
+                }
+                assert!(
+                    server.received_requests().await.unwrap().is_empty(),
+                    "no current publication is admitted before phase 2"
+                );
+                assert_eq!(summary.source_deleted, 0);
+                assert_eq!(
+                    summary.downloaded, 1,
+                    "rejected source inventory must not publish partial work"
+                );
                 let mut pending = db.get_pending().await.unwrap();
                 pending.extend(db.get_failed().await.unwrap());
                 assert_eq!(pending.len(), 1);
                 assert_eq!(pending[0].id.as_ref(), "asset-master-debt");
                 assert_eq!(pending[0].checksum.as_ref(), checksum);
                 assert_eq!(pending[0].filename.as_ref(), "debt.jpg");
-                // The marker schedules replay; a completed quiet delta may
-                // clear it while durable targeted-retry work remains.
-                if phase == 0 {
-                    assert!(
-                        db.get_metadata(&state::unresolved_identity_key("PrimarySync"))
-                            .await
-                            .unwrap()
-                            .is_some()
-                    );
-                }
-                if !collecting {
-                    let row = rows
-                        .iter()
-                        .find(|row| row.id.as_ref() == "asset-master-earlier")
-                        .unwrap();
-                    if phase == 0 {
-                        earlier_snapshot = Some(row.clone());
-                    }
-                    assert_eq!(
-                        row.local_path,
-                        earlier_snapshot.as_ref().unwrap().local_path
-                    );
-                    assert_eq!(
-                        row.downloaded_at,
-                        earlier_snapshot.as_ref().unwrap().downloaded_at
-                    );
-                }
+                assert_eq!(pending[0].size_bytes, bytes.len() as u64);
+                assert_eq!(
+                    db.get_master_record_name_for_asset("PrimarySync", "asset-master-debt")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("master-debt"),
+                    "empty current selection must preserve historical identity evidence"
+                );
+                // Rejected input retains the replay marker. A complete empty
+                // current selection consumes that scheduling marker, not the
+                // unresolved historical row or its provider identity.
+                assert_eq!(
+                    db.get_metadata(&state::unresolved_identity_key("PrimarySync"))
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    if phase == 0 { Some("1") } else { None }
+                );
             } else {
                 assert_eq!(cursor, "recovered");
                 assert_eq!(summary.pending + summary.failed, 0);
@@ -2126,7 +2719,19 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
                     "recovery must download, not delete"
                 );
                 assert_eq!(summary.downloaded, 3);
-                assert!(result.can_advance_database_checkpoint(), "{result:?}");
+                assert_eq!(
+                    result.as_ref().unwrap().stats.downloaded,
+                    if phase == 2 { 2 } else { 0 }
+                );
+                assert_eq!(
+                    server.received_requests().await.unwrap().len(),
+                    2,
+                    "current recovery publishes each source once across quiet reopens"
+                );
+                assert!(
+                    result.as_ref().unwrap().can_advance_database_checkpoint(),
+                    "{result:?}"
+                );
                 assert!(
                     db.get_metadata(&state::unresolved_identity_key("PrimarySync"))
                         .await
@@ -2147,16 +2752,6 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
                     assert_eq!(row.local_checksum, saved.local_checksum);
                     assert_eq!(row.downloaded_at, saved.downloaded_at);
                 }
-                if !collecting {
-                    let row = rows
-                        .iter()
-                        .find(|row| row.id.as_ref() == "asset-master-earlier")
-                        .unwrap();
-                    assert_eq!(
-                        row.downloaded_at,
-                        earlier_snapshot.as_ref().unwrap().downloaded_at
-                    );
-                }
             }
             if phase == 0 || phase == 2 {
                 assert_eq!(
@@ -2165,6 +2760,7 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
                 );
             }
             if phase > 2 {
+                let result = result.as_ref().unwrap();
                 assert_eq!(result.stats.downloaded, 0);
                 assert_eq!(*requests.lock().unwrap(), ["delta:recovered"]);
                 assert!(result.stats.full_enumeration_reason.is_none());
@@ -2267,7 +2863,9 @@ async fn account_adoption_reopens_owned_state_and_runs_two_production_quiet_cycl
         .await
         .bind_principal(&authenticated, None)
         .unwrap();
-    for cycle in 0..2 {
+    // Adoption retains source history, but current selection still needs one
+    // real inventory before two reopened cycles can prove quiet execution.
+    for cycle in 0..3 {
         assert_eq!(
             state::db::account::state_path(directory.path(), username, "com")
                 .await
@@ -2282,15 +2880,21 @@ async fn account_adoption_reopens_owned_state_and_runs_two_production_quiet_cycl
         let db: Arc<dyn download::DownloadStore> = inner.clone();
         // The quiet synthetic source reports the retained cursor, rather than
         // creating an artificial full-scan anchor or replacing historical work.
-        let library=make_run_cycle_library_state_with_album("PrimarySync","sync_token:PrimarySync",
-            make_full_album_with_session("PrimarySync",crate::test_helpers::MockPhotosSession::new()
-                .ok(serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync"},"records":[],"syncToken":"adopted-cursor","moreComing":false}]}))));
+        let album = crate::sync_loop::test_support::make_captured_cycle_album(
+            "PrimarySync",
+            crate::icloud::photos::inbox::ShadowCapture::new(inner.clone(), owner.clone(), "com"),
+            Box::new(
+                crate::test_helpers::DynamicRecentPhotosSession::new(0)
+                    .with_token("adopted-cursor"),
+            ),
+        );
+        let library =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
         let builder = make_run_cycle_download_config_builder(directory.path(), db.clone());
         let result = run_cycle(
             &[&library],
             &config,
             Some(db.as_ref()),
-            false,
             &builder,
             download::DownloadControls::download_hidden(),
             &shared,
@@ -2299,11 +2903,13 @@ async fn account_adoption_reopens_owned_state_and_runs_two_production_quiet_cycl
         .await
         .unwrap();
         assert_eq!(result.stats.downloaded, 0, "cycle {cycle}");
-        assert_eq!(result.failed_count, 0, "cycle {cycle}");
-        assert!(
-            result.stats.full_enumeration_reason.is_none(),
-            "cycle {cycle}: {result:?}"
-        );
+        assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
+        if cycle > 0 {
+            assert!(
+                result.stats.full_enumeration_reason.is_none(),
+                "cycle {cycle}: {result:?}"
+            );
+        }
         assert!(
             result.db_sync_token_advance_safe,
             "cycle {cycle}: {result:?}"
@@ -2397,8 +3003,8 @@ async fn run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_res
         let db: Arc<dyn download::DownloadStore> = inner.clone();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         if phase == 0 {
-            inner.acquire_lock("inject shadow receipt failure").unwrap().execute_batch(
-                "CREATE TRIGGER shadow_cycle_fault BEFORE INSERT ON provider_shadow_receipts BEGIN SELECT RAISE(ABORT,'synthetic capture fault'); END").unwrap();
+            inner.acquire_lock("inject shadow page failure").unwrap().execute_batch(
+                "CREATE TRIGGER shadow_cycle_fault AFTER INSERT ON provider_shadow_pages BEGIN SELECT RAISE(ABORT,'synthetic capture fault'); END").unwrap();
         } else if phase == 1 {
             inner
                 .acquire_lock("remove injected capture fault")
@@ -2408,14 +3014,14 @@ async fn run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_res
         }
         let capture =
             crate::icloud::photos::inbox::ShadowCapture::new(inner.clone(), owner.clone(), "com");
-        let mut album = make_full_album_with_boxed_session(
+        let album = crate::sync_loop::test_support::make_captured_cycle_album(
             "PrimarySync",
+            capture,
             Box::new(ValidatedPageCycleSession {
                 phase,
                 requests: requests.clone(),
             }),
         );
-        album.set_shadow_capture(capture, Arc::from("private"));
         let library =
             make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
         if phase == 1 {
@@ -2438,7 +3044,6 @@ async fn run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_res
             &[&library],
             &config,
             Some(db.as_ref()),
-            false,
             &builder,
             download::DownloadControls::download_hidden(),
             &shared_session,
@@ -2448,7 +3053,10 @@ async fn run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_res
         if phase == 0 {
             let error =
                 result.expect_err("capture refusal must propagate, not run a rank fallback");
-            assert!(format!("{error:#}").contains("synthetic capture fault"));
+            assert!(
+                format!("{error:#}").contains("synthetic capture fault"),
+                "{error:#}"
+            );
             assert_eq!(*requests.lock().unwrap(), ["saved"]);
             let summary = inner.get_summary().await.unwrap();
             assert_eq!(summary.downloaded, 1);
@@ -2518,19 +3126,20 @@ async fn run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_res
         if phase == 3 {
             assert!(result.stats.full_enumeration_reason.is_none());
             assert_eq!(*requests.lock().unwrap(), ["recovered"]);
-            let conn = inner
-                .acquire_lock("capture does not clear historical debt")
-                .unwrap();
-            let receipt: String = conn.query_row("SELECT p.successor FROM provider_shadow_receipts r JOIN provider_shadow_pages p ON p.id=r.page_id",[],|r|r.get(0)).unwrap();
-            assert_eq!(receipt, "recovered");
+            // Only the page carrying the DEBT deletion survives the restart.
+            // Both empty terminal pages are reclaimed after capture.
+            let conn = inner.acquire_lock("retained recovery page").unwrap();
             assert_eq!(
-                conn.query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_shadow_pages",
-                    [],
-                    |r| r.get(0)
-                )
-                .unwrap(),
-                3
+                conn.prepare("SELECT request_cursor, successor FROM provider_shadow_pages")
+                    .unwrap()
+                    .query_map([], |row| Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?
+                    )))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap(),
+                [("saved".to_owned(), "recovered".to_owned())]
             );
         }
     }

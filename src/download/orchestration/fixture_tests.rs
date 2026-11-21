@@ -28,6 +28,7 @@ use crate::test_helpers::MockPhotosFlow;
 use super::dispatch::download_photos_with_sync;
 use super::models::SyncMode;
 use super::test_support::{incremental_photo_records_with_url, mock_album};
+use super::test_support::{open_fixture_db, selected_pass_with_session};
 
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(
@@ -54,6 +55,8 @@ fn records(name: &str, uti: &str, server: &MockServer, bytes: &[u8]) -> Vec<Valu
     records[0]["fields"]["itemType"] = json!({"value": uti});
     records[0]["fields"]["resOriginalFileType"] = json!({"value": uti});
     records[1]["fields"]["isFavorite"] = json!({"value": 1});
+    records[1]["fields"]["masterRef"]["value"]["zoneID"] =
+        json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
     records
 }
 
@@ -76,8 +79,18 @@ fn pass(records: Vec<Value>) -> AlbumPass {
     }
 }
 
-async fn cycle(config: &DownloadConfig, records: Vec<Value>) -> super::models::SyncResult {
-    cycle_passes(config, &[pass(records)]).await
+use super::test_support::SelectedMediaSession;
+
+fn selected_pass(db: &Arc<SqliteStateDb>, name: &str, records: Vec<Value>) -> AlbumPass {
+    selected_pass_with_session(db, name, Box::new(SelectedMediaSession(Arc::new(records))))
+}
+
+async fn selected_cycle(
+    config: &DownloadConfig,
+    db: &Arc<SqliteStateDb>,
+    records: Vec<Value>,
+) -> super::models::SyncResult {
+    cycle_passes(config, &[selected_pass(db, "", records)]).await
 }
 
 async fn cycle_passes(config: &DownloadConfig, passes: &[AlbumPass]) -> super::models::SyncResult {
@@ -135,7 +148,7 @@ async fn bundled_media_download_finalize_reopen_and_second_sync() {
             .await;
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("state.db");
-        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let db = open_fixture_db(&db_path).await;
         let mut config = DownloadConfig::test_default();
         config.directory = Arc::from(dir.path().join("media"));
         config.folder_structure = String::new();
@@ -143,7 +156,7 @@ async fn bundled_media_download_finalize_reopen_and_second_sync() {
         config.state_db = Some(db.clone());
         let filename = Path::new(name).file_name().unwrap().to_str().unwrap();
         let records = records(filename, uti, &server, &source);
-        let result = cycle(&config, records.clone()).await;
+        let result = selected_cycle(&config, &db, records.clone()).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{name}: {result:?}"
@@ -165,9 +178,9 @@ async fn bundled_media_download_finalize_reopen_and_second_sync() {
         );
         config.state_db = None;
         drop(db);
-        let reopened = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let reopened = open_fixture_db(&db_path).await;
         config.state_db = Some(reopened.clone());
-        let result = cycle(&config, records).await;
+        let result = selected_cycle(&config, &reopened, records).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{name}: {result:?}"
@@ -216,7 +229,7 @@ async fn bundled_heif_prepublication_xmp_preserves_media_and_checksum_roles() {
             .await;
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("state.db");
-        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let db = open_fixture_db(&db_path).await;
         let mut config = DownloadConfig::test_default();
         config.directory = Arc::from(dir.path().join("media"));
         config.folder_structure = String::new();
@@ -231,7 +244,7 @@ async fn bundled_heif_prepublication_xmp_preserves_media_and_checksum_roles() {
             "public.heic"
         };
         let records = records(filename, uti, &server, &source);
-        let result = cycle(&config, records.clone()).await;
+        let result = selected_cycle(&config, &db, records.clone()).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{name}: {result:?}"
@@ -266,9 +279,9 @@ async fn bundled_heif_prepublication_xmp_preserves_media_and_checksum_roles() {
         );
         config.state_db = None;
         drop(db);
-        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let db = open_fixture_db(&db_path).await;
         config.state_db = Some(db.clone());
-        let result = cycle(&config, records).await;
+        let result = selected_cycle(&config, &db, records).await;
         assert!(matches!(result.outcome, DownloadOutcome::Success));
         assert_eq!(result.stats.downloaded, 0);
         assert!(
@@ -333,14 +346,14 @@ async fn bundled_live_photo_modes_preserve_pair_and_companion_naming() {
             json!({"value": "com.apple.quicktime-movie"});
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("state.db");
-        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let db = open_fixture_db(&db_path).await;
         let mut config = DownloadConfig::test_default();
         config.directory = Arc::from(dir.path().join("media"));
         config.folder_structure = String::new();
         config.sync_mode = SyncMode::Full;
         config.live_photo_mode = mode;
         config.state_db = Some(db.clone());
-        let result = cycle(&config, records.clone()).await;
+        let result = selected_cycle(&config, &db, records.clone()).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{mode:?}: {:?}; failed={:?}",
@@ -350,7 +363,7 @@ async fn bundled_live_photo_modes_preserve_pair_and_companion_naming() {
         assert_eq!(result.stats.downloaded, expected_names.len(), "{mode:?}");
         config.state_db = None;
         drop(db);
-        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let db = open_fixture_db(&db_path).await;
         config.state_db = Some(db.clone());
         let rows = db.get_downloaded_page(0, 10).await.unwrap();
         let mut names: Vec<_> = rows
@@ -368,7 +381,7 @@ async fn bundled_live_photo_modes_preserve_pair_and_companion_naming() {
             .collect();
         names.sort();
         assert_eq!(names, expected_names, "{mode:?}");
-        let result = cycle(&config, records).await;
+        let result = selected_cycle(&config, &db, records).await;
         assert!(matches!(result.outcome, DownloadOutcome::Success));
         assert_eq!(result.stats.downloaded, 0);
         assert!(db.get_pending().await.unwrap().is_empty());
@@ -402,14 +415,14 @@ async fn bundled_invalid_download_retains_retry_evidence_then_recovers_after_res
         let records = records("retry.jpg", "public.jpeg", &server, &source);
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("state.db");
-        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let db = open_fixture_db(&db_path).await;
         let mut config = DownloadConfig::test_default();
         config.directory = Arc::from(dir.path().join("media"));
         config.folder_structure = String::new();
         config.sync_mode = SyncMode::Full;
         config.retry.max_retries = 0;
         config.state_db = Some(db.clone());
-        let result = cycle(&config, records.clone()).await;
+        let result = selected_cycle(&config, &db, records.clone()).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::PartialFailure { .. }),
             "{result:?}"
@@ -429,7 +442,7 @@ async fn bundled_invalid_download_retains_retry_evidence_then_recovers_after_res
         }
         config.state_db = None;
         drop(db);
-        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let db = open_fixture_db(&db_path).await;
         assert_eq!(db.get_failed().await.unwrap().len(), 1);
         assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
         config.state_db = Some(db.clone());
@@ -444,7 +457,7 @@ async fn bundled_invalid_download_retains_retry_evidence_then_recovers_after_res
             .mount(&server)
             .await;
         for expected_downloads in [1, 0] {
-            let result = cycle(&config, records.clone()).await;
+            let result = selected_cycle(&config, &db, records.clone()).await;
             assert!(
                 matches!(result.outcome, DownloadOutcome::Success),
                 "{result:?}"

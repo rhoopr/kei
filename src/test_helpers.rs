@@ -6,6 +6,7 @@
 pub(crate) mod allocation;
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -14,6 +15,152 @@ use serde_json::{Value, json};
 use crate::icloud::photos::PhotoAsset;
 use crate::icloud::photos::session::PhotosSession;
 use crate::state::types::{AssetMetadata, AssetRecord, MediaType, VersionSizeKey};
+
+/// Check exact saved cursor bytes before and after fresh-start retirement.
+/// A retired cursor must be preserved as evidence and absent from live state.
+pub(crate) fn assert_checkpoint_evidence(conn: &rusqlite::Connection, key: &str, expected: &str) {
+    let retired: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='historical_v030_checkpoints')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let table = if retired {
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM metadata WHERE key=?1", [key], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        "historical_v030_checkpoints"
+    } else {
+        "metadata"
+    };
+    assert_eq!(
+        conn.query_row(
+            &format!("SELECT value FROM {table} WHERE key=?1"),
+            [key],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        expected
+    );
+}
+
+/// Directories created by this release's temporary upgrade bundle.
+///
+/// A successful verified upgrade removes its own directory. Failures,
+/// interruptions, and prior-release bundles remain for diagnosis.
+pub(crate) fn temporary_backup_bundles(root: &Path) -> Vec<PathBuf> {
+    bundle_paths(root)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".kei-schema-backup-tmp-"))
+        })
+        .collect()
+}
+
+/// A successful verified upgrade must not leave this release's bundle behind.
+pub(crate) fn assert_no_temporary_backup_bundles(root: &Path) {
+    let remaining = temporary_backup_bundles(root);
+    assert!(
+        remaining.is_empty(),
+        "successful upgrade left temporary bundles under {}: {remaining:?}",
+        root.display()
+    );
+}
+
+/// Copy `path` through SQLite's backup API before a production open, then
+/// return the self-contained copy. A successful upgrade deletes its own
+/// temporary bundle, so callers needing exact pre-upgrade evidence must
+/// snapshot the fixture first.
+pub(crate) fn snapshot_database(path: &Path) -> rusqlite::Connection {
+    let snapshot = path.with_file_name(format!("pre-upgrade-snapshot-{}.db", uuid::Uuid::new_v4()));
+    let destination = {
+        let source = rusqlite::Connection::open(path).unwrap();
+        let mut destination = rusqlite::Connection::open(&snapshot).unwrap();
+        {
+            let backup = rusqlite::backup::Backup::new(&source, &mut destination).unwrap();
+            match backup.step(-1).unwrap() {
+                rusqlite::backup::StepResult::Done => {}
+                other => panic!("snapshot backup did not complete: {other:?}"),
+            }
+        }
+        destination
+    };
+    // The backup copies the source database header, including WAL mode. Fold
+    // that into the snapshot so callers need no companion files.
+    let mode: String = destination
+        .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    destination
+}
+
+fn bundle_paths(root: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".kei-schema-backup-"))
+        })
+        .collect()
+}
+
+/// Complete recovery bundles under `root`, opened read-only.
+///
+/// After a successful upgrade only retained failure or prior-release bundles
+/// remain. Bundle name UUIDs are not chronology; callers with more than one
+/// bundle must verify every snapshot rather than treating the first as the
+/// latest.
+pub(crate) fn recovery_bundle_connections(root: &Path) -> Vec<rusqlite::Connection> {
+    let mut bundles = bundle_paths(root)
+        .into_iter()
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .extension()
+                    .is_none_or(|extension| extension != "partial")
+                && path.join("manifest.json").is_file()
+        })
+        .collect::<Vec<_>>();
+    bundles.sort();
+    bundles
+        .into_iter()
+        .map(|bundle| {
+            rusqlite::Connection::open_with_flags(
+                bundle.join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+pub(crate) fn assert_no_retired_inbox_archive(conn: &rusqlite::Connection) {
+    for table in [
+        "historical_v030_provider_shadow_pages",
+        "historical_v030_provider_shadow_records",
+        "historical_v030_provider_shadow_receipts",
+    ] {
+        assert!(
+            !conn
+                .query_row::<bool, _, _>(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            "{table} must not be copied into the live database"
+        );
+    }
+}
 
 /// Synthetic QuickTime track metadata without an ISO FullBox prefix.
 #[cfg(feature = "xmp")]
@@ -834,6 +981,17 @@ impl DynamicRecentPhotosSession {
     pub fn emitted_ids(&self) -> Vec<String> {
         self.emitted_ids.lock().expect("emitted ids lock").clone()
     }
+
+    fn records_at(&self, index: usize) -> Vec<Value> {
+        let mut records = mock_photo_records_for_zone_with_filename(
+            &self.ids[index],
+            &self.zone,
+            &format!("{}-{index:04}.jpg", self.filename_prefix),
+        );
+        records[1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+            json!("_defaultOwner");
+        records
+    }
 }
 
 #[async_trait::async_trait]
@@ -844,10 +1002,35 @@ impl PhotosSession for DynamicRecentPhotosSession {
         body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
+        if url.contains("/changes/zone?") {
+            return Ok(
+                json!({"zones":[{"zoneID":{"zoneName":self.zone.as_ref(),"ownerRecordName":"_defaultOwner"},"syncToken":self.token.as_ref(),"moreComing":false,"records":[]}]}),
+            );
+        }
         if url.contains("/internal/records/query/batch") {
             return Ok(json!({
                 "batch": [{"records": [{"fields": {"itemCount": {"value": self.ids.len() as u64}}}]}]
             }));
+        }
+
+        if url.contains("/records/lookup?") {
+            let request: Value = serde_json::from_str(&body)?;
+            let mut records = Vec::new();
+            for wanted in request["records"].as_array().expect("lookup records") {
+                let name = wanted["recordName"].as_str().expect("lookup record name");
+                let found = self.ids.iter().enumerate().find_map(|(index, id)| {
+                    (name == id || name == format!("asset-{id}")).then(|| {
+                        self.records_at(index)
+                            .into_iter()
+                            .find(|record| record["recordName"] == name)
+                            .unwrap()
+                    })
+                });
+                records.push(found.unwrap_or_else(
+                    || json!({"recordName":name,"serverErrorCode":"UNKNOWN_ITEM"}),
+                ));
+            }
+            return Ok(json!({"records":records}));
         }
 
         if !url.contains("/records/query?") {
@@ -893,11 +1076,7 @@ impl PhotosSession for DynamicRecentPhotosSession {
         for index in start..end {
             let id = &self.ids[index];
             emitted.push(id.clone());
-            records.extend(mock_photo_records_for_zone_with_filename(
-                id,
-                &self.zone,
-                &format!("{}-{index:04}.jpg", self.filename_prefix),
-            ));
+            records.extend(self.records_at(index));
         }
         drop(emitted);
 

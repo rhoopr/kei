@@ -27,7 +27,9 @@ pub(crate) struct PathReconciliationResult {
     pub(crate) stats: SyncStats,
 }
 
-fn classify_reconciliation_io_error(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
+pub(super) fn classify_reconciliation_io_error(
+    error: &anyhow::Error,
+) -> Option<std::io::ErrorKind> {
     error
         .downcast_ref::<std::io::Error>()
         .map(std::io::Error::kind)
@@ -74,6 +76,28 @@ pub(crate) async fn reconcile_catalog_paths_with_client(
     let Some(provider_pass) = passes.first() else {
         return Ok(PathReconciliationResult::default());
     };
+
+    if !config.provisional
+        && let Some(context) = Box::pin(super::generation::context(
+            passes,
+            &config,
+            super::models::DownloadControls::new(
+                super::models::DownloadRunMode::Download,
+                super::models::DownloadReporting::new(true, crate::personality::Mode::Off),
+            ),
+        ))
+        .await?
+    {
+        // Current selection owns recorded destinations and missing-file replay.
+        // Copying catalog rows into newly rendered paths here would create work
+        // before selection and bypass those bindings. Dispatch still performs
+        // recovery, and the cycle gates config activation on its final result.
+        context.current().await?;
+        return Ok(PathReconciliationResult {
+            complete: true,
+            ..PathReconciliationResult::default()
+        });
+    }
 
     let protected_paths =
         crate::download::legacy_preservation::protected_replacement_paths(Some(db.as_ref()))

@@ -44,9 +44,7 @@ pub enum AuthError {
     )]
     TerminalAppleAuth { code: String, message: String },
 
-    #[error(
-        "Two-factor authentication is required. Run `kei login get-code`, then `kei login submit-code <CODE>`."
-    )]
+    #[error("Two-factor authentication is required.")]
     TwoFactorRequired,
 
     /// The Apple ID has FIDO/WebAuthn hardware security keys registered.
@@ -276,10 +274,7 @@ mod tests {
     #[test]
     fn two_factor_required_display() {
         let err = AuthError::TwoFactorRequired;
-        assert_eq!(
-            err.to_string(),
-            "Two-factor authentication is required. Run `kei login get-code`, then `kei login submit-code <CODE>`."
-        );
+        assert_eq!(err.to_string(), "Two-factor authentication is required.");
     }
 
     #[test]

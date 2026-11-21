@@ -13,16 +13,36 @@ use wiremock::{Mock, ResponseTemplate};
 use crate::icloud::photos::{PhotoLibrary, PhotosSession};
 use crate::sync_cycle::{ENUM_CONFIG_HASH_KEY, indexing_reconciliation_key, run_cycle};
 use crate::sync_loop::test_support::{
-    FailingMetadataSetDb, MetadataSetFailure, album_count_response, full_album_page_with_download,
-    make_full_album_with_boxed_session, make_run_cycle_config,
-    make_run_cycle_download_config_builder, make_run_cycle_library_state_with_album,
-    make_shared_session_for_run_cycle,
+    album_count_response, full_album_page_with_download, make_captured_cycle_album,
+    make_run_cycle_config, make_run_cycle_download_config_builder,
+    make_run_cycle_library_state_with_album, make_shared_session_for_run_cycle,
 };
 use crate::{download, retry, state};
 
 const ZONE: &str = "PrimarySync";
 const CURSOR: &str = "sync_token:PrimarySync";
 const BYTES: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+
+fn indexing_owner() -> state::db::account::AccountOwner {
+    state::db::account::AccountOwner::authenticated(
+        "indexing@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo": {"dsid": "indexing-fixture"}})).unwrap(),
+    )
+    .unwrap()
+}
+
+async fn indexing_db(path: &std::path::Path) -> Arc<state::SqliteStateDb> {
+    Arc::new(
+        state::SqliteStateDb::open_owned(path, &indexing_owner())
+            .await
+            .unwrap(),
+    )
+}
+
+fn indexing_capture(db: &Arc<state::SqliteStateDb>) -> crate::icloud::photos::inbox::ShadowCapture {
+    crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), indexing_owner(), "com")
+}
 
 #[derive(Clone)]
 struct IndexingSession {
@@ -64,9 +84,15 @@ impl PhotosSession for IndexingSession {
         if url.contains("/changes/zone?") {
             let cursor = request["zones"][0]["syncToken"]
                 .as_str()
-                .unwrap()
+                .unwrap_or("<bootstrap>")
                 .to_owned();
             self.changes.lock().unwrap().push(cursor);
+            if request["zones"][0]["syncToken"].is_null() {
+                return Ok(json!({"zones": [{
+                    "zoneID": {"zoneName": ZONE, "ownerRecordName": "_defaultOwner"},
+                    "records": self.records.as_ref(), "syncToken": "query-candidate", "moreComing": false
+                }]}));
+            }
             if self.reject_cursor {
                 return Ok(
                     json!({"zones":[{"zoneID":{"zoneName":ZONE,"ownerRecordName":"_defaultOwner"},
@@ -81,7 +107,12 @@ impl PhotosSession for IndexingSession {
             );
         }
         if url.contains("/records/lookup?") {
-            return Ok(json!({"records":self.records.as_ref()}));
+            let records: Vec<_> = request["records"].as_array().unwrap().iter().map(|wanted| {
+                self.change_records.iter().chain(self.records.iter())
+                    .find(|record| record["recordName"] == wanted["recordName"])
+                    .cloned().unwrap_or_else(|| json!({"recordName": wanted["recordName"], "serverErrorCode": "UNKNOWN_ITEM"}))
+            }).collect();
+            return Ok(json!({"records": records}));
         }
         if url.contains("/records/query/batch?") {
             return Ok(album_count_response(
@@ -130,7 +161,10 @@ fn provider(readiness: &'static str, ids: &[&str], base: &str) -> IndexingSessio
                 BYTES.len() as u64,
                 &checksum,
             );
-            page["records"][0]["fields"]["filenameEnc"]["value"] = json!(format!("{id}.jpg"));
+            page["records"][0]["fields"]["filenameEnc"]["value"] =
+                json!(base64::engine::general_purpose::STANDARD.encode(format!("{id}.jpg")));
+            page["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+                json!("_defaultOwner");
             page["records"].as_array().unwrap().clone()
         })
         .collect();
@@ -148,18 +182,21 @@ fn provider(readiness: &'static str, ids: &[&str], base: &str) -> IndexingSessio
     }
 }
 
-async fn library(provider: &IndexingSession) -> crate::sync_cycle::LibraryState {
+async fn library(
+    provider: &IndexingSession,
+    db: &Arc<state::SqliteStateDb>,
+) -> crate::sync_cycle::LibraryState {
     let mut library = make_run_cycle_library_state_with_album(
         ZONE,
         CURSOR,
-        make_full_album_with_boxed_session(ZONE, Box::new(provider.clone())),
+        make_captured_cycle_album(ZONE, indexing_capture(db), Box::new(provider.clone())),
     );
     // Use the real readiness constructor and request path, not the legacy stub.
     library.library = PhotoLibrary::new(
         "https://example.com".into(),
         Arc::new(HashMap::new()),
         Box::new(provider.clone()),
-        Arc::new(json!({"zoneName":ZONE})),
+        Arc::new(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})),
         "private".into(),
         retry::RetryConfig {
             max_retries: 0,
@@ -168,6 +205,7 @@ async fn library(provider: &IndexingSession) -> crate::sync_cycle::LibraryState 
     )
     .await
     .unwrap();
+    library.library.shadow_capture = Some(indexing_capture(db));
     library
 }
 
@@ -197,16 +235,15 @@ async fn indexing_restart_recovers_omitted_assets_and_reuses_downloaded_files() 
         (3, "FINISHED", vec!["existing", "provisional", "omitted"]),
         (4, "FINISHED", vec![]),
     ] {
-        let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        let inner = indexing_db(&database).await;
         let db: Arc<dyn download::DownloadStore> = inner.clone();
         let provider = provider(readiness, &ids, &server.uri());
-        let library = library(&provider).await;
+        let library = library(&provider, &inner).await;
         let build = make_run_cycle_download_config_builder(&media, db.clone());
         let result = run_cycle(
             &[&library],
             &config,
             Some(db.as_ref()),
-            false,
             &build,
             download::DownloadControls::download_hidden(),
             &shared,
@@ -306,6 +343,7 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
         "regressed",
         "unknown",
     ] {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         let root = tempfile::tempdir().unwrap();
         let database = root.path().join("state.db");
         let media = root.path().join("media");
@@ -315,7 +353,7 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
         let config = make_run_cycle_config();
         let hold = indexing_reconciliation_key(ZONE);
         {
-            let db = state::SqliteStateDb::open(&database).await.unwrap();
+            let db = indexing_db(&database).await;
             db.set_metadata(CURSOR, "trusted-before").await.unwrap();
             db.set_metadata(
                 ENUM_CONFIG_HASH_KEY,
@@ -338,17 +376,20 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
                 state::METADATA_CAPTURE_REVISION,
             );
         }
-        let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
-        let raw: Arc<dyn download::DownloadStore> = inner.clone();
-        let db: Arc<dyn download::DownloadStore> = if fault == "checkpoint_write" {
-            Arc::new(FailingMetadataSetDb::new(
-                raw,
-                MetadataSetFailure::Prefix(crate::sync_cycle::INDEXING_REPLAY_PREFIX),
-                "injected inventory qualification failure",
-            ))
-        } else {
-            raw
-        };
+        let inner = indexing_db(&database).await;
+        if fault == "checkpoint_write" {
+            inner
+                .acquire_lock("inject inventory qualification failure")
+                .unwrap()
+                .execute_batch(&format!(
+                    "CREATE TEMP TRIGGER indexing_replay_fault BEFORE INSERT ON metadata
+                 WHEN NEW.key = '{}'
+                 BEGIN SELECT RAISE(ABORT, 'injected inventory qualification failure'); END;",
+                    crate::sync_cycle::indexing_replay_key(ZONE),
+                ))
+                .unwrap();
+        }
+        let db: Arc<dyn download::DownloadStore> = inner.clone();
         let mut provider = provider("FINISHED", &[], "http://unused.invalid");
         let cancel = CancellationToken::new();
         if fault == "malformed" {
@@ -361,6 +402,8 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
                 "checksum",
             );
             bad["records"][1]["fields"]["assetDate"]["value"] = Value::Null;
+            bad["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+                json!("_defaultOwner");
             provider.records = Arc::new(bad["records"].as_array().unwrap().clone());
         }
         if fault == "interrupted" {
@@ -369,7 +412,7 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
         if fault == "regressed" {
             provider.regress_after_query = true;
         }
-        let library = library(&provider).await;
+        let library = library(&provider, &inner).await;
         if fault == "unknown" {
             *provider.readiness.lock().unwrap() = "UNKNOWN";
         }
@@ -379,7 +422,6 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
             &[&library],
             &config,
             Some(db.as_ref()),
-            false,
             &build,
             download::DownloadControls::download_hidden(),
             &shared,
@@ -394,10 +436,29 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
                 "{fault}"
             );
         }
+        if fault == "checkpoint_write" {
+            assert!(provider.queries.load(Ordering::SeqCst) > 0);
+            assert!(
+                capture
+                    .events()
+                    .iter()
+                    .any(|event| event.field("error").is_some_and(
+                        |error| error.contains("injected inventory qualification failure")
+                    )),
+                "qualification trigger must actually execute"
+            );
+            assert!(
+                inner
+                    .get_metadata(&crate::sync_cycle::indexing_replay_key(ZONE))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
         drop(build);
         drop(db);
         drop(inner);
-        let reopened = state::SqliteStateDb::open(&database).await.unwrap();
+        let reopened = indexing_db(&database).await;
         assert_eq!(
             reopened.get_metadata(CURSOR).await.unwrap().as_deref(),
             Some("trusted-before"),
@@ -432,7 +493,7 @@ async fn indexing_provisional_listing_preserves_membership_pending_rows_and_medi
         std::fs::create_dir(&media).unwrap();
         let media_path = media.join("old.jpg");
         std::fs::write(&media_path, BYTES).unwrap();
-        let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        let db = indexing_db(&database).await;
         let config = make_run_cycle_config();
         db.set_metadata(
             ENUM_CONFIG_HASH_KEY,
@@ -482,7 +543,7 @@ async fn indexing_provisional_listing_preserves_membership_pending_rows_and_medi
         provider.change_records = Arc::new(vec![json!({
             "recordName":"asset-old-IN-trip","recordType":"CPLContainerRelation","deleted":true
         })]);
-        let mut library = library(&provider).await;
+        let mut library = library(&provider, &db).await;
         library.plan.passes = vec![AlbumPass {
             kind: PassKind::Album,
             album: PhotoAlbum::new(
@@ -490,11 +551,13 @@ async fn indexing_provisional_listing_preserves_membership_pending_rows_and_medi
                     params: Arc::new(HashMap::new()),
                     service_endpoint: Arc::from("https://example.com"),
                     name: Arc::from("Trip"),
-                    list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
-                    obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
-                    query_filter: None,
+                    list_type: Arc::from("CPLContainerRelationLiveByAssetDate"),
+                    obj_type: Arc::from("CPLContainerRelationNotDeletedByAssetDate:trip"),
+                    query_filter: Some(Arc::new(
+                        json!([{"fieldName":"parentId","comparator":"EQUALS","fieldValue":{"type":"STRING","value":"trip"}}]),
+                    )),
                     page_size: 100,
-                    zone_id: Arc::new(json!({"zoneName":ZONE})),
+                    zone_id: Arc::new(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})),
                     retry_config: retry::RetryConfig::default(),
                     container_id: Some(Arc::from("trip")),
                     cross_zone_sources: Vec::new(),
@@ -503,6 +566,9 @@ async fn indexing_provisional_listing_preserves_membership_pending_rows_and_medi
             ),
             exclude_ids: Arc::default(),
         }];
+        library.plan.passes[0]
+            .album
+            .set_shadow_capture(indexing_capture(&db), Arc::from("private"));
         let store: Arc<dyn download::DownloadStore> = db.clone();
         let build = make_run_cycle_download_config_builder(&media, store.clone());
         let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
@@ -510,7 +576,6 @@ async fn indexing_provisional_listing_preserves_membership_pending_rows_and_medi
             &[&library],
             &config,
             Some(store.as_ref()),
-            false,
             &build,
             download::DownloadControls::download_hidden(),
             &shared,
@@ -555,11 +620,22 @@ async fn indexing_provisional_listing_preserves_membership_pending_rows_and_medi
             "even a qualified inventory defers its deletion-capable replay"
         );
         if scenario == "QUALIFIED" {
+            let completed: i64 = rusqlite::Connection::open(&database)
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM album_membership_snapshots WHERE status='complete'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                completed, 1,
+                "inventory alone cannot certify the new snapshot"
+            );
             run_cycle(
                 &[&library],
                 &config,
                 Some(store.as_ref()),
-                false,
                 &build,
                 download::DownloadControls::download_hidden(),
                 &shared,
@@ -581,13 +657,16 @@ async fn indexing_provisional_listing_preserves_membership_pending_rows_and_medi
             "deletion is deferred until a previously qualified inventory permits trusted replay"
         );
         let snapshots: i64 = connection
-            .query_row("SELECT COUNT(*) FROM album_membership_snapshots", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM album_membership_snapshots WHERE status='complete'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(
-            snapshots, 1,
-            "provisional queries do not certify album snapshots"
+            snapshots,
+            1 + i64::from(scenario == "QUALIFIED"),
+            "only the subsequent trusted replay may certify a new album snapshot: {scenario}"
         );
     }
 }
@@ -595,20 +674,21 @@ async fn indexing_provisional_listing_preserves_membership_pending_rows_and_medi
 #[tokio::test]
 async fn indexing_hold_write_failure_stops_before_listing_or_downloading() {
     let root = tempfile::tempdir().unwrap();
-    let inner = Arc::new(
-        state::SqliteStateDb::open(&root.path().join("state.db"))
-            .await
-            .unwrap(),
-    );
+    let inner = indexing_db(&root.path().join("state.db")).await;
     inner.set_metadata(CURSOR, "trusted-before").await.unwrap();
-    let raw: Arc<dyn download::DownloadStore> = inner.clone();
-    let db: Arc<dyn download::DownloadStore> = Arc::new(FailingMetadataSetDb::new(
-        raw,
-        MetadataSetFailure::Prefix(crate::sync_cycle::INDEXING_RECONCILIATION_PREFIX),
-        "injected indexing hold failure",
-    ));
+    inner
+        .acquire_lock("inject indexing hold failure")
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TEMP TRIGGER indexing_hold_fault BEFORE INSERT ON metadata
+         WHEN NEW.key = '{}'
+         BEGIN SELECT RAISE(ABORT, 'injected indexing hold failure'); END;",
+            indexing_reconciliation_key(ZONE),
+        ))
+        .unwrap();
+    let db: Arc<dyn download::DownloadStore> = inner.clone();
     let provider = provider("RUNNING", &["new-photo"], "http://unused.invalid");
-    let library = library(&provider).await;
+    let library = library(&provider, &inner).await;
     let config = make_run_cycle_config();
     let build = make_run_cycle_download_config_builder(root.path(), db.clone());
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
@@ -616,14 +696,17 @@ async fn indexing_hold_write_failure_stops_before_listing_or_downloading() {
         &[&library],
         &config,
         Some(db.as_ref()),
-        false,
         &build,
         download::DownloadControls::download_hidden(),
         &shared,
         &CancellationToken::new(),
     )
     .await;
-    assert!(result.is_err());
+    let error = result.expect_err("native indexing hold write must fail");
+    assert!(
+        format!("{error:#}").contains("injected indexing hold failure"),
+        "{error:#}"
+    );
     assert_eq!(provider.queries.load(Ordering::SeqCst), 0);
     assert!(provider.changes.lock().unwrap().is_empty());
     assert_eq!(
@@ -631,38 +714,46 @@ async fn indexing_hold_write_failure_stops_before_listing_or_downloading() {
         Some("trusted-before")
     );
     assert!(inner.get_downloaded_page(0, 10).await.unwrap().is_empty());
+    assert!(
+        inner
+            .get_metadata(&indexing_reconciliation_key(ZONE))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(inner.get_pending().await.unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn indexing_cross_zone_source_requires_reconciliation_without_permanent_hold() {
     let root = tempfile::tempdir().unwrap();
-    let db = state::SqliteStateDb::open(&root.path().join("state.db"))
-        .await
-        .unwrap();
+    let db = indexing_db(&root.path().join("state.db")).await;
     let primary = provider("FINISHED", &[], "http://unused.invalid");
     let shared = provider("RUNNING", &[], "http://unused.invalid");
-    let mut library = library(&primary).await;
+    let mut library = library(&primary, &db).await;
     library.cross_zone_libraries.push(
         PhotoLibrary::new(
             "https://example.com".into(),
             Arc::new(HashMap::new()),
             Box::new(shared.clone()),
-            Arc::new(json!({"zoneName":"SharedSync-TEST"})),
+            Arc::new(json!({"zoneName":"SharedSync-TEST","ownerRecordName":"_defaultOwner"})),
             "shared".into(),
             retry::RetryConfig::default(),
         )
         .await
         .unwrap(),
     );
-    let (finished, hold) = crate::sync_cycle::prepare_library_indexing(&library, Some(&db), false)
-        .await
-        .unwrap();
+    let (finished, hold) =
+        crate::sync_cycle::prepare_library_indexing(&library, Some(db.as_ref()), false)
+            .await
+            .unwrap();
     assert!(!finished);
     assert!(hold.is_some());
     *shared.readiness.lock().unwrap() = "FINISHED";
-    let (finished, hold) = crate::sync_cycle::prepare_library_indexing(&library, Some(&db), false)
-        .await
-        .unwrap();
+    let (finished, hold) =
+        crate::sync_cycle::prepare_library_indexing(&library, Some(db.as_ref()), false)
+            .await
+            .unwrap();
     assert!(finished);
     assert!(
         hold.is_some(),
@@ -671,9 +762,10 @@ async fn indexing_cross_zone_source_requires_reconciliation_without_permanent_ho
     db.delete_metadata_by_prefix(&indexing_reconciliation_key(ZONE))
         .await
         .unwrap();
-    let (finished, hold) = crate::sync_cycle::prepare_library_indexing(&library, Some(&db), false)
-        .await
-        .unwrap();
+    let (finished, hold) =
+        crate::sync_cycle::prepare_library_indexing(&library, Some(db.as_ref()), false)
+            .await
+            .unwrap();
     assert!(finished);
     assert!(
         hold.is_none(),
@@ -682,7 +774,7 @@ async fn indexing_cross_zone_source_requires_reconciliation_without_permanent_ho
 }
 
 #[tokio::test]
-async fn indexing_retry_only_keeps_hold_until_normal_inventory_recovers_omitted_photo() {
+async fn indexing_normal_recovery_restores_failed_and_omitted_photos_across_restart() {
     let server = wiremock::MockServer::start().await;
     for id in ["known", "omitted", "late"] {
         Mock::given(method("GET"))
@@ -699,7 +791,7 @@ async fn indexing_retry_only_keeps_hold_until_normal_inventory_recovers_omitted_
     let config = make_run_cycle_config();
     let hold = indexing_reconciliation_key(ZONE);
     {
-        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        let db = indexing_db(&database).await;
         db.set_metadata(CURSOR, "trusted-before").await.unwrap();
         db.set_metadata(
             ENUM_CONFIG_HASH_KEY,
@@ -720,26 +812,25 @@ async fn indexing_retry_only_keeps_hold_until_normal_inventory_recovers_omitted_
             .unwrap();
     }
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
-    for (round, retry_only) in [true, false, true, false].into_iter().enumerate() {
-        let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+    for round in 0..4 {
+        let inner = indexing_db(&database).await;
         let db: Arc<dyn download::DownloadStore> = inner.clone();
-        let mut session = provider("FINISHED", &["known", "omitted"], &server.uri());
-        if round >= 2 {
+        let ids = if round == 0 {
+            vec!["known", "omitted"]
+        } else {
+            vec!["known", "omitted", "late"]
+        };
+        let mut session = provider("FINISHED", &ids, &server.uri());
+        if round == 1 {
             session.change_records = provider("FINISHED", &["late"], &server.uri()).records;
         }
         let provider = session;
-        let library = library(&provider).await;
-        let base = make_run_cycle_download_config_builder(&media, db.clone());
-        let build = |mode, exclude, groups, zone| {
-            let mut config = base(mode, exclude, groups, zone);
-            Arc::make_mut(&mut config).retry_only = retry_only;
-            config
-        };
+        let library = library(&provider, &inner).await;
+        let build = make_run_cycle_download_config_builder(&media, db.clone());
         let result = run_cycle(
             &[&library],
             &config,
             Some(db.as_ref()),
-            retry_only,
             &build,
             download::DownloadControls::download_hidden(),
             &shared,
@@ -748,44 +839,44 @@ async fn indexing_retry_only_keeps_hold_until_normal_inventory_recovers_omitted_
         .await
         .unwrap();
         assert_eq!(result.failed_count, 0, "{:?}", result.stats);
-        assert_eq!(result.can_advance_database_checkpoint(), round == 3);
+        assert_eq!(result.can_advance_database_checkpoint(), round > 0);
         assert_eq!(
             inner.get_metadata(CURSOR).await.unwrap().as_deref(),
-            Some(if round < 3 {
+            Some(if round == 0 {
                 "trusted-before"
             } else {
                 "trusted-after"
             })
         );
-        assert_eq!(
-            inner.get_metadata(&hold).await.unwrap().is_some(),
-            round == 0
-        );
-        assert_eq!(
-            inner.get_downloaded_page(0, 10).await.unwrap().len(),
-            if round == 0 {
-                1
-            } else if round == 3 {
-                3
-            } else {
-                2
-            }
-        );
+        assert!(inner.get_metadata(&hold).await.unwrap().is_none());
+        let downloaded = inner.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(downloaded.len(), if round == 0 { 2 } else { 3 });
+        for record in downloaded {
+            assert_eq!(std::fs::read(record.local_path.unwrap()).unwrap(), BYTES);
+        }
+        assert!(inner.get_pending().await.unwrap().is_empty());
         assert_eq!(
             inner
                 .get_metadata(&crate::sync_cycle::indexing_replay_key(ZONE))
                 .await
                 .unwrap()
                 .is_some(),
-            round == 1 || round == 2
+            round == 0
         );
-        if round < 2 {
+        if round == 0 {
             assert!(
                 provider.changes.lock().unwrap().is_empty(),
-                "held/retry inventory must retain old cursor"
+                "qualification inventory must retain old cursor"
             );
         } else {
-            assert_eq!(*provider.changes.lock().unwrap(), ["trusted-before"]);
+            assert_eq!(
+                *provider.changes.lock().unwrap(),
+                [if round == 1 {
+                    "trusted-before"
+                } else {
+                    "trusted-after"
+                }]
+            );
         }
     }
     server.verify().await;
@@ -805,11 +896,7 @@ async fn indexing_running_plan_cannot_qualify_after_late_finished_probe() {
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
     std::fs::create_dir(&media).unwrap();
-    let db = Arc::new(
-        state::SqliteStateDb::open(&root.path().join("state.db"))
-            .await
-            .unwrap(),
-    );
+    let db = indexing_db(&root.path().join("state.db")).await;
     let mut config = make_run_cycle_config();
     config.filters.selection.albums = AlbumSelector::All {
         excluded: Default::default(),
@@ -826,7 +913,7 @@ async fn indexing_running_plan_cannot_qualify_after_late_finished_probe() {
     let mut provider = provider("RUNNING", &["omitted"], &server.uri());
     let transition = Arc::new(AtomicBool::new(false));
     provider.catalog = Some(transition.clone());
-    let primary = library(&provider).await.library;
+    let primary = library(&provider, &db).await.library;
     let libraries = vec![primary.clone()];
     let mut service = PhotosService::for_testing_with_libraries(
         Box::new(provider.clone()),
@@ -834,6 +921,7 @@ async fn indexing_running_plan_cannot_qualify_after_late_finished_probe() {
         HashMap::from([(ZONE.to_owned(), primary)]),
         HashMap::new(),
     );
+    service.set_shadow_capture(indexing_capture(&db));
     let (mut states, mut context) =
         crate::sync_loop::planning::resolve_library_plans(&mut service, &libraries, &config)
             .await
@@ -864,7 +952,6 @@ async fn indexing_running_plan_cannot_qualify_after_late_finished_probe() {
             &states.iter().collect::<Vec<_>>(),
             &config,
             Some(store.as_ref()),
-            false,
             &build,
             download::DownloadControls::download_hidden(),
             &shared,
@@ -894,11 +981,7 @@ async fn indexing_running_plan_cannot_qualify_after_late_finished_probe() {
 #[tokio::test]
 async fn indexing_qualified_replay_keeps_expired_trusted_cursor_and_recovery_debt() {
     let root = tempfile::tempdir().unwrap();
-    let db = Arc::new(
-        state::SqliteStateDb::open(&root.path().join("state.db"))
-            .await
-            .unwrap(),
-    );
+    let db = indexing_db(&root.path().join("state.db")).await;
     let config = make_run_cycle_config();
     db.set_metadata(
         ENUM_CONFIG_HASH_KEY,
@@ -911,7 +994,7 @@ async fn indexing_qualified_replay_keeps_expired_trusted_cursor_and_recovery_deb
     db.set_metadata(&replay, "1").await.unwrap();
     let mut provider = provider("FINISHED", &[], "http://unused.invalid");
     provider.reject_cursor = true;
-    let library = library(&provider).await;
+    let library = library(&provider, &db).await;
     let store: Arc<dyn download::DownloadStore> = db.clone();
     let build = make_run_cycle_download_config_builder(root.path(), store.clone());
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
@@ -919,7 +1002,6 @@ async fn indexing_qualified_replay_keeps_expired_trusted_cursor_and_recovery_deb
         &[&library],
         &config,
         Some(store.as_ref()),
-        false,
         &build,
         download::DownloadControls::download_hidden(),
         &shared,
@@ -952,7 +1034,7 @@ async fn indexing_materialization_debt_refreshes_finished_scope_after_reopen() {
     let root = tempfile::tempdir().unwrap();
     let database = root.path().join("state.db");
     {
-        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        let db = indexing_db(&database).await;
         db.set_metadata(
             &crate::sync_cycle::indexing_materialization_key(ZONE),
             "future-version",
@@ -960,7 +1042,7 @@ async fn indexing_materialization_debt_refreshes_finished_scope_after_reopen() {
         .await
         .unwrap();
     }
-    let db = state::SqliteStateDb::open(&database).await.unwrap();
+    let db = indexing_db(&database).await;
     let mut config = make_run_cycle_config();
     config.filters.selection.albums = AlbumSelector::All {
         excluded: Default::default(),
@@ -969,7 +1051,7 @@ async fn indexing_materialization_debt_refreshes_finished_scope_after_reopen() {
     config.filters.selection.albums_explicit = false;
     let mut provider = provider("FINISHED", &[], "http://unused.invalid");
     provider.catalog = Some(Arc::new(AtomicBool::new(false)));
-    let primary = library(&provider).await.library;
+    let primary = library(&provider, &db).await.library;
     let libraries = vec![primary.clone()];
     let mut service = PhotosService::for_testing_with_libraries(
         Box::new(provider),
@@ -977,6 +1059,7 @@ async fn indexing_materialization_debt_refreshes_finished_scope_after_reopen() {
         HashMap::from([(ZONE.to_owned(), primary)]),
         HashMap::new(),
     );
+    service.set_shadow_capture(indexing_capture(&db));
     let (mut states, mut context) =
         crate::sync_loop::planning::resolve_library_plans(&mut service, &libraries, &config)
             .await
@@ -987,7 +1070,7 @@ async fn indexing_materialization_debt_refreshes_finished_scope_after_reopen() {
         &mut service,
         &libraries,
         &config,
-        Some(&db),
+        Some(db.as_ref()),
         &mut states,
         &mut context,
     )
@@ -1039,7 +1122,7 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
         let config = make_run_cycle_config();
         let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
         {
-            let db = state::SqliteStateDb::open(&path).await.unwrap();
+            let db = indexing_db(&path).await;
             db.set_metadata(CURSOR, "trusted-before").await.unwrap();
             db.set_metadata(
                 ENUM_CONFIG_HASH_KEY,
@@ -1049,7 +1132,7 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
             .unwrap();
         }
         for step in 0..5 {
-            let db = Arc::new(state::SqliteStateDb::open(&path).await.unwrap());
+            let db = indexing_db(&path).await;
             let readiness = if step == 0 { "RUNNING" } else { "FINISHED" };
             let ids = if step == 0 {
                 vec!["provisional"]
@@ -1065,7 +1148,7 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
                     record["fields"]["isHidden"] = json!({"value":1,"type":"INT64"});
                 }
             }
-            let mut selected = library(&source).await;
+            let mut selected = library(&source, &db).await;
             let hidden = crate::icloud::photos::smart_folders::smart_folders()
                 .into_iter()
                 .find(|(name, _)| *name == "Hidden")
@@ -1093,6 +1176,9 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
                 ),
                 exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
             }];
+            selected.plan.passes[0]
+                .album
+                .set_shadow_capture(indexing_capture(&db), Arc::from("private"));
             selected.pass_scope = crate::commands::PassScope {
                 include_albums: false,
                 include_smart_folders: true,
@@ -1105,15 +1191,20 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
                 &[&selected],
                 &config,
                 Some(store.as_ref()),
-                false,
                 &build,
                 download::DownloadControls::download_hidden(),
                 &shared,
                 &CancellationToken::new(),
             )
             .with_subscriber(tracing_subscriber::registry().with(recorder))
-            .await
-            .unwrap();
+            .await;
+            let result = if step == 2 {
+                let error = result.expect_err("blank source successor must be refused");
+                assert!(format!("{error:#}").contains("Missing changes/zone successor"));
+                None
+            } else {
+                Some(result.unwrap())
+            };
             assert_eq!(std::fs::read(&retained).unwrap(), BYTES, "step {step}");
             let rows = db.get_downloaded_page(0, 10).await.unwrap();
             assert_eq!(rows.len(), if step == 0 { 1 } else { 2 }, "step {step}");
@@ -1143,6 +1234,15 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
                     .is_some(),
                 step == 1 || step == 2
             );
+            let Some(result) = result else {
+                assert_eq!(*source.changes.lock().unwrap(), ["trusted-before"]);
+                assert_eq!(
+                    source.queries.load(Ordering::SeqCst),
+                    0,
+                    "a refused source successor cannot be replaced with a fresh query token"
+                );
+                continue;
+            };
             assert_eq!(
                 result.can_advance_database_checkpoint(),
                 step >= 3,
@@ -1157,10 +1257,7 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
                 } else {
                     "trusted-before"
                 };
-                // Main's missing-successor fallback performs the initial
-                // replay and one retained-cursor bridge after its inventory.
-                let calls = if step == 2 { 2 } else { 1 };
-                assert_eq!(*source.changes.lock().unwrap(), vec![cursor; calls]);
+                assert_eq!(*source.changes.lock().unwrap(), [cursor]);
             }
             assert_eq!(result.stats.downloaded, usize::from(step < 2));
             let events = diagnostics();

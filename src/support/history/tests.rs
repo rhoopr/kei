@@ -582,7 +582,7 @@ fn missing_reference_history_survives_restart_and_revalidates_export() {
 }
 
 #[test]
-fn legacy_receipt_prerequisites_roundtrip_only_fixed_labels() {
+fn historical_legacy_receipt_prerequisites_roundtrip_only_fixed_labels() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("support.json");
     let mut history = History {
@@ -907,48 +907,46 @@ fn storage_reuse_counters_saturate_and_preserve_last_stop() {
 }
 
 #[test]
-fn migration_evidence_replaces_counts_and_budgets_with_the_last_result() {
-    let mut history = History {
-        schema_version: 1,
-        ..History::default()
-    };
-    apply(&mut history, Message::Begin(json!({})));
-    super::apply_migration(
-        &mut history,
-        super::MigrationEvent::Committed(super::CompactionSummary {
-            examined_raw_pages: 10,
-            logical_charge_before: Some(100),
-            logical_charge_after: Some(40),
-            ..Default::default()
-        }),
-    );
-    super::apply_migration(
-        &mut history,
-        super::MigrationEvent::Committed(super::CompactionSummary {
-            examined_raw_pages: 2,
-            logical_charge_before: Some(9),
-            logical_charge_after: Some(4),
-            ..Default::default()
-        }),
-    );
-    let evidence = &history.cycles[0].transport_compaction;
-    assert_eq!(evidence.committed, 2);
-    assert_eq!(evidence.examined_raw_pages, 2);
-    assert_eq!(evidence.logical_charge_before, Some(9));
-    assert_eq!(evidence.logical_charge_after, Some(4));
-    assert_eq!(evidence.committed_reclaim, Some(5));
-    super::apply_migration(
-        &mut history,
-        super::MigrationEvent::Failed(super::MigrationFailure::MigrationFailed),
-    );
-    let evidence = &history.cycles[0].transport_compaction;
-    assert_eq!(evidence.failed, 1);
-    assert_eq!(evidence.reason, super::CompactionReason::MigrationFailed);
-    assert_eq!(evidence.examined_raw_pages, 0);
-    assert_eq!(evidence.logical_charge_before, None);
-    assert_eq!(evidence.logical_charge_after, None);
-    assert_eq!(evidence.committed_reclaim, Some(0));
-    assert_eq!(evidence.committed, 2);
+fn historical_compaction_evidence_survives_new_cycles_and_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("support.json");
+    for reason in ["committed", "migration_failed", "rollback_failed"] {
+        let mut history = History {
+            schema_version: 1,
+            ..History::default()
+        };
+        apply(&mut history, Message::Begin(json!({})));
+        let evidence = json!({
+            "committed": 2, "failed": 1, "reason": reason,
+            "examined_raw_pages": 10, "eligible": 8, "compacted_aliases": 3,
+            "retained_unsupported_shape": 1, "retained_projection_or_dependency": 2,
+            "no_equivalent_peer": 3, "invalid_canonical_or_member": 4,
+            "no_positive_saving": 5, "retained_representative": 6,
+            "logical_charge_before": 100, "logical_charge_after": 40,
+            "committed_reclaim": 60
+        });
+        let mut legacy = serde_json::to_value(&history).unwrap();
+        legacy["cycles"][0]["transport_compaction"] = evidence.clone();
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        for _ in 0..2 {
+            let (mut reopened, _) = read(&path);
+            assert_eq!(
+                serde_json::to_value(&reopened.cycles[0].transport_compaction).unwrap(),
+                evidence
+            );
+            apply(&mut reopened, Message::Begin(json!({})));
+            let current = &reopened.cycles.last().unwrap().transport_compaction;
+            assert_eq!(current.reason, super::CompactionReason::NotObserved);
+            assert_eq!((current.committed, current.failed), (0, 0));
+            assert_eq!(current.committed_reclaim, None);
+            save(&path, &mut reopened).unwrap();
+        }
+        let (reopened, _) = read(&path);
+        assert_eq!(
+            serde_json::to_value(&reopened.cycles[0].transport_compaction).unwrap(),
+            evidence
+        );
+    }
 }
 
 #[test]

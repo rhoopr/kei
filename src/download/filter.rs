@@ -47,8 +47,10 @@ pub(crate) use expected_paths::{
 };
 pub(crate) use metadata::AssetGroupings;
 pub(super) use metadata::{MetadataPayload, build_selected_payload};
+pub(super) use tasks::selected_resource_tasks;
 pub(super) use tasks::{DownloadTask, filter_asset_to_tasks, filter_asset_to_tasks_with_primary};
 pub(super) use versions::{VersionsView, extract_skip_candidates};
 pub(crate) use versions::{
-    metadata_capture, metadata_for_selected_version, provider_version_for_selected,
+    metadata_capture, metadata_for_selected_version, provider_version_for_frozen_resource,
+    provider_version_for_selected,
 };

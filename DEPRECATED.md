@@ -4,8 +4,7 @@ There are no active warning windows. Removed flags, commands, env vars, and TOML
 
 ## v0.20.0
 
-The v0.20 cleanup removed the v0.13-v0.19 compatibility aliases. Current
-migration guidance lives in [docs/v0.20-migration.md](docs/v0.20-migration.md).
+The v0.20 cleanup removed the v0.13-v0.19 compatibility aliases. Follow the [upgrade checklist](docs/upgrade.md) when moving an existing installation to the current build.
 
 Removed examples include:
 

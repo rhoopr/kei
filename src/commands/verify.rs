@@ -26,17 +26,22 @@ pub(crate) async fn run_verify(
         return Ok(());
     }
 
-    let db =
-        state::SqliteStateDb::open_owned(&db_path, &super::super::get_account_owner(globals, toml))
-            .await?;
+    let db = state::SqliteStateDb::open_owned_with_config(
+        &db_path,
+        &super::super::get_account_owner(globals, toml),
+        &globals.config_source,
+    )
+    .await?;
     let summary = db.get_summary().await?;
 
     println!("Verifying {} downloaded assets...", summary.downloaded);
     println!();
 
     let mut missing: usize = 0;
-    let mut corrupted: usize = 0;
-    let mut verified: usize = 0;
+    let mut checksum_verified: usize = 0;
+    let mut present_unchecked: usize = 0;
+    let mut different: usize = 0;
+    let mut unreadable: usize = 0;
     let mut printed_issues: usize = 0;
 
     const PAGE_SIZE: u32 = 1000;
@@ -51,8 +56,18 @@ pub(crate) async fn run_verify(
         for asset in &page {
             debug_assert_eq!(asset.status, state::AssetStatus::Downloaded);
 
-            if let Some(local_path) = &asset.local_path {
-                if !local_path.exists() {
+            let Some(local_path) = &asset.local_path else {
+                if printed_issues < LISTING_CAP {
+                    println!("MISSING: {} - no local path recorded", asset.id);
+                    printed_issues += 1;
+                }
+                missing += 1;
+                continue;
+            };
+
+            match inspect_local_path(local_path).await {
+                LocalPathState::File => {}
+                LocalPathState::Missing => {
                     if printed_issues < LISTING_CAP {
                         let downloaded_at = asset.downloaded_at.map_or_else(
                             || "unknown".to_string(),
@@ -69,47 +84,61 @@ pub(crate) async fn run_verify(
                     missing += 1;
                     continue;
                 }
-
-                if args.checksums {
-                    if let Some(local_cksum) = &asset.local_checksum {
-                        match verify_local_checksum(local_path, local_cksum).await {
-                            Ok(true) => verified += 1,
-                            Ok(false) => {
-                                if printed_issues < LISTING_CAP {
-                                    println!("CORRUPTED: {} ({})", local_path.display(), asset.id);
-                                    printed_issues += 1;
-                                }
-                                corrupted += 1;
-                            }
-                            Err(e) => {
-                                if printed_issues < LISTING_CAP {
-                                    println!("ERROR: {} - {}", local_path.display(), e);
-                                    printed_issues += 1;
-                                }
-                                corrupted += 1;
-                            }
-                        }
-                    } else {
-                        tracing::debug!(
-                            id = %asset.id,
-                            "No local checksum stored, skipping verification"
+                LocalPathState::Unreadable(error) => {
+                    if printed_issues < LISTING_CAP {
+                        println!(
+                            "UNREADABLE: {} ({}) - {}",
+                            local_path.display(),
+                            asset.id,
+                            error
                         );
-                        verified += 1;
+                        printed_issues += 1;
                     }
-                } else {
-                    verified += 1;
+                    unreadable += 1;
+                    continue;
                 }
-            } else {
-                if printed_issues < LISTING_CAP {
-                    println!("NO PATH: {} - no local path recorded", asset.id);
-                    printed_issues += 1;
+            }
+
+            if !args.checksums {
+                present_unchecked += 1;
+                continue;
+            }
+
+            let Some(local_checksum) = &asset.local_checksum else {
+                present_unchecked += 1;
+                continue;
+            };
+
+            match verify_local_checksum(local_path, local_checksum).await {
+                Ok(true) => checksum_verified += 1,
+                Ok(false) => {
+                    if printed_issues < LISTING_CAP {
+                        println!(
+                            "DIFFERENT: {} ({}) - may be an intentional edit",
+                            local_path.display(),
+                            asset.id
+                        );
+                        printed_issues += 1;
+                    }
+                    different += 1;
                 }
-                missing += 1;
+                Err(e) => {
+                    if printed_issues < LISTING_CAP {
+                        println!(
+                            "UNREADABLE: {} ({}) - {}",
+                            local_path.display(),
+                            asset.id,
+                            e
+                        );
+                        printed_issues += 1;
+                    }
+                    unreadable += 1;
+                }
             }
         }
     }
 
-    let total_issues = missing + corrupted;
+    let total_issues = missing + different + unreadable;
     if total_issues > printed_issues {
         println!();
         print_truncation_tail(total_issues, printed_issues);
@@ -117,19 +146,57 @@ pub(crate) async fn run_verify(
 
     println!();
     println!("Results:");
-    println!("  Verified:  {verified}");
-    println!("  Missing:   {missing}");
     if args.checksums {
-        println!("  Corrupted: {corrupted}");
+        println!("  Checksum verified:              {checksum_verified}");
+        println!("  Present, no checksum recorded:  {present_unchecked}");
+        println!("  Different checksum:             {different}");
+        println!("  Unreadable:                     {unreadable}");
+        println!("  Missing:                        {missing}");
+        println!();
+        println!(
+            "Scope: compared local files with their recorded SHA-256 checksums where available. A file without a recorded checksum is present but unchecked, not verified. A different checksum may be an intentional local edit. This check does not establish cloud completeness."
+        );
+    } else {
+        println!("  Present, not checksum-verified: {present_unchecked}");
+        println!("  Unreadable:                     {unreadable}");
+        println!("  Missing:                        {missing}");
+        println!();
+        println!(
+            "Scope: checked recorded local paths only. Checksums were not compared. Run `{}` to compare recorded SHA-256 values; files without a recorded checksum remain unchecked.",
+            cli::command_for_config("verify --checksums", globals.config_source.recovery_path())
+        );
     }
 
-    if missing > 0 || corrupted > 0 {
+    if missing > 0 || different > 0 || unreadable > 0 {
         anyhow::bail!(
-            "Verification found {missing} missing files and {corrupted} corrupted files."
+            "Verification found {missing} missing files, {different} files with a different checksum, and {unreadable} unreadable paths. Use `{}` to inspect an exact managed destination.",
+            cli::command_for_config(
+                "reconcile --inspect-path PATH",
+                globals.config_source.recovery_path()
+            )
         );
     }
 
     Ok(())
+}
+
+/// Classify a recorded local path without treating a stat failure as absence.
+enum LocalPathState {
+    File,
+    Missing,
+    Unreadable(std::io::Error),
+}
+
+async fn inspect_local_path(path: &Path) -> LocalPathState {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.is_file() => LocalPathState::File,
+        Ok(_) => LocalPathState::Unreadable(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => LocalPathState::Missing,
+        Err(error) => LocalPathState::Unreadable(error),
+    }
 }
 
 /// Verify a file's SHA-256 hash against a hex-encoded expected value.

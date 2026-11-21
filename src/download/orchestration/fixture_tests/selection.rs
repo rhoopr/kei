@@ -148,22 +148,18 @@ async fn bundled_rendition_selection_and_fallback() {
                 "Sized.jpg",
                 "public.jpeg",
                 "media/metadata.jpg",
-                u64::from(!available && !forced),
+                1,
             )
             .await;
         if available {
-            pair[0]["fields"]["resJPEGMedRes"] = h.resource("medium", "media/pattern.jpg", 1).await;
+            pair[0]["fields"]["resJPEGMedRes"] = h.resource("medium", "media/pattern.jpg", 0).await;
             pair[0]["fields"]["resJPEGMedFileType"] = json!({"value": "public.jpeg"});
             pair[0]["fields"]["resJPEGMedWidth"] = json!({"value": 48});
             pair[0]["fields"]["resJPEGMedHeight"] = json!({"value": 32});
         }
-        let expected = if available {
-            vec![("Sized-medium.JPG", "media/pattern.jpg")]
-        } else if forced {
-            vec![]
-        } else {
-            vec![("Sized.JPG", "media/metadata.jpg")]
-        };
+        // Historical size preferences cannot select a preview under the fixed
+        // policy. Verify original bytes and zero requests for preview bytes.
+        let expected = vec![("Sized.JPG", "media/metadata.jpg")];
         h.stable(pair, &expected).await;
     }
     let mut h = Harness::new().await;

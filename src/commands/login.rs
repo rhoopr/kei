@@ -17,7 +17,7 @@ pub(crate) async fn run_login(
     toml: Option<&config::TomlConfig>,
     input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
-    let (username, password, domain, cookie_directory) = config::resolve_auth(globals, pw, toml);
+    let (username, password, domain, cookie_directory) = config::resolve_auth(globals, pw, toml)?;
 
     if username.is_empty() {
         anyhow::bail!(
@@ -47,7 +47,13 @@ pub(crate) async fn run_login(
             })
             .await?;
             println!("2FA code requested. Check your trusted devices, then run:");
-            println!("  kei login submit-code <CODE>");
+            println!(
+                "  {}",
+                cli::command_for_config(
+                    "login submit-code <CODE>",
+                    globals.config_source.recovery_path()
+                )
+            );
         }
         Some(cli::LoginCommand::SubmitCode { code }) => {
             let result = retry_on_lock_contention(|| {

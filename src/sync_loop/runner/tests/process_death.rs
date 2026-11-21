@@ -18,14 +18,14 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use crate::commands::{AlbumPass, PassKind};
+use crate::download;
 use crate::icloud::photos::PhotosSession;
 use crate::sync_loop::test_support::{
     RUN_CYCLE_ASSET_DATE_MS, RunCycleDownloadConfigOptions, album_count_response,
-    full_album_page_with_download, make_full_album_with_boxed_session, make_run_cycle_config,
+    full_album_page_with_download, make_owned_cycle_album, make_run_cycle_config,
     make_run_cycle_download_config_builder_with_options, make_run_cycle_library_state_with_passes,
     make_shared_session_for_run_cycle,
 };
-use crate::{download, state};
 
 const POINTS: [&str; 6] = [
     "journal-displaced",
@@ -36,9 +36,12 @@ const POINTS: [&str; 6] = [
     "checkpoint-persisted",
 ];
 const WORKER: &str = "sync_loop::runner::tests::process_death::process_death_worker";
+const METADATA_WORKER: &str =
+    "sync_loop::runner::tests::process_death::metadata_ownership_process_death_worker";
 const ZONE: &str = "PrimarySync";
 const FOREIGN: &str = "SharedSync-DEATH";
 const ID: &str = "asset-death";
+const CAPTION: &str = "initial embedded description";
 const MEDIA: &[u8] = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
 const OLD: &[u8] = b"\xff\xd8\xff";
 const PRIVATE: &[u8] = b"unselected zone: private bytes";
@@ -153,6 +156,8 @@ struct Provider {
     hydrations: Arc<AtomicUsize>,
     requests: Arc<AtomicUsize>,
     quiet: bool,
+    records_with_token: bool,
+    token_records_sent: Arc<std::sync::atomic::AtomicBool>,
 }
 #[async_trait::async_trait]
 impl PhotosSession for Provider {
@@ -164,8 +169,10 @@ impl PhotosSession for Provider {
         let request: Value = serde_json::from_str(&body)?;
         if url.contains("/changes/zone?") {
             let token = request["zones"][0]["syncToken"].as_str();
+            let send_even_with_token =
+                self.records_with_token && !self.token_records_sent.swap(true, Ordering::SeqCst);
             return Ok(
-                json!({"zones":[{"zoneID":{"zoneName":ZONE,"ownerRecordName":"_defaultOwner"},"records":if token.is_none() {self.records.clone()} else {Vec::new()},"syncToken":"after","moreComing":false}]}),
+                json!({"zones":[{"zoneID":{"zoneName":ZONE,"ownerRecordName":"_defaultOwner"},"records":if token.is_none() || send_even_with_token {self.records.clone()} else {Vec::new()},"syncToken":"after","moreComing":false}]}),
             );
         }
         if url.contains("/records/query/batch?") {
@@ -196,60 +203,93 @@ impl PhotosSession for Provider {
     }
 }
 async fn cycle(root: &Path, url: &str, quiet: bool) -> (usize, usize) {
+    // The repair opt-in is enabled only after the initial verified publication.
+    // Its changed current configuration must select the damaged rendition;
+    // a historical failed asset row alone is not a work scheduler.
+    let repair_truncated = root.join("repair-requested").exists();
+    cycle_source(root, url, quiet, MEDIA, None, repair_truncated, false, true).await
+}
+
+async fn cycle_source(
+    root: &Path,
+    url: &str,
+    quiet: bool,
+    source: &[u8],
+    description: Option<&str>,
+    repair_truncated: bool,
+    records_with_token: bool,
+    sidecar: bool,
+) -> (usize, usize) {
     let mut page = full_album_page_with_download(
         ZONE,
         "death",
         "after",
         url,
-        MEDIA.len() as u64,
-        &checksum(MEDIA),
+        source.len() as u64,
+        &checksum(source),
     );
     page["records"][0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+    if let Some(description) = description {
+        page["records"][1]["fields"]["extendedDescEnc"] =
+            json!({"type":"STRING","value":description});
+        page["records"][1]["fields"]["captionEnc"] = json!({"type":"STRING","value":""});
+        // Provider revisions must identify the emitted fields so an explicit
+        // clear is a real observation rather than a duplicate record.
+        for record in page["records"].as_array_mut().unwrap() {
+            let change_tag = hash(&serde_json::to_vec(&record["fields"]).unwrap());
+            record["recordChangeTag"] = json!(change_tag);
+        }
+    }
     let hydrations = Arc::new(AtomicUsize::new(0));
     let provider = Provider {
         records: page["records"].as_array().unwrap().clone(),
         hydrations: hydrations.clone(),
         requests: Arc::new(AtomicUsize::new(0)),
         quiet,
+        records_with_token,
+        token_records_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
+    let inner = crate::sync_loop::test_support::open_owned_cycle_db(&root.join("state.db")).await;
     let pass = AlbumPass {
         kind: PassKind::Unfiled,
-        album: make_full_album_with_boxed_session(ZONE, Box::new(provider.clone())),
+        album: make_owned_cycle_album(&inner, ZONE, "private", Box::new(provider.clone())),
         exclude_ids: Arc::default(),
     };
     let mut library =
         make_run_cycle_library_state_with_passes(ZONE, "sync_token:PrimarySync", vec![pass]);
     library.library =
         crate::icloud::photos::PhotoLibrary::new_stub_with_zone(Box::new(provider), ZONE);
-    let db: Arc<dyn download::DownloadStore> = Arc::new(
-        state::SqliteStateDb::open(&root.join("state.db"))
-            .await
-            .unwrap(),
-    );
+    let db: Arc<dyn download::DownloadStore> = inner;
     let media = root.join("media");
+    #[cfg(feature = "xmp")]
+    let xmp_sidecar = sidecar;
+    #[cfg(not(feature = "xmp"))]
+    let _ = sidecar;
     let base = make_run_cycle_download_config_builder_with_options(
         &media,
         db.clone(),
         RunCycleDownloadConfigOptions {
             concurrent_downloads: Some(1),
             #[cfg(feature = "xmp")]
-            xmp_sidecar: true,
+            xmp_sidecar,
             ..Default::default()
         },
     );
     let build = |mode, excluded, groups, zone| {
         let mut built = base(mode, excluded, groups, zone);
-        Arc::make_mut(&mut built).repair_truncated = true;
+        let config = Arc::make_mut(&mut built);
+        config.repair_truncated = repair_truncated;
+        config.metadata.set_exif_description = description.is_some();
         built
     };
     let (_session_dir, session) = make_shared_session_for_run_cycle().await;
     let mut config = make_run_cycle_config();
-    config.runtime.repair_truncated = true;
+    config.runtime.repair_truncated = repair_truncated;
+    config.metadata.set_exif_description = description.is_some();
     let result = Box::pin(crate::sync_cycle::run_cycle(
         &[&library],
         &config,
         Some(db.as_ref()),
-        false,
         &build,
         download::DownloadControls::download_hidden(),
         &session,
@@ -257,7 +297,7 @@ async fn cycle(root: &Path, url: &str, quiet: bool) -> (usize, usize) {
     ))
     .await
     .unwrap();
-    assert_eq!(result.failed_count, 0);
+    assert_eq!(result.failed_count, 0, "failed cycle: {:?}", result.stats);
     assert!(!result.session_expired);
     assert!(result.db_sync_token_advance_safe);
     assert_eq!(result.stats.exif_failures, 0);
@@ -276,9 +316,7 @@ async fn cycle(root: &Path, url: &str, quiet: bool) -> (usize, usize) {
 async fn seed(root: &Path) {
     std::fs::create_dir_all(root.join("media")).unwrap();
     std::fs::write(root.join("fixture-owner"), b"kei-synthetic-process-death").unwrap();
-    let db = state::SqliteStateDb::open(&root.join("state.db"))
-        .await
-        .unwrap();
+    let db = crate::sync_loop::test_support::open_owned_cycle_db(&root.join("state.db")).await;
     let date = chrono::DateTime::from_timestamp_millis(RUN_CYCLE_ASSET_DATE_MS).unwrap();
     let path = root.join("media/foreign.jpg");
     std::fs::write(&path, PRIVATE).unwrap();
@@ -358,7 +396,27 @@ async fn process_death_recovery_matrix() {
             );
             assert_eq!(std::fs::read(target(root.path())).unwrap(), MEDIA);
             std::fs::write(target(root.path()), OLD).unwrap();
-            let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+            std::fs::write(
+                root.path().join("repair-requested"),
+                b"explicit repair opt-in",
+            )
+            .unwrap();
+            let db =
+                crate::sync_loop::test_support::open_owned_cycle_db(&root.path().join("state.db"))
+                    .await;
+            let path = target(root.path());
+            let inspected = db
+                .inspect_integrity_destination(path.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            let fingerprint = crate::download::file::inspect_integrity_fingerprint(
+                &root.path().join("media"),
+                &path,
+            )
+            .await
+            .unwrap();
+            db.confirm_integrity_damage(inspected, fingerprint)
                 .await
                 .unwrap();
             db.mark_failed(
@@ -495,9 +553,10 @@ async fn process_death_recovery_matrix() {
             i64::from(repair || persisted == 1),
             "publication receipt boundary"
         );
-        // The repair runs in the retry pass after enumeration has completed
-        // its tracked run. Initial-download finalization remains inside it.
-        let interrupted = matches!(point, "published" | "state-persisted");
+        // Both initial publication and explicitly selected repair execute in
+        // the current enumeration's tracked run. Only the checkpoint hook is
+        // reached after that run has completed.
+        let interrupted = point != "checkpoint-persisted";
         let orphaned = u64::from(interrupted);
         assert_eq!(
             count(
@@ -509,9 +568,9 @@ async fn process_death_recovery_matrix() {
         );
         {
             // Reuse the production runner's one-time startup recovery owner.
-            let db = state::SqliteStateDb::open(&root.path().join("state.db"))
-                .await
-                .unwrap();
+            let db =
+                crate::sync_loop::test_support::open_owned_cycle_db(&root.path().join("state.db"))
+                    .await;
             assert_eq!(db.promote_orphaned_sync_runs().await.unwrap(), orphaned);
         }
         let downloads_before = server.received_requests().await.unwrap().len();
@@ -551,9 +610,9 @@ async fn process_death_recovery_matrix() {
             "only committed adoption can retain a recent part"
         );
         if claims == 1 {
-            let db = state::SqliteStateDb::open(&root.path().join("state.db"))
-                .await
-                .unwrap();
+            let db =
+                crate::sync_loop::test_support::open_owned_cycle_db(&root.path().join("state.db"))
+                    .await;
             let owned = db.get_owned_temp_files_before(i64::MAX).await.unwrap();
             assert_eq!(owned.len(), 1);
             let part = &owned[0].path;
@@ -700,6 +759,494 @@ async fn process_death_worker() {
     let root =
         PathBuf::from(std::env::var_os("KEI_TEST_PROCESS_DEATH_ROOT").expect("parent fixture"));
     let url = std::env::var("KEI_TEST_PROCESS_DEATH_URL").unwrap();
-    cycle(&root, &url, false).await;
+    let (downloads, hydrations) = cycle(&root, &url, false).await;
+    let preserved = count(
+        &root,
+        "SELECT count(*) FROM provider_active_destinations WHERE preserved_local IS NOT NULL",
+    );
+    panic!(
+        "worker completed without reaching requested death point: downloads={downloads}, hydrations={hydrations}, preserved={preserved}, old_bytes={}",
+        std::fs::read(target(&root)).unwrap() == OLD
+    );
+}
+
+fn metadata_source() -> Vec<u8> {
+    let base = include_bytes!("../../../../tests/data/media/pattern.jpg").to_vec();
+    let mut metadata = little_exif::metadata::Metadata::new_from_vec(
+        &base,
+        little_exif::filetype::FileExtension::JPEG,
+    )
+    .unwrap_or_else(|_| little_exif::metadata::Metadata::new());
+    metadata.set_tag(little_exif::exif_tag::ExifTag::Artist(
+        "camera artist".into(),
+    ));
+    let mut output = base;
+    metadata
+        .write_to_vec(&mut output, little_exif::filetype::FileExtension::JPEG)
+        .unwrap();
+    output
+}
+
+fn native_image_description(path: &Path) -> Option<String> {
+    let metadata = little_exif::metadata::Metadata::new_from_path(path).ok()?;
+    metadata
+        .get_tag(&little_exif::exif_tag::ExifTag::ImageDescription(
+            String::new(),
+        ))
+        .find_map(|tag| match tag {
+            little_exif::exif_tag::ExifTag::ImageDescription(value) => Some(value.clone()),
+            _ => None,
+        })
+}
+
+fn native_artist(path: &Path) -> Option<String> {
+    let metadata = little_exif::metadata::Metadata::new_from_path(path).ok()?;
+    metadata
+        .get_tag(&little_exif::exif_tag::ExifTag::Artist(String::new()))
+        .find_map(|tag| match tag {
+            little_exif::exif_tag::ExifTag::Artist(value) => Some(value.clone()),
+            _ => None,
+        })
+}
+
+#[cfg(feature = "xmp")]
+fn expected_initial_fields(path: &Path) -> crate::state::types::EmbeddedMetadataFields {
+    let native_description = native_image_description(path).map(|value| {
+        let mut bytes = value.into_bytes();
+        bytes.push(0);
+        data_encoding::HEXLOWER.encode(&bytes)
+    });
+    crate::state::types::EmbeddedMetadataFields {
+        description: Some(CAPTION.to_owned()),
+        native_description,
+        ..Default::default()
+    }
+}
+
+#[cfg(not(feature = "xmp"))]
+fn expected_initial_fields(path: &Path) -> crate::state::types::EmbeddedMetadataFields {
+    let fields = crate::state::types::EmbeddedMetadataFields {
+        description: native_image_description(path),
+        ..Default::default()
+    };
+    assert_eq!(
+        fields.description.as_deref(),
+        Some(CAPTION),
+        "native description write"
+    );
+    fields
+}
+
+fn embedded_receipt(
+    root: &Path,
+    sql: &str,
+) -> Option<crate::state::types::EmbeddedMetadataReceipt> {
+    let conn = rusqlite::Connection::open(root.join("state.db")).unwrap();
+    let mut statement = conn.prepare(sql).unwrap();
+    let mut rows = statement.query([]).unwrap();
+    match rows.next().unwrap() {
+        Some(row) => {
+            let raw: Option<String> = row.get(0).unwrap();
+            raw.map(|raw| serde_json::from_str(&raw).unwrap())
+        }
+        None => None,
+    }
+}
+
+fn assert_metadata_receipts(
+    root: &Path,
+    expected: &crate::state::types::EmbeddedMetadataReceipt,
+    native_root: bool,
+) {
+    let native = embedded_receipt(
+        root,
+        "SELECT embedded_metadata_receipt FROM provider_active_destinations \
+         WHERE library='PrimarySync' AND asset_id='asset-death' AND version_size='original' \
+         AND admitted=1 AND current_publication=1",
+    );
+    assert_eq!(
+        native.as_ref(),
+        Some(expected),
+        "exact native published receipt"
+    );
+    let legacy = embedded_receipt(
+        root,
+        "SELECT embedded_metadata_receipt FROM asset_metadata_paths \
+         WHERE library='PrimarySync' AND id='asset-death' AND version_size='original'",
+    );
+    if native_root {
+        // The legacy catalogue path is lossy for a native root. When present it
+        // must still agree with the authoritative native receipt.
+        if let Some(legacy) = legacy {
+            assert_eq!(&legacy, expected, "lossy catalogue receipt diverged");
+        }
+    } else {
+        assert_eq!(
+            legacy.as_ref(),
+            Some(expected),
+            "exact catalogue published receipt"
+        );
+    }
+}
+
+fn assert_downloaded_state(
+    root: &Path,
+    target: &Path,
+    checksum: &str,
+    label: &str,
+    native_root: bool,
+) {
+    let conn = rusqlite::Connection::open(root.join("state.db")).unwrap();
+    let (status, local_checksum, local_path, last_error): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT status,local_checksum,local_path,last_error FROM assets \
+             WHERE library='PrimarySync' AND id='asset-death' AND version_size='original'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "downloaded", "{label}: status");
+    assert_eq!(
+        local_path.as_deref(),
+        Some(target.to_string_lossy().as_ref()),
+        "{label}: catalogue path"
+    );
+    assert_eq!(last_error, None, "{label}: error");
+    if native_root {
+        // The lossy legacy catalogue path is not authority for a native root.
+        let native_checksum: Option<String> = conn
+            .query_row(
+                "SELECT local_checksum FROM provider_active_destinations \
+                 WHERE library='PrimarySync' AND asset_id='asset-death' \
+                 AND version_size='original' AND admitted=1 AND current_publication=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            native_checksum.as_deref(),
+            Some(checksum),
+            "{label}: native checksum"
+        );
+    } else {
+        assert_eq!(
+            local_checksum.as_deref(),
+            Some(checksum),
+            "{label}: checksum"
+        );
+    }
+}
+
+async fn metadata_ownership_case(native_root: bool) {
+    let server = wiremock::MockServer::start().await;
+    let source = metadata_source();
+    Mock::given(method("GET"))
+        .and(path("/media"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(source.clone()))
+        .mount(&server)
+        .await;
+    let root = if native_root {
+        use std::os::unix::ffi::OsStringExt;
+        tempfile::Builder::new()
+            .prefix(&std::ffi::OsString::from_vec(
+                b"kei-death-metadata-\xff".to_vec(),
+            ))
+            .tempdir()
+            .unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
+    std::fs::create_dir_all(root.path().join("media")).unwrap();
+    std::fs::write(
+        root.path().join("fixture-owner"),
+        b"kei-synthetic-process-death",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("source.jpg"), &source).unwrap();
+    let log = std::fs::File::create(root.path().join("worker.log")).unwrap();
+    let mut worker = Worker(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", METADATA_WORKER, "--ignored", "--nocapture"])
+            .env("KEI_TEST_PROCESS_DEATH_ROOT", root.path())
+            .env("KEI_TEST_PROCESS_DEATH_POINT", "download-state-committed")
+            .env(
+                "KEI_TEST_PROCESS_DEATH_URL",
+                format!("{}/media", server.uri()),
+            )
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !root.path().join("ready").exists() {
+        assert!(
+            worker.0.try_wait().unwrap().is_none(),
+            "worker exited before download-state-committed: {}",
+            std::fs::read_to_string(root.path().join("worker.log")).unwrap()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "worker timeout at download-state-committed: {}",
+            std::fs::read_to_string(root.path().join("worker.log")).unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("ready")).unwrap(),
+        "download-state-committed"
+    );
+    worker.0.kill().unwrap();
+    assert_eq!(
+        worker.0.wait().unwrap().signal(),
+        Some(9),
+        "actual SIGKILL without unwinding"
+    );
+
+    let target = target(root.path());
+    let initial_bytes = std::fs::read(&target).unwrap();
+    let initial_checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(&initial_bytes));
+    let initial_fields = expected_initial_fields(&target);
+    let initial_receipt = crate::state::types::EmbeddedMetadataReceipt {
+        published: true,
+        input_checksum: initial_checksum.clone(),
+        output_checksum: initial_checksum.clone(),
+        previous: Default::default(),
+        written: initial_fields.clone(),
+    };
+    assert_eq!(
+        count(
+            root.path(),
+            "SELECT count(*) FROM metadata WHERE key='sync_token:PrimarySync' AND value='after'"
+        ),
+        0,
+        "state commit precedes checkpoint"
+    );
+    assert_eq!(
+        count(
+            root.path(),
+            "SELECT count(*) FROM provider_active_destinations \
+             WHERE library='PrimarySync' AND asset_id='asset-death' \
+             AND admitted=1 AND verified_media=1 AND current_publication=1"
+        ),
+        1,
+        "current verified native destination"
+    );
+    assert_downloaded_state(
+        root.path(),
+        &target,
+        &initial_checksum,
+        "after kill",
+        native_root,
+    );
+    assert_metadata_receipts(root.path(), &initial_receipt, native_root);
+    assert_eq!(
+        native_artist(&target).as_deref(),
+        Some("camera artist"),
+        "unmanaged native metadata published"
+    );
+    assert_eq!(
+        count(
+            root.path(),
+            "SELECT count(*) FROM sync_runs WHERE status='running'"
+        ),
+        1,
+        "durable interrupted run"
+    );
+
+    {
+        let db = crate::sync_loop::test_support::open_owned_cycle_db(&root.path().join("state.db"))
+            .await;
+        assert_eq!(db.promote_orphaned_sync_runs().await.unwrap(), 1);
+    }
+
+    // Settle the interrupted run with unchanged provider metadata first. This
+    // advances the checkpoint so the explicit clear arrives as a normal delta
+    // rather than a full-inventory mutation of the retained selection.
+    let (downloaded, _) = cycle_source(
+        root.path(),
+        &format!("{}/media", server.uri()),
+        false,
+        &source,
+        Some(CAPTION),
+        false,
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(downloaded, 0, "recovery cannot re-download media");
+    assert_eq!(
+        count(
+            root.path(),
+            "SELECT count(*) FROM metadata WHERE key='sync_token:PrimarySync' AND value='after'"
+        ),
+        1,
+        "recovery settles the interrupted checkpoint"
+    );
+    let pre_clear_bytes = std::fs::read(&target).unwrap();
+    let pre_clear_checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(&pre_clear_bytes));
+    assert_downloaded_state(
+        root.path(),
+        &target,
+        &pre_clear_checksum,
+        "after recovery",
+        native_root,
+    );
+    assert_eq!(
+        native_artist(&target).as_deref(),
+        Some("camera artist"),
+        "recovery preserves unmanaged metadata"
+    );
+
+    // The explicit provider clear is delivered as a delta after recovery.
+    let (downloaded, _) = cycle_source(
+        root.path(),
+        &format!("{}/media", server.uri()),
+        false,
+        &source,
+        Some(""),
+        false,
+        true,
+        false,
+    )
+    .await;
+    assert_eq!(downloaded, 0, "provider clear cannot re-download media");
+    assert_eq!(
+        count(
+            root.path(),
+            "SELECT count(*) FROM metadata WHERE key='sync_token:PrimarySync' AND value='after'"
+        ),
+        1,
+        "clear retains the settled checkpoint"
+    );
+
+    let clear_bytes = std::fs::read(&target).unwrap();
+    let clear_checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(&clear_bytes));
+    let clear_receipt = crate::state::types::EmbeddedMetadataReceipt {
+        published: true,
+        input_checksum: pre_clear_checksum,
+        output_checksum: clear_checksum.clone(),
+        previous: initial_fields,
+        written: Default::default(),
+    };
+    assert_downloaded_state(
+        root.path(),
+        &target,
+        &clear_checksum,
+        "after clear",
+        native_root,
+    );
+    assert_metadata_receipts(root.path(), &clear_receipt, native_root);
+    assert_eq!(
+        native_artist(&target).as_deref(),
+        Some("camera artist"),
+        "clear removes only the managed description"
+    );
+    assert!(
+        native_image_description(&target).is_none(),
+        "managed native description removed"
+    );
+    if native_root {
+        // The lossy legacy catalogue row cannot own this root's completion.
+        // Assert native authority; the legacy marker may remain as lossy-path
+        // debt without re-driving the native file.
+        assert_eq!(
+            count(
+                root.path(),
+                "SELECT count(*) FROM provider_active_destinations \
+                 WHERE library='PrimarySync' AND asset_id='asset-death' \
+                 AND admitted=1 AND current_publication=1 \
+                 AND verified_metadata=1 AND prepared_hash IS NULL"
+            ),
+            1,
+            "native metadata completion"
+        );
+    } else {
+        assert_eq!(
+            count(
+                root.path(),
+                "SELECT count(*) FROM assets WHERE library='PrimarySync' AND id='asset-death' \
+                 AND metadata_write_failed_at IS NULL"
+            ),
+            1,
+            "clear retires its marker"
+        );
+    }
+    assert_eq!(
+        count(root.path(), "SELECT count(*) FROM metadata_capture_retries"),
+        0
+    );
+
+    let stable_mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
+    for _ in 0..2 {
+        let (downloaded, hydrations) = cycle_source(
+            root.path(),
+            &format!("{}/media", server.uri()),
+            true,
+            &source,
+            Some(""),
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!((downloaded, hydrations), (0, 0), "quiet reopened cycle");
+        assert_eq!(std::fs::read(&target).unwrap(), clear_bytes, "quiet bytes");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().modified().unwrap(),
+            stable_mtime,
+            "quiet metadata rewrite"
+        );
+        assert_metadata_receipts(root.path(), &clear_receipt, native_root);
+        assert_eq!(
+            native_artist(&target).as_deref(),
+            Some("camera artist"),
+            "quiet unmanaged metadata"
+        );
+        assert_eq!(
+            count(
+                root.path(),
+                "SELECT count(*) FROM metadata WHERE key='sync_token:PrimarySync' AND value='after'"
+            ),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn initial_download_embedded_description_ownership_survives_state_commit_sigkill_and_provider_clear()
+ {
+    metadata_ownership_case(false).await;
+    // The default toolkit cannot open a non-UTF path even when native EXIF is
+    // enabled; the native-only build can.
+    #[cfg(not(feature = "xmp"))]
+    {
+        metadata_ownership_case(true).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "dedicated synthetic subprocess; parent kills it at a fixed durable point"]
+async fn metadata_ownership_process_death_worker() {
+    let root =
+        PathBuf::from(std::env::var_os("KEI_TEST_PROCESS_DEATH_ROOT").expect("parent fixture"));
+    let url = std::env::var("KEI_TEST_PROCESS_DEATH_URL").unwrap();
+    let source = std::fs::read(root.join("source.jpg")).unwrap();
+    cycle_source(
+        &root,
+        &url,
+        false,
+        &source,
+        Some(CAPTION),
+        false,
+        false,
+        false,
+    )
+    .await;
     panic!("worker completed without reaching requested death point");
 }

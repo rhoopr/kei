@@ -1,7 +1,5 @@
 //! Shared filter test fixtures. Production owners do not depend on this module.
 
-use std::sync::Arc;
-
 use rustc_hash::FxHashMap;
 use serde_json::json;
 
@@ -49,10 +47,6 @@ pub(super) fn video_asset() -> PhotoAsset {
 
 pub(super) fn skip_live_photos(config: &mut DownloadConfig) {
     config.live_photo_mode = LivePhotoMode::Skip;
-}
-
-pub(super) fn exclude_aae_filenames(config: &mut DownloadConfig) {
-    config.filename_exclude = Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
 }
 
 pub(super) fn test_live_photo_asset() -> PhotoAsset {

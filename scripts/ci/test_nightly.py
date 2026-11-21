@@ -165,6 +165,27 @@ class NightlyCase(unittest.TestCase):
 
 
 class HealthTests(NightlyCase):
+    def test_latest_nightly_cannot_be_masked_by_an_older_success(self):
+        good = completed_run(7, conclusion="success", created_at=NOW - timedelta(hours=1))
+        for state in ("queued", "in_progress", "waiting"):
+            newer = {**completed_run(8, attempt=2, created_at=NOW), "status": state, "conclusion": None}
+            finding = nightly.health([good, newer], NOW)
+            self.assertEqual(finding.identity, "run 8 attempt 2")
+            self.assertIn(state, finding.message)
+
+    def test_freshness_requires_latest_new_york_midnight_slot(self):
+        # 00:05 local in winter, summer and on each DST transition day.
+        for start in ("2026-01-12T05:05:00+00:00", "2026-07-12T04:05:00+00:00",
+                      "2026-03-08T05:05:00+00:00", "2026-11-01T04:05:00+00:00"):
+            slot = datetime.fromisoformat(start)
+            now = slot + timedelta(hours=2)
+            previous = completed_run(7, conclusion="success", created_at=slot - timedelta(seconds=1))
+            current = completed_run(8, conclusion="success", created_at=slot)
+            with self.subTest(start=start):
+                self.assertEqual(nightly.health([previous], now).identity, "stale run 7")
+                self.assertTrue(nightly.health([previous, current], now).healthy)
+                self.assertTrue(nightly.health([previous], slot - timedelta(seconds=1)).healthy)
+
     def test_fresh_missing_failed_cancelled_and_stale(self):
         run = completed_run(7, conclusion="success", created_at=NOW)
         self.assertTrue(nightly.health([run], NOW).healthy)
@@ -322,7 +343,7 @@ class IncidentTests(NightlyCase):
         github = FakeGitHub(runs=())
         self.assertEqual(self.run_nightly(github, ["health"]), 1)
         missing = github.open_incidents()[0]
-        self.assertIn("No completed nightly qualification is available.", missing["body"])
+        self.assertIn("No nightly qualification is available.", missing["body"])
         self.assertIn(f"- {nightly.MISSING_IDENTITY}\n", missing["body"])
         missing["state"] = "closed"
 

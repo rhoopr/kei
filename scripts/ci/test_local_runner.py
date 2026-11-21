@@ -50,6 +50,7 @@ class LocalRunnerTests(unittest.TestCase):
                    "KEI_TEST_SCRATCH_DIR": str(Path(directory) / "shell"),
                    "KEI_FULL_TEST_TMPDIR": str(Path(directory) / "tmp"),
                    "KEI_FULL_TEST_REAL_SERVICE": "0", "KEI_FULL_TEST_CROSS_ZONE_ALBUM": ""}
+            env.pop("KEI_DOCKER_IMAGE", None)
             def run():
                 return subprocess.run(["bash", str(scripts / "run_local_release.sh")], cwd=root, env=env, capture_output=True, text=True, check=False)
             self.assertEqual(run().returncode, 64)
@@ -61,6 +62,13 @@ class LocalRunnerTests(unittest.TestCase):
             self.assertEqual(set(record["phases"]), local_release.BASE_PHASES | local_release.LIVE_COMMANDS)
             self.assertEqual(Path(env["CALLS"]).read_text().splitlines(), [
                 "cargo build --locked --release", "docker build -t kei:local-release .", "just test live", "just test host-service"])
+            self.assertFalse((state / ".run-marker").exists())
+            Path(env["CALLS"]).unlink()
+            env["KEI_DOCKER_IMAGE"] = "fixture:explicit-release"
+            result = run()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(Path(env["CALLS"]).read_text().splitlines(), [
+                "cargo build --locked --release", "docker build -t fixture:explicit-release .", "just test live", "just test host-service"])
             self.assertFalse((state / ".run-marker").exists())
             (root / "dirty").touch()
             self.assertNotEqual(run().returncode, 0)

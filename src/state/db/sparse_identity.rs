@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::SqliteStateDb;
@@ -125,7 +126,19 @@ pub(crate) struct SparseIdentityProof {
     library: String,
     source: SparseSourceId,
     generation: SparseGeneration,
-    target: Option<SparseTargetState>,
+    target: Option<SparseTargetProof>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum SparseTargetProof {
+    Selected(SparseTargetState),
+    DirectHidden {
+        library: String,
+        child: String,
+        master: String,
+        scan: String,
+        selected: Option<SparseTargetState>,
+    },
 }
 
 #[derive(Clone)]
@@ -134,15 +147,32 @@ pub(crate) struct SparseTargetState {
     child: String,
     master: String,
     evidence: String,
+    requires_metadata: bool,
+    pub(crate) copies: Vec<super::provider_generations::SparseSelectedCopy>,
+    generation: Option<String>,
     validate_files: Option<Arc<SparseFileValidation>>,
 }
 type SparseFileValidation = dyn Fn() -> Result<(), StateError> + Send + Sync;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum SparseTargetHold {
+    #[error("target not observed in current selected passes")]
+    MembershipUnobserved,
+    #[error("target identity is ambiguous")]
+    PairUnresolved,
+    #[error("target publication receipt is incomplete")]
+    ReceiptUnqualified,
+}
+
 impl PartialEq for SparseTargetState {
     fn eq(&self, other: &Self) -> bool {
         self.library == other.library
             && self.child == other.child
             && self.master == other.master
             && self.evidence == other.evidence
+            && self.requires_metadata == other.requires_metadata
+            && self.generation == other.generation
+            && self.copies == other.copies
     }
 }
 impl Eq for SparseTargetState {}
@@ -153,7 +183,7 @@ impl SparseTargetState {
     }
 }
 impl SparseIdentityProof {
-    pub(crate) fn with_target(mut self, target: SparseTargetState) -> Self {
+    pub(crate) fn with_target(mut self, target: SparseTargetProof) -> Self {
         self.target = Some(target);
         self
     }
@@ -180,8 +210,10 @@ pub(crate) trait SparseIdentityStore: Send + Sync {
         _library: &str,
         _child: &str,
         _master: &str,
-    ) -> Result<Option<SparseTargetState>, StateError> {
-        Ok(None)
+        _generation: Option<&str>,
+        _requires_metadata: bool,
+    ) -> Result<Result<SparseTargetState, SparseTargetHold>, StateError> {
+        Ok(Err(SparseTargetHold::ReceiptUnqualified))
     }
 
     async fn observe_sparse_identity(
@@ -292,10 +324,23 @@ impl SparseIdentityStore for SqliteStateDb {
         library: &str,
         child: &str,
         master: &str,
-    ) -> Result<Option<SparseTargetState>, StateError> {
+        generation: Option<&str>,
+        requires_metadata: bool,
+    ) -> Result<Result<SparseTargetState, SparseTargetHold>, StateError> {
         let (library, child, master) = (library.to_owned(), child.to_owned(), master.to_owned());
+        let generation = generation.map(str::to_owned);
         self.with_conn("sparse_target_state", move |conn| {
-            target_state(conn, &library, &child, &master)
+            let tx = conn.unchecked_transaction()?;
+            let proof = target_state(
+                &tx,
+                &library,
+                &child,
+                &master,
+                generation.as_deref(),
+                requires_metadata,
+            )?;
+            tx.commit()?;
+            Ok(proof)
         })
         .await
     }
@@ -388,14 +433,38 @@ fn target_state(
     library: &str,
     child: &str,
     master: &str,
-) -> Result<Option<SparseTargetState>, StateError> {
+    generation: Option<&str>,
+    requires_metadata: bool,
+) -> Result<Result<SparseTargetState, SparseTargetHold>, StateError> {
+    let copies = if let Some(id) = generation {
+        match super::provider_generations::sparse_selected_copies(conn, id, library, child, master)?
+        {
+            Ok(copies) if !copies.is_empty() => copies,
+            Ok(_) => return Ok(Err(SparseTargetHold::MembershipUnobserved)),
+            Err(hold) => return Ok(Err(hold)),
+        }
+    } else {
+        Vec::new()
+    };
     let mapped: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM asset_master_mappings WHERE library=?1 AND asset_record_name=?2 AND master_record_name=?3)",
         params![library, child, master], |row| row.get(0))?;
-    if !mapped || !super::legacy_preservation::child_receipts_ready(conn, library, child)? {
-        return Ok(None);
+    if !mapped
+        || (generation.is_none()
+            && !super::legacy_preservation::child_publications_ready(
+                conn,
+                library,
+                child,
+                requires_metadata,
+            )?)
+    {
+        return Ok(Err(SparseTargetHold::ReceiptUnqualified));
     }
-    validate_target_paths(conn, library, child)?;
+    let selected_paths = copies
+        .iter()
+        .map(|copy| copy.path.clone())
+        .collect::<Vec<_>>();
+    validate_target_paths(conn, library, child, &selected_paths)?;
     let dependencies = super::legacy_preservation::dependencies(conn, library, master)?;
     let mut statement = conn.prepare("SELECT key,value FROM metadata WHERE key IN ('enum_config_hash','config_hash','pending_enum_config_hash','pending_download_config_hash') ORDER BY key")?;
     let config = statement
@@ -404,18 +473,26 @@ fn target_state(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let evidence = serde_json::json!([dependencies, config]).to_string();
-    Ok(Some(SparseTargetState {
+    Ok(Ok(SparseTargetState {
         library: library.into(),
         child: child.into(),
         master: master.into(),
         evidence,
+        requires_metadata,
+        copies,
+        generation: generation.map(str::to_owned),
         validate_files: None,
     }))
 }
 
 // Repeat global authority checks inside the checkpoint transaction. Family
 // snapshots alone cannot see a competing owner created in another library.
-fn validate_target_paths(conn: &Connection, library: &str, child: &str) -> Result<(), StateError> {
+fn validate_target_paths(
+    conn: &Connection,
+    library: &str,
+    child: &str,
+    selected_paths: &[PathBuf],
+) -> Result<(), StateError> {
     let mut statement = conn.prepare("SELECT library,id,local_path FROM assets WHERE local_path IS NOT NULL UNION SELECT library,id,local_path FROM asset_metadata_paths")?;
     let catalog = statement
         .query_map([], |row| {
@@ -429,12 +506,21 @@ fn validate_target_paths(conn: &Connection, library: &str, child: &str) -> Resul
     let mut paths = conn.prepare(
         "SELECT local_path FROM assets WHERE library=?1 AND id=?2 AND local_path IS NOT NULL",
     )?;
-    let paths = paths
-        .query_map(params![library, child], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut paths = paths
+        .query_map(params![library, child], |row| {
+            row.get::<_, String>(0).map(PathBuf::from)
+        })?
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    for path in selected_paths {
+        paths.insert(path.clone());
+    }
     for media in paths {
-        for (path, sidecar) in [(media.clone(), false), (format!("{media}.xmp"), true)] {
-            let path = std::path::Path::new(&path);
+        let mut sidecar_path = media.as_os_str().to_owned();
+        sidecar_path.push(".xmp");
+        for (path, sidecar) in [
+            (media.as_path(), false),
+            (std::path::Path::new(&sidecar_path), true),
+        ] {
             super::primary_layout::guard_writer(conn, path)?;
             super::legacy_preservation::guard_writer(conn, path)?;
             let key = crate::fs_util::confined_path_key(path)
@@ -474,13 +560,40 @@ pub(super) fn clear_proven(
                     && proof.generation == current.generation
             })
             .ok_or_else(|| invariant("checkpoint lacks current sparse identity proof"))?;
-        if let Some(target) = &proof.target
-            && target_state(tx, &target.library, &target.child, &target.master)?.as_ref()
-                != Some(target)
+        let target = match &proof.target {
+            Some(SparseTargetProof::DirectHidden {
+                library,
+                child,
+                master,
+                scan,
+                selected,
+            }) => {
+                if !matches!(
+                    super::provider_generations::sparse_selected_copies(tx, scan, library, child, master)?,
+                    Ok(copies) if copies.is_empty()
+                ) {
+                    return Err(invariant("direct Hidden selection changed"));
+                }
+                selected.as_ref()
+            }
+            Some(SparseTargetProof::Selected(target)) => Some(target),
+            None => None,
+        };
+        if let Some(target) = target
+            && target_state(
+                tx,
+                &target.library,
+                &target.child,
+                &target.master,
+                target.generation.as_deref(),
+                target.requires_metadata,
+            )?
+            .as_ref()
+                != Ok(target)
         {
             return Err(invariant("sparse target receipt state changed"));
         }
-        if let Some(target) = &proof.target {
+        if let Some(target) = target {
             target
                 .validate_files
                 .as_ref()
@@ -505,14 +618,15 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
         db.with_conn_mut("sparse_target_test", |conn| {
             conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,local_path,local_checksum) VALUES ('SharedSync','target','original','provider','image.jpg',1,10,'photo','downloaded',1,'/photos/image.jpg','local')", [])?;
-            super::validate_target_paths(conn, "SharedSync", "target")?;
+            super::validate_target_paths(conn, "SharedSync", "target", &[])?;
             // New authority is outside the target family and was previously invisible.
             conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,local_path,local_checksum) VALUES ('OtherSync','other','original','provider','image.jpg',1,10,'photo','downloaded',1,'/photos/image.jpg','local')", [])?;
-            assert!(super::validate_target_paths(conn, "SharedSync", "target").is_err());
+            assert!(super::validate_target_paths(conn, "SharedSync", "target", &[]).is_err());
             conn.execute("UPDATE assets SET local_path='/photos/image.jpg.xmp' WHERE library='OtherSync'", [])?;
-            assert!(super::validate_target_paths(conn, "SharedSync", "target").is_err());
+            assert!(super::validate_target_paths(conn, "SharedSync", "target", &[]).is_err());
             conn.execute("UPDATE assets SET local_path='/photos/unrelated.jpg' WHERE library='OtherSync'", [])?;
-            super::validate_target_paths(conn, "SharedSync", "target")?;
+            super::validate_target_paths(conn, "SharedSync", "target", &[])?;
+            assert!(super::validate_target_paths(conn, "SharedSync", "target", &[std::path::PathBuf::from("/photos/unrelated.jpg")]).is_err());
             Ok(())
         }).await.unwrap();
     }
@@ -549,7 +663,7 @@ mod tests {
         let stable = Arc::new(AtomicBool::new(true));
         let check = Arc::clone(&stable);
         let target = db
-            .sparse_target_state("SharedSync", "target", "master")
+            .sparse_target_state("SharedSync", "target", "master", None, true)
             .await
             .unwrap()
             .unwrap()
@@ -560,11 +674,12 @@ mod tests {
                     Err(super::invariant("synthetic file proof drift"))
                 }
             }));
-        let proof = identity.proof().with_target(target);
+        let proof = identity
+            .proof()
+            .with_target(super::SparseTargetProof::Selected(target));
         let transition = || CheckpointTransition {
+            album_snapshots: Vec::new(),
             expected_metadata: Vec::new(),
-            legacy_preservation_proofs: Vec::new(),
-            legacy_config_hash: None,
             sparse_identity_proofs: vec![proof.clone()],
             metadata_updates: vec![
                 ("sync_token:PrimarySync".into(), "after".into()),
@@ -907,9 +1022,8 @@ mod tests {
             .await
             .unwrap();
         let transition = |proofs| CheckpointTransition {
+            album_snapshots: Vec::new(),
             expected_metadata: Vec::new(),
-            legacy_preservation_proofs: Vec::new(),
-            legacy_config_hash: None,
             sparse_identity_proofs: proofs,
             metadata_updates: vec![
                 ("sync_token:PrimarySync".into(), "after".into()),

@@ -9,7 +9,7 @@ The review is advisory: demonstrable defects, regressions, and concrete missing 
 
 ## New issue intake
 
-After merge to main, the workflow also handles **issues.opened only**.
+Both issue reviews run when someone other than the repository owner opens an issue. Issues opened by the owner or a bot skip both reviews.
 Editing or reopening an issue
 does not trigger intake. There is no issue backfill, manual issue dispatch,
 schedule, or automatic retry after a stale result is discarded.

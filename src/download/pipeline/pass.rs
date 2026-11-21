@@ -21,6 +21,7 @@ use super::task::{
 };
 
 /// Configuration for a download pass.
+#[derive(Clone)]
 pub(in crate::download) struct PassConfig<'a> {
     pub(in crate::download) prior_auth_errors: usize,
     pub(in crate::download) url_obtained_at:
@@ -69,6 +70,7 @@ pub(in crate::download) struct PassResult {
     pub(in crate::download) failed: Vec<DownloadTask>,
     pub(in crate::download) auth_errors: usize,
     pub(in crate::download) state_write_failures: usize,
+    pub(in crate::download) storage_failed: bool,
     pub(in crate::download) bytes_downloaded: u64,
     pub(in crate::download) disk_bytes_written: u64,
     pub(in crate::download) rate_limit_observations: usize,
@@ -157,6 +159,7 @@ pub(in crate::download) async fn run_download_pass(
     let mut downloaded = 0usize;
     let mut downloaded_tasks: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
+    let mut storage_failed = false;
     let mut exif_failures = 0usize;
     let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
     let mut bytes_downloaded_total: u64 = 0;
@@ -179,7 +182,16 @@ pub(in crate::download) async fn run_download_pass(
     // the end of the pass — defeating the point of parallel cleanup.
     while let Some((task, result)) = download_stream.next().await {
         match &result {
-            Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes, retained)) => {
+            Ok((
+                exif_ok,
+                local_checksum,
+                download_checksum,
+                bytes_dl,
+                disk_bytes,
+                retained,
+                embedded_fields,
+                metadata_storage_failed,
+            )) => {
                 downloaded += 1;
                 downloaded_tasks.push(task.clone());
                 bytes_downloaded_total += bytes_dl;
@@ -213,6 +225,7 @@ pub(in crate::download) async fn run_download_pass(
                         *exif_ok,
                         mark_capture_repair_after_download,
                         retained.clone(),
+                        embedded_fields.clone(),
                     )
                     .await
                     {
@@ -244,6 +257,17 @@ pub(in crate::download) async fn run_download_pass(
                             }
                         }
                     }
+                }
+                if *metadata_storage_failed {
+                    storage_failed = true;
+                    config.shutdown_token.cancel();
+                    pass_shutdown.cancel();
+                    tracing::error!(
+                        target: "kei::download::pipeline",
+                        asset_id = %task.asset_id,
+                        path = %task.download_path.display(),
+                        "Metadata storage unavailable; stopping file work for this cycle"
+                    );
                 }
             }
             Err(e) => {
@@ -280,6 +304,12 @@ pub(in crate::download) async fn run_download_pass(
                         pb.suspend(|| {
                             tracing::error!(target: "kei::download::pipeline", asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
                         });
+                    }
+                    DownloadTaskErrorClass::Storage => {
+                        storage_failed = true;
+                        config.shutdown_token.cancel();
+                        pass_shutdown.cancel();
+                        tracing::error!(error = %e, "Storage unavailable; stopping file work for this cycle");
                     }
                 }
                 if let Some(db) = &state_db
@@ -345,6 +375,7 @@ pub(in crate::download) async fn run_download_pass(
         failed,
         auth_errors,
         state_write_failures: state_write_failures + failure_state_writes,
+        storage_failed,
         bytes_downloaded: bytes_downloaded_total,
         disk_bytes_written: disk_bytes_total,
         rate_limit_observations: rate_limit_counter.load(std::sync::atomic::Ordering::Relaxed),

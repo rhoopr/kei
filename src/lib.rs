@@ -331,6 +331,7 @@ struct PartialSyncError(usize);
 enum ExitClassification {
     Partial,
     Auth,
+    TwoFactor,
     TerminalAuth,
     Other,
 }
@@ -339,7 +340,7 @@ impl ExitClassification {
     const fn exit_code(self) -> u8 {
         match self {
             Self::Partial => EXIT_PARTIAL,
-            Self::Auth => EXIT_AUTH,
+            Self::Auth | Self::TwoFactor => EXIT_AUTH,
             Self::TerminalAuth => EXIT_TERMINAL_AUTH,
             Self::Other => 1,
         }
@@ -358,7 +359,7 @@ fn classify_exit_error(e: &anyhow::Error) -> ExitClassification {
     if e.downcast_ref::<auth::error::AuthError>()
         .is_some_and(auth::error::AuthError::is_two_factor_required)
     {
-        ExitClassification::Auth
+        ExitClassification::TwoFactor
     } else if e
         .downcast_ref::<auth::error::AuthError>()
         .is_some_and(auth::error::AuthError::is_terminal_apple_auth)
@@ -557,8 +558,7 @@ fn get_account_owner(
     globals: &config::GlobalArgs,
     toml: Option<&TomlConfig>,
 ) -> state::db::account::AccountOwner {
-    let (username, _, domain, _) =
-        config::resolve_auth(globals, &cli::PasswordArgs::default(), toml);
+    let (username, domain) = config::resolve_account(globals, toml);
     state::db::account::AccountOwner::configured(&username, domain.as_str())
 }
 
@@ -567,7 +567,7 @@ async fn get_db_path(
     toml: Option<&TomlConfig>,
 ) -> anyhow::Result<PathBuf> {
     let (username, _, domain, cookie_dir) =
-        config::resolve_auth(globals, &cli::PasswordArgs::default(), toml);
+        config::resolve_auth(globals, &cli::PasswordArgs::default(), toml)?;
     if username.is_empty() {
         anyhow::bail!("Set your iCloud username with ICLOUD_USERNAME or [auth].username.");
     }
@@ -686,7 +686,8 @@ pub fn main_inner() -> ExitCode {
         .build()
         .expect("Failed to create tokio runtime");
 
-    match rt.block_on(run(env_password, input_mode)) {
+    let mut recovery_config = None;
+    match rt.block_on(run(env_password, input_mode, &mut recovery_config)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             if let Some(parse_exit) = classify_cli_parse_exit(&e) {
@@ -713,9 +714,18 @@ pub fn main_inner() -> ExitCode {
                 )]
                 {
                     eprintln!("Error: {e:#}");
+                    if classification == ExitClassification::TwoFactor {
+                        eprintln!(
+                            "{}",
+                            cli::two_factor_instructions(recovery_config.as_deref())
+                        );
+                    }
                     if classification.should_suggest_diagnostics() {
                         eprintln!();
-                        eprintln!("Run `kei doctor --json` for a redacted diagnostic report.");
+                        eprintln!(
+                            "Run `{}` for a redacted diagnostic report.",
+                            cli::command_for_config("doctor --json", recovery_config.as_deref())
+                        );
                         eprintln!("Report bugs: https://github.com/rhoopr/kei/issues");
                     }
                 }
@@ -725,35 +735,60 @@ pub fn main_inner() -> ExitCode {
     }
 }
 
-async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Result<()> {
+async fn run(
+    env_password: Option<String>,
+    input_mode: InputMode,
+    recovery_config: &mut Option<PathBuf>,
+) -> anyhow::Result<()> {
     let cli = cli::parse_cli_with_sources(std::env::args_os()).map_err(|e| anyhow::anyhow!(e))?;
     // Export has its own input path: no runtime config construction, logging,
     // credentials, service hooks, or network-capable command dispatch.
     if let cli::Command::SupportExport(args) = &cli.command {
-        return support::export(args.clone(), &cli.config).await;
+        return support::export(args.clone(), cli.config.as_deref()).await;
     }
     if let cli::Command::Doctor(args) = &cli.command
         && args.missing_reference_inventory
     {
-        return inventory_diagnostic::run(std::path::Path::new(&cli.config)).await;
+        return inventory_diagnostic::run(&config::bootstrap_config(cli.config.as_deref())?.0)
+            .await;
+    }
+    // Diagnostics can be shared with support. Don't echo a private config path
+    // in their stderr fallback after the command has redacted its report.
+    if !matches!(cli.command, cli::Command::Doctor(_)) {
+        *recovery_config = cli.config.as_deref().map(config::expand_tilde);
     }
     let config = load_startup_config(&cli)?;
+    if let Command::Config {
+        action: cli::ConfigAction::Setup { output: Some(path) },
+    } = &cli.command
+    {
+        *recovery_config = Some(config::expand_tilde(path));
+    }
     let output = resolve_startup_output(&cli, config.toml.as_ref());
 
     // Keep the guard until dispatch returns so fast commands drain their logs.
     // BarSuspendingStderr pauses progress rendering around each log write.
     let (make_writer, _writer_guard, redact_password) = build_redacting_writer(BarSuspendingStderr);
-    let globals = config::GlobalArgs::from_bootstrap_env();
-    let recording = matches!(
-        &cli.command,
-        cli::Command::Sync { .. }
-            | cli::Command::ImportExisting(_)
-            | cli::Command::Service {
-                action: cli::ServiceAction::Run(_)
-            }
-    );
+    let mut globals = config::GlobalArgs::from_bootstrap_env();
+    globals.config_source = config.source.clone();
+    let preview = match &cli.command {
+        cli::Command::Sync { sync, .. } => sync.dry_run || sync.only_print_filenames,
+        cli::Command::Service {
+            action: cli::ServiceAction::Run(args),
+        } => args.sync.dry_run || args.sync.only_print_filenames,
+        _ => false,
+    };
+    let recording = !preview
+        && matches!(
+            &cli.command,
+            cli::Command::Sync { .. }
+                | cli::Command::ImportExisting(_)
+                | cli::Command::Service {
+                    action: cli::ServiceAction::Run(_)
+                }
+        );
     let (recorder, support_guard) = if recording {
-        match support::initialize(&globals, config.toml.as_ref(), config.explicitly_set) {
+        match support::initialize(&globals, config.toml.as_ref(), config.explicitly_set)? {
             Some((recorder, guard)) => (Some(recorder), Some(guard)),
             None => (None, None),
         }
@@ -808,6 +843,7 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
 
 /// Config discovery facts and the load result, including recoverable doctor errors.
 struct StartupConfig {
+    source: config::ConfigSource,
     path: PathBuf,
     explicitly_set: bool,
     used_docker_fallback: bool,
@@ -815,32 +851,9 @@ struct StartupConfig {
     load_error: Option<String>,
 }
 
-const DOCKER_FALLBACK_CONFIG: &str = "/config/config.toml";
-
 fn load_startup_config(cli: &cli::Cli) -> anyhow::Result<StartupConfig> {
-    // Load TOML config early so it can influence log level.
-    //
-    // Docker fallback: when no --config is passed, the default
-    // ~/.config/kei/config.toml may not exist inside a container (it
-    // resolves to /root/.config/kei/config.toml). Try the Docker
-    // convention /config/config.toml as a fallback so that `docker exec`
-    // subcommands (get-code, submit-code, credential, etc.) automatically
-    // find the same config the Docker CMD uses.
-    let config_explicitly_set =
-        cli.config != "~/.config/kei/config.toml" && cli.config != DOCKER_FALLBACK_CONFIG;
-    let (config_path, used_docker_fallback) = {
-        let expanded = config::expand_tilde(&cli.config);
-        if !config_explicitly_set && !expanded.exists() {
-            let docker = PathBuf::from(DOCKER_FALLBACK_CONFIG);
-            if docker.exists() {
-                (docker, true)
-            } else {
-                (expanded, false)
-            }
-        } else {
-            (expanded, false)
-        }
-    };
+    let config_explicitly_set = cli.config.is_some();
+    let (config_path, used_docker_fallback) = config::bootstrap_config(cli.config.as_deref())?;
     // When --config is explicit but the file doesn't exist and the parent
     // dir does exist, allow it (auto-config will create the file).
     // Otherwise require the file to exist so typos in --config paths error.
@@ -848,14 +861,25 @@ fn load_startup_config(cli: &cli::Cli) -> anyhow::Result<StartupConfig> {
         !config_path.exists() && config_path.parent().is_some_and(std::path::Path::is_dir);
     let config_required = config_explicitly_set && !can_auto_create;
     let is_doctor_command = matches!(cli.command, cli::Command::Doctor(_));
-    let (toml_config, toml_config_error) =
-        match config::load_toml_config(&config_path, config_required) {
-            Ok(config) => (config, None),
-            Err(e) if is_doctor_command => (None, Some(e.to_string())),
+    let (toml_config, mut source, toml_config_error) =
+        match config::load_toml_config_with_source(&config_path, config_required) {
+            Ok((config, source)) => (config, source, None),
+            Err(e) if is_doctor_command => {
+                (None, config::ConfigSource::Unavailable, Some(e.to_string()))
+            }
             Err(e) => return Err(e),
         };
 
+    if let config::ConfigSource::Absent {
+        explicitly_selected,
+        ..
+    } = &mut source
+    {
+        *explicitly_selected = config_explicitly_set;
+    }
+
     Ok(StartupConfig {
+        source,
         path: config_path,
         explicitly_set: config_explicitly_set,
         used_docker_fallback,
@@ -998,6 +1022,8 @@ async fn dispatch_command(
         load_error: toml_config_error,
         ..
     } = config;
+    let mut globals = globals.clone();
+    let globals = &mut globals;
     let StartupOutput {
         personality_mode,
         friendly_request,
@@ -1089,7 +1115,10 @@ async fn dispatch_command(
                         one_shot_password,
                     } => {
                         // Reload TOML from the newly written config
-                        toml_config = config::load_toml_config(&cfg_path, true)?;
+                        let (loaded, source) =
+                            config::load_toml_config_with_source(&cfg_path, true)?;
+                        toml_config = loaded;
+                        globals.config_source = source;
                         let sync_pw = cli::PasswordArgs {
                             password: one_shot_password.map(|p| p.expose_secret().to_string()),
                             ..cli::PasswordArgs::default()
@@ -1102,10 +1131,17 @@ async fn dispatch_command(
             }
         },
         Command::Install(args) => {
+            // An explicit config can still need automatic state discovery.
+            // Resolve it before registering a service that could not start.
+            config::resolve_data_dir(
+                globals.data_dir.as_deref(),
+                toml_config.as_ref().and_then(|t| t.data_dir.as_deref()),
+            )?;
             return service::install::run(args, &config_path).await;
         }
         Command::Uninstall(args) => {
-            return service::uninstall::run(args).await;
+            return service::uninstall::run(args, &config_path, globals, toml_config.as_ref())
+                .await;
         }
         Command::Service { action } => match action {
             cli::ServiceAction::Status => return service::status::run().await,
@@ -1132,7 +1168,7 @@ async fn dispatch_command(
                 .await;
             }
         },
-        Command::Sync { password, sync, .. } => (sync.retry_failed, password, sync),
+        Command::Sync { password, sync, .. } => (false, password, sync),
     };
     Box::pin(sync_loop::run_sync(
         globals,
@@ -1160,7 +1196,7 @@ mod tests {
 
     fn startup_cli() -> cli::Cli {
         cli::Cli {
-            config: String::new(),
+            config: None,
             log_level: None,
             verbose: false,
             command: Command::Config {
@@ -1173,9 +1209,13 @@ mod tests {
     fn startup_config_loads_explicit_file_before_output_resolution() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "log_level = 'warn'\n[ui]\nfriendly = false\n").unwrap();
+        std::fs::write(
+            &path,
+            "config_version = 1\nlog_level = 'warn'\n[ui]\nfriendly = false\n",
+        )
+        .unwrap();
         let cli = cli::Cli {
-            config: path.to_string_lossy().into_owned(),
+            config: Some(path.to_string_lossy().into_owned()),
             ..startup_cli()
         };
         let config = load_startup_config(&cli).unwrap();
@@ -1193,21 +1233,23 @@ mod tests {
     fn startup_config_allows_missing_file_only_when_parent_exists() {
         let dir = tempfile::tempdir().unwrap();
         let mut cli = startup_cli();
-        cli.config = dir
-            .path()
-            .join("config.toml")
-            .to_string_lossy()
-            .into_owned();
+        cli.config = Some(
+            dir.path()
+                .join("config.toml")
+                .to_string_lossy()
+                .into_owned(),
+        );
         let config = load_startup_config(&cli).unwrap();
         assert!(config.explicitly_set);
         assert!(config.toml.is_none());
         assert!(config.load_error.is_none());
         assert!(!config.path.exists(), "discovery must not create config");
-        cli.config = dir
-            .path()
-            .join("missing/config.toml")
-            .to_string_lossy()
-            .into_owned();
+        cli.config = Some(
+            dir.path()
+                .join("missing/config.toml")
+                .to_string_lossy()
+                .into_owned(),
+        );
         let err = load_startup_config(&cli).err().unwrap();
         assert!(err.to_string().contains("Could not read config file"));
     }
@@ -1218,12 +1260,13 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "broken = [").unwrap();
         let mut cli = cli::Cli {
-            config: path.to_string_lossy().into_owned(),
+            config: Some(path.to_string_lossy().into_owned()),
             ..startup_cli()
         };
         let err = load_startup_config(&cli).err().unwrap().to_string();
         assert!(err.contains("Failed to parse config file"));
         cli.command = Command::Doctor(cli::DoctorArgs {
+            has_env_password: false,
             missing_reference_inventory: false,
             json: true,
             live: false,
@@ -1841,7 +1884,7 @@ mod tests {
     fn classify_exit_error_two_factor_required_uses_auth_failure() {
         let e: anyhow::Error = auth::error::AuthError::TwoFactorRequired.into();
         let c = classify_exit_error(&e);
-        assert_eq!(c, ExitClassification::Auth);
+        assert_eq!(c, ExitClassification::TwoFactor);
         assert_eq!(c.exit_code(), EXIT_AUTH);
         assert!(c.should_log());
     }
@@ -1929,7 +1972,7 @@ mod tests {
             .context("during startup");
         assert_eq!(
             classify_exit_error(&e),
-            ExitClassification::Auth,
+            ExitClassification::TwoFactor,
             "context-wrapped 2FA-required must keep the documented auth exit code"
         );
 
@@ -1960,7 +2003,7 @@ mod tests {
         assert_eq!(
             sorted.len(),
             codes.len(),
-            "every exit classification must map to a distinct code; got {codes:?}"
+            "documented partial, auth, terminal-auth and generic exit codes must be distinct; got {codes:?}"
         );
     }
 }

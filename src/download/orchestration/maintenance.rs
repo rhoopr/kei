@@ -19,9 +19,18 @@ use super::models::{
     SyncStats, block_sync_token_for_incremental_delta, block_sync_token_for_metadata_capture,
 };
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MetadataDrainOutcome {
+    /// Markers left unfinished when the drain stopped.
+    pub(crate) failed: usize,
+    /// At least one destination rejected metadata work for operational
+    /// storage reasons. Remaining retry markers are preserved.
+    pub(crate) storage_failed: bool,
+}
+
 /// Drain pending metadata-rewrite markers in bounded batches so a
 /// `--refresh-metadata` migration finishes in its own run. Returns the number
-/// of markers left failing when the drain stops.
+/// of markers left failing and whether operational storage stopped the drain.
 pub(crate) async fn drain_pending_metadata_rewrites(
     db: &dyn DownloadStore,
     metadata: &crate::config::MetadataConfig,
@@ -29,10 +38,10 @@ pub(crate) async fn drain_pending_metadata_rewrites(
     library_scope: &[&str],
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
-) -> usize {
+) -> MetadataDrainOutcome {
     let flags = MetadataFlags::from(metadata);
     if !flags.has_any_write() {
-        return 0;
+        return MetadataDrainOutcome::default();
     }
     let mut offset = 0usize;
     let mut failed = 0usize;
@@ -48,8 +57,17 @@ pub(crate) async fn drain_pending_metadata_rewrites(
         )
         .await;
         failed = failed.saturating_add(pass.failed);
+        if pass.storage_failed {
+            return MetadataDrainOutcome {
+                failed: failed.max(1),
+                storage_failed: true,
+            };
+        }
         if pass.fetched == 0 {
-            return failed;
+            return MetadataDrainOutcome {
+                failed,
+                storage_failed: false,
+            };
         }
         tracing::debug!(
             applied = pass.applied,
@@ -58,7 +76,10 @@ pub(crate) async fn drain_pending_metadata_rewrites(
             "Metadata rewrite batch completed"
         );
         if shutdown_token.is_cancelled() {
-            return failed.max(1);
+            return MetadataDrainOutcome {
+                failed: failed.max(1),
+                storage_failed: false,
+            };
         }
         offset = offset.saturating_add(
             pass.fetched
@@ -87,6 +108,41 @@ pub(super) async fn has_metadata_backfill_work(config: &DownloadConfig) -> bool 
 }
 
 const METADATA_CAPTURE_BATCH: usize = 500;
+
+impl DownloadConfig {
+    #[cfg(test)]
+    pub(crate) async fn repair_metadata_capture_for_test(
+        &self,
+        passes: &[crate::commands::AlbumPass],
+    ) -> (SyncStats, usize) {
+        let repair = run_metadata_capture_repair(
+            passes,
+            self,
+            DownloadControls::download_hidden(),
+            &CancellationToken::new(),
+        )
+        .await;
+        (repair.stats, repair.failures)
+    }
+
+    /// Historical revision debt is authoritative only for compatibility work.
+    /// Normal selection owns its own identity, publication, and metadata gates.
+    pub(crate) async fn historical_capture_has_checkpoint_authority(
+        &self,
+        passes: &[crate::commands::AlbumPass],
+        controls: DownloadControls,
+    ) -> anyhow::Result<bool> {
+        if self.refresh_metadata || self.provisional {
+            return Ok(true);
+        }
+        let Some(context) = super::generation::context(passes, self, controls).await? else {
+            return Ok(true);
+        };
+        // Scope qualification alone does not prove the destination's account pin.
+        context.current().await?;
+        Ok(false)
+    }
+}
 
 #[derive(Default)]
 pub(super) struct MetadataCaptureRepair {
@@ -202,6 +258,44 @@ pub(super) async fn run_metadata_capture_repair(
 ) -> MetadataCaptureRepair {
     let mut repair =
         collect_metadata_capture_repair(passes, config, controls, shutdown_token).await;
+    repair.checkpoint.project(&mut repair.stats);
+    repair
+}
+
+/// Observe retained capture evidence without admitting historical repair work.
+pub(super) async fn observe_metadata_capture(config: &DownloadConfig) -> MetadataCaptureRepair {
+    let mut repair = MetadataCaptureRepair::default();
+    repair.stats.metadata_capture_revision = Some(crate::state::METADATA_CAPTURE_REVISION);
+    let Some(db) = &config.state_db else {
+        return repair;
+    };
+    let library = config.library.as_ref();
+    match db.get_summary().await {
+        Ok(summary) => {
+            if let Some(status) = summary
+                .metadata_capture
+                .iter()
+                .find(|status| status.library == library)
+            {
+                repair.stats.metadata_capture_remaining = status.remaining_assets;
+                repair.stats.metadata_capture_unresolved = status.unresolved_assets;
+                repair.stats.metadata_capture_deferred = status.deferred_assets;
+                repair.stats.unattributed_legacy_assets = status.unattributed_legacy_assets;
+                repair.stats.unattributed_legacy_pending = status.unattributed_legacy_pending;
+            }
+        }
+        Err(error) => {
+            repair.failures = 1;
+            repair.stats.metadata_capture_failures = 1;
+            repair.checkpoint.state_write_failures = 1;
+            repair.checkpoint.sync_token_blocked = true;
+            block_sync_token_for_incremental_delta(
+                &mut repair.stats,
+                METADATA_CAPTURE_REPAIR_FAILED_REASON,
+            );
+            tracing::warn!(error = %error, library, "Could not read retained metadata-capture evidence");
+        }
+    }
     repair.checkpoint.project(&mut repair.stats);
     repair
 }

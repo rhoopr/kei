@@ -1,7 +1,27 @@
 use crate::types::LogLevel;
 use clap::{Args, FromArgMatches, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+pub(crate) fn command_for_config(command: &str, config: Option<&Path>) -> String {
+    let Some(path) = config else {
+        return format!("kei {command}");
+    };
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    let quoted = path.replace('\'', "''"); // PowerShell literal string
+    #[cfg(not(windows))]
+    let quoted = path.replace('\'', "'\\''");
+    format!("kei --config '{quoted}' {command}")
+}
+
+pub(crate) fn two_factor_instructions(config: Option<&Path>) -> String {
+    format!(
+        "Run `{}`, then `{}`.",
+        command_for_config("login get-code", config),
+        command_for_config("login submit-code <CODE>", config)
+    )
+}
 
 /// Reject empty strings at CLI parse time.
 fn non_empty_string(s: &str) -> Result<String, String> {
@@ -94,19 +114,6 @@ fn parse_2fa_code(s: &str) -> Result<String, String> {
     }
 }
 
-/// Limit on which assets a sync pass processes.
-///
-/// `--recent 100` is a count limit (top N most-recent assets). `--recent 30d`
-/// is a days limit (assets created in the last 30 days) and translates to a
-/// `skip_created_before` cutoff at `Config::build` time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecentLimit {
-    /// Take the N most-recent assets by creation date.
-    Count(u32),
-    /// Take assets created in the last N days.
-    Days(u32),
-}
-
 /// Explicit legacy-state adoption. No automatic account inference or overwrite.
 #[derive(Debug, Clone, clap::Args)]
 pub struct MigrateStateArgs {
@@ -123,89 +130,11 @@ pub struct MigrateStateArgs {
     pub password: PasswordArgs,
 }
 
-/// Where a count-form `--recent N` limit is applied when filters create
-/// multiple CloudKit streams.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
-    clap::ValueEnum,
-    serde::Deserialize,
-    serde::Serialize,
-)]
-#[serde(rename_all = "kebab-case")]
-pub enum RecentScope {
-    /// Apply `recent` once to the selected library, then narrow with filters.
-    #[default]
-    Global,
-    /// Apply `recent` independently to each album, smart-folder, or unfiled pass.
-    PerFilter,
-}
-
-/// Parse `--recent N` (count) or `--recent Nd` (days). Clap `value_parser`.
-///
-/// Rejects zero, empty, and unknown suffixes. Only `d` (days) is supported
-/// today; this keeps the syntax open for future units without locking us in.
-pub(crate) fn parse_recent_limit(s: &str) -> Result<RecentLimit, String> {
-    if s.is_empty() {
-        return Err("must not be empty".to_string());
-    }
-    let (num_str, is_days) = if let Some(stripped) = s.strip_suffix('d') {
-        (stripped, true)
-    } else {
-        (s, false)
-    };
-    let n: u32 = num_str
-        .parse()
-        .map_err(|_e| format!("expected a positive integer or `Nd` form (got `{s}`)"))?;
-    if n == 0 {
-        return Err(format!("must be greater than zero (got `{s}`)"));
-    }
-    Ok(if is_days {
-        RecentLimit::Days(n)
-    } else {
-        RecentLimit::Count(n)
+/// Import-only provider sampling. Sync has no count-selection policy.
+fn parse_import_sample_count(s: &str) -> Result<u32, String> {
+    s.parse::<u32>().ok().filter(|count| *count > 0).ok_or_else(|| {
+        "import-existing --recent requires a positive count, such as --recent 100. Date windows are not supported by import-existing; omit --recent to scan all selected existing files.".to_owned()
     })
-}
-
-impl std::fmt::Display for RecentLimit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Count(n) => write!(f, "{n}"),
-            Self::Days(n) => write!(f, "{n}d"),
-        }
-    }
-}
-
-impl serde::Serialize for RecentLimit {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            // Count serializes as a bare integer so TOML round-trips cleanly
-            // for the common case (`recent = 100`, not `recent = "100"`).
-            Self::Count(n) => s.serialize_u32(*n),
-            Self::Days(n) => s.serialize_str(&format!("{n}d")),
-        }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for RecentLimit {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        #[derive(serde::Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            Int(u32),
-            Str(String),
-        }
-        match Raw::deserialize(d)? {
-            Raw::Int(0) => Err(D::Error::custom("`recent` must be greater than zero")),
-            Raw::Int(n) => Ok(Self::Count(n)),
-            Raw::Str(s) => parse_recent_limit(&s).map_err(D::Error::custom),
-        }
-    }
 }
 
 /// Password arguments shared across commands that authenticate.
@@ -232,24 +161,15 @@ pub struct PasswordArgs {
     pub password_command: Option<String>,
 }
 
+/// Validate date syntax before startup can create support or state directories.
+fn parse_created_date_argument(s: &str) -> Result<String, String> {
+    crate::config::parse_created_date_filter(s).map_err(|error| error.to_string())?;
+    Ok(s.to_owned())
+}
+
 /// Arguments for the sync command.
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SyncArgs {
-    /// Limit to recent assets (e.g. `--recent 100`) or use a days window
-    /// (e.g. `--recent 30d`).
-    /// This is not a global exact file count - filters and live-photo parts
-    /// can change the final number of downloaded files. Days form maps to
-    /// `--skip-created-before` internally.
-    #[arg(long, value_parser = parse_recent_limit)]
-    pub recent: Option<RecentLimit>,
-
-    /// Where count-form `--recent N` applies when filters create multiple streams.
-    ///
-    /// `global` means "take the library-wide recent N, then apply filters".
-    /// `per-filter` means "take up to N from each album/smart-folder/unfiled pass".
-    #[arg(long, value_enum)]
-    pub recent_scope: Option<RecentScope>,
-
     /// Do not modify local system or iCloud
     #[arg(long)]
     pub dry_run: bool,
@@ -259,13 +179,13 @@ pub struct SyncArgs {
     pub no_progress_bar: bool,
 
     /// Skip assets before this cutoff. Date-only values compare the capture-local calendar date;
-    /// explicit datetimes and relative intervals compare the instant (e.g., 2025-01-02 or 20d).
-    #[arg(long)]
+    /// host-local datetimes compare the instant (e.g., 2025-01-02T14:30:00).
+    #[arg(long, value_parser = parse_created_date_argument)]
     pub skip_created_before: Option<String>,
 
     /// Skip assets after this cutoff. Date-only values compare the capture-local calendar date;
-    /// explicit datetimes and relative intervals compare the instant (e.g., 2025-01-02 or 20d).
-    #[arg(long)]
+    /// host-local datetimes compare the instant (e.g., 2025-01-02T14:30:00).
+    #[arg(long, value_parser = parse_created_date_argument)]
     pub skip_created_after: Option<String>,
 
     /// Only print filenames without downloading
@@ -277,16 +197,12 @@ pub struct SyncArgs {
     #[arg(long)]
     pub save_password: bool,
 
-    /// Re-sync only previously failed assets
-    #[arg(long, conflicts_with = "dry_run")]
-    pub retry_failed: bool,
-
     /// One-shot full-library repair that refreshes metadata for every downloaded version without re-downloading media.
     /// Requires a complete selected-library sweep and rewrites EXIF/XMP per the configured metadata outputs.
     /// Use with sync, not service run. A configured watch interval is ignored.
     #[arg(
         long,
-        conflicts_with_all = ["dry_run", "retry_failed", "only_print_filenames", "recent"]
+        conflicts_with_all = ["dry_run", "only_print_filenames"]
     )]
     pub refresh_metadata: bool,
 
@@ -296,9 +212,7 @@ pub struct SyncArgs {
     #[arg(long, requires = "refresh_metadata")]
     pub repair_capture_timestamps: bool,
 
-    /// Replace a recorded local file only when reconcile marked it truncated.
-    /// The replacement is verified before it atomically takes the recorded path.
-    /// Use with sync, not service run. A configured watch interval is ignored.
+    /// Retired: use reconcile --inspect-path and --confirm-damage for each damaged copy.
     #[arg(
         long,
         conflicts_with_all = ["dry_run", "only_print_filenames", "refresh_metadata"]
@@ -364,6 +278,9 @@ pub struct StatusArgs {
 /// Arguments for local diagnostics.
 #[derive(Parser, Debug, Clone)]
 pub struct DoctorArgs {
+    /// Whether startup captured a direct sync password before scrubbing the environment.
+    #[arg(skip)]
+    pub(crate) has_env_password: bool,
     /// Inventory missing parent references using cached auth only; no media or catalogue access
     #[arg(long, requires_all = ["live", "json"])]
     pub missing_reference_inventory: bool,
@@ -416,10 +333,9 @@ pub struct ImportArgs {
     #[arg(long = "library", value_parser = non_empty_string)]
     pub libraries: Vec<String>,
 
-    /// Number of recent photos to check (`--recent 100`). The `--recent Nd`
-    /// days form is only supported in `sync`; import-existing errors on use.
-    #[arg(long, value_parser = parse_recent_limit)]
-    pub recent: Option<RecentLimit>,
+    /// Number of recent photos to check (`--recent 100`).
+    #[arg(long, value_parser = parse_import_sample_count)]
+    pub recent: Option<u32>,
 
     /// Scan and report matches without writing to the state DB. Useful for
     /// verifying that TOML path and filename settings match the tree you're
@@ -450,7 +366,7 @@ pub struct ImportArgs {
 /// Arguments for the verify command.
 #[derive(Parser, Debug, Clone)]
 pub struct VerifyArgs {
-    /// Verify checksums (slower but more thorough)
+    /// Compare files with their stored local SHA-256 checksums; report missing baselines separately
     #[arg(long)]
     pub checksums: bool,
 }
@@ -463,6 +379,13 @@ pub struct ReconcileArgs {
     /// Show what would change without updating the state database.
     #[arg(long)]
     pub dry_run: bool,
+    /// Inspect one exact managed destination and print its repair fingerprint.
+    #[arg(long)]
+    pub inspect_path: Option<PathBuf>,
+    /// Confirm this destination is damaged, using the fingerprint printed by inspection.
+    /// Queues conditional replacement for the next sync; other copies are preserved.
+    #[arg(long, requires = "inspect_path", conflicts_with = "dry_run")]
+    pub confirm_damage: Option<String>,
 }
 
 // ── New subcommand types ─────────────────────────────────────────────
@@ -579,7 +502,8 @@ pub struct InstallArgs {
 #[derive(Args, Debug, Clone)]
 pub struct UninstallArgs {
     /// Also remove the state database, configuration, and stored
-    /// credentials. Default off: data is sacred, removal is opt-in.
+    /// credentials. Requires a single discovered kei root. For a symlinked
+    /// root or custom config/state paths, uninstall without --purge.
     #[arg(long)]
     pub purge: bool,
 }
@@ -720,8 +644,8 @@ pub enum Command {
     Verify(VerifyArgs),
 
     /// Reconcile state database with files on disk: mark assets as
-    /// failed when their local file is missing or truncated, so the
-    /// next sync re-downloads them.
+    /// failed when their local file is missing. Inspect and explicitly confirm
+    /// damage to queue fingerprint-pinned repair of one destination.
     #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Reconcile")]
     Reconcile(ReconcileArgs),
 
@@ -778,14 +702,11 @@ pub struct Cli {
     #[arg(long, short = 'v', global = true)]
     pub verbose: bool,
 
-    /// Path to TOML config file
-    #[arg(
-        long,
-        global = true,
-        default_value = "~/.config/kei/config.toml",
-        env = "KEI_CONFIG"
-    )]
-    pub config: String,
+    /// Path to TOML config file. Defaults to $XDG_CONFIG_HOME/kei/config.toml
+    /// when XDG_CONFIG_HOME is absolute, or ~/.config/kei/config.toml otherwise.
+    /// A lone existing legacy root is retained. Two distinct roots require explicit selection.
+    #[arg(long, global = true, env = "KEI_CONFIG")]
+    pub config: Option<String>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -885,6 +806,16 @@ fn should_append_removed_sync_surface_hint(argv: &[OsString], err: &clap::Error)
 }
 
 fn with_removed_sync_surface_hint(message: String) -> String {
+    if message.contains("--retry-failed") {
+        return format!(
+            "{message}\n\nnote: --retry-failed is retired. Run ordinary `kei sync`; it retries unfinished destinations alongside current selected work. Pending work and configuration were not changed."
+        );
+    }
+    if message.contains("--recent") {
+        return format!(
+            "{message}\n\nnote: sync count selection is no longer supported. Remove --recent and --recent-scope, and remove recent/recent_scope from [filters]. To bound sync, set a fixed YYYY-MM-DD with --skip-created-before/--skip-created-after or [filters].skip_created_before/skip_created_after. Configuration was not changed."
+        );
+    }
     format!(
         "{message}\n\nnote: v0.20 removed durable sync CLI flags. Put persistent sync settings in config.toml instead.\n      See {}",
         crate::upgrade_hints::V020_MIGRATION_URL
@@ -976,6 +907,10 @@ impl Command {
     /// the active command carries.
     pub fn inject_env_password(&mut self, env_password: Option<String>) {
         let Some(pw) = env_password else { return };
+        if let Self::Doctor(doctor) = self {
+            doctor.has_env_password = true;
+            return;
+        }
         if let Some(args) = self.password_args_mut()
             && args.password.is_none()
         {
@@ -1122,137 +1057,51 @@ mod tests {
         }
     }
 
-    // ── RecentLimit parser ──────────────────────────────────────────
-
     #[test]
-    fn parse_recent_limit_bare_count() {
-        assert_eq!(parse_recent_limit("100").unwrap(), RecentLimit::Count(100));
-        assert_eq!(parse_recent_limit("1").unwrap(), RecentLimit::Count(1));
-    }
-
-    #[test]
-    fn parse_recent_limit_days_suffix() {
-        assert_eq!(parse_recent_limit("30d").unwrap(), RecentLimit::Days(30));
-        assert_eq!(parse_recent_limit("1d").unwrap(), RecentLimit::Days(1));
-    }
-
-    #[test]
-    fn parse_recent_limit_rejects_zero() {
-        assert!(parse_recent_limit("0").unwrap_err().contains("zero"));
-        assert!(parse_recent_limit("0d").unwrap_err().contains("zero"));
-    }
-
-    #[test]
-    fn parse_recent_limit_rejects_empty() {
-        assert!(parse_recent_limit("").is_err());
-    }
-
-    #[test]
-    fn parse_recent_limit_rejects_unknown_suffix() {
-        // Only `d` is accepted today. Other units (w, m, y) would need
-        // explicit design decisions around month/year boundaries.
-        assert!(parse_recent_limit("3w").is_err());
-        assert!(parse_recent_limit("1y").is_err());
-        assert!(parse_recent_limit("2m").is_err());
-        assert!(parse_recent_limit("30days").is_err());
-    }
-
-    #[test]
-    fn parse_recent_limit_rejects_garbage() {
-        assert!(parse_recent_limit("abc").is_err());
-        assert!(parse_recent_limit("-5").is_err());
-        assert!(parse_recent_limit("10.5").is_err());
-        assert!(parse_recent_limit("10 d").is_err());
-    }
-
-    #[test]
-    fn recent_limit_toml_parses_integer() {
-        #[derive(serde::Deserialize)]
-        struct Wrap {
-            recent: RecentLimit,
+    fn import_sample_count_is_positive_and_has_import_only_guidance() {
+        for count in [1, 100, u32::MAX] {
+            assert_eq!(parse_import_sample_count(&count.to_string()), Ok(count));
         }
-        let got: Wrap = toml::from_str("recent = 100").unwrap();
-        assert_eq!(got.recent, RecentLimit::Count(100));
-    }
-
-    #[test]
-    fn recent_limit_toml_parses_days_string() {
-        #[derive(serde::Deserialize)]
-        struct Wrap {
-            recent: RecentLimit,
+        for value in [
+            "",
+            "0",
+            "-5",
+            "10.5",
+            "30d",
+            "0d",
+            "3w",
+            "abc",
+            "4294967296",
+        ] {
+            let error = parse_import_sample_count(value).unwrap_err();
+            assert!(error.contains("import-existing --recent"));
+            assert!(error.contains("positive count"));
+            assert!(!error.contains("--skip-created"));
         }
-        let got: Wrap = toml::from_str(r#"recent = "30d""#).unwrap();
-        assert_eq!(got.recent, RecentLimit::Days(30));
     }
 
     #[test]
-    fn recent_limit_toml_rejects_zero_integer() {
-        #[derive(serde::Deserialize, Debug)]
-        struct Wrap {
-            #[allow(dead_code)]
-            recent: RecentLimit,
+    fn retired_sync_counts_fail_with_supported_fixed_date_guidance() {
+        for command in [vec!["sync"], vec!["service", "run"]] {
+            for (flag, value) in [
+                ("--recent", "100"),
+                ("--recent", "30d"),
+                ("--recent-scope", "global"),
+            ] {
+                let mut args = vec!["kei"];
+                args.extend(command.iter().copied());
+                args.extend([flag, value]);
+                let error = parse_cli_with_sources(args).unwrap_err();
+                assert_eq!(error.exit_code(), 2);
+                assert!(
+                    error
+                        .rendered()
+                        .contains("count selection is no longer supported")
+                );
+                assert!(error.rendered().contains("--skip-created-before"));
+                assert!(!error.rendered().contains("recent = 100"));
+            }
         }
-        let err = toml::from_str::<Wrap>("recent = 0")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("zero"), "got: {err}");
-    }
-
-    #[test]
-    fn recent_limit_toml_rejects_garbage_string() {
-        #[derive(serde::Deserialize, Debug)]
-        struct Wrap {
-            #[allow(dead_code)]
-            recent: RecentLimit,
-        }
-        assert!(toml::from_str::<Wrap>(r#"recent = "abc""#).is_err());
-    }
-
-    #[test]
-    fn recent_limit_display_roundtrip() {
-        assert_eq!(RecentLimit::Count(100).to_string(), "100");
-        assert_eq!(RecentLimit::Days(30).to_string(), "30d");
-    }
-
-    #[test]
-    fn recent_scope_parses_global_and_per_filter() {
-        let cli = parse(&["kei", "sync", "--recent", "100", "--recent-scope", "global"]);
-        let Command::Sync { sync, .. } = cli.command else {
-            panic!("expected sync command");
-        };
-        assert_eq!(sync.recent_scope, Some(RecentScope::Global));
-
-        let cli = parse(&[
-            "kei",
-            "sync",
-            "--recent",
-            "100",
-            "--recent-scope",
-            "per-filter",
-        ]);
-        let Command::Sync { sync, .. } = cli.command else {
-            panic!("expected sync command");
-        };
-        assert_eq!(sync.recent_scope, Some(RecentScope::PerFilter));
-    }
-
-    #[test]
-    fn recent_scope_rejects_unknown_value() {
-        let err = Cli::try_parse_from(["kei", "sync", "--recent-scope", "per_album"])
-            .expect_err("invalid recent scope should fail");
-        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
-    }
-
-    #[test]
-    fn recent_limit_serializes_count_as_integer() {
-        let json = serde_json::to_string(&RecentLimit::Count(5)).unwrap();
-        assert_eq!(json, "5");
-    }
-
-    #[test]
-    fn recent_limit_serializes_days_as_string() {
-        let json = serde_json::to_string(&RecentLimit::Days(7)).unwrap();
-        assert_eq!(json, "\"7d\"");
     }
 
     fn base_args() -> Vec<&'static str> {
@@ -1335,7 +1184,7 @@ mod tests {
     #[test]
     fn test_config_flag_default() {
         let cli = parse(&base_args());
-        assert_eq!(cli.config, "~/.config/kei/config.toml");
+        assert_eq!(cli.config, None);
     }
 
     #[test]
@@ -1343,7 +1192,7 @@ mod tests {
         let mut args = base_args();
         args.extend(["--config", "/etc/kei.toml"]);
         let cli = parse(&args);
-        assert_eq!(cli.config, "/etc/kei.toml");
+        assert_eq!(cli.config.as_deref(), Some("/etc/kei.toml"));
     }
 
     // ── Explicit subcommand required ──────────────────────────────
@@ -1601,7 +1450,7 @@ mod tests {
     }
     #[test]
     fn test_sync_retry_failed_flag() {
-        assert_removed_sync_flag(&["kei", "sync", "--retry-failed", "--download-dir", "/photos"]);
+        assert_removed_sync_flag(&["kei", "sync", "--retry-failed"]);
     }
 
     // ── Legacy subcommand compat ──────────────────────────────────
@@ -2074,6 +1923,45 @@ mod tests {
         };
         assert_eq!(sync.skip_created_after.as_deref(), Some("2025-06-01"));
     }
+
+    #[test]
+    fn date_arguments_reject_relative_and_invalid_fixed_values_before_startup() {
+        for command in [&["kei", "sync"][..], &["kei", "service", "run"][..]] {
+            for flag in ["--skip-created-before", "--skip-created-after"] {
+                for value in ["30d", "2025-02-30", "not-a-date"] {
+                    let args: Vec<_> = command.iter().copied().chain([flag, value]).collect();
+                    let err = Cli::try_parse_from(args).unwrap_err();
+                    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+                    let message = err.to_string();
+                    assert!(message.contains(flag), "{message}");
+                    assert!(message.contains("fixed date"), "{message}");
+                    assert!(
+                        message.contains("remove") || message.contains("Remove"),
+                        "{message}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn date_arguments_preserve_fixed_date_and_datetime_text() {
+        for value in ["2024-01-01", "2025-06-01T14:30:00"] {
+            let cli = parse(&[
+                "kei",
+                "sync",
+                "--skip-created-before",
+                value,
+                "--skip-created-after",
+                value,
+            ]);
+            let Command::Sync { sync, .. } = cli.command else {
+                panic!("expected sync command");
+            };
+            assert_eq!(sync.skip_created_before.as_deref(), Some(value));
+            assert_eq!(sync.skip_created_after.as_deref(), Some(value));
+        }
+    }
     #[test]
     fn test_albums_multiple() {
         assert_removed_sync_option(&["--album", "Favorites", "--album", "Vacation"]);
@@ -2215,7 +2103,7 @@ mod tests {
     fn test_config_global_before_subcommand() {
         let cli =
             Cli::try_parse_from(["kei", "--config", "/custom/config.toml", "status"]).unwrap();
-        assert_eq!(cli.config, "/custom/config.toml");
+        assert_eq!(cli.config.as_deref(), Some("/custom/config.toml"));
         assert!(matches!(cli.command, Command::Status(_)));
     }
 
@@ -2598,8 +2486,6 @@ mod tests {
             "kei",
             "sync",
             "--friendly",
-            "--recent",
-            "100",
             "--skip-created-before",
             "2025-01-01",
         ])
@@ -2612,9 +2498,17 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
     #[test]
-    fn retry_failed_with_sync_flag_parses_under_sync() {
-        Cli::try_parse_from(["kei", "sync", "--retry-failed", "--recent", "100"])
-            .expect("sync --retry-failed accepts kept per-run sync flags");
+    fn retry_failed_with_sync_flag_has_migration_guidance() {
+        let error = parse_cli_with_sources([
+            "kei",
+            "sync",
+            "--retry-failed",
+            "--skip-created-before",
+            "2025-01-01",
+        ])
+        .expect_err("retired retry-only selection must refuse before startup");
+        assert!(error.rendered.contains("--retry-failed is retired"));
+        assert!(error.rendered.contains("ordinary `kei sync`"));
     }
 
     #[test]
@@ -2629,8 +2523,15 @@ mod tests {
     }
     #[test]
     fn service_run_accepts_own_sync_flags() {
-        Cli::try_parse_from(["kei", "service", "run", "--recent", "100", "--dry-run"])
-            .expect("service run must accept its own sync flags");
+        Cli::try_parse_from([
+            "kei",
+            "service",
+            "run",
+            "--skip-created-before",
+            "2025-01-01",
+            "--dry-run",
+        ])
+        .expect("service run must accept its own sync flags");
     }
 
     #[test]
@@ -2805,7 +2706,7 @@ mod read_only_entrypoint_tests {
     }
 }
 
-/// Bounded offline local-byte acceptance; source verification is unchanged.
+/// Retired legacy file trust command. Existing trust records are retained.
 #[derive(Debug, Clone, clap::Args)]
 pub struct TrustedLegacyArgs {
     #[command(subcommand)]
@@ -2813,14 +2714,14 @@ pub struct TrustedLegacyArgs {
 }
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum TrustedLegacyAction {
-    /// Write a new reviewable JSON plan for one library (maximum 128 renditions)
+    /// Retired: run kei sync instead; no plan will be written
     Plan {
         #[arg(long)]
         library: String,
         #[arg(long)]
         output: std::path::PathBuf,
     },
-    /// Accept exactly the unchanged files and catalogue bindings in a reviewed plan
+    /// Retired: run kei sync instead; trust records and media will not be changed
     Apply {
         #[arg(long)]
         plan: std::path::PathBuf,
@@ -2829,7 +2730,7 @@ pub enum TrustedLegacyAction {
 
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum ReconcileAction {
-    /// Explicitly trust selected local files for preserved legacy migration (offline)
+    /// Retired legacy file trust command; normal sync no longer requires coverage certificates
     #[command(
         after_help = "Documentation: https://github.com/rhoopr/kei/blob/main/docs/trusted-legacy-files.md"
     )]

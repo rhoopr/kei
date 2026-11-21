@@ -25,7 +25,7 @@ fn read_publication(
            ON p.library=a.library AND p.id=a.id AND p.version_size=a.version_size \
            AND p.local_path=a.local_path \
          WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 \
-           AND a.status IN ('pending','downloaded') AND a.is_deleted=0 \
+           AND a.status IN ('pending','failed','downloaded') AND a.is_deleted=0 \
            AND a.downloaded_at IS NOT NULL AND a.size_bytes>=0 \
            AND a.checksum<>'' AND p.provider_checksum=a.checksum \
            AND length(a.local_checksum)=64 AND a.download_checksum=a.local_checksum \
@@ -280,12 +280,12 @@ impl SqliteStateDb {
                 crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "cancelled"}));
                 return Ok(false);
             }
-            if current.status == "pending" {
+            if current.status == "pending" || current.status == "failed" {
                 // This recovers a prior publication. Preserve the path, original
                 // publication timestamp, hashes, every receipt and metadata debt.
                 let changed = tx.execute(
                     "UPDATE assets SET status='downloaded',last_error=NULL \
-                     WHERE library=?1 AND id=?2 AND version_size=?3 AND status='pending'",
+                     WHERE library=?1 AND id=?2 AND version_size=?3 AND status IN ('pending','failed')",
                     params![proof.library, proof.id, proof.version_size.as_str()],
                 )?;
                 if changed != 1 {

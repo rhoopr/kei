@@ -19,6 +19,7 @@ impl<T> DownloadFinalizationStore for T where T: DownloadStateStore + MetadataRe
 /// Accumulated during download loops and retried in a final flush.
 #[derive(Debug)]
 pub(super) struct PendingStateWrite {
+    pub(super) embedded_fields: Box<crate::state::types::EmbeddedMetadataFields>,
     pub(super) library: Arc<str>,
     pub(super) asset_id: Arc<str>,
     pub(super) version_size: VersionSizeKey,
@@ -82,10 +83,15 @@ where
         exif_ok,
         mark_capture_repair,
         None,
+        Default::default(),
     )
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "field ownership and retained media are independent finalization evidence"
+)]
 pub(super) async fn finalize_downloaded_with_proof<D>(
     db: &D,
     library: &Arc<str>,
@@ -95,6 +101,7 @@ pub(super) async fn finalize_downloaded_with_proof<D>(
     exif_ok: bool,
     mark_capture_repair: bool,
     retained: Option<Arc<super::file::RetainedPendingFile>>,
+    embedded_fields: Box<crate::state::types::EmbeddedMetadataFields>,
 ) -> DownloadedFinalization
 where
     D: DownloadFinalizationStore + ?Sized,
@@ -102,6 +109,7 @@ where
     #[cfg(all(test, target_os = "linux"))]
     crate::test_helpers::process_death_point("published");
     let write = PendingStateWrite {
+        embedded_fields,
         library: Arc::clone(library),
         asset_id: task.asset_id.clone(),
         version_size: task.version_size,
@@ -127,10 +135,13 @@ where
             &write.local_checksum,
             write.download_checksum.as_deref(),
             mark_capture_repair,
+            &write.embedded_fields,
         )
         .await
     {
         Ok(()) => {
+            #[cfg(all(test, target_os = "linux"))]
+            crate::test_helpers::process_death_point("download-state-committed");
             update_metadata_marker(
                 db,
                 library,
@@ -165,7 +176,8 @@ where
     D: DownloadStateStore + ?Sized,
 {
     let durable_error = match task.publication() {
-        super::file::FinalPublication::NoReplace => error,
+        super::file::FinalPublication::NoReplace
+        | super::file::FinalPublication::ReplaceLocal { .. } => error,
         super::file::FinalPublication::ReplaceTruncated(_) => {
             crate::commands::reconcile::FILE_TRUNCATED_REASON
         }
@@ -235,6 +247,12 @@ async fn validate_pending_write(
             detail: error.to_string(),
         })?;
     }
+    crate::fs_util::fsync_parent_dir_async(&write.download_path)
+        .await
+        .map_err(|error| crate::state::error::StateError::Invariant {
+            operation: "download publication durability",
+            detail: error.to_string(),
+        })?;
     Ok(())
 }
 
@@ -244,17 +262,17 @@ async fn retry_pending_state_write<D>(
     pending_count: usize,
 ) -> bool
 where
-    D: DownloadStateStore + ?Sized,
+    D: DownloadFinalizationStore + ?Sized,
 {
     use rand::RngExt;
 
     for attempt in 1..=STATE_WRITE_MAX_RETRIES {
         if let Err(error) = validate_pending_write(write).await {
             tracing::warn!(asset_id = %write.asset_id, %error,
-                "Reserved pending publication proof changed; retaining media and pending debt");
+                "Publication validation or durability failed; retaining media and pending debt");
             return false;
         }
-        match db
+        let result = db
             .mark_verified_download(
                 &write.library,
                 &write.asset_id,
@@ -263,9 +281,10 @@ where
                 &write.local_checksum,
                 write.download_checksum.as_deref(),
                 write.mark_capture_repair,
+                &write.embedded_fields,
             )
-            .await
-        {
+            .await;
+        match result {
             Ok(()) => {
                 if attempt > 1 {
                     tracing::info!(
@@ -310,7 +329,7 @@ pub(super) async fn flush_pending_state_writes_retaining_failures<D>(
     pending: &mut Vec<PendingStateWrite>,
 ) -> StateWriteFlush
 where
-    D: DownloadStateStore + ?Sized,
+    D: DownloadFinalizationStore + ?Sized,
 {
     if pending.is_empty() {
         return StateWriteFlush::default();
@@ -351,7 +370,7 @@ where
 /// Returns the number of writes that still failed after all retries.
 pub(super) async fn flush_pending_state_writes<D>(db: &D, pending: &[PendingStateWrite]) -> usize
 where
-    D: DownloadStateStore + ?Sized,
+    D: DownloadFinalizationStore + ?Sized,
 {
     if pending.is_empty() {
         return 0;
@@ -393,7 +412,7 @@ pub(super) async fn check_state_write_circuit_breaker<D>(
     pending: &mut Vec<PendingStateWrite>,
 ) -> Option<anyhow::Error>
 where
-    D: DownloadStateStore + ?Sized,
+    D: DownloadFinalizationStore + ?Sized,
 {
     if pending.len() < STATE_DB_UNWRITABLE_THRESHOLD {
         return None;
@@ -452,6 +471,74 @@ mod tests {
         tokio::fs::write(path, b"finalized").await.unwrap();
     }
 
+    /// Invoked by the exclusive preload matrix; ordinary suite execution is inert.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn actual_parent_durability_fault_child() {
+        let Some(root) = std::env::var_os("KEI_TEST_LATE_IO_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let path = root.join("landed.jpg");
+        let part = root.join("landed.jpg.part");
+        write_file(&path).await;
+        write_file(&part).await;
+        let checksum = super::super::file::compute_sha256(&path).await.unwrap();
+        let original = std::fs::metadata(&path).unwrap();
+        std::fs::write(root.join("reconcile-target"), path.to_str().unwrap()).unwrap();
+        std::fs::write(root.join("fault-enabled"), b"enabled").unwrap();
+
+        // Identical collision handling can remove the redundant part, but cannot
+        // turn unsynced directory entries into a durable downloaded receipt.
+        super::super::file::rename_part_to_final(&part, &path)
+            .await
+            .unwrap();
+        assert!(!part.exists());
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        seed_pending(&db, "PARENT", "landed.jpg").await;
+        let result = finalize_downloaded(
+            &db,
+            &Arc::from(LIBRARY),
+            &task("PARENT", path.clone()),
+            checksum.clone(),
+            Some(checksum.clone()),
+            true,
+            false,
+        )
+        .await;
+        let DownloadedFinalization::Deferred { write, error } = result else {
+            panic!("parent EIO must refuse the downloaded receipt");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("download publication durability")
+        );
+        let mut pending = vec![write];
+        for _ in 0..2 {
+            std::fs::remove_file(root.join("fault-reached")).unwrap();
+            let flush = flush_pending_state_writes_retaining_failures(&db, &mut pending).await;
+            assert_eq!((flush.attempted, flush.failures, pending.len()), (1, 1, 1));
+            let marker = std::fs::read_to_string(root.join("fault-reached")).unwrap();
+            assert!(marker.contains("fsync errno=5 progress=9"), "{marker}");
+            assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
+            assert_eq!(db.get_pending().await.unwrap().len(), 1);
+        }
+        std::fs::remove_file(root.join("fault-enabled")).unwrap();
+        let flush = flush_pending_state_writes_retaining_failures(&db, &mut pending).await;
+        assert_eq!((flush.attempted, flush.failures), (1, 0));
+        assert!(pending.is_empty());
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(downloaded.len(), 1);
+        assert_eq!(
+            downloaded[0].local_checksum.as_deref(),
+            Some(checksum.as_str())
+        );
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), original.ino());
+        assert_eq!(std::fs::read(&path).unwrap(), b"finalized");
+    }
+
     async fn reserved_deferred_boundary(mutation: &str) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("old-album/pending.jpg");
@@ -474,6 +561,7 @@ mod tests {
             true,
             false,
             Some(proof),
+            Default::default(),
         )
         .await;
         let DownloadedFinalization::Deferred { write, .. } = result else {
@@ -585,6 +673,7 @@ mod tests {
                 true,
                 false,
                 if missing { None } else { Some(proof) },
+                Default::default(),
             )
             .await;
             let DownloadedFinalization::Deferred { write, .. } = result else {
@@ -800,11 +889,14 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
         seed_pending(&db, "FINAL_REPAIR", "repair.jpg").await;
         let mut task = task("FINAL_REPAIR", PathBuf::from("repair.jpg"));
-        task.replacement_fingerprint =
-            Some(Arc::new(crate::download::file::ExistingFileFingerprint {
-                size: 3,
-                sha256: [7; 32],
-            }));
+        task.replacement_fingerprint = Some(Arc::new(
+            crate::download::file::FinalPublication::ReplaceTruncated(
+                crate::download::file::ExistingFileFingerprint {
+                    size: 3,
+                    sha256: [7; 32],
+                },
+            ),
+        ));
 
         finalize_failed(&db, &Arc::from(LIBRARY), &task, "network failed")
             .await
@@ -816,5 +908,27 @@ mod tests {
             failed[0].last_error.as_deref(),
             Some(crate::commands::reconcile::FILE_TRUNCATED_REASON)
         );
+    }
+
+    #[tokio::test]
+    async fn local_policy_failure_cannot_authorize_truncated_repair() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        seed_pending(&db, "FINAL_LOCAL", "local.jpg").await;
+        let mut task = task("FINAL_LOCAL", PathBuf::from("local.jpg"));
+        task.replacement_fingerprint = Some(Arc::new(
+            crate::download::file::FinalPublication::ReplaceLocal {
+                fingerprint: crate::download::file::ExistingFileFingerprint {
+                    size: 3,
+                    sha256: [7; 32],
+                },
+                modified: Some(std::time::UNIX_EPOCH),
+            },
+        ));
+        finalize_failed(&db, &Arc::from(LIBRARY), &task, "local input changed")
+            .await
+            .unwrap();
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].last_error.as_deref(), Some("local input changed"));
     }
 }

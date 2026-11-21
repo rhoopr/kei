@@ -108,10 +108,8 @@ pub(crate) fn read_config_username(kei_dir: &Path) -> Option<String> {
 }
 
 /// Wipes `kei_dir` plus any platform-specific extras after clearing the
-/// stored credential. Each platform's `--purge` path resolves the kei
-/// state directory however it wants (linux honours `XDG_CONFIG_HOME`;
-/// macOS and Windows hard-code `~/.config/kei` rather than the platform
-/// default config dir) and passes the resolved path here.
+/// stored credential. The uninstall dispatcher validates the root before
+/// removing the service registration.
 pub(crate) fn purge_kei_state(kei_dir: &Path, extra_dirs: &[PathBuf]) -> Result<()> {
     if let Some(username) = read_config_username(kei_dir) {
         let realm = crate::config::load_toml_config(&kei_dir.join("config.toml"), false)
@@ -157,15 +155,6 @@ pub(crate) fn purge_kei_state(kei_dir: &Path, extra_dirs: &[PathBuf]) -> Result<
         Err(e) => Err(e)
             .with_context(|| format!("Could not remove state directory {}", kei_dir.display())),
     }
-}
-
-/// kei state directory at the dotted-config convention.
-///
-/// macOS and Windows both bypass `dirs::config_dir()` (which returns
-/// `~/Library/Application Support` and `%APPDATA%\Roaming` respectively)
-/// so service purge paths match the rest of kei's `~/.config/kei` state.
-pub(crate) fn kei_state_dir_dotted() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| crate::config::kei_data_dir_with_home(&home))
 }
 
 /// Canonical absolute path to the running `kei` executable.

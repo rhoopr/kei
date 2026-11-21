@@ -20,7 +20,7 @@ kei_require_env
 kei_require_release_binary
 kei_install_scratch_cleanup
 
-COOKIES="$(kei_cookie_dir)"
+SESSION_SOURCE="$(kei_cookie_dir)"
 KEI="$(kei_release_bin)"
 kei_check_init
 
@@ -37,12 +37,12 @@ kei_sync() {
         --log-level info "$@" 2>&1
 }
 
-# Each scenario uses a different download root. Clear provider checkpoints and
-# path/config hashes with the asset rows so the next scenario starts with a
-# full inventory instead of treating the new root as deferred reconciliation.
-reset_sync_state() {
-    kei_db_exec "DELETE FROM metadata WHERE key LIKE '%token%' OR key IN ('config_hash', 'enum_config_hash', 'pending_download_config_hash', 'pending_enum_config_hash')"
-    kei_db_exec "DELETE FROM assets"
+# Each download root gets a fresh account-owned database. Only login state
+# is shared with the operator or the other scenario.
+fresh_session() {
+    COOKIES=$(kei_scratch_dir "$1")
+    ICLOUD_TEST_COOKIE_DIR="$SESSION_SOURCE" kei_copy_session_without_state "$COOKIES"
+    export ICLOUD_TEST_COOKIE_DIR="$COOKIES"
 }
 
 kei_suite_banner "CONCURRENCY / RESUME"
@@ -57,7 +57,7 @@ kei_preflight_session
 echo ""
 echo "=== 1. Concurrent downloads (threads=5) ==="
 DIR1=$(kei_scratch_dir concurrent)
-reset_sync_state
+fresh_session concurrent-session
 
 OUT=$(KEI_SYNC_DOWNLOAD_TOML=$'threads = 5\n' kei_sync "$DIR1")
 echo "$OUT" | grep -E "concurrency|downloaded|failed|completed"
@@ -97,7 +97,7 @@ rm -rf "$DIR1"
 echo ""
 echo "=== 2. Interrupted download + resume ==="
 DIR2=$(kei_scratch_dir resume)
-reset_sync_state
+fresh_session resume-session
 
 # Session reuse puts auth at ~3s; kill at 4s so we interrupt mid- or
 # just-post-download. Even if all files complete before the kill the

@@ -22,8 +22,7 @@ fn readiness(state: &'static str) -> IndexingOptions {
         cancel: CancellationToken::new(),
         interrupt: false,
         stale_plan: false,
-        recent: None,
-        retry_only: false,
+        date_bound: false,
         token: Some("query-token"),
         queries: Arc::new(AtomicUsize::new(0)),
         cursors: Arc::new(Mutex::new(Vec::new())),
@@ -146,12 +145,6 @@ async fn indexing_managed_reopen_qualifies_then_materializes_omissions_with_quie
         assert_eq!(media(root.path()), before_media);
         assert_eq!(managed_state(root.path()), before_state);
         let materialize = readiness("FINISHED");
-        let mut retry = readiness("FINISHED");
-        retry.retry_only = true;
-        let (retry_result, _) =
-            cycle_options(root.path(), all.clone(), true, naming, options(&retry)).await;
-        assert!(!retry_result.can_advance_database_checkpoint());
-        assert_hold(root.path(), &cursor, false, true);
         let (recovered, _) = cycle_options(
             root.path(),
             all.clone(),
@@ -175,22 +168,9 @@ async fn indexing_managed_reopen_qualifies_then_materializes_omissions_with_quie
         assert!(metadata(root.path(), &indexing_replay_key(ZONE)).is_none());
         let target = root.path().join("media");
         assert_bytes(&target.join("IMG_0502.JPG"), ORIGINAL);
-        assert_bytes(
-            &target.join(if naming == EditedNaming::Primary {
-                "IMG_0501.JPG"
-            } else {
-                "IMG_0501_edited.JPG"
-            }),
-            EDIT_ONE,
-        );
-        assert_bytes(
-            &target.join(if naming == EditedNaming::Primary {
-                "IMG_0501_original.JPG"
-            } else {
-                "IMG_0501.JPG"
-            }),
-            ORIGINAL,
-        );
+        assert_bytes(&target.join("IMG_0501.JPG"), EDIT_ONE);
+        assert_bytes(&target.join("IMG_0501_original.JPG"), ORIGINAL);
+        assert!(!target.join("IMG_0501_edited.JPG").exists());
         let gets = server.received_requests().await.unwrap().len();
         for _ in 0..2 {
             let steady = readiness("FINISHED");
@@ -245,7 +225,7 @@ async fn indexing_managed_inventory_faults_never_publish_or_release_hold() {
         match fault {
             "regression" => finished.regress = true,
             "cancel" => finished.interrupt = true,
-            "bound" => finished.recent = Some(1),
+            "bound" => finished.date_bound = true,
             "stale" => finished.stale_plan = true,
             "identity" => current[1]["recordName"] = json!(""),
             "token" => finished.token = None,
@@ -327,7 +307,7 @@ async fn indexing_managed_materialization_failure_keeps_full_debt_and_cursor() {
                 rusqlite::Connection::open(root.path().join("state.db")).unwrap().execute_batch("CREATE TRIGGER fail_recovery_checkpoint BEFORE UPDATE OF value ON metadata WHEN NEW.key='sync_token:PrimarySync' BEGIN SELECT RAISE(FAIL,'injected recovery checkpoint failure'); END").unwrap();
             }
             "cancel" => interrupted.interrupt = true,
-            "bound" => interrupted.recent = Some(1),
+            "bound" => interrupted.date_bound = true,
             "regression" => interrupted.regress = true,
             _ => panic!("unknown fixture fault: {fault}"),
         }
@@ -397,9 +377,12 @@ async fn indexing_managed_pending_journal_is_held_even_under_suffix_then_recover
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     drop(
-        crate::state::SqliteStateDb::open(&root.path().join("state.db"))
-            .await
-            .unwrap(),
+        crate::state::SqliteStateDb::open_owned(
+            &root.path().join("state.db"),
+            &super::fixture_owner(),
+        )
+        .await
+        .unwrap(),
     );
     let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
     conn.execute(
@@ -473,13 +456,13 @@ async fn indexing_managed_pending_journal_is_held_even_under_suffix_then_recover
         ),
         0
     );
-    assert_bytes(&root.path().join("media/IMG_0501.JPG"), ORIGINAL);
-    assert_bytes(&root.path().join("media/IMG_0501_edited.JPG"), EDIT_ONE);
+    assert_bytes(&root.path().join("media/IMG_0501.JPG"), EDIT_ONE);
+    assert_bytes(&root.path().join("media/IMG_0501_original.JPG"), ORIGINAL);
+    assert!(!root.path().join("media/IMG_0501_edited.JPG").exists());
 }
 
 #[tokio::test]
-async fn indexing_managed_local_modification_holds_materialization_and_foreign_collision_is_preserved()
- {
+async fn indexing_managed_local_modification_resolves_and_foreign_collision_is_preserved() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     cycle(
@@ -527,13 +510,12 @@ async fn indexing_managed_local_modification_holds_materialization_and_foreign_c
             options(&readiness("FINISHED")),
         )
         .await;
-        assert!(!held.can_advance_database_checkpoint(), "{:?}", held.stats);
-        assert_hold(root.path(), &cursor, false, true);
+        assert!(held.can_advance_database_checkpoint(), "{:?}", held.stats);
+        assert_hold(root.path(), "cycle-token", false, false);
         assert_bytes(&target.join("IMG_0501.JPG"), local);
         assert_bytes(&target.join("IMG_0502.JPG"), foreign);
     }
-    // Test-fixture operator restores exactly the original owned bytes.
-    std::fs::write(target.join("IMG_0501.JPG"), ORIGINAL).unwrap();
+    // Reopening retains the policy-resolved local copy without operator repair.
     let (recovered, _) = cycle_options(
         root.path(),
         current,
@@ -545,7 +527,7 @@ async fn indexing_managed_local_modification_holds_materialization_and_foreign_c
     assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
     assert!(recovered.can_advance_database_checkpoint());
     assert_hold(root.path(), "cycle-token", false, false);
-    assert_bytes(&target.join("IMG_0501.JPG"), EDIT_ONE);
+    assert_bytes(&target.join("IMG_0501.JPG"), local);
     assert_bytes(&target.join("IMG_0502.JPG"), foreign);
     assert!(
         media(root.path()).into_iter().any(|(path, bytes)| path

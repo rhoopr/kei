@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::auth;
 use crate::config;
 use crate::download;
+use crate::icloud::photos::PRIMARY_ZONE_NAME;
 use crate::state;
 
 /// Per-library state: zone name, sync token key, and resolved album plan.
@@ -24,6 +25,8 @@ pub(crate) struct LibraryState {
     /// Ordered list of download passes. Each pass carries its own
     /// exclude-asset-ids set. See [`crate::commands::AlbumPlan`].
     pub(crate) plan: crate::commands::AlbumPlan,
+    pub(crate) deleted_album_bindings:
+        Vec<crate::state::db::provider_generations::BoundAlbumSelection>,
     /// True when `resolve_passes` failed at the end of the prior cycle and
     /// the plan above is the previous cycle's stale snapshot. Album
     /// membership data captured under a stale plan can route assets to the
@@ -54,6 +57,10 @@ const LAST_FULL_ENUMERATION_REASON_KEY: &str = "last_full_enumeration_reason";
 
 /// Prefix for every per-zone CloudKit sync token row in the metadata table.
 pub(crate) const SYNC_TOKEN_PREFIX: &str = "sync_token:";
+
+pub(crate) fn inventory_reconciliation_key(zone: &str) -> String {
+    format!("inventory_reconciliation_required:{zone}")
+}
 // Legacy inventory_anchor: rows lack coverage proof and are never read or migrated.
 const INVENTORY_ANCHOR_PREFIX: &str = "inventory_anchor_v1:";
 const INVENTORY_ANCHOR_VERSION: u8 = 1;
@@ -225,9 +232,8 @@ async fn persist_retained_checkpoint_hold(
     expected_metadata: Vec<(String, Option<String>)>,
 ) -> anyhow::Result<()> {
     db.commit_checkpoint_transition(state::CheckpointTransition {
+        album_snapshots: Vec::new(),
         expected_metadata,
-        legacy_preservation_proofs: Vec::new(),
-        legacy_config_hash: None,
         sparse_identity_proofs: Vec::new(),
         metadata_updates: vec![
             (key, serde_json::to_string(hold)?),
@@ -357,7 +363,6 @@ pub(crate) enum CheckpointHoldReason {
     EnumerationIncomplete,
     StateNotDurable,
     TokenProofIncomplete,
-    LegacyPreservationIncomplete,
 }
 
 impl CheckpointHoldReason {
@@ -370,7 +375,6 @@ impl CheckpointHoldReason {
             Self::EnumerationIncomplete => "enumeration_incomplete",
             Self::StateNotDurable => "state_not_durable",
             Self::TokenProofIncomplete => "token_proof_incomplete",
-            Self::LegacyPreservationIncomplete => "legacy_preservation_incomplete",
         }
     }
 }
@@ -597,13 +601,11 @@ fn should_warn_zero_assets(
     sync_result: &download::SyncResult,
     library_completed_without_errors: bool,
     run_mode: download::DownloadRunMode,
-    is_retry_failed: bool,
     lib_state: &LibraryState,
 ) -> bool {
     sync_result.full_enumeration_ran
         && library_completed_without_errors
         && run_mode.downloads_files()
-        && !is_retry_failed
         && sync_result.stats.assets_seen == 0
         && has_active_passes(lib_state)
 }
@@ -863,9 +865,8 @@ where
         Ok(Some(stored)) if stored == legacy_hash => {
             if let Err(e) = db
                 .commit_checkpoint_transition(state::CheckpointTransition {
+                    album_snapshots: Vec::new(),
                     expected_metadata: Vec::new(),
-                    legacy_preservation_proofs: Vec::new(),
-                    legacy_config_hash: None,
                     sparse_identity_proofs: Vec::new(),
                     metadata_updates: vec![(
                         download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
@@ -923,7 +924,31 @@ pub(crate) async fn run_cycle(
     library_states: &[&LibraryState],
     config: &config::Config,
     state_db: Option<&dyn download::DownloadStore>,
-    is_retry_failed: bool,
+    build_download_config: &BuildDownloadConfigFn<'_>,
+    download_controls: download::DownloadControls,
+    shared_session: &auth::SharedSession,
+    shutdown_token: &CancellationToken,
+) -> anyhow::Result<CycleResult> {
+    // Bound the cycle's state machine once here rather than growing every
+    // runner, service and test future that awaits a complete sync cycle.
+    // A storage circuit stops this cycle without shutting down interval mode.
+    let cycle_shutdown = shutdown_token.child_token();
+    Box::pin(run_cycle_inner(
+        library_states,
+        config,
+        state_db,
+        build_download_config,
+        download_controls,
+        shared_session,
+        &cycle_shutdown,
+    ))
+    .await
+}
+
+async fn run_cycle_inner(
+    library_states: &[&LibraryState],
+    config: &config::Config,
+    state_db: Option<&dyn download::DownloadStore>,
     build_download_config: &BuildDownloadConfigFn<'_>,
     download_controls: download::DownloadControls,
     shared_session: &auth::SharedSession,
@@ -1092,8 +1117,42 @@ pub(crate) async fn run_cycle(
         Vec::new()
     };
     let mut active_cursor_fences = Vec::new();
+    let mut qualified_inventory_requests = Vec::new();
+    let mut capture_authority_libraries: rustc_hash::FxHashSet<_> = library_states
+        .iter()
+        .filter(|library| has_active_passes(library))
+        .map(|library| library.zone_name.clone())
+        .collect();
 
-    for lib_state in library_states.iter().copied() {
+    let scoped = |state: &LibraryState| {
+        config.filters.skip_created_before.is_some()
+            || config.filters.skip_created_after.is_some()
+            || !matches!(state.plan.passes.as_slice(),
+                [pass] if pass.kind == crate::commands::PassKind::Unfiled && pass.exclude_ids.is_empty())
+    };
+    let mut completed_scans = rustc_hash::FxHashMap::default();
+    let mut ordered_libraries = library_states.to_vec();
+    // Sparse private records in PrimarySync point into Shared libraries.
+    // Let their ordinary scoped queries and local writers finish first.
+    let collect_shared_scans = download_controls.run_mode.downloads_files()
+        && library_states
+            .iter()
+            .any(|state| state.zone_name == PRIMARY_ZONE_NAME && has_active_passes(state));
+    if collect_shared_scans {
+        ordered_libraries
+            .sort_by_key(|state| state.zone_name == PRIMARY_ZONE_NAME || !scoped(state));
+    }
+    let due_links: Vec<_> = if collect_shared_scans
+        && ordered_libraries
+            .iter()
+            .any(|state| state.zone_name != PRIMARY_ZONE_NAME && scoped(state))
+        && let Some(db) = state_db
+    {
+        download::sparse_target::due_primary_links(db).await?
+    } else {
+        Vec::new()
+    };
+    for lib_state in ordered_libraries {
         if shutdown_token.is_cancelled() {
             break;
         }
@@ -1104,7 +1163,48 @@ pub(crate) async fn run_cycle(
         let indexing_reconciliation = indexing_hold_at_start.is_some() || !indexing_finished;
         if !has_active_passes(lib_state) {
             db_sync_token_advance_safe &= !indexing_reconciliation;
+            if !lib_state.deleted_album_bindings.is_empty() {
+                // Recovery coverage is never a provider change-stream checkpoint.
+                db_sync_token_advance_safe = false;
+                path_reconciliation_complete = false;
+                if !lib_state.plan_is_stale
+                    && !indexing_reconciliation
+                    && !config.runtime.dry_run
+                    && download_controls.run_mode.downloads_files()
+                {
+                    let recovery_config = build_download_config(
+                        download::SyncMode::Full,
+                        Arc::default(),
+                        Arc::default(),
+                        Arc::from(lib_state.zone_name.as_str()),
+                    );
+                    if !download::recover_deleted_album_selection(
+                        &lib_state.library.all(),
+                        &lib_state.deleted_album_bindings,
+                        &recovery_config,
+                        shutdown_token,
+                    )
+                    .await?
+                    {
+                        cycle_failed_count = cycle_failed_count.saturating_add(1);
+                    }
+                }
+            }
             continue;
+        }
+        let mut legacy_probe = build_download_config(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from(lib_state.zone_name.as_str()),
+        );
+        Arc::make_mut(&mut legacy_probe).provisional =
+            indexing_reconciliation || !indexing_finished;
+        let historical_capture_authoritative = legacy_probe
+            .historical_capture_has_checkpoint_authority(&lib_state.plan.passes, download_controls)
+            .await?;
+        if !historical_capture_authoritative {
+            capture_authority_libraries.remove(&lib_state.zone_name);
         }
         if !indexing_finished {
             db_sync_token_advance_safe = false;
@@ -1138,6 +1238,15 @@ pub(crate) async fn run_cycle(
         };
         let indexing_materialization_pending = materialization_at_start.is_some();
         let mut zone_metadata_fence = enum_metadata_at_start.clone();
+        let inventory_request_key = inventory_reconciliation_key(&lib_state.zone_name);
+        let inventory_request_at_start = match state_db {
+            Some(db) => db.get_metadata(&inventory_request_key).await?,
+            None => None,
+        };
+        zone_metadata_fence.push((
+            inventory_request_key.clone(),
+            inventory_request_at_start.clone(),
+        ));
         zone_metadata_fence.push((
             materialization_key.clone(),
             materialization_at_start.clone(),
@@ -1250,9 +1359,9 @@ pub(crate) async fn run_cycle(
             }
         }
 
-        let mut legacy_cycle = download::legacy_preservation::LegacyCycle::default();
         if indexing_finished
             && !indexing_reconciliation
+            && historical_capture_authoritative
             && download_controls.run_mode.downloads_files()
             && !lib_state.plan_is_stale
             && let Some(db) = state_db
@@ -1262,17 +1371,10 @@ pub(crate) async fn run_cycle(
                 .metadata_capture
                 .iter()
                 .any(|capture| {
-                    capture.library == lib_state.zone_name
-                        && (capture.unresolved_assets > 0 || capture.unattributed_legacy_assets > 0)
+                    capture.library == lib_state.zone_name && capture.unresolved_assets > 0
                 })
         {
-            let legacy_probe = build_download_config(
-                download::SyncMode::Full,
-                Arc::new(rustc_hash::FxHashSet::default()),
-                Arc::new(download::AssetGroupings::default()),
-                Arc::from(lib_state.zone_name.as_str()),
-            );
-            legacy_cycle = download::legacy_preservation::LegacyCycle::begin(
+            download::legacy_preservation::prepare(
                 db,
                 &legacy_probe,
                 &lib_state.library.all(),
@@ -1300,7 +1402,20 @@ pub(crate) async fn run_cycle(
             } else {
                 None
             };
-        let sync_mode_decision = if indexing_reconciliation || indexing_materialization_pending {
+        let sync_mode_decision = if inventory_request_at_start.is_some()
+            && indexing_finished
+            && !indexing_reconciliation
+            && let Some(prior) = retained_cursor_at_start
+                .as_ref()
+                .filter(|token| !token.trim().is_empty())
+        {
+            SyncModeDecision {
+                mode: download::SyncMode::Incremental {
+                    zone_sync_token: prior.clone(),
+                },
+                full_enumeration_reason: None,
+            }
+        } else if indexing_reconciliation || indexing_materialization_pending {
             SyncModeDecision {
                 mode: download::SyncMode::Full,
                 full_enumeration_reason: Some(download::FullEnumerationReason::OtherStaticReason),
@@ -1309,11 +1424,6 @@ pub(crate) async fn run_cycle(
             metadata_refresh_mode_decision(config.runtime.refresh_metadata)
         {
             refresh_decision
-        } else if legacy_cycle.requires_inventory() {
-            SyncModeDecision {
-                mode: download::SyncMode::Full,
-                full_enumeration_reason: Some(download::FullEnumerationReason::MetadataBackfill),
-            }
         } else if let Some(zone_sync_token) = pending_zone_token {
             tracing::debug!(
                 zone = %lib_state.zone_name,
@@ -1347,7 +1457,6 @@ pub(crate) async fn run_cycle(
             }
         } else {
             determine_sync_mode_decision(
-                is_retry_failed,
                 library_states.len(),
                 state_db,
                 &lib_state.sync_token_key,
@@ -1381,7 +1490,9 @@ pub(crate) async fn run_cycle(
 
         // Skip the DB scan entirely when nothing downstream will read it.
         #[cfg(feature = "xmp")]
-        let asset_groupings = if config.metadata.embed_xmp || config.metadata.xmp_sidecar {
+        let asset_groupings = if (config.metadata.embed_xmp || config.metadata.xmp_sidecar)
+            && (config.metadata.include_albums || config.metadata.include_people)
+        {
             preload_asset_groupings(state_db, &lib_state.zone_name).await
         } else {
             Arc::new(download::AssetGroupings::default())
@@ -1397,6 +1508,16 @@ pub(crate) async fn run_cycle(
             Arc::clone(&asset_groupings),
             Arc::from(lib_state.zone_name.as_str()),
         );
+        Arc::make_mut(&mut download_config).inventory_reconciliation =
+            inventory_request_at_start.is_some();
+        Arc::make_mut(&mut download_config).sparse_membership_due = !lib_state.plan_is_stale
+            && !indexing_reconciliation
+            && scoped(lib_state)
+            && lib_state.plan.passes.first().is_some_and(|pass| {
+                due_links
+                    .iter()
+                    .any(|link| pass.album.sparse_link_matches(link))
+            });
         // FINISHED is a prerequisite, not proof that this inventory remained
         // complete. Deletion-capable maintenance stays deferred until the
         // full scope and its final readiness check have qualified.
@@ -1410,27 +1531,30 @@ pub(crate) async fn run_cycle(
                 });
         Arc::make_mut(&mut download_config).indexing_inventory_only =
             managed_indexing_recovery && indexing_finished;
-        if pending_download_config_hash.is_some() && path_reconciliation_has_smart_folders {
+        if pending_download_config_hash.is_some()
+            && (path_reconciliation_has_smart_folders || !historical_capture_authoritative)
+        {
             Arc::make_mut(&mut download_config).complete_path_selection = true;
         }
         let download_client = shared_session.read().await.download_client().clone();
-        // Only an unrestricted current full-library selection can admit an exact
-        // sparse target without inventing album/rank membership.
         let mut sparse_targets = Vec::new();
-        if download_controls.run_mode.downloads_files() && !is_retry_failed {
-            for target in library_states.iter().copied().filter(|target| {
-                target.zone_name != lib_state.zone_name
-                    && !target.plan_is_stale
-                    && target.plan.passes.len() == 1
-            }) {
+        if download_controls.run_mode.downloads_files() {
+            for target in library_states
+                .iter()
+                .copied()
+                .filter(|target| target.zone_name != lib_state.zone_name && !target.plan_is_stale)
+            {
                 let Some(pass) = target.plan.passes.first() else {
                     continue;
                 };
-                if pass.kind != crate::commands::PassKind::Unfiled || !pass.exclude_ids.is_empty() {
+                let scan = completed_scans.get(&target.zone_name).cloned();
+                if scoped(target) && scan.is_none() {
                     continue;
                 }
                 #[cfg(feature = "xmp")]
-                let target_groupings = if config.metadata.embed_xmp || config.metadata.xmp_sidecar {
+                let target_groupings = if (config.metadata.embed_xmp || config.metadata.xmp_sidecar)
+                    && (config.metadata.include_albums || config.metadata.include_people)
+                {
                     preload_asset_groupings(state_db, &target.zone_name).await
                 } else {
                     Arc::new(download::AssetGroupings::default())
@@ -1439,25 +1563,39 @@ pub(crate) async fn run_cycle(
                 let target_groupings = Arc::new(download::AssetGroupings::default());
                 let target_config = build_download_config(
                     download::SyncMode::Full,
-                    Arc::clone(&pass.exclude_ids),
+                    Arc::default(),
                     target_groupings,
                     Arc::from(target.zone_name.as_str()),
                 );
-                if target_config.recent.is_some()
-                    || target_config.skip_created_before.is_some()
-                    || target_config.skip_created_after.is_some()
-                    || target_config.retry_only
+                if (scan.is_none()
+                    && (target_config.skip_created_before.is_some()
+                        || target_config.skip_created_after.is_some()))
                     || target_config.edited_naming == crate::types::EditedNaming::Primary
                 {
                     continue;
                 }
-                let mut target_config = target_config.with_pass(pass);
-                // A full-library path label is not evidence of album membership.
-                target_config.album_name = None;
+                let hidden_only = scan.is_some()
+                    && target.plan.passes.len() == 1
+                    && pass.kind == crate::commands::PassKind::SmartFolder
+                    && pass.exclude_ids.is_empty()
+                    && pass.album.is_hidden_query();
+                let target_config = if hidden_only {
+                    Arc::new(target_config.with_pass(pass))
+                } else if scan.is_some() {
+                    // The generation owns the destinations and exclusions for every pass.
+                    target_config
+                } else {
+                    let mut config = target_config.with_pass(pass);
+                    // A full-library path label is not evidence of album membership.
+                    config.album_name = None;
+                    Arc::new(config)
+                };
                 sparse_targets.push(download::sparse_target::SelectedSparseTarget {
+                    hidden_only,
+                    scan,
                     library: target.library.clone(),
                     album: pass.album.clone(),
-                    config: Arc::new(target_config),
+                    config: target_config,
                     client: download_client.clone(),
                     controls: download_controls,
                 });
@@ -1499,13 +1637,13 @@ pub(crate) async fn run_cycle(
                 continue;
             }
         }
-        let mut sync_result = download::download_photos_with_sync(
+        let mut sync_result = Box::pin(download::download_photos_with_sync(
             &download_client,
             &lib_state.plan.passes,
             Arc::clone(&download_config),
             download_controls,
             shutdown_token.clone(),
-        )
+        ))
         .await?;
 
         // Capture only the initial complete selected scope, before a bridge
@@ -1521,40 +1659,25 @@ pub(crate) async fn run_cycle(
             lib_state.plan.passes.len(),
         );
 
-        if indexing_finished
-            && legacy_cycle.requires_inventory()
+        // Guarded inventory may finish healthy current work after either source
+        // boundary was rejected. Dispatch sets this evidence only after complete
+        // inventory; reuse the existing fenced hold without adopting its token.
+        let mut retained_checkpoint_expired = inventory_request_at_start.is_some()
+            && sync_result.checkpoint.retained_token_rejected
             && sync_result.full_enumeration_ran
-            && matches!(
-                source_checkpoint_decision(
-                    &sync_result,
-                    config.runtime.dry_run,
-                    lib_state.plan_is_stale,
-                    CheckpointBasis::CompleteInventory
-                ),
-                SourceCheckpointDecision::Advance { .. }
-            )
-            && let Some(db) = state_db
-        {
-            let prior = db
-                .get_metadata(&lib_state.sync_token_key)
-                .await?
-                .unwrap_or_default();
-            if let Err(error) = legacy_cycle
-                .certify(
-                    db,
-                    &download_config,
-                    &lib_state.library.all(),
-                    preservation_config_hash.as_deref().unwrap_or(""),
-                    &prior,
-                    shutdown_token,
-                )
-                .await
-            {
-                download::legacy_preservation::log_preservation_hold("certification", &error);
-            }
-        }
-
-        let mut retained_checkpoint_expired = false;
+            && matches!(sync_result.outcome, download::DownloadOutcome::Success)
+            && sync_result.stats.failed == 0
+            && sync_result.stats.exif_failures == 0
+            && sync_result.checkpoint.state_write_failures == 0
+            && sync_result.checkpoint.enumeration_errors == 0
+            && !sync_result.checkpoint.enumeration_incomplete
+            && !sync_result.checkpoint.identity_incomplete
+            && !sync_result.checkpoint.interrupted
+            && checkpoint_transition_state_safe
+            && !lib_state.plan_is_stale
+            && !shutdown_token.is_cancelled()
+            && !config.runtime.dry_run
+            && download_controls.run_mode.downloads_files();
         let mut checkpoint_basis =
             if sync_result.full_enumeration_ran && !sync_result.checkpoint.completed_delta_replay {
                 CheckpointBasis::CompleteInventory
@@ -1576,10 +1699,8 @@ pub(crate) async fn run_cycle(
         };
         if (matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed)
             || unresolved_identity
-            || legacy_cycle.requires_inventory()
-            || ((indexing_replay_pending || indexing_materialization_pending)
-                && !is_retry_failed
-                && !download_config.retry_only))
+            || indexing_replay_pending
+            || indexing_materialization_pending)
             && indexing_finished
             && !indexing_reconciliation
             && sync_result.full_enumeration_ran
@@ -1589,7 +1710,6 @@ pub(crate) async fn run_cycle(
                 || (matches!(sync_result.outcome, download::DownloadOutcome::Success)
                     && sync_result.stats.failed == 0
                     && sync_result.stats.exif_failures == 0
-                    && download_config.recent.is_none()
                     && download_config.skip_created_before.is_none()
                     && download_config.skip_created_after.is_none()))
         {
@@ -1616,14 +1736,29 @@ pub(crate) async fn run_cycle(
                     );
                     Arc::make_mut(&mut bridge_config).sparse_targets =
                         Arc::clone(&download_config.sparse_targets);
-                    let bridge_result = download::download_photos_with_sync(
+                    crate::support::observe_scoped(
+                        &lib_state.zone_name,
+                        None,
+                        "support_delta_bridge_v1",
+                        serde_json::json!({"outcome":"started"}),
+                    );
+                    let bridge_result = Box::pin(download::download_photos_with_sync(
                         &download_client,
                         &lib_state.plan.passes,
                         bridge_config,
                         download_controls,
                         shutdown_token.clone(),
-                    )
-                    .await?;
+                    ))
+                    .await
+                    .inspect_err(|error| {
+                        crate::support::observe_scoped(
+                            &lib_state.zone_name,
+                            None,
+                            "support_delta_bridge_v1",
+                            serde_json::json!({"outcome":"failed", "reason":
+                                crate::icloud::photos::error::bridge_error_reason(error)}),
+                        );
+                    })?;
                     observe_sync_component(
                         &lib_state.zone_name,
                         "delta_bridge",
@@ -1639,34 +1774,21 @@ pub(crate) async fn run_cycle(
                     sync_result.outcome =
                         merge_download_outcomes(&sync_result.outcome, &bridge_result.outcome);
                     sync_result.accumulate(&bridge_result);
+                    // A later scan supersedes the inventory's membership proof.
+                    // Only a raw-empty bridge can leave that earlier proof current.
+                    if bridge_result.checkpoint.scanned_generation.is_some()
+                        || bridge_result.checkpoint.delta_raw_records_observed != Some(false)
+                    {
+                        sync_result
+                            .checkpoint
+                            .scanned_generation
+                            .clone_from(&bridge_result.checkpoint.scanned_generation);
+                    }
                     if bridge_result.checkpoint.retained_token_rejected
                         && !bridge_result.checkpoint.completed_delta_replay
-                        && let Some(db) = state_db
+                        && state_db.is_some()
                     {
                         retained_checkpoint_expired = true;
-                        let mut hold = RetainedCheckpointHold::new(
-                            &prior_token,
-                            &enum_config_hash,
-                            preservation_config_hash.as_deref(),
-                        );
-                        hold.attempt_count = retained_checkpoint_attempt;
-                        if persist_retained_checkpoint_hold(
-                            db,
-                            retained_checkpoint_hold_key(&lib_state.zone_name),
-                            &hold,
-                            zone_metadata_fence.clone(),
-                        )
-                        .await
-                        .is_err()
-                        {
-                            sync_result.checkpoint.state_write_failures = sync_result
-                                .checkpoint
-                                .state_write_failures
-                                .saturating_add(1);
-                            sync_result.stats.state_write_failures =
-                                sync_result.stats.state_write_failures.saturating_add(1);
-                        }
-                        block_for_retained_checkpoint(&mut sync_result.stats);
                     }
                     if !bridge_result.full_enumeration_ran
                         || bridge_result.checkpoint.completed_delta_replay
@@ -1714,6 +1836,32 @@ pub(crate) async fn run_cycle(
         }
 
         if retained_checkpoint_expired {
+            if let Some(db) = state_db
+                && let Some(prior_token) = retained_cursor_at_start.as_deref()
+            {
+                let mut hold = RetainedCheckpointHold::new(
+                    prior_token,
+                    &enum_config_hash,
+                    preservation_config_hash.as_deref(),
+                );
+                hold.attempt_count = retained_checkpoint_attempt;
+                if persist_retained_checkpoint_hold(
+                    db,
+                    retained_checkpoint_hold_key(&lib_state.zone_name),
+                    &hold,
+                    zone_metadata_fence.clone(),
+                )
+                .await
+                .is_err()
+                {
+                    sync_result.checkpoint.state_write_failures = sync_result
+                        .checkpoint
+                        .state_write_failures
+                        .saturating_add(1);
+                    sync_result.stats.state_write_failures =
+                        sync_result.stats.state_write_failures.saturating_add(1);
+                }
+            }
             block_for_retained_checkpoint(&mut sync_result.stats);
         }
 
@@ -1737,7 +1885,7 @@ pub(crate) async fn run_cycle(
             sync_result.stats.metadata_capture_remaining = capture.remaining_assets;
             sync_result.stats.metadata_capture_unresolved = capture.unresolved_assets;
             sync_result.stats.metadata_capture_deferred = capture.deferred_assets;
-            if capture.unresolved_assets > 0 {
+            if historical_capture_authoritative && capture.unresolved_assets > 0 {
                 sync_result.block_for_metadata_capture();
             }
         }
@@ -1748,6 +1896,31 @@ pub(crate) async fn run_cycle(
                 && !sync_result.checkpoint.interrupted
                 && sync_result.checkpoint.enumeration_errors == 0
                 && !shutdown_token.is_cancelled();
+        let current_inventory_qualified = inventory_request_at_start.is_some()
+            && sync_result.checkpoint.inventory_reconciliation_complete
+            && library_completed_without_errors
+            && sync_result.stats.failed == 0
+            && sync_result.stats.exif_failures == 0
+            && sync_result.checkpoint.state_write_failures == 0
+            && !sync_result.checkpoint.enumeration_incomplete
+            && checkpoint_transition_state_safe
+            && !lib_state.plan_is_stale
+            && !lib_state.plan_needs_refresh
+            && download_controls.run_mode.downloads_files();
+        if pending_download_config_hash.is_some() && !historical_capture_authoritative {
+            // Native reconciliation defers publication to current selection.
+            // Its local scan alone cannot activate a path configuration. Prove
+            // current work completion independently of historical cursor debt.
+            path_reconciliation_complete &= library_completed_without_errors
+                && sync_result.stats.failed == 0
+                && sync_result.stats.exif_failures == 0
+                && sync_result.checkpoint.state_write_failures == 0
+                && !sync_result.checkpoint.enumeration_incomplete
+                && checkpoint_transition_state_safe
+                && !lib_state.plan_is_stale
+                && !lib_state.plan_needs_refresh
+                && download_controls.run_mode.downloads_files();
+        }
         if path_reconciliation_requires_smart_query {
             // Historical smart membership cannot certify the current selection.
             // Full query proof is separate from a bounded source cursor hold.
@@ -1759,7 +1932,6 @@ pub(crate) async fn run_cycle(
             &sync_result,
             library_completed_without_errors,
             download_controls.run_mode,
-            is_retry_failed,
             lib_state,
         ) {
             tracing::warn!(
@@ -1776,7 +1948,6 @@ pub(crate) async fn run_cycle(
             && !sync_result.checkpoint.enumeration_incomplete
             && sync_result.checkpoint.state_write_failures == 0
             && !cycle_has_stale_plan
-            && !is_retry_failed
             && download_controls.run_mode.downloads_files()
             && let Some(inventory) = inventory.as_ref()
             && let Some(db) = state_db
@@ -1810,6 +1981,22 @@ pub(crate) async fn run_cycle(
         // but do not turn ordinary interrupted sync into a new indexing hold.
         let indexing_hold_required =
             !indexing_finished || matches!(readiness_after, Some(Ok(false)) | Some(Err(_)));
+        if current_inventory_qualified
+            && matches!(readiness_after, Some(Ok(true)))
+            && !indexing_reconciliation
+            && let Some(value) = inventory_request_at_start.clone()
+        {
+            qualified_inventory_requests.push((
+                inventory_request_key.clone(),
+                value,
+                lib_state.zone_name.clone(),
+                lib_state.sync_token_key.clone(),
+                retained_cursor_at_start.clone(),
+                sync_result.sync_token.clone(),
+                std::mem::take(&mut sync_result.deferred_album_snapshots),
+                download::hash_download_config(&download_config),
+            ));
+        }
         if indexing_hold_required {
             if !config.runtime.dry_run
                 && let Some(db) = state_db
@@ -1828,27 +2015,14 @@ pub(crate) async fn run_cycle(
             db_sync_token_advance_safe = false;
             path_reconciliation_complete = false;
         }
-        // Retry-only work cannot discharge either phase: new assets may be
-        // skipped before they acquire durable retry rows. Keep their cursor.
-        let recovery_retry_only = (indexing_reconciliation
-            || indexing_replay_pending
-            || indexing_materialization_pending)
-            && (is_retry_failed || download_config.retry_only);
-        if recovery_retry_only
-            || (indexing_reconciliation
-                && (!sync_result.full_enumeration_ran
-                    || !library_completed_without_errors
-                    || sync_result.stats.failed > 0
-                    || sync_result.stats.exif_failures > 0))
+        if indexing_reconciliation
+            && (!sync_result.full_enumeration_ran
+                || !library_completed_without_errors
+                || sync_result.stats.failed > 0
+                || sync_result.stats.exif_failures > 0)
         {
             sync_result.checkpoint.sync_token_blocked = true;
             sync_result.checkpoint.project(&mut sync_result.stats);
-            if recovery_retry_only && !indexing_reconciliation {
-                sync_result.stats.sync_token_blocked_reason = Some("indexing_replay_required");
-                sync_result.stats.sync_token_blocked_source = Some("kei");
-                sync_result.stats.sync_token_blocked_explanation =
-                    Some("retry-only processing cannot discharge retained-cursor replay");
-            }
         }
 
         // An inventory-only pass queued nothing. Unlike ordinary durable
@@ -1860,7 +2034,6 @@ pub(crate) async fn run_cycle(
                 || !sync_result.full_enumeration_ran
                 || sync_result.stats.failed > 0
                 || sync_result.stats.exif_failures > 0
-                || download_config.recent.is_some()
                 || download_config.skip_created_before.is_some()
                 || download_config.skip_created_after.is_some()
                 || (retained_cursor_at_start
@@ -1910,15 +2083,12 @@ pub(crate) async fn run_cycle(
             if matches!(
                 checkpoint_decision,
                 SourceCheckpointDecision::Advance { .. }
-            ) && !is_retry_failed
-                && !download_config.retry_only
-                && !indexing_hold_required
+            ) && !indexing_hold_required
                 && indexing_finished
                 && sync_result.full_enumeration_ran
                 && library_completed_without_errors
                 && (!managed_indexing_recovery
                     || (matches!(readiness_after, Some(Ok(true)))
-                        && download_config.recent.is_none()
                         && download_config.skip_created_before.is_none()
                         && download_config.skip_created_after.is_none()))
                 && let Some(db) = state_db
@@ -1931,9 +2101,8 @@ pub(crate) async fn run_cycle(
                 }
                 match db
                     .commit_checkpoint_transition(state::CheckpointTransition {
+                        album_snapshots: Vec::new(),
                         expected_metadata: zone_metadata_fence.clone(),
-                        legacy_preservation_proofs: Vec::new(),
-                        legacy_config_hash: None,
                         sparse_identity_proofs: Vec::new(),
                         metadata_updates: obligations,
                         metadata_deletes: vec![indexing_key.clone()],
@@ -1979,40 +2148,6 @@ pub(crate) async fn run_cycle(
             path_reconciliation_cycle_safe = false;
         }
 
-        let mut legacy_proofs = Vec::new();
-        if let SourceCheckpointDecision::Advance { token, .. } = &checkpoint_decision
-            && let Some(db) = state_db
-        {
-            let qualified = if legacy_cycle.requires_inventory()
-                && (!matches!(sync_result.outcome, download::DownloadOutcome::Success)
-                    || sync_result.stats.failed > 0
-                    || sync_result.stats.exif_failures > 0)
-            {
-                Err(anyhow::anyhow!("Legacy current work is incomplete"))
-            } else {
-                legacy_cycle
-                    .finish(db, &download_config, token, shutdown_token)
-                    .await
-            };
-            match qualified {
-                Ok(proofs) => legacy_proofs = proofs,
-                Err(error) => {
-                    download::legacy_preservation::log_preservation_hold("checkpoint", &error);
-                    checkpoint_decision = SourceCheckpointDecision::Preserve {
-                        reason: CheckpointHoldReason::LegacyPreservationIncomplete,
-                        recovery: RecoveryAction::ReplayFromPriorToken,
-                    };
-                    sync_result.stats.sync_token_blocked = true;
-                    sync_result.stats.sync_token_blocked_reason =
-                        Some("legacy_preservation_incomplete");
-                    sync_result.stats.sync_token_blocked_source = Some("kei");
-                    sync_result.stats.sync_token_blocked_explanation = Some(
-                        "legacy evidence is protected, but independent current coverage is incomplete",
-                    );
-                }
-            }
-        }
-
         path_reconciliation_cycle_safe &= library_completed_without_errors
             && checkpoint_transition_state_safe
             && !retained_checkpoint_expired
@@ -2027,11 +2162,11 @@ pub(crate) async fn run_cycle(
                 }
             ) && sync_result.checkpoint.bounded_path_selection_complete
                 && !sync_result.checkpoint.enumeration_incomplete
-                && sync_result.checkpoint.state_write_failures == 0
-                && !legacy_cycle.requires_inventory()));
+                && sync_result.checkpoint.state_write_failures == 0));
 
         let mut checkpoint_evidence = checkpoint_support_fields(&checkpoint_decision);
         let mut checkpoint_persistence = "no_state_db";
+        let mut zone_checkpoint_stored = false;
         match checkpoint_decision {
             SourceCheckpointDecision::Advance { token, basis } => {
                 crate::metrics::record_checkpoint_decision("advanced", basis.as_str());
@@ -2055,9 +2190,8 @@ pub(crate) async fn run_cycle(
                             pending_zone_token_key(&enum_config_hash, &lib_state.zone_name);
                         if let Err(e) = db
                             .commit_checkpoint_transition(state::CheckpointTransition {
+                                album_snapshots: Vec::new(),
                                 expected_metadata: zone_metadata_fence.clone(),
-                                legacy_preservation_proofs: legacy_proofs,
-                                legacy_config_hash: preservation_config_hash.clone(),
                                 sparse_identity_proofs: Vec::new(),
                                 metadata_updates: vec![(candidate_key, token)],
                                 metadata_deletes: vec![retained_checkpoint_hold_key(
@@ -2078,6 +2212,7 @@ pub(crate) async fn run_cycle(
                             checkpoint_persistence = "failed";
                         } else {
                             checkpoint_persistence = "staged_reconciliation";
+                            zone_checkpoint_stored = true;
                         }
                     } else {
                         let mut metadata_updates = vec![(lib_state.sync_token_key.clone(), token)];
@@ -2100,9 +2235,8 @@ pub(crate) async fn run_cycle(
                         }
                         if let Err(e) = db
                             .commit_checkpoint_transition(state::CheckpointTransition {
+                                album_snapshots: Vec::new(),
                                 expected_metadata: zone_metadata_fence.clone(),
-                                legacy_preservation_proofs: legacy_proofs,
-                                legacy_config_hash: preservation_config_hash.clone(),
                                 sparse_identity_proofs: sync_result
                                     .checkpoint
                                     .sparse_identity_proofs
@@ -2126,6 +2260,7 @@ pub(crate) async fn run_cycle(
                             checkpoint_persistence = "failed";
                         } else {
                             checkpoint_persistence = "stored";
+                            zone_checkpoint_stored = true;
                             if cycle_has_stale_plan && !lib_state.plan_is_stale {
                                 tracing::warn!(
                                     zone = %lib_state.zone_name,
@@ -2161,9 +2296,8 @@ pub(crate) async fn run_cycle(
                 if let Some(db) = state_db
                     && let Err(e) = db
                         .commit_checkpoint_transition(state::CheckpointTransition {
+                            album_snapshots: Vec::new(),
                             expected_metadata: Vec::new(),
-                            legacy_preservation_proofs: Vec::new(),
-                            legacy_config_hash: None,
                             sparse_identity_proofs: Vec::new(),
                             metadata_updates: vec![
                                 (
@@ -2204,6 +2338,32 @@ pub(crate) async fn run_cycle(
             }
         }
 
+        if zone_checkpoint_stored
+            && library_completed_without_errors
+            && sync_result.stats.failed == 0
+            && sync_result.stats.exif_failures == 0
+            && scoped(lib_state)
+            && !indexing_reconciliation
+            && !lib_state.plan_is_stale
+            && library_states
+                .iter()
+                .filter(|state| state.zone_name == lib_state.zone_name)
+                .count()
+                == 1
+            && let Some((scope, generation)) = sync_result.checkpoint.scanned_generation.take()
+            && scope == download::inventory_scope(&lib_state.plan.passes, &download_config)
+        {
+            completed_scans.insert(lib_state.zone_name.clone(), generation);
+        }
+        if checkpoint_persistence == "failed" {
+            sync_result.checkpoint.state_write_failures = sync_result
+                .checkpoint
+                .state_write_failures
+                .saturating_add(1);
+            sync_result.stats.state_write_failures =
+                sync_result.stats.state_write_failures.saturating_add(1);
+            cycle_failed_count += 1;
+        }
         if let Some(fields) = checkpoint_evidence.as_object_mut() {
             fields.insert(
                 "persistence".into(),
@@ -2258,19 +2418,6 @@ pub(crate) async fn run_cycle(
             cycle_failed_count += 1;
         }
 
-        if sync_result.stats.unattributed_legacy_assets > 0
-            && let Some(db) = state_db
-            && let Some(capture) = db
-                .get_summary()
-                .await?
-                .metadata_capture
-                .into_iter()
-                .find(|capture| capture.library == lib_state.zone_name)
-        {
-            sync_result.stats.unattributed_legacy_assets = capture.unattributed_legacy_assets;
-            sync_result.stats.unattributed_legacy_pending = capture.unattributed_legacy_pending;
-        }
-
         // Accumulate stats across libraries.
         cycle_stats.accumulate(&sync_result.stats);
 
@@ -2289,8 +2436,15 @@ pub(crate) async fn run_cycle(
                 cycle_failed_count += failed_count;
             }
         }
+        if cycle_stats.storage_failed {
+            db_sync_token_advance_safe = false;
+            break;
+        }
     }
 
+    if cycle_stats.selected_work_remaining {
+        cycle_failed_count = cycle_failed_count.max(1);
+    }
     let reconciliation_active = force_full_for_config_hash;
     if reconciliation_active
         && db_sync_token_advance_safe
@@ -2329,7 +2483,7 @@ pub(crate) async fn run_cycle(
                 metadata_deletes.push(indexing_materialization_key(&lib_state.zone_name));
             }
             if db_sync_token_advance_safe {
-                metadata_updates.push((ENUM_CONFIG_HASH_KEY.to_owned(), enum_config_hash));
+                metadata_updates.push((ENUM_CONFIG_HASH_KEY.to_owned(), enum_config_hash.clone()));
                 metadata_deletes.push(PENDING_ENUM_CONFIG_HASH_KEY.to_owned());
             }
         }
@@ -2338,13 +2492,12 @@ pub(crate) async fn run_cycle(
             metadata_updates.push((LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()));
             if let Err(e) = db
                 .commit_checkpoint_transition(state::CheckpointTransition {
+                    album_snapshots: Vec::new(),
                     expected_metadata: enum_metadata_at_start
                         .iter()
                         .cloned()
                         .chain(active_cursor_fences)
                         .collect(),
-                    legacy_preservation_proofs: Vec::new(),
-                    legacy_config_hash: preservation_config_hash.clone(),
                     sparse_identity_proofs,
                     metadata_updates,
                     metadata_deletes,
@@ -2354,6 +2507,9 @@ pub(crate) async fn run_cycle(
                 db_sync_token_advance_safe = false;
                 path_reconciliation_cycle_safe = false;
                 tracing::warn!(error = %e, "Failed to atomically promote checkpoint reconciliation");
+                cycle_stats.state_write_failures =
+                    cycle_stats.state_write_failures.saturating_add(1);
+                cycle_failed_count = cycle_failed_count.saturating_add(1);
             }
         }
     }
@@ -2366,9 +2522,8 @@ pub(crate) async fn run_cycle(
         && let (Some(db), Some(download_config_hash)) = (state_db, pending_download_config_hash)
         && let Err(e) = db
             .commit_checkpoint_transition(state::CheckpointTransition {
+                album_snapshots: Vec::new(),
                 expected_metadata: path_metadata_at_start,
-                legacy_preservation_proofs: Vec::new(),
-                legacy_config_hash: None,
                 sparse_identity_proofs: Vec::new(),
                 metadata_updates: vec![(
                     download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
@@ -2379,30 +2534,74 @@ pub(crate) async fn run_cycle(
             .await
     {
         tracing::warn!(error = %e, "Failed to promote completed local path reconciliation");
+        cycle_stats.state_write_failures = cycle_stats.state_write_failures.saturating_add(1);
+        cycle_failed_count = cycle_failed_count.saturating_add(1);
+        db_sync_token_advance_safe = false;
+    }
+
+    // Inventory coverage is not historical checkpoint certification. Retire its
+    // request without updating a source token, but only after required current
+    // configuration activation. Failed transactions retain snapshots and debt.
+    if !shutdown_token.is_cancelled()
+        && let Some(db) = state_db
+    {
+        for (key, value, zone, cursor_key, prior, offered, snapshots, path_hash) in
+            qualified_inventory_requests
+        {
+            let current = db.get_metadata(&cursor_key).await?;
+            if current != prior && current != offered {
+                continue;
+            }
+            let transition = state::CheckpointTransition {
+                album_snapshots: snapshots,
+                expected_metadata: vec![
+                    (key.clone(), Some(value)),
+                    (cursor_key, current),
+                    (
+                        ENUM_CONFIG_HASH_KEY.to_owned(),
+                        Some(enum_config_hash.clone()),
+                    ),
+                    (PENDING_ENUM_CONFIG_HASH_KEY.to_owned(), None),
+                    (
+                        download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+                        Some(path_hash),
+                    ),
+                    (PENDING_DOWNLOAD_CONFIG_HASH_KEY.to_owned(), None),
+                    (indexing_reconciliation_key(&zone), None),
+                    (state::unresolved_identity_key(&zone), None),
+                ],
+                sparse_identity_proofs: Vec::new(),
+                metadata_updates: Vec::new(),
+                metadata_deletes: vec![key],
+            };
+            if let Err(error) = db.commit_checkpoint_transition(transition).await {
+                cycle_stats.state_write_failures += 1;
+                cycle_failed_count = cycle_failed_count.saturating_add(1);
+                db_sync_token_advance_safe = false;
+                tracing::warn!(%error, "Guarded inventory retirement remains pending");
+            }
+        }
     }
 
     if let Some(db) = state_db {
         let summary = db.get_summary().await?;
         if summary.unresolved_identity_zones > 0 {
-            download::block_sync_token_for_unresolved_identity(&mut cycle_stats);
-            cycle_failed_count = cycle_failed_count.max(1);
             db_sync_token_advance_safe = false;
+            for library in library_states {
+                if db
+                    .get_metadata(&state::unresolved_identity_key(&library.zone_name))
+                    .await?
+                    .is_some()
+                {
+                    download::block_sync_token_for_unresolved_identity(&mut cycle_stats);
+                    cycle_failed_count = cycle_failed_count.max(1);
+                    break;
+                }
+            }
         }
-        if summary
-            .metadata_capture
-            .iter()
-            .any(|capture| capture.unattributed_legacy_pending > 0)
-        {
-            // Protected history no longer appears in the capture retry count,
-            // but pending current-work proof is still incomplete cycle work.
-            cycle_failed_count = cycle_failed_count.max(1);
-            db_sync_token_advance_safe = false;
-        }
-        if summary
-            .metadata_capture
-            .iter()
-            .any(|capture| capture.unresolved_assets > 0)
-        {
+        if summary.metadata_capture.iter().any(|capture| {
+            capture_authority_libraries.contains(&capture.library) && capture.unresolved_assets > 0
+        }) {
             download::block_sync_token_for_metadata_capture(&mut cycle_stats);
             cycle_failed_count = cycle_failed_count.max(1);
             db_sync_token_advance_safe = false;
@@ -2492,7 +2691,6 @@ where
 
 /// Determine the sync mode for a library: full enumeration or incremental.
 pub(crate) async fn determine_sync_mode_decision<D>(
-    _is_retry_failed: bool,
     _library_count: usize,
     state_db: Option<&D>,
     sync_token_key: &str,
@@ -2547,7 +2745,6 @@ where
 
 #[cfg(test)]
 pub(crate) async fn determine_sync_mode<D>(
-    is_retry_failed: bool,
     library_count: usize,
     state_db: Option<&D>,
     sync_token_key: &str,
@@ -2556,15 +2753,9 @@ pub(crate) async fn determine_sync_mode<D>(
 where
     D: state::SyncTokenStore + ?Sized,
 {
-    determine_sync_mode_decision(
-        is_retry_failed,
-        library_count,
-        state_db,
-        sync_token_key,
-        zone_name,
-    )
-    .await
-    .mode
+    determine_sync_mode_decision(library_count, state_db, sync_token_key, zone_name)
+        .await
+        .mode
 }
 
 /// Keep strict-policy hashes byte-compatible with existing preservation proofs.
@@ -2704,6 +2895,7 @@ mod tests {
                     Vec::new()
                 },
             },
+            deleted_album_bindings: Vec::new(),
             plan_is_stale: false,
             plan_needs_refresh: false,
         }
@@ -2726,7 +2918,6 @@ mod tests {
             &sync_result,
             true,
             download::DownloadRunMode::Download,
-            false,
             &make_library_state(false),
         ));
     }
@@ -2748,7 +2939,6 @@ mod tests {
             &sync_result,
             true,
             download::DownloadRunMode::Download,
-            false,
             &make_library_state(true),
         ));
     }
@@ -3033,8 +3223,7 @@ mod tests {
             .expect("set token");
 
         for cycle in 1..=2 {
-            let mode =
-                determine_sync_mode(false, 1, Some(&db), &sync_token_key, "PrimarySync").await;
+            let mode = determine_sync_mode(1, Some(&db), &sync_token_key, "PrimarySync").await;
             assert!(
                 matches!(mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "stored-token-abc"),
                 "normal sync cycle {cycle} should use the stored token, got {mode:?}"
@@ -3069,7 +3258,7 @@ mod tests {
             .expect("set token");
 
         let retry =
-            determine_sync_mode_decision(true, 1, Some(&db), &sync_token_key, "PrimarySync").await;
+            determine_sync_mode_decision(1, Some(&db), &sync_token_key, "PrimarySync").await;
         assert!(matches!(
             retry.mode,
             download::SyncMode::Incremental { ref zone_sync_token }
@@ -3081,7 +3270,7 @@ mod tests {
             .await
             .expect("clear token");
         let no_token =
-            determine_sync_mode_decision(false, 1, Some(&db), &sync_token_key, "PrimarySync").await;
+            determine_sync_mode_decision(1, Some(&db), &sync_token_key, "PrimarySync").await;
         assert!(matches!(no_token.mode, download::SyncMode::Full));
         assert_eq!(
             no_token.full_enumeration_reason,

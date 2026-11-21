@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::commands::{AlbumPass, PassKind};
 use crate::cycle_reporter::{CycleFacts, CycleReporter, CycleReporterConfig};
 use crate::download::{DownloadOutcome, SyncStats};
 use crate::health::HealthStatus;
@@ -14,22 +13,14 @@ use crate::notifications::Notifier;
 use crate::personality::Mode;
 use crate::report::RunOptions;
 
-use super::super::test_support::album_with_session;
 use super::support::Harness;
-use super::{cycle_passes, fixture, pass};
+use super::{cycle_passes, fixture};
 
 const EXPECTED_FILES: &[(&str, &str)] = &[
     ("Photos/First.JPG", "media/pattern.jpg"),
     ("Photos/Second.JPG", "media/metadata.jpg"),
     ("Movies/Movie.MOV", "media/pattern.mov"),
 ];
-
-fn album_pass(name: &str, records: Vec<Value>) -> AlbumPass {
-    let mut p = pass(records);
-    p.kind = PassKind::Album;
-    p.album.name = Arc::from(name);
-    p
-}
 
 async fn assets(h: &Harness) -> (Vec<Value>, Vec<Value>) {
     let mut photos = h
@@ -84,6 +75,7 @@ async fn assert_reporting(
     let report_path = dir.join("sync_report.json");
     let config = crate::config::Config::build(
         &crate::config::GlobalArgs {
+            config_source: Default::default(),
             username: Some("counter-fixture@example.invalid".into()),
             domain: None,
             data_dir: Some(dir.to_string_lossy().into_owned()),
@@ -165,16 +157,16 @@ async fn assert_normal_passes(multiple_passes: bool) {
     let (photos, movie) = assets(&h).await;
     assert!(!h.config.directory.exists());
     assert!(h.db().get_downloaded_page(0, 10).await.unwrap().is_empty());
-    let make_passes = || {
+    let make_passes = |h: &Harness| {
         if multiple_passes {
             vec![
-                album_pass("Photos", photos.clone()),
-                album_pass("Movies", movie.clone()),
+                h.pass("Photos", photos.clone()),
+                h.pass("Movies", movie.clone()),
             ]
         } else {
             let mut all = photos.clone();
             all.extend(movie.clone());
-            vec![album_pass("Photos", all)]
+            vec![h.pass("Photos", all)]
         }
     };
     let expected_files = if multiple_passes {
@@ -187,7 +179,7 @@ async fn assert_normal_passes(multiple_passes: bool) {
         ]
     };
     let metrics = MetricsHandle::new(None);
-    let result = cycle_passes(&h.config, &make_passes()).await;
+    let result = cycle_passes(&h.config, &make_passes(&h)).await;
     assert!(
         matches!(result.outcome, DownloadOutcome::Success),
         "{result:?}"
@@ -199,7 +191,7 @@ async fn assert_normal_passes(multiple_passes: bool) {
     h.reopen().await;
     h.assert_files(&expected_files).await;
     let before = h.db().get_downloaded_page(0, 10).await.unwrap();
-    let unchanged = cycle_passes(&h.config, &make_passes()).await;
+    let unchanged = cycle_passes(&h.config, &make_passes(&h)).await;
     assert!(
         matches!(unchanged.outcome, DownloadOutcome::Success),
         "{unchanged:?}"
@@ -242,11 +234,16 @@ impl PhotosSession for CounterRecoverySession {
     async fn post(
         &self,
         url: &str,
-        _body: String,
+        body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
         if url.contains("/internal/records/query/batch") {
             return Ok(json!({"batch": [{"records": [{"fields": {"itemCount": {"value": 3}}}]}]}));
+        }
+        if url.contains("/records/lookup?") {
+            return super::SelectedMediaSession(Arc::new(self.recovered.clone()))
+                .post(url, body, &[])
+                .await;
         }
         assert!(url.contains("/records/query?"), "unexpected fixture route");
         // The initial pass has one data page plus the five empty stream/tail
@@ -297,8 +294,7 @@ async fn bundled_streaming_counters_include_token_recovery_transfers_without_rec
         initial: all[..2].to_vec(),
         recovered: all.clone(),
     };
-    let mut recovery_pass = album_pass("Photos", Vec::new());
-    recovery_pass.album = album_with_session("PrimarySync", "Photos", Box::new(session));
+    let recovery_pass = h.pass_with_session("Photos", Box::new(session));
     assert!(!h.config.directory.exists());
     let result = cycle_passes(&h.config, &[recovery_pass]).await;
     assert!(
@@ -328,7 +324,7 @@ async fn bundled_streaming_counters_include_token_recovery_transfers_without_rec
         ("Photos/Movie.MOV", "media/pattern.mov"),
     ];
     h.assert_files(expected).await;
-    let unchanged = cycle_passes(&h.config, &[album_pass("Photos", all)]).await;
+    let unchanged = cycle_passes(&h.config, &[h.pass("Photos", all)]).await;
     assert!(
         matches!(unchanged.outcome, DownloadOutcome::Success),
         "{unchanged:?}"

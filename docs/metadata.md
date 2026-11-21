@@ -1,8 +1,10 @@
 # Metadata output
 
-kei captures provider metadata in SQLite without enabling local metadata writes.
-Embedded output and XMP sidecars are off by default. Enable only the outputs you
-want in [example.config.toml](../example.config.toml).
+kei captures provider metadata in SQLite. Setup explicitly enables supported embedded capture date/timezone, missing original orientation, location, description/caption, favourite/rating, title and source keywords. Album names, people and sidecars remain disabled. Review the generated settings before syncing.
+
+Existing `config_version = 1` files keep omitted metadata settings disabled. Runs without a config also keep writers disabled. Saving or showing a resolved config preserves explicit false values. The rendition migration does not opt an existing installation into metadata output.
+
+An enabled setting authorizes initial output and later updates to its managed fields. Ordinary date and GPS output still preserve existing values under their probe checks. Replacing an existing capture timestamp requires the separate repair option. See [example.config.toml](../example.config.toml) for individual settings.
 
 ```toml
 [metadata]
@@ -11,6 +13,10 @@ xmp_sidecar = true
 
 Sidecars leave media bytes unchanged. Embedded writes change local bytes and
 record their resulting checksums. Back up originals before enabling them.
+
+`embed_xmp` writes standard title and source keywords; rating, GPS and description have independent settings. It no longer bundles album names, people, hidden/archived state, media subtype or burst identifiers. Set `include_albums = true` or `include_people = true` to add those optional groupings to enabled embedded XMP or sidecars. Provider-internal fields are excluded from new output.
+
+`set_exif_orientation = true` fills absent orientation only on JPEG/TIFF originals qualified by the provider's original-resource checksum and a verified download's unchanged bytes. Existing orientation, edited renditions, asset-level resource overrides and ambiguous evidence are preserved. Native-only builds conservatively skip files containing XMP because they cannot prove the packet has no orientation. Setup writes this independent option as true; existing omissions and no-config runs keep it false. Native-only builds also support the existing JPEG/TIFF date, location, description and rating fields, not XMP title/keywords or optional groupings.
 
 ## Capture, output, and repair
 
@@ -37,7 +43,7 @@ Capture dates use Apple's usable per-asset offset; otherwise they use host-local
 rendering. Date-only filters compare that calendar date. Datetime and relative
 interval filters compare an instant. Capture/addition milliseconds are retained
 in the catalogue and supported sidecar output, not newly written as native EXIF
-subseconds. See [compatibility](v0.24-upgrade.md#fractional-timestamps).
+subseconds.
 
 Ordinary datetime output preserves native timestamps. When safe, it adds a
 matching offset or fills a missing timestamp. Replacing an existing timestamp
@@ -57,7 +63,7 @@ capability, not automatic mutation. Unsupported formats can still have sidecars.
 
 ### HEIF safety and limits
 
-HEIC/HEIF/AVIF embedding is advanced opt-in support. The production writer edits
+HEIC/HEIF/AVIF embedding requires enabled metadata settings. The production writer edits
 the primary image's XMP item map and preserves encoded image bytes and auxiliary
 gain-map, depth, and matte content. The old typed `mp4-atom` writer is test-only.
 Tone-map scope must be proven by item relationships. Ambiguous relationships,
@@ -69,8 +75,6 @@ Inspect metadata failures, not only downloaded/failed counts. This safe writer
 prevents the old corruption path; it does not detect or restore every historically
 damaged container. Capture-timestamp repair is not general HEIF repair.
 
-Released v0.25.3 still buffers whole files and can amplify memory use under concurrent writes. Main after [#978](https://github.com/rhoopr/kei/commit/8d6e04b725e9af3f8c95b5d4ba9d7c6c886592f2) streams unchanged HEIF ranges and bounds retained control data; this change is absent from v0.25.3. No universal process-memory ceiling or physical filesystem qualification is established by either description. Supported-layout, fingerprint and publication checks still apply. Historical [v0.24 validation](v0.24-validation.md) describes that release candidate only.
-
 ## Sidecar ownership and convergence
 
 kei updates fields it owns and can clear obsolete managed fields. It preserves
@@ -79,11 +83,15 @@ control managed replacements and clearing. An unreadable, malformed, or
 concurrently changed packet remains untouched with durable retry evidence;
 there is no fallback that discards it for a fresh packet.
 
-Album and people groupings converge on supported rewrites, including membership
+With their explicit options enabled, album and people groupings converge on supported sidecar rewrites, including membership
 additions/removals. Album membership is available on the first write. Recorded
 output paths retry independently. Live Photo stills and movies keep their own
 rendition dimensions and duration. This does not claim ownership of every
 historical copy.
+
+Embedded clearing requires an enabled field option, explicit current source absence, and a per-path receipt proving that kei changed that field. The current value must still match kei's recorded output. Completing a recipe without changing an identical preexisting value does not acquire ownership. Missing or malformed source fields and unobserved groupings do not authorize deletion. Existing camera fields, user changes and unrelated properties are preserved, including native GPS companion tags that did not change during the original write.
+
+Prepared rewrite evidence survives interrupted publication and state finalization in the existing receipts. Initial downloads commit measured field ownership with downloaded state after installing the output. An identical existing file gains no ownership from a discarded temporary download. Historical receipts without field-write evidence grant no clearing authority. Rewrites preserve the local modification time. Sidecar ownership and clearing retain their existing rules. Disabling an output does not schedule cleanup.
 
 Untouched stale sidecars have no automatic output-revision sweep; that remains
 [#799](https://github.com/rhoopr/kei/issues/799). Path reconciliation copies an

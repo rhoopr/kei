@@ -153,7 +153,8 @@ int fdatasync(int fd) {
     pthread_once(&init_once, init_calls);
     const char *mode=getenv("KEI_TEST_LATE_IO_CASE");
     off_t size;
-    if (mode && strcmp(mode,"file_sync")==0 && matches(fd,0,&size) && size>0) {
+    if (mode && (strcmp(mode,"file_sync")==0 || strcmp(mode,"reconcile_sync")==0)
+        && matches(fd,0,&size) && size>0) {
         reached("fdatasync",EIO,size); errno=EIO; return -1;
     }
     return next_fdatasync(fd);

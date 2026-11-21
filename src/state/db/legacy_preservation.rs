@@ -1,10 +1,10 @@
-//! Immutable legacy evidence and generation-fenced current-coverage receipts.
+//! Immutable legacy evidence and protected original paths.
 //! This owner never assigns identity, writes files or infers provider completion.
 
 use std::path::PathBuf;
 
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -44,6 +44,7 @@ pub(crate) struct LegacyFileEvidence {
     pub(crate) size: Option<u64>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LegacyPreservation {
     pub(crate) library: String,
@@ -54,20 +55,6 @@ pub(crate) struct LegacyPreservation {
     pub(crate) dependency_evidence: Option<String>,
     pub(crate) provider_evidence: Option<String>,
     pub(crate) config_hash: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LegacyActivationProof {
-    pub(crate) library: String,
-    pub(crate) asset_id: String,
-    pub(crate) expected_original: String,
-    pub(crate) expected_dependencies: String,
-    pub(crate) provider_evidence: String,
-    pub(crate) expected_metadata: Vec<(String, Option<String>)>,
-    pub(crate) expected_active_generation: Option<i64>,
-    pub(crate) config_hash: String,
-    pub(crate) prior_cursor: String,
-    pub(crate) next_cursor: String,
 }
 
 fn invalid() -> StateError {
@@ -129,7 +116,7 @@ pub(super) fn snapshot_rows(
     id: &str,
 ) -> Result<Value, StateError> {
     let mut stmt = conn.prepare(sql)?;
-    let columns: Vec<_> = stmt.column_names().into_iter().map(str::to_owned).collect();
+    let columns: Vec<_> = stmt.column_names().map(str::to_owned).collect();
     let count = columns.len();
     let mut rows = stmt
         .query_map(params![library, id], |row| {
@@ -333,58 +320,41 @@ fn preparation_snapshot(
     }))
 }
 
-/// Diagnostic-only snapshot after an already refused selected receipt. It never
-/// grants qualification, even if another writer has since made the row eligible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LegacyChildReceiptRefusal {
-    ChildNotReady,
-    RenditionMissing,
-    PathReceiptMissing,
-    BindingMismatch,
-    SourceMissing,
-    SourceInvalid,
-    StateChanged,
-    Unavailable,
-}
-
-impl LegacyChildReceiptRefusal {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::ChildNotReady => "child_not_ready",
-            Self::RenditionMissing => "rendition_missing",
-            Self::PathReceiptMissing => "path_receipt_missing",
-            Self::BindingMismatch => "receipt_binding_mismatch",
-            Self::SourceMissing => "source_receipt_missing",
-            Self::SourceInvalid => "source_receipt_invalid",
-            Self::StateChanged => "receipt_state_changed",
-            Self::Unavailable => "diagnostic_unavailable",
-        }
-    }
-}
-
 pub(super) fn child_receipts_ready(
     conn: &Connection,
     library: &str,
     id: &str,
 ) -> Result<bool, StateError> {
-    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM asset_metadata_capture_revisions WHERE library=?1 AND asset_id=?2 AND revision>=?3) AND NOT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND (status!='downloaded' OR is_deleted!=0 OR metadata_hash IS NULL OR metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND (metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL))", params![library, id, crate::state::METADATA_CAPTURE_REVISION], |row| row.get(0))?)
+    child_publications_ready(conn, library, id, true)
+}
+
+/// Grouping changes can queue a metadata rewrite even with writers disabled.
+/// A sealed selection owns its writer policy; prepared repairs always veto.
+pub(super) fn child_publications_ready(
+    conn: &Connection,
+    library: &str,
+    id: &str,
+    requires_metadata: bool,
+) -> Result<bool, StateError> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM asset_metadata_capture_revisions WHERE library=?1 AND asset_id=?2 AND revision>=?3) AND NOT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND (status!='downloaded' OR is_deleted!=0 OR metadata_hash IS NULL OR (?4 AND metadata_write_failed_at IS NOT NULL) OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND ((?4 AND metadata_write_failed_at IS NOT NULL) OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL))", params![library, id, crate::state::METADATA_CAPTURE_REVISION, requires_metadata], |row| row.get(0))?)
 }
 
 impl SqliteStateDb {
-    /// Return finalized current-child receipts with verified source provenance or
-    /// explicit Trusted Legacy File acceptance for this exact generation/binding.
-    /// Reconciliation reservations are retained naming evidence, not pending
-    /// work. They remain part of the dependency fence; the sync owner must
-    /// independently prove reconciliation completed before certification.
-    pub(crate) async fn legacy_child_receipts(
+    /// Return ready current-child receipts with verified source provenance or an
+    /// exact historical local-trust declaration. The provenances remain distinct.
+    /// Reconciliation reservations are naming evidence, not pending work, and
+    /// remain in the preparation dependency snapshot. Receipt eligibility alone
+    /// does not establish current completion or checkpoint permission.
+    pub(crate) async fn qualified_child_receipts(
         &self,
         library: &str,
         id: &str,
+        requires_metadata: bool,
     ) -> Result<Vec<crate::state::AssetRecord>, StateError> {
         let library = library.to_owned();
         let id = id.to_owned();
         self.with_conn("legacy_child_receipts", move |conn| {
-            let ready = child_receipts_ready(conn, &library, &id)?;
+            let ready = child_publications_ready(conn, &library, &id, requires_metadata)?;
             if !ready {
                 return Ok(Vec::new());
             }
@@ -413,54 +383,13 @@ impl SqliteStateDb {
         .await
     }
 
-    /// Explain a missing selected receipt without writing state or changing the
-    /// acceptance query. These observations can differ from the preceding read.
-    pub(crate) async fn legacy_child_receipt_refusal(
+    #[cfg(test)]
+    pub(crate) async fn legacy_child_receipts(
         &self,
         library: &str,
         id: &str,
-        version_size: &str,
-    ) -> Result<LegacyChildReceiptRefusal, StateError> {
-        let library = library.to_owned();
-        let id = id.to_owned();
-        let version_size = version_size.to_owned();
-        self.with_conn("legacy_child_receipt_refusal", move |conn| {
-            if !child_receipts_ready(conn, &library, &id)? {
-                return Ok(LegacyChildReceiptRefusal::ChildNotReady);
-            }
-            let rendition: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND version_size=?3)",
-                params![library, id, version_size], |row| row.get(0),
-            )?;
-            if !rendition {
-                return Ok(LegacyChildReceiptRefusal::RenditionMissing);
-            }
-            let receipt: Option<(bool, bool)> = conn.query_row(
-                "SELECT p.source_checksum IS NOT NULL,
-                        COALESCE(length(p.source_checksum)=64 AND p.source_checksum NOT GLOB '*[^0-9a-f]*', 0)
-                 FROM assets a JOIN asset_metadata_paths p ON p.library=a.library AND p.id=a.id
-                   AND p.version_size=a.version_size AND p.local_path=a.local_path
-                   AND p.provider_checksum=a.checksum AND p.local_checksum=a.local_checksum
-                 WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3",
-                params![library, id, version_size], |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional()?;
-            Ok(match receipt {
-                Some((_, true)) => LegacyChildReceiptRefusal::StateChanged,
-                Some((false, false)) => LegacyChildReceiptRefusal::SourceMissing,
-                Some((true, false)) => LegacyChildReceiptRefusal::SourceInvalid,
-                None => {
-                    let scoped_path: bool = conn.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size=?3)",
-                        params![library, id, version_size], |row| row.get(0),
-                    )?;
-                    if scoped_path {
-                        LegacyChildReceiptRefusal::BindingMismatch
-                    } else {
-                        LegacyChildReceiptRefusal::PathReceiptMissing
-                    }
-                }
-            })
-        }).await
+    ) -> Result<Vec<crate::state::AssetRecord>, StateError> {
+        self.qualified_child_receipts(library, id, true).await
     }
 
     pub(crate) async fn legacy_preparation_snapshots(
@@ -556,6 +485,7 @@ impl SqliteStateDb {
         }).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn legacy_preservations(
         &self,
         library: &str,
@@ -566,207 +496,63 @@ impl SqliteStateDb {
             let mut rows=stmt.query([&library])?; let mut result=Vec::new();
             while let Some(row)=rows.next()? {
                 let active:Option<i64>=row.get(4)?;
-                if row.get::<_,i64>(1)?!=EVIDENCE_VERSION || (active.is_some() && row.get::<_,Option<i64>>(7)?!=Some(EVIDENCE_VERSION)) { return Err(invalid()); }
                 let files=serde_json::from_str(&row.get::<_,String>(3)?).map_err(|_private_error|invalid())?;
                 result.push(LegacyPreservation {library:library.clone(),asset_id:row.get(0)?,original_evidence:row.get(2)?,files,active_generation:active,dependency_evidence:row.get(5)?,config_hash:row.get(6)?,provider_evidence:row.get(8)?});
             }
             Ok(result)
         }).await
     }
-
-    pub(crate) async fn legacy_dependency_evidence(
-        &self,
-        library: &str,
-        id: &str,
-    ) -> Result<String, StateError> {
-        let library = library.to_owned();
-        let id = id.to_owned();
-        self.with_conn("legacy_dependency_evidence", move |conn| {
-            dependencies(conn, &library, &id)
-        })
-        .await
-    }
-
-    pub(crate) async fn reactivate_legacy_preservation(
-        &self,
-        library: &str,
-        id: &str,
-        expected_generation: Option<i64>,
-    ) -> Result<(), StateError> {
-        let library = library.to_owned();
-        let id = id.to_owned();
-        self.with_conn("reactivate_legacy_preservation",move |conn| {
-            let changed=conn.execute("UPDATE unattributed_legacy SET active_generation=NULL WHERE library=?1 AND asset_id=?2 AND active_generation IS ?3",params![library,id,expected_generation])?;
-            if changed!=1 { return Err(invalid()); }
-            Ok(())
-        }).await
-    }
 }
 
-// Called only inside the cursor transaction, after normal current-work proof.
-pub(super) fn activate(conn: &Connection, proof: &LegacyActivationProof) -> Result<(), StateError> {
-    if proof.config_hash.trim().is_empty()
-        || proof.next_cursor.trim().is_empty()
-        || proof.provider_evidence.trim().is_empty()
-    {
-        return Err(invalid());
-    }
-    for (key, expected) in &proof.expected_metadata {
-        let current: Option<String> = conn
-            .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        if &current != expected {
-            return Err(invalid());
-        }
-    }
-    let current:Option<(i64,String,Option<i64>)>=conn.query_row("SELECT evidence_version,original_evidence,active_generation FROM unattributed_legacy WHERE library=?1 AND asset_id=?2",params![proof.library,proof.asset_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    if current
-        != Some((
-            EVIDENCE_VERSION,
-            proof.expected_original.clone(),
-            proof.expected_active_generation,
-        ))
-        || dependencies(conn, &proof.library, &proof.asset_id)? != proof.expected_dependencies
-    {
-        return Err(invalid());
-    }
-    let prior: Option<String> = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key=?1",
-            [format!("sync_token:{}", proof.library)],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if prior.as_deref().unwrap_or("") != proof.prior_cursor {
-        return Err(invalid());
-    }
-    let generation:i64=conn.query_row("SELECT COALESCE(MAX(generation),0) FROM unattributed_legacy_proofs WHERE library=?1 AND asset_id=?2",params![proof.library,proof.asset_id],|r|r.get(0))?;
-    let generation = generation.checked_add(1).ok_or_else(invalid)?;
-    conn.execute(
-        "INSERT INTO unattributed_legacy_proofs VALUES (?1,?2,?3,1,?4,?5,?6,?7,?8,?9)",
-        params![
-            proof.library,
-            proof.asset_id,
-            generation,
-            proof.expected_dependencies,
-            proof.provider_evidence,
-            proof.config_hash,
-            proof.prior_cursor,
-            proof.next_cursor,
-            Utc::now().timestamp()
-        ],
-    )?;
-    conn.execute(
-        "UPDATE unattributed_legacy SET active_generation=?3 WHERE library=?1 AND asset_id=?2",
-        params![proof.library, proof.asset_id, generation],
-    )?;
-    Ok(())
-}
-
-pub(super) fn checkpoint_library(key: &str) -> Option<&str> {
-    key.strip_prefix("sync_token:").or_else(|| {
-        key.strip_prefix("pending_sync_token:")
-            .and_then(|key| key.split_once(':').map(|(_, library)| library))
-    })
-}
-
-pub(super) fn invalid_checkpoint() -> StateError {
-    invalid()
-}
-
-pub(super) fn validate_checkpoint(
-    conn: &Connection,
-    library: &str,
-    config_hash: Option<&str>,
-) -> Result<(), StateError> {
-    let mut stmt=conn.prepare("SELECT p.asset_id,p.evidence_version,p.active_generation,r.evidence_version,r.dependency_evidence,r.config_hash FROM unattributed_legacy p LEFT JOIN unattributed_legacy_proofs r ON r.library=p.library AND r.asset_id=p.asset_id AND r.generation=p.active_generation WHERE p.library=?1 ORDER BY p.asset_id")?;
-    let mut rows = stmt.query([library])?;
-    while let Some(row) = rows.next()? {
-        let id: String = row.get(0)?;
-        if row.get::<_, i64>(1)? != EVIDENCE_VERSION
-            || row.get::<_, Option<i64>>(2)?.is_none()
-            || row.get::<_, Option<i64>>(3)? != Some(EVIDENCE_VERSION)
-            || row.get::<_, Option<String>>(5)?.as_deref() != config_hash
-            || row.get::<_, Option<String>>(4)?.as_deref()
-                != Some(dependencies(conn, library, &id)?.as_str())
-        {
-            return Err(invalid());
-        }
-    }
-    Ok(())
-}
-
-/// Read-only status includes locally invalidated coverage before the next cycle
-/// persists reactivation. This does not certify file contents or provider state.
+/// Historical diagnostics only. A stored certificate is not revalidated and
+/// neither counter describes pending sync work or current provider coverage.
 pub(super) fn counts(conn: &Connection, library: &str) -> Result<(u64, u64), StateError> {
-    let mut stmt=conn.prepare("SELECT p.asset_id,p.evidence_version,p.active_generation,r.evidence_version,r.dependency_evidence FROM unattributed_legacy p LEFT JOIN unattributed_legacy_proofs r ON r.library=p.library AND r.asset_id=p.asset_id AND r.generation=p.active_generation WHERE p.library=?1")?;
-    let mut rows = stmt.query([library])?;
-    let mut total = 0;
-    let mut pending = 0;
-    while let Some(row) = rows.next()? {
-        total += 1;
-        let id: String = row.get(0)?;
-        if row.get::<_, i64>(1)? != EVIDENCE_VERSION
-            || row.get::<_, Option<i64>>(2)?.is_none()
-            || row.get::<_, Option<i64>>(3)? != Some(EVIDENCE_VERSION)
-            || row.get::<_, Option<String>>(4)?.as_deref()
-                != Some(dependencies(conn, library, &id)?.as_str())
-        {
-            pending += 1;
-        }
-    }
-    Ok((total, pending))
+    let (total, uncertified): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE r.generation IS NULL)
+         FROM unattributed_legacy p LEFT JOIN unattributed_legacy_proofs r
+           ON r.library=p.library AND r.asset_id=p.asset_id AND r.generation=p.active_generation
+         WHERE p.library=?1",
+        [library],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok((
+        u64::try_from(total).map_err(|_negative_count| invalid())?,
+        u64::try_from(uncertified).map_err(|_negative_count| invalid())?,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        LegacyActivationProof, LegacyFileEvidence, LegacyPreparationSnapshot, SqliteStateDb,
-    };
+    use super::{LegacyFileEvidence, LegacyPreparationSnapshot, SqliteStateDb};
     use crate::state::CheckpointTransition;
     use std::path::Path;
 
     #[tokio::test]
     async fn legacy_receipt_prerequisites_are_read_only_after_reopen() {
-        use super::LegacyChildReceiptRefusal;
-        for (fault, expected) in [
-            ("ready", LegacyChildReceiptRefusal::StateChanged),
-            ("missing_capture", LegacyChildReceiptRefusal::ChildNotReady),
-            ("stale_capture", LegacyChildReceiptRefusal::ChildNotReady),
-            ("pending", LegacyChildReceiptRefusal::ChildNotReady),
-            ("deleted", LegacyChildReceiptRefusal::ChildNotReady),
-            ("metadata", LegacyChildReceiptRefusal::ChildNotReady),
-            ("asset_debt", LegacyChildReceiptRefusal::ChildNotReady),
-            ("path_debt", LegacyChildReceiptRefusal::ChildNotReady),
-            ("prepared_debt", LegacyChildReceiptRefusal::ChildNotReady),
-            ("rendition", LegacyChildReceiptRefusal::RenditionMissing),
-            (
-                "path_receipt",
-                LegacyChildReceiptRefusal::PathReceiptMissing,
-            ),
-            (
-                "foreign_library",
-                LegacyChildReceiptRefusal::PathReceiptMissing,
-            ),
-            (
-                "foreign_child",
-                LegacyChildReceiptRefusal::PathReceiptMissing,
-            ),
-            (
-                "foreign_rendition",
-                LegacyChildReceiptRefusal::PathReceiptMissing,
-            ),
-            ("path", LegacyChildReceiptRefusal::BindingMismatch),
-            ("provider", LegacyChildReceiptRefusal::BindingMismatch),
-            ("local", LegacyChildReceiptRefusal::BindingMismatch),
-            ("null_local", LegacyChildReceiptRefusal::BindingMismatch),
-            ("source_missing", LegacyChildReceiptRefusal::SourceMissing),
-            ("source_empty", LegacyChildReceiptRefusal::SourceInvalid),
-            ("source_short", LegacyChildReceiptRefusal::SourceInvalid),
-            ("source_upper", LegacyChildReceiptRefusal::SourceInvalid),
-            ("source_nonhex", LegacyChildReceiptRefusal::SourceInvalid),
+        for fault in [
+            "ready",
+            "missing_capture",
+            "stale_capture",
+            "pending",
+            "deleted",
+            "metadata",
+            "asset_debt",
+            "path_debt",
+            "prepared_debt",
+            "rendition",
+            "path_receipt",
+            "foreign_library",
+            "foreign_child",
+            "foreign_rendition",
+            "path",
+            "provider",
+            "local",
+            "null_local",
+            "source_missing",
+            "source_empty",
+            "source_short",
+            "source_upper",
+            "source_nonhex",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let database = dir.path().join("state.db");
@@ -787,6 +573,7 @@ mod tests {
                 &hash,
                 Some(&hash),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -835,6 +622,28 @@ mod tests {
                     _ => "SELECT 1",
                 };
                 conn.execute_batch(sql).unwrap();
+                if matches!(fault, "asset_debt" | "path_debt" | "prepared_debt") {
+                    assert!(
+                        !super::child_publications_ready(
+                            &conn,
+                            "PrimarySync",
+                            "private-child",
+                            true
+                        )
+                        .unwrap()
+                    );
+                    assert_eq!(
+                        super::child_publications_ready(
+                            &conn,
+                            "PrimarySync",
+                            "private-child",
+                            false
+                        )
+                        .unwrap(),
+                        fault == "asset_debt",
+                        "disabling writers leaves prepared repairs blocking: {fault}"
+                    );
+                }
             }
             drop(db);
             let db = SqliteStateDb::open(&database).await.unwrap();
@@ -861,15 +670,6 @@ mod tests {
                 conn.query_row("SELECT total_changes()", [], |row| row.get(0))
                     .unwrap()
             };
-            for _ in 0..2 {
-                assert_eq!(
-                    db.legacy_child_receipt_refusal("PrimarySync", "private-child", version)
-                        .await
-                        .unwrap(),
-                    expected,
-                    "{fault}"
-                );
-            }
             let after = db
                 .legacy_child_receipts("PrimarySync", "private-child")
                 .await
@@ -939,6 +739,7 @@ mod tests {
                     &hash,
                     Some(&hash),
                     false,
+                    &Default::default(),
                 )
                 .await
                 .unwrap();
@@ -1087,6 +888,7 @@ mod tests {
                 &hash,
                 Some(&hash),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -1235,6 +1037,7 @@ mod tests {
                 &hash,
                 Some(&hash),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -1711,7 +1514,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_preservation_single_child_stale_receipt_keeps_checkpoint() {
+    async fn legacy_preservation_single_child_history_does_not_gate_current_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let (db, snapshot, files) = seed(&path).await;
@@ -1722,17 +1525,10 @@ mod tests {
         );
         let child = crate::test_helpers::TestAssetRecord::new("child-a").build();
         db.upsert_seen(&child).await.unwrap();
-        // Only the SQLite compare-and-commit boundary is under test here;
-        // the synthetic proof is not a claim of validated provider coverage.
-        let stale = proof(&db, &snapshot).await;
         let mut changed = child.clone();
         changed.added_at = chrono::DateTime::from_timestamp(1_600_000_000, 0);
         db.upsert_seen(&changed).await.unwrap();
-        assert!(
-            db.commit_checkpoint_transition(transition(vec![stale]))
-                .await
-                .is_err()
-        );
+        db.commit_checkpoint_transition(transition()).await.unwrap();
         drop(db);
         let db = SqliteStateDb::open(&path).await.unwrap();
         assert_eq!(
@@ -1740,7 +1536,7 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("before")
+            Some("after")
         );
         let preserved = db.legacy_preservations("PrimarySync").await.unwrap();
         assert_eq!(preserved[0].active_generation, None);
@@ -1762,31 +1558,13 @@ mod tests {
         assert_eq!(proofs, 0);
     }
 
-    async fn proof(
-        db: &SqliteStateDb,
-        snapshot: &LegacyPreparationSnapshot,
-    ) -> LegacyActivationProof {
-        LegacyActivationProof {
-            library: "PrimarySync".into(),
-            asset_id: "master".into(),
-            expected_original: snapshot.evidence.clone(),
-            provider_evidence: "synthetic-state-owner-test".into(),
-            expected_metadata: vec![("enum_config_hash".into(), None)],
-            expected_dependencies: db
-                .legacy_dependency_evidence("PrimarySync", "master")
-                .await
-                .unwrap(),
-            expected_active_generation: None,
-            config_hash: "config".into(),
-            prior_cursor: "before".into(),
-            next_cursor: "after".into(),
-        }
-    }
-    fn transition(proofs: Vec<LegacyActivationProof>) -> CheckpointTransition {
+    fn transition() -> CheckpointTransition {
         CheckpointTransition {
-            expected_metadata: Vec::new(),
-            legacy_preservation_proofs: proofs,
-            legacy_config_hash: Some("config".into()),
+            album_snapshots: Vec::new(),
+            expected_metadata: vec![
+                ("sync_token:PrimarySync".into(), Some("before".into())),
+                ("enum_config_hash".into(), None),
+            ],
             sparse_identity_proofs: Vec::new(),
             metadata_updates: vec![("sync_token:PrimarySync".into(), "after".into())],
             metadata_deletes: Vec::new(),
@@ -1802,11 +1580,6 @@ mod tests {
             db.prepare_legacy_preservation(&snapshot, &files)
                 .await
                 .unwrap()
-        );
-        assert!(
-            db.commit_checkpoint_transition(transition(Vec::new()))
-                .await
-                .is_err()
         );
         assert_eq!(
             db.get_metadata("sync_token:PrimarySync")
@@ -1826,10 +1599,7 @@ mod tests {
             db.legacy_preservations("PrimarySync").await.unwrap()[0].original_evidence,
             snapshot.evidence
         );
-        let activation = proof(&db, &snapshot).await;
-        db.commit_checkpoint_transition(transition(vec![activation.clone()]))
-            .await
-            .unwrap();
+        db.commit_checkpoint_transition(transition()).await.unwrap();
         drop(db);
         let db = SqliteStateDb::open(&path).await.unwrap();
         let retained = db
@@ -1839,7 +1609,7 @@ mod tests {
             .remove(0);
         assert_eq!(retained.original_evidence, snapshot.evidence);
         assert_eq!(retained.files, files);
-        assert_eq!(retained.active_generation, Some(1));
+        assert_eq!(retained.active_generation, None);
         assert_eq!(
             db.get_metadata("sync_token:PrimarySync")
                 .await
@@ -1851,37 +1621,7 @@ mod tests {
             std::fs::read(dir.path().join("original.jpg")).unwrap(),
             b"legacy bytes"
         );
-        assert!(
-            db.commit_checkpoint_transition(transition(vec![activation]))
-                .await
-                .is_err()
-        );
-        // An unchanged subsequent cursor uses retained coverage, without a new
-        // preservation receipt. Current-work proof remains the caller's duty.
-        db.commit_checkpoint_transition(transition(Vec::new()))
-            .await
-            .unwrap();
-        assert_eq!(
-            db.legacy_preservations("PrimarySync").await.unwrap()[0].active_generation,
-            Some(1)
-        );
-        assert!(
-            db.reactivate_legacy_preservation("PrimarySync", "master", Some(0))
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            db.legacy_preservations("PrimarySync").await.unwrap()[0].active_generation,
-            Some(1)
-        );
-        db.reactivate_legacy_preservation("PrimarySync", "master", Some(1))
-            .await
-            .unwrap();
-        assert!(
-            db.commit_checkpoint_transition(transition(Vec::new()))
-                .await
-                .is_err()
-        );
+        assert!(db.commit_checkpoint_transition(transition()).await.is_err());
         assert_eq!(
             db.legacy_preservations("PrimarySync").await.unwrap()[0].original_evidence,
             snapshot.evidence
@@ -1889,8 +1629,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_preservation_checkpoint_failure_rolls_back_activation() {
-        for failure in ["receipt", "cursor"] {
+    async fn legacy_preservation_checkpoint_failure_rolls_back_current_activation() {
+        for failure in ["config", "cursor"] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("state.db");
             let (db, snapshot, files) = seed(&path).await;
@@ -1899,8 +1639,8 @@ mod tests {
                     .await
                     .unwrap()
             );
-            let sql = if failure == "receipt" {
-                "CREATE TRIGGER fail_proof BEFORE INSERT ON unattributed_legacy_proofs BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;"
+            let sql = if failure == "config" {
+                "CREATE TRIGGER fail_config BEFORE INSERT ON metadata WHEN NEW.key='enum_config_hash' BEGIN SELECT RAISE(ABORT,'injected config failure'); END;"
             } else {
                 "CREATE TRIGGER fail_cursor BEFORE UPDATE ON metadata WHEN OLD.key='sync_token:PrimarySync' BEGIN SELECT RAISE(ABORT,'injected cursor failure'); END;"
             };
@@ -1908,11 +1648,11 @@ mod tests {
                 .unwrap()
                 .execute_batch(sql)
                 .unwrap();
-            assert!(
-                db.commit_checkpoint_transition(transition(vec![proof(&db, &snapshot).await]))
-                    .await
-                    .is_err()
-            );
+            let mut activation = transition();
+            activation
+                .metadata_updates
+                .push(("enum_config_hash".into(), "current".into()));
+            assert!(db.commit_checkpoint_transition(activation).await.is_err());
             drop(db);
             let db = SqliteStateDb::open(&path).await.unwrap();
             assert_eq!(
@@ -1926,6 +1666,7 @@ mod tests {
                     .as_deref(),
                 Some("before")
             );
+            assert!(db.get_metadata("enum_config_hash").await.unwrap().is_none());
             assert_eq!(
                 rusqlite::Connection::open(&path)
                     .unwrap()
@@ -1964,10 +1705,8 @@ mod tests {
             );
         }
         for change in [
-            "INSERT INTO asset_master_mappings VALUES ('PrimarySync','third','master',0)",
             "UPDATE metadata SET value='concurrent' WHERE key='sync_token:PrimarySync'",
             "INSERT INTO metadata(key,value) VALUES ('enum_config_hash','concurrent')",
-            "INSERT INTO asset_master_mappings VALUES ('PrimarySync','master','different-master',0)",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("state.db");
@@ -1977,16 +1716,12 @@ mod tests {
                     .await
                     .unwrap()
             );
-            let activation = proof(&db, &snapshot).await;
+            let activation = transition();
             rusqlite::Connection::open(&path)
                 .unwrap()
                 .execute_batch(change)
                 .unwrap();
-            assert!(
-                db.commit_checkpoint_transition(transition(vec![activation]))
-                    .await
-                    .is_err()
-            );
+            assert!(db.commit_checkpoint_transition(activation).await.is_err());
             assert_eq!(
                 db.legacy_preservations("PrimarySync").await.unwrap()[0].active_generation,
                 None
@@ -2009,20 +1744,10 @@ mod tests {
                 .unwrap();
         assert_eq!(protected.len(), 2);
         assert!(files.iter().all(|file| protected.contains(&file.path)));
-        assert!(
-            db.set_metadata("sync_token:PrimarySync", "unsafe")
-                .await
-                .is_err()
-        );
-        assert!(
-            db.set_metadata("pending_sync_token:config:PrimarySync", "unsafe")
-                .await
-                .is_err()
-        );
         db.set_metadata("sync_token:OtherLibrary", "independent")
             .await
             .unwrap();
-        let mut staged = transition(vec![proof(&db, &snapshot).await]);
+        let mut staged = transition();
         staged.metadata_updates = vec![(
             "pending_sync_token:config:PrimarySync".into(),
             "after".into(),
@@ -2035,9 +1760,12 @@ mod tests {
                 .as_deref(),
             Some("before")
         );
-        let mut promotion = transition(Vec::new());
+        let mut promotion = transition();
         promotion.metadata_deletes = vec!["pending_sync_token:config:PrimarySync".into()];
-        promotion.legacy_config_hash = Some("changed".into());
+        promotion.expected_metadata.push((
+            "pending_sync_token:config:PrimarySync".into(),
+            Some("changed".into()),
+        ));
         assert!(db.commit_checkpoint_transition(promotion).await.is_err());
         assert_eq!(
             db.get_metadata("sync_token:PrimarySync")
@@ -2053,7 +1781,11 @@ mod tests {
                 .as_deref(),
             Some("after")
         );
-        let mut promotion = transition(Vec::new());
+        let mut promotion = transition();
+        promotion.expected_metadata.push((
+            "pending_sync_token:config:PrimarySync".into(),
+            Some("after".into()),
+        ));
         promotion.metadata_deletes = vec!["pending_sync_token:config:PrimarySync".into()];
         db.commit_checkpoint_transition(promotion).await.unwrap();
         assert_eq!(
@@ -2078,7 +1810,7 @@ mod tests {
         );
         assert_eq!(
             db.legacy_preservations("PrimarySync").await.unwrap()[0].active_generation,
-            Some(1)
+            None
         );
     }
 }

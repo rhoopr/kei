@@ -214,26 +214,11 @@ fn test_legacy_download_config_hash_changes_on_skip_created_before() {
 }
 
 #[test]
-fn test_hash_download_config_changes_on_recent() {
-    let mut config1 = test_config();
-    config1.recent = None;
-    let mut config2 = test_config();
-    config2.recent = Some(100);
-    assert_ne!(
-        hash_download_config(&config1),
-        hash_download_config(&config2)
-    );
-}
-
-#[test]
-fn test_hash_download_config_changes_on_recent_scope_when_recent_is_set() {
-    let mut config1 = test_config();
-    config1.recent = Some(100);
-    config1.recent_scope = crate::cli::RecentScope::Global;
-    let mut config2 = test_config();
-    config2.recent = Some(100);
-    config2.recent_scope = crate::cli::RecentScope::PerFilter;
-    assert_ne!(
+fn inventory_request_does_not_change_historical_uncapped_hash() {
+    let config1 = test_config();
+    let mut config2 = config1.clone();
+    config2.inventory_reconciliation = true;
+    assert_eq!(
         hash_download_config(&config1),
         hash_download_config(&config2)
     );
@@ -296,6 +281,7 @@ fn test_compute_config_hash_matches_hash_download_config() {
 
     let dl_config = test_config();
     let globals = crate::config::GlobalArgs {
+        config_source: Default::default(),
         username: Some("u@example.com".to_string()),
         domain: None,
         data_dir: Some("/tmp".to_string()),
@@ -304,11 +290,9 @@ fn test_compute_config_hash_matches_hash_download_config() {
         &globals,
         &crate::cli::PasswordArgs::default(),
         crate::cli::SyncArgs {
-            recent: dl_config.recent.map(crate::cli::RecentLimit::Count),
             config_overrides: crate::config::SyncConfigOverrides {
                 download_dir: Some(dl_config.directory.display().to_string()),
                 folder_structure: Some(dl_config.folder_structure.clone()),
-                resolution: Some(crate::types::PhotoResolution::Original),
                 ..Default::default()
             },
             no_progress_bar: true,
@@ -338,8 +322,6 @@ fn test_compute_config_hash_matches_hash_download_config() {
     );
 }
 
-// ── Gap coverage: retry_only known_ids filtering ────────────────────
-
 // ── Gap coverage: skip_created_before AND skip_created_after ────────
 
 // ── Gap coverage: incremental Modified events are downloadable ──────
@@ -359,6 +341,7 @@ fn build_config_with(
     use crate::config::GlobalArgs;
 
     let globals = GlobalArgs {
+        config_source: Default::default(),
         username: Some("test@example.com".to_string()),
         domain: None,
         data_dir: Some(cookie_dir.to_string_lossy().into_owned()),
@@ -399,9 +382,9 @@ fn test_compute_config_hash_different_directory() {
 fn test_compute_config_hash_different_size() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos", |_| {});
-    let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.config_overrides.resolution = Some(crate::types::PhotoResolution::Medium);
-    });
+    // Retained historical rendition decisions still have distinct hashes.
+    let mut b = build_config_with(tmp.path(), "/photos", |_| {});
+    b.photos.resolution = crate::types::PhotoResolution::Medium;
     assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
 }
 
@@ -447,9 +430,8 @@ fn test_compute_config_hash_different_inline_album_excludes() {
 fn test_compute_config_hash_different_live_photo_mode() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos", |_| {});
-    let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.config_overrides.live_photo_mode = Some(LivePhotoMode::Skip);
-    });
+    let mut b = build_config_with(tmp.path(), "/photos", |_| {});
+    b.photos.live_photo_mode = LivePhotoMode::Skip;
     assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
 }
 
@@ -518,16 +500,16 @@ fn test_compute_config_hash_path_only_changes_same_hash() {
 }
 
 #[test]
-fn test_compute_config_hash_different_recent_requires_inventory() {
+fn test_compute_config_hash_fixed_date_drift_requires_inventory() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos", |_| {});
     let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.recent = Some(crate::cli::RecentLimit::Count(100));
+        s.skip_created_before = Some("2025-01-01".into());
     });
     assert_ne!(
         compute_config_hash(&a),
         compute_config_hash(&b),
-        "recent changes require inventory and a preserved-cursor bridge"
+        "fixed-date changes require inventory and a preserved-cursor bridge"
     );
 }
 
@@ -547,7 +529,7 @@ fn test_compute_config_hash_different_dry_run_same_hash() {
 
 // ── filter_asset_to_tasks edge-case tests ──────────────────────
 
-// ── LivePhotoMode + filename_exclude filter tests ─────────────
+// ── LivePhotoMode filter tests ─────────────
 
 // ── exclude_asset_ids filter tests ─────────────────────────────
 
@@ -556,17 +538,6 @@ fn test_hash_changes_on_live_photo_mode() {
     let config1 = test_config();
     let mut config2 = test_config();
     config2.live_photo_mode = LivePhotoMode::Skip;
-    assert_ne!(
-        hash_download_config(&config1),
-        hash_download_config(&config2)
-    );
-}
-
-#[test]
-fn test_hash_changes_on_filename_exclude() {
-    let config1 = test_config();
-    let mut config2 = test_config();
-    config2.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
     assert_ne!(
         hash_download_config(&config1),
         hash_download_config(&config2)
@@ -765,7 +736,6 @@ fn test_with_pass_preserves_all_fields() {
     config.force_resolution = true;
     config.keep_unicode_in_filenames = true;
     config.metadata.set_exif_datetime = true;
-    config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
     config.temp_suffix = std::sync::Arc::from(".custom-tmp");
     let derived = config.with_pass(&make_pass(PassKind::Album, "Test"));
     assert!(!derived.media.photos);
@@ -774,27 +744,8 @@ fn test_with_pass_preserves_all_fields() {
     assert!(derived.force_resolution);
     assert!(derived.keep_unicode_in_filenames);
     assert!(derived.metadata.set_exif_datetime);
-    assert_eq!(derived.filename_exclude.len(), 1);
     assert_eq!(&*derived.temp_suffix, ".custom-tmp");
     assert_eq!(derived.directory, config.directory);
-}
-
-// ── extract_skip_candidates: filename_exclude ─────────────────
-
-// ── compute_config_hash: filename_exclude ─────────────────────
-
-#[test]
-fn test_compute_config_hash_different_filename_exclude() {
-    let tmp = TempDir::new().unwrap();
-    let a = build_config_with(tmp.path(), "/photos", |_| {});
-    let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.config_overrides.filename_exclude = vec!["*.AAE".to_string()];
-    });
-    assert_ne!(
-        compute_config_hash(&a),
-        compute_config_hash(&b),
-        "changing filename_exclude should change the config hash"
-    );
 }
 
 #[test]
@@ -848,6 +799,8 @@ fn golden_hash_download_config_defaults() {
 
 #[test]
 fn golden_hash_download_config_non_defaults() {
+    // Retired filename restrictions are absent. Default-policy goldens above
+    // retain their released values; this fixture now hashes an empty exclusion set.
     let mut config = test_config();
     config.directory = std::sync::Arc::from(std::path::Path::new("/my/photos"));
     config.folder_structure = "{:%Y/%m}".to_string();
@@ -867,22 +820,17 @@ fn golden_hash_download_config_non_defaults() {
             .unwrap()
             .with_timezone(&Utc),
     ));
-    config.recent = Some(500);
     config.force_resolution = true;
     config.media.videos = false;
     config.live_photo_mode = LivePhotoMode::ImageOnly;
-    config.filename_exclude = std::sync::Arc::from(vec![
-        glob::Pattern::new("*.AAE").unwrap(),
-        glob::Pattern::new("*.THM").unwrap(),
-    ]);
     let hash = hash_download_config(&config);
     assert_eq!(
-        hash, "4d5a9f1a5a0bf903",
+        hash, "238f3f4ded9518f7",
         "hash_download_config golden hash changed -- this will trigger full re-syncs"
     );
     assert_eq!(
         hash_legacy_download_config(&config),
-        "d327fda31e8bec04",
+        "9057fc0901697949",
         "legacy hash changed -- matching stored hashes would no longer migrate safely"
     );
 }
@@ -890,12 +838,18 @@ fn golden_hash_download_config_non_defaults() {
 #[test]
 fn golden_compute_config_hash_defaults() {
     let tmp = TempDir::new().unwrap();
-    let config = build_config_with(tmp.path(), "/photos", |_| {});
+    let mut config = build_config_with(tmp.path(), "/photos", |_| {});
     let hash = compute_config_hash(&config);
     assert_eq!(
-        hash, "ad7d38163f7d7bad",
+        hash, "ec9963c3fdf2a5a2",
         "compute_config_hash golden hash changed -- this will invalidate sync tokens"
     );
+    // Migration expands selected renditions, while the released encoding
+    // remains recognizable for the old policy.
+    config.photos.edited = false;
+    config.photos.alternative = false;
+    config.photos.force_resolution = false;
+    assert_eq!(compute_config_hash(&config), "ad7d38163f7d7bad");
 }
 
 #[test]
@@ -910,7 +864,7 @@ fn golden_compute_config_hash_with_albums() {
     });
     let hash = compute_config_hash(&config);
     assert_eq!(
-        hash, "ad7d38163f7d7bad",
+        hash, "ec9963c3fdf2a5a2",
         "album selection should not change the CloudKit zone-token hash"
     );
 }
@@ -925,7 +879,7 @@ fn golden_compute_config_hash_with_smart_folders() {
     });
     let hash = compute_config_hash(&config);
     assert_eq!(
-        hash, "ad7d38163f7d7bad",
+        hash, "ec9963c3fdf2a5a2",
         "smart-folder selection should not change the CloudKit zone-token hash"
     );
 }
@@ -942,35 +896,8 @@ fn golden_compute_config_hash_with_unfiled_false() {
     });
     let hash = compute_config_hash(&config);
     assert_eq!(
-        hash, "08d06f84680c44b9",
+        hash, "1f3d64d238010c41",
         "compute_config_hash golden hash changed -- this will invalidate sync tokens"
-    );
-}
-
-#[test]
-fn enumeration_hash_binds_recent_scope_only_when_the_count_is_active() {
-    let tmp = TempDir::new().unwrap();
-    let global = build_config_with(tmp.path(), "/photos", |s| {
-        s.recent = Some(crate::cli::RecentLimit::Count(3));
-        s.recent_scope = Some(crate::cli::RecentScope::Global);
-    });
-    let per_filter = build_config_with(tmp.path(), "/photos", |s| {
-        s.recent = Some(crate::cli::RecentLimit::Count(3));
-        s.recent_scope = Some(crate::cli::RecentScope::PerFilter);
-    });
-    assert_ne!(
-        compute_config_hash(&global),
-        compute_config_hash(&per_filter)
-    );
-    // Public CLI rejects scope without a count; the resolved hash must still
-    // ignore its inactive stored/default value.
-    let mut disabled_global = build_config_with(tmp.path(), "/photos", |_| {});
-    disabled_global.filters.recent_scope = crate::cli::RecentScope::Global;
-    let mut disabled_per_filter = build_config_with(tmp.path(), "/photos", |_| {});
-    disabled_per_filter.filters.recent_scope = crate::cli::RecentScope::PerFilter;
-    assert_eq!(
-        compute_config_hash(&disabled_global),
-        compute_config_hash(&disabled_per_filter)
     );
 }
 
@@ -1052,7 +979,8 @@ fn inventory_scope_round_trip_preserves_resolved_queries_and_filters() {
         "multiplicity changes the observation sum",
     );
     let mut filtered = config.clone();
-    filtered.filename_exclude = Arc::from(vec![glob::Pattern::new("private*").unwrap()]);
+    filtered.skip_created_before =
+        Some(crate::config::parse_created_date_filter("2099-01-01").unwrap());
     assert_ne!(
         super::inventory_scope(&[hidden.clone(), favorite.clone()], &filtered),
         scope

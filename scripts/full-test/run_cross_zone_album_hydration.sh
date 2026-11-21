@@ -34,6 +34,7 @@ if ! [[ "$min_files" =~ ^[0-9]+$ ]] || [[ "$min_files" -lt 1 ]]; then
     exit 64
 fi
 
+date_filters=$(kei_live_date_filters) || exit 64
 kei_require_env
 kei_require_release_binary
 command -v sqlite3 >/dev/null 2>&1 || {
@@ -54,6 +55,7 @@ config="$work/cross-zone.toml"
 {
     printf 'data_dir = %s\n' "$(kei_toml_string "$data_dir")"
     echo
+    echo "config_version = 1"
     echo "[auth]"
     printf 'username = %s\n' "$(kei_toml_string "$ICLOUD_USERNAME")"
     echo
@@ -64,6 +66,7 @@ config="$work/cross-zone.toml"
     printf 'albums = [%s]\n' "$(kei_toml_string "$album")"
     echo "unfiled = false"
     echo 'libraries = ["all"]'
+    printf '%s\n' "$date_filters"
 } >"$config"
 
 echo "--- cross-zone album sync ($album, libraries=all) ---"

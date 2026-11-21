@@ -1,3 +1,7 @@
+#![cfg(test)]
+
+mod current_debt;
+
 use super::{admit_retained_work, config_hash, has_due_retained_work};
 use crate::commands::{AlbumPass, PassKind};
 use crate::download::orchestration::models::{
@@ -7,10 +11,10 @@ use crate::download::orchestration::test_support::incremental_photo_records;
 use crate::download::planner::{TaskPlanner, pending_record_for_task};
 use crate::icloud::photos::inbox::ShadowCapture;
 use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
-use crate::state::SqliteStateDb;
 use crate::state::db::account::AccountOwner;
-use crate::state::db::provider_selection::{MAX_SELECTION_BYTES, SelectionOutcome, SelectionPath};
+use crate::state::db::provider_selection::{SelectionOutcome, SelectionPath};
 use crate::state::db::provider_work::{WorkAdmission, WorkPlan};
+use crate::state::{DownloadContextStateStore, SqliteStateDb, VersionSizeKey};
 use rustc_hash::FxHashSet;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,10 +26,12 @@ use tokio_util::sync::CancellationToken;
 struct CurrentSession {
     records: Arc<Mutex<Vec<Value>>>,
     calls: Arc<AtomicUsize>,
+    lookup_names: Arc<Mutex<Vec<String>>>,
     rank_calls: Arc<AtomicUsize>,
     corrupt: Arc<Mutex<Option<&'static str>>>,
     discovery: bool,
     zone_name: Arc<str>,
+    zone_owner: Arc<str>,
 }
 
 #[async_trait::async_trait]
@@ -80,13 +86,20 @@ impl PhotosSession for CurrentSession {
         }
         let request: Value = serde_json::from_str(&body)?;
         assert_eq!(request["zoneID"]["zoneName"], self.zone_name.as_ref());
-        assert_eq!(request["zoneID"]["ownerRecordName"], "_defaultOwner");
+        assert_eq!(
+            request["zoneID"]["ownerRecordName"],
+            self.zone_owner.as_ref()
+        );
         let names: Vec<_> = request["records"]
             .as_array()
             .unwrap()
             .iter()
             .map(|r| r["recordName"].as_str().unwrap())
             .collect();
+        self.lookup_names
+            .lock()
+            .unwrap()
+            .extend(names.iter().map(|name| (*name).to_owned()));
         let mut records: Vec<_> = self
             .records
             .lock()
@@ -184,6 +197,11 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        // macOS TMPDIR traverses /var, a symlink deliberately refused by
+        // the no-follow inspection walk. Seed receipts under the real root.
+        #[cfg(target_os = "macos")]
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        #[cfg(not(target_os = "macos"))]
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(
             SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
@@ -194,10 +212,12 @@ impl Fixture {
         let session = CurrentSession {
             records: Arc::new(Mutex::new(records("m", CURRENT, "current"))),
             calls: Arc::new(AtomicUsize::new(0)),
+            lookup_names: Arc::new(Mutex::new(Vec::new())),
             rank_calls: Arc::new(AtomicUsize::new(0)),
             corrupt: Arc::new(Mutex::new(None)),
             discovery: false,
             zone_name: Arc::from("PrimarySync"),
+            zone_owner: Arc::from("_defaultOwner"),
         };
         let mut album = PhotoAlbum::new(
             PhotoAlbumConfig {
@@ -241,7 +261,7 @@ impl Fixture {
         }
     }
     async fn capture(&self, records: Vec<Value>, cursor: &str) {
-        let (_, scope, zone) = self.pass.album.owned_private_scope().unwrap().unwrap();
+        let (_, scope, zone) = self.pass.album.owned_selection_scope().unwrap().unwrap();
         let raw=serde_json::to_vec(&json!({"zones":[{"zoneID":zone,"records":records,"syncToken":format!("{cursor}-successor"),"moreComing":false}]})).unwrap();
         self.capture
             .capture(crate::icloud::photos::catalog_observed_page(raw, &scope, cursor).unwrap())
@@ -320,22 +340,19 @@ impl Fixture {
             std::fs::read(self.config.directory.join("existing.xmp")).unwrap(),
             b"retained-sidecar"
         );
-        assert_eq!(
-            self.db
-                .get_metadata("sync_token:PrimarySync")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("old-cursor")
-        );
-        assert_eq!(
-            self.db
-                .get_metadata("pending_sync_token:sparse:OtherZone")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("retained-debt")
-        );
+        {
+            let conn = self.db.acquire_lock("checkpoint evidence").unwrap();
+            crate::test_helpers::assert_checkpoint_evidence(
+                &conn,
+                "sync_token:PrimarySync",
+                "old-cursor",
+            );
+            crate::test_helpers::assert_checkpoint_evidence(
+                &conn,
+                "pending_sync_token:sparse:OtherZone",
+                "retained-debt",
+            );
+        }
         assert_eq!(
             self.db
                 .acquire_lock("future bytes oracle")
@@ -575,7 +592,7 @@ async fn queue_projection_equivalent_confirmation_requires_exact_non_url_bytes()
 }
 
 #[tokio::test]
-async fn queue_projection_selection_equivalent_url_retries_stay_bounded_across_reopen() {
+async fn queue_projection_work_equivalent_url_retries_stay_bounded_across_reopen() {
     let mut f = Fixture::new().await;
     f.capture(
         eligible_records(
@@ -589,7 +606,7 @@ async fn queue_projection_selection_equivalent_url_retries_stay_bounded_across_r
         .await
         .unwrap();
     // Explicit fixture scheduling only: the production retry clock stays
-    // unchanged, and catalogue/selection preparation is never manual.
+    // unchanged, and catalogue/work preparation is never manual.
     let make_due = |f: &Fixture| {
         f.db.acquire_lock("fixture retry schedule")
             .unwrap()
@@ -599,7 +616,7 @@ async fn queue_projection_selection_equivalent_url_retries_stay_bounded_across_r
             )
             .unwrap();
     };
-    let mut baseline: Option<(Vec<i64>, i64, i64)> = None;
+    let mut baseline: Option<(Vec<i64>, i64)> = None;
     let mut first_url = String::new();
     let mut last_url = String::new();
     for reopen in 0..2 {
@@ -652,15 +669,6 @@ async fn queue_projection_selection_equivalent_url_retries_stay_bounded_across_r
             ]
             .map(|table| f.count(table))
             .to_vec();
-            let selection_charge: i64 =
-                f.db.acquire_lock("selection charge oracle")
-                    .unwrap()
-                    .query_row(
-                        "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_selection_generations",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .unwrap();
             let work_charge: i64 =
                 f.db.acquire_lock("work charge oracle")
                     .unwrap()
@@ -670,25 +678,31 @@ async fn queue_projection_selection_equivalent_url_retries_stay_bounded_across_r
                         |r| r.get(0),
                     )
                     .unwrap();
-            if let Some((expected_counts, expected_selection, expected_work)) = &baseline {
+            if let Some((expected_counts, expected_work)) = &baseline {
                 assert_eq!(&counts, expected_counts, "count growth at {rotation}");
-                assert_eq!(selection_charge, *expected_selection, "selection charge");
                 assert_eq!(work_charge, *expected_work, "work charge");
             } else {
-                baseline = Some((counts, selection_charge, work_charge));
+                baseline = Some((counts, work_charge));
             }
             f.preserved().await;
         }
     }
-    let (_, manifest) = selection_manifest(&f).await;
-    let retained = manifest.decisions[0].confirmation.as_deref().unwrap();
+    let retained: Vec<u8> =
+        f.db.acquire_lock("retained work confirmation")
+            .unwrap()
+            .query_row(
+                "SELECT confirmation FROM provider_work_receipts LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
     assert!(
-        String::from_utf8_lossy(retained).contains(&first_url),
-        "the retained selection representative must keep its original bytes"
+        String::from_utf8_lossy(&retained).contains(&first_url),
+        "the retained work representative must keep its original bytes"
     );
     assert!(
-        !String::from_utf8_lossy(retained).contains(&last_url),
-        "a fresh URL must not replace retained selection bytes"
+        !String::from_utf8_lossy(&retained).contains(&last_url),
+        "a fresh URL must not replace retained work bytes"
     );
     // A genuine non-URL confirmation change remains a distinct decision.
     let mut changed = eligible_records(
@@ -699,13 +713,13 @@ async fn queue_projection_selection_equivalent_url_retries_stay_bounded_across_r
     *f.session.records.lock().unwrap() = changed;
     make_due(&f);
     f.cycle().await.unwrap();
-    assert_eq!(f.count("provider_selection_generations"), 2);
+    assert_eq!(f.count("provider_selection_generations"), 0);
     assert_eq!(f.count("provider_work_receipts"), 2);
     f.preserved().await;
 }
 
 #[tokio::test]
-async fn queue_projection_selection_equivalent_url_reuses_class_beyond_lexical_prefix() {
+async fn queue_projection_work_equivalent_url_reuses_class_beyond_lexical_prefix() {
     let f = Fixture::new().await;
     f.capture(
         eligible_records(
@@ -742,15 +756,18 @@ async fn queue_projection_selection_equivalent_url_reuses_class_beyond_lexical_p
         *f.session.records.lock().unwrap() = records;
         make_due(&f);
         f.cycle().await.unwrap();
-        let ids: Vec<String> =
-            f.db.acquire_lock("selection class identities")
-                .unwrap()
-                .prepare("SELECT id FROM provider_selection_generations ORDER BY id")
-                .unwrap()
-                .query_map([], |r| r.get(0))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap();
+        let ids: Vec<String> = f
+            .db
+            .acquire_lock("selection class identities")
+            .unwrap()
+            .prepare(
+                "SELECT confirmation_hash FROM provider_work_receipts ORDER BY confirmation_hash",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
         let inserted: Vec<String> = ids
             .iter()
             .filter(|id| !previous.contains(id))
@@ -758,10 +775,7 @@ async fn queue_projection_selection_equivalent_url_reuses_class_beyond_lexical_p
             .collect();
         assert_eq!(inserted.len(), 1, "class {index} generation growth");
         previous = ids;
-        assert_eq!(
-            f.count("provider_selection_generations"),
-            i64::from(index) + 1
-        );
+        assert_eq!(f.count("provider_work_receipts"), i64::from(index) + 1);
         classes.push((tag, original_url, inserted[0].clone()));
     }
     classes.sort_by(|left, right| left.2.cmp(&right.2));
@@ -776,19 +790,13 @@ async fn queue_projection_selection_equivalent_url_reuses_class_beyond_lexical_p
         TARGET,
         "target representative must sort beyond the first 64 candidate IDs"
     );
-    let counts = [
-        "provider_selection_generations",
-        "provider_selection_sources",
-        "provider_selection_decisions",
-        "provider_selection_destinations",
-    ]
-    .map(|table| f.count(table));
-    assert_eq!(counts, [66; 4]);
+    let count = f.count("provider_work_receipts");
+    assert_eq!(count, 66);
     let charge: i64 =
-        f.db.acquire_lock("selection class charge")
+        f.db.acquire_lock("work class charge")
             .unwrap()
             .query_row(
-                "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_selection_generations",
+                "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_work_receipts",
                 [],
                 |r| r.get(0),
             )
@@ -804,48 +812,46 @@ async fn queue_projection_selection_equivalent_url_reuses_class_beyond_lexical_p
         make_due(&f);
         f.cycle().await.unwrap();
         assert_eq!(
-            [
-                "provider_selection_generations",
-                "provider_selection_sources",
-                "provider_selection_decisions",
-                "provider_selection_destinations",
-            ]
-            .map(|table| f.count(table)),
-            counts,
-            "selection count growth at rotation {rotation}"
+            f.count("provider_work_receipts"),
+            count,
+            "work count growth at rotation {rotation}"
         );
         let current_charge: i64 =
-            f.db.acquire_lock("selection class charge after rotation")
+            f.db.acquire_lock("work class charge after rotation")
                 .unwrap()
                 .query_row(
-                    "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_selection_generations",
+                    "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_work_receipts",
                     [],
                     |r| r.get(0),
                 )
                 .unwrap();
-        assert_eq!(current_charge, charge, "selection charge at {rotation}");
+        assert_eq!(current_charge, charge, "work charge at {rotation}");
         assert_eq!(
             f.db.acquire_lock("target class generation oracle")
                 .unwrap()
                 .query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_selection_generations WHERE id=?1",
+                    "SELECT count(*) FROM provider_work_receipts WHERE confirmation_hash=?1",
                     [&target_id],
                     |r| r.get(0),
                 )
                 .unwrap(),
             1
         );
-        let retained =
-            f.db.replay_selection_shadow(owner(), target_id.clone())
-                .await
+        let body: Vec<u8> =
+            f.db.acquire_lock("retained work class")
+                .unwrap()
+                .query_row(
+                    "SELECT confirmation FROM provider_work_receipts WHERE confirmation_hash=?1",
+                    [&target_id],
+                    |row| row.get(0),
+                )
                 .unwrap();
-        let body = retained.decisions[0].confirmation.as_deref().unwrap();
         assert!(
-            String::from_utf8_lossy(body).contains(&target_url),
+            String::from_utf8_lossy(&body).contains(&target_url),
             "the beyond-prefix representative must keep its original bytes at {rotation}"
         );
         assert!(
-            !String::from_utf8_lossy(body).contains(&rotated_url),
+            !String::from_utf8_lossy(&body).contains(&rotated_url),
             "a fresh URL must not replace retained class bytes at {rotation}"
         );
     }
@@ -1255,21 +1261,11 @@ async fn queue_projection_lookup_failures_retain_fixed_debt_and_recover_current_
 
 #[tokio::test]
 async fn queue_projection_unsupported_selection_and_read_only_modes_do_not_publish() {
-    for fault in [
-        "recent",
-        "retry_only",
-        "repair",
-        "album",
-        "exclude",
-        "dry_run",
-        "print",
-    ] {
+    for fault in ["repair", "album", "exclude", "dry_run", "print"] {
         let mut f = Fixture::new().await;
         f.capture(records("m", OLD, "source"), "old").await;
         let mut controls = controls();
         match fault {
-            "recent" => f.config.recent = Some(1),
-            "retry_only" => f.config.retry_only = true,
             "repair" => f.config.refresh_metadata = true,
             "album" => f.pass.kind = PassKind::Album,
             "exclude" => {
@@ -1397,7 +1393,8 @@ async fn queue_projection_cancelled_attempt_leaves_source_and_no_admission() {
 async fn queue_projection_current_filters_retain_source_then_replan_changed_configuration() {
     let mut f = Fixture::new().await;
     f.capture(records("m", OLD, "source"), "old").await;
-    f.config.filename_exclude = Arc::from([glob::Pattern::new("changed.jpg").unwrap()]);
+    f.config.skip_created_before =
+        Some(crate::config::parse_created_date_filter("2099-01-01").unwrap());
     f.cycle().await.unwrap();
     assert_eq!(f.count("assets"), 0);
     assert_eq!(
@@ -1408,7 +1405,7 @@ async fn queue_projection_current_filters_retain_source_then_replan_changed_conf
             .unwrap(),
         "currently_filtered"
     );
-    f.config.filename_exclude = Arc::from([]);
+    f.config.skip_created_before = None;
     f.cycle().await.unwrap();
     assert_eq!(f.count("assets"), 1);
     assert_eq!(f.count("provider_shadow_pages"), 1);
@@ -1448,41 +1445,144 @@ async fn queue_projection_hidden_current_asset_retains_source_without_queue_work
 }
 
 #[tokio::test]
-async fn queue_projection_dispatch_fault_holds_cursor_and_does_not_rank_fallback() {
-    let mut f = Fixture::new().await;
-    f.capture(records("m", OLD, "source"), "old").await;
-    f.config.sync_mode = crate::download::SyncMode::Incremental {
-        zone_sync_token: "old-cursor".into(),
-    };
-    f.db.acquire_lock("dispatch fault before receipt").unwrap().execute_batch("CREATE TRIGGER work_fault BEFORE INSERT ON provider_work_receipts BEGIN SELECT RAISE(ABORT,'synthetic dispatch work fault'); END;").unwrap();
-    for _ in 0..2 {
-        let result = crate::download::download_photos_with_sync(
-            &reqwest::Client::new(),
-            std::slice::from_ref(&f.pass),
-            Arc::new(f.config.clone()),
-            controls(),
-            CancellationToken::new(),
-        )
-        .await;
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("synthetic dispatch work fault")
+async fn current_selection_dispatch_ignores_legacy_catalog_admission_fault() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    for naming in [
+        crate::types::EditedNaming::Suffix,
+        crate::types::EditedNaming::Primary,
+    ] {
+        let server = MockServer::start().await;
+        let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut f = Fixture::new().await;
+        f.config.edited_naming = naming;
+        f.capture(records("m", OLD, "source"), "old").await;
+        f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+            "downloadURL":format!("{}/media",server.uri()),"size":bytes.len(),
+            "fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(bytes))
+        });
+        let (_, _, zone) = f.pass.album.owned_selection_scope().unwrap().unwrap();
+        f.pass.album = PhotoAlbum::new(
+            PhotoAlbumConfig {
+                params: Arc::new(std::collections::HashMap::new()),
+                service_endpoint: Arc::from("https://example.invalid"),
+                name: Arc::from(""),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 2,
+                zone_id: Arc::new(zone),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(DestinationSelectionSession(f.session.clone())),
         );
-        assert_eq!(f.count("assets"), 0);
-        assert_eq!(f.count("provider_work_receipts"), 0);
-        f.preserved().await;
-    }
-    f.db.acquire_lock("restore fixture")
-        .unwrap()
-        .execute_batch("DROP TRIGGER work_fault")
+        f.pass
+            .album
+            .set_shadow_capture(f.capture.clone(), Arc::from("private"));
+        assert!(f.pass.album.catalog_work_scope().unwrap().is_some());
+        let mut historical = f.plan().await.records[0].clone();
+        historical.id = "historical-unselected".into();
+        f.db.upsert_seen(&historical).await.unwrap();
+        let mut pending = historical.clone();
+        pending.id = "historical-pending".into();
+        f.db.upsert_seen(&pending).await.unwrap();
+        f.db.mark_failed(
+            &historical.library,
+            &historical.id,
+            historical.version_size.as_str(),
+            "retained historical failure",
+        )
+        .await
         .unwrap();
-    f.cycle().await.unwrap();
-    let baseline = f.queue();
-    f.cycle().await.unwrap();
-    assert_eq!(f.queue(), baseline);
-    f.preserved().await;
+        f.db.acquire_lock("historical scheduling evidence")
+            .unwrap()
+            .execute(
+                "UPDATE assets SET download_attempts=7 WHERE id='historical-unselected'",
+                [],
+            )
+            .unwrap();
+        for run_mode in [DownloadRunMode::DryRun, DownloadRunMode::PrintFilenames] {
+            let preview = crate::download::download_photos_with_sync(
+                &reqwest::Client::new(),
+                std::slice::from_ref(&f.pass),
+                Arc::new(f.config.clone()),
+                DownloadControls {
+                    run_mode,
+                    ..controls()
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(preview.outcome, crate::download::DownloadOutcome::Success),
+                "historical retry debt must not turn current-selection preview into a failure: {preview:?}"
+            );
+            assert!(server.received_requests().await.unwrap().is_empty());
+            assert_eq!(f.count("provider_active_generations"), 0);
+            assert_eq!(f.db.acquire_lock("preview preserves retry schedule").unwrap().query_row::<i64,_,_>(
+            "SELECT download_attempts FROM assets WHERE id='historical-unselected' AND status='failed' AND last_error='retained historical failure'", [], |row| row.get(0),
+        ).unwrap(), 7);
+        }
+        f.config.sync_mode = crate::download::SyncMode::Incremental {
+            zone_sync_token: "old-cursor".into(),
+        };
+        f.db.acquire_lock("dispatch fault before receipt").unwrap().execute_batch("CREATE TRIGGER work_fault BEFORE INSERT ON provider_work_receipts BEGIN SELECT RAISE(ABORT,'synthetic dispatch work fault'); END;").unwrap();
+        for round in 0..3 {
+            let result = crate::download::download_photos_with_sync(
+                &reqwest::Client::new(),
+                std::slice::from_ref(&f.pass),
+                Arc::new(f.config.clone()),
+                controls(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(result.outcome, crate::download::DownloadOutcome::Success),
+                "{result:?}"
+            );
+            assert_eq!(result.stats.downloaded, usize::from(round == 0));
+            assert!(f.count("provider_active_destinations") > 0);
+            assert_eq!(f.count("provider_work_receipts"), 0);
+            let evidence: (String, i64, String) = f.db.acquire_lock("historical retry remains informational").unwrap()
+            .query_row("SELECT status,download_attempts,last_error FROM assets WHERE id='historical-unselected'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+            assert_eq!(
+                evidence,
+                ("failed".into(), 7, "retained historical failure".into())
+            );
+            let downloaded: String =
+                f.db.acquire_lock("current selection publication")
+                    .unwrap()
+                    .query_row(
+                        "SELECT local_path FROM assets WHERE id='asset-m' AND status='downloaded'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+            assert_eq!(std::fs::read(downloaded).unwrap(), bytes);
+            assert_eq!(
+                f.db.acquire_lock("historical pending is not current failure")
+                    .unwrap()
+                    .query_row::<String, _, _>(
+                        "SELECT status FROM assets WHERE id='historical-pending'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                "pending"
+            );
+            f.preserved().await;
+        }
+    }
 }
 
 #[tokio::test]
@@ -1753,7 +1853,7 @@ async fn queue_projection_companion_obligations_commit_all_or_defer_all() {
 }
 
 #[tokio::test]
-async fn queue_projection_raw_alignment_preserves_current_provider_metadata_binding() {
+async fn queue_projection_retired_raw_preference_preserves_provider_metadata_binding() {
     let mut f = Fixture::new().await;
     f.capture(records("m", OLD, "source"), "old").await;
     {
@@ -1768,10 +1868,10 @@ async fn queue_projection_raw_alignment_preserves_current_provider_metadata_bind
     f.config.raw_policy = crate::types::RawPolicy::PreferJpeg;
     f.cycle().await.unwrap();
     assert_eq!(
-        f.db.acquire_lock("logical original uses confirmed JPEG facts")
+        f.db.acquire_lock("provider alternative uses confirmed JPEG facts")
             .unwrap()
             .query_row::<(String, i64, i64), _, _>(
-                "SELECT checksum,width,height FROM assets WHERE version_size='original'",
+                "SELECT checksum,width,height FROM assets WHERE version_size='alternative'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             )
@@ -1908,6 +2008,23 @@ async fn queue_projection_actual_discovery_qualifies_primary_and_private_shared(
             "{}",
             library.zone_name()
         );
+        if eligible {
+            let pass = AlbumPass {
+                album: library.all(),
+                ..f.pass.clone()
+            };
+            let config = crate::download::DownloadConfig {
+                library: Arc::from(library.zone_name()),
+                ..f.config.clone()
+            };
+            assert!(
+                super::super::generation::context(&[pass], &config, controls())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "every discovered legacy catalog selector has a destination owner"
+            );
+        }
     }
     f.pass.album = service.get_library("PrimarySync").await.unwrap().all();
     assert!(f.pass.album.catalog_work_scope().unwrap().is_some());
@@ -2251,7 +2368,8 @@ async fn queue_projection_wake_requires_current_scope_config_and_unfinished_gene
             .await
             .is_err()
     );
-    f.config.filename_exclude = Arc::from([glob::Pattern::new("changed.jpg").unwrap()]);
+    f.config.skip_created_before =
+        Some(crate::config::parse_created_date_filter("2099-01-01").unwrap());
     assert!(
         has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
             .await
@@ -2341,7 +2459,7 @@ async fn queue_projection_schema31_retry_migration_preserves_receipts_and_confli
                 let opened = opened.unwrap();
                 let (_, scope, zone) = f.pass.album.catalog_work_scope().unwrap().unwrap();
                 assert!(
-                    opened
+                    !opened
                         .has_due_provider_work(
                             owner(),
                             scope,
@@ -2349,10 +2467,20 @@ async fn queue_projection_schema31_retry_migration_preserves_receipts_and_confli
                         )
                         .await
                         .unwrap(),
-                    "legacy deferred receipt is not silently acknowledged"
+                    "retired deferred receipts must not schedule current work"
                 );
             }
-            assert_eq!(f.count("provider_work_receipts"), 1);
+            assert_eq!(
+                f.count(if conflict {
+                    "provider_work_receipts"
+                } else {
+                    "historical_v030_provider_work_receipts"
+                }),
+                1
+            );
+            if !conflict {
+                assert_eq!(f.count("provider_work_receipts"), 0);
+            }
             assert_eq!(f.count("assets"), 0);
             f.preserved().await;
         }
@@ -2469,324 +2597,64 @@ async fn queue_projection_admitted_before_dispatch_reopens_materializes_and_stay
     }
 }
 
-async fn selection_manifest(
-    fixture: &Fixture,
-) -> (
-    String,
-    crate::state::db::provider_selection::SelectionManifest,
-) {
-    let id: String = fixture
-        .db
-        .acquire_lock("shadow generation identity")
-        .unwrap()
-        .query_row(
-            "SELECT id FROM provider_selection_generations ORDER BY id LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let manifest = fixture
-        .db
-        .replay_selection_shadow(owner(), id.clone())
-        .await
-        .unwrap();
-    (id, manifest)
-}
-
 #[tokio::test]
-async fn selection_shadow_current_authority_original_bytes_and_two_reopens_preserve_progress() {
-    let fixture = Fixture::new().await;
-    fixture
-        .capture(records("m", OLD, "historical"), "old-page")
-        .await;
-    fixture.cycle().await.unwrap();
-    let (id, manifest) = selection_manifest(&fixture).await;
-    assert_eq!(manifest.profile["coverage"], "confirmed_sources_only");
-    assert_eq!(manifest.decisions.len(), 1);
-    let decision = &manifest.decisions[0];
-    assert_eq!(decision.outcome, SelectionOutcome::Selected);
-    assert_eq!(decision.child, "asset-m");
-    assert_eq!(decision.master.as_deref(), Some("m"));
-    let body = decision.confirmation.as_ref().unwrap();
-    assert!(
-        std::str::from_utf8(body)
-            .unwrap()
-            .contains("\"futureExact\":1.2300e+30")
-    );
-    assert_eq!(decision.destinations.len(), 1);
-    assert_eq!(decision.destinations[0].checksum, CURRENT);
-    assert!(
-        decision.destinations[0]
-            .path
-            .to_path()
-            .starts_with(&fixture.config.directory)
-    );
-    assert_eq!(fixture.count("provider_selection_sources"), 1);
-    assert_eq!(fixture.count("provider_selection_destinations"), 1);
-    let pending: String = fixture
-        .db
-        .acquire_lock("selection is not byte completion")
-        .unwrap()
-        .query_row("SELECT status FROM assets WHERE id='asset-m'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(pending, "pending");
-    fixture.preserved().await;
-    let calls = fixture.session.calls.load(Ordering::SeqCst);
-    fixture.cycle().await.unwrap();
-    assert_eq!(fixture.session.calls.load(Ordering::SeqCst), calls);
-    assert_eq!(fixture.count("provider_selection_generations"), 1);
-    let database = fixture.dir.path().join("state.db");
-    let media = fixture.config.directory.to_path_buf();
-    let Fixture {
-        dir,
-        db,
-        capture,
-        session,
-        pass,
-        config,
-    } = fixture;
-    drop(config);
-    drop(pass);
-    drop(capture);
-    drop(db);
-    drop(session);
-    for _ in 0..2 {
-        let reopened = SqliteStateDb::open_owned(&database, &owner())
-            .await
-            .unwrap();
-        assert_eq!(
-            reopened
-                .replay_selection_shadow(owner(), id.clone())
-                .await
-                .unwrap(),
-            manifest
-        );
-        assert_eq!(
-            reopened
-                .get_metadata("sync_token:PrimarySync")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("old-cursor")
-        );
-        assert_eq!(
-            std::fs::read(media.join("existing.jpg")).unwrap(),
-            b"existing-media"
-        );
-        drop(reopened);
-    }
-    drop(dir);
-}
-
-#[tokio::test]
-async fn selection_shadow_multiple_destinations_capacity_and_atomic_failure_do_not_admit_work() {
-    let fixture = Fixture::new().await;
-    fixture
-        .capture(records("m", OLD, "historical"), "source")
-        .await;
-    fixture.cycle().await.unwrap();
-    let (id, mut manifest) = selection_manifest(&fixture).await;
-    let original_queue = fixture.queue();
-    assert_eq!(
-        fixture
-            .db
-            .capture_selection_shadow(owner(), manifest.clone(), 0)
-            .await
-            .unwrap(),
-        id
-    );
-    let mut second = manifest.decisions[0].clone();
-    manifest.decisions[0].pass_key = "album-A".to_owned();
-    second.pass_key = "album-B".to_owned();
-    second.destinations[0].path =
-        SelectionPath::from_path(&fixture.config.directory.join("B/photo.jpg"));
-    manifest.decisions.push(second);
-    assert!(matches!(
-        fixture
-            .db
-            .capture_selection_shadow(owner(), manifest.clone(), 0)
-            .await,
-        Err(crate::state::error::StateError::ProviderSelectionFull)
-    ));
-    assert_eq!(fixture.count("provider_selection_generations"), 1);
-    fixture.db.acquire_lock("fault second destination").unwrap().execute_batch(
-        "CREATE TRIGGER selection_fault BEFORE INSERT ON provider_selection_destinations WHEN NEW.pass_key='album-B' BEGIN SELECT RAISE(ABORT,'synthetic destination failure'); END;"
-    ).unwrap();
-    assert!(
-        fixture
-            .db
-            .capture_selection_shadow(owner(), manifest.clone(), MAX_SELECTION_BYTES)
-            .await
-            .is_err()
-    );
-    for (table, count) in [
-        ("provider_selection_generations", 1),
-        ("provider_selection_sources", 1),
-        ("provider_selection_decisions", 1),
-        ("provider_selection_destinations", 1),
-    ] {
-        assert_eq!(
-            fixture.count(table),
-            count,
-            "partial shadow insert into {table}"
-        );
-    }
-    fixture
-        .db
-        .acquire_lock("restore destination writes")
-        .unwrap()
-        .execute_batch("DROP TRIGGER selection_fault;")
-        .unwrap();
-    let generation = fixture
-        .db
-        .capture_selection_shadow(owner(), manifest.clone(), MAX_SELECTION_BYTES)
-        .await
-        .unwrap();
-    assert_eq!(
-        fixture
-            .db
-            .replay_selection_shadow(owner(), generation)
-            .await
-            .unwrap(),
-        manifest
-    );
-    assert_eq!(fixture.count("provider_selection_destinations"), 3);
-    assert_eq!(fixture.queue(), original_queue);
-    assert_eq!(fixture.count("provider_work_receipts"), 1);
-    fixture.preserved().await;
-}
-
-#[tokio::test]
-async fn selection_shadow_replay_rejects_corrupt_rows_sources_confirmations_and_foreign_owner() {
-    let fixture = Fixture::new().await;
-    fixture
-        .capture(records("m", OLD, "historical"), "source")
-        .await;
-    fixture.cycle().await.unwrap();
-    let (id, manifest) = selection_manifest(&fixture).await;
-    let original_queue = fixture.queue();
-    let wrong = AccountOwner::authenticated(
-        "other@example.invalid",
-        "com",
-        &serde_json::from_value(json!({"dsInfo":{"dsid":"queue-provider"}})).unwrap(),
-    )
-    .unwrap();
-    assert!(matches!(
-        fixture.db.replay_selection_shadow(wrong, id.clone()).await,
-        Err(crate::state::error::StateError::AccountOwnerMismatch)
-    ));
-    for mutation in [
-        "UPDATE provider_selection_destinations SET checksum='wrong'",
-        "DELETE FROM provider_selection_destinations",
-        "UPDATE provider_selection_sources SET body_hash='wrong'",
-        "UPDATE provider_selection_generations SET config_hash='wrong'",
-        "UPDATE provider_shadow_pages SET body=X'7B7D'",
-    ] {
-        let probe = Fixture::new().await;
-        probe
-            .capture(records("m", OLD, "historical"), "corruption-source")
-            .await;
-        probe.cycle().await.unwrap();
-        let (probe_id, healthy) = selection_manifest(&probe).await;
-        assert_eq!(
-            probe
-                .db
-                .replay_selection_shadow(owner(), probe_id.clone())
-                .await
-                .unwrap(),
-            healthy
-        );
-        let queue = probe.queue();
-        probe
-            .db
-            .acquire_lock("committed shadow corruption probe")
-            .unwrap()
-            .execute_batch(mutation)
-            .unwrap();
-        let error = probe
-            .db
-            .replay_selection_shadow(owner(), probe_id)
-            .await
-            .expect_err("corrupted evidence cannot replay");
-        if mutation.contains("provider_shadow_pages") {
-            assert!(
-                matches!(
-                    error,
-                    crate::state::error::StateError::ProviderCatalogInvalid
-                ),
-                "wrong validation error: {error:?}"
-            );
-        } else {
-            assert!(
-                matches!(
-                    error,
-                    crate::state::error::StateError::ProviderSelectionInvalid
-                ),
-                "wrong validation error: {error:?}"
-            );
-        }
-        assert_eq!(probe.queue(), queue);
-        probe.preserved().await;
-    }
-    assert_eq!(
-        fixture
-            .db
-            .replay_selection_shadow(owner(), id)
-            .await
-            .unwrap(),
-        manifest
-    );
-    let mut wrong = manifest.clone();
-    wrong.decisions[0].confirmation = Some(b"{\"records\":[]}".to_vec());
-    assert!(matches!(
-        fixture
-            .db
-            .capture_selection_shadow(owner(), wrong, MAX_SELECTION_BYTES)
-            .await,
-        Err(crate::state::error::StateError::ProviderSelectionInvalid)
-    ));
-    let mut wrong = manifest;
-    wrong.scope = wrong.scope.replace("PrimarySync", "OtherZone");
-    assert!(matches!(
-        fixture
-            .db
-            .capture_selection_shadow(owner(), wrong, MAX_SELECTION_BYTES)
-            .await,
-        Err(crate::state::error::StateError::ProviderSelectionInvalid)
-    ));
-    assert_eq!(fixture.queue(), original_queue);
-    fixture.preserved().await;
-}
-
-#[tokio::test]
-async fn selection_shadow_failure_precedes_queue_admission_then_recovers_quietly() {
-    let fixture = Fixture::new().await;
+async fn queue_projection_obsolete_selection_shadow_cannot_block_current_work() {
+    let mut fixture = Fixture::new().await;
     fixture
         .capture(records("m", OLD, "historical"), "source")
         .await;
     fixture.db.acquire_lock("shadow manifest fault").unwrap().execute_batch(
-        "CREATE TRIGGER selection_manifest_fault BEFORE INSERT ON provider_selection_generations BEGIN SELECT RAISE(ABORT,'synthetic selection failure'); END;"
+        "INSERT INTO provider_selection_generations VALUES ('opaque-history','unknown','unknown',1,'unknown','unknown',X'00FF09',9223372036854775807);
+         CREATE TRIGGER selection_manifest_fault BEFORE INSERT ON provider_selection_generations BEGIN SELECT RAISE(ABORT,'synthetic selection failure'); END;
+         CREATE TRIGGER current_work_fault BEFORE INSERT ON provider_work_receipts BEGIN SELECT RAISE(ABORT,'synthetic current work failure'); END;"
     ).unwrap();
-    assert!(fixture.cycle().await.is_err());
-    assert_eq!(fixture.count("provider_selection_generations"), 0);
+    let error = fixture.cycle().await.unwrap_err();
+    assert!(format!("{error:#}").contains("synthetic current work failure"));
     assert_eq!(fixture.count("assets"), 0);
     assert_eq!(fixture.count("provider_work_receipts"), 0);
-    assert_eq!(fixture.count("provider_catalog_records"), 2);
     fixture.preserved().await;
     fixture
         .db
-        .acquire_lock("remove shadow fault")
+        .acquire_lock("restore current admission")
         .unwrap()
-        .execute_batch("DROP TRIGGER selection_manifest_fault;")
+        .execute_batch("DROP TRIGGER current_work_fault;")
         .unwrap();
     fixture.cycle().await.unwrap();
+    assert_eq!(fixture.count("provider_selection_generations"), 1);
     assert_eq!(fixture.count("assets"), 1);
     assert_eq!(fixture.count("provider_work_receipts"), 1);
+    assert_eq!(fixture.count("provider_catalog_records"), 2);
+    fixture.preserved().await;
     let calls = fixture.session.calls.load(Ordering::SeqCst);
-    fixture.cycle().await.unwrap();
-    fixture.cycle().await.unwrap();
+    for _ in 0..2 {
+        fixture.db = Arc::new(
+            SqliteStateDb::open_owned(&fixture.dir.path().join("state.db"), &owner())
+                .await
+                .unwrap(),
+        );
+        fixture.capture = ShadowCapture::new(Arc::clone(&fixture.db), owner(), "com");
+        fixture
+            .pass
+            .album
+            .set_shadow_capture(fixture.capture.clone(), Arc::from("private"));
+        fixture.config.state_db = Some(Arc::clone(&fixture.db) as Arc<dyn DownloadStore>);
+        fixture.cycle().await.unwrap();
+        assert_eq!(
+            fixture
+                .db
+                .acquire_lock("opaque selection bytes")
+                .unwrap()
+                .query_row::<Vec<u8>, _, _>(
+                    "SELECT manifest FROM provider_selection_generations",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            [0, 255, 9]
+        );
+        assert_eq!(fixture.count("provider_work_receipts"), 1);
+        fixture.preserved().await;
+    }
     assert_eq!(fixture.session.calls.load(Ordering::SeqCst), calls);
     assert_eq!(fixture.count("provider_selection_generations"), 1);
     fixture.preserved().await;
@@ -2854,7 +2722,7 @@ async fn selection_shadow_schema32_migration_preserves_live_wal_work_and_unknown
             .acquire_lock("work preserved after migration")
             .unwrap()
             .query_row(
-                "SELECT confirmation FROM provider_work_receipts LIMIT 1",
+                "SELECT confirmation FROM historical_v030_provider_work_receipts LIMIT 1",
                 [],
                 |r| r.get::<_, Vec<u8>>(0)
             )
@@ -2883,7 +2751,7 @@ async fn selection_shadow_schema32_migration_preserves_live_wal_work_and_unknown
 }
 
 #[tokio::test]
-async fn selection_shadow_relative_download_root_keeps_existing_admission_contract() {
+async fn queue_projection_relative_download_root_keeps_existing_admission_contract() {
     let mut fixture = Fixture::new().await;
     let current = std::env::current_dir().unwrap();
     let relative = tempfile::tempdir_in(&current).unwrap();
@@ -2898,11 +2766,24 @@ async fn selection_shadow_relative_download_root_keeps_existing_admission_contra
         .capture(records("m", OLD, "historical"), "relative-source")
         .await;
     fixture.cycle().await.unwrap();
-    let (_, manifest) = selection_manifest(&fixture).await;
+    assert_eq!(fixture.count("assets"), 1);
+    let current = fixture
+        .pass
+        .album
+        .confirm_catalog_asset("asset-m")
+        .await
+        .unwrap();
+    let mut planner = TaskPlanner::for_download(fixture.config.state_db.as_deref())
+        .await
+        .unwrap();
+    let plan = planner
+        .plan_download_asset(&current.asset, &fixture.config)
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1);
     assert!(
-        manifest.decisions[0].destinations[0]
-            .path
-            .to_path()
+        std::path::absolute(&plan.tasks[0].download_path)
+            .unwrap()
             .starts_with(&absolute)
     );
     fixture.preserved().await;
@@ -2910,7 +2791,7 @@ async fn selection_shadow_relative_download_root_keeps_existing_admission_contra
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn selection_shadow_non_utf8_download_root_preserves_native_path() {
+async fn queue_projection_non_utf8_download_root_preserves_native_path() {
     use std::os::unix::ffi::OsStringExt;
     let mut fixture = Fixture::new().await;
     let root = fixture
@@ -2926,33 +2807,30 @@ async fn selection_shadow_non_utf8_download_root_preserves_native_path() {
         .capture(records("m", OLD, "historical"), "native-source")
         .await;
     fixture.cycle().await.unwrap();
-    let (generation, manifest) = selection_manifest(&fixture).await;
-    let path = manifest.decisions[0].destinations[0].path.to_path();
-    assert!(path.starts_with(&root));
-    assert!(path.to_str().is_none());
-    let reopened = SqliteStateDb::open_owned(&fixture.dir.path().join("state.db"), &owner())
+    let current = fixture
+        .pass
+        .album
+        .confirm_catalog_asset("asset-m")
         .await
         .unwrap();
-    assert_eq!(
-        reopened
-            .replay_selection_shadow(owner(), generation)
-            .await
-            .unwrap(),
-        manifest
-    );
+    let mut planner = TaskPlanner::for_download(fixture.config.state_db.as_deref())
+        .await
+        .unwrap();
+    let plan = planner
+        .plan_download_asset(&current.asset, &fixture.config)
+        .await
+        .unwrap();
+    let path = &plan.tasks[0].download_path;
+    assert!(path.starts_with(&root));
+    assert!(path.to_str().is_none());
     assert_eq!(fixture.count("assets"), 1);
     fixture.preserved().await;
 }
 
 #[cfg(any(unix, windows))]
 #[tokio::test]
-async fn selection_shadow_native_path_storage_reopens_without_filesystem_creation() {
-    let fixture = Fixture::new().await;
-    fixture
-        .capture(records("m", OLD, "historical"), "native-storage-source")
-        .await;
-    fixture.cycle().await.unwrap();
-    let (_, mut manifest) = selection_manifest(&fixture).await;
+async fn selection_native_path_encoding_round_trips_without_filesystem_creation() {
+    let directory = tempfile::tempdir().unwrap();
     let component = {
         #[cfg(unix)]
         {
@@ -2967,56 +2845,12 @@ async fn selection_shadow_native_path_storage_reopens_without_filesystem_creatio
     };
     // Native encoding is a storage contract even when the current filesystem
     // cannot create this name. This fixture deliberately never creates it.
-    let destination = fixture.dir.path().join(component).join("selected.jpg");
+    let destination = directory.path().join(component).join("selected.jpg");
     assert!(destination.is_absolute());
     assert!(destination.to_str().is_none());
-    manifest.decisions[0].destinations[0].path = SelectionPath::from_path(&destination);
-    let queue = fixture.queue();
-    let generation = fixture
-        .db
-        .capture_selection_shadow(owner(), manifest.clone(), MAX_SELECTION_BYTES)
-        .await
-        .unwrap();
-    assert_eq!(fixture.queue(), queue);
-    fixture.preserved().await;
-    let database = fixture.dir.path().join("state.db");
-    let Fixture {
-        dir,
-        db,
-        capture,
-        session,
-        pass,
-        config,
-    } = fixture;
-    drop(config);
-    drop(pass);
-    drop(capture);
-    drop(db);
-    drop(session);
-    for _ in 0..2 {
-        let reopened = SqliteStateDb::open_owned(&database, &owner())
-            .await
-            .unwrap();
-        let replay = reopened
-            .replay_selection_shadow(owner(), generation.clone())
-            .await
-            .unwrap();
-        assert_eq!(replay, manifest);
-        assert_eq!(
-            replay.decisions[0].destinations[0].path.to_path(),
-            destination
-        );
-        assert_eq!(
-            reopened
-                .get_metadata("sync_token:PrimarySync")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("old-cursor")
-        );
-        drop(reopened);
-    }
-    drop(dir);
+    let encoded = SelectionPath::from_path(&destination).key().unwrap();
+    let decoded: SelectionPath = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded.to_path(), destination);
 }
 
 #[derive(Clone)]
@@ -3085,7 +2919,26 @@ fn destination_pass_with(
     capture: &ShadowCapture,
     name: &str,
 ) -> AlbumPass {
-    let mut album = PhotoAlbum::new(
+    let mut pass = uncaptured_destination_pass(session, name);
+    pass.album
+        .set_shadow_capture(capture.clone(), Arc::from("private"));
+    pass
+}
+
+fn uncaptured_destination_pass(session: &CurrentSession, name: &str) -> AlbumPass {
+    destination_pass_with_session(
+        session,
+        name,
+        Box::new(DestinationSelectionSession(session.clone())),
+    )
+}
+
+fn destination_pass_with_session(
+    session: &CurrentSession,
+    name: &str,
+    transport: Box<dyn PhotosSession>,
+) -> AlbumPass {
+    let album = PhotoAlbum::new(
         PhotoAlbumConfig {
             params: Arc::new(std::collections::HashMap::new()),
             service_endpoint: Arc::from("https://example.invalid"),
@@ -3097,19 +2950,185 @@ fn destination_pass_with(
             )),
             page_size: 2,
             zone_id: Arc::new(
-                json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}),
+                json!({"zoneName":session.zone_name.as_ref(),"ownerRecordName":session.zone_owner.as_ref(),"zoneType":"REGULAR_CUSTOM_ZONE"}),
             ),
             retry_config: crate::retry::RetryConfig::default(),
             container_id: Some(Arc::from(name)),
             cross_zone_sources: Vec::new(),
         },
-        Box::new(DestinationSelectionSession(session.clone())),
+        transport,
     );
-    album.set_shadow_capture(capture.clone(), Arc::from("private"));
     AlbumPass {
         kind: PassKind::Album,
         album,
         exclude_ids: Arc::new(FxHashSet::default()),
+    }
+}
+
+fn smart_pass(f: &Fixture, name: &str) -> AlbumPass {
+    let (_, definition) = crate::icloud::photos::smart_folders::smart_folders()
+        .into_iter()
+        .find(|(candidate, _)| *candidate == name)
+        .unwrap();
+    let mut album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: Arc::from("https://example.invalid"),
+            name: Arc::from(name),
+            list_type: Arc::from(definition.list_type),
+            obj_type: Arc::from(definition.obj_type),
+            query_filter: definition.query_filter,
+            page_size: 2,
+            zone_id: Arc::new(
+                json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}),
+            ),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(DestinationSelectionSession(f.session.clone())),
+    );
+    album.set_shadow_capture(f.capture.clone(), Arc::from("private"));
+    AlbumPass {
+        kind: PassKind::SmartFolder,
+        album,
+        exclude_ids: Arc::new(FxHashSet::default()),
+    }
+}
+
+#[tokio::test]
+async fn private_smart_folder_destinations_survive_template_changes_and_reopen() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let bytes = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
+    Mock::given(method("GET"))
+        .and(path("/media"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+        .expect(4)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_smart_folders = Arc::from("before/{smart-folder}");
+    let mut current = records("m", CURRENT, "smart selection");
+    current[0]["fields"]["filenameEnc"]["value"] = json!("smart.JPG");
+    current[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/media",server.uri()),"size":bytes.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(bytes))});
+    *f.session.records.lock().unwrap() = current;
+    f.capture(
+        vec![json!({"recordName":"smart-source","recordType":"FutureOpaque"})],
+        "smart-source",
+    )
+    .await;
+    for name in crate::icloud::photos::smart_folders::smart_folder_names() {
+        let mut pass = smart_pass(&f, name);
+        assert!(
+            pass.album.current_selection_scope().unwrap().is_some(),
+            "{name}"
+        );
+        pass.album.name = Arc::from("unknown-smart-query");
+        assert!(pass.album.current_selection_scope().unwrap().is_none());
+    }
+    for cycle in 0..4 {
+        if cycle > 0 {
+            f.config.folder_structure_smart_folders = Arc::from("after/{smart-folder}");
+            if cycle == 1 {
+                let mut added = records("new", CURRENT, "new smart selection");
+                added[0]["fields"]["filenameEnc"]["value"] = json!("new.JPG");
+                added[0]["fields"]["resOriginalRes"] =
+                    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"].clone();
+                f.session.records.lock().unwrap().extend(added);
+            }
+            if cycle == 3 {
+                // Leaving a smart query is not a provider deletion fact.
+                f.session.records.lock().unwrap().retain(|record| {
+                    matches!(record["recordName"].as_str(), Some("new" | "asset-new"))
+                });
+            }
+            f = reopen_destination_fixture(f).await;
+        }
+        if cycle == 1 {
+            f.db.acquire_lock("fail smart query capture").unwrap().execute_batch(
+                "CREATE TRIGGER fail_smart_capture BEFORE INSERT ON provider_selection_rank_pages BEGIN SELECT RAISE(ABORT, 'injected smart capture failure'); END;"
+            ).unwrap();
+            let failed = crate::download::download_photos_with_sync(
+                &reqwest::Client::new(),
+                &[smart_pass(&f, "Favorites"), smart_pass(&f, "Videos")],
+                Arc::new(f.config.clone()),
+                controls(),
+                CancellationToken::new(),
+            )
+            .await;
+            if let Ok(result) = failed {
+                assert!(result.checkpoint.sync_token_blocked, "{result:?}");
+                assert!(result.sync_token.is_none(), "{result:?}");
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
+            f.db.acquire_lock("restore smart query capture")
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_smart_capture")
+                .unwrap();
+            f = reopen_destination_fixture(f).await;
+        }
+        let before_queries = f.session.rank_calls.load(Ordering::SeqCst);
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &[smart_pass(&f, "Favorites"), smart_pass(&f, "Videos")],
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.stats.downloaded,
+            if cycle <= 1 { 2 } else { 0 },
+            "cycle {cycle}: {result:?}"
+        );
+        if cycle > 0 {
+            assert_eq!(
+                result.sync_token.as_deref(),
+                Some("quiet-zone-cursor"),
+                "{result:?}"
+            );
+            assert!(!result.checkpoint.sync_token_blocked, "{result:?}");
+        }
+        assert!(
+            f.session.rank_calls.load(Ordering::SeqCst) > before_queries,
+            "smart membership must be refreshed"
+        );
+        for name in ["Favorites", "Videos"] {
+            assert_eq!(
+                std::fs::read(
+                    f.config
+                        .directory
+                        .join("before")
+                        .join(name)
+                        .join("smart.JPG")
+                )
+                .unwrap(),
+                bytes
+            );
+            assert!(
+                !f.config
+                    .directory
+                    .join("after")
+                    .join(name)
+                    .join("smart.JPG")
+                    .exists()
+            );
+            if cycle > 0 {
+                assert_eq!(
+                    std::fs::read(f.config.directory.join("after").join(name).join("new.JPG"))
+                        .unwrap(),
+                    bytes
+                );
+            }
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            if cycle == 0 { 2 } else { 4 }
+        );
     }
 }
 
@@ -3118,10 +3137,876 @@ async fn private_destination_reopen_materializes_missing_copy() {
     Box::pin(destination_reopen_fixture(false, false, false)).await;
 }
 
+#[tokio::test]
+async fn private_completed_album_copy_is_repaired_independently_after_reopen() {
+    Box::pin(completed_album_copy_reopen_fixture(
+        false,
+        crate::types::EditedNaming::Suffix,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn colliding_album_and_smart_folder_copies_repair_independently() {
+    Box::pin(smart_copy_reopen_fixture(PassKind::Album)).await;
+}
+
+#[tokio::test]
+async fn colliding_two_smart_folder_copies_repair_independently() {
+    Box::pin(smart_copy_reopen_fixture(PassKind::SmartFolder)).await;
+}
+
+async fn smart_copy_reopen_fixture(first_kind: PassKind) {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    for preserve_peer in [false, true] {
+        let server = MockServer::start().await;
+        let media = b"\xff\xd8\xff\xe0independent smart copy";
+        Mock::given(method("GET"))
+            .and(path("/smart-copy"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let mut f = Fixture::new().await;
+        f.config.folder_structure_albums = Arc::from("copies");
+        f.config.folder_structure_smart_folders = Arc::from("copies");
+        f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+            "downloadURL":format!("{}/smart-copy",server.uri()),"size":media.len(),
+            "fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media)),
+        });
+        f.capture(records("m", OLD, "historical"), "smart-copies")
+            .await;
+        let passes = |f: &Fixture| {
+            [
+                if first_kind == PassKind::Album {
+                    destination_pass(f, "A")
+                } else {
+                    smart_pass(f, "Favorites")
+                },
+                smart_pass(f, "Videos"),
+            ]
+        };
+        let run = |f: &Fixture| {
+            let selected = passes(f);
+            let config = Arc::new(f.config.clone());
+            async move {
+                crate::download::download_photos_with_sync(
+                    &reqwest::Client::new(),
+                    &selected,
+                    config,
+                    controls(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let first = run(&f).await;
+        assert_eq!(first.stats.downloaded, 2, "{first:?}");
+        assert!(!first.checkpoint.sync_token_blocked, "{first:?}");
+        let paths: Vec<_> = {
+            let conn =
+                f.db.acquire_lock("two complete independent destinations")
+                    .unwrap();
+            conn.prepare("SELECT DISTINCT path FROM provider_active_destinations WHERE admitted=1 AND verified_media=1 AND verified_metadata=1 ORDER BY path").unwrap()
+                .query_map([], |row| row.get::<_, String>(0)).unwrap()
+                .map(|row| serde_json::from_str::<SelectionPath>(&row.unwrap()).unwrap().to_path()).collect()
+        };
+        assert_eq!(paths.len(), 2);
+        for path in &paths {
+            assert_eq!(std::fs::read(path).unwrap(), media);
+        }
+        let [peer, missing] = <[_; 2]>::try_from(paths).unwrap();
+        if preserve_peer {
+            std::fs::write(&peer, b"local user edit").unwrap();
+        }
+        let peer_bytes = std::fs::read(&peer).unwrap();
+        let peer_time = std::fs::metadata(&peer).unwrap().modified().unwrap();
+        std::fs::remove_file(&missing).unwrap();
+        let mut repaired_time = None;
+        for cycle in 0..3 {
+            f = reopen_destination_fixture(f).await;
+            let result = run(&f).await;
+            assert_eq!(
+                result.stats.downloaded,
+                usize::from(cycle == 0),
+                "{result:?}"
+            );
+            assert!(!result.checkpoint.sync_token_blocked, "{result:?}");
+            assert_eq!(std::fs::read(&peer).unwrap(), peer_bytes);
+            assert_eq!(
+                std::fs::metadata(&peer).unwrap().modified().unwrap(),
+                peer_time
+            );
+            assert_eq!(std::fs::read(&missing).unwrap(), media);
+            let modified = std::fs::metadata(&missing).unwrap().modified().unwrap();
+            if let Some(previous) = repaired_time {
+                assert_eq!(modified, previous);
+            }
+            repaired_time = Some(modified);
+            assert_eq!(server.received_requests().await.unwrap().len(), 3);
+            if preserve_peer {
+                assert!(f.db.acquire_lock("preserved local peer").unwrap().query_row::<bool,_,_>("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE preserved_local IS NOT NULL)",[],|row|row.get(0)).unwrap());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn colliding_album_paths_keep_independent_copies_after_missing_file_and_quiet_reopens() {
+    Box::pin(completed_album_copy_reopen_fixture(
+        true,
+        crate::types::EditedNaming::Suffix,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn colliding_managed_album_families_keep_bound_paths_across_template_drift() {
+    Box::pin(completed_album_copy_reopen_fixture(
+        true,
+        crate::types::EditedNaming::Primary,
+    ))
+    .await;
+}
+
+async fn completed_album_copy_reopen_fixture(colliding: bool, naming: crate::types::EditedNaming) {
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let managed = naming == crate::types::EditedNaming::Primary;
+    let media = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\0\xff\xd9";
+    let checksum = format!("{:x}", Sha256::digest(media));
+    Mock::given(method("GET"))
+        .and(path("/completed-copy"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+        .expect(if managed { 1..=2 } else { 3..=3 })
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.edited_naming = naming;
+    f.config.folder_structure_albums = Arc::from(if colliding { "copies" } else { "{album}" });
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL": format!("{}/completed-copy", server.uri()),
+        "size": media.len(),
+        "fileChecksum": data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    f.capture(records("m", OLD, "historical"), "old").await;
+    let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+    for pass in &passes {
+        crate::download::orchestration::test_support::seed_complete_album_snapshot(
+            f.db.as_ref(),
+            pass.album.container_id().unwrap(),
+            pass.album.name.as_ref(),
+            &[("asset-m", "m")],
+        )
+        .await;
+    }
+    let receipts = |db: &SqliteStateDb| {
+        let conn = db
+            .acquire_lock("independent completed album receipts")
+            .unwrap();
+        conn.prepare("SELECT DISTINCT pass_key,path,source_checksum,local_checksum FROM provider_active_destinations WHERE child='asset-m' AND version_size='original' AND admitted=1 AND verified_media=1 ORDER BY pass_key,path")
+            .unwrap()
+            .query_map([], |row| {
+                let path: String = row.get(1)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    serde_json::from_str::<SelectionPath>(&path)
+                        .unwrap()
+                        .to_path(),
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let initial = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes,
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let initial_requests = server.received_requests().await.unwrap().len();
+    if managed {
+        // Managed journals may copy the first verified source locally.
+        assert!((1..=2).contains(&initial_requests));
+    } else {
+        assert_eq!(initial.stats.downloaded, 2, "{initial:?}");
+        assert_eq!(initial_requests, 2);
+    }
+    assert!(initial.stats.sync_token_blocked_reason.is_none());
+    let expected = receipts(&f.db);
+    assert_eq!(expected.len(), 2);
+    let paths = passes
+        .iter()
+        .map(|pass| {
+            let key = crate::download::orchestration::generation::pass_key(pass);
+            let (_, path, source, local) = expected.iter().find(|row| row.0 == key).unwrap();
+            assert_eq!((source, local), (&checksum, &checksum));
+            if colliding {
+                assert_eq!(
+                    path.parent(),
+                    Some(f.config.directory.join("copies").as_path())
+                );
+                assert_eq!(path.extension().unwrap(), "JPG");
+                assert!(
+                    path.file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .starts_with("changed")
+                );
+            } else {
+                assert_eq!(
+                    *path,
+                    f.config
+                        .directory
+                        .join(pass.album.name.as_ref())
+                        .join("changed.JPG")
+                );
+            }
+            path.clone()
+        })
+        .collect::<Vec<_>>();
+    let [a, b] = <[std::path::PathBuf; 2]>::try_from(paths).unwrap();
+    assert_ne!(
+        a, b,
+        "selected albums must have distinct physical destinations"
+    );
+    assert_eq!(std::fs::read(&a).unwrap(), media);
+    assert_eq!(std::fs::read(&b).unwrap(), media);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        initial_requests
+    );
+    let mut original_metadata = std::fs::metadata(&a).unwrap();
+    if managed {
+        f.config.edited_naming = crate::types::EditedNaming::Suffix;
+        f.config.folder_structure_albums = Arc::from("after");
+    } else {
+        std::fs::remove_file(&b).unwrap();
+    }
+    drop(passes);
+    let mut settled_lookups = None;
+    for cycle in 0..3 {
+        f = reopen_destination_fixture(f).await;
+        let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+        assert_eq!(
+            crate::download::has_due_selection_work(&passes, &f.config, controls())
+                .await
+                .unwrap(),
+            Some(cycle == 0),
+        );
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &passes,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.stats.downloaded,
+            usize::from(cycle == 0 && !managed),
+            "{result:?}\n{:?}",
+            capture.events()
+        );
+        assert!(matches!(
+            result.outcome,
+            crate::download::DownloadOutcome::Success
+        ));
+        assert!(result.stats.sync_token_blocked_reason.is_none());
+        assert_eq!(std::fs::read(&a).unwrap(), media);
+        assert_eq!(std::fs::read(&b).unwrap(), media);
+        let unchanged = std::fs::metadata(&a).unwrap();
+        if managed && cycle == 0 {
+            // Config drift commits a preservation-backed managed generation;
+            // both subsequent quiet reopens must retain its physical files.
+            assert!(f.count("primary_layout_preserved") > 0);
+            original_metadata = unchanged.clone();
+        }
+        assert_eq!(
+            unchanged.modified().unwrap(),
+            original_metadata.modified().unwrap(),
+            "{:?}",
+            capture.events()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                (unchanged.dev(), unchanged.ino()),
+                (original_metadata.dev(), original_metadata.ino())
+            );
+            assert_ne!(unchanged.ino(), std::fs::metadata(&b).unwrap().ino());
+        }
+        assert_eq!(receipts(&f.db), expected);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            if managed { initial_requests } else { 3 }
+        );
+        if managed {
+            assert!(!f.config.directory.join("after/changed.JPG").exists());
+            assert_eq!(f.count("primary_layout_bindings"), 2);
+        }
+        let lookups = f.session.calls.load(Ordering::SeqCst);
+        if let Some(settled) = settled_lookups {
+            assert_eq!(lookups, settled, "quiet reopen repeated provider lookup");
+        }
+        settled_lookups = Some(lookups);
+    }
+}
+
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn private_destination_reopen_finishes_exact_sidecar_receipts() {
     Box::pin(destination_reopen_fixture(false, true, false)).await;
+}
+
+async fn album_collision_declarations(
+    f: &Fixture,
+    passes: &[AlbumPass],
+    root: &crate::state::db::provider_generations::ActiveGeneration,
+) -> Vec<(
+    crate::state::db::provider_generations::ActiveDecision,
+    Vec<crate::state::AssetRecord>,
+)> {
+    let mut declarations = Vec::new();
+    for pass in passes {
+        let key = crate::download::orchestration::generation::pass_key(pass);
+        let album = pass.album.clone().with_rank_capture(&root.id, &key);
+        assert_eq!(album.photos(None).await.unwrap().len(), 1);
+        let current = pass.album.confirm_catalog_asset("asset-m").await.unwrap();
+        let config = f.config.with_pass(pass);
+        let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+            .await
+            .unwrap();
+        let plan = planner
+            .plan_download_asset(&current.asset, &config)
+            .await
+            .unwrap();
+        let records = plan
+            .tasks
+            .iter()
+            .map(|task| pending_record_for_task(&config, &current.asset, task))
+            .collect();
+        let destinations = crate::download::filter::derive_expected_paths(&current.asset, &config)
+            .into_iter()
+            .map(
+                |path| crate::state::db::provider_selection::SelectionDestination {
+                    version_size: path.version_size.as_str().into(),
+                    path: SelectionPath::from_path(&std::path::absolute(path.path).unwrap()),
+                    checksum: path.checksum.into(),
+                    size: path.size,
+                    metadata_hash: crate::download::filter::metadata_for_selected_version(
+                        &current.asset,
+                        &config,
+                        path.version_size,
+                    )
+                    .metadata_hash
+                    .clone()
+                    .unwrap(),
+                },
+            )
+            .collect();
+        declarations.push((
+            crate::state::db::provider_generations::ActiveDecision {
+                state_id: "asset-m".into(),
+                sources: f
+                    .db
+                    .selection_rank_sources(owner(), root.id.clone(), key.clone(), "asset-m".into())
+                    .await
+                    .unwrap(),
+                decision: crate::state::db::provider_selection::SelectionDecision {
+                    pass_key: key,
+                    child: "asset-m".into(),
+                    master: Some("m".into()),
+                    confirmation: Some(current.body),
+                    media_source: None,
+                    outcome: SelectionOutcome::Selected,
+                    reason: String::new(),
+                    destinations,
+                },
+            },
+            records,
+        ));
+    }
+    declarations
+}
+
+#[tokio::test]
+async fn concurrent_album_admission_cannot_freeze_one_physical_destination_twice() {
+    use crate::state::db::provider_generations::MAX_GENERATION_BYTES;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("copies");
+    f.capture(records("m", OLD, "historical"), "collision")
+        .await;
+    let passes = [destination_pass(&f, "A"), destination_pass(&f, "B")];
+    let root = crate::download::orchestration::generation::begin_frozen_fixture(
+        &passes,
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    let mut declarations = album_collision_declarations(&f, &passes, &root).await;
+    let (b, b_records) = declarations.pop().unwrap();
+    let (a, a_records) = declarations.pop().unwrap();
+    assert_eq!(
+        a.decision.destinations[0].path,
+        b.decision.destinations[0].path
+    );
+    let (first, second) = tokio::join!(
+        f.db.project_selection_decision(
+            owner(),
+            root.id.clone(),
+            a,
+            a_records,
+            MAX_GENERATION_BYTES
+        ),
+        f.db.project_selection_decision(
+            owner(),
+            root.id.clone(),
+            b,
+            b_records,
+            MAX_GENERATION_BYTES
+        ),
+    );
+    let outcomes = [first, second];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| result.as_ref().is_ok_and(|projection| projection.admitted))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| matches!(
+                result,
+                Err(crate::state::error::StateError::ProviderWorkConflict)
+            ))
+            .count(),
+        1
+    );
+    drop(passes);
+    f = reopen_destination_fixture(f).await;
+    assert_eq!(
+        f.count("provider_active_decisions"),
+        1,
+        "loser must remain unfrozen for replanning"
+    );
+    assert_eq!(f.count("provider_active_destinations"), 1);
+    f.preserved().await;
+}
+
+#[tokio::test]
+async fn historical_shared_album_receipts_survive_independent_successor_and_quiet_reopens() {
+    Box::pin(historical_shared_album_successor_fixture(false)).await;
+}
+
+#[tokio::test]
+async fn confirmed_deferred_copy_rechecks_ownership_before_admission() {
+    use crate::state::db::provider_generations::MAX_GENERATION_BYTES;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let media = b"\xff\xd8\xff\xe0deferred independent copy";
+    Mock::given(method("GET"))
+        .and(path("/deferred-copy"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("copies");
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL":format!("{}/deferred-copy",server.uri()),"size":media.len(),
+        "fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    f.capture(records("m", OLD, "historical"), "deferred-collision")
+        .await;
+    let current = f.session.records.lock().unwrap().clone();
+    *f.session.records.lock().unwrap() =
+        eligible_records("m", "https://p01.icloud-content.com/older-resource.jpg");
+    let blocked =
+        f.db.project_provider_work(owner(), f.plan().await, MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+    assert_eq!(
+        blocked,
+        WorkAdmission::Admitted,
+        "{}",
+        f.db.acquire_lock("blocker reason")
+            .unwrap()
+            .query_row::<String, _, _>(
+                "SELECT reason FROM provider_work_receipts LIMIT 1",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap()
+    );
+    *f.session.records.lock().unwrap() = current;
+    let passes = [destination_pass(&f, "A"), destination_pass(&f, "B")];
+    let root = crate::download::orchestration::generation::begin_frozen_fixture(
+        &passes,
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    let mut declarations = album_collision_declarations(&f, &passes, &root).await;
+    let (b, b_records) = declarations.pop().unwrap();
+    let (a, a_records) = declarations.pop().unwrap();
+    assert_eq!(
+        a.decision.destinations[0].path,
+        b.decision.destinations[0].path
+    );
+    let deferred =
+        f.db.project_selection_decision(
+            owner(),
+            root.id.clone(),
+            a.clone(),
+            a_records.clone(),
+            MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap();
+    assert!(!deferred.admitted);
+    assert_eq!(deferred.reason, "unfinished_generation_conflict");
+    let snapshot = |db: &SqliteStateDb| {
+        db.acquire_lock("frozen confirmed deferred declaration").unwrap().query_row::<(Vec<u8>,String,String,i64),_,_>(
+            "SELECT manifest,manifest_hash,admission,attempts FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+            rusqlite::params![root.id,a.decision.pass_key,a.decision.child],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap()
+    };
+    let frozen = snapshot(&f.db);
+    let old_path = f.config.directory.join("completed-history.JPG");
+    std::fs::create_dir_all(&f.config.directory).unwrap();
+    std::fs::write(&old_path, b"older resource").unwrap();
+    let old_hash = format!("{:x}", Sha256::digest(b"older resource"));
+    f.db.mark_downloaded(
+        "PrimarySync",
+        "asset-m",
+        "original",
+        &old_path,
+        &old_hash,
+        Some(&old_hash),
+    )
+    .await
+    .unwrap();
+    let old_time = std::fs::metadata(&old_path).unwrap().modified().unwrap();
+    assert!(
+        f.db.project_selection_decision(
+            owner(),
+            root.id.clone(),
+            b,
+            b_records,
+            MAX_GENERATION_BYTES
+        )
+        .await
+        .unwrap()
+        .admitted
+    );
+    f = reopen_destination_fixture(f).await;
+    for _ in 0..2 {
+        assert!(matches!(
+            f.db.project_selection_decision(
+                owner(),
+                root.id.clone(),
+                a.clone(),
+                a_records.clone(),
+                MAX_GENERATION_BYTES
+            )
+            .await,
+            Err(crate::state::error::StateError::ProviderWorkConflict)
+        ));
+        assert_eq!(snapshot(&f.db), frozen);
+        assert_eq!(
+            f.db.acquire_lock("only peer admitted")
+                .unwrap()
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_active_destinations WHERE admitted=1",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            f.db.selection_decision(
+                owner(),
+                root.id.clone(),
+                a.decision.pass_key.clone(),
+                a.decision.child.clone()
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .sources,
+            a.sources
+        );
+    }
+    // A current configuration successor may plan a new destination. The old
+    // confirmed declaration remains frozen and unadmitted as historical debt.
+    f.config.folder_structure_albums = Arc::from("recovered");
+    for cycle in 0..3 {
+        f = reopen_destination_fixture(f).await;
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &[destination_pass(&f, "A"), destination_pass(&f, "B")],
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.stats.downloaded,
+            if cycle == 0 { 2 } else { 0 },
+            "{result:?}"
+        );
+        assert!(!result.checkpoint.sync_token_blocked, "{result:?}");
+        assert_eq!(snapshot(&f.db), frozen);
+        let paths: Vec<String> =
+            f.db.acquire_lock("successor has independent physical receipts")
+                .unwrap()
+                .prepare(
+                    "SELECT DISTINCT path FROM provider_active_destinations WHERE verified_media=1",
+                )
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        assert_eq!(paths.len(), 2);
+        for path in paths {
+            assert_eq!(
+                std::fs::read(
+                    serde_json::from_str::<SelectionPath>(&path)
+                        .unwrap()
+                        .to_path()
+                )
+                .unwrap(),
+                media
+            );
+        }
+        assert_eq!(std::fs::read(&old_path).unwrap(), b"older resource");
+        assert_eq!(
+            std::fs::metadata(&old_path).unwrap().modified().unwrap(),
+            old_time
+        );
+        f.preserved().await;
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn historical_shared_album_metadata_keeps_one_physical_writer_before_successor() {
+    Box::pin(historical_shared_album_successor_fixture(true)).await;
+}
+
+async fn historical_shared_album_successor_fixture(metadata: bool) {
+    use crate::state::db::provider_generations::{INDEPENDENT_ALBUM_COPIES, MAX_GENERATION_BYTES};
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let media = b"\xff\xd8\xff\xe0historical shared album source";
+    let checksum = format!("{:x}", Sha256::digest(media));
+    Mock::given(method("GET"))
+        .and(path("/historical-copy"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("copies");
+    #[cfg(feature = "xmp")]
+    {
+        f.config.metadata.xmp_sidecar = metadata;
+    }
+    f.config.enum_config_hash = Some(Arc::from("historical-membership-selection"));
+    #[cfg(not(feature = "xmp"))]
+    assert!(!metadata);
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL":format!("{}/historical-copy",server.uri()), "size":media.len(),
+        "fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    f.capture(records("m", OLD, "historical"), "shared-history")
+        .await;
+    let passes = [destination_pass(&f, "A"), destination_pass(&f, "B")];
+    let template = crate::download::orchestration::generation::begin_frozen_fixture(
+        &passes,
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    let mut spec = template.spec;
+    spec.profile
+        .as_object_mut()
+        .unwrap()
+        .remove(INDEPENDENT_ALBUM_COPIES);
+    let old =
+        f.db.begin_selection_generation(owner(), spec, MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+    let declarations = album_collision_declarations(&f, &passes, &old).await;
+    let original = f.config.directory.join("copies").join("changed.JPG");
+    std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+    std::fs::write(&original, media).unwrap();
+    // Publish a historical source through the real downloaded-state owner;
+    // subsequent native receipts must validate that exact local/source proof.
+    f.db.upsert_seen(&declarations[0].1[0]).await.unwrap();
+    f.db.mark_downloaded(
+        "PrimarySync",
+        "asset-m",
+        "original",
+        &original,
+        &checksum,
+        Some(&checksum),
+    )
+    .await
+    .unwrap();
+    for (manifest, records) in declarations {
+        let key = manifest.decision.pass_key.clone();
+        assert!(
+            f.db.project_selection_decision(
+                owner(),
+                old.id.clone(),
+                manifest,
+                records,
+                MAX_GENERATION_BYTES
+            )
+            .await
+            .unwrap()
+            .admitted
+        );
+        assert!(
+            f.db.reuse_selection_publication(
+                owner(),
+                old.id.clone(),
+                key,
+                "asset-m".into(),
+                SelectionPath::from_path(&original),
+                (checksum.clone(), media.len() as u64)
+            )
+            .await
+            .unwrap()
+        );
+    }
+    f.db.seal_selection_generation(owner(), old.id.clone(), true, None)
+        .await
+        .unwrap();
+    #[cfg(feature = "xmp")]
+    if metadata {
+        let written = crate::download::metadata_rewrite::run_pending_budget(
+            f.db.as_ref(),
+            crate::download::pipeline::MetadataFlags::from(&f.config),
+            crate::download::CaptureTimestampRepair::Preserve,
+            f.config.temp_suffix.clone(),
+            &CancellationToken::new(),
+            None,
+            (0, 500),
+        )
+        .await;
+        assert_eq!(
+            written.applied, 1,
+            "two historical aliases require one physical sidecar writer"
+        );
+        assert!(original.with_file_name("changed.JPG.xmp").is_file());
+        assert_eq!(f.db.acquire_lock("historical aliases share one completed writer").unwrap()
+            .query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND verified_metadata=1",[&old.id],|row|row.get(0)).unwrap(),2);
+    }
+    let snapshot = |db: &SqliteStateDb| {
+        let conn = db
+            .acquire_lock("immutable historical shared evidence")
+            .unwrap();
+        conn.prepare("SELECT hex(d.manifest)||d.manifest_hash||w.path||w.source_checksum||w.local_checksum||w.verified_media||w.verified_metadata FROM provider_active_decisions d JOIN provider_active_destinations w USING(generation,pass_key,child) WHERE d.generation=?1 ORDER BY d.pass_key,w.path").unwrap()
+            .query_map([&old.id], |row| row.get::<_,String>(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap()
+    };
+    let historical = snapshot(&f.db);
+    assert_eq!(historical.len(), 2);
+    assert!(old.spec.profile["selection_config"].is_string());
+    // Legacy source reuse alone does not grant authority. The metadata writer
+    // publishes one current alias, which still cannot own the shared path alone.
+    assert_eq!(f.db.acquire_lock("historical current authority").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND current_publication=1",[&old.id],|row|row.get(0)).unwrap(),i64::from(metadata));
+    // A current receipt on one alias cannot establish exclusive retirement
+    // authority over a path historically owned by two selected passes.
+    let mut probe_spec = old.spec.clone();
+    probe_spec.config_hash = format!("{:x}", Sha256::digest(b"membership-shared-path-probe"));
+    probe_spec.profile[INDEPENDENT_ALBUM_COPIES] = json!(true);
+    let probe =
+        f.db.begin_selection_generation(owner(), probe_spec, MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+    let (candidates, cursor) =
+        f.db.membership_destinations(owner(), probe.id, None)
+            .await
+            .unwrap();
+    assert!(candidates.is_empty());
+    assert!(cursor.is_none());
+    assert_eq!(snapshot(&f.db), historical);
+    let before = std::fs::metadata(&original).unwrap();
+    drop(passes);
+    let mut stable = None;
+    for cycle in 0..3 {
+        f = reopen_destination_fixture(f).await;
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &[destination_pass(&f, "A"), destination_pass(&f, "B")],
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result.outcome, crate::download::DownloadOutcome::Success),
+            "{result:?}"
+        );
+        assert_eq!(result.stats.downloaded, if cycle == 0 { 2 } else { 0 });
+        assert!(result.stats.sync_token_blocked_reason.is_none());
+        assert_eq!(snapshot(&f.db), historical);
+        assert_eq!(std::fs::read(&original).unwrap(), media);
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        let paths = {
+            let conn =
+                f.db.acquire_lock("independent successor destinations")
+                    .unwrap();
+            conn.prepare("SELECT DISTINCT path FROM provider_active_destinations WHERE generation<>?1 AND admitted=1 AND verified_media=1 ORDER BY path").unwrap().query_map([&old.id],|row|row.get::<_,String>(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap()
+        };
+        assert_eq!(paths.len(), 2);
+        for path in &paths {
+            let path = serde_json::from_str::<SelectionPath>(path)
+                .unwrap()
+                .to_path();
+            assert_ne!(path, original);
+            assert_eq!(std::fs::read(path).unwrap(), media);
+        }
+        if let Some(stable) = &stable {
+            assert_eq!(stable, &paths);
+        }
+        stable = Some(paths);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "xmp"))]
@@ -3446,14 +4331,14 @@ async fn destination_reopen_fixture_with_signature(
         assert_eq!(std::fs::read(&b).unwrap(), media);
         if backlog {
             assert!(
-                std::fs::read_to_string(backlog_tail.with_file_name("backlog-tail.JPG.xmp"))
-                    .unwrap()
-                    .contains("current")
+                !backlog_tail.with_file_name("backlog-tail.JPG.xmp").exists(),
+                "unselected historical markers cannot authorize metadata writes"
             );
+            assert_eq!(std::fs::read(&backlog_tail).unwrap(), media);
             let conn =
-                f.db.acquire_lock("failed prefix survives healthy tail")
+                f.db.acquire_lock("historical evidence survives current completion")
                     .unwrap();
-            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM assets WHERE library='MetadataBacklog' AND metadata_write_failed_at IS NOT NULL",[],|r|r.get(0)).unwrap(),501);
+            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM assets WHERE library='MetadataBacklog' AND metadata_write_failed_at IS NOT NULL",[],|r|r.get(0)).unwrap(),502);
         }
         f.preserved().await;
     }
@@ -3462,7 +4347,7 @@ async fn destination_reopen_fixture_with_signature(
 
 #[cfg(feature = "xmp")]
 #[tokio::test]
-async fn private_metadata_shared_native_path_completes_compatible_pass_aliases() {
+async fn private_metadata_colliding_album_paths_complete_independent_native_writers() {
     Box::pin(private_metadata_recovery_fixture(
         true,
         false,
@@ -3555,7 +4440,7 @@ async fn private_metadata_recovery_fixture_with_signature(
     Mock::given(method("GET"))
         .and(path("/metadata-history"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
-        .expect(if shared { 1 } else { 2 })
+        .expect(2)
         .mount(&server)
         .await;
     let mut f = Fixture::new().await;
@@ -3658,8 +4543,8 @@ async fn private_metadata_recovery_fixture_with_signature(
         f.capture(vec![json!({"recordName":"new-unresolved-observation","recordType":"FutureOpaque","future":{"payload":"keep"}})],"changed-basis").await;
     } else if finalization_fault != MetadataStateFault::None {
         let first = first.unwrap();
-        assert_eq!(first.stats.downloaded, usize::from(!native));
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(first.stats.downloaded, if native { 1 } else { 2 });
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
         assert!(
             first.stats.sync_token_blocked_reason.is_some(),
             "unfinished exact receipts must hold publication: {first:?}"
@@ -3670,9 +4555,9 @@ async fn private_metadata_recovery_fixture_with_signature(
             media,
             "the embedded writer must actually have landed bytes before the state fault"
         );
-        let written_path = f.config.directory.join(format!("copies/{filename}"));
+        let written_path = f.config.directory.join("copies").join(filename);
         let own_output = std::fs::read(&written_path).unwrap();
-        let (generation,key,child,prepared):(String,String,String,String)=f.db.acquire_lock("prepared output independently persisted").unwrap().query_row("SELECT generation,pass_key,child,prepared_checksum FROM provider_active_destinations WHERE prepared_checksum IS NOT NULL",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        let (generation,key,child,prepared):(String,String,String,String)=f.db.acquire_lock("prepared output independently persisted").unwrap().query_row("SELECT generation,pass_key,child,prepared_checksum FROM provider_active_destinations WHERE prepared_checksum IS NOT NULL AND path=?1",[SelectionPath::from_path(&written_path).key().unwrap()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
         assert_eq!(prepared, format!("{:x}", Sha256::digest(&own_output)));
         f.db.acquire_lock("negative corrupted prepared output proof").unwrap().execute("UPDATE provider_active_destinations SET prepared_checksum=?4 WHERE generation=?1 AND pass_key=?2 AND child=?3",rusqlite::params![generation,key,child,"0".repeat(64)]).unwrap();
         assert!(
@@ -3728,7 +4613,7 @@ async fn private_metadata_recovery_fixture_with_signature(
                 .filter(|e| e.level <= tracing::Level::WARN)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(first.stats.downloaded, if shared { 1 } else { 2 });
+        assert_eq!(first.stats.downloaded, 2);
     }
     // The TEXT projection collides with this distinct real UTF-8 sibling.
     // Its matching old resource bytes cannot authorize writes under the native
@@ -3736,11 +4621,22 @@ async fn private_metadata_recovery_fixture_with_signature(
     let native_collision = if native
         && finalization_fault == MetadataStateFault::AfterWriteAndSourceDrift
     {
-        let mirror = std::path::PathBuf::from(f.config.directory.to_string_lossy().into_owned())
-            .join(format!("copies/{filename}"));
+        let mirror = std::path::PathBuf::from(
+            f.db.acquire_lock("exact ambiguous canonical path")
+                .unwrap()
+                .query_row::<String, _, _>(
+                    "SELECT local_path FROM assets WHERE id='asset-m'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+        );
         std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
         std::fs::write(&mirror, media).unwrap();
-        let sidecar = mirror.with_file_name(format!("{filename}.xmp"));
+        let sidecar = mirror.with_file_name(format!(
+            "{}.xmp",
+            mirror.file_name().unwrap().to_str().unwrap()
+        ));
         std::fs::write(&sidecar, b"unrelated-sibling-sidecar").unwrap();
         let legacy =
             f.db.acquire_lock("retain ambiguous legacy sibling debt")
@@ -3756,23 +4652,30 @@ async fn private_metadata_recovery_fixture_with_signature(
     } else {
         None
     };
-    let media_paths: Vec<_> = if shared {
-        vec![f.config.directory.join(format!("copies/{filename}"))]
-    } else {
-        vec![
-            f.config.directory.join(format!("A/{filename}")),
-            f.config.directory.join(format!("B/{filename}")),
-        ]
+    let media_paths: Vec<_> = {
+        let conn =
+            f.db.acquire_lock("independent physical metadata destinations")
+                .unwrap();
+        conn.prepare("SELECT DISTINCT path FROM provider_active_destinations WHERE admitted=1 AND verified_media=1 ORDER BY path").unwrap()
+            .query_map([], |row|row.get::<_,String>(0)).unwrap()
+            .map(|row|serde_json::from_str::<SelectionPath>(&row.unwrap()).unwrap().to_path()).collect()
     };
+    assert_eq!(
+        media_paths.len(),
+        2,
+        "each album keeps its own writer and exact receipt"
+    );
     for media_path in &media_paths {
         assert!(media_path.is_file());
     }
     if shared {
-        assert_ne!(
-            std::fs::read(&media_paths[0]).unwrap(),
-            media,
-            "embedded metadata must actually change media bytes"
-        );
+        for path in &media_paths {
+            assert_ne!(
+                std::fs::read(path).unwrap(),
+                media,
+                "embedded metadata must actually change media bytes"
+            );
+        }
     }
     if finalization_fault == MetadataStateFault::AfterWriteAndSourceDrift {
         f.capture(vec![json!({"recordName":"independent-source-drift-after-own-output","recordType":"FutureOpaque","unknown":{"keep":"all"}})],"prepared-output-source-drift").await;
@@ -3811,7 +4714,8 @@ async fn private_metadata_recovery_fixture_with_signature(
     .unwrap();
     assert!(
         matches!(recovered.outcome, crate::download::DownloadOutcome::Success),
-        "{recovered:?}; warnings: {:?}",
+        "{recovered:?}; receipts: {:?}; warnings: {:?}",
+        f.db.acquire_lock("failed recovery evidence").unwrap().prepare("SELECT generation,path,local_checksum,prepared_checksum,embedded_metadata_receipt FROM provider_active_destinations ORDER BY generation,path").unwrap().query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,Option<String>>(4)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap(),
         trace
             .events()
             .iter()
@@ -3843,7 +4747,7 @@ async fn private_metadata_recovery_fixture_with_signature(
     if refresh {
         // The existing explicit command deliberately queues during enumeration
         // and owns this separate bounded refresh tail after all passes finish.
-        let failed = crate::download::orchestration::maintenance::drain_pending_metadata_rewrites(
+        let drain = crate::download::orchestration::maintenance::drain_pending_metadata_rewrites(
             f.db.as_ref(),
             &f.config.metadata,
             crate::download::metadata_rewrite::CaptureTimestampRepair::Preserve,
@@ -3852,7 +4756,8 @@ async fn private_metadata_recovery_fixture_with_signature(
             &CancellationToken::new(),
         )
         .await;
-        assert_eq!(failed, 0);
+        assert_eq!(drain.failed, 0);
+        assert!(!drain.storage_failed);
         for media_path in &media_paths {
             let sidecar = media_path.with_file_name(format!(
                 "{}.xmp",
@@ -3970,6 +4875,8 @@ async fn private_unresolved_recovery_fixture(drift: bool, native: bool, incompat
     assert!(!native);
     f.config.folder_structure_albums = Arc::from("{album}");
     f.config.metadata.xmp_sidecar = true;
+    f.config.metadata.include_people = true;
+    f.config.metadata.include_albums = true;
     let mut observed = records("m", CURRENT, "healthy-title");
     observed.extend(records("c", CURRENT, "later-title"));
     for pair in observed.chunks_mut(2) {
@@ -4392,7 +5299,7 @@ async fn private_selection_schema33_migration_preserves_live_wal_work_and_unknow
             .acquire_lock("work preserved after migration")
             .unwrap()
             .query_row(
-                "SELECT confirmation FROM provider_work_receipts LIMIT 1",
+                "SELECT confirmation FROM historical_v030_provider_work_receipts LIMIT 1",
                 [],
                 |r| r.get::<_, Vec<u8>>(0)
             )
@@ -4426,14 +5333,612 @@ async fn active_pending_fixture() -> (
     crate::state::db::provider_generations::ActiveDecision,
     Vec<crate::state::AssetRecord>,
 ) {
+    admit_pending_fixture(Fixture::new().await, &[]).await
+}
+
+#[tokio::test]
+async fn published_confirmation_releases_only_matching_inbox_records() {
+    use sha2::{Digest, Sha256};
+    let seed = Fixture::new().await;
+    let media = b"durably published media";
+    {
+        let mut records = seed.session.records.lock().unwrap();
+        let resource = &mut records[0]["fields"]["resOriginalRes"]["value"];
+        resource["fileChecksum"] = json!(data_encoding::BASE64.encode(&Sha256::digest(media)));
+        resource["size"] = json!(media.len());
+    }
+    let (f, root, decision, _) = Box::pin(admit_pending_fixture(seed, &[])).await;
+    let current: Value =
+        serde_json::from_slice(decision.decision.confirmation.as_ref().unwrap()).unwrap();
+    let records = current["records"].as_array().unwrap().clone();
+    f.capture(records.clone(), "held-live").await;
+    assert_eq!(f.count("provider_finished_changes"), 0);
+    let dst = &decision.decision.destinations[0];
+    let path = dst.path.to_path();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, media).unwrap();
+    let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+    assert!(
+        f.db.reuse_selection_publication(
+            owner(),
+            root.id,
+            decision.decision.pass_key,
+            decision.decision.child,
+            dst.path.clone(),
+            (checksum, dst.size)
+        )
+        .await
+        .unwrap()
+    );
+    f.capture(records.clone(), "held-live").await;
+    assert_eq!(f.count("provider_finished_changes"), 1);
+    let mut changed = records;
+    changed[0]["newField"] = json!("new work");
+    f.capture(changed, "held-live").await;
+    assert_eq!(f.count("provider_finished_changes"), 1);
+    assert_eq!(f.db.acquire_lock("distinct live change remains recoverable").unwrap().query_row("SELECT count(*) FROM provider_shadow_pages WHERE request_cursor='held-live' AND length(body)>0",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+}
+
+#[tokio::test]
+async fn explicit_media_source_cannot_rebind_retained_membership_evidence() {
+    use crate::state::db::provider_generations::MAX_GENERATION_BYTES;
+    use crate::state::db::provider_selection::SelectionMediaSource;
+    let (f, root, original, records) = active_pending_fixture().await;
+    for fault in ["database", "zone"] {
+        let mut manifest = original.clone();
+        let mut source = SelectionMediaSource {
+            scope: root.spec.scope.clone(),
+            zone: root.spec.zone.clone(),
+        };
+        if fault == "database" {
+            let mut scope: Value = serde_json::from_str(&source.scope).unwrap();
+            scope["database"] = json!("shared");
+            source.scope = scope.to_string();
+        } else {
+            source.zone["zoneName"] = json!("SharedSync-other");
+        }
+        manifest.decision.media_source = Some(source);
+        let error =
+            f.db.project_selection_decision(
+                owner(),
+                root.id.clone(),
+                manifest,
+                records.clone(),
+                MAX_GENERATION_BYTES,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::state::error::StateError::ProviderSelectionInvalid
+            ),
+            "{fault}: {error}"
+        );
+        let reopened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        let retained = reopened
+            .selection_decision(
+                owner(),
+                root.id.clone(),
+                original.decision.pass_key.clone(),
+                original.decision.child.clone(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained, original);
+        f.preserved().await;
+    }
+}
+
+#[tokio::test]
+async fn membership_source_lookup_spans_validation_windows_after_reopen() {
+    use crate::state::db::provider_generations::{MAX_GENERATION_BYTES, RankSource};
+    let (f, root, manifest, _) = active_pending_fixture().await;
+    let key = manifest.decision.pass_key;
+    let request =
+        crate::icloud::photos::queries::build_changes_zone_request(&root.spec.zone, None, 200);
+    let mut capacity = 0;
+    let mut expected = Vec::new();
+    for (page, children) in [
+        ["target", "other", "target"],
+        ["other", "other", "other"],
+        ["other", "target", "other"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let records: Vec<_> = children.iter().enumerate().map(|(ordinal, child)| json!({
+            "recordName": format!("relation-{page}-{ordinal}"), "recordType":"CPLContainerRelation",
+            "fields":{"containerId":{"type":"STRING","value":"A"},"itemId":{"type":"STRING","value":child}}
+        })).collect();
+        let body = serde_json::to_vec(&json!({"zones":[{
+            "zoneID":root.spec.zone,"syncToken":format!("page-{page}"),"moreComing":false,"records":records
+        }]})).unwrap();
+        capacity = capacity.max(serde_json::to_vec(&request).unwrap().len() + body.len());
+        f.db.capture_selection_rank_page(
+            owner(),
+            root.id.clone(),
+            key.clone(),
+            request.clone(),
+            body.clone(),
+            MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap();
+        let id: String =
+            f.db.acquire_lock("original membership page id")
+                .unwrap()
+                .query_row(
+                    "SELECT id FROM provider_selection_rank_pages WHERE generation=?1 AND body=?2",
+                    rusqlite::params![root.id, body],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        for (ordinal, child) in children.iter().enumerate() {
+            if *child == "target" {
+                expected.push(RankSource {
+                    page_id: id.clone(),
+                    ordinal: ordinal.try_into().unwrap(),
+                });
+            }
+        }
+    }
+    expected.sort_by(|a, b| (&a.page_id, a.ordinal).cmp(&(&b.page_id, b.ordinal)));
+    let db = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+        .await
+        .unwrap();
+    let lookup = |budget| {
+        db.selection_rank_sources_with_budget(
+            owner(),
+            root.id.clone(),
+            key.clone(),
+            "target".into(),
+            budget,
+        )
+    };
+    assert_eq!(lookup(capacity).await.unwrap(), expected);
+    assert!(matches!(
+        lookup(capacity - 1).await,
+        Err(crate::state::error::StateError::ProviderSelectionFull)
+    ));
+}
+
+#[tokio::test]
+async fn original_membership_pages_reuse_selection_capture_and_survive_reopen() {
+    use crate::state::db::provider_generations::MAX_GENERATION_BYTES;
+    let (f, root, mut manifest, records) = active_pending_fixture().await;
+    let request =
+        crate::icloud::photos::queries::build_changes_zone_request(&root.spec.zone, None, 200);
+    let mut body = serde_json::to_vec(&json!({"zones":[{
+        "zoneID":root.spec.zone,"syncToken":"membership-boundary","moreComing":false,
+        "records":[{"recordName":"relation-A-m","recordType":"CPLContainerRelation",
+            "fields":{"containerId":{"type":"STRING","value":"A"},"itemId":{"type":"STRING","value":"asset-foreign"}}},
+            {"recordName":"asset-foreign","recordType":"CPLContainerRelation",
+            "fields":{"containerId":{"type":"STRING","value":"B"},"itemId":{"type":"STRING","value":"asset-foreign"}}},
+            {"recordName":"deleted-relation","recordType":"CPLContainerRelation","deleted":true,
+            "fields":{"containerId":{"type":"STRING","value":"A"},"itemId":{"type":"STRING","value":"asset-foreign"}}}]
+    }]})).unwrap();
+    body.pop();
+    body.extend_from_slice(b",\"membershipFutureExact\":1.2300e+30}");
+    let before = f.count("provider_selection_rank_pages");
+    for _ in 0..2 {
+        let reopened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        reopened
+            .capture_selection_rank_page(
+                owner(),
+                root.id.clone(),
+                manifest.decision.pass_key.clone(),
+                request.clone(),
+                body.clone(),
+                MAX_GENERATION_BYTES,
+            )
+            .await
+            .unwrap();
+        let sources = reopened
+            .selection_rank_sources(
+                owner(),
+                root.id.clone(),
+                manifest.decision.pass_key.clone(),
+                "asset-foreign".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sources.len(), 1);
+        let stored: Vec<u8> = reopened
+            .acquire_lock("original membership source bytes")
+            .unwrap()
+            .query_row(
+                "SELECT body FROM provider_selection_rank_pages WHERE id=?1",
+                [&sources[0].page_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, body);
+        assert_eq!(f.count("provider_selection_rank_pages"), before + 1);
+    }
+    let mut wrong_request = request.clone();
+    wrong_request["zones"][0]["zoneID"]["zoneName"] = json!("SharedSync-foreign");
+    assert!(
+        f.db.capture_selection_rank_page(
+            owner(),
+            root.id.clone(),
+            manifest.decision.pass_key.clone(),
+            wrong_request,
+            body.clone(),
+            MAX_GENERATION_BYTES
+        )
+        .await
+        .is_err()
+    );
+    let mut wrong_body: Value = serde_json::from_slice(&body).unwrap();
+    wrong_body["zones"][0]["zoneID"]["ownerRecordName"] = json!("foreign-owner");
+    assert!(
+        f.db.capture_selection_rank_page(
+            owner(),
+            root.id.clone(),
+            manifest.decision.pass_key.clone(),
+            request.clone(),
+            serde_json::to_vec(&wrong_body).unwrap(),
+            MAX_GENERATION_BYTES
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(f.count("provider_selection_rank_pages"), before + 1);
+    let next =
+        f.db.begin_selection_generation(owner(), root.spec.clone(), MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+    let mut membership: Value = serde_json::from_slice(&body).unwrap();
+    membership["zones"][0]["records"][0]["fields"]["itemId"]["value"] =
+        json!(manifest.decision.child);
+    f.db.capture_selection_rank_page(
+        owner(),
+        next.id.clone(),
+        manifest.decision.pass_key.clone(),
+        request,
+        serde_json::to_vec(&membership).unwrap(),
+        MAX_GENERATION_BYTES,
+    )
+    .await
+    .unwrap();
+    manifest.sources =
+        f.db.selection_rank_sources(
+            owner(),
+            next.id.clone(),
+            manifest.decision.pass_key.clone(),
+            manifest.decision.child.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(manifest.sources.len(), 1);
+    let admitted =
+        f.db.project_selection_decision(
+            owner(),
+            next.id.clone(),
+            manifest.clone(),
+            records,
+            MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap();
+    assert!(admitted.admitted, "{}", admitted.reason);
+    let reopened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .selection_decision(
+                owner(),
+                next.id,
+                manifest.decision.pass_key.clone(),
+                manifest.decision.child.clone()
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        manifest
+    );
+    f.preserved().await;
+}
+
+#[tokio::test]
+async fn foreign_membership_admission_keeps_media_ownership_after_reopen() {
+    use crate::state::db::provider_generations::MAX_GENERATION_BYTES;
+    use crate::state::db::provider_selection::SelectionMediaSource;
+    for unresolved in [false, true] {
+        let (f, root, mut manifest, mut records) = active_pending_fixture().await;
+        let zone = json!({"zoneName":"SharedSync-media","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"});
+        let source = SelectionMediaSource {
+            scope: f.capture.scope("shared", &zone).unwrap(),
+            zone: zone.clone(),
+        };
+        let mut spec = root.spec.clone();
+        let mut media_session = f.session.clone();
+        media_session.zone_name = Arc::from("SharedSync-media");
+        let mut media = uncaptured_destination_pass(&media_session, "A").album;
+        media.set_shadow_capture(f.capture.clone(), Arc::from("shared"));
+        let album = f.pass.album.clone().with_cross_zone_sources(vec![media]);
+        let bound_sources = album.selection_media_sources().unwrap();
+        assert_eq!(bound_sources, std::slice::from_ref(&source));
+        spec.profile["passes"][0]["media_sources"] = json!(bound_sources);
+        let next =
+            f.db.begin_selection_generation(owner(), spec, MAX_GENERATION_BYTES)
+                .await
+                .unwrap();
+        let request =
+            crate::icloud::photos::queries::build_changes_zone_request(&root.spec.zone, None, 200);
+        let body = serde_json::to_vec(&json!({"zones":[{"zoneID":root.spec.zone,
+        "syncToken":"membership-boundary","moreComing":false,"records":[{
+        "recordName":"relation-A-m","recordType":"CPLContainerRelation",
+        "fields":{"containerId":{"value":"A"},"itemId":{"value":manifest.decision.child}}}]}]}))
+        .unwrap();
+        f.db.capture_selection_rank_page(
+            owner(),
+            next.id.clone(),
+            manifest.decision.pass_key.clone(),
+            request,
+            body,
+            MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap();
+        manifest.sources =
+            f.db.selection_rank_sources(
+                owner(),
+                next.id.clone(),
+                manifest.decision.pass_key.clone(),
+                manifest.decision.child.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manifest.sources.len(), 1);
+        let confirmation =
+            String::from_utf8(manifest.decision.confirmation.take().unwrap()).unwrap();
+        manifest.decision.confirmation = Some(
+            confirmation
+                .replace("PrimarySync", "SharedSync-media")
+                .into_bytes(),
+        );
+        manifest.decision.media_source = Some(source);
+        for record in &mut records {
+            record.library = "SharedSync-media".into();
+        }
+        for fault in [
+            "unbound-source",
+            "wrong-account",
+            "wrong-confirmation",
+            "wrong-library",
+        ] {
+            let mut invalid = manifest.clone();
+            let mut invalid_records = records.clone();
+            let mut authenticated = owner();
+            match fault {
+                "unbound-source" => invalid
+                    .decision
+                    .media_source
+                    .as_mut()
+                    .unwrap()
+                    .scope
+                    .push(' '),
+                "wrong-account" => {
+                    authenticated = AccountOwner::configured("other@example.invalid", "com")
+                }
+                "wrong-confirmation" => {
+                    invalid.decision.confirmation = Some(confirmation.as_bytes().to_vec())
+                }
+                "wrong-library" => invalid_records[0].library = "PrimarySync".into(),
+                _ => panic!("unknown source fault: {fault}"),
+            }
+            assert!(
+                f.db.project_selection_decision(
+                    authenticated,
+                    next.id.clone(),
+                    invalid,
+                    invalid_records,
+                    MAX_GENERATION_BYTES
+                )
+                .await
+                .is_err(),
+                "{fault}"
+            );
+            assert_eq!(
+                f.db.acquire_lock("rejected foreign admission")
+                    .unwrap()
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM provider_active_destinations WHERE generation=?1",
+                        [&next.id],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+        if unresolved {
+            let mut deferred = manifest.clone();
+            deferred.decision.master = None;
+            deferred.decision.confirmation = None;
+            deferred.decision.outcome = SelectionOutcome::Deferred;
+            deferred.decision.reason = "current_lookup_unresolved".into();
+            deferred.decision.destinations.clear();
+            let result =
+                f.db.project_selection_decision(
+                    owner(),
+                    next.id.clone(),
+                    deferred.clone(),
+                    Vec::new(),
+                    MAX_GENERATION_BYTES,
+                )
+                .await
+                .unwrap();
+            assert!(!result.admitted);
+            let reopened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+                .await
+                .unwrap();
+            let result = reopened
+                .project_selection_decision(
+                    owner(),
+                    next.id.clone(),
+                    manifest.clone(),
+                    records.clone(),
+                    MAX_GENERATION_BYTES,
+                )
+                .await
+                .unwrap();
+            assert!(!result.admitted);
+            assert_eq!(result.reason, "original_selected_facts_unresolved");
+            assert!(
+                reopened
+                    .project_selection_decision_with_proof(
+                        owner(),
+                        next.id.clone(),
+                        manifest.clone(),
+                        records.clone(),
+                        Some(confirmation.as_bytes().to_vec()),
+                        MAX_GENERATION_BYTES,
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                reopened
+                    .selection_decision(
+                        owner(),
+                        next.id.clone(),
+                        deferred.decision.pass_key.clone(),
+                        deferred.decision.child.clone()
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                deferred
+            );
+        }
+        let admitted =
+            f.db.project_selection_decision_with_proof(
+                owner(),
+                next.id.clone(),
+                manifest.clone(),
+                records.clone(),
+                unresolved.then(|| manifest.decision.confirmation.clone().unwrap()),
+                MAX_GENERATION_BYTES,
+            )
+            .await
+            .unwrap();
+        assert!(admitted.admitted, "{}", admitted.reason);
+        let reopened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .selection_decision(
+                    owner(),
+                    next.id.clone(),
+                    manifest.decision.pass_key.clone(),
+                    manifest.decision.child.clone()
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            manifest
+        );
+        let libraries: Vec<String> = reopened
+            .acquire_lock("foreign destination owner")
+            .unwrap()
+            .prepare(
+                "SELECT DISTINCT library FROM provider_active_destinations WHERE generation=?1",
+            )
+            .unwrap()
+            .query_map([&next.id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(libraries, ["SharedSync-media"]);
+        let asset_libraries: Vec<String> = reopened
+            .acquire_lock("equal child IDs retain separate media state")
+            .unwrap()
+            .prepare("SELECT DISTINCT library FROM assets WHERE id=?1 ORDER BY library")
+            .unwrap()
+            .query_map([&manifest.state_id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(asset_libraries, ["PrimarySync", "SharedSync-media"]);
+        let replay = reopened
+            .project_selection_decision(
+                owner(),
+                next.id.clone(),
+                manifest.clone(),
+                records,
+                MAX_GENERATION_BYTES,
+            )
+            .await
+            .unwrap();
+        assert!(replay.admitted, "{}", replay.reason);
+        assert_eq!(
+            reopened
+                .acquire_lock("one foreign destination after replay")
+                .unwrap()
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_active_destinations WHERE generation=?1",
+                    [&next.id],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            manifest.decision.destinations.len() as i64
+        );
+        f.preserved().await;
+    }
+}
+
+// Explicit logical/provider key pairs model a frozen historical declaration,
+// without asking the current selector to reproduce a retired RAW preference.
+async fn admit_pending_fixture(
+    f: Fixture,
+    historical_keys: &[(VersionSizeKey, VersionSizeKey)],
+) -> (
+    Fixture,
+    crate::state::db::provider_generations::ActiveGeneration,
+    crate::state::db::provider_generations::ActiveDecision,
+    Vec<crate::state::AssetRecord>,
+) {
+    let (f, root, manifest, records) = prepare_pending_fixture(f, historical_keys).await;
+    assert!(
+        f.db.project_selection_decision(
+            owner(),
+            root.id.clone(),
+            manifest.clone(),
+            records.clone(),
+            crate::state::db::provider_generations::MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap()
+        .admitted
+    );
+    (f, root, manifest, records)
+}
+
+async fn prepare_pending_fixture(
+    mut f: Fixture,
+    historical_keys: &[(VersionSizeKey, VersionSizeKey)],
+) -> (
+    Fixture,
+    crate::state::db::provider_generations::ActiveGeneration,
+    crate::state::db::provider_generations::ActiveDecision,
+    Vec<crate::state::AssetRecord>,
+) {
     use crate::state::db::provider_generations::{
         ActiveDecision, GenerationSpec, MAX_GENERATION_BYTES,
     };
-    let mut f = Fixture::new().await;
     f.capture(records("m", OLD, "retained"), "active-proofs")
         .await;
     f.pass = destination_pass_with(&f.session, &f.capture, "A");
-    let (_, scope, zone) = f.pass.album.private_selection_scope().unwrap().unwrap();
+    let (_, scope, zone) = f.pass.album.current_selection_scope().unwrap().unwrap();
     let key = crate::download::orchestration::generation::pass_key(&f.pass);
     let root=f.db.begin_selection_generation(owner(),GenerationSpec {
         format:1,scope:scope.clone(),zone:zone.clone(),config_hash:"a".repeat(64),
@@ -4452,17 +5957,18 @@ async fn active_pending_fixture() -> (
         .plan_download_asset(&current.asset, &effective)
         .await
         .unwrap();
-    let records = plan
+    let mut records = plan
         .tasks
         .iter()
         .map(|task| pending_record_for_task(&effective, &current.asset, task))
         .collect::<Vec<_>>();
-    let manifest = ActiveDecision {
+    let mut manifest = ActiveDecision {
         decision: crate::state::db::provider_selection::SelectionDecision {
             pass_key: key.clone(),
             child: "asset-m".into(),
             master: Some("m".into()),
             confirmation: Some(current.body),
+            media_source: None,
             outcome: SelectionOutcome::Selected,
             reason: String::new(),
             destinations: crate::download::filter::derive_expected_paths(
@@ -4495,19 +6001,225 @@ async fn active_pending_fixture() -> (
             .unwrap(),
         state_id: "asset-m".into(),
     };
-    assert!(
-        f.db.project_selection_decision(
+    for record in &mut records {
+        if let Some((logical, _)) = historical_keys
+            .iter()
+            .find(|(_, provider)| *provider == record.version_size)
+        {
+            record.version_size = *logical;
+        }
+    }
+    for destination in &mut manifest.decision.destinations {
+        if let Some((logical, _)) = historical_keys
+            .iter()
+            .find(|(_, provider)| provider.as_str() == destination.version_size)
+        {
+            destination.version_size = logical.as_str().into();
+        }
+    }
+    (f, root, manifest, records)
+}
+
+#[tokio::test]
+async fn native_selection_legacy_guard_protects_state_not_shared_master() {
+    use crate::state::db::provider_generations::MAX_GENERATION_BYTES;
+    for protected in ["m", "asset-m"] {
+        let (mut f, root, manifest, records) =
+            prepare_pending_fixture(Fixture::new().await, &[]).await;
+        f.db.acquire_lock("retained ambiguous identity").unwrap().execute(
+            "INSERT INTO unattributed_legacy(library,asset_id,evidence_version,original_evidence,files,prepared_at) VALUES('PrimarySync',?1,1,'{}','[]',1)", [protected],
+        ).unwrap();
+        let historical =
+            f.db.acquire_lock("historical identity snapshot")
+                .unwrap()
+                .query_row::<String, _, _>(
+                    "SELECT original_evidence FROM unattributed_legacy WHERE asset_id=?1",
+                    [protected],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        for _ in 0..2 {
+            let result =
+                f.db.project_selection_decision(
+                    owner(),
+                    root.id.clone(),
+                    manifest.clone(),
+                    records.clone(),
+                    MAX_GENERATION_BYTES,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.admitted, protected == "m", "{protected}: {result:?}");
+            assert_eq!(
+                result.reason,
+                if protected == "m" {
+                    ""
+                } else {
+                    "identity_conflict"
+                }
+            );
+            f = reopen_destination_fixture(f).await;
+            {
+                let conn =
+                    f.db.acquire_lock("exact identity guard after reopen")
+                        .unwrap();
+                let (admission, admitted): (String, i64) = conn.query_row(
+                "SELECT d.admission,w.admitted FROM provider_active_decisions d JOIN provider_active_destinations w USING(generation,pass_key,child) WHERE d.generation=?1 AND d.child='asset-m'",
+                [&root.id], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+                assert_eq!(
+                    (admission.as_str(), admitted),
+                    if protected == "m" {
+                        ("admitted", 1)
+                    } else {
+                        ("deferred", 0)
+                    }
+                );
+                let retained: (String, Option<i64>) = conn.query_row("SELECT original_evidence,active_generation FROM unattributed_legacy WHERE asset_id=?1", [protected], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+                assert_eq!(retained, (historical.clone(), None));
+            }
+            f.preserved().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn current_child_cannot_recover_unproven_protected_legacy_path_after_reopen() {
+    let mut f = Fixture::new().await;
+    let path = f.dir.path().join("legacy-owned.jpg");
+    std::fs::write(&path, b"retained media").unwrap();
+    let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+    let record = crate::test_helpers::TestAssetRecord::new("current-child")
+        .filename("legacy-owned.jpg")
+        .checksum("current-resource")
+        .size(14)
+        .build();
+    f.db.upsert_seen(&record).await.unwrap();
+    f.db.mark_downloaded(
+        "PrimarySync",
+        "current-child",
+        "original",
+        &path,
+        &checksum,
+        Some(&checksum),
+    )
+    .await
+    .unwrap();
+    f.db.mark_failed(
+        "PrimarySync",
+        "current-child",
+        "original",
+        "interrupted sibling",
+    )
+    .await
+    .unwrap();
+    let proof =
+        f.db.get_pending_publication("PrimarySync", "current-child", VersionSizeKey::Original)
+            .await
+            .unwrap()
+            .expect("valid independent publication candidate");
+    let key = crate::fs_util::confined_path_key(&path).unwrap();
+    f.db.acquire_lock("historical path authority")
+        .unwrap()
+        .execute(
+            "INSERT INTO unattributed_legacy_paths VALUES('PrimarySync','ambiguous-master',?1,?2)",
+            rusqlite::params![key, path.to_str().unwrap()],
+        )
+        .unwrap();
+    for _ in 0..2 {
+        f = reopen_destination_fixture(f).await;
+        let result =
+            f.db.recover_pending_publication(
+                &proof,
+                &record,
+                "current-child",
+                "ambiguous-master",
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            !matches!(result, Ok(true)),
+            "protected path must refuse independent-child adoption: {result:?}"
+        );
+        assert_eq!(
+            f.db.get_pending_publication("PrimarySync", "current-child", VersionSizeKey::Original)
+                .await
+                .unwrap(),
+            Some(proof.clone())
+        );
+        let retained: (String, String) =
+            f.db.acquire_lock("retained path after refusal")
+                .unwrap()
+                .query_row(
+                    "SELECT asset_id,local_path FROM unattributed_legacy_paths WHERE path_key=?1",
+                    [&key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+        assert_eq!(
+            retained,
+            ("ambiguous-master".into(), path.to_str().unwrap().into())
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"retained media");
+        f.preserved().await;
+    }
+}
+
+#[tokio::test]
+async fn frozen_raw_generation_preserves_swapped_keys_and_resource_evidence_on_reopen() {
+    let f = Fixture::new().await;
+    {
+        let mut records = f.session.records.lock().unwrap();
+        records[0]["fields"]["resOriginalAltRes"] = json!({"value": {
+            "downloadURL": "https://p01.icloud-content.com/frozen-raw",
+            "size": 2000, "fileChecksum": "frozen-raw-checksum"
+        }});
+        records[0]["fields"]["resOriginalAltFileType"] = json!({"value":"com.adobe.raw-image"});
+    }
+    let (f, root, manifest, records) = admit_pending_fixture(
+        f,
+        &[
+            (VersionSizeKey::Original, VersionSizeKey::Alternative),
+            (VersionSizeKey::Alternative, VersionSizeKey::Original),
+        ],
+    )
+    .await;
+    assert_eq!(records.len(), 2);
+    let f = reopen_destination_fixture(f).await;
+    let retained =
+        f.db.selection_decision(
             owner(),
-            root.id.clone(),
-            manifest.clone(),
-            records.clone(),
-            MAX_GENERATION_BYTES
+            root.id,
+            manifest.decision.pass_key.clone(),
+            "asset-m".into(),
         )
         .await
         .unwrap()
-        .admitted
-    );
-    (f, root, manifest, records)
+        .unwrap();
+    assert_eq!(retained, manifest);
+    let current = f.pass.album.confirm_catalog_asset("asset-m").await.unwrap();
+    for destination in &retained.decision.destinations {
+        let logical = records
+            .iter()
+            .find(|record| record.version_size.as_str() == destination.version_size)
+            .unwrap()
+            .version_size;
+        let expected = match logical {
+            VersionSizeKey::Original => VersionSizeKey::Alternative,
+            VersionSizeKey::Alternative => VersionSizeKey::Original,
+            _ => panic!("fixture contains only RAW/JPEG siblings"),
+        };
+        assert_eq!(
+            crate::download::filter::provider_version_for_frozen_resource(
+                &current.asset,
+                logical,
+                &destination.checksum,
+                destination.size,
+            ),
+            Some(expected)
+        );
+    }
+    assert_eq!(f.db.get_pending().await.unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -4520,7 +6232,7 @@ async fn private_historical_replay_windows_round_robin_and_persist_past_64_after
     *f.session.records.lock().unwrap() = (0..72)
         .flat_map(|n| records(&format!("history-{n:03}"), CURRENT, "retained"))
         .collect();
-    let (_, scope, zone) = f.pass.album.private_selection_scope().unwrap().unwrap();
+    let (_, scope, zone) = f.pass.album.current_selection_scope().unwrap().unwrap();
     let key = crate::download::orchestration::generation::pass_key(&f.pass);
     let config_hash = "a".repeat(64);
     let mut roots = Vec::new();
@@ -4548,6 +6260,7 @@ async fn private_historical_replay_windows_round_robin_and_persist_past_64_after
                     child,
                     master: None,
                     confirmation: None,
+                    media_source: None,
                     outcome: SelectionOutcome::Deferred,
                     reason: "current_lookup_unresolved".into(),
                     destinations: Vec::new(),
@@ -4880,6 +6593,7 @@ async fn private_quota_valid_large_source_declaration_keeps_same_root_healthy_ta
             child: child_name.into(),
             master: None,
             confirmation: None,
+            media_source: None,
             outcome: SelectionOutcome::Deferred,
             reason: "current_lookup_unresolved".into(),
             destinations: Vec::new(),
@@ -5013,6 +6727,234 @@ async fn private_selection_committed_corruption_refuses_pending_publication_proo
         assert_eq!(f.queue(), queue);
         f.preserved().await;
     }
+}
+
+#[tokio::test]
+async fn private_selection_rank_retirement_keeps_sealed_unfinished_destinations() {
+    let (f, root, manifest, _) = Box::pin(active_pending_fixture()).await;
+    f.db.seal_selection_generation(owner(), root.id.clone(), true, None)
+        .await
+        .unwrap();
+    f.db.freeze_interrupted_selection(owner(), root.spec.scope)
+        .await
+        .unwrap();
+    let retained =
+        f.db.selection_decision(
+            owner(),
+            root.id.clone(),
+            manifest.decision.pass_key.clone(),
+            manifest.decision.child.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained, manifest);
+    let original: bool = f.db.acquire_lock("verify pending selection still has original pages").unwrap()
+        .query_row("SELECT count(*)>0 AND count(*)=sum(retired_proof_hash IS NULL) FROM provider_selection_rank_pages WHERE generation=?1",
+            [&root.id], |r| r.get(0)).unwrap();
+    assert!(original);
+}
+
+#[tokio::test]
+async fn private_selection_rank_retirement_rolls_back_then_reopens_schema_45() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let media = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
+    Mock::given(method("GET"))
+        .and(path("/settled"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("copies");
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL":format!("{}/settled",server.uri()), "size": media.len(),
+        "fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    let unfinished = destination_pass(&f, "B");
+    let neighbor = super::super::generation::begin_frozen_fixture(
+        std::slice::from_ref(&unfinished),
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    let key = super::super::generation::pass_key(&unfinished);
+    assert_eq!(
+        unfinished
+            .album
+            .with_rank_capture(&neighbor.id, &key)
+            .photos(None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let page_bodies =
+        |db: &SqliteStateDb, generation: &str| {
+            db.acquire_lock("original rank bytes").unwrap().prepare(
+            "SELECT body FROM provider_selection_rank_pages WHERE generation=?1 ORDER BY id"
+        ).unwrap().query_map([generation], |r| r.get::<_, Vec<u8>>(0)).unwrap()
+        .collect::<Result<Vec<_>, _>>().unwrap()
+        };
+    let untouched = page_bodies(&f.db, &neighbor.id);
+    f.db.acquire_lock("interrupt after first receipt").unwrap().execute_batch(
+        "CREATE TRIGGER stop_retirement BEFORE UPDATE OF retired_proof_hash ON provider_selection_rank_pages
+         WHEN EXISTS(SELECT 1 FROM provider_selection_rank_pages WHERE retired_proof_hash IS NOT NULL)
+         BEGIN SELECT RAISE(ABORT,'interrupted rank retirement'); END;"
+    ).unwrap();
+    let client = reqwest::Client::new();
+    let error = crate::download::download_photos_with_sync(
+        &client,
+        &[destination_pass(&f, "A")],
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("interrupted rank retirement"),
+        "{error:#}"
+    );
+    let settled: String = {
+        let conn =
+            f.db.acquire_lock("verify rollback; model a schema-45 upgrade")
+                .unwrap();
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_selection_rank_pages WHERE retired_proof_hash IS NOT NULL", [], |r| r.get(0)).unwrap(), 0);
+        conn.execute_batch("DROP TRIGGER stop_retirement; DROP INDEX idx_selection_rank_unretired;
+            ALTER TABLE provider_selection_rank_pages DROP COLUMN retired_proof_hash; PRAGMA user_version=45;").unwrap();
+        conn.query_row(
+            "SELECT id FROM provider_active_generations WHERE sealed=1 AND checkpoint_ready=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let before = page_bodies(&f.db, &settled);
+    f = reopen_destination_fixture(f).await;
+    let result = crate::download::download_photos_with_sync(
+        &client,
+        std::slice::from_ref(&f.pass),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(!result.checkpoint.sync_token_blocked, "{result:?}");
+    assert_eq!(result.stats.downloaded, 0);
+    assert_eq!(page_bodies(&f.db, &neighbor.id), untouched);
+    let after = page_bodies(&f.db, &settled);
+    assert_eq!(after.len(), before.len());
+    assert!(after.iter().map(Vec::len).sum::<usize>() < before.iter().map(Vec::len).sum());
+    for (old, new) in before.iter().zip(&after) {
+        assert_ne!(old, new);
+    }
+    f.preserved().await;
+    f = reopen_destination_fixture(f).await;
+    let quiet = crate::download::download_photos_with_sync(
+        &client,
+        std::slice::from_ref(&f.pass),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(!quiet.checkpoint.sync_token_blocked, "{quiet:?}");
+    assert_eq!(page_bodies(&f.db, &settled), after);
+    f.db.acquire_lock("damage a retired proof").unwrap().execute(
+        "UPDATE provider_selection_rank_pages SET body=X'5B5D' WHERE generation=?1 AND length(body)>2", [&settled],
+    ).map(|changed| assert!(changed > 0)).unwrap();
+    let invalid = crate::download::download_photos_with_sync(
+        &client,
+        std::slice::from_ref(&f.pass),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        invalid.downcast_ref::<crate::state::error::StateError>(),
+        Some(crate::state::error::StateError::ProviderSelectionInvalid)
+    ));
+}
+
+#[tokio::test]
+async fn private_selection_resumes_and_seals_above_former_store_limit() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let media = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
+    Mock::given(method("GET"))
+        .and(path("/selected"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("copies");
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL": format!("{}/selected", server.uri()), "size": media.len(),
+        "fileChecksum": data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    let root = crate::download::orchestration::generation::begin_frozen_fixture(
+        &[destination_pass(&f, "A")],
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    // Model the saved logical charge of an interrupted baseline without a 512 MiB fixture.
+    f.db.acquire_lock("seed retained evidence charge")
+        .unwrap()
+        .execute(
+            "UPDATE provider_active_generations SET charged_bytes=536870912 WHERE id=?1",
+            [&root.id],
+        )
+        .unwrap();
+    f = reopen_destination_fixture(f).await;
+    f.config.sync_mode = crate::download::SyncMode::Full;
+    let result = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        std::slice::from_ref(&f.pass),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.stats.downloaded, 1, "{result:?}");
+    assert_eq!(result.stats.state_write_failures, 0);
+    assert!(result.sync_token.is_some(), "{result:?}");
+    assert!(!result.checkpoint.sync_token_blocked);
+    let sealed: bool =
+        f.db.acquire_lock("verify original generation completed")
+            .unwrap()
+            .query_row(
+                "SELECT sealed AND checkpoint_ready FROM provider_active_generations WHERE id=?1",
+                [&root.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert!(sealed);
+    assert!(f.count("provider_selection_rank_pages") > 0);
+    assert_eq!(f.count("provider_active_decisions"), 1);
+    crate::download::orchestration::generation::begin_frozen_fixture(
+        &[destination_pass(&f, "B")],
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    f.preserved().await;
 }
 
 #[tokio::test]
@@ -5166,9 +7108,13 @@ async fn private_invalidated_old_root_cannot_hide_corrupted_destination_or_heade
             .is_none()
         );
         assert!(
-            f.db.unfinished_selection_debt(owner(), root.spec.scope.clone())
-                .await
-                .unwrap()
+            f.db.unfinished_selection_debt(
+                owner(),
+                root.spec.scope.clone(),
+                root.spec.config_hash.clone()
+            )
+            .await
+            .unwrap()
         );
         let before = f.queue();
         f.db.acquire_lock("committed historical corruption")
@@ -5176,9 +7122,13 @@ async fn private_invalidated_old_root_cannot_hide_corrupted_destination_or_heade
             .execute_batch(mutation)
             .unwrap();
         let error =
-            f.db.unfinished_selection_debt(owner(), root.spec.scope.clone())
-                .await
-                .expect_err(mutation);
+            f.db.unfinished_selection_debt(
+                owner(),
+                root.spec.scope.clone(),
+                root.spec.config_hash.clone(),
+            )
+            .await
+            .expect_err(mutation);
         assert!(
             matches!(
                 error,
@@ -5206,7 +7156,7 @@ async fn private_metadata_retry_schedule_is_bounded_and_never_publication_proof(
         501
     );
     assert!(
-        f.db.unfinished_selection_debt(owner(), root.spec.scope)
+        f.db.unfinished_selection_debt(owner(), root.spec.scope, root.spec.config_hash)
             .await
             .unwrap()
     );
@@ -5246,8 +7196,10 @@ async fn private_completed_native_publications_receive_explicit_current_metadata
 }
 
 #[tokio::test]
-async fn private_smart_selector_preserves_existing_dispatch_and_retained_debt_gate() {
+async fn unsupported_smart_selector_refuses_before_work_and_preserves_retained_debt() {
     let (mut f, root, _, _) = Box::pin(active_pending_fixture()).await;
+    // Relabeling an album pass does not supply a provider-defined smart query.
+    // Unsupported selectors cannot acquire destination authority by relabeling.
     f.pass.kind = PassKind::SmartFolder;
     f.config.media = crate::config::MediaSelection {
         photos: false,
@@ -5264,7 +7216,13 @@ async fn private_smart_selector_preserves_existing_dispatch_and_retained_debt_ga
         .unwrap()
         .is_none()
     );
-    let result = crate::download::download_photos_with_sync(
+    let changes =
+        f.db.acquire_lock("before refused dispatch")
+            .unwrap()
+            .total_changes();
+    let calls = f.session.calls.load(Ordering::SeqCst);
+    let ranks = f.session.rank_calls.load(Ordering::SeqCst);
+    let error = crate::download::download_photos_with_sync(
         &reqwest::Client::new(),
         std::slice::from_ref(&f.pass),
         Arc::new(f.config.clone()),
@@ -5272,18 +7230,23 @@ async fn private_smart_selector_preserves_existing_dispatch_and_retained_debt_ga
         CancellationToken::new(),
     )
     .await
-    .unwrap();
-    assert_eq!(result.stats.downloaded, 0);
-    assert!(result.full_enumeration_ran);
-    assert!(result.checkpoint.sync_token_blocked);
-    assert!(result.sync_token.is_none());
-    assert_eq!(
-        result.stats.sync_token_blocked_reason,
-        Some("selection_generation_deferred")
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("requires authenticated destination ownership")
     );
+    assert_eq!(
+        f.db.acquire_lock("after refused dispatch")
+            .unwrap()
+            .total_changes(),
+        changes
+    );
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), calls);
+    assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), ranks);
     assert_eq!(f.count("provider_active_generations"), 1);
     assert!(
-        f.db.unfinished_selection_debt(owner(), root.spec.scope)
+        f.db.unfinished_selection_debt(owner(), root.spec.scope, root.spec.config_hash)
             .await
             .unwrap()
     );
@@ -5296,7 +7259,7 @@ async fn private_smart_selector_preserves_existing_dispatch_and_retained_debt_ga
         videos: true,
         live_photos: false,
     };
-    let healthy_result = crate::download::download_photos_with_sync(
+    let error = crate::download::download_photos_with_sync(
         &reqwest::Client::new(),
         std::slice::from_ref(&healthy.pass),
         Arc::new(healthy.config.clone()),
@@ -5304,18 +7267,62 @@ async fn private_smart_selector_preserves_existing_dispatch_and_retained_debt_ga
         CancellationToken::new(),
     )
     .await
-    .unwrap();
-    assert_eq!(healthy_result.stats.downloaded, 0);
-    assert!(!healthy_result.checkpoint.sync_token_blocked);
-    assert!(healthy_result.sync_token.is_some());
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("requires authenticated destination ownership")
+    );
+    assert_eq!(healthy.session.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(healthy.session.rank_calls.load(Ordering::SeqCst), 0);
     assert_eq!(healthy.count("provider_active_generations"), 0);
     healthy.preserved().await;
 }
 
 #[cfg(feature = "xmp")]
 #[tokio::test]
-async fn private_current_destination_and_retained_tail_progress_past_501_failed_writers() {
+async fn private_current_destination_ignores_502_unselected_metadata_markers() {
     Box::pin(destination_reopen_fixture(false, true, true)).await;
+}
+
+#[tokio::test]
+async fn writable_dispatch_refuses_changed_authenticated_pin_before_mutation() {
+    let f = Fixture::new().await;
+    let pass = destination_pass_with(&f.session, &f.capture, "A");
+    f.db.acquire_lock("invalidate fixture provider pin")
+        .unwrap()
+        .execute(
+            "UPDATE account_owner SET provider_key='mismatched-provider'",
+            [],
+        )
+        .unwrap();
+    let changes =
+        f.db.acquire_lock("before invalid pin dispatch")
+            .unwrap()
+            .total_changes();
+    let error = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &[pass],
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<crate::state::error::StateError>(),
+        Some(crate::state::error::StateError::AccountOwnerMismatch)
+    ));
+    assert_eq!(
+        f.db.acquire_lock("after invalid pin dispatch")
+            .unwrap()
+            .total_changes(),
+        changes
+    );
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.count("provider_active_generations"), 0);
+    f.preserved().await;
 }
 
 #[cfg(feature = "xmp")]
@@ -5336,7 +7343,7 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
         Mock::given(method("GET"))
             .and(path(format!("/{name}")))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
     }
@@ -5355,7 +7362,7 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
     )
     .await
     .unwrap();
-    assert_eq!(first.stats.downloaded, 1, "{first:?}");
+    assert_eq!(first.stats.downloaded, 2, "{first:?}");
     assert!(first.sync_token.is_none());
     let old =
         f.db.acquire_lock("prepared original writer proof")
@@ -5397,12 +7404,16 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
     )
     .await
     .unwrap();
-    assert_eq!(current.stats.downloaded, 1, "{current:?}");
+    assert_eq!(current.stats.downloaded, 2, "{current:?}");
+    // Current publication reuse independently verifies and settles the prepared
+    // bytes. It does not complete the disabled historical metadata intent.
     assert!(
-        current.sync_token.is_none(),
-        "disabled historical writer remains unfinished debt"
+        matches!(current.outcome, crate::download::DownloadOutcome::Success),
+        "{current:?}"
     );
-    assert_eq!(f.db.acquire_lock("disabled frozen embed cannot be acknowledged by sidecar only").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND verified_metadata=0",[&old],|r|r.get(0)).unwrap(),2);
+    assert!(!current.checkpoint.sync_token_blocked, "{current:?}");
+    assert_eq!(current.sync_token.as_deref(), Some("quiet-zone-cursor"));
+    assert_eq!(f.db.acquire_lock("settled bytes do not acknowledge disabled frozen embed").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND verified_media=1 AND verified_metadata=0 AND prepared_hash IS NULL AND prepared_checksum IS NULL",[&old],|r|r.get(0)).unwrap(),2);
     assert_eq!(
         std::fs::read(&path).unwrap(),
         original.0,
@@ -5486,9 +7497,8 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
 #[cfg(feature = "xmp")]
 #[tokio::test]
 #[ignore = "300-photo stress coverage: scripts/test-copies-stress.sh"]
-async fn private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes()
- {
-    Box::pin(current_writers_reseed_fixture(300, 5)).await;
+async fn private_600_independent_album_writers_finish_through_reseeds_without_repeated_writes() {
+    Box::pin(current_writers_reseed_fixture(300, 6)).await;
 }
 
 #[cfg(feature = "xmp")]
@@ -5497,14 +7507,22 @@ async fn private_unchanged_sidecar_packets_survive_reseeds_and_two_quiet_reopens
     Box::pin(current_writers_reseed_fixture(3, 5)).await;
 }
 
-// Cross the same priority/remaining scheduling branch with three writers.
+// Cross the same priority/remaining scheduling branch with six writers.
 // The owner separately pins production's 250-current/500-total limits; the
 // full stress case crosses those real limits without the test-only override.
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn private_current_writers_cross_priority_reserve_with_small_budget() {
     crate::download::orchestration::generation::TEST_METADATA_WRITER_BUDGET
-        .scope(4, Box::pin(current_writers_reseed_fixture(3, 1)))
+        .scope(8, Box::pin(current_writers_reseed_fixture(3, 1)))
+        .await;
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn private_independent_writers_exceed_budget_then_finish_across_reseeds() {
+    crate::download::orchestration::generation::TEST_METADATA_WRITER_BUDGET
+        .scope(5, Box::pin(current_writers_reseed_fixture(3, 6)))
         .await;
 }
 
@@ -5514,11 +7532,14 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     let server = MockServer::start().await;
+    let budget = crate::download::orchestration::generation::TEST_METADATA_WRITER_BUDGET
+        .try_with(|budget| *budget)
+        .unwrap_or(500);
     let media = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
     Mock::given(method("GET"))
         .and(path("/many-owned-current"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
-        .expect(u64::try_from(writers).unwrap())
+        .expect(u64::try_from(2 * writers).unwrap())
         .mount(&server)
         .await;
     let mut f = Fixture::new().await;
@@ -5529,7 +7550,13 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
         pair[0]["fields"]["filenameEnc"]["value"]=json!(format!("writer-{n:03}.jpg"));
         pair[0]["fields"]["resOriginalRes"]["value"]=json!({"downloadURL":format!("{}/many-owned-current",server.uri()),"size":media.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media))});pair
     }).collect();
-    let mut stable = None;
+    type WriterSnapshot = (
+        std::path::PathBuf,
+        (std::time::SystemTime, std::time::SystemTime, bool),
+    );
+    let mut stable: Option<Vec<WriterSnapshot>> = None;
+    let mut known_generations = std::collections::BTreeSet::new();
+    let mut current_generation = None;
     for cycle in 0..cycles {
         if cycle > 0 {
             f = reopen_destination_fixture(f).await;
@@ -5550,58 +7577,871 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
         .unwrap();
         assert_eq!(
             result.stats.downloaded,
-            if cycle == 0 { writers } else { 0 },
+            if cycle == 0 { 2 * writers } else { 0 },
             "cycle{cycle}: {result:?}"
         );
         {
             let conn =
                 f.db.acquire_lock("physical writer versus pass obligation oracle")
                     .unwrap();
-            assert_eq!(conn.query_row::<(i64,i64),_,_>("SELECT count(DISTINCT path),count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap(),(i64::try_from(writers).unwrap(),i64::try_from(2*writers*(cycle.min(2)+1)).unwrap()));
+            let generations = conn
+                .prepare("SELECT id FROM provider_active_generations")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()
+                .unwrap();
+            let added: Vec<_> = generations
+                .difference(&known_generations)
+                .cloned()
+                .collect();
+            assert_eq!(added.len(), usize::from(cycle < 3));
+            if let Some(generation) = added.into_iter().next() {
+                current_generation = Some(generation);
+            }
+            known_generations = generations;
+            assert_eq!(conn.query_row::<(i64,i64),_,_>("SELECT count(DISTINCT path),count(*) FROM provider_active_destinations WHERE verified_media=1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap(),(i64::try_from(2*writers).unwrap(),i64::try_from(2*writers*(cycle.min(2)+1)).unwrap()));
             assert_eq!(
                 conn.query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_active_destinations WHERE verified_metadata=0",
-                    [],
+                    "SELECT count(*) FROM provider_active_destinations WHERE verified_metadata=0 AND generation=?1",
+                    [&current_generation],
                     |r| r.get(0)
                 )
                 .unwrap(),
-                0,
-                "current lane and remaining budget must finish every physical writer"
+                if cycle < 3 {
+                    i64::try_from((2 * writers).saturating_sub(budget)).unwrap()
+                } else {
+                    0
+                },
+                "cycle {cycle}: current destinations respect the writer budget and finish after an unchanged cycle; historical rows are not replayed"
             );
         }
-        let files: Vec<_> = (0..writers)
-            .map(|n| {
-                let path = f
-                    .config
-                    .directory
-                    .join("copies")
-                    .join(format!("writer-{n:03}.JPG"));
-                let sidecar = path.with_file_name(format!("writer-{n:03}.JPG.xmp"));
+        let paths: Vec<_> = {
+            let conn = f.db.acquire_lock("all independent writer paths").unwrap();
+            conn.prepare("SELECT path,max(verified_metadata) FROM provider_active_destinations WHERE admitted=1 AND verified_media=1 GROUP BY path ORDER BY path").unwrap().query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,bool>(1)?))).unwrap()
+                .map(|row|{let (path,complete)=row.unwrap();(serde_json::from_str::<SelectionPath>(&path).unwrap().to_path(),complete)}).collect()
+        };
+        assert_eq!(paths.len(), 2 * writers);
+        let files: Vec<_> = paths
+            .into_iter()
+            .map(|(path, complete)| {
+                let sidecar = path.with_file_name(format!(
+                    "{}.xmp",
+                    path.file_name().unwrap().to_str().unwrap()
+                ));
                 assert_eq!(std::fs::read(&path).unwrap(), media);
                 assert!(
                     std::fs::read_to_string(&sidecar)
                         .unwrap()
                         .contains("Current metadata")
                 );
-                (
-                    std::fs::metadata(path).unwrap().modified().unwrap(),
-                    std::fs::metadata(sidecar).unwrap().modified().unwrap(),
-                )
+                let sidecar_time = std::fs::metadata(sidecar).unwrap().modified().unwrap();
+                let media_time = std::fs::metadata(&path).unwrap().modified().unwrap();
+                (path, (media_time, sidecar_time, complete))
             })
             .collect();
         if let Some(stable) = &stable {
-            assert_eq!(
-                stable, &files,
-                "unchanged current receipts must survive source reseeds without repeated physical writes"
-            );
-        } else {
-            stable = Some(files);
+            for ((old_path, (old_media, old_sidecar, complete)), (path, (media, sidecar, _))) in
+                std::iter::zip(stable, &files)
+            {
+                assert_eq!(old_path, path);
+                assert_eq!(
+                    old_media, media,
+                    "media must survive every reseed unchanged"
+                );
+                if *complete {
+                    assert_eq!(
+                        old_sidecar, sidecar,
+                        "completed sidecars must survive every reseed without repeated physical writes"
+                    );
+                }
+            }
         }
-        if cycle >= 3 {
+        assert_eq!(
+            files
+                .iter()
+                .filter(|(_, (_, _, complete))| *complete)
+                .count(),
+            if cycle < 3 {
+                (2 * writers).min(budget)
+            } else {
+                2 * writers
+            }
+        );
+        stable = Some(files);
+        if cycle >= if 2 * writers > budget { 4 } else { 3 } {
             assert_eq!(f.session.calls.load(Ordering::SeqCst), before_calls);
             assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), before_ranks);
         }
         f.preserved().await;
+    }
+}
+
+#[tokio::test]
+async fn selected_destination_retry_does_not_resurrect_historical_reservations() {
+    for failed_album in [
+        None,
+        Some(&["A"][..]),
+        Some(&["B"][..]),
+        Some(&["A", "B"][..]),
+    ] {
+        selected_destination_retry_fixture(
+            true,
+            failed_album,
+            crate::download::CaptureTimestampRepair::Preserve,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn shared_selection_admission_preserves_account_and_zone_boundaries() {
+    let f = Fixture::new().await;
+    let mut pass = uncaptured_destination_pass(&f.session, "A");
+    pass.album
+        .set_shadow_capture(f.capture.clone(), Arc::from("shared"));
+    let root = crate::download::orchestration::generation::begin_frozen_fixture(
+        std::slice::from_ref(&pass),
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    let scope: Value = serde_json::from_str(&root.spec.scope).unwrap();
+    assert_eq!(scope["database"], "shared");
+    for fault in ["account", "zone", "owner", "database"] {
+        let mut spec = root.spec.clone();
+        let mut authenticated = owner();
+        match fault {
+            "account" => authenticated = AccountOwner::configured("other@example.invalid", "com"),
+            "zone" => spec.zone["zoneName"] = json!("another-zone"),
+            "owner" => spec.zone["ownerRecordName"] = json!("another-owner"),
+            "database" => {
+                let mut invalid_scope = scope.clone();
+                invalid_scope["database"] = json!("public");
+                spec.scope = invalid_scope.to_string();
+            }
+            _ => panic!("unknown selection admission fault: {fault}"),
+        }
+        assert!(
+            f.db.begin_selection_generation(
+                authenticated,
+                spec,
+                crate::state::db::provider_generations::MAX_GENERATION_BYTES,
+            )
+            .await
+            .is_err(),
+            "{fault}"
+        );
+        assert_eq!(f.count("provider_active_generations"), 1);
+        assert_eq!(f.count("provider_active_destinations"), 0);
+        assert_eq!(f.count("assets"), 0);
+    }
+}
+
+#[tokio::test]
+async fn selected_confirmation_uses_bound_media_source_not_membership_library() {
+    let f = Fixture::new().await;
+    let mut media_session = f.session.clone();
+    media_session.zone_name = Arc::from("SharedSync-media");
+    media_session.zone_owner = Arc::from("MEDIA_OWNER_CANARY");
+    media_session.calls = Arc::new(AtomicUsize::new(0));
+    let mut media_records = records("m", CURRENT, "current");
+    media_records[1]["fields"]["masterRef"]["value"]["zoneID"] = json!({"zoneName":media_session.zone_name.as_ref(),"ownerRecordName":media_session.zone_owner.as_ref()});
+    media_session.records = Arc::new(Mutex::new(media_records));
+    let mut media = uncaptured_destination_pass(&media_session, "A").album;
+    media.set_shadow_capture(f.capture.clone(), Arc::from("shared"));
+    let observed = media.confirm_catalog_asset("asset-m").await.unwrap().asset;
+    let owner_asset = f
+        .pass
+        .album
+        .confirm_catalog_asset("asset-m")
+        .await
+        .unwrap()
+        .asset;
+    assert!(!crate::icloud::photos::same_selected_facts(
+        &owner_asset,
+        &observed
+    ));
+    assert!(!crate::icloud::photos::same_selected_facts(
+        &observed,
+        &owner_asset
+    ));
+    assert!(crate::icloud::photos::same_selected_facts(
+        &owner_asset
+            .clone()
+            .with_source_zone(Arc::from("SharedSync-media")),
+        &observed,
+    ));
+    let owner_calls = f.session.calls.load(Ordering::SeqCst);
+    let media_calls = media_session.calls.load(Ordering::SeqCst);
+    let album = f
+        .pass
+        .album
+        .clone()
+        .with_cross_zone_sources(vec![media.clone()]);
+    let confirmed = album.confirm_selected_asset(&observed).await.unwrap();
+    assert_eq!(
+        album.selection_media_sources().unwrap(),
+        [album.selected_media_source(&observed).unwrap()]
+    );
+    assert!(f.pass.album.selection_media_sources().unwrap().is_empty());
+    let duplicate = f
+        .pass
+        .album
+        .clone()
+        .with_cross_zone_sources(vec![media.clone(), media.clone()]);
+    assert!(duplicate.selection_media_sources().is_err());
+    let same_zone = f
+        .pass
+        .album
+        .clone()
+        .with_cross_zone_sources(vec![f.pass.album.clone()]);
+    assert!(same_zone.selection_media_sources().is_err());
+    let unbound = f
+        .pass
+        .album
+        .clone()
+        .with_cross_zone_sources(vec![uncaptured_destination_pass(&media_session, "A").album]);
+    assert!(unbound.selection_media_sources().is_err());
+    let mut foreign_account = media.clone();
+    foreign_account.set_shadow_capture(
+        ShadowCapture::new(
+            f.db.clone(),
+            AccountOwner::configured("other@example.invalid", "com"),
+            "com",
+        ),
+        Arc::from("shared"),
+    );
+    assert!(
+        f.pass
+            .album
+            .clone()
+            .with_cross_zone_sources(vec![foreign_account])
+            .selection_media_sources()
+            .is_err()
+    );
+    assert_eq!(confirmed.asset.source_zone(), Some("SharedSync-media"));
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), owner_calls);
+    assert_eq!(media_session.calls.load(Ordering::SeqCst), media_calls + 2);
+    let binding = album.selected_media_source(&observed).unwrap();
+    let mut wrong_owner = binding.clone();
+    wrong_owner.zone["ownerRecordName"] = json!("OTHER_OWNER_CANARY");
+    let calls_before_owner_refusal = media_session.calls.load(Ordering::SeqCst);
+    assert!(
+        album
+            .confirm_selection_identity("asset-m", &wrong_owner)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        media_session.calls.load(Ordering::SeqCst),
+        calls_before_owner_refusal
+    );
+    let recovered = album
+        .confirm_selection_identity("asset-m", &binding)
+        .await
+        .unwrap();
+    assert!(crate::icloud::photos::same_selected_facts(
+        &recovered.asset,
+        &observed
+    ));
+    let mut changed_binding = binding;
+    changed_binding.scope.push(' ');
+    let calls_before_refusal = media_session.calls.load(Ordering::SeqCst);
+    assert!(
+        album
+            .confirm_selection_identity("asset-m", &changed_binding)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        media_session.calls.load(Ordering::SeqCst),
+        calls_before_refusal
+    );
+
+    let before = media_session.calls.load(Ordering::SeqCst);
+    assert!(
+        f.pass
+            .album
+            .confirm_selected_asset(&observed)
+            .await
+            .is_err()
+    );
+    let foreign = Fixture::new().await;
+    let mut foreign_realm = media.clone();
+    foreign_realm.set_shadow_capture(
+        ShadowCapture::new(f.db.clone(), owner(), "cn"),
+        Arc::from("shared"),
+    );
+    let foreign_realm = f
+        .pass
+        .album
+        .clone()
+        .with_cross_zone_sources(vec![foreign_realm]);
+    assert!(foreign_realm.selection_media_sources().is_err());
+    assert!(
+        foreign_realm
+            .confirm_selected_asset(&observed)
+            .await
+            .is_err()
+    );
+    media.set_shadow_capture(foreign.capture.clone(), Arc::from("shared"));
+    let mismatched = f.pass.album.clone().with_cross_zone_sources(vec![media]);
+    assert!(mismatched.confirm_selected_asset(&observed).await.is_err());
+    assert!(mismatched.selection_media_sources().is_err());
+    assert_eq!(media_session.calls.load(Ordering::SeqCst), before);
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), owner_calls);
+    assert_eq!(f.count("provider_active_destinations"), 0);
+}
+
+#[cfg(target_os = "linux")]
+async fn shared_process_fixture(url: &str) -> Fixture {
+    use sha2::{Digest, Sha256};
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("{album}");
+    f.config.retry.max_retries = 0;
+    let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    let checksum = data_encoding::BASE64.encode(&Sha256::digest(bytes));
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] =
+        json!({"downloadURL":url,"size":bytes.len(),"fileChecksum":checksum});
+    f
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+enum ProcessSelection {
+    SameZone,
+    CrossZone,
+    ExplicitOwners,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct MembershipProcessSession(CurrentSession);
+
+#[cfg(target_os = "linux")]
+#[async_trait::async_trait]
+impl PhotosSession for MembershipProcessSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        if url.contains("/records/query?") {
+            self.0.rank_calls.fetch_add(1, Ordering::SeqCst);
+            return Ok(json!({"records":[],"syncToken":"owner-rank-boundary"}));
+        }
+        if url.contains("/changes/zone?") {
+            let request: Value = serde_json::from_str(&body)?;
+            let relations = if self.0.zone_name.as_ref() == "SharedSync-media" {
+                self.0.records.lock().unwrap().clone()
+            } else if request["zones"][0].get("syncToken").is_none() {
+                ["A", "B"].into_iter().map(|album| json!({"recordName":format!("relation-{album}"),"recordType":"CPLContainerRelation","fields":{"containerId":{"value":album,"type":"STRING"},"itemId":{"value":"asset-m","type":"STRING"}}})).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            return Ok(
+                json!({"zones":[{"zoneID":request["zones"][0]["zoneID"],"records":relations,"syncToken":"quiet-zone-cursor","moreComing":false}]}),
+            );
+        }
+        DestinationSelectionSession(self.0.clone())
+            .post(url, body, headers)
+            .await
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn shared_process_passes(f: &Fixture, selection: ProcessSelection) -> [AlbumPass; 2] {
+    ["A", "B"].map(|name| {
+        let mut pass = uncaptured_destination_pass(&f.session, name);
+        if !matches!(selection, ProcessSelection::SameZone) {
+            let mut media_session = f.session.clone();
+            media_session.zone_name = Arc::from("SharedSync-media");
+            let mut membership_session = f.session.clone();
+            if matches!(selection, ProcessSelection::ExplicitOwners) {
+                media_session.zone_owner = Arc::from("MEDIA_OWNER_CANARY");
+                membership_session.zone_owner = Arc::from("MEMBERSHIP_OWNER_CANARY");
+            }
+            let mut records = f.session.records.lock().unwrap().clone();
+            records[1]["fields"]["masterRef"]["value"]["zoneID"] =
+                json!({"zoneName":"SharedSync-media","ownerRecordName":media_session.zone_owner.as_ref()});
+            media_session.records = Arc::new(Mutex::new(records));
+            let mut media = destination_pass_with_session(
+                &media_session,
+                name,
+                Box::new(MembershipProcessSession(media_session.clone())),
+            )
+            .album;
+            media.set_shadow_capture(f.capture.clone(), Arc::from("shared"));
+            pass.album = destination_pass_with_session(
+                &membership_session,
+                name,
+                Box::new(MembershipProcessSession(membership_session.clone())),
+            )
+            .album
+            .with_cross_zone_sources(vec![media]);
+        }
+        pass.album
+            .set_shadow_capture(f.capture.clone(), Arc::from("shared"));
+        pass
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "isolated subprocess controlled by the shared destination process-death parent"]
+async fn shared_destination_process_death_child() {
+    let (trace, _guard) = crate::test_helpers::TracingCapture::install();
+    use crate::state::ReconciliationStateStore;
+    let url = std::env::var("KEI_TEST_DESTINATION_URL").unwrap();
+    let marker = std::env::var_os("KEI_TEST_DESTINATION_MARKER").unwrap();
+    let selection = match std::env::var("KEI_TEST_DESTINATION_SELECTION")
+        .unwrap()
+        .as_str()
+    {
+        "SameZone" => ProcessSelection::SameZone,
+        "CrossZone" => ProcessSelection::CrossZone,
+        "ExplicitOwners" => ProcessSelection::ExplicitOwners,
+        other => panic!("unknown selection {other}"),
+    };
+    let f = shared_process_fixture(&url).await;
+    let historical = f.config.directory.join("historical/never-recreate.JPG");
+    std::fs::create_dir_all(historical.parent().unwrap()).unwrap();
+    std::fs::write(
+        historical.with_file_name("retained.bin"),
+        b"historical bytes",
+    )
+    .unwrap();
+    let key = crate::state::ReconciliationPathKey(
+        crate::fs_util::confined_path_key(&historical).unwrap(),
+    );
+    let checksum: Box<str> =
+        f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"]
+            .as_str()
+            .unwrap()
+            .into();
+    f.db.reserve_reconciliation_paths(&[crate::state::ReconciliationReservation {
+        library: match selection {
+            ProcessSelection::SameZone => Arc::clone(&f.config.library),
+            ProcessSelection::CrossZone | ProcessSelection::ExplicitOwners => {
+                Arc::from("SharedSync-media")
+            }
+        },
+        asset_id: "asset-m".into(),
+        version_size: VersionSizeKey::Original,
+        content: Some(crate::state::ReconciliationContent {
+            checksum,
+            size: include_bytes!("../../../../tests/data/media/pattern.jpg").len() as u64,
+        }),
+        requested_path_key: key.clone(),
+        destination_path_key: key,
+        destination_path: historical,
+    }])
+    .await
+    .unwrap();
+    std::fs::write(marker, f.dir.path().to_str().unwrap()).unwrap();
+    assert!(
+        crate::download::orchestration::generation::context(
+            &shared_process_passes(&f, selection),
+            &f.config,
+            controls()
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+    let result = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &shared_process_passes(&f, selection),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    panic!(
+        "process-death child completed before interruption: {result:?}\n{:?}",
+        trace.events()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shared_destination_process_death_preserves_unfinished_peer() {
+    destination_process_death_fixture(ProcessSelection::SameZone).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cross_zone_destination_process_death_preserves_unfinished_peer() {
+    destination_process_death_fixture(ProcessSelection::CrossZone).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn explicit_owner_destination_process_death_preserves_unfinished_peer() {
+    destination_process_death_fixture(ProcessSelection::ExplicitOwners).await;
+}
+
+#[cfg(target_os = "linux")]
+async fn destination_process_death_fixture(selection: ProcessSelection) {
+    use crate::state::ReconciliationStateStore;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::clone(&calls);
+    Mock::given(method("GET"))
+        .respond_with(move |_: &wiremock::Request| {
+            let response = ResponseTemplate::new(200).set_body_bytes(bytes);
+            if requests.fetch_add(1, Ordering::SeqCst) == 1 {
+                response.set_delay(std::time::Duration::from_secs(60))
+            } else {
+                response
+            }
+        })
+        .mount(&server)
+        .await;
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("destination-child");
+    let url = format!("{}/media", server.uri());
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "download::orchestration::queue_projection::tests::shared_destination_process_death_child", "--ignored", "--nocapture"])
+        .env("TMPDIR", root.path())
+        .env("KEI_TEST_DESTINATION_URL", &url)
+        .env("KEI_TEST_DESTINATION_MARKER", &marker)
+        .env("KEI_TEST_DESTINATION_SELECTION", format!("{selection:?}"))
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut paused = None;
+    for _ in 0..800 {
+        if let Ok(directory) = std::fs::read_to_string(&marker) {
+            let directory = std::path::PathBuf::from(directory);
+            let conn = rusqlite::Connection::open(directory.join("state.db")).unwrap();
+            let counts = conn.query_row::<(i64, i64), _, _>(
+                "SELECT count(*),coalesce(sum(verified_media),0) FROM provider_active_destinations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            if counts == (2, 1) && calls.load(Ordering::SeqCst) == 2 {
+                paused = Some(directory);
+                break;
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("destination child exited before interruption boundary: {status}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    let directory = paused.expect("child must publish one destination with its peer unfinished");
+    let mut f = shared_process_fixture(&url).await;
+    f.config.directory = Arc::from(directory.join("media").as_path());
+    f.config.sync_mode = crate::download::SyncMode::Incremental {
+        zone_sync_token: "old-cursor".into(),
+    };
+    let mut historical_reservation = None;
+    for round in 0..3 {
+        f.db = Arc::new(
+            SqliteStateDb::open_owned(&directory.join("state.db"), &owner())
+                .await
+                .unwrap(),
+        );
+        f.capture = ShadowCapture::new(Arc::clone(&f.db), owner(), "com");
+        f.config.state_db = Some(Arc::clone(&f.db) as Arc<dyn DownloadStore>);
+        let historical = f.config.directory.join("historical/never-recreate.JPG");
+        let reservation =
+            f.db.get_reconciliation_reservations()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|reservation| reservation.destination_path == historical)
+                .unwrap();
+        if let Some(previous) = &historical_reservation {
+            assert_eq!(&reservation, previous);
+        } else {
+            historical_reservation = Some(reservation);
+        }
+        let before = calls.load(Ordering::SeqCst);
+        let ranks_before = f.session.rank_calls.load(Ordering::SeqCst);
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &shared_process_passes(&f, selection),
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result.outcome, crate::download::DownloadOutcome::Success),
+            "{result:?}"
+        );
+        assert_eq!(result.stats.downloaded, usize::from(round == 0));
+        assert_eq!(
+            calls.load(Ordering::SeqCst) - before,
+            usize::from(round == 0)
+        );
+        for album in ["A", "B"] {
+            assert_eq!(
+                std::fs::read(f.config.directory.join(album).join("changed.JPG")).unwrap(),
+                bytes
+            );
+        }
+        assert!(!historical.exists());
+        assert_eq!(
+            std::fs::read(historical.with_file_name("retained.bin")).unwrap(),
+            b"historical bytes"
+        );
+        assert_eq!(
+            f.db.acquire_lock("unfinished peer after process death")
+                .unwrap()
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_active_destinations WHERE verified_media=0",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            0
+        );
+        if !matches!(selection, ProcessSelection::SameZone) {
+            assert!(f.session.rank_calls.load(Ordering::SeqCst) > ranks_before);
+            let conn =
+                f.db.acquire_lock("cross-zone durable ownership after process death")
+                    .unwrap();
+            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE library<>'SharedSync-media'", [], |row| row.get(0)).unwrap(), 0);
+            assert!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_selection_rank_pages WHERE json_type(request,'$.zones')='array'", [], |row| row.get(0)).unwrap() > 0);
+            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_decisions WHERE json_extract(manifest,'$.decision.media_source.zone.zoneName') IS NOT 'SharedSync-media'", [], |row| row.get(0)).unwrap(), 0);
+            if matches!(selection, ProcessSelection::ExplicitOwners) {
+                assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_decisions WHERE json_extract(manifest,'$.decision.media_source.zone.ownerRecordName') IS NOT 'MEDIA_OWNER_CANARY'", [], |row| row.get(0)).unwrap(), 0);
+                assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_generations WHERE json_extract(specification,'$.zone.ownerRecordName') IS NOT 'MEMBERSHIP_OWNER_CANARY'", [], |row| row.get(0)).unwrap(), 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn ordinary_destination_retry_does_not_resurrect_historical_reservations() {
+    for failed_album in [
+        None,
+        Some(&["A"][..]),
+        Some(&["B"][..]),
+        Some(&["A", "B"][..]),
+    ] {
+        selected_destination_retry_fixture(
+            false,
+            failed_album,
+            crate::download::CaptureTimestampRepair::Preserve,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn capture_repair_destination_retry_does_not_resurrect_historical_reservations() {
+    selected_destination_retry_fixture(
+        true,
+        Some(&["A", "B"]),
+        crate::download::CaptureTimestampRepair::ReplaceWithCaptureLocal,
+    )
+    .await;
+}
+
+async fn selected_destination_retry_fixture(
+    captured: bool,
+    failed_album: Option<&'static [&'static str]>,
+    capture_timestamp_repair: crate::download::CaptureTimestampRepair,
+) {
+    let (trace, _guard) = crate::test_helpers::TracingCapture::install();
+    use crate::state::ReconciliationStateStore;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let bytes = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
+    let checksum = data_encoding::BASE64.encode(&Sha256::digest(bytes));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let requests = calls.clone();
+    let fail = failing.clone();
+    Mock::given(method("GET"))
+        .respond_with(move |_: &wiremock::Request| {
+            let ordinal = requests.fetch_add(1, Ordering::SeqCst);
+            if failed_album.is_none() && ordinal > 0 && fail.load(Ordering::SeqCst) {
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200).set_body_bytes(bytes)
+            }
+        })
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("{album}/copies");
+    f.config.retry.max_retries = 0;
+    f.config.capture_timestamp_repair = capture_timestamp_repair;
+    if !captured {
+        f.session.zone_name = Arc::from("SharedSync-destination");
+        f.config.library = Arc::clone(&f.session.zone_name);
+        f.session.records.lock().unwrap()[1]["fields"]["masterRef"]["value"]["zoneID"]["zoneName"] =
+            json!(f.session.zone_name.as_ref());
+    }
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/media",server.uri()),"size":bytes.len(),"fileChecksum":checksum});
+    let historical = f.config.directory.join("historical/never-recreate.JPG");
+    std::fs::create_dir_all(historical.parent().unwrap()).unwrap();
+    let retained = historical.with_file_name("retained.bin");
+    std::fs::write(&retained, b"historical bytes").unwrap();
+    let key = crate::state::ReconciliationPathKey(
+        crate::fs_util::confined_path_key(&historical).unwrap(),
+    );
+    let reservation = crate::state::ReconciliationReservation {
+        library: Arc::clone(&f.config.library),
+        asset_id: "asset-m".into(),
+        version_size: VersionSizeKey::Original,
+        content: Some(crate::state::ReconciliationContent {
+            checksum: checksum.clone().into(),
+            size: bytes.len() as u64,
+        }),
+        requested_path_key: key.clone(),
+        destination_path_key: key,
+        destination_path: historical.clone(),
+    };
+    f.db.reserve_reconciliation_paths(std::slice::from_ref(&reservation))
+        .await
+        .unwrap();
+    let mut completed_path = None;
+    for round in 0..4 {
+        if round > 0 {
+            if round == 1 {
+                for album in failed_album.into_iter().flatten() {
+                    std::fs::remove_file(f.config.directory.join(album).join("copies")).unwrap();
+                }
+            }
+            f = reopen_destination_fixture(f).await;
+            failing.store(false, Ordering::SeqCst);
+        }
+        let before = calls.load(Ordering::SeqCst);
+        let passes = if captured {
+            [destination_pass(&f, "A"), destination_pass(&f, "B")]
+        } else {
+            ["A", "B"].map(|name| {
+                let mut pass = uncaptured_destination_pass(&f.session, name);
+                pass.album
+                    .set_shadow_capture(f.capture.clone(), Arc::from("shared"));
+                pass
+            })
+        };
+        if round == 0 && failed_album.is_some() {
+            // A preexisting album root is a valid collision and selects a
+            // sibling. Block the required parent *inside* the bound root.
+            crate::download::orchestration::album_directory::prepare(
+                &passes,
+                &f.config,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            for album in failed_album.into_iter().flatten() {
+                std::fs::write(
+                    f.config.directory.join(album).join("copies"),
+                    b"blocked parent",
+                )
+                .unwrap();
+            }
+        }
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &passes,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.stats.downloaded,
+            match round {
+                0 => 2 - failed_album.map_or(1, |albums| albums.len()),
+                1 => failed_album.map_or(1, |albums| albums.len()),
+                _ => 0,
+            },
+            "captured={captured} failed_album={failed_album:?} round {round}: {result:?}\n{:?}",
+            trace.events()
+        );
+        let paths = [
+            f.config.directory.join("A/copies/changed.JPG"),
+            f.config.directory.join("B/copies/changed.JPG"),
+        ];
+        if round == 0 {
+            assert!(matches!(
+                result.outcome,
+                crate::download::DownloadOutcome::PartialFailure { .. }
+            ));
+            assert!(result.checkpoint.sync_token_blocked);
+            assert!(result.sync_token.is_none());
+            let existing: Vec<_> = paths.iter().filter(|path| path.exists()).cloned().collect();
+            assert_eq!(
+                existing.len(),
+                2 - failed_album.map_or(1, |albums| albums.len())
+            );
+            completed_path = existing.first().cloned();
+        } else {
+            assert_eq!(
+                calls.load(Ordering::SeqCst) - before,
+                if round == 1 {
+                    failed_album.map_or(1, |albums| albums.len())
+                } else {
+                    0
+                }
+            );
+            for path in &paths {
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+        }
+        if let Some(path) = &completed_path {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        assert!(!historical.exists());
+        assert_eq!(std::fs::read(&retained).unwrap(), b"historical bytes");
+        assert_eq!(
+            f.db.acquire_lock("explicit current media source").unwrap().query_row::<i64,_,_>(
+                "SELECT count(*) FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE json_extract(d.manifest,'$.decision.confirmation') IS NOT NULL AND json_extract(d.manifest,'$.decision.media_source.scope') IS NOT g.scope",
+                [], |row| row.get(0),
+            ).unwrap(),
+            0,
+        );
+        assert!(
+            f.db.get_reconciliation_reservations()
+                .await
+                .unwrap()
+                .contains(&reservation)
+        );
+        {
+            assert_eq!(
+                f.db.acquire_lock("current destination obligations")
+                    .unwrap()
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM provider_active_destinations WHERE verified_media=0",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                if round == 0 {
+                    failed_album.map_or(1, |albums| albums.len()) as i64
+                } else {
+                    0
+                }
+            );
+        }
     }
 }
 
@@ -5706,11 +8546,7 @@ async fn private_multi_destination_raw_edited_alternative_and_companion_failure_
         .await
         .unwrap();
         assert_eq!(recovered.stats.downloaded, 2, "{policy:?}: {recovered:?}");
-        let names = if policy == crate::types::RawPolicy::PreferRaw {
-            vec![("r.DNG", raw.as_slice()), ("r_alt.JPG", jpeg.as_slice())]
-        } else {
-            vec![("r.JPG", jpeg.as_slice()), ("r_RAW.DNG", raw.as_slice())]
-        };
+        let names = [("r.JPG", jpeg.as_slice()), ("r_RAW.DNG", raw.as_slice())];
         for album in ["A", "B"] {
             for (name, bytes) in names.iter().copied().chain([
                 ("r_edited.JPG", edited.as_slice()),
@@ -5727,6 +8563,33 @@ async fn private_multi_destination_raw_edited_alternative_and_companion_failure_
             }
         }
         assert_eq!(f.db.acquire_lock("asset versus physical rendition oracle").unwrap().query_row::<(i64,i64),_,_>("SELECT count(DISTINCT child),count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap(),(2,10));
+        // A new configuration generation must keep each album's established
+        // copies, including both Live Photo components, at their recorded paths.
+        f.config.folder_structure_albums = Arc::from("new-template/{album}");
+        f = reopen_destination_fixture(f).await;
+        let changed = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &[destination_pass(&f, "A"), destination_pass(&f, "B")],
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed.stats.downloaded, 0, "{policy:?}: {changed:?}");
+        assert!(!f.config.directory.join("new-template").exists());
+        for album in ["A", "B"] {
+            for (name, bytes) in names.iter().copied().chain([
+                ("r_edited.JPG", edited.as_slice()),
+                ("l.JPG", jpeg.as_slice()),
+                ("l.MOV", movie.as_slice()),
+            ]) {
+                assert_eq!(
+                    std::fs::read(f.config.directory.join(album).join(name)).unwrap(),
+                    bytes
+                );
+            }
+        }
         let lookups = f.session.calls.load(Ordering::SeqCst);
         let ranks = f.session.rank_calls.load(Ordering::SeqCst);
         for _ in 0..2 {
@@ -5750,7 +8613,7 @@ async fn private_multi_destination_raw_edited_alternative_and_companion_failure_
 
 #[cfg(unix)]
 #[tokio::test]
-async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflicts_then_recover() {
+async fn private_selected_paths_qualify_around_regular_leaf_and_parent_symlink_conflicts() {
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::symlink;
     use wiremock::matchers::{method, path};
@@ -5799,11 +8662,7 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
         )
         .await
         .unwrap();
-        assert_eq!(
-            first.stats.downloaded,
-            if kind == "parent" { 1 } else { 2 },
-            "{kind}: {first:?}"
-        );
+        assert_eq!(first.stats.downloaded, 2, "{kind}: {first:?}");
         assert_eq!(
             std::fs::read(&outside_media).unwrap(),
             b"outside-owned-media"
@@ -5822,8 +8681,9 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
             assert!(std::fs::symlink_metadata(&conflict).unwrap().is_symlink());
         }
         if kind == "parent" {
-            assert!(first.checkpoint.sync_token_blocked);
-            assert!(first.sync_token.is_none());
+            assert!(std::fs::symlink_metadata(&album).unwrap().is_symlink());
+            assert!(!first.checkpoint.sync_token_blocked);
+            assert!(first.sync_token.is_some());
             assert_eq!(
                 f.db.acquire_lock("parent symlink cannot receive proof")
                     .unwrap()
@@ -5833,26 +8693,10 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
                         |r| r.get(0)
                     )
                     .unwrap(),
-                1
+                0
             );
-            // Remove only the owned fixture link. No existing target is changed.
-            std::fs::remove_file(&album).unwrap();
-            std::fs::create_dir(&album).unwrap();
-            drop(passes);
-            f = reopen_destination_fixture(f).await;
-            let recovered = crate::download::download_photos_with_sync(
-                &reqwest::Client::new(),
-                &[destination_pass(&f, "A"), destination_pass(&f, "B")],
-                Arc::new(f.config.clone()),
-                controls(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-            assert_eq!(recovered.stats.downloaded, 1, "{recovered:?}");
-        } else {
-            drop(passes);
         }
+        drop(passes);
         let verified: Vec<(String, String)> = {
             let conn =
                 f.db.acquire_lock("every destination has actual confined bytes")
@@ -5875,12 +8719,10 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
             );
             assert!(!std::fs::symlink_metadata(&path).unwrap().is_symlink());
             assert!(path.starts_with(&f.config.directory));
-            if kind != "parent" {
-                assert_ne!(
-                    path, conflict,
-                    "ordinary collision cannot overwrite the conflicting entry"
-                );
-            }
+            assert_ne!(
+                path, conflict,
+                "collision qualification cannot use the conflicting entry"
+            );
         }
         let lookups = f.session.calls.load(Ordering::SeqCst);
         let ranks = f.session.rank_calls.load(Ordering::SeqCst);
@@ -5908,11 +8750,15 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
             std::fs::read(&outside_sidecar).unwrap(),
             b"outside-owned-sidecar"
         );
+        if kind == "parent" {
+            assert!(std::fs::symlink_metadata(&album).unwrap().is_symlink());
+        }
     }
 }
 
 #[tokio::test]
 async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_resource() {
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5921,7 +8767,6 @@ async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_reso
     let jpeg = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
     let mut f = Fixture::new().await;
     f.config.folder_structure_albums = Arc::from("copies");
-    f.config.raw_policy = crate::types::RawPolicy::PreferRaw;
     f.config.retry.max_retries = 0;
     {
         let mut records = f.session.records.lock().unwrap();
@@ -5949,15 +8794,110 @@ async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_reso
     Mock::given(method("GET"))
         .and(path("/fresh-original-raw"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(raw))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/unused-jpeg"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(0)
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(jpeg))
+        .expect(2)
         .mount(&server)
         .await;
+    let passes = [destination_pass(&f, "A"), destination_pass(&f, "B")];
+    f.capture(
+        vec![json!({"recordName":"frozen-source","recordType":"FutureOpaque"})],
+        "frozen-source",
+    )
+    .await;
+    let root = crate::download::orchestration::generation::begin_frozen_fixture(
+        &passes,
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    for pass in &passes {
+        let key = crate::download::orchestration::generation::pass_key(pass);
+        assert_eq!(
+            pass.album
+                .clone()
+                .with_rank_capture(&root.id, &key)
+                .photos(None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let current = pass.album.confirm_catalog_asset("asset-m").await.unwrap();
+        let effective = f.config.with_pass(pass);
+        let mut planner = TaskPlanner::for_download(effective.state_db.as_deref())
+            .await
+            .unwrap();
+        let plan = planner
+            .plan_download_asset(&current.asset, &effective)
+            .await
+            .unwrap();
+        let mut frozen_records = Vec::new();
+        let mut destinations = Vec::new();
+        for mut task in plan.tasks {
+            let (logical, filename) = match task.version_size {
+                VersionSizeKey::Original => (VersionSizeKey::Alternative, "changed_alt.JPG"),
+                VersionSizeKey::Alternative => (VersionSizeKey::Original, "changed.DNG"),
+                _ => panic!("historical fixture contains only RAW/JPEG siblings"),
+            };
+            let filename = if pass.album.name.as_ref() == "B" {
+                format!("B-{filename}")
+            } else {
+                filename.to_owned()
+            };
+            task.download_path = f.config.directory.join("copies").join(filename);
+            let mut record = pending_record_for_task(&effective, &current.asset, &task);
+            record.version_size = logical;
+            destinations.push(crate::state::db::provider_selection::SelectionDestination {
+                version_size: logical.as_str().into(),
+                path: SelectionPath::from_path(&task.download_path),
+                checksum: task.checksum.to_string(),
+                size: task.size,
+                metadata_hash: record.metadata.metadata_hash.clone().unwrap(),
+            });
+            frozen_records.push(record);
+        }
+        assert_eq!(frozen_records.len(), 2);
+        let decision = crate::state::db::provider_generations::ActiveDecision {
+            sources: f
+                .db
+                .selection_rank_sources(owner(), root.id.clone(), key.clone(), "asset-m".into())
+                .await
+                .unwrap(),
+            state_id: "asset-m".into(),
+            decision: crate::state::db::provider_selection::SelectionDecision {
+                pass_key: key,
+                child: "asset-m".into(),
+                master: Some("m".into()),
+                confirmation: Some(current.body),
+                media_source: None,
+                outcome: SelectionOutcome::Selected,
+                reason: String::new(),
+                destinations,
+            },
+        };
+        assert!(
+            f.db.project_selection_decision(
+                owner(),
+                root.id.clone(),
+                decision,
+                frozen_records,
+                crate::state::db::provider_generations::MAX_GENERATION_BYTES
+            )
+            .await
+            .unwrap()
+            .admitted
+        );
+    }
+    f.db.seal_selection_generation(owner(), root.id, false, Some("bounded_fixture".into()))
+        .await
+        .unwrap();
+    f = reopen_destination_fixture(f).await;
     let first = crate::download::download_photos_with_sync(
         &reqwest::Client::new(),
         &[destination_pass(&f, "A"), destination_pass(&f, "B")],
@@ -5967,7 +8907,12 @@ async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_reso
     )
     .await
     .unwrap();
-    assert_eq!(first.stats.downloaded, 0, "{first:?}");
+    assert_eq!(
+        first.stats.downloaded,
+        2,
+        "{first:?}\n{:?}",
+        capture.events()
+    );
     assert!(first.sync_token.is_none());
     let roots = f.count("provider_active_generations");
     assert_eq!(roots, 1);
@@ -5994,7 +8939,7 @@ async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_reso
     )
     .await
     .unwrap();
-    assert_eq!(recovered.stats.downloaded, 1, "{recovered:?}");
+    assert_eq!(recovered.stats.downloaded, 2, "{recovered:?}");
     assert_eq!(
         f.session.rank_calls.load(Ordering::SeqCst),
         rank_calls,
@@ -6003,6 +8948,10 @@ async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_reso
     assert_eq!(f.count("provider_active_generations"), roots);
     let physical = f.config.directory.join("copies/changed.DNG");
     assert_eq!(std::fs::read(&physical).unwrap(), raw);
+    assert_eq!(
+        std::fs::read(f.config.directory.join("copies/B-changed.DNG")).unwrap(),
+        raw
+    );
     assert_eq!(f.db.acquire_lock("RAW provider swap cannot retire a JPEG or only one alias").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE version_size='original' AND verified_media=1 AND verified_metadata=1",[],|r|r.get(0)).unwrap(),2);
     let modified = std::fs::metadata(&physical).unwrap().modified().unwrap();
     let requests = server.received_requests().await.unwrap().len();
@@ -6516,34 +9465,108 @@ async fn private_lookup_session_recovery(multi: bool) {
 }
 
 #[tokio::test]
-async fn private_capture_timestamp_repair_keeps_its_whole_existing_receipt_owner() {
+async fn private_capture_timestamp_repair_uses_selected_destinations_and_existing_writer() {
+    let (trace, _guard) = crate::test_helpers::TracingCapture::install();
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
     let mut f = Fixture::new().await;
-    f.pass = destination_pass_with(&f.session, &f.capture, "A");
-    f.config.refresh_metadata = true;
-    assert!(
-        crate::download::orchestration::generation::context(
+    let source = f.dir.path().join("source.jpg");
+    std::fs::write(
+        &source,
+        include_bytes!("../../../../tests/data/media/pattern.jpg"),
+    )
+    .unwrap();
+    crate::download::metadata::apply_metadata(
+        &source,
+        &crate::download::metadata::MetadataWrite {
+            datetime: Some("2001:01:01 01:01:01".into()),
+            offset_time_original: Some("+05:00".into()),
+            ..Default::default()
+        },
+        ".seed",
+    )
+    .unwrap();
+    let original_timestamp = crate::download::metadata::probe_exif(&source).unwrap();
+    let bytes = std::fs::read(&source).unwrap();
+    let checksum = data_encoding::BASE64.encode(&Sha256::digest(&bytes));
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/media",server.uri()),"size":bytes.len(),"fileChecksum":checksum});
+    f.config.folder_structure_albums = Arc::from("{album}");
+    f.config.metadata.set_exif_datetime = true;
+    f.session.records.lock().unwrap()[1]["fields"]["timeZoneOffset"] =
+        json!({"type":"INT64","value":0});
+    for round in 0..5 {
+        if round > 0 {
+            f = reopen_destination_fixture(f).await;
+            f.config.refresh_metadata = true;
+            f.config.capture_timestamp_repair =
+                crate::download::CaptureTimestampRepair::ReplaceWithCaptureLocal;
+        }
+        if round == 1 {
+            f.db.acquire_lock("interrupt repaired metadata finalization").unwrap().execute_batch(
+                "CREATE TRIGGER repair_finish_fault BEFORE UPDATE OF verified_metadata ON provider_active_destinations WHEN OLD.prepared_checksum IS NOT NULL AND NEW.verified_metadata=1 BEGIN SELECT RAISE(ABORT,'synthetic repair finalization failure'); END;"
+            ).unwrap();
+        } else if round == 2 {
+            f.db.acquire_lock("resume repaired metadata finalization")
+                .unwrap()
+                .execute_batch("DROP TRIGGER repair_finish_fault")
+                .unwrap();
+        }
+        f.pass = destination_pass_with(&f.session, &f.capture, "A");
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
             std::slice::from_ref(&f.pass),
-            &f.config,
-            controls()
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
         )
         .await
-        .unwrap()
-        .is_some()
-    );
-    f.config.capture_timestamp_repair =
-        crate::download::metadata_rewrite::CaptureTimestampRepair::ReplaceWithCaptureLocal;
-    assert!(
-        crate::download::orchestration::generation::context(
-            std::slice::from_ref(&f.pass),
-            &f.config,
-            controls()
-        )
-        .await
-        .unwrap()
-        .is_none()
-    );
-    assert_eq!(f.count("provider_active_generations"), 0);
-    f.preserved().await;
+        .unwrap();
+        if round == 1 {
+            assert!(
+                matches!(
+                    result.outcome,
+                    crate::download::DownloadOutcome::PartialFailure { .. }
+                ),
+                "{result:?}"
+            );
+            assert!(result.checkpoint.sync_token_blocked);
+            assert_eq!(f.db.acquire_lock("prepared timestamp repair survives failure").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE prepared_checksum IS NOT NULL AND verified_metadata=0",[],|row|row.get(0)).unwrap(), 1);
+        } else {
+            assert!(
+                matches!(result.outcome, crate::download::DownloadOutcome::Success),
+                "round {round}: {result:?}\n{:?}",
+                trace.events()
+            );
+        }
+        assert_eq!(result.stats.downloaded, usize::from(round == 0));
+        let probe =
+            crate::download::metadata::probe_exif(&f.config.directory.join("A/changed.JPG"))
+                .unwrap();
+        if round == 0 {
+            assert_eq!(
+                probe.datetime_original,
+                original_timestamp.datetime_original
+            );
+            assert_eq!(
+                probe.offset_time_original,
+                original_timestamp.offset_time_original
+            );
+        } else {
+            let created = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+                .unwrap()
+                .fixed_offset();
+            assert!(probe.denotes_capture_time(&created), "{probe:?}");
+        }
+        assert!(f.count("provider_active_destinations") > 0);
+        f.preserved().await;
+    }
 }
 
 #[tokio::test]
@@ -6699,35 +9722,15 @@ async fn queue_projection_actual_diagnostics_child() {
     f.capture(records("m", OLD, "source"), "old").await;
     f.cycle().await.unwrap();
     let queue = f.queue();
-    assert_eq!(f.count("provider_selection_generations"), 1);
+    assert_eq!(f.count("provider_selection_generations"), 0);
     assert_eq!(f.count("provider_work_receipts"), 1);
 
-    let (id, manifest) = selection_manifest(&f).await;
-    assert_eq!(
-        f.db.capture_selection_shadow(owner(), manifest.clone(), 0)
-            .await
-            .unwrap(),
-        id
-    );
     let plan = f.plan().await;
     assert_eq!(
         f.db.project_provider_work(owner(), plan, 0).await.unwrap(),
         WorkAdmission::Admitted
     );
 
-    let mut equivalent = manifest.clone();
-    let body = equivalent.decisions[0].confirmation.take().unwrap();
-    let body = String::from_utf8(body)
-        .unwrap()
-        .replace(INITIAL_URL, ROTATED_URL)
-        .into_bytes();
-    equivalent.decisions[0].confirmation = Some(body);
-    assert_eq!(
-        f.db.capture_selection_shadow(owner(), equivalent, MAX_SELECTION_BYTES)
-            .await
-            .unwrap(),
-        id
-    );
     *f.session.records.lock().unwrap() = eligible_records("m", ROTATED_URL);
     let plan = f.plan().await;
     assert_eq!(
@@ -6736,7 +9739,7 @@ async fn queue_projection_actual_diagnostics_child() {
             .unwrap(),
         WorkAdmission::Admitted
     );
-    assert_eq!(f.count("provider_selection_generations"), 1);
+    assert_eq!(f.count("provider_selection_generations"), 0);
     assert_eq!(f.count("provider_work_receipts"), 1);
     assert_eq!(f.queue(), queue);
 
@@ -6752,24 +9755,10 @@ async fn queue_projection_actual_diagnostics_child() {
             .await,
         Err(crate::state::error::StateError::ProviderWorkFull)
     ));
-    let (_, mut manifest) = selection_manifest(&f).await;
-    manifest.decisions[0].reason = "x".repeat(16 * 1024 * 1024);
-    assert!(matches!(
-        f.db.capture_selection_shadow(owner(), manifest, MAX_SELECTION_BYTES)
-            .await,
-        Err(crate::state::error::StateError::ProviderSelectionFull)
-    ));
     let plan = f.plan().await;
     assert_eq!(
         f.db.project_provider_work(owner(), plan, 0).await.unwrap(),
         WorkAdmission::Admitted
-    );
-    let (_, manifest) = selection_manifest(&f).await;
-    assert_eq!(
-        f.db.capture_selection_shadow(owner(), manifest, 0)
-            .await
-            .unwrap(),
-        id
     );
 
     crate::support::begin(json!({"scenario": "capacity"}));
@@ -6779,22 +9768,12 @@ async fn queue_projection_actual_diagnostics_child() {
         f.db.project_provider_work(owner(), plan, 0).await,
         Err(crate::state::error::StateError::ProviderWorkFull)
     ));
-    let (_, mut manifest) = selection_manifest(&f).await;
-    let mut second = manifest.decisions[0].clone();
-    manifest.decisions[0].pass_key = "album-A".to_owned();
-    second.pass_key = "album-B".to_owned();
-    second.destinations[0].path = SelectionPath::from_path(&f.config.directory.join("B/photo.jpg"));
-    manifest.decisions.push(second);
-    assert!(matches!(
-        f.db.capture_selection_shadow(owner(), manifest, 0).await,
-        Err(crate::state::error::StateError::ProviderSelectionFull)
-    ));
 
     guard.finish().await;
 }
 
 #[tokio::test]
-async fn queue_projection_actual_diagnostics_record_selection_and_work_limits() {
+async fn queue_projection_actual_diagnostics_record_work_limits() {
     if std::env::var_os("KEI_TEST_QUEUE_DIAGNOSTICS_CHILD").is_some() {
         queue_projection_actual_diagnostics_child().await;
         return;
@@ -6804,7 +9783,7 @@ async fn queue_projection_actual_diagnostics_record_selection_and_work_limits() 
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "download::orchestration::queue_projection::tests::queue_projection_actual_diagnostics_record_selection_and_work_limits",
+            "download::orchestration::queue_projection::tests::queue_projection_actual_diagnostics_record_work_limits",
             "--nocapture",
         ])
         .env("TMPDIR", root.path())
@@ -6823,24 +9802,940 @@ async fn queue_projection_actual_diagnostics_record_selection_and_work_limits() 
     let snapshot = crate::support::history::test_retained_snapshot(&history);
     let cycles = snapshot["cycles"].as_array().unwrap();
     let first = &cycles[0]["storage_reuse"];
-    assert_eq!(first["selection"]["new"], 1);
-    assert_eq!(first["selection"]["exact"], 1);
-    assert_eq!(first["selection"]["equivalent"], 1);
+    assert_eq!(first["selection"]["observed"], false);
     assert_eq!(first["work"]["new"], 1);
     assert_eq!(first["work"]["exact"], 1);
     assert_eq!(first["work"]["equivalent"], 1);
     let single = &cycles[1]["storage_reuse"];
-    assert_eq!(single["selection"]["single_item_limit"], 1);
-    assert_eq!(single["selection"]["last_reason"], "single_item_limit");
-    assert!(single["selection"]["last_observed_used"].is_null());
+    assert_eq!(single["selection"]["observed"], false);
     assert_eq!(single["work"]["single_item_limit"], 1);
     assert_eq!(single["work"]["last_reason"], "single_item_limit");
     assert!(single["work"]["last_observed_used"].is_null());
     let capacity = &cycles[2]["storage_reuse"];
-    assert_eq!(capacity["selection"]["capacity_rejected"], 1);
-    assert_eq!(capacity["selection"]["last_reason"], "capacity");
-    assert_eq!(capacity["selection"]["last_observed_limit"], 0);
+    assert_eq!(capacity["selection"]["observed"], false);
     assert_eq!(capacity["work"]["capacity_rejected"], 1);
     assert_eq!(capacity["work"]["last_reason"], "capacity");
     assert_eq!(capacity["work"]["last_observed_limit"], 0);
+}
+
+#[tokio::test]
+async fn explicit_integrity_confirmation_repairs_only_target_after_reopen() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::Confirmed)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_unavailable_source_keeps_damaged_bytes_and_retries() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::Unavailable)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_concurrent_edit_refuses_replacement_after_reopen() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::ConcurrentEdit)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_same_size_corruption_requires_confirmation() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::SameSize)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_landed_repair_recovers_after_finalization_failure() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::Interrupted)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_managed_copy_uses_existing_publication_owner() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::Managed)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_managed_copy_refuses_concurrent_edit() {
+    Box::pin(completed_copy_recovery(
+        IntegrityRecovery::ManagedConcurrentEdit,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_managed_copy_preserves_unavailable_damage() {
+    Box::pin(completed_copy_recovery(
+        IntegrityRecovery::ManagedUnavailable,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_managed_copy_recovers_interrupted_publication() {
+    Box::pin(completed_copy_recovery(
+        IntegrityRecovery::ManagedInterrupted,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_stale_cli_confirmation_refuses_changed_fingerprint() {
+    Box::pin(completed_copy_recovery(
+        IntegrityRecovery::StaleConfirmation,
+    ))
+    .await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IntegrityRecovery {
+    Preserved,
+    Reconfirmed,
+    ManagedReconfirmed,
+    ManagedInterrupted,
+    ManagedConcurrentEdit,
+    ManagedUnavailable,
+    Interrupted,
+    Missing,
+    Confirmed,
+    Unavailable,
+    ConcurrentEdit,
+    SameSize,
+    Managed,
+    StaleConfirmation,
+}
+
+#[tokio::test]
+async fn explicit_integrity_confirmed_preserved_copy_repairs_only_target() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::Preserved)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_reconfirms_edited_bytes_and_repairs_only_target() {
+    Box::pin(completed_copy_recovery(IntegrityRecovery::Reconfirmed)).await;
+}
+
+#[tokio::test]
+async fn explicit_integrity_managed_copy_reconfirms_edited_bytes_and_repairs_only_target() {
+    Box::pin(completed_copy_recovery(
+        IntegrityRecovery::ManagedReconfirmed,
+    ))
+    .await;
+}
+
+async fn completed_copy_recovery(scenario: IntegrityRecovery) {
+    let managed = matches!(
+        scenario,
+        IntegrityRecovery::Managed
+            | IntegrityRecovery::ManagedReconfirmed
+            | IntegrityRecovery::ManagedConcurrentEdit
+            | IntegrityRecovery::ManagedUnavailable
+            | IntegrityRecovery::ManagedInterrupted
+    );
+    let reconfirmed = matches!(
+        scenario,
+        IntegrityRecovery::Reconfirmed | IntegrityRecovery::ManagedReconfirmed
+    );
+    let interrupted_repair = matches!(
+        scenario,
+        IntegrityRecovery::Interrupted | IntegrityRecovery::ManagedInterrupted
+    );
+    let unavailable_source = matches!(
+        scenario,
+        IntegrityRecovery::Unavailable | IntegrityRecovery::ManagedUnavailable
+    );
+    let concurrent_edit = matches!(
+        scenario,
+        IntegrityRecovery::ConcurrentEdit | IntegrityRecovery::ManagedConcurrentEdit
+    );
+    let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let media = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\0\xff\xd9";
+    let checksum = format!("{:x}", Sha256::digest(media));
+    let unavailable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let media_unavailable = Arc::clone(&unavailable);
+    Mock::given(method("GET"))
+        .and(path("/completed-copy"))
+        .respond_with(move |_request: &wiremock::Request| {
+            if media_unavailable.load(Ordering::SeqCst) {
+                ResponseTemplate::new(404)
+            } else {
+                ResponseTemplate::new(200).set_body_bytes(media)
+            }
+        })
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    if managed {
+        f.config.primary_layout_active = true;
+        f.config.edited_naming = crate::types::EditedNaming::Primary;
+    }
+    f.config.folder_structure_albums = Arc::from("{album}");
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL": format!("{}/completed-copy", server.uri()),
+        "size": media.len(),
+        "fileChecksum": data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    f.capture(records("m", OLD, "historical"), "old").await;
+    let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+    for pass in &passes {
+        crate::download::orchestration::test_support::seed_complete_album_snapshot(
+            f.db.as_ref(),
+            pass.album.container_id().unwrap(),
+            pass.album.name.as_ref(),
+            &[("asset-m", "m")],
+        )
+        .await;
+    }
+    let a = f.config.directory.join("A").join("changed.JPG");
+    let b = f.config.directory.join("B").join("changed.JPG");
+    let mut expected = passes
+        .iter()
+        .zip([&a, &b])
+        .map(|(pass, path)| {
+            (
+                crate::download::orchestration::generation::pass_key(pass),
+                path.clone(),
+                checksum.clone(),
+                checksum.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
+    let receipts = |db: &SqliteStateDb| {
+        let conn = db
+            .acquire_lock("independent completed album receipts")
+            .unwrap();
+        conn.prepare("SELECT DISTINCT pass_key,path,source_checksum,local_checksum FROM provider_active_destinations WHERE child='asset-m' AND version_size='original' AND admitted=1 AND verified_media=1 ORDER BY pass_key,path")
+            .unwrap()
+            .query_map([], |row| {
+                let path: String = row.get(1)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    serde_json::from_str::<SelectionPath>(&path)
+                        .unwrap()
+                        .to_path(),
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let initial = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes,
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let initial_requests = if managed { 1 } else { 2 };
+    assert_eq!(initial.stats.downloaded, initial_requests, "{initial:?}");
+    assert!(initial.stats.sync_token_blocked_reason.is_none());
+    assert_eq!(receipts(&f.db), expected);
+    assert_eq!(std::fs::read(&a).unwrap(), media);
+    assert_eq!(std::fs::read(&b).unwrap(), media);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        initial_requests
+    );
+    let mut requests_before_repair = initial_requests;
+    let original_metadata = std::fs::metadata(&a).unwrap();
+    drop(passes);
+    if scenario != IntegrityRecovery::Missing {
+        let mut damaged = if scenario == IntegrityRecovery::SameSize {
+            media.to_vec()
+        } else {
+            b"damaged bytes".to_vec()
+        };
+        if scenario == IntegrityRecovery::SameSize {
+            *damaged.last_mut().unwrap() ^= 1;
+        }
+        std::fs::write(&b, &damaged).unwrap();
+        f = reopen_destination_fixture(f).await;
+        let quiet_passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+        let quiet = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &quiet_passes,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            quiet.stats.downloaded, 0,
+            "ordinary sync must preserve uncertain bytes: {quiet:?}"
+        );
+        assert_eq!(std::fs::read(&b).unwrap(), damaged);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            initial_requests
+        );
+        drop(quiet_passes);
+        if scenario == IntegrityRecovery::Preserved {
+            let path = SelectionPath::from_path(&b);
+            let (generation, pass_key, child) = f.db.acquire_lock("selected copy for local preservation").unwrap().query_row("SELECT generation,pass_key,child FROM provider_active_destinations WHERE path=?1 AND current_publication=1",[path.key().unwrap()],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+            f.db.preserve_selection_local(
+                owner(),
+                generation,
+                pass_key,
+                child,
+                path,
+                (
+                    format!("{:x}", Sha256::digest(&damaged)),
+                    damaged.len() as u64,
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(
+                f.db.inspect_integrity_destination(b.clone())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .preserved
+            );
+        }
+        let token = format!("{:x}:{}", Sha256::digest(&damaged), damaged.len());
+        f = confirm_damage_through_cli(
+            f,
+            &b,
+            &token,
+            scenario == IntegrityRecovery::StaleConfirmation,
+        )
+        .await;
+        assert_eq!(std::fs::read(&b).unwrap(), damaged);
+        assert_eq!(std::fs::read(&a).unwrap(), media);
+        if reconfirmed {
+            let replacement = b"re-edited bytes";
+            let previous = (
+                format!("{:x}", Sha256::digest(&damaged)),
+                damaged.len() as u64,
+            );
+            let current = (
+                format!("{:x}", Sha256::digest(replacement)),
+                replacement.len() as u64,
+            );
+            if scenario == IntegrityRecovery::ManagedReconfirmed {
+                // Attempt the explicit repair while its cloud source is
+                // unavailable. Execution after projection persists the planned
+                // journal pinned to the confirmed damaged bytes.
+                unavailable.store(true, Ordering::SeqCst);
+                f = reopen_destination_fixture(f).await;
+                let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+                let blocked = crate::download::download_photos_with_sync(
+                    &reqwest::Client::new(),
+                    &passes,
+                    Arc::new(f.config.clone()),
+                    controls(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(blocked.stats.downloaded, 0, "{blocked:?}");
+                assert!(
+                    blocked.stats.sync_token_blocked_reason.is_some(),
+                    "{blocked:?}"
+                );
+                assert_eq!(std::fs::read(&b).unwrap(), damaged);
+                assert_eq!(std::fs::read(&a).unwrap(), media);
+                assert!(
+                    server.received_requests().await.unwrap().len() > initial_requests,
+                    "the unavailable repair source must actually be attempted"
+                );
+                let planned =
+                    f.db.primary_layout_operations("PrimarySync".into())
+                        .await
+                        .unwrap();
+                assert_eq!(planned.len(), 1);
+                let planned = &planned[0];
+                assert_eq!(planned.phase, "planned");
+                assert!(
+                    planned
+                        .members
+                        .iter()
+                        .filter_map(|member| member.old.as_ref())
+                        .any(|old| {
+                            old.path.to_path() == b
+                                && old.fingerprint.size == damaged.len() as u64
+                                && data_encoding::HEXLOWER.encode(&old.fingerprint.sha256)
+                                    == previous.0
+                        }),
+                    "planned repair journal must pin the confirmed damaged bytes"
+                );
+                drop(passes);
+                f.db.make_selection_retry_due(owner(), "asset-m".into())
+                    .await
+                    .unwrap();
+                // Change the local copy after the journal was planned. A fresh
+                // generation with the same selected copy must bind the inherited
+                // confirmation without overwriting bytes it never confirmed.
+                std::fs::write(&b, replacement).unwrap();
+                let generations_before: i64 =
+                    f.db.acquire_lock("generations before fresh copy")
+                        .unwrap()
+                        .query_row(
+                            "SELECT count(*) FROM provider_active_generations",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                let inherited_before: i64 = f
+                    .db
+                    .acquire_lock("inherited confirmations before fresh copy")
+                    .unwrap()
+                    .query_row(
+                        "SELECT count(DISTINCT generation) FROM provider_active_destinations WHERE path=?1 AND confirmed_repair IS NOT NULL",
+                        [SelectionPath::from_path(&b).key().unwrap()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                f.capture(records("m", OLD, "historical"), "fresh").await;
+                f = reopen_destination_fixture(f).await;
+                let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+                let refused = crate::download::download_photos_with_sync(
+                    &reqwest::Client::new(),
+                    &passes,
+                    Arc::new(f.config.clone()),
+                    controls(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(refused.stats.downloaded, 0, "{refused:?}");
+                assert!(
+                    refused.stats.sync_token_blocked_reason.is_some(),
+                    "{refused:?}"
+                );
+                assert_eq!(std::fs::read(&b).unwrap(), replacement);
+                assert_eq!(std::fs::read(&a).unwrap(), media);
+                let generations_after: i64 =
+                    f.db.acquire_lock("generations after fresh copy")
+                        .unwrap()
+                        .query_row(
+                            "SELECT count(*) FROM provider_active_generations",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                assert!(
+                    generations_after > generations_before,
+                    "the same selected copy under a fresh basis must start a new generation"
+                );
+                let inherited_after: i64 = f
+                    .db
+                    .acquire_lock("inherited confirmations after fresh copy")
+                    .unwrap()
+                    .query_row(
+                        "SELECT count(DISTINCT generation) FROM provider_active_destinations WHERE path=?1 AND confirmed_repair IS NOT NULL",
+                        [SelectionPath::from_path(&b).key().unwrap()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(
+                    inherited_after > inherited_before,
+                    "the fresh generation must bind the inherited confirmation for this selected copy"
+                );
+                let retained =
+                    f.db.primary_layout_operations("PrimarySync".into())
+                        .await
+                        .unwrap();
+                assert_eq!(retained.len(), 1);
+                assert_eq!(retained[0].operation, planned.operation);
+                assert_eq!(retained[0].phase, "planned");
+                requests_before_repair = server.received_requests().await.unwrap().len();
+                drop(passes);
+            } else {
+                std::fs::write(&b, replacement).unwrap();
+            }
+            let stale =
+                f.db.inspect_integrity_destination(b.clone())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(stale.confirmed, Some(previous.clone()));
+            assert!(stale.local_checksum.is_none());
+            let token = format!("{}:{}", current.0, current.1);
+            f = confirm_damage_through_cli(f, &b, &token, false).await;
+            if scenario == IntegrityRecovery::ManagedReconfirmed {
+                unavailable.store(false, Ordering::SeqCst);
+            }
+            assert_eq!(std::fs::read(&b).unwrap(), replacement);
+            assert_eq!(std::fs::read(&a).unwrap(), media);
+            let replaced =
+                f.db.inspect_integrity_destination(b.clone())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(replaced.confirmed, Some(current));
+            assert!(replaced.local_checksum.is_none());
+            assert!(
+                f.db.confirm_integrity_damage(stale, previous)
+                    .await
+                    .is_err(),
+                "a stale inspected confirmation must not replace the current one"
+            );
+            assert_eq!(std::fs::read(&b).unwrap(), replacement);
+        }
+        if unavailable_source || concurrent_edit {
+            if unavailable_source {
+                unavailable.store(true, Ordering::SeqCst);
+                if !managed {
+                    *f.session.corrupt.lock().unwrap() = Some("missing");
+                }
+            } else {
+                std::fs::write(&b, b"new intentional edit").unwrap();
+            }
+            f = reopen_destination_fixture(f).await;
+            let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+            let blocked = crate::download::download_photos_with_sync(
+                &reqwest::Client::new(),
+                &passes,
+                Arc::new(f.config.clone()),
+                controls(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                blocked.stats.sync_token_blocked_reason.is_some(),
+                "{blocked:?}"
+            );
+            assert_eq!(
+                std::fs::read(&b).unwrap(),
+                if unavailable_source {
+                    b"damaged bytes".as_slice()
+                } else {
+                    b"new intentional edit".as_slice()
+                }
+            );
+            assert_eq!(std::fs::read(&a).unwrap(), media);
+            assert_eq!(
+                std::fs::metadata(&a).unwrap().modified().unwrap(),
+                original_metadata.modified().unwrap(),
+                "failed repair rewrote healthy peer"
+            );
+            requests_before_repair = server.received_requests().await.unwrap().len();
+            if unavailable_source {
+                assert!(
+                    requests_before_repair > initial_requests,
+                    "the unavailable media endpoint must actually be attempted"
+                );
+                unavailable.store(false, Ordering::SeqCst);
+            } else {
+                assert_eq!(requests_before_repair, initial_requests);
+            }
+            let confirmed: i64 = f.db.acquire_lock("retained explicit repair after refusal").unwrap()
+                .query_row("SELECT count(*) FROM provider_active_destinations WHERE confirmed_repair IS NOT NULL AND verified_media=0 AND source_checksum IS NULL", [], |row| row.get(0)).unwrap();
+            assert_eq!(confirmed, 1);
+            drop(passes);
+            *f.session.corrupt.lock().unwrap() = None;
+            if concurrent_edit {
+                // Restore the exact explicitly confirmed damaged bytes. The
+                // refused user edit was never overwritten by sync.
+                std::fs::write(&b, b"damaged bytes").unwrap();
+            }
+            f.db.make_selection_retry_due(owner(), "asset-m".into())
+                .await
+                .unwrap();
+        }
+    } else {
+        std::fs::remove_file(&b).unwrap();
+    }
+    if interrupted_repair {
+        f.db.acquire_lock("interrupt repair finalization").unwrap().execute_batch(
+            "CREATE TRIGGER integrity_finalization_fault BEFORE UPDATE OF verified_media ON provider_active_destinations WHEN NEW.verified_media=1 AND OLD.confirmed_repair IS NOT NULL BEGIN SELECT RAISE(ABORT,'repair finalization interrupted'); END;"
+        ).unwrap();
+        let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+        let interrupted = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &passes,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            interrupted.stats.sync_token_blocked_reason.is_some(),
+            "{interrupted:?}"
+        );
+        assert_eq!(
+            std::fs::read(&b).unwrap(),
+            media,
+            "verified bytes must have landed before the injected failure"
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), media);
+        f.db.acquire_lock("release repair finalization fault")
+            .unwrap()
+            .execute_batch("DROP TRIGGER integrity_finalization_fault;")
+            .unwrap();
+        f.db.make_selection_retry_due(owner(), "asset-m".into())
+            .await
+            .unwrap();
+    }
+    let mut settled_lookups = None;
+    for cycle in 0..3 {
+        f = reopen_destination_fixture(f).await;
+        let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+        assert_eq!(
+            crate::download::has_due_selection_work(&passes, &f.config, controls())
+                .await
+                .unwrap(),
+            Some(cycle == 0),
+        );
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &passes,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.stats.downloaded,
+            usize::from(cycle == 0 && !interrupted_repair),
+            "{result:?}; {:?}",
+            trace
+                .events()
+                .into_iter()
+                .filter(|event| event.level == tracing::Level::ERROR)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(result.outcome, crate::download::DownloadOutcome::Success),
+            "{result:?}; {:?}",
+            trace
+                .events()
+                .into_iter()
+                .filter(|event| event.level == tracing::Level::ERROR)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            result.stats.sync_token_blocked_reason.is_none(),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), media);
+        assert_eq!(std::fs::read(&b).unwrap(), media);
+        if managed {
+            let preserved: Vec<Vec<u8>> =
+                f.db.acquire_lock("managed damaged input preservation")
+                    .unwrap()
+                    .prepare("SELECT evidence FROM primary_layout_preserved")
+                    .unwrap()
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+            assert!(
+                preserved.into_iter().any(|bytes| {
+                    let file: crate::state::db::primary_layout::LayoutFile =
+                        serde_json::from_slice(&bytes).unwrap();
+                    std::fs::read(file.path.to_path()).unwrap()
+                        == if reconfirmed {
+                            b"re-edited bytes".as_slice()
+                        } else {
+                            b"damaged bytes".as_slice()
+                        }
+                        && file.source_checksum.is_none()
+                }),
+                "managed repair must durably preserve damaged input without cloud-source provenance"
+            );
+        }
+        assert_eq!(f.db.acquire_lock("completed repair consumes authority").unwrap()
+            .query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND confirmed_repair IS NOT NULL", [], |row| row.get(0)).unwrap(), 0);
+        let unchanged = std::fs::metadata(&a).unwrap();
+        assert_eq!(
+            unchanged.modified().unwrap(),
+            original_metadata.modified().unwrap(),
+            "{result:?}; {:?}",
+            trace
+                .events()
+                .into_iter()
+                .filter(|event| event.level == tracing::Level::INFO)
+                .collect::<Vec<_>>()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                (unchanged.dev(), unchanged.ino()),
+                (original_metadata.dev(), original_metadata.ino())
+            );
+            assert_ne!(unchanged.ino(), std::fs::metadata(&b).unwrap().ino());
+        }
+        assert_eq!(receipts(&f.db), expected);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            requests_before_repair + 1
+        );
+        let lookups = f.session.calls.load(Ordering::SeqCst);
+        if let Some(settled) = settled_lookups {
+            assert_eq!(lookups, settled, "quiet reopen repeated provider lookup");
+        }
+        settled_lookups = Some(lookups);
+    }
+}
+
+async fn confirm_damage_through_cli(
+    mut f: Fixture,
+    path: &std::path::Path,
+    token: &str,
+    stale_confirmation: bool,
+) -> Fixture {
+    use clap::Parser;
+    let globals = crate::config::GlobalArgs {
+        config_source: crate::config::ConfigSource::Unavailable,
+        username: Some("queue-stage@example.invalid".into()),
+        domain: None,
+        data_dir: Some(f.dir.path().to_str().unwrap().to_owned()),
+    };
+    let cli_path = crate::get_db_path(&globals, None).await.unwrap();
+    f.config.state_db = None;
+    drop(f.capture);
+    drop(f.pass);
+    drop(f.db);
+    std::fs::rename(f.dir.path().join("state.db"), &cli_path).unwrap();
+    for confirmation in [None, Some(token)] {
+        let mut argv = vec!["kei", "reconcile", "--inspect-path", path.to_str().unwrap()];
+        if let Some(token) = confirmation {
+            argv.extend(["--confirm-damage", token]);
+        }
+        if stale_confirmation && confirmation.is_some() {
+            let before = std::fs::read(path).unwrap();
+            let cli = crate::cli::Cli::try_parse_from([
+                "kei",
+                "reconcile",
+                "--inspect-path",
+                path.to_str().unwrap(),
+                "--confirm-damage",
+                "stale-fingerprint",
+            ])
+            .unwrap();
+            let crate::cli::Command::Reconcile(args) = cli.command else {
+                panic!("reconcile command")
+            };
+            let error = crate::commands::reconcile::run_reconcile(args, &globals, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("File changed since inspection"));
+            assert_eq!(std::fs::read(path).unwrap(), before);
+        }
+        let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+        let crate::cli::Command::Reconcile(args) = cli.command else {
+            panic!("reconcile command")
+        };
+        crate::commands::reconcile::run_reconcile(args, &globals, None)
+            .await
+            .unwrap();
+    }
+    std::fs::rename(&cli_path, f.dir.path().join("state.db")).unwrap();
+    f.db = Arc::new(
+        SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    f.capture = ShadowCapture::new(f.db.clone(), owner(), "com");
+    f.config.state_db = Some(f.db.clone() as Arc<dyn DownloadStore>);
+    f.pass = destination_pass_with(&f.session, &f.capture, "A");
+    f
+}
+
+/// A selected album whose provider enumeration is empty. Exact lookups still
+/// reach the unchanged provider resource, so membership removal cannot be
+/// mistaken for source unavailability.
+#[derive(Clone)]
+struct RemovedAlbumMembershipSession(CurrentSession);
+
+#[async_trait::async_trait]
+impl PhotosSession for RemovedAlbumMembershipSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        if url.contains("/internal/records/query/batch?") {
+            let request: Value = serde_json::from_str(&body)?;
+            let batch = request["batch"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|_| json!({"records":[{"fields":{"itemCount":{"value":1}}}]}))
+                .collect::<Vec<_>>();
+            return Ok(json!({"batch":batch}));
+        }
+        if url.contains("/records/query?") {
+            // A complete empty page still carries the zone token, as an empty
+            // provider album does. The count probe remains deliberately stale.
+            return Ok(json!({"records":[],"syncToken":"destination-rank-proof"}));
+        }
+        self.0.post(url, body, headers).await
+    }
+    async fn post_changes_body(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Vec<u8>> {
+        if url.contains("/records/query?") {
+            return Ok(serde_json::to_vec(
+                &json!({"records":[],"syncToken":"destination-rank-proof"}),
+            )?);
+        }
+        self.0.post_changes_body(url, body, headers).await
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn confirmed_damage_removed_from_one_selected_album_stays_stable_without_completion() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let media = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\0\xff\xd9";
+    Mock::given(method("GET"))
+        .and(path("/membership-removal"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("{album}");
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL": format!("{}/membership-removal", server.uri()),
+        "size": media.len(),
+        "fileChecksum": data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    f.capture(records("m", OLD, "historical"), "old").await;
+    let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+    for pass in &passes {
+        crate::download::orchestration::test_support::seed_complete_album_snapshot(
+            f.db.as_ref(),
+            pass.album.container_id().unwrap(),
+            pass.album.name.as_ref(),
+            &[("asset-m", "m")],
+        )
+        .await;
+    }
+    let a = f.config.directory.join("A").join("changed.JPG");
+    let b = f.config.directory.join("B").join("changed.JPG");
+    let initial = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes,
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(initial.stats.downloaded, 2, "{initial:?}");
+    assert!(initial.stats.sync_token_blocked_reason.is_none());
+    assert_eq!(std::fs::read(&a).unwrap(), media);
+    assert_eq!(std::fs::read(&b).unwrap(), media);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    drop(passes);
+    let damaged = b"confirmed damaged bytes";
+    std::fs::write(&b, damaged).unwrap();
+    let token = format!("{:x}:{}", Sha256::digest(damaged), damaged.len());
+    f = confirm_damage_through_cli(f, &b, &token, false).await;
+    assert_eq!(std::fs::read(&b).unwrap(), damaged);
+    assert_eq!(std::fs::read(&a).unwrap(), media);
+    assert!(
+        f.db.inspect_integrity_destination(b.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .confirmed
+            .is_some()
+    );
+    // Reseed the same selected albums under the same configuration. A retains
+    // the provider membership; B no longer enumerates the asset. The provider
+    // resource and both album passes stay unchanged.
+    crate::download::orchestration::test_support::seed_complete_album_snapshot(
+        f.db.as_ref(),
+        "A",
+        "A",
+        &[("asset-m", "m")],
+    )
+    .await;
+    crate::download::orchestration::test_support::seed_complete_album_snapshot(
+        f.db.as_ref(),
+        "B",
+        "B",
+        &[],
+    )
+    .await;
+    let a_pass = destination_pass(&f, "A");
+    let mut b_pass = destination_pass_with_session(
+        &f.session,
+        "B",
+        Box::new(RemovedAlbumMembershipSession(f.session.clone())),
+    );
+    b_pass
+        .album
+        .set_shadow_capture(f.capture.clone(), Arc::from("private"));
+    let b_key = crate::download::orchestration::generation::pass_key(&b_pass);
+    let result = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &[a_pass, b_pass],
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.stats.downloaded, 0, "{result:?}");
+    assert!(
+        matches!(result.outcome, crate::download::DownloadOutcome::Success),
+        "{result:?}"
+    );
+    assert_eq!(std::fs::read(&b).unwrap(), damaged);
+    assert_eq!(std::fs::read(&a).unwrap(), media);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    let path = SelectionPath::from_path(&b);
+    let conn =
+        f.db.acquire_lock("removed membership repair state")
+            .unwrap();
+    let (pending, verified): (i64, i64) = conn
+        .query_row(
+            "SELECT COALESCE(SUM(confirmed_repair IS NOT NULL),0),COALESCE(SUM(verified_media),0) FROM provider_active_destinations WHERE pass_key=?1 AND path=?2",
+            rusqlite::params![&b_key, path.key().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(pending, 1, "confirmed damage intent must survive");
+    assert_eq!(verified, 0, "removed membership must not complete repair");
+    let (local, source): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT local_checksum,source_checksum FROM provider_active_destinations WHERE pass_key=?1 AND path=?2 AND confirmed_repair IS NOT NULL",
+            rusqlite::params![&b_key, path.key().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(local.is_none(), "completion must not claim damaged bytes");
+    assert!(
+        source.is_none(),
+        "completion must not claim cloud provenance"
+    );
+    drop(conn);
+    assert_eq!(
+        f.db.acquire_lock("no spurious completed repair").unwrap().query_row::<i64, _, _>(
+            "SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND confirmed_repair IS NOT NULL",
+            [],
+            |row| row.get(0)
+        ).unwrap(),
+        0
+    );
+    assert!(
+        result.stats.sync_token_blocked_reason.is_none(),
+        "removed membership must not block the current checkpoint: {result:?}"
+    );
+    assert!(!result.checkpoint.sync_token_blocked, "{result:?}");
 }

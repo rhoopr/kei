@@ -10,7 +10,6 @@ use tokio::sync::mpsc;
 use crate::download::filter::{
     DownloadTask, FilterReason, extract_skip_candidates, is_asset_filtered,
 };
-use crate::download::finalize::finalize_failed;
 use crate::download::metadata_rewrite::MetadataFlags;
 use crate::download::orchestration::generation::{
     SelectionConfirmationErrorClass, classify_selection_confirmation_error,
@@ -99,8 +98,6 @@ fn should_resnapshot_free_space(total: u64, last_snapshot_total: u64, interval: 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 enum AssetDisposition {
     Unresolved,
-    RetryOnly,
-    RetryExhausted,
     StateSkip,
     AmpmVariant,
     OnDisk,
@@ -149,7 +146,6 @@ impl ProducerSkipSummary {
             crate::download::filter::FilterReason::MediaType => self.by_media_type += 1,
             crate::download::filter::FilterReason::LivePhoto => self.by_live_photo += 1,
             crate::download::filter::FilterReason::DateRange => self.by_date_range += 1,
-            crate::download::filter::FilterReason::Filename => self.by_filename += 1,
         }
     }
 }
@@ -211,6 +207,7 @@ pub(super) struct StreamProducerMetrics {
     pub(super) enum_errors: Arc<std::sync::atomic::AtomicUsize>,
     pub(super) provider_auth_errors: Arc<std::sync::atomic::AtomicUsize>,
     pub(super) state_write_failures: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) storage_failed: Arc<std::sync::atomic::AtomicBool>,
     pub(super) enumeration_complete: Arc<std::sync::atomic::AtomicBool>,
     pub(super) layout_downloaded: Arc<std::sync::atomic::AtomicUsize>,
     pub(super) layout_photos: Arc<std::sync::atomic::AtomicUsize>,
@@ -247,6 +244,7 @@ where
     let enum_errors_producer = Arc::clone(&metrics.enum_errors);
     let provider_auth_errors = Arc::clone(&metrics.provider_auth_errors);
     let state_write_failures_producer = Arc::clone(&metrics.state_write_failures);
+    let storage_failed = Arc::clone(&metrics.storage_failed);
     let enumeration_complete_producer = Arc::clone(&metrics.enumeration_complete);
     let layout_downloaded = Arc::clone(&metrics.layout_downloaded);
     let layout_photos = Arc::clone(&metrics.layout_photos);
@@ -362,10 +360,17 @@ where
             }
         };
         tokio::pin!(combined);
-        'assets: while let Some(result) = combined.next().await {
-            if producer_shutdown.is_cancelled() {
-                break;
-            }
+        'assets: loop {
+            // User/pipeline cancellation must interrupt a pending provider tail.
+            // HTTP 410 cancels the consumer's transfer-only child, not this token.
+            let result = tokio::select! {
+                biased;
+                () = producer_shutdown.cancelled() => break,
+                result = combined.next() => match result {
+                    Some(result) => result,
+                    None => break,
+                },
+            };
             match result {
                 Ok(mut asset) => {
                     if !seen_asset_record_names.insert(asset.asset_record_name_arc()) {
@@ -384,6 +389,7 @@ where
                     // context.
                     let mut metadata_refresh_attempted = false;
                     let mut selected_plan = None;
+                    let mut selected_integrity_repair = false;
                     let mut reserved_pending = false;
                     if let Some(run) = &config.selection_run {
                         if run
@@ -401,7 +407,7 @@ where
                             continue;
                         };
                         let observed_child = asset.asset_record_name().to_owned();
-                        let (current, body) = match run.confirm(key, asset).await {
+                        let (current, body) = match run.confirm(key, &asset).await {
                             Ok(confirmed) => confirmed,
                             Err(error) => {
                                 enum_errors_producer
@@ -419,8 +425,9 @@ where
                                         return skips;
                                     }
                                     SelectionConfirmationErrorClass::Refused => {
-                                        if let Err(state_error) =
-                                            run.defer_confirmation(key, observed_child).await
+                                        if let Err(state_error) = run
+                                            .defer_confirmation(key, observed_child, Some(&asset))
+                                            .await
                                         {
                                             state_write_failures_producer
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -438,11 +445,13 @@ where
                             }
                         };
                         asset = current;
-                        if let Some(db) = &producer_state_db {
+                        if producer_state_db.is_some() {
                             let library = effective_asset_library(&asset, config).to_owned();
+                            // Preserve exact recorded retry ownership without
+                            // attributing unrelated historical master rows.
                             match download_ctx
-                                .select_asset_state_record_name_for_download(
-                                    Some(db.as_ref()),
+                                .select_current_asset_state_record_name_for_download(
+                                    producer_state_db.as_deref(),
                                     &library,
                                     &asset,
                                     &mut claimed_legacy_master_states,
@@ -457,7 +466,7 @@ where
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     run.held.store(true, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(target: "kei::download::pipeline", %error,
-                                        "Selection could not preserve legacy state ownership");
+                                        "Selection could not validate existing state ownership");
                                     producer_pb.inc(1);
                                     continue;
                                 }
@@ -484,8 +493,74 @@ where
                                 }
                             }
                         }
-                        let mut plan = match task_planner.plan_download_asset(&asset, config).await
-                        {
+                        if let Some(db) = &producer_state_db {
+                            match super::adoption::recover_selected_reserved_publication(
+                                db.as_ref(),
+                                config,
+                                &asset,
+                                &download_ctx,
+                                &task_planner,
+                            )
+                            .await
+                            {
+                                Ok(true) => {}
+                                result => {
+                                    if let Err(error) = result {
+                                        tracing::warn!(%error, "Selected reserved publication proof was refused");
+                                    }
+                                    state_write_failures_producer
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    producer_pb.inc(1);
+                                    continue 'assets;
+                                }
+                            }
+                            for derived in crate::download::filter::derive_expected_paths(
+                                &asset,
+                                config.as_ref(),
+                            ) {
+                                match super::recover_confirmed_publication(
+                                    db.as_ref(),
+                                    config,
+                                    &asset,
+                                    &mut task_planner,
+                                    derived.version_size,
+                                    &producer_shutdown,
+                                )
+                                .await
+                                {
+                                    Ok(Some(super::PendingOnDiskAdoption::StateWriteFailed(_))) => {
+                                        state_write_failures_producer
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        producer_pb.inc(1);
+                                        continue 'assets;
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        enum_errors_producer
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        tracing::warn!(%error, "Selected publication recovery refused unsafe local evidence");
+                                        producer_pb.inc(1);
+                                        continue 'assets;
+                                    }
+                                }
+                            }
+                        }
+                        let planned = async {
+                            if let Some(plan) = run
+                                .confirmed_repair_plan(key, &asset, config, &mut task_planner)
+                                .await?
+                            {
+                                selected_integrity_repair = true;
+                                Ok(plan)
+                            } else {
+                                task_planner.plan_selected_asset(&asset, config).await
+                            }
+                        }
+                        .await;
+                        let mut plan = match planned {
                             Ok(plan) => plan,
                             Err(error) => {
                                 state_write_failures_producer
@@ -495,11 +570,52 @@ where
                                 return skips;
                             }
                         };
+                        let mut selected_tasks = Vec::with_capacity(plan.tasks.len());
+                        for task in std::mem::take(&mut plan.tasks) {
+                            match download_ctx
+                                .plan_selected_truncation_repair(task, config, &mut task_planner)
+                                .await
+                            {
+                                Ok(Some(task)) => selected_tasks.push(task),
+                                Ok(None) => {
+                                    run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    producer_pb.inc(1);
+                                    continue 'assets;
+                                }
+                                Err(error) => {
+                                    enum_errors_producer
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!(%error, "Selected truncation repair could not retain its destination");
+                                    producer_pb.inc(1);
+                                    continue 'assets;
+                                }
+                            }
+                        }
+                        plan.tasks = selected_tasks;
                         match run
                             .project(key, &asset, body, &mut plan, &mut task_planner, config)
                             .await
                         {
-                            Ok(true) => selected_plan = Some(plan),
+                            Ok(true) => {
+                                for task in &mut plan.tasks {
+                                    if task_planner.managed_layout_session().is_some() {
+                                        continue;
+                                    }
+                                    if let Err(error) = download_ctx
+                                        .bind_selected_truncation_repair(task, config)
+                                        .await
+                                    {
+                                        enum_errors_producer
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        tracing::warn!(%error, "Selected truncation repair refused unsafe local evidence");
+                                        producer_pb.inc(1);
+                                        continue 'assets;
+                                    }
+                                }
+                                selected_plan = Some(plan);
+                            }
                             Ok(false) => {
                                 producer_pb.inc(1);
                                 continue;
@@ -694,7 +810,19 @@ where
                             }
                         }
                     };
-                    if let Some(session) = task_planner.managed_layout_session() {
+                    if !selected_integrity_repair
+                        && let Some(session) = task_planner.managed_layout_session()
+                    {
+                        if config.selection_run.as_ref().is_some_and(|run| {
+                            run.phase
+                                == crate::download::orchestration::generation::SelectionPhase::Inventory
+                        }) {
+                            // Projection above owns admission and membership. The
+                            // selected replay runs this same journal owner only
+                            // after all observed memberships have been frozen.
+                            producer_pb.inc(1);
+                            continue 'assets;
+                        }
                         match crate::download::orchestration::primary_layout::process_asset(
                             &client,
                             asset.clone(),
@@ -743,8 +871,27 @@ where
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             Err(error) => {
-                                enum_errors_producer
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                // A confirmed copy's unavailable source leaves
+                                // its journal pending. It is not failed provider
+                                // enumeration and must not reseed healthy peers.
+                                if matches!(
+                                    super::task::classify_download_task_error(&error),
+                                    super::task::DownloadTaskErrorClass::Storage
+                                ) {
+                                    storage_failed
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    shared.cycle_shutdown.cancel();
+                                    producer_shutdown.cancel();
+                                    tracing::error!(%error,"Storage unavailable during managed publication; stopping this cycle");
+                                    break 'assets;
+                                }
+                                let repair = crate::download::orchestration::primary_layout::has_confirmed_repair(
+                                    &asset, config, &plan.tasks,
+                                ).await.unwrap_or(false);
+                                if !repair {
+                                    enum_errors_producer
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 if let Some(run) = &config.selection_run {
                                     run.held.store(true, std::sync::atomic::Ordering::Relaxed);
                                 }
@@ -894,49 +1041,6 @@ where
                                 tracing::error!(%error, "Reserved pending task confinement failed");
                                 continue 'assets;
                             }
-                            // Mark assets that have exceeded the retry limit as failed.
-                            if let Some(attempts) =
-                                download_ctx.attempt_count(&task.library, &task.asset_id)
-                                && config.max_download_attempts > 0
-                                && attempts >= config.max_download_attempts
-                            {
-                                tracing::warn!(target: "kei::download::pipeline",
-                                    asset_id = %task.asset_id,
-                                    attempts,
-                                    max = config.max_download_attempts,
-                                    "Asset exceeded max download attempts, marking as failed"
-                                );
-                                if let Some(db) = &producer_state_db {
-                                    let error = format!(
-                                        "Exceeded max download attempts ({attempts}/{})",
-                                        config.max_download_attempts
-                                    );
-                                    if let Err(e) =
-                                        finalize_failed(db.as_ref(), &task.library, &task, &error)
-                                            .await
-                                    {
-                                        tracing::warn!(target: "kei::download::pipeline",
-                                            asset_id = %task.asset_id,
-                                            error = %e,
-                                            "Failed to mark asset as failed"
-                                        );
-                                    }
-                                }
-                                disposition = disposition.max(AssetDisposition::RetryExhausted);
-                                continue;
-                            }
-
-                            if config.retry_only
-                                && !download_ctx.is_known(&task.library, &task.asset_id)
-                            {
-                                tracing::debug!(target: "kei::download::pipeline",
-                                    asset_id = %task.asset_id,
-                                    "Skipping new asset in retry-only mode"
-                                );
-                                disposition = disposition.max(AssetDisposition::RetryOnly);
-                                continue;
-                            }
-
                             if let Some(db) = &producer_state_db {
                                 let adoption = match adopt_pending_on_disk_task(
                                     producer_state_db.as_deref(),
@@ -979,13 +1083,21 @@ where
                                     continue;
                                 }
 
-                                match download_ctx.should_download_fast(
-                                    &task.library,
-                                    &task.asset_id,
-                                    task.version_size,
-                                    &task.checksum,
-                                    false,
-                                ) {
+                                // Explicit conditional publication is per path.
+                                // A rendition-wide downloaded receipt or mere
+                                // presence cannot discharge that destination.
+                                let download = if task.replacement_fingerprint.is_some() {
+                                    Some(true)
+                                } else {
+                                    download_ctx.should_download_fast(
+                                        &task.library,
+                                        &task.asset_id,
+                                        task.version_size,
+                                        &task.checksum,
+                                        false,
+                                    )
+                                };
+                                match download {
                                     Some(true) => {
                                         disposition = disposition.max(AssetDisposition::Forwarded);
                                         if record_seen_for_forwarded_task(
@@ -1119,8 +1231,6 @@ where
                             AssetDisposition::OnDisk => skips.on_disk += 1,
                             AssetDisposition::AmpmVariant => skips.ampm_variant += 1,
                             AssetDisposition::StateSkip => skips.by_state += 1,
-                            AssetDisposition::RetryExhausted => skips.retry_exhausted += 1,
-                            AssetDisposition::RetryOnly => skips.retry_only += 1,
                             AssetDisposition::Unresolved => {
                                 tracing::warn!(target: "kei::download::pipeline",
                                     asset_id = %asset.id(),

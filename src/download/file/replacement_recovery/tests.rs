@@ -23,6 +23,86 @@ fn prepare(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf, Jo
 }
 
 #[test]
+fn local_policy_journal_checks_displaced_mtime_and_restores_on_race() {
+    let expected = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let changed = expected + std::time::Duration::from_secs(60);
+    for stage in [Stage::Prepared, Stage::Displaced, Stage::Installed] {
+        let dir = TempDir::new().unwrap();
+        let (target, part, mut journal) = prepare(dir.path());
+        fs::File::open(&target)
+            .unwrap()
+            .set_modified(expected)
+            .unwrap();
+        assert!(
+            super::publish_journal_with_mtime(&journal, Some(expected), |current| {
+                if current == stage {
+                    let path = if current == Stage::Prepared {
+                        &target
+                    } else {
+                        journal.original.path()
+                    };
+                    fs::File::open(path)?.set_modified(changed)?;
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!journal.commit.path().exists());
+        journal.recover().unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert_eq!(fs::metadata(&target).unwrap().modified().unwrap(), changed);
+        assert_eq!(fs::read(&part).unwrap(), b"replacement");
+        drop(journal);
+        recover_target(&target).unwrap();
+        assert_eq!(fs::metadata(&target).unwrap().modified().unwrap(), changed);
+    }
+}
+
+#[test]
+fn local_policy_journal_publishes_with_exact_time_and_recovers_interruption() {
+    let expected = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    for stage in [
+        Stage::Prepared,
+        Stage::Displaced,
+        Stage::Installed,
+        Stage::Committed,
+    ] {
+        let dir = TempDir::new().unwrap();
+        let (target, part, journal) = prepare(dir.path());
+        fs::File::open(&target)
+            .unwrap()
+            .set_modified(expected)
+            .unwrap();
+        assert!(
+            super::publish_journal_with_mtime(&journal, Some(expected), |current| {
+                anyhow::ensure!(current != stage, "interrupted fixture");
+                Ok(())
+            })
+            .is_err()
+        );
+        drop(journal);
+        recover_target(&target).unwrap();
+        if stage == Stage::Committed {
+            assert_eq!(fs::read(&target).unwrap(), b"replacement");
+        } else {
+            assert_eq!(fs::read(&target).unwrap(), b"original");
+            assert_eq!(fs::metadata(&target).unwrap().modified().unwrap(), expected);
+            super::publish_with_mtime(
+                &part,
+                &target,
+                fingerprint_regular_file_blocking(&target).unwrap(),
+                fingerprint_regular_file_blocking(&part).unwrap(),
+                Some(expected),
+            )
+            .unwrap();
+            assert_eq!(fs::read(&target).unwrap(), b"replacement");
+        }
+        recover_target(&target).unwrap();
+        assert!(!directory_path(&target).unwrap().exists());
+    }
+}
+
+#[test]
 fn manifest_round_trip_preserves_non_utf8_target_and_fingerprints() {
     let expected = Manifest {
         version: super::FORMAT_VERSION,
@@ -377,6 +457,9 @@ fn unsupported_rename_flags_exercise_the_production_publication_routes() {
         + FLAGS_ARGUMENT * std::mem::size_of::<u64>()
         + if cfg!(target_endian = "big") { 4 } else { 0 };
     let routes = [
+        "sync_loop::runner::tests::primary_layout::local_policy_adjusted_still_requires_strictly_newer_cloud_time",
+        #[cfg(feature = "xmp")]
+        "sync_loop::runner::tests::primary_layout::local_policy_metadata_keeps_preserved_disposition_and_mtime",
         "download::file::replacement::tests::approved_truncated_publish_replaces_only_expected_bytes",
         #[cfg(feature = "xmp")]
         "download::metadata::sidecar::tests::write_sidecar_creates_xmp_file_next_to_media",
@@ -506,6 +589,73 @@ fn recovery_preserves_user_directories_that_only_share_the_prefix() {
     );
 }
 
+fn recovery_owner() -> crate::state::db::account::AccountOwner {
+    crate::state::db::account::AccountOwner::authenticated(
+        "replacement-recovery@example.invalid",
+        "com",
+        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"replacement-recovery"}}))
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn recovery_pass(db: &std::sync::Arc<crate::state::SqliteStateDb>) -> crate::commands::AlbumPass {
+    use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct EmptySelection;
+    #[async_trait::async_trait]
+    impl PhotosSession for EmptySelection {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/internal/records/query/batch?") {
+                return Ok(json!({"batch":[{"records":[{"fields":{"itemCount":{"value":0}}}]}]}));
+            }
+            anyhow::ensure!(
+                url.contains("/records/query?"),
+                "unexpected recovery fixture request"
+            );
+            Ok(json!({"records":[],"syncToken":"recovery-selection-token"}))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    let mut album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: Arc::from("https://fixture.invalid"),
+            name: Arc::from(""),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(EmptySelection),
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), recovery_owner(), "com"),
+        Arc::from("private"),
+    );
+    crate::commands::AlbumPass {
+        kind: crate::commands::PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+    }
+}
+
 #[tokio::test]
 async fn production_download_recovers_before_work_but_dry_run_does_not_mutate() {
     use crate::download::{DownloadConfig, DownloadControls, download_photos_with_sync};
@@ -513,7 +663,7 @@ async fn production_download_recovers_before_work_but_dry_run_does_not_mutate() 
     use tokio_util::sync::CancellationToken;
 
     let dir = TempDir::new().unwrap();
-    let (target, _, journal) = prepare(dir.path());
+    let (target, part, journal) = prepare(dir.path());
     assert!(
         publish_journal(&journal, |stage| {
             anyhow::ensure!(stage != Stage::Displaced, "simulated interruption");
@@ -522,12 +672,19 @@ async fn production_download_recovers_before_work_but_dry_run_does_not_mutate() 
         .is_err()
     );
     drop(journal);
+    let db_path = dir.path().join("state.db");
+    let db = Arc::new(
+        crate::state::SqliteStateDb::open_owned(&db_path, &recovery_owner())
+            .await
+            .unwrap(),
+    );
     let mut config = DownloadConfig::test_default();
     config.directory = Arc::from(dir.path());
+    config.state_db = Some(db.clone());
     let config = Arc::new(config);
     download_photos_with_sync(
         &reqwest::Client::new(),
-        &[],
+        &[recovery_pass(&db)],
         Arc::clone(&config),
         DownloadControls::dry_run_hidden(),
         CancellationToken::new(),
@@ -536,27 +693,51 @@ async fn production_download_recovers_before_work_but_dry_run_does_not_mutate() 
     .unwrap();
     assert!(!target.exists());
     assert!(directory_path(&target).unwrap().exists());
-    download_photos_with_sync(
+    assert_eq!(
+        fs::read(directory_path(&target).unwrap().join("original")).unwrap(),
+        b"original"
+    );
+    assert_eq!(fs::read(&part).unwrap(), b"replacement");
+    let result = download_photos_with_sync(
         &reqwest::Client::new(),
-        &[],
+        &[recovery_pass(&db)],
         Arc::clone(&config),
         DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
     .await
     .unwrap();
+    assert_eq!(
+        result.sync_token.as_deref(),
+        Some("recovery-selection-token")
+    );
     assert_eq!(fs::read(&target).unwrap(), b"original");
     assert!(!directory_path(&target).unwrap().exists());
-    download_photos_with_sync(
+    let mut reopened_config = config.as_ref().clone();
+    reopened_config.state_db = None;
+    drop(config);
+    drop(db);
+    let db = Arc::new(
+        crate::state::SqliteStateDb::open_owned(&db_path, &recovery_owner())
+            .await
+            .unwrap(),
+    );
+    reopened_config.state_db = Some(db.clone());
+    let result = download_photos_with_sync(
         &reqwest::Client::new(),
-        &[],
-        config,
+        &[recovery_pass(&db)],
+        Arc::new(reopened_config),
         DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
     .await
     .unwrap();
+    assert_eq!(
+        result.sync_token.as_deref(),
+        Some("recovery-selection-token")
+    );
     assert_eq!(fs::read(&target).unwrap(), b"original");
+    assert!(!directory_path(&target).unwrap().exists());
 }
 
 #[tokio::test]
@@ -567,7 +748,7 @@ async fn production_download_keeps_checkpoint_when_recovery_is_unresolved() {
     use tokio_util::sync::CancellationToken;
 
     let dir = TempDir::new().unwrap();
-    let (target, _, journal) = prepare(dir.path());
+    let (target, part, journal) = prepare(dir.path());
     assert!(
         publish_journal(&journal, |stage| {
             if stage == Stage::Displaced {
@@ -579,7 +760,11 @@ async fn production_download_keeps_checkpoint_when_recovery_is_unresolved() {
     );
     drop(journal);
     let db_path = dir.path().join("state.db");
-    let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &recovery_owner())
+            .await
+            .unwrap(),
+    );
     let checkpoint = ScopedDbSyncToken {
         provider: "icloud".into(),
         account: "test-account".into(),
@@ -595,15 +780,21 @@ async fn production_download_keeps_checkpoint_when_recovery_is_unresolved() {
     config.state_db = Some(db.clone());
     let result = download_photos_with_sync(
         &reqwest::Client::new(),
-        &[],
+        &[recovery_pass(&db)],
         Arc::new(config),
         DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
     .await;
-    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Concurrent replacement target preserved"),
+        "{error:#}"
+    );
     drop(db);
-    let db = SqliteStateDb::open(&db_path).await.unwrap();
+    let db = SqliteStateDb::open_owned(&db_path, &recovery_owner())
+        .await
+        .unwrap();
     assert_eq!(
         db.get_scoped_db_sync_token("icloud", "test-account", 1, "test-scope")
             .await
@@ -613,6 +804,7 @@ async fn production_download_keeps_checkpoint_when_recovery_is_unresolved() {
         "previous-checkpoint"
     );
     assert_eq!(fs::read(&target).unwrap(), b"concurrent user file");
+    assert_eq!(fs::read(&part).unwrap(), b"replacement");
     assert_eq!(
         fs::read(directory_path(&target).unwrap().join("original")).unwrap(),
         b"original"

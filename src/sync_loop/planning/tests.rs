@@ -376,6 +376,7 @@ fn commingle_test_states(
                     .flatten()
                     .collect(),
                 },
+                deleted_album_bindings: Vec::new(),
                 plan_is_stale: false,
                 plan_needs_refresh: false,
             }
@@ -697,6 +698,7 @@ async fn refresh_needed_library_plans_filters_to_changed_zones() {
     let collection_context = CollectionContext {
         collection_album_names: std::collections::BTreeSet::new(),
         selected_smart_folder_names: Vec::new(),
+        deleted_album_bindings: Vec::new(),
     };
     let mut failures = 0;
 
@@ -741,6 +743,7 @@ async fn refresh_needed_library_plans_without_zone_filter_refreshes_every_stale_
     let collection_context = CollectionContext {
         collection_album_names: std::collections::BTreeSet::new(),
         selected_smart_folder_names: Vec::new(),
+        deleted_album_bindings: Vec::new(),
     };
     let mut failures = 2;
 

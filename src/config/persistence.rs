@@ -6,20 +6,18 @@ use super::input::{
 };
 use super::runtime::Config;
 use super::templates::{DEFAULT_FOLDER_STRUCTURE_ALBUMS, DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS};
-use crate::types::{
-    Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoResolution,
-    PhotoResolution, RawPolicy,
-};
+use crate::types::{Domain, FileMatchPolicy, LivePhotoMovFilenamePolicy};
 use std::path::Path;
 
 impl Config {
     /// Convert the resolved config back to a [`TomlConfig`] for serialization.
     ///
     /// Only includes static fields suitable for persistence. Passwords are
-    /// never included. Per-run flags (`dry_run`, `recent`, etc.) are omitted.
+    /// never included. Per-run flags (`dry_run`, CLI date bounds, etc.) are omitted.
     pub(crate) fn to_toml(&self) -> TomlConfig {
         TomlConfig {
-            data_dir: None,  // derived from config path, not serialized unless explicit
+            config_version: Some(1),
+            data_dir: None,  // Keep automatic discovery unless explicitly configured.
             log_level: None, // only written if user explicitly set it
             auth: Some(TomlAuth {
                 username: if self.auth.username.is_empty() {
@@ -74,15 +72,6 @@ impl Config {
                     .then_some(true),
                 retry: Some(TomlRetry {
                     per_transfer: Some(self.retry.max_retries),
-                    // Emit `per_asset` only when the user has
-                    // overridden the default of 10. Keeps the round-trip
-                    // clean for the common case and surfaces explicit
-                    // overrides in `kei config show`.
-                    per_asset: if self.retry.max_download_attempts == 10 {
-                        None
-                    } else {
-                        Some(self.retry.max_download_attempts)
-                    },
                 }),
             }),
             filters: Some(TomlFilters {
@@ -120,46 +109,14 @@ impl Config {
                 } else {
                     Some(false)
                 },
-                media: if self.filters.media.is_all() {
-                    None
-                } else {
-                    Some(self.filters.media.to_kinds())
-                },
-                filename_exclude: if self.download.filename_exclude.is_empty() {
-                    None
-                } else {
-                    Some(
-                        self.download
-                            .filename_exclude
-                            .iter()
-                            .map(|p| p.as_str().to_string())
-                            .collect(),
-                    )
-                },
-                recent: self.filters.persistent_recent,
-                recent_scope: self
-                    .filters
-                    .persistent_recent_scope
-                    .and_then(|scope| (scope != crate::cli::RecentScope::Global).then_some(scope)),
+                exclude: Some(super::runtime::MediaExclusion::from_selection(
+                    self.filters.media,
+                    self.photos.live_photo_mode,
+                )),
                 skip_created_before: self.filters.persistent_skip_created_before.clone(),
                 skip_created_after: self.filters.persistent_skip_created_after.clone(),
             }),
             photos: Some(TomlPhotos {
-                resolution: if self.photos.resolution == PhotoResolution::Original {
-                    None
-                } else {
-                    Some(self.photos.resolution)
-                },
-                live_resolution: if self.photos.live_resolution == LivePhotoResolution::Original {
-                    None
-                } else {
-                    Some(self.photos.live_resolution)
-                },
-                live_photo_mode: if self.photos.live_photo_mode == LivePhotoMode::Both {
-                    None
-                } else {
-                    Some(self.photos.live_photo_mode)
-                },
                 live_photo_mov_filename_policy: if self.photos.live_photo_mov_filename_policy
                     == LivePhotoMovFilenamePolicy::Suffix
                 {
@@ -167,18 +124,12 @@ impl Config {
                 } else {
                     Some(self.photos.live_photo_mov_filename_policy)
                 },
-                edited: if self.photos.edited { Some(true) } else { None },
-                edited_naming: (self.photos.edited_naming != crate::types::EditedNaming::Suffix)
-                    .then_some(self.photos.edited_naming),
-                alternative: if self.photos.alternative {
+                edited_as_primary: if self.photos.edited_naming
+                    == crate::types::EditedNaming::Primary
+                {
                     Some(true)
                 } else {
                     None
-                },
-                raw_policy: if self.photos.raw_policy == RawPolicy::AsIs {
-                    None
-                } else {
-                    Some(self.photos.raw_policy)
                 },
                 file_match_policy: if self.photos.file_match_policy
                     == FileMatchPolicy::NameSizeDedupWithSuffix
@@ -186,11 +137,6 @@ impl Config {
                     None
                 } else {
                     Some(self.photos.file_match_policy)
-                },
-                force_resolution: if self.photos.force_resolution {
-                    Some(true)
-                } else {
-                    None
                 },
                 keep_unicode_in_filenames: if self.photos.keep_unicode_in_filenames {
                     Some(true)
@@ -203,57 +149,21 @@ impl Config {
             } else {
                 None
             },
-            metadata: if self.metadata.set_exif_datetime
-                || self.metadata.set_exif_rating
-                || self.metadata.set_exif_gps
-                || self.metadata.set_exif_description
-                || {
-                    #[cfg(feature = "xmp")]
-                    {
-                        self.metadata.embed_xmp || self.metadata.xmp_sidecar
-                    }
-                    #[cfg(not(feature = "xmp"))]
-                    {
-                        false
-                    }
-                } {
-                Some(TomlMetadata {
-                    set_exif_datetime: if self.metadata.set_exif_datetime {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                    set_exif_rating: if self.metadata.set_exif_rating {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                    set_exif_gps: if self.metadata.set_exif_gps {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                    set_exif_description: if self.metadata.set_exif_description {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                    #[cfg(feature = "xmp")]
-                    embed_xmp: if self.metadata.embed_xmp {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                    #[cfg(feature = "xmp")]
-                    xmp_sidecar: if self.metadata.xmp_sidecar {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                })
-            } else {
-                None
-            },
+            metadata: Some(TomlMetadata {
+                set_exif_datetime: Some(self.metadata.set_exif_datetime),
+                set_exif_orientation: Some(self.metadata.set_exif_orientation),
+                set_exif_rating: Some(self.metadata.set_exif_rating),
+                set_exif_gps: Some(self.metadata.set_exif_gps),
+                set_exif_description: Some(self.metadata.set_exif_description),
+                #[cfg(feature = "xmp")]
+                embed_xmp: Some(self.metadata.embed_xmp),
+                #[cfg(feature = "xmp")]
+                xmp_sidecar: Some(self.metadata.xmp_sidecar),
+                #[cfg(feature = "xmp")]
+                include_albums: Some(self.metadata.include_albums),
+                #[cfg(feature = "xmp")]
+                include_people: Some(self.metadata.include_people),
+            }),
             watch: if self.watch.interval.is_some()
                 || self.watch.notify_systemd
                 || self.watch.pid_file.is_some()
@@ -321,8 +231,8 @@ impl Config {
 /// Persist a minimal config file on first run.
 ///
 /// Converts the resolved [`Config`] to TOML via [`Config::to_toml()`], then
-/// strips it down to only the essential no-default fields (username, directory,
-/// data-dir, domain, password-file, password-command). Passwords are never
+/// retains the resolved metadata choices and essential connection/path fields.
+/// Explicit false metadata choices remain false on subsequent runs. Passwords are never
 /// included. No-ops if a config file already exists, the parent directory
 /// doesn't exist, or `KEI_NO_AUTO_CONFIG=1` is set.
 pub(crate) fn persist_first_run_config(
@@ -360,6 +270,7 @@ pub(crate) fn persist_first_run_config(
     let data_dir = data_dir_cli.map(String::from);
 
     let minimal = TomlConfig {
+        config_version: Some(1),
         data_dir,
         log_level: None,
         auth: full.auth.map(|a| TomlAuth {
@@ -383,7 +294,7 @@ pub(crate) fn persist_first_run_config(
         filters: None,
         photos: None,
         import: None,
-        metadata: None,
+        metadata: full.metadata,
         watch: None,
         notifications: None,
         server: None,
@@ -428,9 +339,53 @@ pub(crate) fn persist_first_run_config(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn metadata_omissions_and_explicit_opt_outs_survive_roundtrip() {
+        for input in [
+            "config_version = 1",
+            "config_version = 1\n[metadata]\nset_exif_datetime = true\nset_exif_rating = false",
+        ] {
+            let parsed: super::TomlConfig = toml::from_str(input).unwrap();
+            let resolved = super::Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&parsed),
+            )
+            .unwrap();
+            let emitted = resolved.to_toml();
+            let metadata = emitted.metadata.as_ref().unwrap();
+            assert_eq!(metadata.set_exif_rating, Some(false));
+            assert_eq!(metadata.set_exif_orientation, Some(false));
+            assert_eq!(metadata.set_exif_gps, Some(false));
+            assert_eq!(metadata.set_exif_description, Some(false));
+            let serialized = toml::to_string(&emitted).unwrap();
+            let parsed = toml::from_str(&serialized).unwrap();
+            let reopened = super::Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&parsed),
+            )
+            .unwrap();
+            assert_eq!(
+                reopened.metadata.set_exif_datetime,
+                resolved.metadata.set_exif_datetime
+            );
+            assert!(!reopened.metadata.set_exif_rating);
+            #[cfg(feature = "xmp")]
+            {
+                assert!(!reopened.metadata.embed_xmp);
+                assert!(!reopened.metadata.xmp_sidecar);
+                assert!(!reopened.metadata.include_albums);
+                assert!(!reopened.metadata.include_people);
+            }
+        }
+    }
+
     use super::persist_first_run_config;
     use crate::config::input::TomlConfig;
-    use crate::config::runtime::{Config, MediaKind};
+    use crate::config::runtime::Config;
     use crate::config::test_support::{default_globals, default_password, default_sync};
     use std::path::PathBuf;
 
@@ -486,9 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_toml_omits_default_max_download_attempts() {
-        // Default 10 is elided from the round-trip so config dumps stay
-        // clean for the common case.
+    fn test_to_toml_omits_retired_lifetime_retry_limit() {
         let cfg = Config::build(
             &default_globals(),
             &default_password(),
@@ -496,20 +449,13 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(cfg.retry.max_download_attempts, 10);
-        let toml = cfg.to_toml();
-        let retry = toml.download.unwrap().retry.unwrap();
-        assert_eq!(retry.per_asset, None);
-    }
-    #[test]
-    fn test_to_toml_includes_non_default_max_download_attempts() {
-        // User overrides round-trip back into the dump.
-        let mut sync = default_sync();
-        sync.config_overrides.max_download_attempts = Some(42);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        let toml = cfg.to_toml();
-        let retry = toml.download.unwrap().retry.unwrap();
-        assert_eq!(retry.per_asset, Some(42));
+        let text = toml::to_string(&cfg.to_toml()).unwrap();
+        assert!(!text.contains("per_asset"));
+        let parsed: TomlConfig = toml::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.download.unwrap().retry.unwrap().per_transfer,
+            Some(cfg.retry.max_retries)
+        );
     }
     #[test]
     fn test_to_toml_roundtrip_preserves_username() {
@@ -547,8 +493,7 @@ mod tests {
         let toml = cfg.to_toml();
         // Default domain (com) should be omitted
         assert!(toml.auth.as_ref().unwrap().domain.is_none());
-        // Default resolution (original) should be omitted
-        assert!(toml.photos.as_ref().unwrap().resolution.is_none());
+        assert_eq!(toml.config_version, Some(1));
         // Default temp_suffix should be omitted
         assert!(toml.download.as_ref().unwrap().temp_suffix.is_none());
     }
@@ -579,7 +524,7 @@ mod tests {
         let pw = default_password();
         globals.domain = Some(crate::types::Domain::Cn);
         let mut sync = default_sync();
-        sync.config_overrides.resolution = Some(crate::types::PhotoResolution::Medium);
+        sync.config_overrides.file_match_policy = Some(crate::types::FileMatchPolicy::NameId7);
         let cfg = Config::build(&globals, &pw, sync, None).unwrap();
         let toml = cfg.to_toml();
         assert_eq!(
@@ -587,10 +532,60 @@ mod tests {
             Some(crate::types::Domain::Cn)
         );
         assert_eq!(
-            toml.photos.as_ref().unwrap().resolution,
-            Some(crate::types::PhotoResolution::Medium)
+            toml.photos.as_ref().unwrap().file_match_policy,
+            Some(crate::types::FileMatchPolicy::NameId7)
         );
     }
+    #[test]
+    fn edited_as_primary_roundtrips_through_config_export() {
+        use crate::types::EditedNaming;
+
+        let input: TomlConfig =
+            toml::from_str("config_version = 1\n[photos]\nedited_as_primary = true").unwrap();
+        let resolved = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&input),
+        )
+        .unwrap();
+        assert_eq!(resolved.photos.edited_naming, EditedNaming::Primary);
+
+        let emitted = resolved.to_toml();
+        assert_eq!(
+            emitted.photos.as_ref().unwrap().edited_as_primary,
+            Some(true)
+        );
+        let serialized = toml::to_string(&emitted).unwrap();
+        let reparsed: TomlConfig = toml::from_str(&serialized).unwrap();
+        let reopened = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&reparsed),
+        )
+        .unwrap();
+        assert_eq!(reopened.photos.edited_naming, EditedNaming::Primary);
+
+        let default = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        let default_toml = default.to_toml();
+        assert_eq!(
+            default_toml.photos.as_ref().unwrap().edited_as_primary,
+            None
+        );
+        assert!(
+            !toml::to_string(&default_toml)
+                .unwrap()
+                .contains("edited_as_primary")
+        );
+    }
+
     #[test]
     fn test_to_toml_serializes_to_valid_toml() {
         let cfg = Config::build(
@@ -608,24 +603,20 @@ mod tests {
     #[test]
     fn test_to_toml_per_run_fields_omitted() {
         let mut sync = default_sync();
-        sync.recent = Some(crate::cli::RecentLimit::Count(50));
         sync.skip_created_before = Some("2025-01-01".to_string());
         sync.skip_created_after = Some("2025-12-31".to_string());
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         let filters = toml.filters.as_ref().unwrap();
-        assert!(filters.recent.is_none());
         assert!(filters.skip_created_before.is_none());
         assert!(filters.skip_created_after.is_none());
     }
     #[test]
-    fn test_to_toml_persists_filter_recent_and_dates_from_toml() {
+    fn test_to_toml_persists_fixed_dates_from_toml() {
         let toml_str = r#"
             [filters]
-            recent = 100
-            recent_scope = "per-filter"
             skip_created_before = "2024-01-01"
-            skip_created_after = "30d"
+            skip_created_after = "2025-06-01T14:30:00"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
@@ -637,19 +628,28 @@ mod tests {
         .unwrap();
         let serialized = cfg.to_toml();
         let filters = serialized.filters.as_ref().unwrap();
-        assert_eq!(filters.recent, Some(crate::cli::RecentLimit::Count(100)));
-        assert_eq!(
-            filters.recent_scope,
-            Some(crate::cli::RecentScope::PerFilter)
-        );
         assert_eq!(filters.skip_created_before.as_deref(), Some("2024-01-01"));
-        assert_eq!(filters.skip_created_after.as_deref(), Some("30d"));
+        assert_eq!(
+            filters.skip_created_after.as_deref(),
+            Some("2025-06-01T14:30:00")
+        );
+        let encoded = ::toml::to_string(&serialized).unwrap();
+        let reopened: TomlConfig = ::toml::from_str(&encoded).unwrap();
+        let reopened_filters = reopened.filters.as_ref().unwrap();
+        assert_eq!(
+            reopened_filters.skip_created_before,
+            filters.skip_created_before
+        );
+        assert_eq!(
+            reopened_filters.skip_created_after,
+            filters.skip_created_after
+        );
     }
     #[test]
     fn test_to_toml_roundtrip_media() {
         let toml_str = r#"
             [filters]
-            media = ["photos", "live-photos"]
+            exclude = ["videos"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
@@ -662,8 +662,8 @@ mod tests {
         let serialized = cfg.to_toml();
         let filters = serialized.filters.as_ref().unwrap();
         assert_eq!(
-            filters.media.as_deref(),
-            Some(&[MediaKind::Photos, MediaKind::LivePhotos][..])
+            filters.exclude.as_deref(),
+            Some(&[crate::config::MediaExclusion::Videos][..])
         );
     }
     #[test]
@@ -685,42 +685,74 @@ mod tests {
         );
     }
     #[test]
-    fn test_to_toml_roundtrip_filename_exclude() {
-        let mut sync = default_sync();
-        sync.config_overrides.filename_exclude =
-            vec!["*.AAE".to_string(), "Screenshot*".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+    fn test_to_toml_omits_retired_filename_exclude() {
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
         let toml = cfg.to_toml();
-        let filters = toml.filters.as_ref().unwrap();
-        assert_eq!(
-            filters.filename_exclude.as_deref(),
-            Some(&["*.AAE".to_string(), "Screenshot*".to_string()][..])
-        );
-        // Round-trip: serialize then deserialize
         let serialized = ::toml::to_string_pretty(&toml).unwrap();
-        let parsed: TomlConfig = ::toml::from_str(&serialized).unwrap();
-        assert_eq!(
-            parsed.filters.as_ref().unwrap().filename_exclude.as_deref(),
-            Some(&["*.AAE".to_string(), "Screenshot*".to_string()][..])
-        );
+        assert!(!serialized.contains("filename_exclude"));
+        let _: TomlConfig = ::toml::from_str(&serialized).unwrap();
     }
     #[test]
-    fn test_to_toml_roundtrip_live_photo_mode() {
-        let mut sync = default_sync();
-        sync.config_overrides.live_photo_mode = Some(crate::types::LivePhotoMode::ImageOnly);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        let toml = cfg.to_toml();
-        assert_eq!(
-            toml.photos.as_ref().unwrap().live_photo_mode,
-            Some(crate::types::LivePhotoMode::ImageOnly)
-        );
-        // Round-trip
-        let serialized = ::toml::to_string_pretty(&toml).unwrap();
-        let parsed: TomlConfig = ::toml::from_str(&serialized).unwrap();
-        assert_eq!(
-            parsed.photos.as_ref().unwrap().live_photo_mode,
-            Some(crate::types::LivePhotoMode::ImageOnly)
-        );
+    fn test_to_toml_roundtrip_component_exclusions() {
+        use crate::config::MediaExclusion;
+        let components = [
+            MediaExclusion::Photos,
+            MediaExclusion::Videos,
+            MediaExclusion::LivePhotoStills,
+            MediaExclusion::LivePhotoVideos,
+        ];
+        for mask in 0..16 {
+            let exclusions: Vec<_> = components
+                .iter()
+                .enumerate()
+                .filter_map(|(index, component)| (mask & (1 << index) != 0).then_some(*component))
+                .collect();
+            let mut input: TomlConfig =
+                ::toml::from_str("config_version=1\n[filters]\nexclude=[]").unwrap();
+            input.filters.as_mut().unwrap().exclude = Some(exclusions.clone());
+            let result = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&input),
+            );
+            if mask == 15 {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("at least one media component")
+                );
+                continue;
+            }
+            let config = result.unwrap();
+            let serialized = ::toml::to_string_pretty(&config.to_toml()).unwrap();
+            let parsed: TomlConfig = ::toml::from_str(&serialized).unwrap();
+            assert_eq!(parsed.config_version, Some(1));
+            assert_eq!(
+                parsed.filters.as_ref().unwrap().exclude.as_ref(),
+                Some(&exclusions)
+            );
+            let reopened = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&parsed),
+            )
+            .unwrap();
+            assert_eq!(reopened.filters.media, config.filters.media);
+            assert_eq!(
+                reopened.photos.live_photo_mode,
+                config.photos.live_photo_mode
+            );
+            assert!(reopened.photos.edited && reopened.photos.alternative);
+        }
     }
     #[test]
     fn test_to_toml_default_live_photo_mode_omitted() {
@@ -732,7 +764,10 @@ mod tests {
         )
         .unwrap();
         let toml = cfg.to_toml();
-        assert!(toml.photos.as_ref().unwrap().live_photo_mode.is_none());
+        assert_eq!(
+            toml.filters.as_ref().unwrap().exclude.as_deref(),
+            Some([].as_slice())
+        );
     }
     #[test]
     fn test_to_toml_roundtrip_bandwidth_limit() {
@@ -808,6 +843,47 @@ mod tests {
         assert!(content.contains("test@example.com"));
         assert!(content.contains("/photos"));
         assert!(content.contains("Generated by kei"));
+        let parsed: TomlConfig = toml::from_str(&content).unwrap();
+        let metadata = parsed.metadata.unwrap();
+        assert_eq!(metadata.set_exif_datetime, Some(false));
+        assert_eq!(metadata.set_exif_orientation, Some(false));
+        assert_eq!(metadata.set_exif_rating, Some(false));
+        assert_eq!(metadata.set_exif_gps, Some(false));
+        assert_eq!(metadata.set_exif_description, Some(false));
+        #[cfg(feature = "xmp")]
+        {
+            assert_eq!(metadata.embed_xmp, Some(false));
+            assert_eq!(metadata.include_albums, Some(false));
+            assert_eq!(metadata.include_people, Some(false));
+        }
+    }
+    #[cfg(feature = "xmp")]
+    #[test]
+    fn first_run_and_config_show_projection_preserve_independent_metadata_choices() {
+        let (_td, path) = persist_test_dir("metadata_choices");
+        let mut config = build_config_for_persist("test@example.com", Some("/photos"), None);
+        config.metadata.embed_xmp = true;
+        config.metadata.set_exif_description = true;
+        config.metadata.include_people = true;
+        persist_first_run_config(&path, &config, None).unwrap();
+        for input in [
+            std::fs::read_to_string(path).unwrap(),
+            toml::to_string(&config.to_toml()).unwrap(),
+        ] {
+            let parsed = toml::from_str(&input).unwrap();
+            let reopened = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&parsed),
+            )
+            .unwrap();
+            assert!(reopened.metadata.embed_xmp);
+            assert!(reopened.metadata.set_exif_description);
+            assert!(reopened.metadata.include_people);
+            assert!(!reopened.metadata.include_albums);
+            assert!(!reopened.metadata.set_exif_datetime);
+        }
     }
     #[test]
     fn test_persist_first_run_never_writes_password() {

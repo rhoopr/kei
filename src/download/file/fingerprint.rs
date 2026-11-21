@@ -56,12 +56,13 @@ pub(in crate::download) async fn fingerprint_downloaded_path(
     .await?
 }
 
-/// Keep the exact confined file and namespace alive through pending adoption.
+/// Keep the confined file, bytes and observed mtime alive through pending adoption.
 #[derive(Debug)]
 pub(in crate::download) struct RetainedPendingFile {
     path: ConfinedPath,
     file: std::fs::File,
     pub(in crate::download) fingerprint: ExistingFileFingerprint,
+    pub(in crate::download) modified: Option<std::time::SystemTime>,
 }
 
 impl RetainedPendingFile {
@@ -78,14 +79,22 @@ impl RetainedPendingFile {
         crate::fs_util::file_link_count(&self.file)
     }
 
-    /// Recheck held bytes and namespace inside the owning state transaction.
+    /// Recheck held bytes, mtime and namespace before finalization.
     pub(in crate::download) fn validate_blocking(&self) -> anyhow::Result<()> {
         let identity = crate::fs_util::file_identity(&self.file)?;
         let mut file = self.path.validate_identity(identity)?;
         anyhow::ensure!(
+            file.metadata()?.modified().ok() == self.modified,
+            "Reserved pending file modification time changed before adoption finalization"
+        );
+        anyhow::ensure!(
             fingerprint_open_file_snapshot_blocking(&mut file, self.path.path())?.fingerprint
                 == self.fingerprint,
             "Reserved pending file changed before adoption finalization"
+        );
+        anyhow::ensure!(
+            file.metadata()?.modified().ok() == self.modified,
+            "Reserved pending file modification time changed during adoption verification"
         );
         self.path.validate_identity(identity)?;
         Ok(())
@@ -109,12 +118,20 @@ pub(in crate::download) async fn retain_pending_file(
             return Ok(None);
         };
         let identity = crate::fs_util::file_identity(&file)?;
+        // Keep the filesystem time from the same confined handle as the bytes.
+        // An unavailable time remains unknown; it is never replaced with now.
+        let modified = file.metadata()?.modified().ok();
         let fingerprint = fingerprint_open_file_snapshot_blocking(&mut file, &path)?.fingerprint;
+        anyhow::ensure!(
+            file.metadata()?.modified().ok() == modified,
+            "Reserved pending file modification time changed while reading"
+        );
         confined.validate_identity(identity)?;
         Ok(Some(Arc::new(RetainedPendingFile {
             path: confined,
             file,
             fingerprint,
+            modified,
         })))
     })
     .await?

@@ -1,6 +1,8 @@
-//! Owns opt-in current-primary layout transitions across selected renditions.
+//! Owns recorded current-primary layout transitions across selected renditions.
 
 use crate::download::{DownloadConfig, DownloadStore, file, filter, planner};
+pub(super) mod membership;
+
 use crate::icloud::photos::PhotoAsset;
 use crate::state::db::primary_layout::{
     LayoutBinding, LayoutFile, LayoutMember, LayoutOperation, path_key,
@@ -73,6 +75,42 @@ impl LayoutSession {
     fn owners(&self, path: &Path) -> Result<impl Iterator<Item = &ReconciliationCatalogPath>> {
         Ok(self.owners.get(&path_key(path)?).into_iter().flatten())
     }
+
+    fn verify_legacy_owner(
+        &self,
+        family: &str,
+        path: &Path,
+        library: &str,
+        child: &str,
+        version: VersionSizeKey,
+    ) -> Result<()> {
+        let key = path_key(path)?;
+        let mut matched = false;
+        let mut foreign = None;
+        for owner in self.owners.get(&key).into_iter().flatten() {
+            if owner.library.as_ref() == library && owner.asset_id.as_ref() == child {
+                matched |= owner.version_size == version;
+            } else if foreign.is_none() {
+                foreign = Some(owner);
+            }
+        }
+        if matched && foreign.is_none() {
+            return Ok(());
+        }
+        let owner_ref = |library: &str, child: &str| -> Result<String> {
+            Ok(digest(serde_json::to_vec(&(library, child))?))
+        };
+        let conflicting_owner = match foreign {
+            Some(owner) => owner_ref(&owner.library, &owner.asset_id)?,
+            None => "none".into(),
+        };
+        anyhow::bail!(
+            "Ambiguous legacy primary path owner: family_ref={family} path_ref={} expected_owner_ref={} rendition={} expected_receipt_matched={matched} conflicting_owner_ref={conflicting_owner}",
+            digest(key),
+            owner_ref(library, child)?,
+            version.as_str()
+        )
+    }
 }
 
 fn digest(value: impl AsRef<[u8]>) -> String {
@@ -83,12 +121,74 @@ fn sidecar(path: &Path) -> PathBuf {
     path.push(".xmp");
     path.into()
 }
+
+/// Root changes must not turn a journal-owned source into ordinary copy input.
+/// Inspect exact recorded targets before provider planning or new layout claims.
+pub(super) async fn validate_recorded_sources(config: &DownloadConfig) -> Result<()> {
+    let Some(db) = config.state_db.as_deref() else {
+        return Ok(());
+    };
+    for record in db.get_primary_layout_receipts().await? {
+        let Some(path) = record.local_path else {
+            continue;
+        };
+        if !matches!(
+            db.source_metadata_recovery(&path).await?,
+            crate::state::db::SourceMetadataRecovery::ManagedPrimary
+        ) {
+            continue;
+        }
+        let parent = path
+            .parent()
+            .context("Recorded managed source has no parent")?;
+        for target in [&path, &sidecar(&path)] {
+            match file::has_replacement_journal(parent, target).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    anyhow::bail!("Recorded managed source has unfinished replacement evidence")
+                }
+                Err(error)
+                    if super::reconciliation::classify_reconciliation_io_error(&error)
+                        == Some(std::io::ErrorKind::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
 fn policy(config: &DownloadConfig) -> &'static str {
     if config.edited_naming == EditedNaming::Primary {
         "primary"
     } else {
         "suffix"
     }
+}
+
+// Established layout and unfinished publication are durable facts, not a
+// request to move files when the default naming policy changes. A pending
+// operation takes precedence because it may already have published members.
+fn recorded_layout_config(
+    config: &DownloadConfig,
+    binding: Option<&LayoutBinding>,
+    operation: Option<&LayoutOperation>,
+) -> Result<Option<Box<DownloadConfig>>> {
+    let recorded = operation
+        .map(|operation| operation.policy.as_str())
+        .or_else(|| binding.map(|binding| binding.policy.as_str()));
+    let naming = match recorded {
+        None => return Ok(None),
+        Some("primary") => EditedNaming::Primary,
+        Some("suffix") => EditedNaming::Suffix,
+        Some(_) => {
+            anyhow::bail!("Unrecognized recorded layout policy; preserving its files and journal")
+        }
+    };
+    if naming == config.edited_naming {
+        return Ok(None);
+    }
+    let mut recorded_config = config.clone();
+    recorded_config.edited_naming = naming;
+    Ok(Some(Box::new(recorded_config)))
 }
 
 fn family(asset: &PhotoAsset, config: &DownloadConfig) -> Result<String> {
@@ -98,16 +198,95 @@ fn family(asset: &PhotoAsset, config: &DownloadConfig) -> Result<String> {
         &asset.created_local(),
         config.album_name.as_deref(),
     );
-    Ok(digest(serde_json::to_vec(&serde_json::json!([
-        1,
+    family_in_parent(asset, config, &parent)
+}
+
+fn family_in_parent(asset: &PhotoAsset, config: &DownloadConfig, parent: &Path) -> Result<String> {
+    Ok(crate::state::db::primary_layout::family_key(
         asset.source_zone().unwrap_or(&config.library),
         asset.state_id(),
         config
             .primary_layout_pass
             .as_deref()
             .unwrap_or(config.pass_label()),
-        SelectionPath::from_path(&std::path::absolute(parent)?)
-    ]))?))
+        parent,
+    )?)
+}
+
+async fn recorded_family(
+    asset: &PhotoAsset,
+    config: &DownloadConfig,
+    session: &LayoutSession,
+) -> Result<String> {
+    let requested = family(asset, config)?;
+    let Some(db) = config.state_db.as_deref() else {
+        return Ok(requested);
+    };
+    if db
+        .primary_layout_binding(requested.clone())
+        .await?
+        .is_some()
+    {
+        return Ok(requested);
+    }
+    let mut candidates = rustc_hash::FxHashSet::default();
+    for record in session.receipts(
+        asset.source_zone().unwrap_or(&config.library),
+        asset.state_id(),
+    ) {
+        if record.is_preserved_history {
+            continue;
+        }
+        let Some(path) = &record.local_path else {
+            continue;
+        };
+        if crate::fs_util::reserved_path_under_root(&config.directory, path).is_err() {
+            continue;
+        }
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let key = family_in_parent(asset, config, parent)?;
+        if db.primary_layout_binding(key.clone()).await?.is_some() {
+            candidates.insert(key);
+        }
+    }
+    for operation in db
+        .primary_layout_operations(config.library.to_string())
+        .await?
+    {
+        if operation.child != asset.state_id()
+            || operation.pass
+                != config
+                    .primary_layout_pass
+                    .as_deref()
+                    .unwrap_or(config.pass_label())
+        {
+            continue;
+        }
+        for member in &operation.members {
+            let Some(destination) = &member.destination else {
+                continue;
+            };
+            let path = destination.to_path();
+            if crate::fs_util::reserved_path_under_root(&config.directory, &path).is_err() {
+                continue;
+            }
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            if family_in_parent(asset, config, parent)? == operation.family {
+                candidates.insert(operation.family.clone());
+            }
+        }
+    }
+    // Multiple historical copies are retained; they do not identify one
+    // established destination for this pass.
+    Ok(if candidates.len() == 1 {
+        candidates.into_iter().next().unwrap_or(requested)
+    } else {
+        requested
+    })
 }
 fn decision(asset: &PhotoAsset, config: &DownloadConfig) -> Result<String> {
     let paths = filter::derive_expected_paths(asset, config);
@@ -128,6 +307,7 @@ fn decision(asset: &PhotoAsset, config: &DownloadConfig) -> Result<String> {
         1,
         super::config::hash_download_config(config),
         crate::download::pipeline::MetadataFlags::from(config).bits(),
+        crate::download::pipeline::MetadataFlags::POLICY_REVISION,
         format!("{:?}", config.capture_timestamp_repair),
         asset.asset_record_name(),
         asset.created(),
@@ -146,10 +326,31 @@ fn metadata_decision(
         version.as_str(),
         checksum,
         crate::download::pipeline::MetadataFlags::from(config).bits(),
+        crate::download::pipeline::MetadataFlags::POLICY_REVISION,
         format!("{:?}", config.capture_timestamp_repair),
         asset.created(),
         filter::build_selected_payload(asset, config, version)
     ]))?))
+}
+
+async fn load_source_fields(
+    db: &dyn DownloadStore,
+    library: &str,
+    id: &str,
+    file: &mut LayoutFile,
+) -> Result<()> {
+    if let Some(receipt) = db
+        .embedded_metadata_receipt(library, id, &file.version, &file.path.to_path(), None)
+        .await?
+    {
+        let checksum = data_encoding::HEXLOWER.encode(&file.fingerprint.sha256);
+        if checksum == receipt.output_checksum {
+            *file.embedded_fields = receipt.written;
+        } else if !receipt.published && checksum == receipt.input_checksum {
+            *file.embedded_fields = receipt.previous;
+        }
+    }
+    Ok(())
 }
 
 async fn file_receipt(
@@ -160,6 +361,9 @@ async fn file_receipt(
     source_checksum: Option<String>,
 ) -> Result<LayoutFile> {
     Ok(LayoutFile {
+        local_preserved: false,
+        local_modified: None,
+        embedded_fields: Default::default(),
         path: SelectionPath::from_path(path),
         version: version.to_owned(),
         provider_checksum: checksum.to_owned(),
@@ -171,6 +375,15 @@ async fn file_receipt(
     })
 }
 async fn validate_file(root: &Path, file: &LayoutFile) -> Result<()> {
+    if let Some(expected) = file.local_modified {
+        let retained = file::retain_pending_file(root, &file.path.to_path())
+            .await?
+            .context("Missing local layout file")?;
+        anyhow::ensure!(
+            retained.modified.map(chrono::DateTime::<chrono::Utc>::from) == Some(expected),
+            "Owned layout modification time changed locally"
+        );
+    }
     anyhow::ensure!(
         snapshot(root, &file.path.to_path()).await?.as_ref() == Some(&file.fingerprint),
         "Owned layout file changed locally"
@@ -179,6 +392,43 @@ async fn validate_file(root: &Path, file: &LayoutFile) -> Result<()> {
         snapshot(root, &sidecar(&file.path.to_path())).await? == file.sidecar,
         "Owned layout sidecar changed locally"
     );
+    Ok(())
+}
+
+pub(super) async fn validate_cancelled_selection_layouts(
+    operations: &[LayoutOperation],
+) -> Result<()> {
+    for op in operations {
+        anyhow::ensure!(
+            matches!(op.phase.as_str(), "planned" | "prepared" | "preserved"),
+            "Successor cannot retire a publishing journal"
+        );
+        for member in &op.members {
+            anyhow::ensure!(
+                member.installed.is_none(),
+                "Successor cannot retire installed journal members"
+            );
+            for file in [
+                &member.old,
+                &member.prepared,
+                &member.preserved,
+                &member.archive_source,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                validate_file(&op.root.to_path(), file)
+                    .await
+                    .context("Cancelled layout input changed")?;
+                for target in [file.path.to_path(), sidecar(&file.path.to_path())] {
+                    anyhow::ensure!(
+                        !file::has_replacement_journal(&op.root.to_path(), &target).await?,
+                        "Cancelled layout retains unfinished replacement evidence"
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -203,6 +453,37 @@ fn qualified_path(path: &Path, qualifier: &str, role: filter::NamingRole) -> Res
         qualifier,
         role.suffix(),
     )))
+}
+
+fn bound_destination(
+    derived: &filter::DerivedPath,
+    qualifier: &str,
+    binding: Option<&LayoutBinding>,
+) -> Result<PathBuf> {
+    let destination = qualified_path(&derived.path, qualifier, derived.naming_role)?;
+    if let Some(file) = binding.and_then(|binding| {
+        binding.files.iter().find(|file| {
+            file.version == derived.version_size.as_str()
+                && file.archive_original
+                    == (derived.naming_role == filter::NamingRole::OriginalArchive)
+                && (file.provider_checksum == derived.checksum.as_ref()
+                    || file.path.to_path().extension() == destination.extension())
+        })
+    }) {
+        return Ok(file.path.to_path());
+    }
+    if let Some(file) =
+        binding.and_then(|binding| binding.files.iter().find(|file| !file.archive_original))
+    {
+        let recorded = file.path.to_path();
+        let parent = recorded.parent().context("Recorded layout has no parent")?;
+        return Ok(parent.join(
+            destination
+                .file_name()
+                .context("Layout destination has no filename")?,
+        ));
+    }
+    Ok(destination)
 }
 
 /// A source observation does not authorize a revert. Confirmation belongs to
@@ -262,8 +543,47 @@ pub(in crate::download) async fn process_asset(
     session: &LayoutSession,
     cancel: &CancellationToken,
 ) -> Result<Option<(PhotoAsset, LayoutOutcome)>> {
-    let key = family(&observed, config)?;
-    let result = process_asset_inner(client, observed, config, session, cancel).await;
+    let mut current_config;
+    let config = if config.selection_run.is_some() {
+        let db = config
+            .state_db
+            .as_deref()
+            .context("Managed layout requires a database")?;
+        let rows = db
+            .get_asset_groupings(
+                observed.source_zone().unwrap_or(&config.library),
+                &[observed.state_id()],
+            )
+            .await?;
+        let mut groupings = crate::download::AssetGroupings::default();
+        for (asset, album) in rows.albums {
+            groupings.albums.entry(asset).or_default().push(album);
+        }
+        for (asset, person) in rows.people {
+            groupings.people.entry(asset).or_default().push(person);
+        }
+        current_config = config.clone();
+        current_config.asset_groupings = Arc::new(groupings);
+        &current_config
+    } else {
+        config
+    };
+    let key = recorded_family(&observed, config, session).await?;
+    let result = async {
+        let result = process_asset_inner(client, observed, config, session, cancel).await?;
+        if config.selection_run.is_some()
+            && let Some((asset, _)) = &result
+            && let Some(db) = config.state_db.as_deref()
+            && let Some(binding) = db.primary_layout_binding(key.clone()).await?
+        {
+            anyhow::ensure!(
+                acknowledge_binding(asset, config, &binding, cancel).await?,
+                "Managed layout has not completed the selected metadata recipe"
+            );
+        }
+        Ok(result)
+    }
+    .await;
     if result.is_err()
         && let Some(db) = config.state_db.as_deref()
     {
@@ -279,6 +599,94 @@ pub(in crate::download) async fn process_asset(
     result
 }
 
+async fn acknowledge_binding(
+    asset: &PhotoAsset,
+    config: &DownloadConfig,
+    binding: &LayoutBinding,
+    cancel: &CancellationToken,
+) -> Result<bool> {
+    let mut paths: Vec<_> = binding
+        .files
+        .iter()
+        .map(|file| file.path.to_path())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    let mut guards = Vec::new();
+    for path in &paths {
+        guards.push(file::lock_download_destination(path, cancel).await?);
+    }
+    for file in &binding.files {
+        if validate_file(&config.directory, file).await.is_err() {
+            return Ok(false);
+        }
+        if config.selection_run.is_some()
+            && filter::derive_expected_paths(asset, config)
+                .iter()
+                .any(|selected| selected.version_size.as_str() == file.version)
+            && file.metadata_decision.as_deref()
+                != Some(
+                    metadata_decision(
+                        asset,
+                        config,
+                        VersionSizeKey::from_str(&file.version)
+                            .context("Invalid managed rendition")?,
+                        &file.provider_checksum,
+                    )?
+                    .as_str(),
+                )
+        {
+            return Ok(false);
+        }
+    }
+    anyhow::ensure!(
+        !cancel.is_cancelled(),
+        "Primary layout interrupted before acknowledgement"
+    );
+    if let Some(run) = &config.selection_run {
+        anyhow::ensure!(
+            run.root.spec.metadata_flags
+                == crate::download::pipeline::MetadataFlags::from(config).bits(),
+            "Managed metadata flags differ from selected intent"
+        );
+        run.capture
+            .db
+            .reuse_layout_selection_publication(
+                run.capture.owner.clone(),
+                run.root.id.clone(),
+                binding.clone(),
+            )
+            .await?;
+    }
+    Ok(true)
+}
+
+fn binding_matches_selection(
+    asset: &PhotoAsset,
+    config: &DownloadConfig,
+    binding: &LayoutBinding,
+) -> bool {
+    let selected = filter::derive_expected_paths(asset, config);
+    !selected.is_empty()
+        && binding
+            .files
+            .iter()
+            .filter(|file| !file.archive_original)
+            .count()
+            == selected.len()
+        && selected.iter().all(|current| {
+            binding.files.iter().any(|file| {
+                file.version == current.version_size.as_str()
+                    && file.provider_checksum == current.checksum.as_ref()
+                    && file.path.to_path() == current.path
+                    && metadata_decision(asset, config, current.version_size, &current.checksum)
+                        .is_ok_and(|decision| {
+                            file.metadata_decision.as_deref() == Some(decision.as_str())
+                        })
+            })
+        })
+}
+
 async fn process_asset_inner(
     client: &reqwest::Client,
     observed: PhotoAsset,
@@ -290,8 +698,17 @@ async fn process_asset_inner(
         .state_db
         .as_deref()
         .context("Primary naming requires an owned state database")?;
-    let family = family(&observed, config)?;
+    let family = recorded_family(&observed, config, session).await?;
     let binding = db.primary_layout_binding(family.clone()).await?;
+    let pending = db
+        .primary_layout_operations(config.library.to_string())
+        .await?;
+    let recorded_config = recorded_layout_config(
+        config,
+        binding.as_ref(),
+        pending.iter().find(|op| op.family == family),
+    )?;
+    let config = recorded_config.as_deref().unwrap_or(config);
     if config.edited_naming == EditedNaming::Suffix
         && binding.is_none()
         && !db
@@ -312,20 +729,26 @@ async fn process_asset_inner(
     if cancel.is_cancelled() {
         anyhow::bail!("Primary layout interrupted")
     }
-    let pending = db
-        .primary_layout_operations(config.library.to_string())
-        .await?;
     let has_pending = pending.iter().any(|op| op.family == family);
+    let pending_op = pending.iter().find(|op| op.family == family);
+    let (repairing, repair_input_changed) =
+        repair_plan_status(&observed, config, binding.as_ref(), pending_op).await?;
     if !has_pending
+        && !repairing
         && !config.refresh_metadata
         && binding.as_ref().is_some_and(|b| {
-            b.decision == decision(&observed, config).unwrap_or_default()
+            (b.decision == decision(&observed, config).unwrap_or_default()
+                || binding_matches_selection(&observed, config, b))
                 && b.policy == policy(config)
         })
+        && acknowledge_binding(
+            &observed,
+            config,
+            binding.as_ref().context("Missing committed binding")?,
+            cancel,
+        )
+        .await?
     {
-        for file in &binding.as_ref().context("Missing committed binding")?.files {
-            validate_file(&config.directory, file).await?;
-        }
         return Ok(Some((observed, LayoutOutcome::default())));
     }
     let asset = confirm(&observed, config).await?;
@@ -340,20 +763,23 @@ async fn process_asset_inner(
     let desired = decision(&asset, config)?;
     if let Some(binding) = &binding
         && !has_pending
+        && !repairing
         && !config.refresh_metadata
-        && binding.decision == desired
+        && (binding.decision == desired || binding_matches_selection(&asset, config, binding))
         && binding.policy == policy(config)
+        && acknowledge_binding(&asset, config, binding, cancel).await?
     {
-        for file in &binding.files {
-            validate_file(&config.directory, file).await?;
-        }
         return Ok(Some((asset, LayoutOutcome::default())));
     }
     let mut op = if let Some(op) = pending.into_iter().find(|op| op.family == family) {
-        if op.decision == desired {
+        if op.decision == desired && !repair_input_changed {
             op
         } else {
             if op.phase == "publishing" {
+                anyhow::ensure!(
+                    !op.is_membership_retirement(),
+                    "Membership retirement requires completed current source evidence"
+                );
                 finish(db, &mut op.clone(), cancel, &mut LayoutOutcome::default()).await?;
             } else {
                 db.cancel_primary_layout(op.operation).await?;
@@ -409,6 +835,100 @@ async fn process_asset_inner(
     Ok(Some((asset, outcome)))
 }
 
+pub(in crate::download) async fn has_confirmed_repair(
+    asset: &PhotoAsset,
+    config: &DownloadConfig,
+    tasks: &[filter::DownloadTask],
+) -> Result<bool> {
+    for task in tasks {
+        if confirmed_damage(
+            asset,
+            config,
+            &SelectionPath::from_path(&task.download_path),
+        )
+        .await?
+        .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn repair_plan_status(
+    asset: &PhotoAsset,
+    config: &DownloadConfig,
+    binding: Option<&LayoutBinding>,
+    op: Option<&LayoutOperation>,
+) -> Result<(bool, bool)> {
+    let mut repairing = false;
+    let mut changed = false;
+    if binding.is_none() {
+        // A suffix-to-primary transition can inherit a confirmed ordinary
+        // copy before the first layout binding exists. Resolve its selected
+        // target without creating a journal ahead of admission.
+        for selected in filter::derive_expected_paths(asset, config) {
+            if confirmed_damage(asset, config, &SelectionPath::from_path(&selected.path))
+                .await?
+                .is_some()
+            {
+                return Ok((true, false));
+            }
+        }
+    }
+    if let Some(binding) = binding {
+        for file in &binding.files {
+            if let Some((checksum, size)) = confirmed_damage(asset, config, &file.path).await? {
+                repairing = true;
+                changed |= op.is_some_and(|op| {
+                    !op.members
+                        .iter()
+                        .filter_map(|member| member.old.as_ref())
+                        .any(|old| {
+                            old.path == file.path
+                                && old.fingerprint.size == size
+                                && data_encoding::HEXLOWER.encode(&old.fingerprint.sha256)
+                                    == checksum
+                        })
+                });
+            }
+        }
+    }
+    Ok((repairing, changed))
+}
+
+async fn confirmed_damage(
+    asset: &PhotoAsset,
+    config: &DownloadConfig,
+    path: &SelectionPath,
+) -> Result<Option<(String, u64)>> {
+    let (Some(run), Some(key)) = (&config.selection_run, &config.selection_pass) else {
+        return Ok(None);
+    };
+    for current in filter::derive_expected_paths(asset, config) {
+        if let Some(confirmation) = run
+            .capture
+            .db
+            .retained_integrity_confirmation(
+                run.capture.owner.clone(),
+                run.root.spec.scope.clone(),
+                key.clone(),
+                (asset.asset_record_name().to_owned(), asset.id().to_owned()),
+                (
+                    path.clone(),
+                    current.version_size.as_str().to_owned(),
+                    current.checksum.to_string(),
+                    current.size,
+                ),
+            )
+            .await?
+        {
+            return Ok(Some(confirmation));
+        }
+    }
+    Ok(None)
+}
+
 async fn plan(
     asset: &PhotoAsset,
     config: &DownloadConfig,
@@ -443,6 +963,11 @@ async fn plan(
             if record.is_preserved_history
                 || path.parent() != Some(parent.as_path())
                 || session.history_paths.contains(&path_key(path)?)
+                || if let Some(run) = &config.selection_run {
+                    run.album_path_claimed(config, path).await?
+                } else {
+                    false
+                }
             {
                 continue;
             }
@@ -457,23 +982,24 @@ async fn plan(
                 !record.checksum.is_empty(),
                 "Legacy layout media has no trusted provider rendition"
             );
+            let locally_changed = data_encoding::HEXLOWER.encode(&actual.sha256) != checksum;
             anyhow::ensure!(
-                data_encoding::HEXLOWER.encode(&actual.sha256) == checksum,
-                "Legacy layout media changed locally"
+                !locally_changed
+                    || filter::derive_expected_paths(asset, config)
+                        .iter()
+                        .any(|derived| derived.version_size == record.version_size
+                            && derived.path == *path),
+                "Changed legacy media cannot be relocated to another rendition slot"
             );
-            anyhow::ensure!(
-                session.owners(path)?.any(|owner| {
-                    owner.library.as_ref() == record.library
-                        && owner.asset_id.as_ref() == record.id
-                        && owner.version_size == record.version_size
-                }) && session
-                    .owners(path)?
-                    .all(|owner| owner.library.as_ref() == record.library
-                        && owner.asset_id.as_ref() == record.id),
-                "Ambiguous legacy primary path owner"
-            );
+            session.verify_legacy_owner(
+                &family,
+                path,
+                &record.library,
+                &record.id,
+                record.version_size,
+            )?;
             if oldfiles.iter().all(|f| f.path.to_path() != *path) {
-                let file = file_receipt(
+                let mut file = file_receipt(
                     &config.directory,
                     path,
                     record.version_size.as_str(),
@@ -481,18 +1007,99 @@ async fn plan(
                     record.download_checksum.clone(),
                 )
                 .await?;
+                file.local_preserved = locally_changed;
+                if locally_changed {
+                    file.source_checksum = None;
+                }
                 anyhow::ensure!(
                     file.fingerprint == actual,
                     "Legacy layout media changed during ownership verification"
                 );
+                if let Some(db) = db {
+                    load_source_fields(db, &record.library, &record.id, &mut file).await?;
+                }
                 oldfiles.push(file);
             }
         }
     }
-    for file in &oldfiles {
-        validate_file(&config.directory, file).await?;
+    let mut repairs = Vec::new();
+    let mut present = Vec::with_capacity(oldfiles.len());
+    for mut old in oldfiles {
+        let confirmed = confirmed_damage(asset, config, &old.path).await?;
+        let Some(current) =
+            file::retain_pending_file(&config.directory, &old.path.to_path()).await?
+        else {
+            anyhow::ensure!(confirmed.is_none(), "Confirmed managed damage disappeared");
+            present.push(old);
+            continue;
+        };
+        let changed = current.fingerprint.sha256 != old.fingerprint.sha256
+            || current.fingerprint.size != old.fingerprint.size;
+        if let Some((checksum, size)) = confirmed {
+            anyhow::ensure!(
+                current.fingerprint.size == size
+                    && data_encoding::HEXLOWER.encode(&current.fingerprint.sha256) == checksum,
+                "Confirmed damaged destination changed; replacement refused"
+            );
+            repairs.push(old.path.clone());
+        }
+        if changed || old.local_preserved {
+            let mut observed = file_receipt(
+                &config.directory,
+                &old.path.to_path(),
+                &old.version,
+                &old.provider_checksum,
+                None,
+            )
+            .await?;
+            observed.local_preserved = true;
+            observed.local_modified = current.modified.map(chrono::DateTime::<chrono::Utc>::from);
+            observed.archive_original = old.archive_original;
+            if !changed {
+                observed.embedded_fields = old.embedded_fields;
+            }
+            old = observed;
+        } else {
+            old.local_modified = None;
+        }
+        current.validate().await?;
+        validate_file(&config.directory, &old).await?;
+        present.push(old);
     }
+    oldfiles = present;
     let paths = filter::derive_expected_paths(asset, config);
+    let mut missingfiles = Vec::new();
+    let mut present = Vec::with_capacity(oldfiles.len());
+    for file in oldfiles {
+        if snapshot(&config.directory, &file.path.to_path())
+            .await?
+            .is_none()
+        {
+            let selected = paths
+                .iter()
+                .find(|path| path.version_size.as_str() == file.version);
+            anyhow::ensure!(
+                selected.is_some_and(|path| bound_destination(
+                    path,
+                    binding.map_or("", |b| b.qualifier.as_str()),
+                    binding
+                )
+                .ok()
+                .as_ref()
+                    == Some(&file.path.to_path())),
+                "Missing retained media has no matching current provider rendition"
+            );
+            anyhow::ensure!(
+                snapshot(&config.directory, &sidecar(&file.path.to_path())).await? == file.sidecar,
+                "Missing media sidecar changed locally"
+            );
+            missingfiles.push(file);
+        } else {
+            validate_file(&config.directory, &file).await?;
+            present.push(file);
+        }
+    }
+    let oldfiles = present;
     let preview_claims = if persist {
         Default::default()
     } else {
@@ -505,26 +1112,30 @@ async fn plan(
     let mut qualifier = binding.map_or(String::new(), |b| b.qualifier.clone());
     if binding.is_none() {
         for derived in &paths {
-            if oldfiles.iter().all(|f| f.path.to_path() != derived.path)
-                && (snapshot(&config.directory, &derived.path).await?.is_some()
-                    || session.owners(&derived.path)?.any(|owner| {
-                        owner.library.as_ref() != asset.source_zone().unwrap_or(&config.library)
-                            || owner.asset_id.as_ref() != asset.state_id()
-                    })
-                    || preview_claims.contains(&path_key(&derived.path)?)
-                    || if let Some(db) = db {
-                        db.guard_primary_slot(
-                            asset.source_zone().unwrap_or(&config.library),
-                            asset.state_id(),
-                            derived.version_size.as_str(),
-                            &derived.checksum,
-                            &derived.path,
-                        )
-                        .await
-                        .is_err()
-                    } else {
-                        false
-                    })
+            if config
+                .selection_run
+                .as_ref()
+                .is_some_and(|run| run.colliding_album_parent(asset, config))
+                || oldfiles.iter().all(|f| f.path.to_path() != derived.path)
+                    && (snapshot(&config.directory, &derived.path).await?.is_some()
+                        || session.owners(&derived.path)?.any(|owner| {
+                            owner.library.as_ref() != asset.source_zone().unwrap_or(&config.library)
+                                || owner.asset_id.as_ref() != asset.state_id()
+                        })
+                        || preview_claims.contains(&path_key(&derived.path)?)
+                        || if let Some(db) = db {
+                            db.guard_primary_slot(
+                                asset.source_zone().unwrap_or(&config.library),
+                                asset.state_id(),
+                                derived.version_size.as_str(),
+                                &derived.checksum,
+                                &derived.path,
+                            )
+                            .await
+                            .is_err()
+                        } else {
+                            false
+                        })
             {
                 qualifier = format!(
                     "-{}",
@@ -541,12 +1152,32 @@ async fn plan(
     let mut members = Vec::new();
     let mut destinations = Vec::new();
     for derived in paths {
-        let destination = qualified_path(&derived.path, &qualifier, derived.naming_role)?;
+        let destination = bound_destination(&derived, &qualifier, binding)?;
         let target = snapshot(&config.directory, &destination).await?;
         let old = oldfiles
             .iter()
             .find(|f| f.path.to_path() == destination)
             .cloned();
+        if !repairs.is_empty() && !repairs.iter().any(|path| path.to_path() == destination) {
+            let unchanged =
+                old.context("Integrity repair cannot introduce another managed destination")?;
+            destinations.push(destination);
+            members.push(LayoutMember {
+                missing: None,
+                record: None,
+                destination: None,
+                path_key: None,
+                stage: None,
+                old: None,
+                archive_source: None,
+                preserved_path: None,
+                retirement: None,
+                prepared: None,
+                preserved: None,
+                installed: Some(unchanged),
+            });
+            continue;
+        }
         anyhow::ensure!(
             target.is_none() || old.is_some(),
             "Foreign file occupies a reserved primary family path"
@@ -572,8 +1203,50 @@ async fn plan(
             &destination,
         );
         let record = planner::pending_record_for_task(config, asset, &task);
+        if repairs.is_empty()
+            && derived.path.parent() == destination.parent()
+            && crate::download::pipeline::MetadataFlags::from(config).bits() == 0
+            && !config.refresh_metadata
+            && let Some(existing) = old.as_ref().filter(|old| {
+                old.version == derived.version_size.as_str()
+                    && old.provider_checksum == derived.checksum.as_ref()
+            })
+        {
+            // A catalogue/grouping refresh with no file metadata recipe does
+            // not authorize republishing an independently verified sibling.
+            let mut retained = existing.clone();
+            retained.metadata_decision = Some(metadata_decision(
+                asset,
+                config,
+                derived.version_size,
+                &derived.checksum,
+            )?);
+            destinations.push(destination.clone());
+            members.push(LayoutMember {
+                missing: None,
+                record: Some(record),
+                destination: Some(SelectionPath::from_path(&destination)),
+                path_key: Some(path_key(&destination)?),
+                stage: Some(SelectionPath::from_path(&destination)),
+                old: None,
+                archive_source: None,
+                preserved_path: None,
+                retirement: None,
+                prepared: Some(retained.clone()),
+                preserved: None,
+                installed: Some(retained),
+            });
+            continue;
+        }
         // Every occupied owned target retains exact old media and sidecar evidence, even for metadata-only changes.
-        let preserved_path = old.as_ref().map(|old| preservation_path(old, &family));
+        let missing = missingfiles
+            .iter()
+            .find(|file| file.path.to_path() == destination)
+            .cloned();
+        let preserved_path = old
+            .as_ref()
+            .or(missing.as_ref())
+            .map(|old| preservation_path(old, &family));
         destinations.push(destination.clone());
         members.push(LayoutMember {
             record: Some(record),
@@ -582,6 +1255,7 @@ async fn plan(
             stage: Some(SelectionPath::from_path(&stage)),
             archive_source: None,
             old,
+            missing,
             preserved_path,
             retirement: None,
             prepared: None,
@@ -592,7 +1266,7 @@ async fn plan(
     // A previously owned original must remain filterable even when a later
     // selection requests only adjusted media. This retains local bytes without
     // adding a provider selection or download obligation.
-    if config.edited_naming == EditedNaming::Primary {
+    if config.edited_naming == EditedNaming::Primary && repairs.is_empty() {
         for old in &oldfiles {
             let adjusted = match old.version.as_str() {
                 "original" => "adjusted",
@@ -655,6 +1329,7 @@ async fn plan(
                     stage: Some(SelectionPath::from_path(&stage)),
                     archive_source: Some(old.clone()),
                     old: None,
+                    missing: None,
                     preserved_path: None,
                     retirement: None,
                     prepared: None,
@@ -670,6 +1345,23 @@ async fn plan(
         if destinations.iter().any(|p| *p == old.path.to_path()) {
             continue;
         }
+        if !repairs.is_empty() {
+            members.push(LayoutMember {
+                missing: None,
+                record: None,
+                destination: None,
+                path_key: None,
+                stage: None,
+                old: None,
+                archive_source: None,
+                preserved_path: None,
+                retirement: None,
+                prepared: None,
+                preserved: None,
+                installed: Some(old),
+            });
+            continue;
+        }
         if old.archive_original {
             members.push(LayoutMember {
                 record: None,
@@ -678,6 +1370,7 @@ async fn plan(
                 stage: None,
                 archive_source: None,
                 old: Some(old.clone()),
+                missing: None,
                 preserved_path: Some(preservation_path(&old, &family)),
                 retirement: None,
                 prepared: None,
@@ -700,6 +1393,7 @@ async fn plan(
             stage: None,
             archive_source: None,
             old: Some(old),
+            missing: None,
             preserved_path: Some(preserved_path),
             retirement: Some(SelectionPath::from_path(&retirement)),
             prepared: None,
@@ -752,6 +1446,10 @@ async fn plan(
 
 fn preservation_path(old: &LayoutFile, family: &str) -> SelectionPath {
     let path = old.path.to_path();
+    // Keep the journal family intact. A colon in a Windows filename
+    // denotes an alternate data stream, not a directory component.
+    #[cfg(windows)]
+    let family = family.replace(':', "-");
     let revision = digest(
         serde_json::to_vec(&serde_json::json!([
             old.version,
@@ -879,16 +1577,36 @@ async fn prepare(
                     && p.checksum.as_ref() == record.checksum.as_ref()
             })
             .context("Selected layout resource changed")?;
+        let repairing = confirmed_damage(asset, config, &SelectionPath::from_path(&target))
+            .await?
+            .is_some();
         let owned = op
             .members
             .iter()
             .filter_map(|m| m.old.as_ref())
             .find(|old| {
-                old.version == record.version_size.as_str()
+                !old.local_preserved
+                    && !repairing
+                    && old.version == record.version_size.as_str()
                     && old.provider_checksum == record.checksum.as_ref()
             })
             .cloned();
-        let source = if let Some(source) = owned {
+        let local_source = member
+            .old
+            .as_ref()
+            .filter(|old| {
+                old.local_preserved
+                    && asset
+                        .media_modified_at(record.version_size)
+                        .zip(old.local_modified)
+                        .is_none_or(|(cloud, local)| cloud <= local)
+            })
+            .cloned();
+        let source = if repairing {
+            None
+        } else if let Some(source) = local_source {
+            Some(source)
+        } else if let Some(source) = owned {
             Some(source)
         } else {
             let mut found = None;
@@ -905,7 +1623,7 @@ async fn prepare(
                 if data_encoding::HEXLOWER.encode(&actual.sha256) == *checksum {
                     #[cfg(test)]
                     crate::test_helpers::primary_source_snapshot_point(path).await?;
-                    let candidate = file_receipt(
+                    let mut candidate = file_receipt(
                         &config.directory,
                         path,
                         record.version_size.as_str(),
@@ -917,6 +1635,7 @@ async fn prepare(
                         candidate.fingerprint == actual,
                         "Retained primary source changed while proving its receipt"
                     );
+                    load_source_fields(db, &op.library, &op.child, &mut candidate).await?;
                     found = Some(candidate);
                     break;
                 }
@@ -925,6 +1644,7 @@ async fn prepare(
         };
         let transform = metadata_decision(asset, config, record.version_size, &record.checksum)?;
         let prepared = if let Some(source) = source {
+            let mut embedded_fields = source.embedded_fields.clone();
             let media = copy_verified(
                 &config.directory,
                 &source.path.to_path(),
@@ -932,6 +1652,17 @@ async fn prepare(
                 &source.fingerprint,
             )
             .await?;
+            if source.local_preserved {
+                if let Some(modified) = source.local_modified {
+                    file::primary_layout::keep_modified(&config.directory, &stage, modified.into())
+                        .await?;
+                } else {
+                    anyhow::ensure!(
+                        crate::download::pipeline::MetadataFlags::from(config).is_empty(),
+                        "Preserved layout metadata requires a known local modification time"
+                    );
+                }
+            }
             if let Some(xmp) = &source.sidecar {
                 copy_verified(
                     &config.directory,
@@ -949,6 +1680,11 @@ async fn prepare(
                     size: media.size,
                     sha256: media.sha256,
                 };
+                let mut payload =
+                    filter::build_selected_payload(asset, config, record.version_size);
+                Arc::make_mut(&mut payload)
+                    .prior_embedded
+                    .clone_from(&source.embedded_fields);
                 let written = crate::download::metadata_rewrite::write_download_metadata(
                     crate::download::metadata_rewrite::MetadataWriteRequest {
                         final_path: &stage,
@@ -956,7 +1692,7 @@ async fn prepare(
                         expected_embed_fingerprint: Some(fingerprint),
                         source_checksum: source.source_checksum.as_deref(),
                         sidecar_path: Some(&stage),
-                        payload: filter::build_selected_payload(asset, config, record.version_size),
+                        payload,
                         created_local: asset.created_local(),
                         flags,
                         capture_timestamp_repair: config.capture_timestamp_repair,
@@ -964,19 +1700,33 @@ async fn prepare(
                     },
                 )
                 .await;
+                if written.storage_failed {
+                    return Err(std::io::Error::other(
+                        "Primary layout metadata storage unavailable",
+                    )
+                    .into());
+                }
                 anyhow::ensure!(
                     !written.any_failed() && !written.embed_input_changed,
                     "Prepared primary metadata remains incomplete"
                 );
+                embedded_fields = written.embedded_fields;
             }
-            file_receipt(
+            let mut prepared = file_receipt(
                 &config.directory,
                 &stage,
                 record.version_size.as_str(),
                 &record.checksum,
                 source.source_checksum,
             )
-            .await?
+            .await?;
+            prepared.local_preserved = source.local_preserved;
+            prepared.local_modified = source
+                .local_preserved
+                .then_some(source.local_modified)
+                .flatten();
+            prepared.embedded_fields = embedded_fields;
+            prepared
         } else {
             anyhow::ensure!(
                 !cancel.is_cancelled(),
@@ -999,20 +1749,33 @@ async fn prepare(
                 shutdown_token: cancel,
                 mode: crate::personality::Mode::Off,
             };
-            let (metadata_ok, checksum, source_checksum, bytes, disk, _) =
-                crate::download::pipeline::download_single_task(
-                    client,
-                    &task,
-                    &config.retry,
-                    crate::download::pipeline::MetadataFlags::from(config),
-                    context,
-                )
-                .await?;
+            let (
+                metadata_ok,
+                checksum,
+                source_checksum,
+                bytes,
+                disk,
+                _,
+                embedded_fields,
+                metadata_storage_failed,
+            ) = crate::download::pipeline::download_single_task(
+                client,
+                &task,
+                &config.retry,
+                crate::download::pipeline::MetadataFlags::from(config),
+                context,
+            )
+            .await?;
+            if metadata_storage_failed {
+                return Err(
+                    std::io::Error::other("Primary layout metadata storage unavailable").into(),
+                );
+            }
             anyhow::ensure!(
                 metadata_ok,
                 "Primary layout metadata preparation is incomplete"
             );
-            let prepared = file_receipt(
+            let mut prepared = file_receipt(
                 &config.directory,
                 &stage,
                 record.version_size.as_str(),
@@ -1020,6 +1783,7 @@ async fn prepare(
                 source_checksum,
             )
             .await?;
+            prepared.embedded_fields = embedded_fields;
             anyhow::ensure!(
                 data_encoding::HEXLOWER.encode(&prepared.fingerprint.sha256) == checksum,
                 "Prepared primary checksum changed"
@@ -1094,7 +1858,38 @@ pub(in crate::download) async fn finish(
     // Preserve every member before the first visible change, including sidecars.
     for index in 0..op.members.len() {
         let member = op.members.get(index).context("Layout member disappeared")?;
-        if member.preserved.is_some() {
+        if let Some(missing) = &member.missing
+            && let Some(expected) = &missing.sidecar
+        {
+            let preserved = sidecar(
+                &member
+                    .preserved_path
+                    .as_ref()
+                    .context("Missing sidecar history path")?
+                    .to_path(),
+            );
+            if let Some(actual) = snapshot(&root, &preserved).await? {
+                anyhow::ensure!(
+                    file::primary_layout::bytes_match(expected, &actual)
+                        && actual.identity != expected.identity,
+                    "Missing media sidecar history changed"
+                );
+            } else {
+                anyhow::ensure!(
+                    op.phase != "publishing",
+                    "Missing durable sidecar preservation"
+                );
+                copy_verified(
+                    &root,
+                    &sidecar(&missing.path.to_path()),
+                    &preserved,
+                    expected,
+                )
+                .await?;
+            }
+        }
+        if let Some(preserved) = &member.preserved {
+            validate_file(&root, preserved).await?;
             continue;
         }
         let Some(old) = &member.old else { continue };
@@ -1105,6 +1900,9 @@ pub(in crate::download) async fn finish(
             .context("Missing archive reservation")?
             .to_path();
         let media = copy_verified(&root, &old.path.to_path(), &path, &old.fingerprint).await?;
+        if let Some(modified) = old.local_modified {
+            file::primary_layout::keep_modified(&root, &path, modified.into()).await?;
+        }
         let xmp = if let Some(xmp) = &old.sidecar {
             Some(copy_verified(&root, &sidecar(&old.path.to_path()), &sidecar(&path), xmp).await?)
         } else {
@@ -1125,6 +1923,10 @@ pub(in crate::download) async fn finish(
     if op.phase != "publishing" {
         op.phase = "preserved".into();
         db.save_primary_layout(op.clone()).await?;
+        #[cfg(all(test, target_os = "linux"))]
+        if op.is_membership_retirement() {
+            crate::test_helpers::process_death_point("membership-layout-preserved");
+        }
         #[cfg(all(test, target_os = "linux"))]
         crate::test_helpers::process_death_point("layout-preserved");
         anyhow::ensure!(
@@ -1168,12 +1970,15 @@ pub(in crate::download) async fn finish(
                         .preserved
                         .as_ref()
                         .context("Missing preservation proof")?;
-                    Some(ManagedPrimaryAuthorization::preserved(
-                        op.operation.clone(),
-                        old.fingerprint.clone(),
-                        preserved.path.to_path(),
-                        preserved.fingerprint.clone(),
-                    )?)
+                    Some(
+                        ManagedPrimaryAuthorization::preserved(
+                            op.operation.clone(),
+                            old.fingerprint.clone(),
+                            preserved.path.to_path(),
+                            preserved.fingerprint.clone(),
+                        )?
+                        .with_modified(old.local_modified.map(Into::into)),
+                    )
                 } else {
                     None
                 };
@@ -1214,6 +2019,27 @@ pub(in crate::download) async fn finish(
                                     .clone()
                                     .context("Missing preserved sidecar")?,
                             )?)
+                        } else if let Some(old) = member
+                            .missing
+                            .as_ref()
+                            .and_then(|missing| missing.sidecar.as_ref())
+                        {
+                            let path = sidecar(
+                                &member
+                                    .preserved_path
+                                    .as_ref()
+                                    .context("Missing sidecar history path")?
+                                    .to_path(),
+                            );
+                            let preserved = snapshot(&root, &path)
+                                .await?
+                                .context("Missing preserved orphan sidecar")?;
+                            Some(ManagedPrimaryAuthorization::preserved(
+                                op.operation.clone(),
+                                old.clone(),
+                                path,
+                                preserved,
+                            )?)
                         } else {
                             None
                         };
@@ -1238,7 +2064,19 @@ pub(in crate::download) async fn finish(
                         .path
                         .to_path()
                         .with_file_name(format!(".retired-sidecar-{}-{index}", op.operation));
-                    file::primary_layout::retire(&root, &xmp_path, &retired, old).await?;
+                    file::primary_layout::retire(&root, &xmp_path, &retired, old, None).await?;
+                } else if let Some(old) = member
+                    .missing
+                    .as_ref()
+                    .and_then(|missing| missing.sidecar.as_ref())
+                {
+                    let retired = member
+                        .preserved_path
+                        .as_ref()
+                        .context("Missing sidecar history path")?
+                        .to_path()
+                        .with_file_name(format!(".retired-sidecar-{}-{index}", op.operation));
+                    file::primary_layout::retire(&root, &xmp_path, &retired, old, None).await?;
                 } else {
                     anyhow::ensure!(
                         snapshot(&root, &xmp_path).await?.is_none(),
@@ -1268,17 +2106,15 @@ pub(in crate::download) async fn finish(
                 &old.path.to_path(),
                 &retirement.to_path(),
                 &old.fingerprint,
+                Some(file::primary_layout::RetirementCompanion {
+                    path: &sidecar(&old.path.to_path()),
+                    retired: &sidecar(&retirement.to_path()),
+                    expected: old.sidecar.as_ref(),
+                }),
             )
             .await?;
-            if let Some(xmp) = &old.sidecar {
-                file::primary_layout::retire(
-                    &root,
-                    &sidecar(&old.path.to_path()),
-                    &sidecar(&retirement.to_path()),
-                    xmp,
-                )
-                .await?;
-            }
+            #[cfg(all(test, target_os = "linux"))]
+            crate::test_helpers::process_death_point("layout-member-retired");
         }
         if let Some(file) = &member.installed {
             validate_file(&root, file).await?;
@@ -1301,12 +2137,24 @@ pub(in crate::download) async fn preview_asset(
     config: &DownloadConfig,
     session: &LayoutSession,
 ) -> Result<Option<Vec<filter::DownloadTask>>> {
-    let key = family(asset, config)?;
+    let key = recorded_family(asset, config, session).await?;
     let binding = if let Some(db) = config.state_db.as_deref() {
         db.primary_layout_binding(key.clone()).await?
     } else {
         None
     };
+    let pending = if let Some(db) = config.state_db.as_deref() {
+        db.primary_layout_operations(config.library.to_string())
+            .await?
+    } else {
+        Vec::new()
+    };
+    let recorded_config = recorded_layout_config(
+        config,
+        binding.as_ref(),
+        pending.iter().find(|op| op.family == key),
+    )?;
+    let config = recorded_config.as_deref().unwrap_or(config);
     if config.edited_naming == EditedNaming::Suffix && binding.is_none() {
         let managed = if let Some(db) = config.state_db.as_deref() {
             db.primary_layout_owns_asset(
@@ -1337,13 +2185,7 @@ pub(in crate::download) async fn preview_asset(
         "Primary layout preview waits for usable adjusted resources"
     );
     let desired = decision(&current, config)?;
-    if let Some(db) = config.state_db.as_deref()
-        && db
-            .primary_layout_operations(config.library.to_string())
-            .await?
-            .iter()
-            .any(|op| op.family == key)
-    {
+    if pending.iter().any(|op| op.family == key) {
         tracing::info!(family=%key,"[PLAN] Recorded primary layout recovery must finish before applying this plan");
     }
     let unchanged = binding
@@ -1352,7 +2194,32 @@ pub(in crate::download) async fn preview_asset(
     let qualifier = if unchanged {
         let binding = binding.as_ref().context("Missing preview binding")?;
         for file in &binding.files {
-            validate_file(&config.directory, file).await?;
+            if let Some(retained) = pending
+                .iter()
+                .filter(|op| op.family == key)
+                .flat_map(|op| &op.members)
+                .filter_map(|member| member.installed.as_ref().or(member.old.as_ref()))
+                .find(|retained| retained.path == file.path)
+            {
+                validate_file(&config.directory, retained)
+                    .await
+                    .context("Preview journal input changed")?;
+            } else if let Some((checksum, size)) =
+                confirmed_damage(&current, config, &file.path).await?
+            {
+                let actual = snapshot(&config.directory, &file.path.to_path())
+                    .await?
+                    .context("Confirmed managed damage disappeared")?;
+                anyhow::ensure!(
+                    actual.size == size
+                        && data_encoding::HEXLOWER.encode(&actual.sha256) == checksum,
+                    "Confirmed damaged destination changed; replacement refused"
+                );
+            } else {
+                validate_file(&config.directory, file)
+                    .await
+                    .context("Preview committed input changed")?;
+            }
         }
         binding.qualifier.clone()
     } else {
@@ -1382,7 +2249,7 @@ pub(in crate::download) async fn preview_asset(
     };
     let mut tasks = Vec::new();
     for path in filter::derive_expected_paths(&current, config) {
-        let target = qualified_path(&path.path, &qualifier, path.naming_role)?;
+        let target = bound_destination(&path, &qualifier, binding.as_ref())?;
         tracing::info!(version=path.version_size.as_str(),path=%target.display(),"[PLAN] Current selected rendition destination");
         tasks.push(task_for(
             &current,
@@ -1407,8 +2274,15 @@ pub(in crate::download) async fn plan_asset(
         .state_db
         .as_deref()
         .context("Primary naming requires an owned state database")?;
-    let key = family(asset, config)?;
+    let key = recorded_family(asset, config, session).await?;
     let binding = db.primary_layout_binding(key.clone()).await?;
+    let op = db
+        .primary_layout_operations(config.library.to_string())
+        .await?
+        .into_iter()
+        .find(|op| op.family == key);
+    let recorded_config = recorded_layout_config(config, binding.as_ref(), op.as_ref())?;
+    let config = recorded_config.as_deref().unwrap_or(config);
     if binding.is_none()
         && config.edited_naming == EditedNaming::Primary
         && filter::derive_expected_paths(asset, config).is_empty()
@@ -1451,16 +2325,20 @@ pub(in crate::download) async fn plan_asset(
         "Primary layout waits for usable adjusted resources"
     );
     let desired = decision(&current, config)?;
-    let op = db
-        .primary_layout_operations(config.library.to_string())
-        .await?
-        .into_iter()
-        .find(|o| o.family == key);
-    let op = if let Some(mut op) = op {
+    // Render the already bound targets first. Only execution after current
+    // selection admission may create or replan a repair journal.
+    let (repairing, _) = repair_plan_status(&current, config, binding.as_ref(), None).await?;
+    let op = if repairing {
+        op
+    } else if let Some(mut op) = op {
         if op.decision == desired {
             Some(op)
         } else {
             if op.phase == "publishing" {
+                anyhow::ensure!(
+                    !op.is_membership_retirement(),
+                    "Membership retirement requires completed current source evidence"
+                );
                 finish(
                     db,
                     &mut op,
@@ -1485,10 +2363,10 @@ pub(in crate::download) async fn plan_asset(
                 .await?,
             )
         }
-    } else if binding
-        .as_ref()
-        .is_some_and(|b| b.decision == desired && b.policy == policy(config))
-    {
+    } else if binding.as_ref().is_some_and(|b| {
+        (b.decision == desired || binding_matches_selection(&current, config, b))
+            && b.policy == policy(config)
+    }) {
         None
     } else {
         Some(
@@ -1512,7 +2390,7 @@ pub(in crate::download) async fn plan_asset(
         .unwrap_or("");
     let mut tasks = Vec::new();
     for path in paths {
-        let target = qualified_path(&path.path, qualifier, path.naming_role)?;
+        let target = bound_destination(&path, qualifier, binding.as_ref())?;
         tasks.push(task_for(
             &current,
             config,
@@ -1543,11 +2421,40 @@ pub(super) async fn recover(
     }
     let session = LayoutSession::load(db).await?;
     for mut op in operations {
+        if op.is_membership_retirement() {
+            continue;
+        }
         let protected =
             crate::download::legacy_preservation::protected_replacement_paths(Some(db)).await?;
         file::recover_conditional_replacements(&op.root.to_path(), &protected).await?;
         if op.phase == "publishing" {
             finish(db, &mut op, cancel, &mut LayoutOutcome::default()).await?;
+            continue;
+        }
+        let mut selected = false;
+        for pass in passes {
+            if let Some((capture, _, _)) = pass.album.owned_selection_scope()? {
+                let concrete = Arc::clone(&capture.db) as Arc<dyn DownloadStore>;
+                anyhow::ensure!(
+                    config
+                        .state_db
+                        .as_ref()
+                        .is_some_and(|store| Arc::ptr_eq(store, &concrete)),
+                    "Managed selection store mismatch"
+                );
+                selected |= capture
+                    .db
+                    .has_selected_layout_obligation(
+                        capture.owner,
+                        op.library.clone(),
+                        op.child.clone(),
+                    )
+                    .await?;
+            }
+        }
+        if selected {
+            // Fresh current selection must bind a replacement resource before
+            // this journal can stop owning the old native obligation.
             continue;
         }
         let mut matched = false;
@@ -1562,7 +2469,7 @@ pub(super) async fn recover(
                 .await?
                 .asset
                 .with_state_record_name(Arc::from(op.child.as_str()));
-            if family(&current, &effective)? != op.family {
+            if recorded_family(&current, &effective, &session).await? != op.family {
                 db.cancel_primary_layout(op.operation.clone()).await?;
                 matched = true;
                 break;
@@ -1593,6 +2500,68 @@ mod tests {
 
     const PREPARED: &[u8] = b"prepared current rendition";
     const LEGACY: &[u8] = b"ambiguous legacy original";
+
+    #[test]
+    fn legacy_owner_diagnostic_preserves_rendition_guard_and_redacts_identifiers() {
+        use crate::state::{ReconciliationCatalogPath, VersionSizeKey};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private-filename.jpg");
+        let mut session = LayoutSession::default();
+        let key = super::path_key(&path).unwrap();
+        let owner = |id: &str, version_size| ReconciliationCatalogPath {
+            library: "private-library".into(),
+            asset_id: id.into(),
+            version_size,
+            path: path.clone(),
+        };
+        let family = super::family_in_parent(
+            &TestPhotoAsset::new("private-child").build(),
+            &DownloadConfig::test_default(),
+            dir.path(),
+        )
+        .unwrap();
+        let verify = |session: &LayoutSession| {
+            session.verify_legacy_owner(
+                &family,
+                &path,
+                "private-library",
+                "private-child",
+                VersionSizeKey::Original,
+            )
+        };
+        session.owners.insert(
+            key.clone(),
+            vec![owner("private-child", VersionSizeKey::Adjusted)],
+        );
+        let missing = verify(&session).unwrap_err().to_string();
+        assert!(missing.contains("expected_receipt_matched=false conflicting_owner_ref=none"));
+
+        session
+            .owners
+            .get_mut(&key)
+            .unwrap()
+            .push(owner("private-child", VersionSizeKey::Original));
+        verify(&session).unwrap();
+        session
+            .owners
+            .get_mut(&key)
+            .unwrap()
+            .push(owner("private-peer", VersionSizeKey::Original));
+        let conflict = verify(&session).unwrap_err().to_string();
+        assert!(conflict.contains("expected_receipt_matched=true"));
+        assert!(conflict.contains(&format!("family_ref={family}")));
+        assert!(!conflict.contains("private-"));
+        let owner_ref = |id: &str| digest(serde_json::to_vec(&("private-library", id)).unwrap());
+        assert!(conflict.contains(&format!(
+            "expected_owner_ref={}",
+            owner_ref("private-child")
+        )));
+        assert!(conflict.contains(&format!(
+            "conflicting_owner_ref={}",
+            owner_ref("private-peer")
+        )));
+    }
 
     async fn prepared_layout(
         db: &Arc<SqliteStateDb>,

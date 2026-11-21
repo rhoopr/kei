@@ -37,10 +37,16 @@ fn classify_sync_auth_error(err: &anyhow::Error) -> SyncAuthErrorClass {
     }
 }
 
-fn two_factor_recovery_message(username: &str) -> String {
-    format!(
-        "2FA required for {username}. Run `kei login get-code`, then `kei login submit-code <CODE>`."
-    )
+fn notify_two_factor_required(config: &config::Config, notifier: &Notifier) {
+    let instructions = crate::cli::two_factor_instructions(config.runtime.config_path.as_deref());
+    tracing::warn!(message = %instructions, "2FA required");
+    notifier.notify(
+        notifications::Event::TwoFaRequired,
+        "Two-factor authentication required. Follow the instructions on the sync host.",
+        &config.auth.username,
+        None,
+        None,
+    );
 }
 
 /// Classify whether an error from `init_photos_service` or
@@ -99,6 +105,10 @@ async fn reauth_after_session_error(
     is_watch_mode: bool,
     input_mode: crate::InputMode,
 ) -> anyhow::Result<auth::AuthResult> {
+    anyhow::ensure!(
+        !config.runtime.dry_run,
+        "Preview authentication expired; refresh authentication before retrying the preview"
+    );
     let expected_generation = if let Some((ss, ps)) = live {
         let session = ss.read().await;
         let generation = session.generation();
@@ -207,6 +217,10 @@ async fn prepare_mid_cycle_reauth(
     shared_session: &auth::SharedSession,
     config: &config::Config,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !config.runtime.dry_run,
+        "Preview authentication expired; refresh authentication before retrying the preview"
+    );
     clear_validation_cache_for_reauth(
         &config.auth.cookie_directory,
         &config.auth.username,
@@ -253,6 +267,11 @@ async fn authenticate_sync_session(
         config.ui.personality_mode,
         input_mode,
         expected_generation,
+        if config.runtime.dry_run {
+            auth::AuthPersistence::ReadOnly
+        } else {
+            auth::AuthPersistence::Writable
+        },
     )
     .await
 }
@@ -294,15 +313,7 @@ async fn notify_and_wait_for_2fa(
     input_mode: crate::InputMode,
     expected_generation: Option<auth::session::SessionGeneration>,
 ) -> anyhow::Result<auth::AuthResult> {
-    let msg = two_factor_recovery_message(&config.auth.username);
-    tracing::warn!(message = %msg, "2FA required");
-    notifier.notify(
-        notifications::Event::TwoFaRequired,
-        &msg,
-        &config.auth.username,
-        None,
-        None,
-    );
+    notify_two_factor_required(config, notifier);
     wait_and_retry_2fa(
         &config.auth.cookie_directory,
         &config.auth.username,
@@ -390,6 +401,9 @@ pub(super) async fn authenticate_initial_session(
     input_mode: crate::InputMode,
 ) -> anyhow::Result<auth::AuthResult> {
     let is_watch_mode = config.watch.interval.is_some();
+    if config.runtime.dry_run {
+        return authenticate_sync_session(config, password_provider, input_mode, None).await;
+    }
     match authenticate_sync_session(config, password_provider, input_mode, None).await {
         Ok(result) => Ok(result),
         Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {
@@ -397,15 +411,7 @@ pub(super) async fn authenticate_initial_session(
             if !super::should_wait_for_2fa(is_watch_mode, &e) {
                 return Err(e);
             }
-            let msg = two_factor_recovery_message(&config.auth.username);
-            tracing::warn!(message = %msg, "2FA required");
-            notifier.notify(
-                notifications::Event::TwoFaRequired,
-                &msg,
-                &config.auth.username,
-                None,
-                None,
-            );
+            notify_two_factor_required(config, notifier);
             wait_and_retry_2fa(
                 &config.auth.cookie_directory,
                 &config.auth.username,
@@ -518,7 +524,8 @@ pub(super) async fn recover_expired_cycle(
     *reauth_attempts += 1;
     if *reauth_attempts >= MAX_REAUTH_ATTEMPTS {
         anyhow::bail!(
-            "Your iCloud session expired and kei could not refresh it after {MAX_REAUTH_ATTEMPTS} attempts. Run `kei login` and try again."
+            "Your iCloud session expired and kei could not refresh it after {MAX_REAUTH_ATTEMPTS} attempts. Run `{}` and try again.",
+            crate::cli::command_for_config("login", config.runtime.config_path.as_deref())
         );
     }
     tracing::warn!(
@@ -547,15 +554,7 @@ pub(super) async fn recover_expired_cycle(
             // can't exhaust the limit.
             *reauth_attempts -= 1;
 
-            let msg = two_factor_recovery_message(&config.auth.username);
-            tracing::warn!(message = %msg, "2FA required");
-            notifier.notify(
-                notifications::Event::TwoFaRequired,
-                &msg,
-                &config.auth.username,
-                None,
-                None,
-            );
+            notify_two_factor_required(config, notifier);
             if !super::should_wait_for_2fa(is_watch_mode, &e) {
                 return Err(e);
             }
@@ -1243,6 +1242,224 @@ mod tests {
             lock_error
                 .downcast_ref::<auth::error::AuthError>()
                 .is_some_and(auth::error::AuthError::is_lock_contention)
+        );
+    }
+
+    fn synthetic_cloudkit_auth_account(base_url: &str, dsid: &str) -> auth::AccountLoginResponse {
+        serde_json::from_value(serde_json::json!({
+            "dsInfo": {"dsid": dsid},
+            "webservices": {"ckdatabasews": {"url": base_url}},
+            "hsaChallengeRequired": false,
+            "hsaTrustedBrowser": true,
+            "hasError": false,
+            "serviceErrors": [],
+            "iCDPEnabled": false,
+        }))
+        .expect("synthetic account data")
+    }
+
+    #[tokio::test]
+    async fn no_auth_method_found_recovers_once_then_terminates_without_acceptance_or_reset() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!(
+            "no_auth_method_found_recovers_once_then_terminates_without_acceptance_or_reset"
+        );
+        let directory = tempfile::tempdir().expect("tempdir");
+        let username = "cloudkit-auth-recovery@example.invalid";
+        let mock_base = server.uri();
+        let account_data = synthetic_cloudkit_auth_account(&mock_base, "synthetic-principal-a");
+
+        let session_path = auth::session_file_path(directory.path(), username, "com");
+        tokio::fs::write(
+            &session_path,
+            serde_json::to_vec(&serde_json::json!({
+                "session_token": "synthetic-session-token",
+                "trust_token": "synthetic-trust-token",
+                "client_id": "synthetic-client",
+            }))
+            .expect("session json"),
+        )
+        .await
+        .expect("persisted session");
+
+        // A fresh cache would let persisted authentication skip accountLogin.
+        // Recovery must clear it, then replace it with the validated account.
+        let stale_cache = auth::responses::ValidationCache {
+            validated_at: chrono::Utc::now().timestamp(),
+            account_data: synthetic_cloudkit_auth_account(&mock_base, "stale-cache-principal"),
+        };
+        let cache_path = auth::validation_cache_file_path(directory.path(), username, "com");
+        tokio::fs::write(
+            &cache_path,
+            serde_json::to_vec(&stale_cache).expect("cache json"),
+        )
+        .await
+        .expect("stale validation cache");
+
+        let owner =
+            crate::state::db::account::AccountOwner::authenticated(username, "com", &account_data)
+                .expect("account owner");
+        let state_path = crate::state::db::account::state_path(directory.path(), username, "com")
+            .await
+            .expect("state path");
+        let db = crate::state::SqliteStateDb::open_owned(&state_path, &owner)
+            .await
+            .expect("state database");
+        db.set_metadata("sync_token:PrimarySync", "seeded-cursor")
+            .await
+            .expect("seed cursor");
+        db.set_metadata("pending_sync_token:epoch:PrimarySync", "seeded-debt")
+            .await
+            .expect("seed debt");
+        drop(db);
+        let media = directory.path().join("seeded.jpg");
+        tokio::fs::write(&media, b"synthetic seeded media")
+            .await
+            .expect("seed media");
+
+        let mut session =
+            auth::session::Session::new(directory.path(), username, "https://www.icloud.com", None)
+                .await
+                .expect("initial session");
+
+        let mut config = make_run_cycle_config();
+        config.download.directory = directory.path().to_path_buf();
+        config.auth.cookie_directory = directory.path().to_path_buf();
+        config.auth.username = username.to_string();
+        config.auth.domain = crate::types::Domain::Com;
+        config.runtime.dry_run = false;
+        let password_provider: crate::password::PasswordProvider = std::sync::Arc::new(|| {
+            panic!("persisted-session recovery must not request a password")
+        });
+        let notifier = crate::notifications::Notifier::new(None);
+
+        let login_body = serde_json::to_value(&account_data).expect("login body");
+        let unauthorized = serde_json::json!({
+            "serverErrorCode": "AUTHENTICATION_FAILED",
+            "reason": "no auth method found",
+        });
+        Mock::given(method("POST"))
+            .and(path("/setup/ws/1/validate"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/setup/ws/1/accountLogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&login_body))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/database/1/com.apple.photos.cloud/production/private/records/query",
+            ))
+            .respond_with(ResponseTemplate::new(401).set_body_json(&unauthorized))
+            .mount(&server)
+            .await;
+
+        let initial_data = auth::twofa::authenticate_with_token(
+            &mut session,
+            &auth::endpoints::Endpoints::for_test_base(&mock_base),
+        )
+        .await
+        .expect("initial account login");
+        let result = Box::pin(crate::auth::endpoints::with_test_endpoint(
+            &mock_base,
+            super::initialize_libraries(
+                auth::AuthResult {
+                    session,
+                    data: initial_data,
+                    requires_2fa: false,
+                },
+                crate::retry::RetryConfig {
+                    max_retries: 0,
+                    base_delay_secs: 0,
+                    max_delay_secs: 0,
+                },
+                &config,
+                &password_provider,
+                &notifier,
+                crate::InputMode::NoInput,
+            ),
+        ))
+        .await;
+
+        let error = result.expect_err("a second CloudKit 401 must terminate initialization");
+        assert!(
+            error
+                .downcast_ref::<crate::icloud::error::ICloudError>()
+                .is_some_and(|error| matches!(
+                    error,
+                    crate::icloud::error::ICloudError::SessionExpired { status: 401 }
+                )),
+            "expected terminal SessionExpired(401), got: {error:#}"
+        );
+
+        let requests = server.received_requests().await.expect("requests");
+        let paths: Vec<_> = requests.iter().map(|request| request.url.path()).collect();
+        let cloudkit_init = "/database/1/com.apple.photos.cloud/production/private/records/query";
+        assert_eq!(
+            paths,
+            [
+                "/setup/ws/1/accountLogin",
+                cloudkit_init,
+                "/setup/ws/1/validate",
+                "/setup/ws/1/accountLogin",
+                cloudkit_init,
+            ],
+            "expected exactly one recovery and no agreement request"
+        );
+        for request in &requests {
+            let body = String::from_utf8_lossy(&request.body).to_ascii_lowercase();
+            assert!(
+                !body.contains("terms") && !body.contains("agreement") && !body.contains("accept"),
+                "recovery must not send an agreement acceptance request"
+            );
+        }
+
+        let recovered_cache: auth::responses::ValidationCache = serde_json::from_slice(
+            &tokio::fs::read(&cache_path)
+                .await
+                .expect("recovered validation cache"),
+        )
+        .expect("cache json");
+        assert!(
+            recovered_cache.validated_at >= stale_cache.validated_at,
+            "the recovered validation cache must not predate the stale cache"
+        );
+        assert_eq!(
+            recovered_cache
+                .account_data
+                .ds_info
+                .as_ref()
+                .and_then(|info| info.dsid.as_deref()),
+            Some("synthetic-principal-a"),
+            "the successful persisted login must replace the stale cache"
+        );
+
+        let reopened = crate::state::SqliteStateDb::open_owned(&state_path, &owner)
+            .await
+            .expect("reopen state");
+        assert_eq!(
+            reopened
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("cursor")
+                .as_deref(),
+            Some("seeded-cursor")
+        );
+        assert_eq!(
+            reopened
+                .get_metadata("pending_sync_token:epoch:PrimarySync")
+                .await
+                .expect("debt")
+                .as_deref(),
+            Some("seeded-debt")
+        );
+        assert_eq!(
+            tokio::fs::read(&media).await.expect("media"),
+            b"synthetic seeded media"
         );
     }
 

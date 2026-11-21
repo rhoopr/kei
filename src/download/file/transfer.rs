@@ -600,7 +600,8 @@ async fn attempt_download_with_publication<C: DownloadClient>(
         retained,
     };
     if !skip_rename {
-        downloaded
+        // Embedded writers defer publication and consume its outcome themselves.
+        let _publication = downloaded
             .publish(download_path, publication)
             .await
             .map_err(DownloadError::Other)?;
@@ -703,12 +704,12 @@ impl DownloadedFile {
         &mut self,
         final_path: &Path,
         publication: FinalPublication,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<super::publication::PublicationOutcome> {
         // ReplaceFileW opens its replacement without sharing data access.
         // Keep an attribute-only identity handle before releasing the reader or
         // writer, so Windows repair publication never has an unpinned interval.
         #[cfg(windows)]
-        let expected_replacement = if matches!(publication, FinalPublication::ReplaceTruncated(_)) {
+        let expected_replacement = if !matches!(publication, FinalPublication::NoReplace) {
             let expected = self.fingerprint().await?;
             let retained = Arc::clone(&self.retained);
             self.retained = tokio::task::spawn_blocking(move || {
@@ -733,7 +734,8 @@ impl DownloadedFile {
             retained.path.sibling(&destination)
         })
         .await??;
-        publish_part_to_final(self.retained.path.path(), final_path, publication).await?;
+        let outcome =
+            publish_part_to_final(self.retained.path.path(), final_path, publication).await?;
         let retained = Arc::clone(&self.retained);
         self.retained = tokio::task::spawn_blocking(move || {
             let mut file = final_confined.open_regular()?;
@@ -763,7 +765,7 @@ impl DownloadedFile {
             }))
         })
         .await??;
-        Ok(())
+        Ok(outcome)
     }
 }
 

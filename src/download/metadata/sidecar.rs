@@ -124,8 +124,27 @@ pub(in crate::download) fn write_reconciled_sidecar(
         let mut file = temp.create_new_regular()?;
         std::io::Write::write_all(&mut file, &bytes)?;
         file.sync_all()?;
-        temp.validate_identity(crate::fs_util::file_identity(&file)?)?;
-        crate::download::file::publish_reconciliation_part_blocking(&temp, &destination)?;
+        let identity = crate::fs_util::file_identity(&file)?;
+        temp.validate_identity(identity)?;
+        let publication =
+            crate::download::file::publish_reconciliation_part_blocking(&temp, &destination)?;
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(hook) = tests::AFTER_PUBLICATION.take() {
+            hook(temp.path());
+        }
+        match publication {
+            crate::download::file::PublishResult::Published => {
+                #[cfg(target_os = "linux")]
+                crate::download::file::finish_owned_prepared_link(
+                    &temp,
+                    &destination,
+                    fingerprint_bytes(&bytes)?,
+                    identity,
+                )?;
+            }
+            // A competing writer won. Accept only an identical packet below.
+            crate::download::file::PublishResult::DestinationExists => {}
+        }
         let installed = ReconciledSidecarSnapshot::read(destination)?
             .context("Reconciled sidecar disappeared")?;
         anyhow::ensure!(
@@ -408,6 +427,79 @@ mod tests {
 
     // ── Sidecar + format-dispatch tests ────────────────────────────────
 
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        pub(super) static AFTER_PUBLICATION: std::cell::Cell<Option<fn(&Path)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reconciled_sidecar_hard_link_fallback() {
+        use crate::download::file::{RECONCILIATION_RENAME_FAULT, copy_local_file_no_replace};
+        use std::os::unix::fs::MetadataExt;
+
+        const PACKET: &[u8] = br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/" dc:format="image/jpeg"/>
+</rdf:RDF>"#;
+        enum Race {
+            None,
+            Destination,
+            Temporary,
+        }
+        for race in [Race::None, Race::Destination, Race::Temporary] {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("source.jpg");
+            let destination = root.path().join("copy.jpg");
+            let sidecar = root.path().join("copy.jpg.xmp");
+            fs::write(&source, b"media").unwrap();
+            fs::write(root.path().join("source.jpg.xmp"), PACKET).unwrap();
+            let copy = copy_local_file_no_replace(root.path(), &source, &destination, ".part")
+                .await
+                .unwrap()
+                .unwrap();
+
+            RECONCILIATION_RENAME_FAULT.set(Some(match race {
+                Race::Destination => |path| fs::write(path, b"competing packet").unwrap(),
+                _ => |_| {},
+            }));
+            if matches!(race, Race::Temporary) {
+                AFTER_PUBLICATION.set(Some(|temp| {
+                    assert_eq!(fs::metadata(temp).unwrap().nlink(), 2);
+                    fs::remove_file(temp).unwrap();
+                    fs::write(temp, b"foreign temporary entry").unwrap();
+                }));
+            }
+            let result =
+                super::write_reconciled_sidecar(&copy, || panic!("source exists"), ".part");
+            assert!(RECONCILIATION_RENAME_FAULT.take().is_none());
+            if matches!(race, Race::Destination) {
+                assert!(result.is_err());
+                assert_eq!(fs::read(sidecar).unwrap(), b"competing packet");
+                continue;
+            }
+            result.unwrap().validate_blocking().unwrap();
+            assert_eq!(fs::read(&sidecar).unwrap(), PACKET);
+            assert_eq!(fs::metadata(sidecar).unwrap().nlink(), 1);
+            let temps: Vec<_> = fs::read_dir(root.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .as_encoded_bytes()
+                        .starts_with(b".kei-xmp-reconcile-")
+                })
+                .collect();
+            if matches!(race, Race::Temporary) {
+                assert_eq!(temps.len(), 1);
+                assert_eq!(fs::read(&temps[0]).unwrap(), b"foreign temporary entry");
+            } else {
+                assert!(temps.is_empty());
+            }
+        }
+    }
+
     fn read_sidecar_meta(media_path: &Path) -> XmpMeta {
         let mut sidecar_path = media_path.as_os_str().to_os_string();
         sidecar_path.push(".xmp");
@@ -583,6 +675,7 @@ mod tests {
         std::fs::write(&media_path, b"placeholder").unwrap();
 
         let first = MetadataWrite {
+            orientation: None,
             title: Some("Before".into()),
             ..MetadataWrite::default()
         };
@@ -795,6 +888,9 @@ mod tests {
 
         let first = MetadataWrite {
             datetime: Some("2024:06:15 10:00:00".into()),
+            prior_embedded: Default::default(),
+            clear_embedded: Default::default(),
+            orientation: None,
             datetime_subseconds: None,
             offset_time_original: Some("+10:00".into()),
             clear_datetime_offsets: false,

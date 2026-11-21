@@ -18,10 +18,12 @@ mod checkpoints;
 mod contracts;
 mod identity;
 mod import;
+mod inbox_compaction;
 mod legacy_preservation;
 mod membership;
 mod metadata;
 mod metadata_capture_retry;
+mod migration_backup;
 mod pending_publication;
 pub(crate) mod provider_catalog;
 pub(crate) mod provider_generations;
@@ -29,10 +31,7 @@ pub(crate) mod provider_inbox;
 pub(crate) mod provider_selection;
 pub(crate) mod provider_work;
 pub(crate) mod trusted_legacy;
-pub(crate) use legacy_preservation::{
-    LegacyActivationProof, LegacyChildReceiptRefusal, LegacyFileEvidence,
-    LegacyPreparationSnapshot, LegacyPreservation,
-};
+pub(crate) use legacy_preservation::{LegacyFileEvidence, LegacyPreparationSnapshot};
 pub(crate) mod primary_layout;
 mod reconciliation;
 mod reports;
@@ -41,7 +40,8 @@ pub(crate) mod support;
 pub(crate) use metadata_capture_retry::MetadataCaptureRetryGeneration;
 pub(crate) use sparse_identity::{
     SparseAttemptOutcome, SparseDeletionCheckpoint, SparseEvidence, SparseIdentity,
-    SparseIdentityProof, SparseIdentityStore, SparseSourceId, SparseTargetState,
+    SparseIdentityProof, SparseIdentityStore, SparseSourceId, SparseTargetHold, SparseTargetProof,
+    SparseTargetState,
 };
 mod rows;
 mod temp_files;
@@ -56,7 +56,7 @@ pub(crate) use contracts::{
     AssetGroupingRows, AssetVerificationState, CheckpointTransition, DownloadContextStateStore,
     DownloadedFileRecord, ManifestAssetRow, OwnedTempFile, PendingPublicationRecord,
     ReconciliationCatalogPath, ReconciliationContent, ReconciliationPathKey,
-    ReconciliationReservation, ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken,
+    ReconciliationReservation, ReconciliationStateStore, ScopedDbSyncToken,
     SelectionMetadataReceipt, TempFileOwnershipStore,
 };
 
@@ -98,9 +98,31 @@ impl std::fmt::Debug for SqliteStateDb {
 }
 
 impl SqliteStateDb {
+    // Test fixtures without a command startup explicitly model no config file.
+    // Production has no context-free migration-capable open.
+    #[cfg(test)]
     pub(crate) async fn open_owned(
         path: &Path,
         owner: &account::AccountOwner,
+    ) -> Result<Self, StateError> {
+        Self::open_owned_with_config(
+            path,
+            owner,
+            &crate::config::ConfigSource::Absent {
+                path: PathBuf::from("test-no-config.toml"),
+                explicitly_selected: false,
+            },
+        )
+        .await
+    }
+
+    /// Upgrade owned state only after durably preserving its old SQLite snapshot
+    /// and actual startup config input. Unavailable config refuses an existing
+    /// old schema; fresh and current databases need no recovery copy.
+    pub(crate) async fn open_owned_with_config(
+        path: &Path,
+        owner: &account::AccountOwner,
+        config: &crate::config::ConfigSource,
     ) -> Result<Self, StateError> {
         let path = path.to_path_buf();
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -113,11 +135,72 @@ impl SqliteStateDb {
         }
         let cloned_path = path.clone();
         let owner = owner.clone();
+        let config = config.clone();
         let conn = tokio::task::spawn_blocking(move || {
-            let conn = account::open(&cloned_path, &owner)?;
+            let (mut conn, fresh) = account::open(&cloned_path, &owner)?;
+            let version = schema::get_schema_version(&conn)?;
+            if version > schema::SCHEMA_VERSION {
+                return Err(StateError::UnsupportedSchemaVersion {
+                    found: version,
+                    expected: schema::SCHEMA_VERSION,
+                });
+            }
+            let mut backup_retired = version < migration_backup::retirement::FIRST_SCHEMA
+                || migration_backup::retirement::finish(&mut conn, &cloned_path, &owner)?;
+            if version < schema::SCHEMA_VERSION {
+                // The verified commit must outlive retirement of its rollback copy.
+                conn.pragma_update(None, "synchronous", "EXTRA")?;
+                // A subsequent release may encounter unfinished housekeeping
+                // from a previous, already committed schema upgrade.
+                if !backup_retired {
+                    return Err(StateError::Invariant {
+                        operation: "starting schema migration",
+                        detail: "previous upgrade's temporary bundle still needs cleanup".into(),
+                    });
+                }
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(StateError::MigrationLock)?;
+                account::validate(&tx, &owner)?;
+                let version = schema::get_schema_version(&tx)?;
+                let backup = if !fresh && version < schema::SCHEMA_VERSION {
+                    Some(migration_backup::create(&cloned_path, &config, version)?)
+                } else {
+                    None
+                };
+                if let Some((backup, _)) = &backup {
+                    tracing::info!(path = %backup.display(), "Temporary migration backup saved until upgrade verification");
+                }
+                let migrated = schema::migrate(&tx).and_then(|()| {
+                    if let Some((_, receipt)) = &backup {
+                        receipt.record(&tx)?;
+                    }
+                    #[cfg(all(test, target_os = "linux"))]
+                    crate::test_helpers::process_death_point("schema-migration-before-commit");
+                    tx.commit().map_err(StateError::Migration)
+                });
+                if let Err(source) = migrated {
+                    return Err(match backup {
+                        Some((backup, _)) => StateError::BackedUpMigration {
+                            backup,
+                            source: Box::new(source),
+                        },
+                        None => source,
+                    });
+                }
+                #[cfg(all(test, target_os = "linux"))]
+                crate::test_helpers::process_death_point("schema-migration-committed");
+                backup_retired = migration_backup::retirement::finish(&mut conn, &cloned_path, &owner)?;
+            }
             conn.pragma_update(None, "journal_mode", "WAL")?;
+            if backup_retired {
+                inbox_compaction::retry(&mut conn, &cloned_path)?;
+            }
             conn.pragma_update(None, "synchronous", "NORMAL")?;
-            schema::migrate(&conn)?;
+            conn.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                false,
+            )?;
             Ok::<_, StateError>(conn)
         })
         .await??;
@@ -345,3 +428,5 @@ impl SqliteStateDb {
         .await?
     }
 }
+#[cfg(test)]
+pub(crate) use contracts::RetryErrorRetention;

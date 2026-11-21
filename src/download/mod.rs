@@ -36,7 +36,10 @@ pub(crate) use orchestration::context::{ClaimedLegacyMasterStates, DownloadConte
 use orchestration::context::{RecordedLocalFile, preload_download_context};
 pub use orchestration::dispatch::download_photos_with_sync;
 pub(crate) use orchestration::generation::has_due as has_due_selection_work;
-pub(crate) use orchestration::maintenance::drain_pending_metadata_rewrites;
+pub(crate) use orchestration::generation::recover_deleted_album_selection;
+pub(crate) use orchestration::maintenance::{
+    MetadataDrainOutcome, drain_pending_metadata_rewrites,
+};
 use orchestration::models::PENDING_RETRY_UNMATCHED_REASON;
 pub(super) use orchestration::models::PRODUCER_ENUMERATION_INCOMPLETE_REASON;
 pub(crate) use orchestration::models::{
@@ -48,15 +51,11 @@ pub(crate) use orchestration::models::{
 pub use orchestration::models::{
     DownloadOutcome, FullEnumerationReason, SkipBreakdown, SyncMode, SyncResult, SyncStats,
 };
-pub(crate) use orchestration::queue_projection::has_due_retained_work;
-pub(crate) use orchestration::recent::requires_recovery as recent_selection_requires_recovery;
 #[cfg(test)]
 pub(crate) use orchestration::reconciliation::reconcile_catalog_paths;
 pub(crate) use orchestration::reconciliation::reconcile_catalog_paths_with_client;
 use orchestration::selection::build_pass_configs_resolving_deferred_excludes;
-use orchestration::url_refresh::{
-    CleanupUrlRefresh, RetryTaskKey, UrlRetrySource, build_retry_download_tasks,
-};
+use orchestration::url_refresh::{RetryTaskKey, UrlRetrySource};
 
 #[expect(
     unused_imports,
@@ -65,6 +64,5 @@ use orchestration::url_refresh::{
 pub(crate) use orchestration::{models::PassKey, reconciliation::PathReconciliationResult};
 
 pub(crate) mod legacy_preservation;
-pub(crate) mod trusted_legacy;
 
 pub(crate) mod sparse_target;

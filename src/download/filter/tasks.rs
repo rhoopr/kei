@@ -6,7 +6,7 @@ use std::sync::Arc;
 use chrono::{DateTime, FixedOffset, Local};
 use rustc_hash::FxHashMap;
 
-use crate::download::file::{ExistingFileFingerprint, FinalPublication};
+use crate::download::file::FinalPublication;
 use crate::download::{DownloadConfig, paths};
 use crate::state::{MediaType, VersionSizeKey};
 use crate::types::FileMatchPolicy;
@@ -15,9 +15,9 @@ use super::collisions::{
     CollisionStrategy, NormalizedPath, PathPlanningMode, ResolveContext,
     identity_collision_filename, resolve_download_path, size_or_identity_collision_filename,
 };
-use super::eligibility::{GLOB_CASE_INSENSITIVE, determine_media_type};
+use super::eligibility::determine_media_type;
 use super::expected_paths::{DerivedPath, raw_filename};
-use super::metadata::{MetadataPayload, build_payload};
+use super::metadata::{MetadataPayload, build_selected_payload};
 use super::{
     DerivationContext, derive_alternative_extra, derive_edited_extra, derive_live_edited_extra,
     derive_mov_companion, derive_primary,
@@ -35,10 +35,10 @@ pub(in crate::download) struct DownloadTask {
     // Heap types first
     pub(in crate::download) url: Box<str>,
     pub(in crate::download) download_path: PathBuf,
-    /// Only truncated repair stores a replacement authorization. Sharing the
+    /// Only authorized replacement stores publication evidence. Sharing the
     /// immutable fingerprint keeps platform task layouts within the existing
     /// budget; ordinary no-replace tasks do not allocate this evidence.
-    pub(in crate::download) replacement_fingerprint: Option<Arc<ExistingFileFingerprint>>,
+    pub(in crate::download) replacement_fingerprint: Option<Arc<FinalPublication>>,
     /// Only cross-parent reserved pending recovery retains publication proof
     /// through finalization; ordinary task policy is unchanged. Clones share
     /// the original current-root association.
@@ -79,7 +79,7 @@ impl DownloadTask {
     /// fingerprint variant inline in every queued task.
     pub(in crate::download) fn publication(&self) -> FinalPublication {
         match &self.replacement_fingerprint {
-            Some(expected) => FinalPublication::ReplaceTruncated(**expected),
+            Some(expected) => **expected,
             None => FinalPublication::NoReplace,
         }
     }
@@ -120,6 +120,32 @@ pub(in crate::download) fn filter_asset_to_tasks(
     filter_asset_to_tasks_with_primary(asset, config, claimed_paths, dir_cache, planning_mode, None)
 }
 
+/// Build selected resource tasks before any presence-only skipping. Callers must
+/// bind an owned destination and explicit publication authority before queueing.
+pub(in crate::download) fn selected_resource_tasks(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> Vec<DownloadTask> {
+    super::derive_expected_paths(asset, config)
+        .into_iter()
+        .map(|d| DownloadTask {
+            url: d.url,
+            download_path: d.path,
+            replacement_fingerprint: None,
+            pending_cross_parent_root: None,
+            checksum: d.checksum,
+            asset_id: asset.state_id_arc(),
+            asset_record_name: asset.asset_record_name_arc(),
+            library: Arc::from(asset.source_zone().unwrap_or(&config.library)),
+            metadata: build_selected_payload(asset, config, d.version_size),
+            size: d.size,
+            created_local: asset.created_local(),
+            version_size: d.version_size,
+            media_type: determine_media_type(d.version_size, asset),
+        })
+        .collect()
+}
+
 /// Use an ownership-verified still filename when deriving its companion.
 pub(in crate::download) fn filter_asset_to_tasks_with_primary(
     asset: &crate::icloud::photos::PhotoAsset,
@@ -133,10 +159,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
         return Ok(Vec::new());
     }
 
-    // Sync-only fingerprint-fallback exclusion: when `asset.filename()` is
-    // None, log the synthesized name and apply `filename_exclude` patterns
-    // to it (`is_asset_filtered` only sees real filenames). Import never
-    // populates `filename_exclude`.
+    // Missing provider filenames use the same stable fallback in sync and import.
     if asset.filename().is_none() {
         let fp = raw_filename(asset);
         tracing::info!(target: "kei::download::filter",
@@ -144,43 +167,12 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
             filename = %fp,
             "Using fingerprint fallback filename"
         );
-        if config
-            .filename_exclude
-            .iter()
-            .any(|p| p.matches_with(&fp, GLOB_CASE_INSENSITIVE))
-        {
-            tracing::debug!(target: "kei::download::filter",
-                asset_id = %asset.id(),
-                filename = %fp,
-                "Skipping (filename_exclude match on fallback)"
-            );
-            return Ok(Vec::new());
-        }
     }
 
     if config.edited_naming == crate::types::EditedNaming::Primary {
-        let metadata = build_payload(asset, config);
-        return Ok(super::derive_expected_paths(asset, config)
-            .into_iter()
-            .map(|d| DownloadTask {
-                url: d.url,
-                download_path: d.path,
-                replacement_fingerprint: None,
-                pending_cross_parent_root: None,
-                checksum: d.checksum,
-                asset_id: asset.state_id_arc(),
-                asset_record_name: asset.asset_record_name_arc(),
-                library: Arc::from(asset.source_zone().unwrap_or(&config.library)),
-                metadata: Arc::clone(&metadata),
-                size: d.size,
-                created_local: asset.created_local(),
-                version_size: d.version_size,
-                media_type: determine_media_type(d.version_size, asset),
-            })
-            .collect());
+        return Ok(selected_resource_tasks(asset, config));
     }
     let ctx = DerivationContext::build(asset, config);
-    let payload = build_payload(asset, config);
     let mut tasks = Vec::with_capacity(5);
     let mut effective_primary_filename: Option<String> = None;
     let mut seen_urls = Vec::<Box<str>>::with_capacity(4);
@@ -189,7 +181,8 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
         .map(Arc::from)
         .unwrap_or_else(|| Arc::clone(&config.library));
 
-    if let Some(d) = derive_primary(asset, config, &ctx) {
+    if let Some(mut d) = derive_primary(asset, config, &ctx) {
+        super::expected_paths::apply_album_path(asset, config, &mut d);
         let strategy = match config.file_match_policy {
             FileMatchPolicy::NameId7 => CollisionStrategy::SkipIfExists,
             FileMatchPolicy::NameSizeDedupWithSuffix => CollisionStrategy::SizeDedup {
@@ -246,7 +239,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),
                 library: Arc::clone(&task_library),
-                metadata: Arc::clone(&payload),
+                metadata: build_selected_payload(asset, config, version_size),
                 size,
                 created_local: ctx.created_local,
                 version_size,
@@ -267,9 +260,10 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
         derive_live_edited_extra,
     ];
     for derive_extra in extra_derivers {
-        let Some(d) = derive_extra(asset, config, &ctx, &seen_urls) else {
+        let Some(mut d) = derive_extra(asset, config, &ctx, &seen_urls) else {
             continue;
         };
+        super::expected_paths::apply_album_path(asset, config, &mut d);
         let DerivedPath {
             path,
             filename,
@@ -315,7 +309,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),
                 library: Arc::clone(&task_library),
-                metadata: Arc::clone(&payload),
+                metadata: build_selected_payload(asset, config, version_size),
                 size,
                 created_local: ctx.created_local,
                 version_size,
@@ -324,12 +318,13 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
         }
     }
 
-    if let Some(d) = derive_mov_companion(
+    if let Some(mut d) = derive_mov_companion(
         asset,
         config,
         &ctx,
         recorded_primary_filename.or(effective_primary_filename.as_deref()),
     ) {
+        super::expected_paths::apply_album_path(asset, config, &mut d);
         let DerivedPath {
             path,
             filename,
@@ -379,7 +374,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),
                 library: task_library,
-                metadata: Arc::clone(&payload),
+                metadata: build_selected_payload(asset, config, version_size),
                 size,
                 created_local: ctx.created_local,
                 version_size,
@@ -599,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_live_photo_medium_size() {
+    fn test_filter_live_photo_preview_is_not_a_full_resolution_companion() {
         let asset = PhotoAsset::new(
             json!({"recordName": "LIVE_MED", "fields": {
                 "filenameEnc": {"value": "IMG_0002.HEIC", "type": "STRING"},
@@ -622,8 +617,9 @@ mod tests {
         let mut config = test_config();
         config.live_resolution = AssetVersionSize::LiveMedium;
         let tasks = filter_asset_fresh(&asset, &config);
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/live_med");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].version_size, VersionSizeKey::Original);
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/heic_orig");
     }
 
     #[test]
@@ -644,15 +640,16 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_asset_uses_raw_policy_swap() {
+    fn retired_raw_preference_preserves_provider_resource_identity() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
         let mut config = test_config();
         config.raw_policy = RawPolicy::PreferRaw;
-        // With AsOriginal and RAW alternative, the swap makes Original point to alt URL
+        // Retained config values cannot relabel new downloads.
         let tasks = filter_asset_fresh(&asset, &config);
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/alt");
-        assert_eq!(&*tasks[0].checksum, "alt_ck");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
+        assert_eq!(&*tasks[0].checksum, "orig_ck");
+        assert_eq!(&*tasks[1].checksum, "alt_ck");
     }
 
     #[test]
@@ -760,6 +757,110 @@ mod tests {
     }
 
     #[test]
+    fn live_component_exclusions_keep_all_selected_renditions_and_resource_identity() {
+        let asset = TestPhotoAsset::new("LIVE_ALL_RENDITIONS")
+            .filename("IMG.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .adjusted_version(
+                "https://p01.icloud-content.com/edit",
+                "edit_ck",
+                900,
+                "public.heic",
+            )
+            .alt_version(
+                "https://p01.icloud-content.com/raw",
+                "raw_ck",
+                2000,
+                "com.adobe.raw-image",
+            )
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .live_adjusted(
+                "https://p01.icloud-content.com/edit_mov",
+                "edit_mov_ck",
+                2500,
+            )
+            .build();
+        for (exclude, expected) in [
+            (
+                "[]",
+                vec![
+                    VersionSizeKey::Original,
+                    VersionSizeKey::Adjusted,
+                    VersionSizeKey::Alternative,
+                    VersionSizeKey::LiveAdjusted,
+                    VersionSizeKey::LiveOriginal,
+                ],
+            ),
+            (
+                "['live-photo-videos']",
+                vec![
+                    VersionSizeKey::Original,
+                    VersionSizeKey::Adjusted,
+                    VersionSizeKey::Alternative,
+                ],
+            ),
+            (
+                "['live-photo-stills']",
+                vec![VersionSizeKey::LiveAdjusted, VersionSizeKey::LiveOriginal],
+            ),
+            ("['live-photo-stills','live-photo-videos']", vec![]),
+            (
+                "['photos','videos']",
+                vec![
+                    VersionSizeKey::Original,
+                    VersionSizeKey::Adjusted,
+                    VersionSizeKey::Alternative,
+                    VersionSizeKey::LiveAdjusted,
+                    VersionSizeKey::LiveOriginal,
+                ],
+            ),
+        ] {
+            let input: crate::config::TomlConfig =
+                toml::from_str(&format!("config_version=1\n[filters]\nexclude={exclude}")).unwrap();
+            let resolved = crate::config::Config::build(
+                &crate::config::GlobalArgs {
+                    config_source: Default::default(),
+                    username: Some("fixture@example.com".to_owned()),
+                    domain: None,
+                    data_dir: None,
+                },
+                &crate::cli::PasswordArgs::default(),
+                crate::cli::SyncArgs::default(),
+                Some(&input),
+            )
+            .unwrap();
+            let mut config = test_config();
+            config.media = resolved.filters.media;
+            config.live_photo_mode = resolved.photos.live_photo_mode;
+            let tasks = filter_asset_fresh(&asset, &config);
+            let paths = expected_paths_for(&asset, &config);
+            assert_eq!(
+                tasks
+                    .iter()
+                    .map(|task| task.version_size)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{exclude}"
+            );
+            assert_eq!(
+                paths
+                    .iter()
+                    .map(|path| path.version_size)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{exclude}"
+            );
+            for (path, task) in paths.iter().zip(&tasks) {
+                assert_eq!(path.path, task.download_path);
+                assert_eq!(path.checksum, task.checksum);
+                assert_eq!(path.size, task.size);
+                assert_eq!(path.url, task.url);
+            }
+        }
+    }
+
+    #[test]
     fn video_only_live_photo_uses_fingerprint_mov_when_unicode_strip_empties_stem() {
         let asset = TestPhotoAsset::new("UNI_LIVE_MOV")
             .filename("日本語.HEIC")
@@ -782,19 +883,40 @@ mod tests {
     }
 
     #[test]
-    fn resolution_none_with_alternative_emits_only_alternative() {
+    fn default_policy_emits_original_edit_and_alternative() {
         let asset = original_adjusted_alternative_asset();
-        let mut config = test_config();
-        config.resolution = crate::types::PhotoResolution::None;
-        config.alternative = true;
+        let config = test_config();
 
         let paths = expected_paths_for(&asset, &config);
-        assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0].version_size, VersionSizeKey::Alternative);
+        let tasks = filter_asset_fresh(&asset, &config);
+        let expected = [
+            VersionSizeKey::Original,
+            VersionSizeKey::Adjusted,
+            VersionSizeKey::Alternative,
+        ];
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| path.version_size)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.version_size)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for (path, task) in paths.iter().zip(&tasks) {
+            assert_eq!(path.path, task.download_path);
+            assert_eq!(path.checksum, task.checksum);
+            assert_eq!(path.size, task.size);
+        }
     }
 
     #[test]
-    fn raw_policy_prefer_raw_makes_raw_primary_and_jpeg_extra() {
+    fn retired_raw_preference_keeps_jpeg_original_and_raw_alternative() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
         let mut config = test_config();
         config.raw_policy = RawPolicy::PreferRaw;
@@ -802,14 +924,14 @@ mod tests {
 
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
-        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/alt");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
         assert_eq!(tasks[0].version_size, VersionSizeKey::Original);
-        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/orig");
+        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/alt");
         assert_eq!(tasks[1].version_size, VersionSizeKey::Alternative);
     }
 
     #[test]
-    fn raw_policy_prefer_jpeg_makes_jpeg_primary_and_raw_extra() {
+    fn retired_jpeg_preference_keeps_raw_original_and_jpeg_alternative() {
         let asset = photo_asset_with_original_and_alternative("com.adobe.raw-image", "public.jpeg");
         let mut config = test_config();
         config.raw_policy = RawPolicy::PreferJpeg;
@@ -817,31 +939,35 @@ mod tests {
 
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
-        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/alt");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
         assert_eq!(tasks[0].version_size, VersionSizeKey::Original);
-        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/orig");
+        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/alt");
         assert_eq!(tasks[1].version_size, VersionSizeKey::Alternative);
-        let raw_extra = tasks[1]
+        let jpeg_extra = tasks[1]
             .download_path
             .file_name()
             .unwrap()
             .to_string_lossy()
             .into_owned();
         assert!(
-            raw_extra.contains("_RAW."),
-            "raw alternative extra should use _RAW suffix, got {raw_extra}"
+            jpeg_extra.contains("_alt."),
+            "JPEG alternative should use _alt suffix, got {jpeg_extra}"
         );
     }
 
     #[test]
-    fn resolution_none_with_missing_edited_extra_skips_asset() {
+    fn missing_edit_does_not_suppress_original() {
         let asset = TestPhotoAsset::new("PR4_NONE_NO_EDITED").build();
         let mut config = test_config();
         config.resolution = crate::types::PhotoResolution::None;
         config.edited = true;
 
-        assert!(expected_paths_for(&asset, &config).is_empty());
-        assert!(filter_asset_fresh(&asset, &config).is_empty());
+        let paths = expected_paths_for(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].version_size, VersionSizeKey::Original);
+        assert_eq!(paths[0].path, tasks[0].download_path);
     }
 
     #[test]
@@ -858,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn live_resolution_medium_with_edited_emits_live_medium_and_live_adjusted() {
+    fn live_preview_does_not_replace_original_or_current_edit() {
         let asset = PhotoAsset::new(
             json!({"recordName": "PR4_LIVE_MEDIUM_EDITED", "fields": {
                 "filenameEnc": {"value": "IMG_LIVE_MEDIUM.HEIC", "type": "STRING"},
@@ -901,11 +1027,11 @@ mod tests {
             vec![
                 VersionSizeKey::Original,
                 VersionSizeKey::LiveAdjusted,
-                VersionSizeKey::LiveMedium,
+                VersionSizeKey::LiveOriginal,
             ]
         );
         assert_eq!(&*paths[1].checksum, "live_adjusted_ck");
-        assert_eq!(&*paths[2].checksum, "live_med_ck");
+        assert_eq!(&*paths[2].checksum, "live_orig_ck");
     }
 
     #[test]
@@ -1026,13 +1152,15 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_asset_as_is_downloads_original() {
+    fn test_filter_asset_as_is_downloads_original_and_raw() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
         let config = test_config(); // raw_policy defaults to AsIs
         let tasks = filter_asset_fresh(&asset, &config);
-        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks.len(), 2);
         assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
         assert_eq!(&*tasks[0].checksum, "orig_ck");
+        assert_eq!(tasks[1].version_size, VersionSizeKey::Alternative);
+        assert_eq!(&*tasks[1].checksum, "alt_ck");
     }
 
     #[test]
@@ -1061,14 +1189,14 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_live_adjusted_force_resolution_no_fallback() {
+    fn test_filter_missing_live_edit_keeps_original_companion() {
         let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
         let mut config = test_config();
         config.live_resolution = AssetVersionSize::LiveAdjusted;
         config.force_resolution = true;
         let tasks = filter_asset_fresh(&asset, &config);
-        // force_resolution prevents fallback — only primary, no live companion
-        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].version_size, VersionSizeKey::LiveOriginal);
     }
 
     // ── NameId7 filter tests ────────────────────────────────────────────
@@ -1190,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn test_medium_size_adds_suffix() {
+    fn test_available_medium_does_not_change_original_filename() {
         let asset = multi_size_photo_asset();
         let mut config = test_config();
         config.resolution = crate::types::PhotoResolution::Medium;
@@ -1202,14 +1330,12 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(
-            filename.contains("-medium"),
-            "Medium size should add '-medium' suffix, got: {filename}"
-        );
+        assert_eq!(filename, "photo.JPG");
+        assert_eq!(tasks[0].version_size, VersionSizeKey::Original);
     }
 
     #[test]
-    fn test_thumb_size_adds_suffix() {
+    fn test_available_thumbnail_does_not_change_original_filename() {
         let asset = multi_size_photo_asset();
         let mut config = test_config();
         config.resolution = crate::types::PhotoResolution::Thumb;
@@ -1221,10 +1347,8 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(
-            filename.contains("-thumb"),
-            "Thumb size should add '-thumb' suffix, got: {filename}"
-        );
+        assert_eq!(filename, "photo.JPG");
+        assert_eq!(tasks[0].version_size, VersionSizeKey::Original);
     }
 
     // ── Gap coverage: empty versions, path traversal, empty filename ───
@@ -1429,55 +1553,6 @@ mod tests {
         );
     }
 
-    // ── Gap coverage: retry_only known_ids filtering ────────────────────
-
-    #[test]
-    fn download_context_retry_only_skips_unknown_assets() {
-        // In retry-only mode, the producer checks known_ids before sending
-        // tasks. Simulate that filtering logic here.
-        let mut ctx = crate::download::DownloadContext::default();
-        ctx.known_ids
-            .entry("PrimarySync".into())
-            .or_default()
-            .insert("PREV_SYNCED_001".into());
-        ctx.known_ids
-            .entry("PrimarySync".into())
-            .or_default()
-            .insert("PREV_SYNCED_002".into());
-
-        let known_asset = TestPhotoAsset::new("TEST_1").build(); // recordName "TEST_1"
-        let config = test_config();
-        let tasks = filter_asset_fresh(&known_asset, &config);
-
-        // Simulate the retry_only check from the producer loop
-        let retry_filtered: Vec<_> = tasks
-            .into_iter()
-            .filter(|task| ctx.is_known(&task.library, &task.asset_id))
-            .collect();
-
-        // "TEST_1" is NOT in known_ids, so retry_only would skip it
-        assert!(
-            retry_filtered.is_empty(),
-            "Unknown asset should be filtered out in retry_only mode"
-        );
-
-        // Now add "TEST_1" to known_ids and verify it passes
-        ctx.known_ids
-            .entry("PrimarySync".into())
-            .or_default()
-            .insert("TEST_1".into());
-        let tasks2 = filter_asset_fresh(&known_asset, &config);
-        let retry_filtered2: Vec<_> = tasks2
-            .into_iter()
-            .filter(|task| ctx.is_known(&task.library, &task.asset_id))
-            .collect();
-        assert_eq!(
-            retry_filtered2.len(),
-            1,
-            "Known asset should pass retry_only filter"
-        );
-    }
-
     // ── Gap coverage: incremental Modified events are downloadable ──────
 
     #[test]
@@ -1544,16 +1619,14 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_force_resolution_missing_version_no_fallback() {
-        // Asset only has Original; request Medium with force_resolution=true
+    fn test_filter_original_without_previews_is_selected() {
         let asset = TestPhotoAsset::new("FORCE_1").build();
         let mut config = test_config();
         config.resolution = crate::types::PhotoResolution::Medium;
         config.force_resolution = true;
-        assert!(
-            filter_asset_fresh(&asset, &config).is_empty(),
-            "force_resolution=true with missing Medium version should not fall back to Original"
-        );
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].version_size, VersionSizeKey::Original);
     }
 
     // ── LivePhotoMode task shaping ─────────────────────────────────

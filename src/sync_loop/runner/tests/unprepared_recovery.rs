@@ -6,12 +6,9 @@
 //! a deadline that is still in the future, and a
 //! deadline that is already due because normal time passed before the run.
 //!
-//! Identity repair still refuses to choose between two current children that
-//! share the master's durable version evidence, so the legacy revision stays 0.
-//! Preservation does not depend on choosing an owner: the existing unattributed
-//! path protects the original and sidecar, then certifies the family from the
-//! complete provider inventory. The due state therefore advances the checkpoint
-//! and keeps the refusal evidence rather than holding the original forever.
+//! Current child selection does not retry historical master ambiguity, even
+//! when its retained deadline is due. The original, sidecar, unknown-source
+//! receipts and retry evidence remain unchanged while current children finish.
 
 use crate::download;
 use crate::icloud::photos::{PhotoAsset, PhotosSession};
@@ -168,12 +165,7 @@ async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_
                 .set_body_bytes(bytes)
                 .insert_header("content-type", "image/jpeg"),
         )
-        .expect(match ambiguity {
-            RetainedAmbiguity::FutureDeferred => 2,
-            // The due start state reattempts the retained identity; the two
-            // independent children are still the only media transfers.
-            RetainedAmbiguity::AlreadyDue => 2,
-        })
+        .expect(2)
         .mount(&server)
         .await;
     let page = full_album_page_with_download(
@@ -251,7 +243,7 @@ async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_
     );
 
     {
-        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        let db = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
         let mut metadata = state::AssetMetadata::default();
         metadata.refresh_hash();
         db.upsert_seen(
@@ -375,7 +367,7 @@ async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_
         let inventory = inventory.clone();
         let records = records.clone();
         async move {
-            let inner = Arc::new(state::SqliteStateDb::open(database).await.unwrap());
+            let inner = crate::sync_loop::test_support::open_owned_cycle_db(database).await;
             let db: Arc<dyn download::DownloadStore> = inner.clone();
             let base_builder = make_run_cycle_download_config_builder(media, db.clone());
             let builder = |mode, excluded, groups, library| {
@@ -391,8 +383,10 @@ async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_
             let mut primary = make_run_cycle_library_state_with_album(
                 "PrimarySync",
                 "sync_token:PrimarySync",
-                crate::sync_loop::test_support::make_full_album_with_boxed_session(
+                crate::sync_loop::test_support::make_owned_cycle_album(
+                    &inner,
                     "PrimarySync",
+                    "private",
                     Box::new(provider.clone()),
                 ),
             );
@@ -404,7 +398,6 @@ async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_
                 &[&primary],
                 config,
                 Some(db.as_ref()),
-                false,
                 &builder,
                 download::DownloadControls::download_hidden(),
                 shared_session,
@@ -482,48 +475,24 @@ async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_
                 "cycle {cycle}: stable paths"
             );
         }
-        if cycle == 0 {
-            // The first complete inventory cannot certify yet: the family is
-            // still a capture candidate, and identity repair has not run.
-            assert!(
-                presences.is_empty(),
-                "cycle {cycle}: no preservation before the family inventory"
-            );
-            assert_eq!(
-                checkpoint.as_deref(),
-                Some("before"),
-                "cycle {cycle}: the unprepared family holds the checkpoint"
-            );
-            assert_eq!(
-                result.stats.sync_token_blocked_reason,
-                Some("metadata_capture_repair_failed"),
-                "cycle {cycle}: {result:?}"
-            );
-        } else {
-            // The complete family inventory activates unattributed preservation
-            // without assigning the original to either current child.
-            assert_eq!(presences.len(), 1, "cycle {cycle}: one family original");
-            assert_eq!(presences[0].asset_id, "legacy-master");
-            assert_eq!(
-                presences[0].active_generation,
-                Some(1),
-                "cycle {cycle}: the family proof is active"
-            );
-            assert_eq!(
-                presences[0].files.len(),
-                2,
-                "cycle {cycle}: original and sidecar are preserved"
-            );
-            assert_eq!(
-                checkpoint.as_deref(),
-                Some("after"),
-                "cycle {cycle}: the certified family advances the checkpoint"
-            );
-            assert_eq!(
-                result.stats.sync_token_blocked_reason, None,
-                "cycle {cycle}: {result:?}"
-            );
-        }
+        assert!(
+            presences.is_empty(),
+            "current work cannot prepare historical evidence"
+        );
+        assert_eq!(
+            checkpoint.as_deref(),
+            Some("after"),
+            "cycle {cycle}: historical ambiguity cannot hold completed current work"
+        );
+        assert_eq!(
+            result.stats.sync_token_blocked_reason, None,
+            "cycle {cycle}: {result:?}"
+        );
+        assert_eq!(
+            retry_row(&database),
+            retry_before,
+            "cycle {cycle}: no historical retry scheduling"
+        );
     }
 
     match ambiguity {
@@ -569,10 +538,11 @@ async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .unwrap();
-            assert_eq!(attempts, 2, "the due ambiguity is a genuine retry");
-            assert!(
-                next_retry_at > last_attempt_at,
-                "the refused identity retains backoff rather than resetting its deadline"
+            assert_eq!(attempts, 1, "due historical ambiguity is not current work");
+            assert_eq!(
+                (last_attempt_at, next_retry_at),
+                (0, 1),
+                "the historical deadline is untouched"
             );
             let (revision, last_error): (i64, Option<String>) =
                 rusqlite::Connection::open(&database)
@@ -589,19 +559,19 @@ async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_
             );
             assert_eq!(
                 last_error.as_deref(),
-                Some("multiple provider children matched durable catalogue evidence"),
-                "exact refusal owner"
+                None,
+                "current selection does not attempt historical identity repair"
             );
         }
     }
 
-    assert!(
-        inventory.load(Ordering::SeqCst) > 0,
-        "certification reads the complete provider inventory"
+    assert_eq!(
+        inventory.load(Ordering::SeqCst),
+        0,
+        "historical ambiguity cannot trigger a preservation inventory"
     );
 
-    // Quiet reopen: an empty after-cursor delta keeps the active proof, the
-    // refusal evidence, the owners and the advanced checkpoint unchanged.
+    // Quiet reopen retains historical evidence and the completed current checkpoint.
     let (inner, result) = run_cycle(cycle_count).await;
     assert_eq!(result.stats.downloaded, 0, "{result:?}");
     assert_eq!(result.stats.sync_token_blocked_reason, None, "{result:?}");
@@ -613,13 +583,11 @@ async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_
     assert_eq!(historical_rows(&database), historical);
     assert_eq!(owner_rows(&database), owners_before);
     let presences = inner.legacy_preservations("PrimarySync").await.unwrap();
-    assert_eq!(
-        presences.len(),
-        1,
-        "the family proof survives the quiet reopen"
+    assert!(
+        presences.is_empty(),
+        "quiet reopen cannot prepare historical evidence"
     );
-    assert_eq!(presences[0].asset_id, "legacy-master");
-    assert_eq!(presences[0].active_generation, Some(1));
+    assert_eq!(retry_row(&database), retry_before);
     assert_eq!(
         inner
             .get_metadata("sync_token:PrimarySync")
@@ -627,7 +595,7 @@ async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_
             .unwrap()
             .as_deref(),
         Some("after"),
-        "the certified checkpoint stays advanced"
+        "the current checkpoint stays advanced"
     );
     server.verify().await;
 }

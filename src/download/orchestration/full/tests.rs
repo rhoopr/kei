@@ -25,8 +25,8 @@ use crate::types::FileMatchPolicy;
 use super::super::config::DownloadConfig;
 use super::super::models::{
     DATE_BOUNDED_FULL_ENUMERATION_REASON, DownloadControls, DownloadOutcome, DownloadReporting,
-    DownloadRunMode, DownloadStore, ICLOUD_ALBUM_COUNT_ERROR_REASON, PassKey,
-    RECENT_LIMITED_FULL_ENUMERATION_REASON, SyncResult, sync_token_blocked_explanation,
+    DownloadRunMode, DownloadStore, ICLOUD_ALBUM_COUNT_ERROR_REASON, PassKey, SyncResult,
+    sync_token_blocked_explanation,
 };
 use super::super::test_support::{
     album_with_session, incremental_photo_records_with_url, mock_album, mock_album_with_container,
@@ -35,9 +35,9 @@ use super::super::test_support::{
 };
 use super::{
     DEFERRED_UNFILED_HEARTBEAT_ASSETS, PaginationShortfall, PassTokenObservation, PassTokenResult,
-    RecentFrontier, TokenGap, ZoneTokenEvidence, build_pass_count_plan,
-    classify_pagination_shortfall, classify_zone_token_evidence, download_photos_full_with_token,
-    fold_pass_count_results, should_skip_pass_count_fetch, stream_created_lower_bound,
+    TokenGap, ZoneTokenEvidence, build_pass_count_plan, classify_pagination_shortfall,
+    classify_zone_token_evidence, download_photos_full_with_token, fold_pass_count_results,
+    should_skip_pass_count_fetch,
 };
 
 #[derive(Clone)]
@@ -1160,6 +1160,21 @@ async fn full_sync_deferred_unfiled_opens_stream_after_album_passes_finish() {
 
 #[tokio::test]
 async fn full_sync_deferred_unfiled_logs_heartbeat_and_completion() {
+    // Tracing's shared callsite interest races with parallel untraced passes.
+    // Keep every structured assertion, but give this capture a fresh process.
+    const CHILD: &str = "KEI_TEST_DEFERRED_HEARTBEAT_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "download::orchestration::full::tests::full_sync_deferred_unfiled_logs_heartbeat_and_completion", "--test-threads=1"])
+            .env(CHILD,"1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let (capture, _guard) = TracingCapture::install();
     let album_session =
         DynamicRecentPhotosSession::from_ids(vec!["album-heartbeat-0000".to_string()])
@@ -2427,18 +2442,6 @@ fn fold_pass_count_results_all_errors_yields_full_error_count() {
 }
 
 #[test]
-fn recent_runs_skip_pass_count_fetch() {
-    let mut config = test_config();
-    config.recent = Some(25);
-
-    assert!(
-        should_skip_pass_count_fetch(&config),
-        "recent-limited runs are not complete enumerations, so the \
-         full-pass count is not an exact pagination bound"
-    );
-}
-
-#[test]
 fn skip_created_before_runs_skip_pass_count_fetch() {
     let mut config = test_config();
     config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
@@ -2453,37 +2456,17 @@ fn skip_created_before_runs_skip_pass_count_fetch() {
 }
 
 #[test]
-fn stream_created_lower_bound_uses_the_stricter_date_or_recent_frontier() {
+fn enumeration_created_lower_bound_preserves_capture_local_margin() {
     let capture_date = chrono::NaiveDate::from_ymd_opt(2025, 2, 1).unwrap();
     let date_bound =
         capture_date.and_time(chrono::NaiveTime::MIN).and_utc() - chrono::Duration::days(1);
     let mut config = test_config();
     config.skip_created_before = Some(crate::config::CreatedDateFilter::CaptureDate(capture_date));
 
-    for (name, frontier_bound, expected) in [
-        (
-            "date bound",
-            date_bound - chrono::Duration::hours(1),
-            date_bound,
-        ),
-        (
-            "recent frontier",
-            date_bound + chrono::Duration::hours(1),
-            date_bound + chrono::Duration::hours(1),
-        ),
-    ] {
-        let frontier = RecentFrontier {
-            query_token: None,
-            truncated: false,
-            asset_ids: Arc::new(FxHashSet::default()),
-            oldest_created: Some(frontier_bound),
-        };
-        assert_eq!(
-            stream_created_lower_bound(&config, Some(&frontier)),
-            Some(expected),
-            "{name}"
-        );
-    }
+    assert_eq!(
+        super::enumeration_created_lower_bound(&config),
+        Some(date_bound)
+    );
 }
 
 #[test]
@@ -2502,8 +2485,7 @@ fn skip_created_after_runs_keep_pass_count_fetch() {
 
 #[test]
 fn unbounded_runs_keep_pass_count_fetch() {
-    let mut config = test_config();
-    config.recent = None;
+    let config = test_config();
 
     assert!(
         !should_skip_pass_count_fetch(&config),
@@ -2513,7 +2495,7 @@ fn unbounded_runs_keep_pass_count_fetch() {
 }
 
 #[tokio::test]
-async fn build_pass_count_plan_uses_recent_bound_without_exact_counts_for_read_only_runs() {
+async fn build_pass_count_plan_uses_fixed_date_bound_without_exact_counts_for_read_only_runs() {
     use crate::commands::{AlbumPass, PassKind};
     use crate::icloud::photos::PhotoAlbum;
     use rustc_hash::FxHashSet;
@@ -2532,180 +2514,16 @@ async fn build_pass_count_plan_uses_recent_bound_without_exact_counts_for_read_o
         },
     ];
     let mut config = test_config();
-    config.recent = Some(10);
+    config.skip_created_before = Some(crate::config::CreatedDateFilter::CaptureDate(
+        chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+    ));
 
     let plan = build_pass_count_plan(&passes, &config, DownloadControls::dry_run_hidden()).await;
 
-    assert_eq!(plan.display_counts, vec![10, 10]);
+    assert_eq!(plan.display_counts, vec![0, 0]);
     assert_eq!(plan.stream_total_counts, vec![None, None]);
     assert_eq!(plan.exact_total, None);
     assert_eq!(plan.len_errors, 0);
-}
-
-#[tokio::test]
-async fn full_sync_recent_album_passes_use_scope_frontier() {
-    let all_assets = recent_scope_assets("frontier", 300, 1_700_000_000_000);
-    let mut album_assets = vec![all_assets[0].clone()];
-    album_assets.extend(recent_scope_assets("old-album", 500, 1_699_000_000_000));
-    let asset = recent_scope_photo_asset(&all_assets[0]);
-    let session = RecentScopeSession::new(all_assets, album_assets);
-
-    let passes: Vec<AlbumPass> = (0..10)
-        .map(|index| AlbumPass {
-            kind: PassKind::Album,
-            album: recent_scope_album(&format!("Album {index}"), session.clone()),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        })
-        .collect();
-
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.concurrent_downloads = 1;
-    config.recent = Some(300);
-    for pass in &passes {
-        seed_existing_file_for_asset(&mut config, pass, &asset).await;
-    }
-
-    let result = download_photos_full_with_token(
-        &Client::new(),
-        &passes,
-        &Arc::new(config),
-        DownloadControls::download_hidden(),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("scope-frontier recent sync should complete");
-
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert_eq!(
-        result.stats.assets_seen,
-        10,
-        "each album should plan only assets inside the library-wide recent frontier; offsets={:?}",
-        session.album_offsets()
-    );
-    assert_eq!(result.stats.pagination_shortfall_warnings, 0);
-    assert_eq!(result.stats.enumeration_errors, 0);
-    assert!(
-        session.album_offsets().len() < 100,
-        "album enumeration should stop near the frontier boundary instead of \
-         applying recent=300 to every album pass"
-    );
-    assert_eq!(result.sync_token, None);
-}
-
-#[tokio::test]
-async fn full_sync_recent_per_filter_scope_limits_each_pass_independently() {
-    let all_assets = recent_scope_assets("frontier", 6, 1_700_000_000_000);
-    let mut album_assets = vec![all_assets[0].clone()];
-    album_assets.extend(recent_scope_assets(
-        "old-per-filter-album",
-        20,
-        1_699_000_000_000,
-    ));
-    let expected_assets = album_assets
-        .iter()
-        .take(6)
-        .map(recent_scope_photo_asset)
-        .collect::<Vec<_>>();
-    let session = RecentScopeSession::new(all_assets, album_assets);
-
-    let passes: Vec<AlbumPass> = (0..3)
-        .map(|index| AlbumPass {
-            kind: PassKind::Album,
-            album: recent_scope_album(&format!("Album {index}"), session.clone()),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        })
-        .collect();
-
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.concurrent_downloads = 1;
-    config.recent = Some(6);
-    config.recent_scope = crate::cli::RecentScope::PerFilter;
-
-    for pass in &passes {
-        for asset in &expected_assets {
-            seed_existing_file_for_asset(&mut config, pass, asset).await;
-        }
-    }
-
-    let result = download_photos_full_with_token(
-        &Client::new(),
-        &passes,
-        &Arc::new(config),
-        DownloadControls::download_hidden(),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("per-filter recent sync should complete");
-
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert_eq!(
-        result.stats.assets_seen, 18,
-        "per-filter recent scope should take the recent limit from each album pass"
-    );
-    assert_eq!(result.stats.pagination_shortfall_warnings, 0);
-    assert_eq!(result.stats.enumeration_errors, 0);
-    assert!(
-        session.album_offsets().len() >= 9,
-        "per-filter scope should enumerate each album's recent window, not stop at the global frontier"
-    );
-    assert_eq!(result.sync_token, None);
-}
-
-#[tokio::test]
-async fn full_sync_recent_single_album_filters_library_frontier() {
-    let all_assets = recent_scope_assets("frontier", 300, 1_700_000_000_000);
-    let mut album_assets = vec![all_assets[0].clone()];
-    album_assets.extend(recent_scope_assets(
-        "old-single-album",
-        500,
-        1_699_000_000_000,
-    ));
-    let asset = recent_scope_photo_asset(&all_assets[0]);
-    let session = RecentScopeSession::new(all_assets, album_assets);
-    let passes = vec![AlbumPass {
-        kind: PassKind::Album,
-        album: recent_scope_album("Vacation", session.clone()),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.concurrent_downloads = 1;
-    config.recent = Some(300);
-    seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
-
-    let result = download_photos_full_with_token(
-        &Client::new(),
-        &passes,
-        &Arc::new(config),
-        DownloadControls::download_hidden(),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("single-album scope-frontier recent sync should complete");
-
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert_eq!(
-        result.stats.assets_seen, 1,
-        "album filter should pare down the library-wide recent frontier"
-    );
-    assert_eq!(result.stats.pagination_shortfall_warnings, 0);
-    assert_eq!(result.stats.enumeration_errors, 0);
-    assert!(
-        session.album_offsets().len() < 10,
-        "single album enumeration should stop at the frontier boundary"
-    );
-    assert_eq!(result.sync_token, None);
-    assert!(result.stats.sync_token_blocked);
-    assert_eq!(
-        result.stats.sync_token_blocked_reason,
-        Some(RECENT_LIMITED_FULL_ENUMERATION_REASON)
-    );
 }
 
 #[tokio::test]
@@ -2855,9 +2673,10 @@ async fn full_sync_skip_created_after_drains_past_newer_prefix() {
 }
 
 #[tokio::test]
-async fn full_sync_recent_download_saves_token_when_cap_does_not_bind() {
+async fn full_sync_uncapped_download_saves_token_at_natural_eof() {
     let records = mock_photo_records_with_filename("MASTER_RECENT", "recent.jpg");
     let album_session = MockPhotosFlow::new()
+        .album_count(1)
         .query_page(records.clone(), Some("zone-token"))
         .empty_query_page(Some("zone-token"))
         .build();
@@ -2870,7 +2689,6 @@ async fn full_sync_recent_download_saves_token_when_cap_does_not_bind() {
     let mut config = test_config();
     let dir = TempDir::new().expect("temp dir");
     config.directory = Arc::from(dir.path());
-    config.recent = Some(100);
     config.file_match_policy = FileMatchPolicy::NameId7;
 
     let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
@@ -2896,19 +2714,25 @@ async fn full_sync_recent_download_saves_token_when_cap_does_not_bind() {
         CancellationToken::new(),
     )
     .await
-    .expect("recent full sync should complete");
+    .expect("uncapped full sync should complete");
 
     assert!(
         matches!(result.outcome, DownloadOutcome::Success),
-        "a sparse recent window must not be treated as pagination undercount"
+        "a naturally drained inventory should succeed"
     );
     assert_eq!(
         result.stats.enumeration_errors, 0,
-        "recent-limited count shortfalls are not exact enumeration errors"
+        "a complete inventory must not report enumeration errors"
     );
     assert_eq!(
-        result.stats.api_total_at_start, None,
-        "recent-limited runs must not seed comparable inventory totals"
+        result.stats.api_total_at_start,
+        Some(1),
+        "uncapped inventory retains its complete count measurement"
+    );
+    assert_eq!(result.stats.assets_seen, 1);
+    assert_eq!(
+        result.stats.skipped.by_state + result.stats.skipped.on_disk,
+        1
     );
     assert_eq!(
         result.sync_token.as_deref(),
@@ -2935,7 +2759,6 @@ async fn full_sync_recent_download_drains_multiple_reduced_pages() {
     let dir = TempDir::new().expect("temp dir");
     config.directory = Arc::from(dir.path());
     config.concurrent_downloads = 10;
-    config.recent = Some(100);
     seed_existing_recent_files(&mut config, &passes[0], "PrimarySync", &ids, "recent-prod").await;
 
     let result = download_photos_full_with_token(
@@ -2981,7 +2804,6 @@ async fn run_recent_mode_for_ids(
     let dir = TempDir::new().expect("temp dir");
     config.directory = Arc::from(dir.path());
     config.concurrent_downloads = 1;
-    config.recent = Some(ids.len().try_into().expect("test id count fits u32"));
     if matches!(mode, DownloadRunMode::Download) {
         seed_existing_recent_files(&mut config, &passes[0], "PrimarySync", ids, filename_prefix)
             .await;
@@ -3059,7 +2881,6 @@ async fn full_sync_recent_deferred_unfiled_filters_album_members_after_multi_pag
     let dir = TempDir::new().expect("temp dir");
     config.directory = Arc::from(dir.path());
     config.concurrent_downloads = 10;
-    config.recent = Some(60);
     seed_existing_recent_files(
         &mut config,
         &passes[0],
@@ -3096,12 +2917,12 @@ async fn full_sync_recent_deferred_unfiled_filters_album_members_after_multi_pag
     assert_eq!(
         result.sync_token.as_deref(),
         Some("zone-token"),
-        "recent deferred-unfiled sync may advance when the global frontier does not truncate"
+        "uncapped deferred-unfiled sync may advance at natural EOF"
     );
     assert_eq!(
         unfiled_session.emitted_ids().len(),
-        120,
-        "recent deferred unfiled should build the global frontier and then re-open a fresh stream for download URLs"
+        60,
+        "uncapped deferred unfiled opens one fresh download stream after album exclusions are known"
     );
 }
 
@@ -3121,7 +2942,6 @@ async fn full_sync_recent_smart_folder_drains_multiple_reduced_pages() {
     let dir = TempDir::new().expect("temp dir");
     config.directory = Arc::from(dir.path());
     config.concurrent_downloads = 10;
-    config.recent = Some(60);
     seed_existing_recent_files(&mut config, &passes[0], "PrimarySync", &ids, "smart-recent").await;
 
     let result = download_photos_full_with_token(
@@ -3176,7 +2996,6 @@ async fn full_sync_deferred_unfiled_waits_when_album_enumeration_errors() {
     let dir = TempDir::new().expect("temp dir");
     config.directory = Arc::from(dir.path());
     config.concurrent_downloads = 10;
-    config.recent = Some(40);
     seed_existing_recent_files(
         &mut config,
         &passes[0],

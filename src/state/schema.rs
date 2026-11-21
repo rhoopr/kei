@@ -7,7 +7,95 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 36;
+pub(crate) const SCHEMA_VERSION: i32 = 46;
+const FRESH_START_VERSION: i32 = 38;
+const RETIRED_INBOX: [&str; 3] = [
+    "provider_shadow_receipts",
+    "provider_shadow_records",
+    "provider_shadow_pages",
+];
+pub(super) const INBOX_COMPACTION_PENDING: &str = "v030_inbox_compaction_pending";
+
+fn mark_inbox_compaction(conn: &Connection) -> Result<(), StateError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO metadata(key,value) VALUES (?1,'1')",
+        [INBOX_COMPACTION_PENDING],
+    )?;
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+        [table],
+        |row| row.get(0),
+    )
+}
+
+/// Retire provider planning authority once, without interpreting historical
+/// payloads or changing file records. The enclosing migration savepoint makes
+/// preservation and retirement atomic; these snapshots have no runtime writers.
+fn retire_historical_provider_plans(conn: &Connection) -> Result<(), StateError> {
+    // Children precede parents so foreign-key enforcement can remain enabled.
+    for table in [
+        "provider_active_sources",
+        "provider_active_destinations",
+        "provider_active_decisions",
+        "provider_selection_rank_records",
+        "provider_selection_rank_pages",
+        "provider_active_generations",
+        "provider_selection_sources",
+        "provider_selection_destinations",
+        "provider_selection_decisions",
+        "provider_selection_generations",
+        "provider_work_obligations",
+        "provider_work_retries",
+        "provider_work_receipts",
+        "provider_work_scan",
+        "provider_catalog_references",
+        "provider_catalog_debt",
+        "provider_catalog_records",
+        "provider_catalog_pages",
+        "provider_transport_aliases",
+        "provider_transport_canonical",
+    ]
+    .into_iter()
+    .chain(RETIRED_INBOX)
+    .chain(["scoped_db_sync_tokens", "unresolved_sparse_identities"])
+    {
+        if !table_exists(conn, table)? {
+            continue;
+        }
+        let inbox = RETIRED_INBOX.contains(&table);
+        if !inbox {
+            conn.execute_batch(&format!(
+                "CREATE TABLE historical_v030_{table} AS SELECT * FROM {table}"
+            ))?;
+        }
+        let retired = conn.execute(&format!("DELETE FROM {table}"), [])?;
+        if inbox && retired > 0 {
+            mark_inbox_compaction(conn)?;
+        }
+    }
+    // Keep historical values byte-for-byte, including malformed tokens. Removing
+    // both zone and database cursors makes the existing startup choose full sync.
+    if !table_exists(conn, "metadata")? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE historical_v030_checkpoints AS SELECT * FROM metadata WHERE
+            key GLOB 'sync_token:*' OR key GLOB 'pending_sync_token:*'
+            OR key GLOB 'inventory_anchor_v1:*' OR key GLOB 'retained_checkpoint_hold:*'
+            OR key GLOB 'indexing_*' OR key GLOB 'inventory_reconciliation_required:*'
+            OR key GLOB 'enum_in_progress:*'
+            OR key GLOB 'unresolved_asset_identity:*'
+            OR key IN ('enum_config_hash','pending_enum_config_hash',
+                       'config_hash','pending_download_config_hash',
+                        'active_selection_metadata_retry_offset','sparse_identity_generation');
+         DELETE FROM metadata WHERE key IN (SELECT key FROM historical_v030_checkpoints);",
+    )?;
+    Ok(())
+}
 
 fn migrate_active_selection(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(r"CREATE TABLE IF NOT EXISTS provider_active_generations (
@@ -261,10 +349,8 @@ CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
 ///
 /// `provider_shadow_pages.body_hash` remains the historical observation hash.
 /// For a legacy alias it is the original transport hash of bytes removed by
-/// this migration, never a digest of the representative body.
-fn migrate_provider_transport_index(
-    conn: &Connection,
-) -> Result<crate::support::CompactionSummary, StateError> {
+/// older versions of this migration, never a digest of the representative body.
+fn migrate_provider_transport_index(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(
         r"
 CREATE TABLE IF NOT EXISTS provider_transport_canonical (
@@ -304,9 +390,7 @@ CREATE INDEX IF NOT EXISTS idx_transport_alias_canonical
     if actual != ["page_id"] {
         return Err(StateError::ProviderInboxInvalid);
     }
-    // Automatic legacy compaction is part of the same savepoint as DDL. Any
-    // failure rolls back all aliases and dropped bodies with this version step.
-    crate::state::db::provider_inbox::compact_legacy_aliases(conn)
+    Ok(())
 }
 
 /// Scheduling evidence neither completes work nor changes checkpoint authority.
@@ -661,9 +745,39 @@ fn set_schema_version(conn: &Connection, version: i32) -> Result<(), StateError>
 /// Initialize or migrate the database schema.
 ///
 /// This function is idempotent and safe to call on both new and existing databases.
-/// Each migration step is wrapped in a SAVEPOINT so that a failure rolls back
-/// only the current step, leaving the database at the last successfully applied version.
+/// Fresh-start upgrades roll back retirement and all schema steps together.
+/// Other migrations retain the per-step savepoint boundary.
 pub(crate) fn migrate(conn: &Connection) -> Result<(), StateError> {
+    let version = get_schema_version(conn)?;
+    let existing: bool = version > 0
+        || conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='assets')",
+            [],
+            |row| row.get(0),
+        )?;
+    if existing && version < FRESH_START_VERSION {
+        // Retire before older migration steps can parse or compact obsolete
+        // provider payloads. Owned startup has already backed up state/config.
+        // Keep the whole transition atomic even for the unowned test opener.
+        conn.execute_batch("SAVEPOINT fresh_start")?;
+        let result = retire_historical_provider_plans(conn).and_then(|()| migrate_steps(conn));
+        if result.is_err() {
+            conn.execute_batch("ROLLBACK TO fresh_start; RELEASE fresh_start")?;
+        } else {
+            conn.execute_batch("RELEASE fresh_start")?;
+        }
+        return result;
+    }
+    migrate_steps(conn)
+}
+
+/// Exercise historical migration behavior independently of fresh-start retirement.
+#[cfg(test)]
+pub(crate) fn migrate_historical_fixture(conn: &Connection) -> Result<(), StateError> {
+    migrate_steps(conn)
+}
+
+fn migrate_steps(conn: &Connection) -> Result<(), StateError> {
     let current_version = get_schema_version(conn)?;
 
     if current_version > SCHEMA_VERSION {
@@ -675,44 +789,18 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StateError> {
 
     for version in (current_version + 1)..=SCHEMA_VERSION {
         conn.execute_batch("SAVEPOINT migration")?;
-        let summary = match migrate_to_version(conn, current_version, version) {
-            Ok(summary) => summary,
-            Err(error) => {
-                let rolled_back = match conn.execute_batch("ROLLBACK TO migration") {
-                    Ok(()) => true,
-                    Err(rollback_err) => {
-                        tracing::error!(
-                            version,
-                            migration_error = %error,
-                            rollback_error = %rollback_err,
-                            "Migration rollback failed — database may be inconsistent"
-                        );
-                        false
-                    }
-                };
-                if version == 36 {
-                    crate::support::record_transport_compaction_failure(if rolled_back {
-                        crate::support::MigrationFailure::MigrationFailed
-                    } else {
-                        crate::support::MigrationFailure::RollbackFailed
-                    });
-                }
-                return Err(error);
-            }
-        };
-        if let Err(error) = conn.execute_batch("RELEASE migration") {
-            if version == 36 {
-                crate::support::record_transport_compaction_failure(
-                    crate::support::MigrationFailure::MigrationFailed,
+        if let Err(error) = migrate_to_version(conn, current_version, version) {
+            if let Err(rollback_err) = conn.execute_batch("ROLLBACK TO migration") {
+                tracing::error!(
+                    version,
+                    migration_error = %error,
+                    rollback_error = %rollback_err,
+                    "Migration rollback failed — database may be inconsistent"
                 );
             }
-            return Err(error.into());
+            return Err(error);
         }
-        if version == 36
-            && let Some(summary) = summary
-        {
-            crate::support::record_transport_compaction(summary);
-        }
+        conn.execute_batch("RELEASE migration")?;
     }
 
     Ok(())
@@ -1240,8 +1328,7 @@ pub(crate) fn migrate_to_version(
     conn: &Connection,
     start_version: i32,
     version: i32,
-) -> Result<Option<crate::support::CompactionSummary>, StateError> {
-    let mut summary = None;
+) -> Result<(), StateError> {
     match version {
         1 => conn.execute_batch(SCHEMA_V1)?,
         2 => conn.execute_batch(SCHEMA_V2)?,
@@ -1419,7 +1506,94 @@ pub(crate) fn migrate_to_version(
         33 => migrate_provider_selection(conn)?,
         34 => migrate_active_selection(conn)?,
         35 => conn.execute_batch(super::db::primary_layout::DDL)?,
-        36 => summary = Some(migrate_provider_transport_index(conn)?),
+        36 => migrate_provider_transport_index(conn)?,
+        37 => {
+            // Receipt existence is the only upgrade input. Preserve every old
+            // key and value, including malformed/future bytes. The schema
+            // version prevents quiet reopens from reseeding completed work.
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO metadata(key,value) \
+                 SELECT 'inventory_reconciliation_required:' || substr(key,27), '1' \
+                  FROM metadata WHERE substr(key,1,26)='recent_selection_recovery:' \
+                  AND NOT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='historical_v030_checkpoints');",
+            )?;
+        }
+        // The owning migration transaction retires historical plans before
+        // running any historical data interpretation steps.
+        38 => {}
+        39 => {
+            if !column_exists(conn, "provider_active_destinations", "current_publication")? {
+                conn.execute_batch("ALTER TABLE provider_active_destinations ADD COLUMN current_publication INTEGER NOT NULL DEFAULT 0 CHECK(current_publication IN (0,1));")?;
+            }
+            conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_current_native_publication ON provider_active_destinations(library,path) WHERE current_publication=1;")?;
+            if !column_exists(conn, "provider_active_destinations", "preserved_local")? {
+                conn.execute_batch(
+                    "ALTER TABLE provider_active_destinations ADD COLUMN preserved_local BLOB;",
+                )?;
+            }
+        }
+        40 => {
+            if !column_exists(conn, "album_containers", "directory_binding")? {
+                conn.execute_batch(
+                    "ALTER TABLE album_containers ADD COLUMN directory_binding BLOB;",
+                )?;
+            }
+        }
+        41 => {
+            for table in ["asset_metadata_paths", "provider_active_destinations"] {
+                if !column_exists(conn, table, "embedded_metadata_receipt")? {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN embedded_metadata_receipt TEXT;"
+                    ))?;
+                }
+            }
+        }
+        42 => {
+            // Confirmation binds an existing native destination to an exact
+            // inspected fingerprint. Nullable and evidence-free by default:
+            // the migration cannot infer repair authority from historical rows.
+            if !column_exists(conn, "provider_active_destinations", "confirmed_repair")? {
+                conn.execute_batch(
+                    "ALTER TABLE provider_active_destinations ADD COLUMN confirmed_repair BLOB;",
+                )?;
+            }
+        }
+        43 => {
+            // Completed nonempty observations still participate in selection's
+            // change detector. They are not checkpoints or raw replay work.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS provider_finished_changes (
+                page_id INTEGER PRIMARY KEY REFERENCES provider_shadow_pages(id),
+                receipt TEXT NOT NULL
+            );",
+            )?;
+        }
+        44 => {
+            if !column_exists(conn, "historical_deletion_checks", "id")? {
+                conn.execute_batch(include_str!("historical_deletion.sql"))?;
+            }
+        }
+        45 => {
+            for table in RETIRED_INBOX {
+                let archive = format!("historical_v030_{table}");
+                if table_exists(conn, &archive)? {
+                    conn.execute_batch(&format!("DROP TABLE {archive}"))?;
+                    mark_inbox_compaction(conn)?;
+                }
+            }
+        }
+        46 => {
+            if !column_exists(conn, "provider_selection_rank_pages", "retired_proof_hash")? {
+                conn.execute_batch(
+                    "ALTER TABLE provider_selection_rank_pages ADD COLUMN retired_proof_hash TEXT
+                    CHECK(retired_proof_hash IS NULL OR length(retired_proof_hash)=64);",
+                )?;
+            }
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_selection_rank_unretired ON provider_selection_rank_pages(generation)
+                 WHERE retired_proof_hash IS NULL;",
+            )?;
+        }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1429,7 +1603,7 @@ pub(crate) fn migrate_to_version(
     }
     set_schema_version(conn, version)?;
     tracing::info!(version, "Migrated database schema");
-    Ok(summary)
+    Ok(())
 }
 
 /// Build a genuine schema-28 database by running every released migration
@@ -1444,7 +1618,1312 @@ pub(crate) fn migrate_genuine_v28(conn: &Connection) -> Result<(), StateError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_helpers::assert_no_retired_inbox_archive;
+
+    #[test]
+    fn embedded_receipt_migration_from_38_never_adopts_legacy_metadata() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for version in 1..=38 {
+            super::migrate_to_version(&conn, 0, version).unwrap();
+        }
+        conn.execute("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum) VALUES ('PrimarySync','old','original','/media/original.jpg','provider','unchanged')",[]).unwrap();
+        super::migrate(&conn).unwrap();
+        super::migrate(&conn).unwrap();
+        let receipt: (String,Option<String>) = conn.query_row("SELECT local_checksum,embedded_metadata_receipt FROM asset_metadata_paths WHERE id='old'",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(receipt, ("unchanged".into(), None));
+        assert_eq!(super::get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+    fn assert_retired_checkpoint(conn: &Connection, key: &str, expected: &str) {
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM metadata WHERE key=?1", [key], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM historical_v030_checkpoints WHERE key=?1",
+                [key],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            expected
+        );
+    }
+    type DestinationEvidence = (
+        String,
+        i64,
+        Option<Vec<u8>>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<Vec<u8>>,
+    );
+
+    fn normalized_sql(sql: &str) -> String {
+        sql.chars()
+            .filter(|ch| !ch.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+
+    fn table_checks(sql: &str) -> Vec<String> {
+        let lower = sql.to_ascii_lowercase();
+        let bytes = sql.as_bytes();
+        let mut checks = Vec::new();
+        let mut cursor = 0;
+        while let Some(relative) = lower.get(cursor..).unwrap_or_default().find("check") {
+            let keyword = cursor + relative;
+            let mut open = keyword + "check".len();
+            while open < bytes.len() && bytes[open].is_ascii_whitespace() {
+                open += 1;
+            }
+            if bytes.get(open) != Some(&b'(') {
+                cursor = keyword + "check".len();
+                continue;
+            }
+            let mut depth = 0usize;
+            let mut end = None;
+            for (offset, ch) in sql.get(open..).unwrap_or_default().char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(open + offset + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(end) = end else {
+                break;
+            };
+            let Some(fragment) = sql.get(open..end) else {
+                break;
+            };
+            checks.push(normalized_sql(fragment));
+            cursor = end;
+        }
+        checks
+    }
+
+    /// Canonical provider-schema shape used to compare the behavioral helper
+    /// DDL with a database produced by the real migration chain. Raw SQL text
+    /// differs after ALTER TABLE, so compare every constraint-bearing surface:
+    /// columns, primary keys, foreign keys, checks, indexes and rowid mode.
+    fn provider_schema_snapshot(conn: &Connection) -> Vec<String> {
+        use rusqlite::OptionalExtension;
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                  WHERE type='table' AND name LIKE 'provider_%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut snapshot = Vec::new();
+        for table in tables {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            snapshot.push(format!(
+                "table {table} without-rowid={}",
+                normalized_sql(&sql).ends_with("withoutrowid")
+            ));
+            let columns: Vec<String> = conn
+                .prepare(
+                    "SELECT cid,name,type,\"notnull\",dflt_value,pk,hidden
+                       FROM pragma_table_xinfo(?1) ORDER BY cid",
+                )
+                .unwrap()
+                .query_map([table.as_str()], |row| {
+                    Ok(format!(
+                        "table {table} column cid={} name={} type={} notnull={} default={:?} pk={} hidden={}",
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            snapshot.extend(columns);
+            let foreign_keys: Vec<String> = conn
+                .prepare(
+                    "SELECT id,seq,\"table\",\"from\",\"to\",on_update,on_delete,match
+                       FROM pragma_foreign_key_list(?1) ORDER BY id,seq",
+                )
+                .unwrap()
+                .query_map([table.as_str()], |row| {
+                    Ok(format!(
+                        "table {table} foreign-key id={} seq={} target={} from={} to={:?} on-update={} on-delete={} match={}",
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            snapshot.extend(foreign_keys);
+            for check in table_checks(&sql) {
+                snapshot.push(format!("table {table} check {check}"));
+            }
+            let indexes: Vec<(String, i64, String, i64)> = conn
+                .prepare(
+                    "SELECT name,\"unique\",origin,partial
+                       FROM pragma_index_list(?1) ORDER BY name",
+                )
+                .unwrap()
+                .query_map([table.as_str()], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for (index, unique, origin, partial) in indexes {
+                snapshot.push(format!(
+                    "index {index} table={table} unique={unique} origin={origin} partial={partial}"
+                ));
+                let index_columns: Vec<String> = conn
+                    .prepare("SELECT seqno,cid,name FROM pragma_index_info(?1) ORDER BY seqno")
+                    .unwrap()
+                    .query_map([index.as_str()], |row| {
+                        Ok(format!(
+                            "index {index} column seqno={} cid={} name={:?}",
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                snapshot.extend(index_columns);
+                let index_sql: Option<String> = conn
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                        [index.as_str()],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()
+                    .unwrap()
+                    .flatten();
+                if let Some(index_sql) = index_sql {
+                    snapshot.push(format!("index {index} sql {}", normalized_sql(&index_sql)));
+                }
+            }
+        }
+        snapshot
+    }
+
+    fn historical_provider_fixture(version: i32) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        seed_historical_provider_fixture(&conn, version);
+        conn
+    }
+
+    fn seed_historical_provider_fixture(conn: &Connection, version: i32) {
+        for target in 1..=version {
+            migrate_to_version(conn, 0, target).unwrap();
+        }
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch(
+            "INSERT INTO provider_shadow_pages VALUES
+                (1,'old-account','old-provider','scope','before','after',0,'invalid',X'00ff',2,1);
+             INSERT INTO provider_shadow_records VALUES (1,0,'child','CPLAsset',0);
+             INSERT INTO provider_shadow_receipts VALUES ('scope',1);
+             INSERT INTO provider_active_generations
+                (id,account_key,provider_key,scope,config_hash,basis,metadata_enabled,
+                 specification,specification_hash,created_at,charged_bytes)
+                VALUES ('old','old-account','old-provider','scope','config','basis',1,X'00ff','invalid',1,2);
+             INSERT INTO provider_active_decisions
+                (generation,pass_key,child,manifest,manifest_hash,outcome,admission,reason,charged_bytes)
+                VALUES ('old','pass','child',X'00ff','invalid','selected','admitted','',2);
+             INSERT INTO provider_active_destinations
+                (generation,pass_key,child,library,asset_id,master,version_size,path,compat_path,
+                 checksum,size_bytes,created_at,metadata_hash,admitted)
+                VALUES ('old','pass','child','PrimarySync','child','master','medium',
+                        'retained-native-path','retained.jpg','old-resource',12,1,'old-metadata',1);
+             INSERT INTO metadata VALUES ('sync_token:PrimarySync',X'00ff');
+             INSERT INTO metadata VALUES ('unrelated-setting','keep');",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn fresh_start_retires_planning_without_decoding_or_repeating_it() {
+        let conn = historical_provider_fixture(37);
+        migrate(&conn).unwrap();
+        assert_no_retired_inbox_archive(&conn);
+        let path: String = conn
+            .query_row(
+                "SELECT path FROM historical_v030_provider_active_destinations",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(path, "retained-native-path");
+        for table in [
+            "provider_shadow_pages",
+            "provider_active_generations",
+            "provider_active_destinations",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        let cursor: Vec<u8> = conn
+            .query_row(
+                "SELECT value FROM historical_v030_checkpoints WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, [0, 255]);
+        conn.execute(
+            "INSERT INTO metadata VALUES ('sync_token:PrimarySync','current')",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "current"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM metadata WHERE key='unrelated-setting'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "keep"
+        );
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn preserved_local_migration_keeps_v38_active_evidence() {
+        let conn = historical_provider_fixture(38);
+        conn.execute_batch("CREATE TABLE historical_v030_provider_shadow_pages(body BLOB); INSERT INTO historical_v030_provider_shadow_pages VALUES(X'00ff');").unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert!(column_exists(&conn, "provider_active_destinations", "preserved_local").unwrap());
+        assert!(
+            column_exists(&conn, "provider_active_destinations", "current_publication").unwrap()
+        );
+        let authority: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM provider_active_destinations WHERE current_publication<>0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            authority, 0,
+            "migration cannot infer publication order from history"
+        );
+        let row: (String, Option<Vec<u8>>) = conn.query_row(
+            "SELECT path,preserved_local FROM provider_active_destinations WHERE generation='old'", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(row, ("retained-native-path".to_owned(), None));
+        let evidence = serde_json::to_vec(&serde_json::json!({
+            "intent": "ab".repeat(32), "checksum": "cd".repeat(32),
+            "size": 42, "modified": "2023-11-14T22:13:20Z"
+        }))
+        .unwrap();
+        conn.execute(
+            "UPDATE provider_active_destinations SET preserved_local=?1 WHERE generation='old'",
+            [&evidence],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            migrate(&conn).unwrap();
+            let retained: Vec<u8> = conn.query_row("SELECT preserved_local FROM provider_active_destinations WHERE generation='old'", [], |row| row.get(0)).unwrap();
+            assert_eq!(retained, evidence);
+            assert_no_retired_inbox_archive(&conn);
+            let live: Vec<u8> = conn
+                .query_row(
+                    "SELECT specification FROM provider_active_generations WHERE id='old'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(live, [0, 255]);
+        }
+    }
+
+    #[test]
+    fn fresh_start_retirement_failure_rolls_back_evidence_and_authority() {
+        let conn = historical_provider_fixture(37);
+        conn.execute_batch("CREATE TRIGGER refuse_retirement BEFORE DELETE ON provider_shadow_pages BEGIN SELECT RAISE(ABORT,'injected retirement failure'); END;").unwrap();
+        assert!(migrate(&conn).is_err());
+        assert_eq!(get_schema_version(&conn).unwrap(), 37);
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM provider_active_destinations",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name GLOB 'historical_v030_*'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let cursor: Vec<u8> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, [0, 255]);
+    }
+
+    #[test]
+    fn album_directory_upgrade_preserves_pending_layout_and_container_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schema39.db");
+        let evidence = b"preserved-local\0\xff";
+        let header = b"retained-layout-header\0\xff";
+        {
+            let conn = Connection::open(&path).unwrap();
+            seed_historical_provider_fixture(&conn, 39);
+            assert_eq!(get_schema_version(&conn).unwrap(), 39);
+            assert!(
+                !column_exists(&conn, "album_containers", "directory_binding").unwrap(),
+                "schema 39 must not carry the directory binding"
+            );
+            conn.execute_batch(
+                "INSERT INTO album_containers
+                    (library,container_id,album_name,pass_kind,is_deleted,updated_at)
+                 VALUES
+                    ('PrimarySync','album','Old','album',0,123),
+                    ('SharedSync-OTHER','album-2','Other','album',1,456);
+                 INSERT INTO album_membership_snapshots
+                    (library,container_id,generation,status,enum_config_hash,started_at,completed_at)
+                 VALUES ('PrimarySync','album',2,'complete','config-hash',1,2);
+                 INSERT INTO asset_album_memberships
+                    (library,asset_record_name,master_record_name,container_id,generation,
+                     is_deleted,source,updated_at)
+                 VALUES ('PrimarySync','asset','master','album',2,0,'xmp',5);",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO primary_layout_operations(operation,family,library,source_library,prior_generation,decision,policy,phase,header) VALUES('old','family','PrimarySync','PrimarySync',1,'decision','primary','publishing',?1)", [header.as_slice()]).unwrap();
+            conn.execute(
+                "UPDATE provider_active_destinations
+                    SET current_publication=1,preserved_local=?1
+                  WHERE generation='old'",
+                [evidence.as_slice()],
+            )
+            .unwrap();
+        }
+
+        for reopen in 0..2 {
+            let conn = Connection::open(&path).unwrap();
+            migrate(&conn).unwrap();
+            assert_eq!(
+                get_schema_version(&conn).unwrap(),
+                SCHEMA_VERSION,
+                "reopen {reopen}"
+            );
+            assert!(column_exists(&conn, "album_containers", "directory_binding").unwrap());
+            let binding_type: String = conn
+                .query_row(
+                    "SELECT type FROM pragma_table_info('album_containers')
+                      WHERE name='directory_binding'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(binding_type, "BLOB", "reopen {reopen}");
+            assert_eq!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM album_containers WHERE directory_binding IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+                0,
+                "reopen {reopen}"
+            );
+            let albums: Vec<(String, String, i64, i64)> = conn
+                .prepare(
+                    "SELECT container_id,album_name,is_deleted,updated_at
+                       FROM album_containers ORDER BY container_id",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                albums,
+                vec![
+                    ("album".into(), "Old".into(), 0, 123),
+                    ("album-2".into(), "Other".into(), 1, 456),
+                ],
+                "reopen {reopen}"
+            );
+            let snapshot: (String, Option<String>, i64) = conn
+                .query_row(
+                    "SELECT status,enum_config_hash,completed_at
+                       FROM album_membership_snapshots
+                      WHERE library='PrimarySync' AND container_id='album' AND generation=2",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                snapshot,
+                ("complete".into(), Some("config-hash".into()), 2),
+                "reopen {reopen}"
+            );
+            let membership: (Option<String>, i64, String) = conn
+                .query_row(
+                    "SELECT master_record_name,is_deleted,source
+                       FROM asset_album_memberships
+                      WHERE library='PrimarySync' AND asset_record_name='asset'
+                        AND container_id='album'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                membership,
+                (Some("master".into()), 0, "xmp".into()),
+                "reopen {reopen}"
+            );
+
+            for column in ["current_publication", "preserved_local"] {
+                assert!(
+                    column_exists(&conn, "provider_active_destinations", column).unwrap(),
+                    "reopen {reopen}"
+                );
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM sqlite_schema
+                      WHERE type='index' AND name='idx_current_native_publication'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "reopen {reopen}"
+            );
+            let authority: (String, i64, Option<Vec<u8>>) = conn
+                .query_row(
+                    "SELECT path,current_publication,preserved_local
+                       FROM provider_active_destinations WHERE generation='old'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                authority,
+                ("retained-native-path".into(), 1, Some(evidence.to_vec())),
+                "reopen {reopen}"
+            );
+
+            let shadow: Vec<u8> = conn
+                .query_row("SELECT body FROM provider_shadow_pages", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(shadow, [0, 255], "reopen {reopen}");
+            let specification: Vec<u8> = conn
+                .query_row(
+                    "SELECT specification FROM provider_active_generations WHERE id='old'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(specification, [0, 255], "reopen {reopen}");
+            let manifest: Vec<u8> = conn
+                .query_row(
+                    "SELECT manifest FROM provider_active_decisions WHERE generation='old'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(manifest, [0, 255], "reopen {reopen}");
+            let cursor: Vec<u8> = conn
+                .query_row(
+                    "SELECT CAST(value AS BLOB) FROM metadata WHERE key='sync_token:PrimarySync'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(cursor, [0, 255], "reopen {reopen}");
+
+            let retained: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT header FROM primary_layout_operations WHERE operation='old'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                retained.as_deref(),
+                Some(header.as_slice()),
+                "reopen {reopen}"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM primary_layout_operations
+                      WHERE operation='old' AND phase='publishing'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "reopen {reopen}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_receipt_upgrade_preserves_native_evidence_and_layout_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schema40.db");
+        let binding = b"album-binding\0\xff";
+        let other_binding = b"other-album-binding\0\xfe";
+        let preserved = b"preserved-local\0\xff";
+        let header = b"retained-layout-header\0\xff";
+        let metadata_receipt = ("path-provider", "path-local", "path-download");
+        {
+            let conn = Connection::open(&path).unwrap();
+            seed_historical_provider_fixture(&conn, 40);
+            assert_eq!(get_schema_version(&conn).unwrap(), 40);
+            assert!(
+                column_exists(&conn, "album_containers", "directory_binding").unwrap(),
+                "schema 40 must carry the directory binding"
+            );
+            for table in ["asset_metadata_paths", "provider_active_destinations"] {
+                assert!(
+                    !column_exists(&conn, table, "embedded_metadata_receipt").unwrap(),
+                    "schema 40 must not carry the embedded receipt"
+                );
+            }
+            conn.execute(
+                "INSERT INTO album_containers
+                    (library,container_id,album_name,pass_kind,is_deleted,updated_at,directory_binding)
+                 VALUES ('PrimarySync','album','Old','album',0,123,?1)",
+                [binding.as_slice()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO album_containers
+                    (library,container_id,album_name,pass_kind,is_deleted,updated_at,directory_binding)
+                 VALUES ('SharedSync-OTHER','album-2','Other','album',1,456,?1)",
+                [other_binding.as_slice()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO asset_metadata_paths
+                    (library,id,version_size,local_path,provider_checksum,local_checksum,
+                     download_checksum,metadata_write_failed_at)
+                 VALUES ('PrimarySync','old','original','/media/original.jpg',?1,?2,?3,7)",
+                rusqlite::params![metadata_receipt.0, metadata_receipt.1, metadata_receipt.2],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO primary_layout_operations
+                    (operation,family,library,source_library,prior_generation,decision,policy,phase,header)
+                 VALUES ('old','family','PrimarySync','PrimarySync',1,'decision','primary','publishing',?1)",
+                [header.as_slice()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE provider_active_destinations
+                    SET current_publication=1,preserved_local=?1,local_checksum=?2
+                  WHERE generation='old'",
+                rusqlite::params![preserved.as_slice(), "native-local-checksum"],
+            )
+            .unwrap();
+        }
+
+        for reopen in 0..2 {
+            let conn = Connection::open(&path).unwrap();
+            migrate(&conn).unwrap();
+            assert_eq!(
+                get_schema_version(&conn).unwrap(),
+                SCHEMA_VERSION,
+                "reopen {reopen}"
+            );
+            for table in ["asset_metadata_paths", "provider_active_destinations"] {
+                assert!(
+                    column_exists(&conn, table, "embedded_metadata_receipt").unwrap(),
+                    "reopen {reopen}"
+                );
+                let receipt_type: String = conn
+                    .query_row(
+                        &format!(
+                            "SELECT type FROM pragma_table_info('{table}')
+                              WHERE name='embedded_metadata_receipt'"
+                        ),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(receipt_type, "TEXT", "reopen {reopen}");
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        &format!(
+                            "SELECT count(*) FROM {table}
+                              WHERE embedded_metadata_receipt IS NOT NULL"
+                        ),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                    0,
+                    "reopen {reopen}"
+                );
+            }
+            let bindings: Vec<(String, Option<Vec<u8>>)> = conn
+                .prepare(
+                    "SELECT container_id,directory_binding
+                       FROM album_containers ORDER BY container_id",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                bindings,
+                vec![
+                    ("album".into(), Some(binding.to_vec())),
+                    ("album-2".into(), Some(other_binding.to_vec())),
+                ],
+                "reopen {reopen}"
+            );
+            let native: (String, i64, Option<Vec<u8>>, String, Option<String>) = conn
+                .query_row(
+                    "SELECT path,current_publication,preserved_local,checksum,local_checksum
+                       FROM provider_active_destinations WHERE generation='old'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                native,
+                (
+                    "retained-native-path".into(),
+                    1,
+                    Some(preserved.to_vec()),
+                    "old-resource".into(),
+                    Some("native-local-checksum".into()),
+                ),
+                "reopen {reopen}"
+            );
+            let receipt: (String, Option<String>, Option<String>, i64, Option<String>) = conn
+                .query_row(
+                    "SELECT provider_checksum,local_checksum,download_checksum,
+                            metadata_write_failed_at,embedded_metadata_receipt
+                       FROM asset_metadata_paths WHERE id='old'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                receipt,
+                (
+                    metadata_receipt.0.into(),
+                    Some(metadata_receipt.1.into()),
+                    Some(metadata_receipt.2.into()),
+                    7,
+                    None,
+                ),
+                "reopen {reopen}"
+            );
+            let layout: (Option<Vec<u8>>, String) = conn
+                .query_row(
+                    "SELECT header,phase FROM primary_layout_operations
+                      WHERE operation='old'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                layout,
+                (Some(header.to_vec()), "publishing".into()),
+                "reopen {reopen}"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmed_repair_upgrade_from_41_preserves_native_evidence_and_reopens_cleanly() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schema41.db");
+        let binding = b"schema41-album-binding\0\xff";
+        let preserved = b"schema41-preserved-local\0\xff";
+        let header = b"schema41-layout-header\0\xff";
+        let path_receipt = (
+            "schema41-path-provider",
+            "schema41-path-local",
+            "schema41-path-download",
+        );
+        let destination_receipt = "schema41-destination-receipt";
+        {
+            let conn = Connection::open(&path).unwrap();
+            seed_historical_provider_fixture(&conn, 41);
+            assert_eq!(get_schema_version(&conn).unwrap(), 41);
+            assert!(
+                !column_exists(&conn, "provider_active_destinations", "confirmed_repair").unwrap(),
+                "schema 41 must not carry confirmed repair authority"
+            );
+            for (table, column) in [
+                ("provider_active_destinations", "current_publication"),
+                ("provider_active_destinations", "preserved_local"),
+                ("provider_active_destinations", "embedded_metadata_receipt"),
+                ("album_containers", "directory_binding"),
+                ("asset_metadata_paths", "embedded_metadata_receipt"),
+            ] {
+                assert!(
+                    column_exists(&conn, table, column).unwrap(),
+                    "schema 41 must carry {table}.{column}"
+                );
+            }
+            conn.execute(
+                "INSERT INTO album_containers
+                    (library,container_id,album_name,pass_kind,is_deleted,updated_at,directory_binding)
+                 VALUES ('PrimarySync','album','Old','album',0,123,?1)",
+                [binding.as_slice()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO asset_metadata_paths
+                    (library,id,version_size,local_path,provider_checksum,local_checksum,
+                     download_checksum,embedded_metadata_receipt)
+                 VALUES ('PrimarySync','old','original','/media/original.jpg',?1,?2,?3,?4)",
+                rusqlite::params![
+                    path_receipt.0,
+                    path_receipt.1,
+                    path_receipt.2,
+                    destination_receipt
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO primary_layout_operations
+                    (operation,family,library,source_library,prior_generation,decision,policy,phase,header)
+                 VALUES ('old','family','PrimarySync','PrimarySync',1,'decision','primary','publishing',?1)",
+                [header.as_slice()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE provider_active_destinations
+                    SET current_publication=1,preserved_local=?1,local_checksum=?2,
+                        embedded_metadata_receipt=?3
+                  WHERE generation='old'",
+                rusqlite::params![
+                    preserved.as_slice(),
+                    "schema41-local-checksum",
+                    destination_receipt
+                ],
+            )
+            .unwrap();
+        }
+
+        for reopen in 0..2 {
+            let conn = Connection::open(&path).unwrap();
+            migrate(&conn).unwrap();
+            assert_eq!(
+                get_schema_version(&conn).unwrap(),
+                SCHEMA_VERSION,
+                "reopen {reopen}"
+            );
+            let repair_type: String = conn
+                .query_row(
+                    "SELECT type FROM pragma_table_info('provider_active_destinations')
+                      WHERE name='confirmed_repair'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(repair_type, "BLOB", "reopen {reopen}");
+            let native: DestinationEvidence = conn
+                .query_row(
+                    "SELECT path,current_publication,preserved_local,checksum,local_checksum,
+                            embedded_metadata_receipt,confirmed_repair
+                       FROM provider_active_destinations WHERE generation='old'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                native,
+                (
+                    "retained-native-path".into(),
+                    1,
+                    Some(preserved.to_vec()),
+                    "old-resource".into(),
+                    Some("schema41-local-checksum".into()),
+                    Some(destination_receipt.into()),
+                    None,
+                ),
+                "reopen {reopen}"
+            );
+            let binding_row: (String, Option<Vec<u8>>) = conn
+                .query_row(
+                    "SELECT container_id,directory_binding
+                       FROM album_containers WHERE container_id='album'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                binding_row,
+                ("album".into(), Some(binding.to_vec())),
+                "reopen {reopen}"
+            );
+            let receipt: (String, Option<String>, Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT provider_checksum,local_checksum,download_checksum,
+                            embedded_metadata_receipt
+                       FROM asset_metadata_paths WHERE id='old'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                receipt,
+                (
+                    path_receipt.0.into(),
+                    Some(path_receipt.1.into()),
+                    Some(path_receipt.2.into()),
+                    Some(destination_receipt.into()),
+                ),
+                "reopen {reopen}"
+            );
+            let layout: (Option<Vec<u8>>, String) = conn
+                .query_row(
+                    "SELECT header,phase FROM primary_layout_operations
+                      WHERE operation='old'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                layout,
+                (Some(header.to_vec()), "publishing".into()),
+                "reopen {reopen}"
+            );
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        let evidence = b"confirmed-repair\0\xff";
+        conn.execute(
+            "UPDATE provider_active_destinations SET confirmed_repair=?1 WHERE generation='old'",
+            [evidence.as_slice()],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let retained: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT confirmed_repair FROM provider_active_destinations WHERE generation='old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained.as_deref(), Some(evidence.as_slice()));
+    }
+
+    #[test]
+    fn behavioral_helper_matches_real_migrated_provider_schema() {
+        let helper_source = include_str!("../../tests/behavioral/support.rs");
+        let start = helper_source
+            .find("CREATE TABLE IF NOT EXISTS provider_active_generations")
+            .unwrap();
+        let end = start
+            + helper_source
+                .get(start..)
+                .unwrap_or_default()
+                .find('"')
+                .unwrap();
+        let helper_ddl = helper_source.get(start..end).unwrap();
+        assert!(
+            helper_ddl.contains("confirmed_repair BLOB"),
+            "helper DDL must pin schema-42 confirmation evidence"
+        );
+
+        let production = Connection::open_in_memory().unwrap();
+        migrate(&production).unwrap();
+        assert_eq!(get_schema_version(&production).unwrap(), SCHEMA_VERSION);
+
+        let helper = Connection::open_in_memory().unwrap();
+        helper.execute_batch(helper_ddl).unwrap();
+        let actual = provider_schema_snapshot(&helper);
+        assert_eq!(
+            actual,
+            provider_schema_snapshot(&production),
+            "behavioral helper provider DDL must match a database built by the real migration chain"
+        );
+
+        for (before, after) in [
+            (
+                "PRIMARY KEY(generation,pass_key,child)",
+                "PRIMARY KEY(generation,child,pass_key)",
+            ),
+            (
+                "CHECK(outcome IN ('selected','excluded','deferred'))",
+                "CHECK(outcome IN ('selected','excluded'))",
+            ),
+            (
+                "WHERE current_publication=1",
+                "WHERE current_publication=1 AND 0",
+            ),
+        ] {
+            let drifted = helper_ddl.replacen(before, after, 1);
+            assert_ne!(
+                helper_ddl, drifted,
+                "negative control must change the helper DDL"
+            );
+            let drifted_db = Connection::open_in_memory().unwrap();
+            drifted_db.execute_batch(&drifted).unwrap();
+            assert_ne!(
+                actual,
+                provider_schema_snapshot(&drifted_db),
+                "canonical comparison must detect key, check or index drift"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_start_cannot_allocate_an_archive_sized_copy() {
+        let conn = historical_provider_fixture(36);
+        conn.execute_batch("UPDATE provider_shadow_pages SET body=zeroblob(12582912)")
+            .unwrap();
+        let pages: u32 = conn
+            .pragma_query_value(None, "page_count", |r| r.get(0))
+            .unwrap();
+        // SQLite must fail any allocation over this limit, even if a later
+        // step would free it. Leave 64 pages for unrelated migration DDL.
+        conn.pragma_update(None, "max_page_count", pages + 64)
+            .unwrap();
+        migrate(&conn).unwrap();
+        assert_no_retired_inbox_archive(&conn);
+    }
+
+    #[test]
+    fn fresh_start_precedes_obsolete_transport_compaction() {
+        let conn = historical_provider_fixture(35);
+        migrate(&conn).unwrap();
+        assert_no_retired_inbox_archive(&conn);
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM provider_shadow_pages", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn fresh_start_preserves_checkpoints_in_existing_unversioned_state() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute(
+            "INSERT INTO metadata VALUES ('sync_token:PrimarySync','old')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 0);
+        migrate(&conn).unwrap();
+        assert_retired_checkpoint(&conn, "sync_token:PrimarySync", "old");
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn inventory_upgrade_seeds_exact_receipt_keys_once_without_reading_their_values() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=36 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        let old = [
+            (
+                "recent_selection_recovery:PrimarySync",
+                b"\0\xffunparseable".as_slice(),
+            ),
+            (
+                "recent_selection_recovery:SharedSync-OTHER",
+                b"future receipt".as_slice(),
+            ),
+            (
+                "recent_selection_recovery:SharedSync-KEPT",
+                b"old receipt".as_slice(),
+            ),
+            (
+                "recent_selection_recoveryX:NOT-A-ZONE",
+                b"near prefix".as_slice(),
+            ),
+        ];
+        for (key, value) in old {
+            conn.execute(
+                "INSERT INTO metadata(key,value) VALUES(?1,?2)",
+                rusqlite::params![key, value],
+            )
+            .unwrap();
+        }
+        conn.execute("INSERT INTO metadata(key,value) VALUES('inventory_reconciliation_required:SharedSync-KEPT','existing obligation')",[]).unwrap();
+        migrate_to_version(&conn, 36, 37).unwrap();
+        let requests: Vec<(String,String)> = conn.prepare(
+            "SELECT key,value FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*' ORDER BY key"
+        ).unwrap().query_map([],|row|Ok((row.get(0)?,row.get(1)?))).unwrap()
+            .collect::<Result<_,_>>().unwrap();
+        assert_eq!(
+            requests,
+            vec![
+                (
+                    "inventory_reconciliation_required:PrimarySync".into(),
+                    "1".into()
+                ),
+                (
+                    "inventory_reconciliation_required:SharedSync-KEPT".into(),
+                    "existing obligation".into()
+                ),
+                (
+                    "inventory_reconciliation_required:SharedSync-OTHER".into(),
+                    "1".into()
+                ),
+            ]
+        );
+        conn.execute(
+            "DELETE FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*'",
+            [],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            migrate(&conn).unwrap();
+            assert_eq!(conn.query_row::<i64,_,_>("SELECT COUNT(*) FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*'",[],|row|row.get(0)).unwrap(),0);
+            for (key, value) in old {
+                assert_eq!(
+                    conn.query_row::<Vec<u8>, _, _>(
+                        "SELECT CAST(value AS BLOB) FROM metadata WHERE key=?1",
+                        [key],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    value
+                );
+            }
+        }
+    }
+
     use super::*;
+
+    #[tokio::test]
+    async fn fresh_start_owned_v36_failure_rolls_back_then_recovers_and_stays_quiet() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owned-v36.db");
+        let username = "seed-migration@example.invalid";
+        let data =
+            serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"seed-provider"}})).unwrap();
+        let owner =
+            crate::state::db::account::AccountOwner::authenticated(username, "com", &data).unwrap();
+        let receipts = [
+            (
+                "recent_selection_recovery:PrimarySync",
+                b"\0\xffunparseable".as_slice(),
+            ),
+            (
+                "recent_selection_recovery:SharedSync-OTHER",
+                b"{\"version\":99,\"opaque\":true}".as_slice(),
+            ),
+            (
+                "recent_selection_recovery:SharedSync-THIRD",
+                b"exact old receipt\0".as_slice(),
+            ),
+        ];
+        let assert_receipts = |conn: &Connection| {
+            for (key, bytes) in receipts {
+                assert_eq!(
+                    conn.query_row::<Vec<u8>, _, _>(
+                        "SELECT CAST(value AS BLOB) FROM metadata WHERE key=?1",
+                        [key],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    bytes
+                );
+            }
+            if get_schema_version(conn).unwrap() == SCHEMA_VERSION {
+                assert_retired_checkpoint(conn, "sync_token:PrimarySync", "saved-source-cursor");
+            } else {
+                assert_eq!(
+                    conn.query_row::<String, _, _>(
+                        "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    "saved-source-cursor"
+                );
+            }
+        };
+        {
+            let conn = Connection::open(&path).unwrap();
+            for version in 1..=36 {
+                migrate_to_version(&conn, 0, version).unwrap();
+            }
+            conn.execute_batch("CREATE TABLE account_owner(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL,account_key TEXT NOT NULL,provider_key TEXT NOT NULL);").unwrap();
+            conn.execute(
+                "INSERT INTO account_owner VALUES(1,1,?1,?2)",
+                rusqlite::params![
+                    crate::account::namespace(username, "com"),
+                    crate::account::provider_fingerprint("com", "seed-provider")
+                ],
+            )
+            .unwrap();
+            for (key, bytes) in receipts {
+                conn.execute(
+                    "INSERT INTO metadata(key,value) VALUES(?1,?2)",
+                    rusqlite::params![key, bytes],
+                )
+                .unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO metadata(key,value) VALUES('sync_token:PrimarySync','saved-source-cursor');
+                 CREATE TRIGGER fail_second_inventory_seed BEFORE DELETE ON metadata
+                 WHEN OLD.key='sync_token:PrimarySync'
+                 BEGIN SELECT RAISE(FAIL,'fresh-start retirement after preservation'); END;"
+            ).unwrap();
+            assert_eq!(get_schema_version(&conn).unwrap(), 36);
+        }
+        let error = crate::state::SqliteStateDb::open_owned(&path, &owner)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, StateError::BackedUpMigration { .. }),
+            "{error:?}"
+        );
+        assert!(
+            format!("{error:?}").contains("fresh-start retirement after preservation"),
+            "failure must occur during retirement, not before migration: {error:?}"
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(get_schema_version(&conn).unwrap(), 36);
+            assert_receipts(&conn);
+            assert_eq!(conn.query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*'", [], |row| row.get(0)
+            ).unwrap(), 0, "failed retirement must not activate inventory work");
+            conn.execute_batch("DROP TRIGGER fail_second_inventory_seed")
+                .unwrap();
+        }
+        {
+            let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .unwrap();
+            let conn = db.acquire_lock("recovered inventory seeding").unwrap();
+            assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+            assert_receipts(&conn);
+            let requests: Vec<(String, String)> = conn.prepare(
+                "SELECT key,value FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*' ORDER BY key"
+            ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap()
+                .collect::<Result<_, _>>().unwrap();
+            assert!(
+                requests.is_empty(),
+                "historical receipts must not seed current work"
+            );
+            conn.execute(
+                "DELETE FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*'",
+                [],
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .unwrap();
+            let conn = db.acquire_lock("quiet post-seed reopen").unwrap();
+            assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+            assert_receipts(&conn);
+            assert_eq!(conn.query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*'", [], |row| row.get(0)
+            ).unwrap(), 0, "completed requests must not be reseeded");
+        }
+    }
 
     #[tokio::test]
     async fn shadow_v29_migration_failure_rolls_back_then_reopens_without_losing_history() {
@@ -1513,18 +2992,20 @@ mod tests {
                     .await
                     .unwrap()
                     .as_deref(),
-                Some("saved")
+                None
             );
             assert_eq!(
                 db.get_metadata("pending_sync_token:old:PrimarySync")
                     .await
                     .unwrap()
                     .as_deref(),
-                Some("debt")
+                None
             );
             let conn = db
                 .acquire_lock("independent migration recovery facts")
                 .unwrap();
+            assert_retired_checkpoint(&conn, "sync_token:PrimarySync", "saved");
+            assert_retired_checkpoint(&conn, "pending_sync_token:old:PrimarySync", "debt");
             assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
             assert_eq!(
                 conn.query_row::<Vec<u8>, _, _>("SELECT payload FROM future_unknown", [], |row| {
@@ -1602,12 +3083,18 @@ mod tests {
             };
             drop(db);
             for _ in 0..2 {
+                let result = crate::state::SqliteStateDb::open_owned(&path, &owner).await;
+                let diagnostic = format!("{result:?}");
                 assert!(
                     matches!(
-                        crate::state::SqliteStateDb::open_owned(&path, &owner).await,
-                        Err(StateError::ProviderInboxInvalid)
+                        result,
+                        Err(StateError::BackedUpMigration { source, backup })
+                            if (matches!(*source, StateError::ProviderInboxInvalid)
+                                || matches!(&*source, StateError::Migration(rusqlite::Error::SqliteFailure(_, Some(detail)))
+                                    if detail == "no such table: main.provider_shadow_records"))
+                                && backup.join("manifest.json").is_file()
                     ),
-                    "{key}: unsupported identity must refuse migration"
+                    "{key}: unsupported identity must refuse migration: {diagnostic}"
                 );
                 let conn = Connection::open(&path).unwrap();
                 assert_eq!(get_schema_version(&conn).unwrap(), 28, "{key}");
@@ -1693,7 +3180,12 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         for (table, original) in tables.iter().zip(before) {
-            assert_eq!(rows(&conn, table), original, "{table}");
+            if *table == "metadata" {
+                assert!(rows(&conn, table).is_empty());
+                assert_eq!(rows(&conn, "historical_v030_checkpoints"), original);
+            } else {
+                assert_eq!(rows(&conn, table), original, "{table}");
+            }
         }
         for table in [
             "unattributed_legacy",
@@ -1799,15 +3291,7 @@ mod tests {
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
-        assert_eq!(
-            conn.query_row(
-                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
-                [],
-                |r| r.get::<_, String>(0)
-            )
-            .unwrap(),
-            "retained"
-        );
+        assert_retired_checkpoint(&conn, "sync_token:PrimarySync", "retained");
         assert_eq!(
             conn.query_row(
                 "SELECT pending_revision,failed_assets FROM metadata_capture_state",
@@ -1839,7 +3323,7 @@ mod tests {
         )
         .unwrap();
         conn.pragma_update(None, "user_version", 26).unwrap();
-        migrate(&conn).unwrap();
+        migrate_to_version(&conn, 26, 27).unwrap();
         assert_eq!(
             conn.query_row(
                 "SELECT asset_id,next_retry_at FROM metadata_capture_retries",
@@ -1862,24 +3346,8 @@ mod tests {
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
-        assert_eq!(
-            conn.query_row(
-                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-            "before"
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT value FROM metadata WHERE key='unresolved_asset_identity:PrimarySync'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-            "1"
-        );
+        assert_retired_checkpoint(&conn, "sync_token:PrimarySync", "before");
+        assert_retired_checkpoint(&conn, "unresolved_asset_identity:PrimarySync", "1");
         assert_eq!(
             conn.query_row(
                 "SELECT local_path,local_checksum,status FROM assets WHERE id='child'",
@@ -1993,15 +3461,7 @@ mod tests {
         for _ in 0..2 {
             migrate(&conn).unwrap();
             assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
-            assert_eq!(
-                conn.query_row::<String, _, _>(
-                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
-                    [],
-                    |row| row.get(0)
-                )
-                .unwrap(),
-                "old-token"
-            );
+            assert_retired_checkpoint(&conn, "sync_token:PrimarySync", "old-token");
             assert_eq!(
                 conn.query_row::<Vec<u8>, _, _>(
                     "SELECT body FROM independent_native_evidence WHERE path=X'00FF01'",
@@ -2427,7 +3887,7 @@ mod tests {
         // test the gate by setting user_version back to 5 and calling
         // migrate again; then lower to 4 once more to trigger re-entry.
         set_schema_version(&conn, 5).unwrap();
-        migrate(&conn).unwrap();
+        migrate_to_version(&conn, 5, 5).unwrap();
         let tokens: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM metadata WHERE key = 'sync_token:PrimarySync'",
@@ -3425,15 +4885,7 @@ mod tests {
                 2048
             )
         );
-        assert_eq!(
-            conn.query_row(
-                "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-            "preserved-token"
-        );
+        assert_retired_checkpoint(&conn, "sync_token:PrimarySync", "preserved-token");
         assert!(conn.execute("INSERT INTO reconciliation_paths SELECT library, id, version_size, requested_path_key, destination_path_key, destination_path, 'invalid', -1 FROM reconciliation_paths", []).is_err());
     }
 
@@ -3466,15 +4918,7 @@ mod tests {
                 "provider-hash".into()
             )
         );
-        assert_eq!(
-            conn.query_row(
-                "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-            "preserved-token"
-        );
+        assert_retired_checkpoint(&conn, "sync_token:PrimarySync", "preserved-token");
         assert_eq!(
             conn.query_row("SELECT count(*) FROM reconciliation_paths", [], |row| row
                 .get::<_, i64>(
@@ -3528,7 +4972,6 @@ mod tests {
         .unwrap();
         migrate_to_version(&conn, 22, 23).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), 23);
-        migrate(&conn).unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, local_checksum, download_checksum, source_checksum, metadata_write_failed_at \
              FROM asset_metadata_paths ORDER BY id"
@@ -3566,7 +5009,7 @@ mod tests {
                 ("missing".into(), None, None, None, 7),
             ]
         );
-        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(get_schema_version(&conn).unwrap(), 23);
     }
 
     #[test]

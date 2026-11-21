@@ -225,6 +225,7 @@ pub async fn authenticate(
         crate::personality::Mode::Off,
         crate::InputMode::detect(),
         None,
+        AuthPersistence::Writable,
     )
     .await
 }
@@ -251,6 +252,7 @@ pub(crate) async fn authenticate_in_input_mode(
         crate::personality::Mode::Off,
         input_mode,
         None,
+        AuthPersistence::Writable,
     )
     .await
 }
@@ -313,11 +315,18 @@ pub async fn authenticate_with_mode(
         mode,
         crate::InputMode::detect(),
         None,
+        AuthPersistence::Writable,
     )
     .await
 }
 
-/// Authenticate with caller-resolved output and input modes.
+#[derive(Clone, Copy)]
+pub(crate) enum AuthPersistence {
+    Writable,
+    ReadOnly,
+}
+
+/// Authenticate with caller-resolved output, input, and persistence policies.
 #[allow(
     clippy::too_many_arguments,
     reason = "input and personality modes are independent startup policies"
@@ -333,6 +342,7 @@ pub(crate) async fn authenticate_with_modes(
     mode: crate::personality::Mode,
     input_mode: crate::InputMode,
     expected_generation: Option<session::SessionGeneration>,
+    persistence: AuthPersistence,
 ) -> Result<AuthResult> {
     #[cfg(debug_assertions)]
     if std::env::var("KEI_UNSTABLE_FAKE_TWO_FACTOR_REQUIRED_FOR_TESTS").as_deref() == Ok("1") {
@@ -341,6 +351,22 @@ pub(crate) async fn authenticate_with_modes(
     }
 
     let endpoints = Endpoints::for_domain(domain)?;
+    if matches!(persistence, AuthPersistence::ReadOnly) {
+        let session =
+            Session::new_read_only(cookie_dir, apple_id, endpoints.home, timeout_secs).await?;
+        return authenticate_inner(
+            session,
+            &endpoints,
+            apple_id,
+            password_provider,
+            domain,
+            client_id,
+            code,
+            mode,
+            input_mode,
+        )
+        .await;
+    }
     retry_once_after_stale_auth(expected_generation, |generation| {
         let client_id = client_id.clone();
         let endpoints = &endpoints;

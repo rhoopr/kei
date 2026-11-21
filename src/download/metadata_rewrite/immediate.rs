@@ -10,18 +10,22 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Result of metadata writes attempted for one downloaded file.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct MetadataWriteOutcome {
+    pub(in crate::download) embedded_fields: Box<crate::state::types::EmbeddedMetadataFields>,
     pub(super) embed_failed: bool,
     pub(in crate::download) embed_input_changed: bool,
     pub(super) embed_no_write: bool,
     pub(in crate::download) embed_output_fingerprint:
         Option<crate::download::file::ExistingFileFingerprint>,
     pub(super) sidecar_failed: bool,
+    /// A metadata write failed for operational storage reasons (capacity,
+    /// read-only destination, or access denial), not ordinary metadata error.
+    pub(in crate::download) storage_failed: bool,
 }
 
 impl MetadataWriteOutcome {
-    pub(in crate::download) fn any_failed(self) -> bool {
+    pub(in crate::download) fn any_failed(&self) -> bool {
         self.embed_failed || self.sidecar_failed
     }
 }
@@ -63,6 +67,10 @@ pub(in crate::download) async fn write_download_metadata(
 ) -> MetadataWriteOutcome {
     // CONTRACT: METADATA_WRITES_REQUIRE_OPT_IN
     let mut outcome = MetadataWriteOutcome::default();
+    outcome
+        .embedded_fields
+        .as_mut()
+        .clone_from(&request.payload.prior_embedded);
     let mut embed_applied = false;
 
     if request.flags.any_embed()
@@ -75,6 +83,7 @@ pub(in crate::download) async fn write_download_metadata(
         match write_embed_metadata(
             embed_path,
             request.expected_embed_fingerprint,
+            request.source_checksum,
             Arc::clone(&request.payload),
             request.created_local,
             request.flags,
@@ -83,12 +92,17 @@ pub(in crate::download) async fn write_download_metadata(
         )
         .await
         {
-            EmbedWriteResult::Applied(output_fingerprint) => {
+            EmbedWriteResult::Applied(output_fingerprint, fields) => {
+                outcome.embedded_fields = fields;
                 embed_applied = true;
                 outcome.embed_output_fingerprint = output_fingerprint;
             }
             EmbedWriteResult::NoWrite => outcome.embed_no_write = true,
             EmbedWriteResult::Failed => outcome.embed_failed = true,
+            EmbedWriteResult::Storage => {
+                outcome.embed_failed = true;
+                outcome.storage_failed = true;
+            }
             EmbedWriteResult::InputChanged => {
                 outcome.embed_failed = true;
                 outcome.embed_input_changed = true;
@@ -100,7 +114,7 @@ pub(in crate::download) async fn write_download_metadata(
     if request.flags.contains(MetadataFlags::XMP_SIDECAR)
         && let Some(sidecar_path) = request.sidecar_path
     {
-        outcome.sidecar_failed = !write_sidecar_metadata(
+        let sidecar = write_sidecar_metadata(
             sidecar_path,
             Arc::clone(&request.payload),
             request.created_local,
@@ -108,6 +122,8 @@ pub(in crate::download) async fn write_download_metadata(
             request.temp_suffix,
         )
         .await;
+        outcome.sidecar_failed = sidecar.failed;
+        outcome.storage_failed |= sidecar.storage_failed;
     }
 
     if request.flags.any_embed() && request.embed_path.is_some() {

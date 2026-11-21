@@ -51,7 +51,7 @@ async fn grouping_read_failure_keeps_marker_without_writing() {
 
     let pass = run_pending(
         &db,
-        MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR,
+        MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR | MetadataFlags::INCLUDE_PEOPLE,
         Arc::from(".meta-tmp"),
         &CancellationToken::new(),
     )

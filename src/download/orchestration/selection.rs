@@ -297,7 +297,6 @@ pub(super) fn should_record_album_snapshots(
         && !controls.run_mode.is_dry_run()
         && !controls.run_mode.only_print_filenames()
         && config.state_db.is_some()
-        && config.recent.is_none()
         && config.skip_created_before.is_none()
         && passes.iter().any(|pass| {
             pass.kind == crate::commands::PassKind::Album && pass.album.container_id().is_some()

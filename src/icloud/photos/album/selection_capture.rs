@@ -15,7 +15,7 @@ pub(crate) struct RankCapture {
 
 impl RankCapture {
     pub(crate) async fn capture(&self, request: Value, body: Vec<u8>) -> Result<Value> {
-        let response = validated_rank_page(&request, &body)?;
+        let response = validated_selection_page(&request, &body)?;
         self.capture
             .db
             .capture_selection_rank_page(
@@ -68,16 +68,19 @@ fn validate_nested(value: &Value, zone: &Value) -> Result<()> {
 
 /// Validate the entire original page before typed pairing. EOF and query tokens
 /// remain observational telemetry, not snapshot, absence or cursor authority.
-pub(crate) fn validated_rank_page(request: &Value, body: &[u8]) -> Result<Value> {
+pub(crate) fn validated_selection_page(request: &Value, body: &[u8]) -> Result<Value> {
     anyhow::ensure!(
         body.len() <= super::super::inbox::MAX_CHANGES_PAGE_BYTES,
         "Rank page exceeds capture limit"
     );
+    if request.get("zones").is_some() {
+        return super::changes::validated_membership_page(request, body);
+    }
     let zone = request
         .get("zoneID")
         .context("Missing rank request scope")?;
     anyhow::ensure!(
-        zone.get("ownerRecordName").and_then(Value::as_str) == Some("_defaultOwner")
+        super::super::has_explicit_owner(zone.get("ownerRecordName"))
             && zone
                 .get("zoneName")
                 .and_then(Value::as_str)
@@ -104,15 +107,55 @@ pub(crate) fn validated_rank_page(request: &Value, body: &[u8]) -> Result<Value>
     Ok(response)
 }
 
+/// Resolve only a live relation in this exact membership query's owner scope.
+pub(crate) fn selection_membership_child<'a>(
+    record: &'a Value,
+    container: &str,
+    zone: &Value,
+) -> Result<Option<&'a str>> {
+    if record.get("recordType").and_then(Value::as_str) != Some("CPLContainerRelation")
+        || record.get("deleted").and_then(Value::as_bool) == Some(true)
+        || record
+            .pointer("/fields/containerId/value")
+            .and_then(Value::as_str)
+            != Some(container)
+    {
+        return Ok(None);
+    }
+    validate_nested(record, zone)?;
+    Ok(Some(
+        record
+            .pointer("/fields/itemId/value")
+            .and_then(Value::as_str)
+            .filter(|child| !child.trim().is_empty())
+            .context("Missing selected relation child")?,
+    ))
+}
+
 impl PhotoAlbum {
-    /// Independently bound ownership protects old private obligations even if
+    /// Require the complete provider query definition before capturing its
+    /// selection; a display name alone cannot establish smart membership.
+    #[must_use]
+    pub(crate) fn is_supported_smart_folder(&self) -> bool {
+        self.container_id.is_none()
+            && super::super::smart_folders::smart_folders()
+                .iter()
+                .any(|(name, definition)| {
+                    self.name.as_ref() == *name
+                        && self.list_type.as_ref() == definition.list_type
+                        && self.obj_type.as_ref() == definition.obj_type
+                        && self.query_filter == definition.query_filter
+                })
+    }
+
+    /// Independently bound ownership protects admitted obligations even if
     /// the current pass is not an eligible activation selector.
-    pub(crate) fn owned_private_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {
+    pub(crate) fn owned_selection_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {
         let Some((capture, database)) = &self.shadow_capture else {
             return Ok(None);
         };
-        if database.as_ref() != "private"
-            || self.zone_id.get("ownerRecordName").and_then(Value::as_str) != Some("_defaultOwner")
+        if !matches!(database.as_ref(), "private" | "shared")
+            || !super::super::has_explicit_owner(self.zone_id.get("ownerRecordName"))
         {
             return Ok(None);
         }
@@ -123,20 +166,22 @@ impl PhotoAlbum {
         )))
     }
 
-    /// Qualify each member before enabling the whole private pass set. Named
+    /// Qualify each member before enabling the whole scoped pass set. Named
     /// folder predicates are supplied by the provider owner, never invented.
-    pub(crate) fn private_selection_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {
-        let Some(owned) = self.owned_private_scope()? else {
+    pub(crate) fn current_selection_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {
+        let Some(owned) = self.owned_selection_scope()? else {
             return Ok(None);
         };
-        if !self.cross_zone_sources.is_empty() {
+        if !self.cross_zone_sources.is_empty() && self.container_id.is_none() {
             return Ok(None);
         }
+        self.selection_media_sources()?;
         let supported = match self.container_id.as_deref() {
             None => {
-                self.list_type.as_ref() == super::QUERY_ALL_LIST
+                (self.list_type.as_ref() == super::QUERY_ALL_LIST
                     && self.obj_type.as_ref() == super::QUERY_ALL_OBJ
-                    && self.query_filter.is_none()
+                    && self.query_filter.is_none())
+                    || self.is_supported_smart_folder()
             }
             Some(id) => {
                 !id.trim().is_empty()

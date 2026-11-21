@@ -34,7 +34,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use plist::{Dictionary, Value as PlistValue};
 use tokio::process::Command;
 
-use crate::cli::UninstallArgs;
 use crate::service::env::{
     SERVICE_DESCRIPTION, SERVICE_IDENTIFIER, current_executable, effective_uid, purge_kei_state,
 };
@@ -128,13 +127,6 @@ fn user_log_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(LOG_SUBDIR))
 }
 
-/// kei state directory on macOS: `~/.config/kei`, matching linux. Just
-/// re-exports `env::kei_state_dir_dotted` so the macOS uninstall path
-/// reads the same way the Windows one does.
-fn kei_state_dir() -> Option<PathBuf> {
-    crate::service::env::kei_state_dir_dotted()
-}
-
 pub(crate) async fn install_user(plan: InstallPlan, config_path: &Path) -> Result<()> {
     let exe = current_executable()?;
     let home = dirs::home_dir().ok_or_else(|| {
@@ -187,7 +179,7 @@ pub(crate) fn install_system(_plan: InstallPlan, _config_path: &Path) -> Result<
     plan::reject_macos_system_install()
 }
 
-pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
+pub(crate) async fn uninstall(root: Option<&Path>) -> Result<()> {
     let plist_path = user_plist_path().filter(|p| p.exists());
 
     if plist_path.is_none() {
@@ -204,12 +196,9 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
         tracing::info!(path = %path.display(), "removed per-user launchd plist");
     }
 
-    if args.purge {
-        let Some(kei_dir) = kei_state_dir() else {
-            bail!("`--purge` needs $HOME so kei can find its state.");
-        };
+    if let Some(kei_dir) = root {
         let extras: Vec<PathBuf> = user_log_dir().into_iter().collect();
-        purge_kei_state(&kei_dir, &extras)?;
+        purge_kei_state(kei_dir, &extras)?;
     }
 
     Ok(())
@@ -738,21 +727,6 @@ com.rhoopr.kei = {
                 p.display(),
             );
             assert!(p.is_absolute());
-        }
-    }
-
-    #[test]
-    fn kei_state_dir_uses_dotted_config_path() {
-        // Match the rest of kei: ~/.config/kei everywhere, not
-        // ~/Library/Application Support. Regression-guard so a casual
-        // refactor toward dirs::config_dir() doesn't break the macOS
-        // state location.
-        if let Some(p) = kei_state_dir() {
-            assert!(
-                p.ends_with(".config/kei"),
-                "expected ~/.config/kei, got {}",
-                p.display(),
-            );
         }
     }
 

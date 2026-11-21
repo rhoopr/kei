@@ -153,7 +153,6 @@ fn owning_checkpoint_decisions_survive_support_allowlist_without_tokens() {
         CheckpointHoldReason::EnumerationIncomplete,
         CheckpointHoldReason::StateNotDurable,
         CheckpointHoldReason::TokenProofIncomplete,
-        CheckpointHoldReason::LegacyPreservationIncomplete,
     ] {
         let decision = SourceCheckpointDecision::Preserve {
             reason,
@@ -252,6 +251,7 @@ fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
     use crate::types::{FileMatchPolicy, LivePhotoMode, RawPolicy};
     let dir = tempfile::tempdir().unwrap();
     let globals = crate::config::GlobalArgs {
+        config_source: Default::default(),
         username: Some("PRIVATE_USER".into()),
         domain: None,
         data_dir: Some(dir.path().to_string_lossy().into_owned()),
@@ -268,6 +268,50 @@ fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
         Some(&toml),
     )
     .unwrap();
+    assert_eq!(
+        super::runtime_configuration(&config)["include_albums"],
+        false
+    );
+    assert_eq!(
+        super::runtime_configuration(&config)["include_people"],
+        false
+    );
+    assert_eq!(
+        super::runtime_configuration(&config)["set_exif_orientation"],
+        false
+    );
+    config.metadata.set_exif_orientation = true;
+    assert_eq!(
+        super::runtime_configuration(&config)["set_exif_orientation"],
+        true
+    );
+    let orientation_input = config.to_toml();
+    assert_eq!(
+        super::configuration(Some(&orientation_input), true)["set_exif_orientation"],
+        true
+    );
+    #[cfg(feature = "xmp")]
+    {
+        config.metadata.include_albums = true;
+        config.metadata.include_people = true;
+        assert_eq!(
+            super::runtime_configuration(&config)["include_albums"],
+            true
+        );
+        assert_eq!(
+            super::runtime_configuration(&config)["include_people"],
+            true
+        );
+        let input = config.to_toml();
+        assert_eq!(
+            super::configuration(Some(&input), true)["include_albums"],
+            true
+        );
+        assert_eq!(
+            super::configuration(Some(&input), true)["include_people"],
+            true
+        );
+    }
     for (variant, label) in [
         (
             FileMatchPolicy::NameSizeDedupWithSuffix,
@@ -300,8 +344,16 @@ fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
             super::runtime_configuration(&config)["live_photo_mode"],
             label
         );
+        let exclusions = crate::config::MediaExclusion::from_selection(
+            crate::config::MediaSelection::all(),
+            variant,
+        );
+        let names: Vec<_> = exclusions
+            .iter()
+            .map(|kind| format!("{:?}", kind.as_str()))
+            .collect();
         let input: crate::config::TomlConfig =
-            toml::from_str(&format!("[photos]\nlive_photo_mode={label:?}")).unwrap();
+            toml::from_str(&format!("[filters]\nexclude=[{}]", names.join(","))).unwrap();
         assert_eq!(
             super::configuration(Some(&input), true)["live_photo_mode"],
             label
@@ -312,6 +364,14 @@ fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
             .to_string()
             .contains("PRIVATE")
     );
+}
+
+#[test]
+fn bridge_history_rejects_arbitrary_error_text() {
+    let fields =
+        json!({"outcome":"failed", "reason":"PRIVATE provider response", "token":"PRIVATE"});
+    let safe = privacy::diagnostic("support_delta_bridge_v1", fields.as_object().unwrap()).unwrap();
+    assert_eq!(serde_json::Value::Object(safe), json!({"outcome":"failed"}));
 }
 
 #[test]

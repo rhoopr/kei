@@ -24,6 +24,211 @@ pub(super) fn test_config() -> DownloadConfig {
     DownloadConfig::test_default()
 }
 
+pub(super) fn fixture_owner() -> crate::state::db::account::AccountOwner {
+    crate::state::db::account::AccountOwner::authenticated(
+        "bundled-media@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"bundled-media"}})).unwrap(),
+    )
+    .unwrap()
+}
+
+#[derive(Clone)]
+pub(super) struct SelectedMediaSession(pub Arc<Vec<Value>>);
+
+#[async_trait::async_trait]
+impl PhotosSession for SelectedMediaSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        let request: Value = serde_json::from_str(&body)?;
+        if url.contains("/internal/records/query/batch?") {
+            let count = self
+                .0
+                .iter()
+                .filter(|record| record["recordType"] == "CPLMaster")
+                .count();
+            return Ok(
+                json!({"batch":request["batch"].as_array().unwrap().iter().map(|_|json!({"records":[{"fields":{"itemCount":{"value":count}}}]})).collect::<Vec<_>>()}),
+            );
+        }
+        if url.contains("/changes/zone?") {
+            assert_eq!(request["zones"][0]["zoneID"]["zoneName"], "PrimarySync");
+            assert_eq!(
+                request["zones"][0]["zoneID"]["ownerRecordName"],
+                "_defaultOwner"
+            );
+            return Ok(changes_zone_response(
+                self.0.as_ref().clone(),
+                "fixture-token",
+            ));
+        }
+        assert_eq!(request["zoneID"]["zoneName"], "PrimarySync");
+        assert_eq!(request["zoneID"]["ownerRecordName"], "_defaultOwner");
+        if url.contains("/records/lookup?") {
+            let records: Vec<_> = request["records"].as_array().unwrap().iter().map(|wanted| {
+                self.0.iter().find(|record| record["recordName"] == wanted["recordName"])
+                    .cloned().unwrap_or_else(|| json!({"recordName":wanted["recordName"],"serverErrorCode":"NOT_FOUND"}))
+            }).collect();
+            return Ok(json!({"records":records}));
+        }
+        anyhow::ensure!(
+            url.contains("/records/query?"),
+            "Unexpected fixture request"
+        );
+        let start = request["query"]["filterBy"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|filter| filter["fieldName"] == "startRank")
+            .unwrap()["fieldValue"]["value"]
+            .as_u64()
+            .unwrap();
+        let records = if start == 0 {
+            self.0.as_ref().clone()
+        } else {
+            Vec::new()
+        };
+        Ok(json!({"records":records,"syncToken":"fixture-token"}))
+    }
+
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+pub(super) async fn open_fixture_db(path: &Path) -> Arc<SqliteStateDb> {
+    Arc::new(
+        SqliteStateDb::open_owned(path, &fixture_owner())
+            .await
+            .unwrap(),
+    )
+}
+
+/// Establish real current-selection coverage before exercising a later delta.
+pub(super) async fn initialize_empty_selection(db: &Arc<SqliteStateDb>, config: &DownloadConfig) {
+    #[derive(Clone)]
+    struct EmptySelectionSession;
+    #[async_trait::async_trait]
+    impl PhotosSession for EmptySelectionSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/internal/records/query/batch?") {
+                return Ok(json!({"batch":[{"records":[{"fields":{"itemCount":{"value":0}}}]}]}));
+            }
+            anyhow::ensure!(
+                url.contains("/records/query?"),
+                "unexpected initial selection route"
+            );
+            Ok(json!({"records":[],"syncToken":"fixture-initial-cursor"}))
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+    let pass = selected_pass_with_session(db, "", Box::new(EmptySelectionSession));
+    let mut initial = config.clone();
+    initial.sync_mode = SyncMode::Full;
+    let result = super::dispatch::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &[pass],
+        Arc::new(initial),
+        super::models::DownloadControls::download_hidden(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result.outcome, super::models::DownloadOutcome::Success),
+        "{result:?}"
+    );
+    assert_eq!(result.sync_token.as_deref(), Some("fixture-initial-cursor"));
+}
+
+pub(super) fn selected_pass_with_session(
+    db: &Arc<SqliteStateDb>,
+    name: &str,
+    session: Box<dyn PhotosSession>,
+) -> AlbumPass {
+    selected_pass_with_retry_config(db, name, RetryConfig::default(), session)
+}
+
+pub(super) fn selected_smart_pass_with_session(
+    db: &Arc<SqliteStateDb>,
+    name: &str,
+    session: Box<dyn PhotosSession>,
+) -> AlbumPass {
+    let (_, definition) = crate::icloud::photos::smart_folders::smart_folders()
+        .into_iter()
+        .find(|(candidate, _)| *candidate == name)
+        .unwrap();
+    let mut album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(HashMap::new()),
+            service_endpoint: Arc::from("https://fixture.invalid"),
+            name: Arc::from(name),
+            list_type: Arc::from(definition.list_type),
+            obj_type: Arc::from(definition.obj_type),
+            query_filter: definition.query_filter,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        session,
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), fixture_owner(), "com"),
+        Arc::from("private"),
+    );
+    AlbumPass {
+        kind: PassKind::SmartFolder,
+        album,
+        exclude_ids: Arc::new(FxHashSet::default()),
+    }
+}
+
+pub(super) fn selected_pass_with_retry_config(
+    db: &Arc<SqliteStateDb>,
+    name: &str,
+    retry_config: RetryConfig,
+    session: Box<dyn PhotosSession>,
+) -> AlbumPass {
+    let mut album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(HashMap::new()),
+            service_endpoint: Arc::from("https://fixture.invalid"), name: Arc::from(name),
+            list_type: Arc::from(if name.is_empty() { "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted" } else { "CPLContainerRelationLiveByAssetDate" }),
+            obj_type: if name.is_empty() { Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted") } else { Arc::from(format!("CPLContainerRelationNotDeletedByAssetDate:{name}")) },
+            query_filter: (!name.is_empty()).then(|| Arc::new(json!([{"fieldName":"parentId","comparator":"EQUALS","fieldValue":{"type":"STRING","value":name}}]))),
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config, container_id: (!name.is_empty()).then(|| Arc::from(name)), cross_zone_sources: Vec::new(),
+        }, session,
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), fixture_owner(), "com"),
+        Arc::from("private"),
+    );
+    AlbumPass {
+        kind: if name.is_empty() {
+            PassKind::Unfiled
+        } else {
+            PassKind::Album
+        },
+        album,
+        exclude_ids: Arc::new(FxHashSet::default()),
+    }
+}
+
 pub(super) fn retry_test_task(
     asset_id: &str,
     version_size: VersionSizeKey,

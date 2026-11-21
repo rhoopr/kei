@@ -142,12 +142,42 @@ impl Drop for TmpGuard {
 }
 
 pub(in crate::download) struct PreparedMetadataFile {
+    pub(in crate::download) embedded_fields: Box<crate::state::types::EmbeddedMetadataFields>,
     pub(super) guard: TmpGuard,
     pub(super) expected_input: crate::download::file::ExistingFileFingerprint,
     pub(super) expected_output: crate::download::file::ExistingFileFingerprint,
+    pub(super) required_mtime: Option<std::time::SystemTime>,
 }
 
 impl PreparedMetadataFile {
+    pub(in crate::download) async fn require_mtime(
+        mut self,
+        modified: std::time::SystemTime,
+    ) -> Result<Self> {
+        tokio::task::spawn_blocking(move || {
+            let path = std::path::absolute(&self.guard.path)?;
+            let parent = path.parent().context("Metadata output has no parent")?;
+            let confined = crate::fs_util::ConfinedPath::open(
+                parent,
+                &path,
+                crate::fs_util::ConfinedParents::Existing,
+            )?;
+            let file = confined.open_regular()?;
+            let identity = crate::fs_util::file_identity(&file)?;
+            let file = confined.validate_for_metadata(identity)?;
+            file.set_modified(modified)?;
+            anyhow::ensure!(
+                file.metadata()?.modified()? == modified,
+                "Metadata output cannot retain local modification time"
+            );
+            #[cfg(not(windows))]
+            file.sync_all()?;
+            confined.validate_identity(identity)?;
+            self.required_mtime = Some(modified);
+            Ok(self)
+        })
+        .await?
+    }
     pub(in crate::download) fn output_fingerprint(
         &self,
     ) -> crate::download::file::ExistingFileFingerprint {
@@ -158,7 +188,16 @@ impl PreparedMetadataFile {
         self,
         final_path: &Path,
     ) -> Result<crate::download::file::ExistingFileFingerprint> {
-        self.publish_with(final_path, publish_prepared_embed)
+        let modified = self.required_mtime;
+        self.publish_with(final_path, move |temp, target, input, output| {
+            if let Some(modified) = modified {
+                crate::download::file::publish_file_if_unchanged_at_mtime_blocking(
+                    temp, target, input, output, modified,
+                )
+            } else {
+                publish_prepared_embed(temp, target, input, output)
+            }
+        })
     }
 
     pub(super) fn publish_with(
@@ -175,6 +214,8 @@ impl PreparedMetadataFile {
             guard,
             expected_input,
             expected_output,
+            required_mtime: _,
+            embedded_fields: _,
         } = self;
         let temp_path = guard.path.clone();
         if let Err(error) = install(&temp_path, final_path, expected_input, expected_output) {

@@ -16,7 +16,7 @@ pub(crate) fn run_password(
     toml: Option<&config::TomlConfig>,
     input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
-    let (username, _password, domain, cookie_directory) = config::resolve_auth(globals, pw, toml);
+    let (username, _password, domain, cookie_directory) = config::resolve_auth(globals, pw, toml)?;
 
     if username.is_empty() {
         anyhow::bail!(
@@ -28,7 +28,8 @@ pub(crate) fn run_password(
 
     match action {
         cli::PasswordAction::Set => {
-            let input = password_set_input(pw, toml, input_mode)?;
+            let input =
+                password_set_input(pw, toml, input_mode, globals.config_source.recovery_path())?;
             let backend = store.store(input.expose_secret())?;
             println!("Password stored in {} backend.", backend.as_str());
         }
@@ -47,6 +48,7 @@ fn password_set_input(
     pw: &cli::PasswordArgs,
     toml: Option<&config::TomlConfig>,
     input_mode: crate::InputMode,
+    config_path: Option<&std::path::Path>,
 ) -> anyhow::Result<SecretString> {
     let toml_auth = toml.and_then(|config| config.auth.as_ref());
     if let Some(command) = config::resolve_password_command(pw, toml_auth) {
@@ -58,7 +60,9 @@ fn password_set_input(
 
     if !input_mode.can_prompt() {
         anyhow::bail!(
-            "`kei password set` cannot prompt because stdin is not a terminal. Use `kei password --password-file <PATH> set` or `kei password --password-command <COMMAND> set` to provide the password from a safe headless source."
+            "Cannot prompt because stdin is not a terminal. Use `{}` or `{}`.",
+            cli::command_for_config("password --password-file <PATH> set", config_path),
+            cli::command_for_config("password --password-command <COMMAND> set", config_path),
         );
     }
 

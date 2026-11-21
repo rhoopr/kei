@@ -158,17 +158,7 @@ async fn issue_770_recovery_nonempty_source_enumeration_retains_unproven_debt_in
             fixture.config.folder_structure_albums = "old-album".into();
             for _ in 0..2 {
                 fixture.reopen().await;
-                let mut passes = fixture.passes(&kinds);
-                for pass in &mut passes {
-                    pass.album = album_with_session(
-                        "PrimarySync",
-                        &pass.album.name,
-                        Box::new(RecoveryLookupSession {
-                            records: Arc::new(fixture.records.clone()),
-                            enumerate: true,
-                        }),
-                    );
-                }
+                let passes = fixture.passes(&kinds);
                 let result = download_photos_with_sync(
                     &Client::new(),
                     &passes,
@@ -279,7 +269,7 @@ async fn issue_770_seed_records(
     records: Vec<Value>,
 ) -> (DownloadConfig, Vec<Value>, std::path::PathBuf) {
     let db_path = root.path().join("state.db");
-    let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+    let db = super::super::super::test_support::open_fixture_db(&db_path).await;
     let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
     let version = asset
         .versions()
@@ -288,7 +278,7 @@ async fn issue_770_seed_records(
         .unwrap()
         .1
         .clone();
-    let old_path = root.path().join("old-album/pending.jpg");
+    let old_path = root.path().join("old-album").join("pending.jpg");
     db.upsert_seen(
         &TestAssetRecord::new("PENDING")
             .filename("pending.jpg")
@@ -610,11 +600,8 @@ impl RecoveryFixture {
         assert!(ledger.iter().any(|row| row.asset_id.as_ref() == "PENDING"
             && row.requested_path_key.0 == expected_requested_key
             && row.destination_path == destination));
-        let db = Arc::new(
-            SqliteStateDb::open(&root.path().join("state.db"))
-                .await
-                .unwrap(),
-        );
+        let db =
+            super::super::super::test_support::open_fixture_db(&root.path().join("state.db")).await;
         config.state_db = Some(db.clone());
         Self {
             root,
@@ -629,18 +616,41 @@ impl RecoveryFixture {
 
     async fn reopen(&mut self) {
         self.config.state_db = None;
-        self.db = Arc::new(
-            SqliteStateDb::open(&self.root.path().join("state.db"))
-                .await
-                .unwrap(),
-        );
+        self.db =
+            super::super::super::test_support::open_fixture_db(&self.root.path().join("state.db"))
+                .await;
         self.config.state_db = Some(self.db.clone());
     }
 
     fn passes(&self, kinds: &[PassKind]) -> Vec<AlbumPass> {
+        use super::super::super::test_support::{
+            SelectedMediaSession, selected_pass_with_session, selected_smart_pass_with_session,
+        };
+        let mut records = self.records.clone();
+        for record in &mut records {
+            if let Some(reference) = record.pointer_mut("/fields/masterRef/value") {
+                reference["zoneID"]["ownerRecordName"] = json!("_defaultOwner");
+            }
+        }
         kinds
             .iter()
-            .map(|kind| issue_770_pass(*kind, &self.records))
+            .map(|kind| {
+                // This hidden asset is selected only by Hidden. Other queries
+                // must not fabricate additional album or unfiled membership.
+                let selected = if *kind == PassKind::SmartFolder {
+                    records.clone()
+                } else {
+                    Vec::new()
+                };
+                let session = Box::new(SelectedMediaSession(Arc::new(selected)));
+                match kind {
+                    PassKind::SmartFolder => {
+                        selected_smart_pass_with_session(&self.db, "Hidden", session)
+                    }
+                    PassKind::Album => selected_pass_with_session(&self.db, "Album", session),
+                    PassKind::Unfiled => selected_pass_with_session(&self.db, "", session),
+                }
+            })
             .collect()
     }
 
@@ -1001,7 +1011,7 @@ async fn issue_770_recovery_adopts_only_durable_exact_hash_proof_in_every_pass_o
             let adopted = fixture.run(&kinds, CancellationToken::new()).await;
             assert!(
                 matches!(adopted.outcome, DownloadOutcome::Success),
-                "{adopted:?}"
+                "equivalent_root={equivalent_root}, kinds={kinds:?}: {adopted:?}"
             );
             assert_eq!(adopted.stats.downloaded, 0);
             fixture.assert_downloaded(PublicationProof::Adoption).await;
@@ -1941,7 +1951,7 @@ async fn issue_770_recovery_case_equivalent_root_replays_absence_and_durable_pro
 }
 
 #[tokio::test]
-async fn issue_770_recovery_enumerated_cleanup_preserves_required_publication_proof() {
+async fn issue_770_recovery_targeted_cleanup_preserves_required_publication_proof() {
     let server = crate::start_wiremock_or_skip!();
     let fixture = RecoveryFixture::new(&server).await;
     Mock::given(method("GET"))
@@ -1980,41 +1990,32 @@ async fn issue_770_recovery_enumerated_cleanup_preserves_required_publication_pr
         "",
         Box::new(RecoveryLookupSession {
             records: Arc::new(fixture.records.clone()),
-            enumerate: true,
+            enumerate: false,
         }),
     );
-    for mode in [
-        crate::download::CleanupUrlRefresh::Enumerate,
-        crate::download::CleanupUrlRefresh::Lookup,
-    ] {
-        let retry = crate::download::build_retry_download_tasks(
-            &[pass.clone()],
-            &config,
-            &failed,
-            mode,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(retry.tasks.len(), 1);
-        assert_eq!(retry.tasks[0].download_path, failed[0].download_path);
-        assert_eq!(
-            retry.tasks[0].pending_cross_parent_root, failed[0].pending_cross_parent_root,
-            "both cleanup routes must retain the affected task's required publication proof"
-        );
-    }
+    let retry = crate::download::orchestration::url_refresh::refresh_failed_download_urls(
+        &[pass.clone()],
+        &failed,
+        &CancellationToken::new(),
+        None,
+    )
+    .await;
+    assert_eq!(retry.tasks.len(), 1);
+    assert_eq!(retry.tasks[0].download_path, failed[0].download_path);
+    assert_eq!(
+        retry.tasks[0].pending_cross_parent_root, failed[0].pending_cross_parent_root,
+        "targeted cleanup must retain the affected task's required publication proof"
+    );
     // Ordinary failures retain their ordinary finalization policy.
     let mut ordinary = failed.clone();
     ordinary[0].pending_cross_parent_root = None;
-    let retry = crate::download::build_retry_download_tasks(
+    let retry = crate::download::orchestration::url_refresh::refresh_failed_download_urls(
         &[pass.clone()],
-        &config,
         &ordinary,
-        crate::download::CleanupUrlRefresh::Enumerate,
-        CancellationToken::new(),
+        &CancellationToken::new(),
+        None,
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(retry.tasks.len(), 1);
     assert!(retry.tasks[0].pending_cross_parent_root.is_none());
     for changed_size in [false, true] {
@@ -2031,7 +2032,7 @@ async fn issue_770_recovery_enumerated_cleanup_preserves_required_publication_pr
             "",
             Box::new(RecoveryLookupSession {
                 records: Arc::new(records.clone()),
-                enumerate: true,
+                enumerate: false,
             }),
         );
         // Bypass saved-generation reservation refusal to test cleanup's own
@@ -2046,15 +2047,13 @@ async fn issue_770_recovery_enumerated_cleanup_preserves_required_publication_pr
             .unwrap();
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].download_path, failed[0].download_path);
-        let retry = crate::download::build_retry_download_tasks(
+        let retry = crate::download::orchestration::url_refresh::refresh_failed_download_urls(
             &[changed_pass],
-            &fresh_config,
             &failed,
-            crate::download::CleanupUrlRefresh::Enumerate,
-            CancellationToken::new(),
+            &CancellationToken::new(),
+            None,
         )
-        .await
-        .unwrap();
+        .await;
         assert!(
             retry.tasks.is_empty(),
             "old failure cannot authorize changed provider content"

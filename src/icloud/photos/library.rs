@@ -1,9 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
-use base64::Engine;
 use serde_json::{Value, json};
 
 use super::album::{
@@ -14,6 +13,10 @@ use super::queries::encode_params;
 use super::session::PhotosSession;
 use super::smart_folders::smart_folders;
 use crate::icloud::error::ICloudError;
+use crate::state::types::HistoricalSourceState;
+
+const ALBUM_TREE_DEPTH_LIMIT: usize = 64;
+const ALBUM_TREE_RECORD_LIMIT: usize = 12_800;
 
 /// CloudKit zone name for the user's own (non-shared) library. Used as the
 /// fallback when a `zone_id` JSON object lacks `zoneName`, as the backfill
@@ -62,7 +65,7 @@ fn map_library_init_error(error: &anyhow::Error) -> ICloudError {
         // If the 403 truly is persistent ADP, AUTH_ERROR_THRESHOLD in the
         // download pipeline stops the sync rather than spamming retries.
         if http_err.status == 401 || http_err.status == 403 {
-            log_fido_security_key_hint(http_err);
+            log_cloudkit_auth_hint(http_err);
             return ICloudError::SessionExpired {
                 status: http_err.status,
             };
@@ -71,7 +74,7 @@ fn map_library_init_error(error: &anyhow::Error) -> ICloudError {
     ICloudError::Connection(error.to_string())
 }
 
-fn log_fido_security_key_hint(http_err: &crate::icloud::photos::session::HttpStatusError) {
+fn log_cloudkit_auth_hint(http_err: &crate::icloud::photos::session::HttpStatusError) {
     if http_err.status != 401 {
         return;
     }
@@ -80,12 +83,10 @@ fn log_fido_security_key_hint(http_err: &crate::icloud::photos::session::HttpSta
     };
     if body.contains("no auth method found") {
         tracing::warn!(
-            url = %http_err.url,
-            body = %body,
-            "CloudKit 401 'no auth method found' - usually means \
-             FIDO/WebAuthn security keys are on the account (issue \
-             #221). Remove them at Settings > Apple ID & iCloud > \
-             Sign-In & Security > Security Keys."
+            "CloudKit 401 'no auth method found'. Sign in to iCloud.com and check for \
+             updated terms or other account prompts. If you complete a prompt, run \
+             `kei login` again and retry. If your account uses FIDO/WebAuthn security \
+             keys, those are another possible cause (see #221)."
         );
     }
 }
@@ -236,16 +237,156 @@ impl PhotoLibrary {
         super::owner_diagnostic_shape(self.zone_id.get("ownerRecordName"))
     }
 
-    /// Return smart-folder albums plus user-created albums.
-    pub async fn albums(&self) -> anyhow::Result<HashMap<String, PhotoAlbum>> {
-        let mut albums = HashMap::new();
+    pub(crate) fn selection_zone(&self) -> &Value {
+        &self.zone_id
+    }
+
+    pub(crate) fn selection_database(&self) -> &str {
+        &self.library_type
+    }
+
+    /// One exact lookup scoped to this authenticated library. Errors, duplicate
+    /// members and missing scope are inconclusive, never absence evidence.
+    pub(crate) async fn historical_sources(
+        &self,
+        ids: &[String],
+    ) -> Vec<(String, HistoricalSourceState)> {
+        if !super::has_explicit_owner(self.zone_id.get("ownerRecordName"))
+            || self
+                .zone_id
+                .get("zoneName")
+                .and_then(Value::as_str)
+                .is_none()
+        {
+            return Vec::new();
+        }
+        let url = format!(
+            "{}/records/lookup?{}",
+            self.service_endpoint,
+            encode_params(&self.params)
+        );
+        let records: Vec<_> = ids.iter().map(|id| json!({"recordName":id})).collect();
+        let body = json!({"zoneID": self.zone_id.as_ref(), "records":records, "desiredKeys":["isDeleted","isExpunged","dateExpunged"]});
+        let Ok(response) = self
+            .session
+            .post(&url, body.to_string(), &[("Content-type", "text/plain")])
+            .await
+        else {
+            return Vec::new();
+        };
+        let Some(records) = response.get("records").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        if response.get("serverErrorCode").is_some()
+            || records.len() > ids.len()
+            || records.iter().any(|r| {
+                !ids.iter()
+                    .any(|id| Some(id.as_str()) == r["recordName"].as_str())
+            })
+        {
+            return Vec::new();
+        }
+        ids.iter()
+            .filter_map(|id| {
+                let mut matching = records
+                    .iter()
+                    .filter(|r| r["recordName"].as_str() == Some(id));
+                let record = matching.next()?;
+                if matching.next().is_some()
+                    || record.get("serverErrorCode").is_some()
+                    || !matches!(
+                        record["recordType"].as_str(),
+                        Some("CPLAsset" | "CPLMaster")
+                    )
+                    || record.pointer("/zoneID/zoneName") != self.zone_id.get("zoneName")
+                    || record.pointer("/zoneID/ownerRecordName")
+                        != self.zone_id.get("ownerRecordName")
+                {
+                    return None;
+                }
+                let flag = |v: Option<&Value>| match v {
+                    None => Some(false),
+                    Some(Value::Bool(b)) => Some(*b),
+                    Some(n) if n.as_i64() == Some(1) => Some(true),
+                    Some(n) if n.as_i64() == Some(0) => Some(false),
+                    _ => None,
+                };
+                let fields = &record["fields"];
+                let deleted = flag(record.get("deleted"))?
+                    | flag(fields.get("isDeleted").map(|f| &f["value"]))?
+                    | flag(fields.get("isExpunged").map(|f| &f["value"]))?;
+                let state = if deleted {
+                    HistoricalSourceState::Deleted(
+                        fields
+                            .pointer("/dateExpunged/value")
+                            .and_then(Value::as_f64)
+                            .and_then(super::asset::f64_to_millis_datetime),
+                    )
+                } else if fields.is_object() {
+                    HistoricalSourceState::Live
+                } else {
+                    return None;
+                };
+                Some((id.clone(), state))
+            })
+            .collect()
+    }
+
+    /// Only an explicit, exact, same-zone tombstone confirms album deletion.
+    pub(crate) async fn confirms_album_deleted(&self, container: &str) -> anyhow::Result<bool> {
+        let url = format!(
+            "{}/records/lookup?{}",
+            self.service_endpoint,
+            encode_params(&self.params)
+        );
+        let body = json!({"zoneID": self.zone_id.as_ref(), "records":[{"recordName":container}]});
+        let response = super::session::retry_post_allowing_record_errors(
+            self.session.as_ref(),
+            &url,
+            &body.to_string(),
+            &[("Content-type", "text/plain")],
+            &self.retry_config,
+        )
+        .await
+        .response?;
+        let Some(records) = response.get("records").and_then(Value::as_array) else {
+            return Ok(false);
+        };
+        let [record] = records.as_slice() else {
+            return Ok(false);
+        };
+        if response.get("serverErrorCode").is_some()
+            || record.get("serverErrorCode").is_some()
+            || record.get("recordName").and_then(Value::as_str) != Some(container)
+            || record
+                .get("recordType")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "CPLAlbum")
+        {
+            return Ok(false);
+        }
+        if let Some(zone) = record.get("zoneID")
+            && (zone.get("zoneName") != self.zone_id.get("zoneName")
+                || zone.get("ownerRecordName") != self.zone_id.get("ownerRecordName"))
+        {
+            return Ok(false);
+        }
+        Ok(record.get("deleted").and_then(Value::as_bool) == Some(true)
+            || record
+                .pointer("/fields/isDeleted/value")
+                .is_some_and(|value| value == &Value::Bool(true) || value.as_i64() == Some(1)))
+    }
+
+    /// Return smart folders and all same-named user containers, sorted by identity.
+    pub async fn albums(&self) -> anyhow::Result<HashMap<String, Vec<PhotoAlbum>>> {
+        let mut albums: HashMap<String, Vec<PhotoAlbum>> = HashMap::new();
 
         // Smart folders are user-scoped and can include assets from shared
         // zones, so always inject their query definitions for every zone.
         for (name, def) in smart_folders() {
             albums.insert(
                 name.to_string(),
-                PhotoAlbum::new(
+                vec![PhotoAlbum::new(
                     PhotoAlbumConfig {
                         params: Arc::clone(&self.params),
                         service_endpoint: Arc::clone(&self.service_endpoint),
@@ -260,24 +401,24 @@ impl PhotoLibrary {
                         cross_zone_sources: Vec::new(),
                     },
                     self.clone_session(),
-                ),
+                )],
             );
         }
 
         // Shared zones currently skip user-created album folder queries.
         if !is_shared_zone(self.zone_name()) {
             let folders = self.fetch_folders().await?;
+            let by_id: HashMap<_, _> = folders
+                .iter()
+                .map(|folder| (folder.record_name.as_str(), folder))
+                .collect();
             for folder in &folders {
                 let record_name = &folder.record_name;
-                if record_name == ROOT_FOLDER || record_name == PROJECT_ROOT_FOLDER {
-                    continue;
-                }
                 if folder
                     .fields
-                    .get("isDeleted")
-                    .and_then(|f| f.get("value"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
+                    .pointer("/albumType/value")
+                    .and_then(Value::as_i64)
+                    == Some(3)
                 {
                     continue;
                 }
@@ -285,22 +426,40 @@ impl PhotoLibrary {
                 let folder_obj_type =
                     format!("CPLContainerRelationNotDeletedByAssetDate:{record_name}");
 
-                let folder_name = match folder
-                    .fields
-                    .get("albumNameEnc")
-                    .and_then(|f| f.get("value"))
-                    .and_then(Value::as_str)
-                {
-                    Some(enc) => {
-                        let decoded = base64::engine::general_purpose::STANDARD
-                            .decode(enc)
-                            .unwrap_or_default();
-                        let raw_name =
-                            String::from_utf8(decoded).unwrap_or_else(|_| record_name.clone());
-                        crate::download::paths::sanitize_path_component(&raw_name)
+                let mut components = Vec::new();
+                let mut current = folder;
+                loop {
+                    let folder_name = super::enc::album_name(&current.fields).context(
+                        "Provider album has no usable name; discovery remains incomplete",
+                    )?;
+                    components.push(folder_name);
+                    match current
+                        .fields
+                        .pointer("/parentId/value")
+                        .and_then(Value::as_str)
+                    {
+                        None => break,
+                        Some(parent) if parent == ROOT_FOLDER || parent == PROJECT_ROOT_FOLDER => {
+                            break;
+                        }
+                        Some(parent) => {
+                            current = by_id
+                                .get(parent)
+                                .context("Album parent was not discovered")?
+                        }
                     }
-                    None => record_name.clone(),
-                };
+                    anyhow::ensure!(
+                        components.len() <= ALBUM_TREE_DEPTH_LIMIT,
+                        "Album hierarchy depth limit exceeded"
+                    );
+                }
+                components.reverse();
+                let selector_name = components.join("/");
+                let folder_name = components
+                    .iter()
+                    .map(|component| crate::download::paths::sanitize_path_component(component))
+                    .collect::<Vec<_>>()
+                    .join("/");
 
                 let query_filter = Some(Arc::new(json!([{
                     "fieldName": "parentId",
@@ -309,8 +468,7 @@ impl PhotoLibrary {
                 }])));
 
                 let name_arc: Arc<str> = Arc::from(folder_name.as_str());
-                albums.insert(
-                    folder_name,
+                albums.entry(selector_name).or_default().push(
                     PhotoAlbum::new(
                         PhotoAlbumConfig {
                             params: Arc::clone(&self.params),
@@ -326,15 +484,19 @@ impl PhotoLibrary {
                             cross_zone_sources: Vec::new(),
                         },
                         self.clone_session(),
-                    ),
+                    )
+                    .with_selector_components(components),
                 );
             }
         }
 
         if let Some(capture) = &self.shadow_capture {
-            for album in albums.values_mut() {
+            for album in albums.values_mut().flatten() {
                 album.set_shadow_capture(capture.clone(), Arc::clone(&self.library_type));
             }
+        }
+        for entries in albums.values_mut() {
+            entries.sort_by(|left, right| left.container_id().cmp(&right.container_id()));
         }
         Ok(albums)
     }
@@ -363,6 +525,72 @@ impl PhotoLibrary {
     }
 
     async fn fetch_folders(&self) -> anyhow::Result<Vec<super::cloudkit::Record>> {
+        let mut pending = VecDeque::from([(None, 0usize)]);
+        let mut seen = HashSet::new();
+        let mut records = Vec::new();
+        while let Some((parent, depth)) = pending.pop_front() {
+            anyhow::ensure!(
+                depth <= ALBUM_TREE_DEPTH_LIMIT,
+                "Album hierarchy depth limit exceeded"
+            );
+            let page = self.fetch_folder_level(parent.as_deref()).await?;
+            for record in page {
+                if record.record_name == ROOT_FOLDER || record.record_name == PROJECT_ROOT_FOLDER {
+                    continue;
+                }
+                if record.deleted == Some(true)
+                    || record
+                        .fields
+                        .pointer("/isDeleted/value")
+                        .is_some_and(|value| value == &Value::Bool(true) || value == &json!(1))
+                {
+                    continue;
+                }
+                anyhow::ensure!(
+                    record.record_type == "CPLAlbum" && !record.record_name.is_empty(),
+                    "Unexpected album discovery record type"
+                );
+                let observed_parent = match record.fields.get("parentId") {
+                    None => None,
+                    Some(field) => Some(
+                        field
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .context("Malformed album parent")?,
+                    ),
+                };
+                let observed_parent =
+                    observed_parent.filter(|id| *id != ROOT_FOLDER && *id != PROJECT_ROOT_FOLDER);
+                anyhow::ensure!(
+                    observed_parent == parent.as_deref(),
+                    "Album discovery parent mismatch"
+                );
+                anyhow::ensure!(
+                    seen.insert(record.record_name.clone()),
+                    "Repeated album identity in discovery"
+                );
+                anyhow::ensure!(
+                    seen.len() <= ALBUM_TREE_RECORD_LIMIT,
+                    "Album discovery record limit exceeded"
+                );
+                match record.fields.get("albumType") {
+                    None => {}
+                    Some(field) => match field.get("value").and_then(Value::as_i64) {
+                        Some(0) => {}
+                        Some(3) => pending.push_back((Some(record.record_name.clone()), depth + 1)),
+                        _ => anyhow::bail!("Unknown album container type"),
+                    },
+                }
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    async fn fetch_folder_level(
+        &self,
+        parent: Option<&str>,
+    ) -> anyhow::Result<Vec<super::cloudkit::Record>> {
         let url = format!(
             "{}/records/query?{}",
             self.service_endpoint,
@@ -378,16 +606,23 @@ impl PhotoLibrary {
         const FOLDER_PAGE_CAP: usize = 64;
         let mut all_records = Vec::new();
         let mut continuation: Option<String> = None;
+        let mut markers = HashSet::new();
 
         for page in 0..FOLDER_PAGE_CAP {
+            let query = match parent {
+                Some(parent) => {
+                    json!({"recordType":"CPLAlbumByPositionLive","filterBy":[{"fieldName":"parentId","comparator":"EQUALS","fieldValue":{"type":"STRING","value":parent}}]})
+                }
+                None => json!({"recordType":"CPLAlbumByPositionLive"}),
+            };
             let body = match &continuation {
                 Some(marker) => json!({
-                    "query": {"recordType": "CPLAlbumByPositionLive"},
+                    "query": query,
                     "zoneID": &*self.zone_id,
                     "continuationMarker": marker,
                 }),
                 None => json!({
-                    "query": {"recordType": "CPLAlbumByPositionLive"},
+                    "query": query,
                     "zoneID": &*self.zone_id,
                 }),
             };
@@ -401,14 +636,27 @@ impl PhotoLibrary {
             )
             .await?;
 
+            anyhow::ensure!(
+                response.get("records").is_some_and(Value::is_array)
+                    && response.get("serverErrorCode").is_none(),
+                "Album discovery response is incomplete"
+            );
             let query: super::cloudkit::QueryResponse = serde_json::from_value(response)
                 .context("Could not read Apple's library query response")?;
 
             let page_size = query.records.len();
+            anyhow::ensure!(
+                all_records.len() + page_size <= ALBUM_TREE_RECORD_LIMIT,
+                "Album discovery record limit exceeded"
+            );
             all_records.extend(query.records);
 
             match query.continuation_marker {
                 Some(marker) if !marker.is_empty() => {
+                    anyhow::ensure!(
+                        markers.insert(marker.clone()),
+                        "Repeated album discovery continuation marker"
+                    );
                     tracing::debug!(
                         page = page,
                         page_size,
@@ -421,20 +669,7 @@ impl PhotoLibrary {
             }
         }
 
-        // Fell through the cap with the marker still set. Surface loudly
-        // so a regression that loosens the cap or a server pathology is
-        // visible in routine logs. Return what we have rather than an
-        // Err — partial results are more useful than a hard failure on
-        // the album-discovery path, and downstream consumers
-        // (`pick_album_names`) already bail loudly on missing names.
-        tracing::warn!(
-            cap = FOLDER_PAGE_CAP,
-            running_total = all_records.len(),
-            "fetch_folders: hit pagination cap with more pages still indicated; \
-             returning truncated album list. If you genuinely have >12,000 albums \
-             please file an issue."
-        );
-        Ok(all_records)
+        anyhow::bail!("Album discovery pagination limit exceeded")
     }
 
     /// Returns the zone name (e.g., "`PrimarySync`", "SharedSync-{UUID}").
@@ -493,6 +728,7 @@ impl PhotoLibrary {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine;
     use serde_json::json;
 
     use super::*;
@@ -872,11 +1108,7 @@ mod tests {
         );
     }
 
-    /// Stub that returns HTTP 401 with a CloudKit "no auth method found" body.
-    /// This is the FIDO-account failure mode from issue #221 when the SRP-side
-    /// up-front detection has been bypassed (e.g. Apple drops the
-    /// `fsaChallenge` field in a future flow).
-    struct NoAuthMethodFoundSession;
+    struct NoAuthMethodFoundSession(u16);
 
     #[async_trait::async_trait]
     impl PhotosSession for NoAuthMethodFoundSession {
@@ -887,33 +1119,28 @@ mod tests {
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
             Err(crate::icloud::photos::session::HttpStatusError {
-                status: 401,
-                url: "https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query".into(),
+                status: self.0,
+                url: "https://example.com/private-url-marker".into(),
                 retry_after: None,
                 body: Some(
-                    r#"{"serverErrorCode":"AUTHENTICATION_FAILED","reason":"no auth method found"}"#
+                    r#"{"serverErrorCode":"AUTHENTICATION_FAILED","reason":"no auth method found","requestId":"private-body-marker"}"#
                         .into(),
                 ),
             }.into())
         }
 
         fn clone_box(&self) -> Box<dyn PhotosSession> {
-            Box::new(NoAuthMethodFoundSession)
+            Box::new(NoAuthMethodFoundSession(self.0))
         }
     }
 
-    /// Even when the CloudKit 401 body identifies a FIDO-class failure, the
-    /// mapping still routes to `SessionExpired` so the existing `sync_loop`
-    /// re-auth path runs (capped by `AUTH_ERROR_THRESHOLD`). The up-front
-    /// detection in `auth/srp.rs` is the primary fix; this test pins the
-    /// belt-and-suspenders behavior so a future refactor doesn't silently
-    /// stop producing the warning or change the retry contract.
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn http_401_no_auth_method_found_still_maps_to_session_expired() {
         let err = PhotoLibrary::new(
             "https://example.com".into(),
             Arc::new(HashMap::new()),
-            Box::new(NoAuthMethodFoundSession),
+            Box::new(NoAuthMethodFoundSession(401)),
             Arc::new(json!({"zoneName": "PrimarySync"})),
             "private".into(),
             RetryConfig {
@@ -926,22 +1153,29 @@ mod tests {
 
         assert!(
             matches!(err, ICloudError::SessionExpired { status: 401 }),
-            "FIDO-class 401 bodies must still route to SessionExpired so \
-             AUTH_ERROR_THRESHOLD in sync_loop bounds the re-auth loop, got: {err:?}"
+            "the hint must preserve session recovery, got: {err:?}"
         );
+        assert!(logs_contain("no auth method found"));
+        assert!(logs_contain(
+            "Sign in to iCloud.com and check for updated terms"
+        ));
+        assert!(logs_contain(
+            "If you complete a prompt, run `kei login` again"
+        ));
+        assert!(logs_contain(
+            "If your account uses FIDO/WebAuthn security keys"
+        ));
+        assert!(!logs_contain("private-body-marker"));
+        assert!(!logs_contain("private-url-marker"));
     }
 
-    /// When the 401 body contains "no auth method found", the mapping must
-    /// emit a WARN naming security keys as the likely cause and pointing
-    /// at issue #221. This is the defense-in-depth hint that fires if a
-    /// future Apple flow change bypasses the SRP-level FIDO detection.
     #[tracing_test::traced_test]
     #[tokio::test]
-    async fn http_401_no_auth_method_found_logs_security_key_hint() {
-        let _err = PhotoLibrary::new(
+    async fn http_403_no_auth_method_found_does_not_log_auth_hint() {
+        let err = PhotoLibrary::new(
             "https://example.com".into(),
             Arc::new(HashMap::new()),
-            Box::new(NoAuthMethodFoundSession),
+            Box::new(NoAuthMethodFoundSession(403)),
             Arc::new(json!({"zoneName": "PrimarySync"})),
             "private".into(),
             RetryConfig {
@@ -952,30 +1186,14 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(
-            logs_contain("no auth method found"),
-            "WARN must quote the CloudKit signal so reporters can grep for it"
-        );
-        assert!(
-            logs_contain("FIDO/WebAuthn security keys"),
-            "WARN must name FIDO/WebAuthn as the likely cause"
-        );
-        assert!(
-            logs_contain("#221"),
-            "WARN must link to the tracking issue so the user can find context"
-        );
-        assert!(
-            logs_contain("Sign-In & Security"),
-            "WARN must include the settings path to remove the keys"
-        );
+        assert!(matches!(err, ICloudError::SessionExpired { status: 403 }));
+        assert!(!logs_contain("Sign in to iCloud.com"));
+        assert!(!logs_contain("security keys"));
     }
 
-    /// A plain 401 without the "no auth method found" signal must NOT
-    /// emit the FIDO hint — that would confuse users whose session is
-    /// stale for ordinary reasons (expired trust token, rotated cookies).
     #[tracing_test::traced_test]
     #[tokio::test]
-    async fn http_401_without_fido_body_does_not_log_security_key_hint() {
+    async fn http_401_without_matching_body_does_not_log_auth_hint() {
         let _err = PhotoLibrary::new(
             "https://example.com".into(),
             Arc::new(HashMap::new()),
@@ -990,14 +1208,8 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(
-            !logs_contain("FIDO/WebAuthn security keys"),
-            "ordinary stale-session 401 must not trigger the FIDO hint"
-        );
-        assert!(
-            !logs_contain("Sign-In & Security"),
-            "only 'no auth method found' bodies should produce the settings hint"
-        );
+        assert!(!logs_contain("Sign in to iCloud.com"));
+        assert!(!logs_contain("security keys"));
     }
 
     /// Stub that returns HTTP 421, the signature of a misdirected CloudKit
@@ -1063,15 +1275,16 @@ mod tests {
     /// successive POSTs and records every body it received. Used to
     /// exercise the pagination loop in `fetch_folders` without a real
     /// HTTP server.
+    #[derive(Clone)]
     struct PaginatingFolderSession {
-        responses: std::sync::Mutex<Vec<Value>>,
+        responses: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
         received_bodies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl PaginatingFolderSession {
         fn new(responses: Vec<Value>) -> Self {
             Self {
-                responses: std::sync::Mutex::new(responses),
+                responses: std::sync::Arc::new(std::sync::Mutex::new(responses)),
                 received_bodies: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
@@ -1098,12 +1311,64 @@ mod tests {
         }
 
         fn clone_box(&self) -> Box<dyn PhotosSession> {
-            unimplemented!(
-                "PaginatingFolderSession::clone_box is not exercised by \
-                 fetch_folders; if a future test needs it, share Arcs over \
-                 the response queue and body log"
-            )
+            Box::new(self.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn album_discovery_refuses_untrustworthy_names_and_preserves_duplicate_leaves() {
+        for fields in [
+            json!({}),
+            json!({"albumNameEnc": {"value": "not base64"}}),
+            json!({"albumNameEnc": {"type": "STRING", "value": "   "}}),
+        ] {
+            let lib = make_library_with_session(Box::new(PaginatingFolderSession::new(vec![
+                json!({"records": [{"recordName": "private-id", "recordType": "CPLAlbum", "fields": fields}]}),
+            ])));
+            let error = match lib.albums().await {
+                Ok(_) => panic!("invalid name accepted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("no usable name"));
+            assert!(!error.to_string().contains("private-id"));
+        }
+        for names in [
+            ["Trip", "Trip"],
+            ["Trip/Day", "Trip\\Day"],
+            ["Videos", "Other"],
+        ] {
+            let records: Vec<Value> = names
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    json!({"recordName": format!("private-{i}"), "recordType": "CPLAlbum",
+                        "fields": {"albumName": {"value": name}}})
+                })
+                .collect();
+            let lib = make_library_with_session(Box::new(PaginatingFolderSession::new(vec![
+                json!({"records": records}),
+            ])));
+            let albums = lib.albums().await.unwrap();
+            let selected: Vec<_> = albums
+                .values()
+                .flatten()
+                .filter_map(PhotoAlbum::container_id)
+                .collect();
+            assert_eq!(selected.len(), 2);
+            assert!(selected.contains(&"private-0"));
+            assert!(selected.contains(&"private-1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn album_discovery_accepts_plain_name_without_identifier_fallback() {
+        let lib = make_library_with_session(Box::new(PaginatingFolderSession::new(vec![
+            json!({"records": [{"recordName": "private-id", "recordType": "CPLAlbum",
+                "fields": {"albumNameEnc": {"value": "malformed"}, "albumName": {"value": "Trip"}}}]}),
+        ])));
+        let albums = lib.albums().await.unwrap();
+        assert_eq!(albums["Trip"][0].container_id(), Some("private-id"));
+        assert!(!albums.contains_key("private-id"));
     }
 
     fn make_folder_records(count: usize, prefix: &str) -> Vec<Value> {
@@ -1137,6 +1402,194 @@ mod tests {
                 max_retries: 0,
                 ..RetryConfig::default()
             },
+        }
+    }
+
+    fn hierarchy_record(id: &str, kind: i64, parent: Option<&str>) -> Value {
+        let mut record = json!({"recordName":id,"recordType":"CPLAlbum","fields":{"albumType":{"type":"INT64","value":kind}}});
+        if let Some(parent) = parent {
+            record["fields"]["parentId"] = json!({"type":"STRING","value":parent});
+        }
+        record
+    }
+
+    #[tokio::test]
+    async fn historical_deletion_check_requires_exact_scoped_evidence() {
+        let zone = json!({"zoneName":"PrimarySync", "ownerRecordName":"owner"});
+        let exact =
+            json!({"recordType":"CPLMaster","recordName":"old","deleted":true,"zoneID":zone});
+        for response in [
+            json!({"records":[exact.clone(), exact.clone()]}),
+            json!({"serverErrorCode":"BAD_REQUEST", "records":[exact.clone()]}),
+            json!({"records":[{"recordName":"old","serverErrorCode":"UNKNOWN_ITEM"}]}),
+            json!({"records":[{"recordName":"old","recordType":"CPLAsset","deleted":true}]}),
+            json!({"records":[{"recordName":"old","recordType":"CPLAsset","deleted":true,"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"foreign"}}]}),
+            json!({"records":[{"recordName":"old","recordType":"CPLAlbum","deleted":true,"zoneID":zone}]}),
+            json!({"records":[{"recordName":"old","recordType":"CPLAsset","zoneID":zone,"fields":{"isDeleted":{"value":"unknown"}}}]}),
+        ] {
+            let mut library =
+                make_library_with_session(Box::new(PaginatingFolderSession::new(vec![response])));
+            library.zone_id = Arc::new(zone.clone());
+            assert!(
+                library
+                    .historical_sources(&["old".into(), "omitted".into()])
+                    .await
+                    .is_empty()
+            );
+        }
+        let session = PaginatingFolderSession::new(vec![
+            json!({"records":[exact,{"recordName":"live","recordType":"CPLAsset","zoneID":zone,"fields":{}}]}),
+        ]);
+        let mut library = make_library_with_session(Box::new(session));
+        library.zone_id = Arc::new(zone);
+        let confirmed = library
+            .historical_sources(&["old".into(), "live".into()])
+            .await;
+        assert!(matches!(
+            confirmed.as_slice(),
+            [
+                (_, HistoricalSourceState::Deleted(None)),
+                (_, HistoricalSourceState::Live)
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn album_deletion_lookup_requires_exact_tombstone() {
+        for (record, expected) in [
+            (
+                json!({"recordName":"bound","recordType":"CPLAlbum","deleted":true}),
+                true,
+            ),
+            (
+                json!({"recordName":"bound","recordType":"CPLAlbum","fields":{"isDeleted":{"value":1}}}),
+                true,
+            ),
+            (
+                json!({"recordName":"bound","serverErrorCode":"UNKNOWN_ITEM"}),
+                false,
+            ),
+            (
+                json!({"recordName":"other","recordType":"CPLAlbum","deleted":true}),
+                false,
+            ),
+            (
+                json!({"recordName":"bound","recordType":"CPLAsset","deleted":true}),
+                false,
+            ),
+            (
+                json!({"recordName":"bound","recordType":"CPLAlbum","deleted":true,"zoneID":{"zoneName":"Other"}}),
+                false,
+            ),
+            (json!({"recordName":"bound","recordType":"CPLAlbum"}), false),
+        ] {
+            let session = PaginatingFolderSession::new(vec![json!({"records":[record]})]);
+            let log = session.body_log();
+            let library = make_library_with_session(Box::new(session));
+            assert_eq!(
+                library.confirms_album_deleted("bound").await.unwrap(),
+                expected
+            );
+            let request: Value = serde_json::from_str(&log.lock().unwrap()[0]).unwrap();
+            assert_eq!(request["zoneID"], *library.zone_id);
+            assert_eq!(request["records"], json!([{"recordName":"bound"}]));
+        }
+        let library = make_library_with_session(Box::new(PaginatingFolderSession::new(vec![
+            json!({"records":[]}),
+        ])));
+        assert!(!library.confirms_album_deleted("bound").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn fetch_folders_breadth_first_preserves_zone_and_parent_across_pages() {
+        let session = PaginatingFolderSession::new(vec![
+            json!({"records":[hierarchy_record("folder-a",3,None),hierarchy_record("folder-b",3,None)]}),
+            json!({"records":[hierarchy_record("album-a",0,Some("folder-a"))],"continuationMarker":"next"}),
+            json!({"records":[hierarchy_record("album-a2",0,Some("folder-a"))]}),
+            json!({"records":[hierarchy_record("album-b",0,Some("folder-b"))]}),
+        ]);
+        let log = session.body_log();
+        let mut library = make_library_with_session(Box::new(session));
+        library.zone_id = Arc::new(
+            json!({"zoneName":"PrimarySync","ownerRecordName":"synthetic-owner","zoneType":"REGULAR_CUSTOM_ZONE"}),
+        );
+        assert_eq!(library.fetch_folders().await.unwrap().len(), 5);
+        let requests: Vec<Value> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| serde_json::from_str(body).unwrap())
+            .collect();
+        assert_eq!(requests.len(), 4);
+        for request in &requests {
+            assert_eq!(request["zoneID"], *library.zone_id);
+        }
+        assert!(requests[0]["query"].get("filterBy").is_none());
+        assert_eq!(
+            requests[1]["query"]["filterBy"][0]["fieldValue"]["value"],
+            "folder-a"
+        );
+        assert_eq!(requests[1]["query"], requests[2]["query"]);
+        assert_eq!(requests[2]["continuationMarker"], "next");
+        assert_eq!(
+            requests[3]["query"]["filterBy"][0]["fieldValue"]["value"],
+            "folder-b"
+        );
+        assert!(requests[3].get("continuationMarker").is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_folders_bounds_depth_and_record_count() {
+        let responses = (0..=ALBUM_TREE_DEPTH_LIMIT)
+            .map(|depth| {
+                let id = format!("folder-{depth}");
+                let parent = depth.checked_sub(1).map(|value| format!("folder-{value}"));
+                json!({"records":[hierarchy_record(&id,3,parent.as_deref())]})
+            })
+            .collect();
+        let session = PaginatingFolderSession::new(responses);
+        let log = session.body_log();
+        let library = make_library_with_session(Box::new(session));
+        assert!(
+            library
+                .fetch_folders()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("depth limit")
+        );
+        assert_eq!(log.lock().unwrap().len(), ALBUM_TREE_DEPTH_LIMIT + 1);
+        let library = make_library_with_session(Box::new(PaginatingFolderSession::new(vec![
+            json!({"records":make_folder_records(ALBUM_TREE_RECORD_LIMIT + 1,"bounded")}),
+        ])));
+        assert!(
+            library
+                .fetch_folders()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("record limit")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_folders_refuses_cycles_unknown_types_and_incomplete_responses() {
+        for responses in [
+            vec![
+                json!({"records":[hierarchy_record("folder-a",3,None)]}),
+                json!({"records":[hierarchy_record("folder-a",3,Some("folder-a"))]}),
+            ],
+            vec![json!({"records":[hierarchy_record("album",0,Some("missing-parent"))]})],
+            vec![json!({"records":[hierarchy_record("unknown",17,None)]})],
+            vec![json!({"serverErrorCode":"UNKNOWN_ERROR"})],
+            vec![
+                json!({"records":[],"continuationMarker":"same"}),
+                json!({"records":[],"continuationMarker":"same"}),
+            ],
+        ] {
+            let library =
+                make_library_with_session(Box::new(PaginatingFolderSession::new(responses)));
+            assert!(library.fetch_folders().await.is_err());
         }
     }
 
@@ -1202,10 +1655,7 @@ mod tests {
 
     /// CF-1 defensive cap: if the server keeps returning a marker forever
     /// (server bug or pathological account), fetch_folders must bail
-    /// rather than loop unbounded. The cap and warn message are part of
-    /// the contract — a future refactor that drops them would silently
-    /// allow infinite loops.
-    #[tracing_test::traced_test]
+    /// rather than return a partial tree or loop unbounded.
     #[tokio::test]
     async fn fetch_folders_caps_iteration_when_continuation_never_clears() {
         // Far more responses than the cap; every one carries a marker.
@@ -1220,17 +1670,13 @@ mod tests {
         let body_log = session.body_log();
         let lib = make_library_with_session(Box::new(session));
 
-        let _ = lib.fetch_folders().await;
+        let error = lib.fetch_folders().await.unwrap_err();
+        assert!(error.to_string().contains("pagination limit"));
 
         let post_count = body_log.lock().unwrap().len();
         assert!(
             post_count <= 64,
             "fetch_folders must stop within the documented cap; made {post_count} POSTs"
-        );
-        assert!(
-            logs_contain("fetch_folders") && logs_contain("cap"),
-            "the cap-fired event must surface in logs so a future regression \
-             that silently loosens the cap is loud"
         );
     }
 }

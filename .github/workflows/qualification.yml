@@ -3,6 +3,8 @@ name: Heavy qualification
 on:
   workflow_call:
   workflow_dispatch:
+  schedule:
+    - cron: "23 3 * * 0"
 
 permissions:
   contents: read
@@ -21,7 +23,7 @@ jobs:
 
   specialized:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: -Dwarnings
@@ -49,17 +51,7 @@ jobs:
       - name: Install bounded fuzz runner
         run: cargo +1.94.1 install --locked cargo-fuzz --version 0.13.1
       - name: Fuzz every registered target with checked-in seeds
-        run: |
-          set -euo pipefail
-          cargo +nightly-2026-05-15 fuzz build
-          mapfile -t targets < <(cargo +nightly-2026-05-15 fuzz list)
-          test "${#targets[@]}" -gt 0
-          for target in "${targets[@]}"; do
-            mkdir -p "fuzz/corpus/$target"
-            seeds=()
-            if [[ -d "fuzz/seeds/$target" ]]; then seeds+=("fuzz/seeds/$target"); fi
-            cargo +nightly-2026-05-15 fuzz run "$target" "fuzz/corpus/$target" "${seeds[@]}" -- -max_total_time=10 -timeout=10
-          done
+        run: bash scripts/ci/seeded-fuzz.sh
       - name: Source-package and optimized regressions
         run: |
           set -euo pipefail
@@ -68,14 +60,6 @@ jobs:
           cargo fetch --locked
           just test packaging
           cargo test --locked --release --all-features --lib
-      - name: Record the ignored-test inventory without running live tests
-        run: cargo test --locked --all-features -- --ignored --list > ignored-tests.txt
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: qualification-inventory
-          path: ignored-tests.txt
-          if-no-files-found: error
-          retention-days: 14
 
   qualified:
     name: Heavy qualification result

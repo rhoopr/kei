@@ -123,6 +123,27 @@ pub(super) async fn include_pending_local_work(
             .primary_layout_operations(zone.to_owned())
             .await
             .map_or(true, |rows| !rows.is_empty());
+        if identity_pending
+            && zone == crate::icloud::photos::PRIMARY_ZONE_NAME
+            && !library.plan.passes.is_empty()
+        {
+            match download::sparse_target::due_primary_links(db).await {
+                Ok(links) => {
+                    for target in library_states {
+                        if target.plan.passes.first().is_some_and(|pass| {
+                            links
+                                .iter()
+                                .any(|link| pass.album.sparse_link_matches(link))
+                        }) {
+                            local_work_zones.insert(target.zone_name.clone());
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Could not inspect sparse target dependencies before watch pre-check")
+                }
+            }
+        }
         let retained_checkpoint_pending = match db
             .get_metadata(&format!(
                 "{}{zone}",
@@ -171,26 +192,45 @@ pub(super) async fn include_pending_provider_work(
             Arc::from(library.zone_name.as_str()),
         );
         let pending = match async {
-            if download::recent_selection_requires_recovery(
-                &library.plan.passes,
-                &config,
-                &library.sync_token_key,
-            )
-            .await?
+            if library.plan.passes.is_empty() && !library.deleted_album_bindings.is_empty() {
+                let Some((capture, scope, _)) = library.library.all().current_selection_scope()?
+                else {
+                    return Ok(true);
+                };
+                let Some(selection_config) = config.enum_config_hash.as_deref() else {
+                    return Ok(true);
+                };
+                let deleted = capture
+                    .db
+                    .pending_deleted_membership_containers(
+                        capture.owner,
+                        scope,
+                        selection_config.to_owned(),
+                    )
+                    .await?;
+                return Ok(deleted.iter().any(|container| {
+                    library
+                        .deleted_album_bindings
+                        .iter()
+                        .any(|binding| binding.container_id == *container)
+                }));
+            }
+            if !library.plan.passes.is_empty()
+                && let Some(db) = &config.state_db
+                && db
+                    .get_metadata(&crate::sync_cycle::inventory_reconciliation_key(
+                        &library.zone_name,
+                    ))
+                    .await?
+                    .is_some()
             {
                 return Ok(true);
             }
-            async {
-                let retained =
-                    download::has_due_retained_work(&library.plan.passes, &config, controls)
-                        .await?;
-                let selected =
-                    download::has_due_selection_work(&library.plan.passes, &config, controls)
-                        .await?
-                        .unwrap_or(false);
-                Ok::<_, anyhow::Error>(retained || selected)
-            }
-            .await
+            Ok::<_, anyhow::Error>(
+                download::has_due_selection_work(&library.plan.passes, &config, controls)
+                    .await?
+                    .unwrap_or(false),
+            )
         }
         .await
         {

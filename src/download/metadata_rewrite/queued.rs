@@ -84,6 +84,10 @@ pub(in crate::download) struct RewritePass {
     pub(in crate::download) fetched: usize,
     pub(in crate::download) applied: usize,
     pub(in crate::download) failed: usize,
+    /// At least one local destination rejected metadata work for operational
+    /// storage reasons (capacity, read-only mount, or access denial). Ordinary
+    /// retryable metadata failures do not set this flag.
+    pub(in crate::download) storage_failed: bool,
     pub(in crate::download) retired_from_selected_queue: usize,
 }
 
@@ -174,14 +178,14 @@ where
             };
         }
     };
-    run_pending_rows(
+    Box::pin(run_pending_rows(
         db,
         metadata_flags,
         capture_timestamp_repair,
         temp_suffix,
         shutdown_token,
         pending,
-    )
+    ))
     .await
 }
 
@@ -212,9 +216,8 @@ where
     let needs_groupings = metadata_flags.uses_xmp_groupings()
         || pending.iter().any(|row| {
             row.selection_receipt.as_ref().is_some_and(|receipt| {
-                receipt.metadata_flags
-                    & (MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR).bits()
-                    != 0
+                MetadataFlags::from_bits(receipt.metadata_flags)
+                    .is_some_and(MetadataFlags::uses_xmp_groupings)
             })
         });
     let (groupings_by_library, grouping_read_failures) = if needs_groupings {
@@ -234,8 +237,28 @@ where
     let mut skipped_unverified = 0usize;
     let mut errored = 0usize;
     let mut deferred = 0usize;
+    let mut storage_failed = false;
     let mut retired_from_selected_queue = 0usize;
     for (idx, pending_rewrite) in pending.into_iter().enumerate() {
+        if storage_failed {
+            deferred += pending_count - idx;
+            tracing::warn!(
+                target: "kei::download::metadata_rewrite",
+                remaining = pending_count - idx,
+                "Operational storage failure; deferring remaining metadata rewrites"
+            );
+            break;
+        }
+        // Selected destinations already carry an exact prepared-output receipt.
+        // Use that publication owner for an explicitly requested timestamp
+        // rewrite rather than requiring a second legacy repair receipt.
+        let selected_queue = if pending_rewrite.selection_receipt.is_some()
+            && pending_rewrite.capture_repair_receipt.is_none()
+        {
+            MetadataRewriteQueue::Ordinary
+        } else {
+            selected_queue
+        };
         let record = &pending_rewrite.asset;
         let metadata_flags = if let Some(receipt) = &pending_rewrite.selection_receipt {
             let Some(flags) = MetadataFlags::from_bits(receipt.metadata_flags) else {
@@ -248,7 +271,9 @@ where
                 deferred += 1;
                 continue;
             }
-            if !cfg!(feature = "xmp") && flags.uses_xmp_groupings() {
+            if !cfg!(feature = "xmp")
+                && flags.intersects(MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR)
+            {
                 deferred += 1;
                 continue;
             }
@@ -293,6 +318,7 @@ where
         if let Err(error) = crate::download::file::recover_metadata_replacements(&path).await {
             tracing::warn!(path = %path.display(), error = %format!("{error:#}"),
                 "Could not recover metadata replacement; leaving marker for retry");
+            storage_failed |= super::is_operational_storage_error(&error);
             errored += 1;
             continue;
         }
@@ -313,6 +339,7 @@ where
                     error = %e,
                     "Could not stat file for metadata rewrite; skipping"
                 );
+                storage_failed |= super::is_operational_storage_io(&e);
                 skipped_missing += 1;
                 continue;
             }
@@ -331,14 +358,93 @@ where
             continue;
         }
 
-        let payload = Arc::new(
-            groupings_by_library
-                .get(record.library.as_ref())
-                .map_or_else(
-                    || MetadataPayload::from_metadata(&record.metadata),
-                    |groupings| groupings.metadata_payload(&record.id, &record.metadata),
-                ),
-        );
+        let mut payload = groupings_by_library
+            .get(record.library.as_ref())
+            .map_or_else(
+                || MetadataPayload::from_metadata(&record.metadata),
+                |groupings| {
+                    groupings.metadata_payload(&record.id, &record.metadata, metadata_flags)
+                },
+            );
+        if metadata_flags.contains(MetadataFlags::ORIENTATION) {
+            payload.original_orientation = crate::icloud::photos::metadata::original_orientation(
+                &record.metadata,
+                record.version_size,
+                &record.checksum,
+            );
+        }
+        let ownership = match db
+            .embedded_metadata_receipt(
+                &record.library,
+                &record.id,
+                record.version_size.as_str(),
+                &path,
+                Some(&pending_rewrite),
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                tracing::warn!(%error, "Could not read embedded field ownership");
+                errored += 1;
+                continue;
+            }
+        };
+        let mut field_recovery_checksum = None;
+        let mut field_recovery_size = None;
+        if let Some(receipt) = ownership {
+            let measured = if !receipt.published {
+                crate::download::file::fingerprint_regular_file(&path)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            let measured_checksum = measured.map(fingerprint_checksum);
+            let current = measured_checksum
+                .as_deref()
+                .or(record.local_checksum.as_deref());
+            if !receipt.published
+                && current == Some(receipt.output_checksum.as_str())
+                && pending_rewrite.capture_repair_receipt.is_none()
+            {
+                if let Some(preserved) = pending_rewrite
+                    .selection_receipt
+                    .as_ref()
+                    .and_then(|r| r.preserved_local.as_ref())
+                {
+                    let modified = tokio::fs::metadata(&path)
+                        .await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .map(chrono::DateTime::<chrono::Utc>::from);
+                    if modified != preserved.modified {
+                        skipped_drifted += 1;
+                        continue;
+                    }
+                }
+                let Some(measured) = measured else {
+                    errored += 1;
+                    continue;
+                };
+                if let Err(error) = db
+                    .recover_embedded_metadata_receipt(&pending_rewrite, &receipt, measured.size)
+                    .await
+                {
+                    tracing::warn!(%error, "Could not finalize previous embedded field output");
+                    errored += 1;
+                    continue;
+                }
+                field_recovery_checksum = Some(receipt.output_checksum.clone());
+                field_recovery_size = Some(measured.size);
+            }
+            if current == Some(&receipt.output_checksum) {
+                payload.prior_embedded = receipt.written;
+            } else if !receipt.published && current == Some(&receipt.input_checksum) {
+                payload.prior_embedded = receipt.previous;
+            }
+        }
+        let payload = Arc::new(payload);
         let created_local = record.metadata.capture_local(record.created_at);
 
         let embed_writable =
@@ -385,7 +491,24 @@ where
         // Only an embedded write touches media bytes, so the drain needs the
         // pre-write hash to tell its own rewrite apart from damage that
         // arrived some other way.
-        let pre_rewrite_fingerprint = if metadata_flags.any_embed() {
+        let preserved_local = pending_rewrite
+            .selection_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.preserved_local.as_ref());
+        if let Some(preserved) = preserved_local {
+            let current_time = tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(chrono::DateTime::<chrono::Utc>::from);
+            if current_time != preserved.modified
+                || (embed_writable && preserved.modified.is_none())
+            {
+                skipped_drifted += 1;
+                continue;
+            }
+        }
+        let pre_rewrite_fingerprint = if metadata_flags.any_embed() || preserved_local.is_some() {
             match crate::download::file::fingerprint_regular_file(&path).await {
                 Ok(fingerprint) => Some(fingerprint),
                 Err(e) => {
@@ -396,6 +519,7 @@ where
                         error = %e,
                         "Could not hash file before metadata rewrite; leaving marker for future retry"
                     );
+                    storage_failed |= super::is_operational_storage_error(&e);
                     errored += 1;
                     continue;
                 }
@@ -431,7 +555,10 @@ where
             (&pre_rewrite_checksum, &record.local_checksum),
             (Some(actual), Some(recorded)) if actual != recorded
         ) && !recovered_prepared_output
-            && !recovered_selection_output;
+            && !recovered_selection_output
+            && field_recovery_checksum
+                .as_ref()
+                .is_none_or(|checksum| Some(checksum) != pre_rewrite_checksum.as_ref());
         if drifted {
             tracing::warn!(
                 target: "kei::download::metadata_rewrite",
@@ -445,6 +572,24 @@ where
 
         let mut outcome = MetadataWriteOutcome::default();
         let mut pending_for_finish = pending_rewrite.clone();
+        if let Some(checksum) = &field_recovery_checksum {
+            // Recovery advanced only the previous output fingerprint. Complete
+            // today's intent against that recovered input, not the stale snapshot.
+            pending_for_finish.asset.local_checksum = Some(checksum.clone());
+            if let Some(selection) = pending_for_finish.selection_receipt.as_mut() {
+                selection.prepared = None;
+            }
+            if let Some(preserved) = pending_for_finish
+                .selection_receipt
+                .as_mut()
+                .and_then(|r| r.preserved_local.as_mut())
+            {
+                preserved.checksum = checksum.clone();
+                if let Some(size) = field_recovery_size {
+                    preserved.size = size;
+                }
+            }
+        }
         let mut final_fingerprint = pre_rewrite_fingerprint;
         let mut capture_embed_complete = false;
         let mut recovered_capture_only = false;
@@ -469,6 +614,7 @@ where
             match prepare_embed_metadata(
                 &path,
                 pre_rewrite_fingerprint,
+                pending_rewrite.source_checksum.as_deref(),
                 Arc::clone(&payload),
                 created_local,
                 metadata_flags,
@@ -478,6 +624,36 @@ where
             .await
             {
                 EmbedPrepareResult::Prepared(prepared) => {
+                    let prepared =
+                        if let Some(modified) = preserved_local.and_then(|local| local.modified) {
+                            match prepared.require_mtime(modified.into()).await {
+                                Ok(prepared) => prepared,
+                                Err(error) => {
+                                    storage_failed |= super::is_operational_storage_error(&error);
+                                    errored += 1;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            prepared
+                        };
+                    let fields = crate::state::types::EmbeddedMetadataReceipt {
+                        published: false,
+                        input_checksum: pre_rewrite_fingerprint
+                            .map(fingerprint_checksum)
+                            .unwrap_or_default(),
+                        output_checksum: fingerprint_checksum(prepared.output_fingerprint()),
+                        previous: payload.prior_embedded.clone(),
+                        written: (*prepared.embedded_fields).clone(),
+                    };
+                    if let Err(error) = db
+                        .record_embedded_metadata_receipt(&pending_for_finish, &fields)
+                        .await
+                    {
+                        tracing::warn!(%error, "Could not retain prepared embedded field ownership");
+                        errored += 1;
+                        continue;
+                    }
                     if selected_queue == MetadataRewriteQueue::Ordinary
                         && pending_rewrite.capture_repair_receipt.is_some()
                     {
@@ -542,7 +718,8 @@ where
                             pending_for_finish.capture_repair_receipt = Some(prepared_receipt);
                         }
                         match publish_embed_metadata(&path, prepared).await {
-                            EmbedWriteResult::Applied(output) => {
+                            EmbedWriteResult::Applied(output, fields) => {
+                                outcome.embedded_fields = fields;
                                 final_fingerprint = output;
                                 capture_embed_complete =
                                     selected_queue == MetadataRewriteQueue::CaptureRepair;
@@ -553,6 +730,10 @@ where
                                 outcome.embed_input_changed = true;
                             }
                             EmbedWriteResult::Failed => outcome.embed_failed = true,
+                            EmbedWriteResult::Storage => {
+                                outcome.embed_failed = true;
+                                storage_failed = true;
+                            }
                             EmbedWriteResult::NoWrite => outcome.embed_no_write = true,
                         }
                     }
@@ -562,6 +743,10 @@ where
                     capture_embed_complete = selected_queue == MetadataRewriteQueue::CaptureRepair;
                 }
                 EmbedPrepareResult::Failed => outcome.embed_failed = true,
+                EmbedPrepareResult::Storage => {
+                    outcome.embed_failed = true;
+                    storage_failed = true;
+                }
                 EmbedPrepareResult::InputChanged => {
                     outcome.embed_failed = true;
                     outcome.embed_input_changed = true;
@@ -571,7 +756,7 @@ where
 
         #[cfg(feature = "xmp")]
         if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
-            outcome.sidecar_failed = !write_sidecar_metadata(
+            let sidecar = write_sidecar_metadata(
                 &path,
                 Arc::clone(&payload),
                 created_local,
@@ -579,6 +764,8 @@ where
                 &temp_suffix,
             )
             .await;
+            outcome.sidecar_failed = sidecar.failed;
+            storage_failed |= sidecar.storage_failed;
         }
 
         if drifted {
@@ -613,6 +800,7 @@ where
                 (_, Err(e)) => {
                     outcome.embed_failed = true;
                     outcome.embed_input_changed = true;
+                    storage_failed |= super::is_operational_storage_error(&e);
                     tracing::warn!(
                         target: "kei::download::metadata_rewrite",
                         asset_id = %record.id,
@@ -625,6 +813,17 @@ where
         }
 
         let ordinary_complete = !outcome.any_failed() && !recovered_capture_only;
+        if let Some(preserved) = preserved_local {
+            let current_time = tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(chrono::DateTime::<chrono::Utc>::from);
+            if current_time != preserved.modified {
+                skipped_drifted += 1;
+                continue;
+            }
+        }
         let capture_complete =
             selected_queue == MetadataRewriteQueue::CaptureRepair && capture_embed_complete;
         let completion = match selected_queue {
@@ -643,11 +842,15 @@ where
 
         let final_checksum = final_fingerprint
             .map(fingerprint_checksum)
-            .or_else(|| record.local_checksum.clone());
-        let media_checksum_changed = final_checksum != record.local_checksum;
+            .or_else(|| pending_for_finish.asset.local_checksum.clone());
+        let media_checksum_changed = final_checksum != pending_for_finish.asset.local_checksum;
         let input_checksum_for_download = final_checksum
             .as_deref()
-            .zip(record.local_checksum.as_deref())
+            // Recovered metadata output is the current writer input, but is
+            // not evidence of the original downloaded bytes.
+            .zip(record.local_checksum.as_deref().filter(|before| {
+                Some(*before) == pending_for_finish.asset.local_checksum.as_deref()
+            }))
             .and_then(|(after, before)| (after != before).then_some(before));
         if completion != MetadataRewriteCompletion::None || media_checksum_changed {
             match db
@@ -737,6 +940,7 @@ where
         fetched: pending_count,
         applied,
         failed: errored + deferred + skipped_drifted + skipped_unverified,
+        storage_failed,
         retired_from_selected_queue,
     }
 }

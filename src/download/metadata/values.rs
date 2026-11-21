@@ -40,6 +40,10 @@ pub(crate) struct SourceGpsMetadata {
 /// fields are skipped.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct MetadataWrite {
+    pub(crate) prior_embedded: crate::state::types::EmbeddedMetadataFields,
+    /// Expected prior values, never an unconditional delete request.
+    pub(crate) clear_embedded: crate::state::types::EmbeddedMetadataFields,
+    pub(crate) orientation: Option<u8>,
     /// Unzoned datetime: `YYYY:MM:DD HH:MM:SS` for embedded writes, or
     /// `YYYY-MM-DDTHH:MM:SS` with optional fractional seconds for sidecars.
     /// `offset_time_original` supplies the XMP zone separately.
@@ -77,8 +81,82 @@ pub(crate) struct MetadataWrite {
 }
 
 impl MetadataWrite {
+    pub(super) fn ownership_after(
+        &self,
+        before: &crate::state::types::EmbeddedMetadataFields,
+        after: &crate::state::types::EmbeddedMetadataFields,
+    ) -> crate::state::types::EmbeddedMetadataFields {
+        let mut owned = self.prior_embedded.after_write(before, after);
+        if self.description.is_none()
+            && self.clear_embedded.native_description.is_none()
+            && before.native_description != after.native_description
+        {
+            owned.native_description = None;
+        }
+        for (((value, clear), before), after) in owned
+            .native_gps
+            .iter_mut()
+            .zip(&self.clear_embedded.native_gps)
+            .zip(&before.native_gps)
+            .zip(&after.native_gps)
+        {
+            if self.gps.is_none() && clear.is_none() && before != after {
+                *value = None;
+            }
+        }
+        for (((value, clear), before), after) in owned
+            .gps
+            .iter_mut()
+            .zip(&self.clear_embedded.gps)
+            .zip(&before.gps)
+            .zip(&after.gps)
+        {
+            if self.gps.is_none() && clear.is_none() && before != after {
+                *value = None;
+            }
+        }
+        if self.rating.is_none()
+            && self.clear_embedded.rating_percent.is_none()
+            && before.rating_percent != after.rating_percent
+        {
+            owned.rating_percent = None;
+        }
+        if self.rating.is_none()
+            && self.clear_embedded.rating.is_none()
+            && before.rating != after.rating
+        {
+            owned.rating = None;
+        }
+        if self.description.is_none()
+            && self.clear_embedded.description.is_none()
+            && before.description != after.description
+        {
+            owned.description = None;
+        }
+        if self.title.is_none()
+            && self.clear_embedded.title.is_none()
+            && before.title != after.title
+        {
+            owned.title = None;
+        }
+        if self.keywords.is_empty()
+            && self.clear_embedded.keywords.is_none()
+            && before.keywords != after.keywords
+        {
+            owned.keywords = None;
+        }
+        if self.people.is_empty()
+            && self.clear_embedded.people.is_none()
+            && before.people != after.people
+        {
+            owned.people = None;
+        }
+        owned
+    }
     pub(crate) fn is_empty(&self) -> bool {
-        self.datetime.is_none()
+        self.clear_embedded == crate::state::types::EmbeddedMetadataFields::default()
+            && self.orientation.is_none()
+            && self.datetime.is_none()
             && self.datetime_subseconds.is_none()
             && self.offset_time_original.is_none()
             && !self.clear_datetime_offsets

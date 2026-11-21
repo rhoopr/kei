@@ -13,13 +13,16 @@ use tokio_util::sync::CancellationToken;
 use super::PhotoAlbum;
 use crate::icloud::photos::asset::{DeltaRecordBuffer, PhotoAsset};
 use crate::icloud::photos::cloudkit::{ChangesZoneResponse, Record};
+use crate::icloud::photos::metadata::change_flag_is_set;
 use crate::icloud::photos::queries::{build_changes_zone_request, encode_params};
 use crate::icloud::photos::session::{self, check_changes_zone_error};
 use crate::types::ChangeReason;
 
 #[derive(Debug)]
 pub(crate) struct CompleteLegacyInventory {
+    #[cfg(test)]
     pub(crate) library: String,
+    #[cfg(test)]
     pub(crate) cursor: String,
     pub(crate) children: Vec<PhotoAsset>,
 }
@@ -170,12 +173,7 @@ fn compact_record(record: &mut Record, masters: &FxHashSet<String>) {
             .and_then(|reference| reference.get("recordName"))
             .and_then(Value::as_str)
             .is_some_and(|master| masters.contains(master))
-        && record
-            .fields
-            .get("isDeleted")
-            .and_then(|field| field.get("value"))
-            .and_then(Value::as_i64)
-            != Some(1);
+        && !change_flag_is_set(&record.fields, "isDeleted");
     let family_master = record.record_type == "CPLMaster" && masters.contains(&record.record_name);
     if record.deleted == Some(true) || (!family_child && !family_master) {
         if record.record_type == "CPLAsset" && record.deleted != Some(true) {
@@ -344,7 +342,10 @@ impl PhotoAlbum {
             !masters.is_empty(),
             InventoryFailureKind::Evidence("missing_candidate_scope")
         );
-        let RetainedLegacyInventory { cursor, latest } = self
+        let RetainedLegacyInventory {
+            cursor: _cursor,
+            latest,
+        } = self
             .scan_legacy_preservation_records(masters, cancel, budget, progress)
             .await?;
         let mut expected = FxHashSet::default();
@@ -357,12 +358,8 @@ impl PhotoAlbum {
             progress.supplied_owner = "not_recorded";
             progress.supplied_owner_type = "not_recorded";
             progress.family_context = "unknown";
-            progress.child_soft_deleted = record
-                .fields
-                .get("isDeleted")
-                .and_then(|field| field.get("value"))
-                .and_then(Value::as_i64)
-                == Some(1);
+            let soft_deleted = change_flag_is_set(&record.fields, "isDeleted");
+            progress.child_soft_deleted = soft_deleted;
             let Some(reference) = record
                 .fields
                 .get("masterRef")
@@ -417,14 +414,7 @@ impl PhotoAlbum {
                 }),
                 InventoryFailureKind::Evidence("child_reference_scope_mismatch")
             );
-            if masters.contains(master)
-                && record
-                    .fields
-                    .get("isDeleted")
-                    .and_then(|field| field.get("value"))
-                    .and_then(Value::as_i64)
-                    != Some(1)
-            {
+            if masters.contains(master) && !soft_deleted {
                 expected.insert(record.record_name.clone());
             }
         }
@@ -475,8 +465,10 @@ impl PhotoAlbum {
         );
         children.sort_by(|a, b| a.asset_record_name().cmp(b.asset_record_name()));
         Ok(CompleteLegacyInventory {
+            #[cfg(test)]
             library: self.zone_name().to_owned(),
-            cursor,
+            #[cfg(test)]
+            cursor: _cursor,
             children,
         })
     }
@@ -743,13 +735,16 @@ mod tests {
 
     #[tokio::test]
     async fn preservation_inventory_folds_later_tombstones_and_metadata() {
-        for hard in [false, true] {
-            let mut deleted = changes_asset("first", "master");
-            if hard {
-                deleted = json!({"recordName":"first","deleted":true});
+        for flag in [Some(json!(1)), Some(json!(true)), None] {
+            let deleted = if let Some(value) = flag {
+                let mut child = changes_asset("first", "master");
+                child["fields"]["isDeleted"] = json!({"value":value});
+                // A trashed sibling's payload must not consume the retention budget.
+                child["fields"]["padding"] = json!({"value":"x".repeat(BUDGET.retained_bytes)});
+                child
             } else {
-                deleted["fields"]["isDeleted"] = json!({"value":1});
-            }
+                json!({"recordName":"first","deleted":true})
+            };
             let mut changed = changes_asset("second", "master");
             changed["fields"]["isFavorite"] = json!({"value":1});
             let result = album(vec![

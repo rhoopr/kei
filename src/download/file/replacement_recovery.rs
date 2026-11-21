@@ -505,14 +505,25 @@ impl Journal {
     }
 }
 
+#[cfg(test)]
 pub(super) fn publish(
     part: &Path,
     target: &Path,
     expected: ExistingFileFingerprint,
     replacement: ExistingFileFingerprint,
 ) -> Result<()> {
+    publish_with_mtime(part, target, expected, replacement, None)
+}
+
+pub(super) fn publish_with_mtime(
+    part: &Path,
+    target: &Path,
+    expected: ExistingFileFingerprint,
+    replacement: ExistingFileFingerprint,
+    modified: Option<std::time::SystemTime>,
+) -> Result<()> {
     let mut journal = Journal::create(&confined(part)?, confined(target)?, expected, replacement)?;
-    let result = publish_journal(&journal, |_| Ok(()));
+    let result = publish_journal_with_mtime(&journal, modified, |_| Ok(()));
     if let Err(error) = result {
         if let Err(recovery_error) = journal.recover() {
             return Err(retain_recovery_error(
@@ -536,10 +547,11 @@ pub(super) fn publish_confined(
     target: &ConfinedPath,
     expected: ExistingFileFingerprint,
     replacement: ExistingFileFingerprint,
+    modified: Option<std::time::SystemTime>,
 ) -> Result<()> {
     let target = target.sibling(target.path())?;
     let mut journal = Journal::create(part, target, expected, replacement)?;
-    if let Err(error) = publish_journal(&journal, |_| Ok(())) {
+    if let Err(error) = publish_journal_with_mtime(&journal, modified, |_| Ok(())) {
         if let Err(recovery_error) = journal.recover() {
             return Err(retain_recovery_error(
                 error.context(format!(
@@ -558,7 +570,7 @@ pub(super) fn publish_confined(
 /// Resume only the exact temporary two-name link left by no-replace or the
 /// committed fallback journal. The layout's durable prepared receipt supplies
 /// custody, identity and bytes; unknown links never receive this authorization.
-pub(super) fn finish_owned_prepared_link(
+pub(in crate::download) fn finish_owned_prepared_link(
     part: &ConfinedPath,
     target: &ConfinedPath,
     expected: ExistingFileFingerprint,
@@ -615,14 +627,41 @@ fn finish_publication(journal: &mut Journal, part: &Path) -> Result<()> {
     Ok(())
 }
 
-fn publish_journal(journal: &Journal, mut hook: impl FnMut(Stage) -> Result<()>) -> Result<()> {
+#[cfg(test)]
+fn publish_journal(journal: &Journal, hook: impl FnMut(Stage) -> Result<()>) -> Result<()> {
+    publish_journal_with_mtime(journal, None, hook)
+}
+
+// The clock authorizes this attempt, not recovery. An interrupted uncommitted
+// journal always restores the displaced file, including its actual timestamps.
+// A committed journal has already passed both same-handle observations below.
+fn original_matches(journal: &Journal, modified: Option<std::time::SystemTime>) -> Result<bool> {
+    let Some(mut file) = journal.original.open_optional_regular()? else {
+        return Ok(false);
+    };
+    let identity = file_identity(&file)?;
+    let before = file.metadata()?.modified().ok();
+    let mut hash = Sha256::new();
+    let size = std::io::copy(&mut file, &mut hash)?;
+    let after = file.metadata()?.modified().ok();
+    journal.original.validate_identity(identity)?;
+    Ok(size == journal.evidence.original.size
+        && <[u8; 32]>::from(hash.finalize()) == journal.evidence.original.sha256
+        && modified.is_none_or(|expected| before == Some(expected) && after == Some(expected)))
+}
+
+fn publish_journal_with_mtime(
+    journal: &Journal,
+    modified: Option<std::time::SystemTime>,
+    mut hook: impl FnMut(Stage) -> Result<()>,
+) -> Result<()> {
     hook(Stage::Prepared)?;
     move_to_owned_slot(&journal.target, &journal.original)?;
     journal.sync()?;
     hook(Stage::Displaced)?;
     #[cfg(test)]
     crate::test_helpers::process_death_point("journal-displaced");
-    if read_fingerprint(&journal.original)?.as_ref() != Some(&journal.evidence.original) {
+    if !original_matches(journal, modified)? {
         return Err(ConditionalPublishTargetChanged::AfterPlanning {
             path: journal.target.path().to_path_buf(),
         }
@@ -639,7 +678,7 @@ fn publish_journal(journal: &Journal, mut hook: impl FnMut(Stage) -> Result<()>)
     crate::test_helpers::process_death_point("journal-installed");
     anyhow::ensure!(
         read_fingerprint(&journal.target)?.as_ref() == Some(&journal.evidence.replacement)
-            && read_fingerprint(&journal.original)?.as_ref() == Some(&journal.evidence.original),
+            && original_matches(journal, modified)?,
         "Replacement bytes changed during publication"
     );
     let mut commit = journal.commit.create_new_regular()?;

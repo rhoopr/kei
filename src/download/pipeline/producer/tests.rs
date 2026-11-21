@@ -374,14 +374,13 @@ fn producer_skip_summary_records_every_filter_reason() {
     skips.record_filter_reason(crate::download::filter::FilterReason::MediaType);
     skips.record_filter_reason(crate::download::filter::FilterReason::LivePhoto);
     skips.record_filter_reason(crate::download::filter::FilterReason::DateRange);
-    skips.record_filter_reason(crate::download::filter::FilterReason::Filename);
 
-    assert_eq!(skips.by_filename, 2);
+    assert_eq!(skips.by_filename, 1);
     assert_eq!(skips.by_excluded_album, 1);
     assert_eq!(skips.by_media_type, 1);
     assert_eq!(skips.by_live_photo, 1);
     assert_eq!(skips.by_date_range, 1);
-    assert_eq!(skips.total(), 6);
+    assert_eq!(skips.total(), 5);
 }
 
 #[test]
@@ -425,20 +424,16 @@ fn test_producer_skip_summary_default_is_zero() {
 /// If variant order changes, `.max()` silently picks the wrong winner.
 #[test]
 fn test_asset_disposition_ordering() {
-    use AssetDisposition::{
-        AmpmVariant, Forwarded, OnDisk, RetryExhausted, RetryOnly, StateSkip, Unresolved,
-    };
+    use AssetDisposition::{AmpmVariant, Forwarded, OnDisk, StateSkip, Unresolved};
     assert!(Forwarded > OnDisk);
     assert!(OnDisk > AmpmVariant);
     assert!(AmpmVariant > StateSkip);
-    assert!(StateSkip > RetryExhausted);
-    assert!(RetryExhausted > RetryOnly);
-    assert!(RetryOnly > Unresolved);
+    assert!(StateSkip > Unresolved);
 
     // .max() picks the highest priority
     assert_eq!(Unresolved.max(Forwarded), Forwarded);
-    assert_eq!(OnDisk.max(RetryExhausted), OnDisk);
-    assert_eq!(RetryOnly.max(RetryExhausted), RetryExhausted);
+    assert_eq!(OnDisk.max(StateSkip), OnDisk);
+    assert_eq!(Unresolved.max(StateSkip), StateSkip);
 }
 
 /// T-11: When the API returns the same asset ID on two different pages,
@@ -622,9 +617,9 @@ async fn producer_plans_distinct_same_path_same_size_assets() {
 }
 
 /// Explicit metadata refresh updates historical versions before current
-/// resolution and filename filters are applied.
+/// resolution and fixed date filters are applied.
 #[tokio::test]
-async fn refresh_metadata_updates_historical_version_before_filename_filter() {
+async fn refresh_metadata_updates_historical_version_before_date_filter() {
     use crate::download::DownloadConfig;
     use crate::icloud::photos::PhotoAsset;
     use crate::state::SqliteStateDb;
@@ -653,8 +648,8 @@ async fn refresh_metadata_updates_historical_version_before_filename_filter() {
     config.capture_timestamp_repair =
         crate::download::CaptureTimestampRepair::ReplaceWithCaptureLocal;
     config.metadata.set_exif_datetime = true;
-    config.filename_exclude =
-        Arc::from(vec![glob::Pattern::new("*.jpg").expect("filename pattern")]);
+    config.skip_created_before =
+        Some(crate::config::parse_created_date_filter("2099-01-01").unwrap());
     let config = Arc::new(config);
 
     let historical_path = dir.path().join("historical-medium.jpg");
@@ -703,7 +698,7 @@ async fn refresh_metadata_updates_historical_version_before_filename_filter() {
 
     assert_eq!(
         result.downloaded, 0,
-        "filename-filtered asset should not be downloaded"
+        "date-filtered asset should not be downloaded"
     );
     let rewrites = db.get_pending_metadata_rewrites(10).await.unwrap();
     assert_eq!(rewrites.len(), 1);
@@ -753,8 +748,8 @@ async fn filtered_embed_rewrite_keeps_stored_checksums_current() {
     config.directory = Arc::from(dir.path());
     config.state_db = Some(db.clone());
     config.metadata.set_exif_rating = true;
-    config.filename_exclude =
-        Arc::from(vec![glob::Pattern::new("*.jpg").expect("filename pattern")]);
+    config.skip_created_before =
+        Some(crate::config::parse_created_date_filter("2099-01-01").unwrap());
     let config = Arc::new(config);
 
     let media_path = dir.path().join("filtered-embed.jpg");
@@ -1050,9 +1045,9 @@ async fn raw_policy_rendition_metadata_tracks_bytes_across_refresh_and_config_dr
                         .await
                         .unwrap();
                     let body = if task.version_size == VersionSizeKey::Original {
-                        alternative.0
-                    } else {
                         original.0
+                    } else {
+                        alternative.0
                     };
                     fs::create_dir_all(task.download_path.parent().unwrap()).unwrap();
                     fs::write(&task.download_path, body).unwrap();
@@ -1106,7 +1101,7 @@ async fn raw_policy_rendition_metadata_tracks_bytes_across_refresh_and_config_dr
                 assert_eq!(rows.len(), 2);
                 for row in &rows {
                     let (provider_key, body, width, height) =
-                        if row.version_size == VersionSizeKey::Original {
+                        if row.version_size == VersionSizeKey::Alternative {
                             (
                                 VersionSizeKey::Alternative,
                                 alternative.0,
@@ -1178,7 +1173,7 @@ async fn raw_policy_rendition_metadata_tracks_bytes_across_refresh_and_config_dr
             assert_eq!(result.state_write_failures, 0);
             let rows = db.get_downloaded_page(0, 10).await.unwrap();
             for row in rows {
-                if row.version_size == VersionSizeKey::Original {
+                if row.version_size == VersionSizeKey::Alternative {
                     assert_eq!(row.metadata.width, Some(9999));
                 } else {
                     assert_eq!(
@@ -1244,31 +1239,31 @@ async fn filtered_replacement_renditions_capture_shared_metadata_without_guessin
         let mut config = DownloadConfig::test_default();
         config.directory = Arc::from(dir.path());
         config.state_db = Some(db.clone());
-        if key == VersionSizeKey::Medium {
-            config.resolution = crate::types::PhotoResolution::Medium;
-        }
-        if key == VersionSizeKey::LiveMedium {
-            config.live_resolution = crate::types::AssetVersionSize::LiveMedium;
-        }
-        let derived = derive_expected_paths(&stored, &config)
-            .into_iter()
-            .find(|path| path.version_size == key)
-            .unwrap();
-        fs::create_dir_all(derived.path.parent().unwrap()).unwrap();
+        // Historical preview rows must remain recoverable even though current
+        // selection cannot create them. Seed their recorded resource directly.
+        let historical_path = dir
+            .path()
+            .join(format!("historical-{}.media", key.as_str()));
         let bytes = vec![0u8; 1000];
-        fs::write(&derived.path, &bytes).unwrap();
-        let local_checksum = crate::download::file::compute_sha256(&derived.path)
+        fs::write(&historical_path, &bytes).unwrap();
+        let local_checksum = crate::download::file::compute_sha256(&historical_path)
             .await
             .unwrap();
-        let record =
-            asset_record_for_derived_path(Arc::from("PrimarySync"), &stored, &derived, &config);
+        let record = crate::test_helpers::TestAssetRecord::new(stored.state_id())
+            .library("PrimarySync")
+            .filename(historical_path.file_name().unwrap().to_str().unwrap())
+            .checksum("previous")
+            .size(1000)
+            .version_size(key)
+            .metadata((*stored.metadata_arc(key)).clone())
+            .build();
         assert_eq!(record.metadata.width, Some(1920));
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded(
             "PrimarySync",
             stored.state_id(),
             key.as_str(),
-            &derived.path,
+            &historical_path,
             &local_checksum,
             None,
         )
@@ -1323,9 +1318,9 @@ async fn filtered_replacement_renditions_capture_shared_metadata_without_guessin
             assert_eq!(row.local_checksum, before.local_checksum);
             assert_eq!(row.download_checksum, before.download_checksum);
             assert_eq!(row.downloaded_at, before.downloaded_at);
-            assert_eq!(fs::read(&derived.path).unwrap(), bytes);
+            assert_eq!(fs::read(&historical_path).unwrap(), bytes);
             assert_eq!(
-                fs::read_dir(derived.path.parent().unwrap())
+                fs::read_dir(historical_path.parent().unwrap())
                     .unwrap()
                     .count(),
                 1
@@ -1389,9 +1384,9 @@ async fn forced_metadata_refresh_resolves_completed_sibling_with_stale_preload()
             .await
             .unwrap();
         let body = if task.version_size == VersionSizeKey::Original {
-            raw
-        } else {
             jpeg
+        } else {
+            raw
         };
         fs::create_dir_all(task.download_path.parent().unwrap()).unwrap();
         fs::write(&task.download_path, body).unwrap();
@@ -1415,12 +1410,12 @@ async fn forced_metadata_refresh_resolves_completed_sibling_with_stale_preload()
     assert_eq!(db.get_pending().await.unwrap().len(), 1);
     // Reject even an intermediate refresh that uses provider keys instead of
     // the current downloaded checksums. Final-state assertions alone miss it.
-    db.acquire_lock("guard swapped metadata")
+    db.acquire_lock("guard resource metadata")
         .unwrap()
         .execute_batch(
-            "CREATE TRIGGER guard_swapped_metadata BEFORE UPDATE OF width ON assets
-         WHEN (NEW.version_size = 'original' AND NEW.width IS NOT 6000)
-           OR (NEW.version_size = 'alternative' AND NEW.width IS NOT 4000)
+            "CREATE TRIGGER guard_resource_metadata BEFORE UPDATE OF width ON assets
+         WHEN (NEW.version_size = 'original' AND NEW.width IS NOT 4000)
+           OR (NEW.version_size = 'alternative' AND NEW.width IS NOT 6000)
          BEGIN SELECT RAISE(ABORT, 'wrong rendition metadata'); END;",
         )
         .unwrap();
@@ -1457,9 +1452,9 @@ async fn forced_metadata_refresh_resolves_completed_sibling_with_stale_preload()
                 .find(|task| task.version_size == row.version_size)
                 .unwrap();
             let (width, body) = if row.version_size == VersionSizeKey::Original {
-                (6000, raw)
-            } else {
                 (4000, jpeg)
+            } else {
+                (6000, raw)
             };
             assert_eq!(row.metadata.width, Some(width));
             assert_eq!(row.metadata.is_favorite, cycle > 0);

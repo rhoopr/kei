@@ -274,6 +274,77 @@ async fn download_pass_invalid_unknown_media_marks_failed_not_downloaded() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn storage_failure_stops_file_work_and_retains_every_task() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let dir = TempDir::new().unwrap();
+    let blocked = dir.path().join("blocked");
+    std::fs::write(&blocked, b"preserve this unrelated file").unwrap();
+    let db = Arc::new(FailingDownloadStore::with_mark_failed_tracking());
+    let client = Client::new();
+    let retry = RetryConfig::default();
+    let service_shutdown = CancellationToken::new();
+    let cycle_shutdown = service_shutdown.child_token();
+    let tasks = [blocked.join("a.jpg"), dir.path().join("b.jpg")]
+        .into_iter()
+        .enumerate()
+        .map(|(index, download_path)| DownloadTask {
+            url: format!("{}/photo.jpg", server.uri()).into(),
+            download_path,
+            replacement_fingerprint: None,
+            pending_cross_parent_root: None,
+            checksum: "unused-before-storage-check".into(),
+            asset_id: format!("storage-{index}").into(),
+            asset_record_name: format!("storage-{index}").into(),
+            library: "PrimarySync".into(),
+            metadata: Arc::new(MetadataPayload::default()),
+            size: 10,
+            created_local: chrono::Local::now().fixed_offset(),
+            version_size: VersionSizeKey::Original,
+            media_type: crate::state::MediaType::Photo,
+        })
+        .collect();
+    let result = run_download_pass(
+        PassConfig {
+            prior_auth_errors: 0,
+            url_obtained_at: Default::default(),
+            client: &client,
+            retry_config: &retry,
+            metadata: MetadataFlags::default(),
+            mark_capture_repair_after_download: false,
+            concurrency: 1,
+            reporting: DownloadReporting::hidden(),
+            temp_suffix: Arc::from(".part"),
+            shutdown_token: cycle_shutdown.clone(),
+            state_db: Some(db.clone()),
+            rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            bandwidth_limiter: None,
+            library: Arc::from("PrimarySync"),
+        },
+        tasks,
+    )
+    .await;
+    assert!(result.storage_failed);
+    assert!(cycle_shutdown.is_cancelled());
+    assert!(!service_shutdown.is_cancelled());
+    assert_eq!(result.failed.len(), 2);
+    assert_eq!(db.failed_call_count(), 2);
+    assert_eq!(result.downloaded, 0);
+    assert!(!dir.path().join("b.jpg").exists());
+    assert_eq!(
+        std::fs::read(blocked).unwrap(),
+        b"preserve this unrelated file"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
     use base64::Engine as _;
     use wiremock::matchers::method;
@@ -364,6 +435,50 @@ async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
     }
 }
 
+#[tokio::test]
+async fn streaming_failed_receipt_is_an_operational_state_failure() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("state.db");
+    let db = Arc::new(crate::state::SqliteStateDb::open(&path).await.unwrap());
+    rusqlite::Connection::open(&path).unwrap().execute_batch(
+        "CREATE TRIGGER failed_receipt_fault BEFORE UPDATE OF status ON assets WHEN NEW.status='failed' BEGIN SELECT RAISE(ABORT,'failed receipt unavailable'); END;"
+    ).unwrap();
+    let mut config = crate::download::DownloadConfig::test_default();
+    config.directory = Arc::from(dir.path().join("media"));
+    config.state_db = Some(db.clone());
+    config.retry.max_retries = 0;
+    let asset = TestPhotoAsset::new("failed-receipt")
+        .filename("failed.jpg")
+        .orig_url(&format!("{}/failed.jpg", server.uri()))
+        .build();
+    let result = stream_and_download_from_stream(
+        &Client::new(),
+        futures_util::stream::iter(vec![Ok(asset)]),
+        &Arc::new(config),
+        DownloadControls::download_hidden(),
+        1,
+        CancellationToken::new(),
+        StreamRuntime::new(None, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.failed.len(), 1);
+    assert_eq!(result.state_write_failures, 1);
+    assert_eq!(result.downloaded, 0);
+    drop(db);
+    let db = crate::state::SqliteStateDb::open(&path).await.unwrap();
+    assert_eq!(db.get_summary().await.unwrap().pending, 1);
+    assert!(!dir.path().join("media/failed.jpg").exists());
+}
+
 /// When a CancellationToken is already cancelled as the next asset is
 /// yielded, the pass must stop before planning or downloading that asset.
 #[tokio::test]
@@ -404,8 +519,7 @@ async fn shutdown_cancellation_exits_download_pass_promptly() {
         repair_truncated: false,
         legacy_preservation_allow_hardlinks: false,
         concurrent_downloads: 10,
-        recent: None,
-        recent_scope: crate::cli::RecentScope::Global,
+        inventory_reconciliation: false,
         retry: crate::retry::RetryConfig {
             max_retries: 0,
             base_delay_secs: 0,
@@ -426,18 +540,16 @@ async fn shutdown_cancellation_exits_download_pass_promptly() {
         file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
         force_resolution: false,
         keep_unicode_in_filenames: false,
-        filename_exclude: std::sync::Arc::from(Vec::<glob::Pattern>::new()),
         temp_suffix: std::sync::Arc::from(".kei-tmp"),
         state_db: None,
         sparse_targets: Arc::from([]),
+        sparse_membership_due: false,
         complete_path_selection: false,
         selection_context: None,
         selection_run: None,
         selection_pass: None,
-        retry_only: false,
         provisional: false,
         indexing_inventory_only: false,
-        max_download_attempts: 10,
         sync_mode: SyncMode::Full,
         enum_config_hash: None,
         album_name: None,

@@ -6,19 +6,53 @@ use crate::icloud::photos::{
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::download::filter::DownloadTask;
-use crate::download::pipeline::PassResult;
-use crate::download::planner;
+use crate::download::pipeline::{AUTH_ERROR_THRESHOLD, PassConfig, PassResult, run_download_pass};
 use crate::state::VersionSizeKey;
 
-use super::config::DownloadConfig;
-use super::selection::build_pass_configs_resolving_deferred_excludes;
-
 pub(super) const INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// Admit and execute one expired-task retry after source-specific failure gates.
+/// Return provider authentication failures separately from transfer failures.
+#[must_use]
+pub(super) async fn refresh_expired_download_pass(
+    passes: &[crate::commands::AlbumPass],
+    retry_sources: &FxHashMap<RetryTaskKey, UrlRetrySource>,
+    mut config: PassConfig<'_>,
+    result: &mut PassResult,
+) -> usize {
+    if !result.url_expired
+        || result.auth_errors >= AUTH_ERROR_THRESHOLD
+        || result.state_write_failures > 0
+        || config.shutdown_token.is_cancelled()
+    {
+        return 0;
+    }
+    let candidates = result.expired_tasks.clone();
+    let plan = refresh_failed_download_urls(
+        passes,
+        &candidates,
+        &config.shutdown_token,
+        Some(retry_sources),
+    )
+    .await;
+    let provider_auth_errors = plan.provider_auth_errors;
+    if plan.tasks.is_empty() {
+        result.rate_limit_observations += plan.rate_limit_observations;
+    } else {
+        tracing::info!(
+            count = plan.tasks.len(),
+            "Retrying tasks after targeted URL refresh"
+        );
+        config.prior_auth_errors = result.auth_errors;
+        let retried = plan.execute(config).await;
+        merge_expired_url_retry_result(result, retried);
+    }
+    provider_auth_errors
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(in crate::download) struct RetryTaskKey {
@@ -47,42 +81,6 @@ impl From<&DownloadTask> for RetryTaskKey {
     }
 }
 
-fn retry_state_ids_by_asset_record(tasks: &[DownloadTask]) -> FxHashMap<Arc<str>, Arc<str>> {
-    tasks
-        .iter()
-        .map(|task| {
-            (
-                Arc::clone(&task.asset_record_name),
-                Arc::clone(&task.asset_id),
-            )
-        })
-        .collect()
-}
-
-fn take_matching_retry_tasks<I>(
-    tasks: I,
-    pending_keys: &mut FxHashSet<RetryTaskKey>,
-    out: &mut Vec<DownloadTask>,
-) where
-    I: IntoIterator<Item = DownloadTask>,
-{
-    for task in tasks {
-        let key = RetryTaskKey::from(&task);
-        if pending_keys.remove(&key) {
-            out.push(task);
-            if pending_keys.is_empty() {
-                break;
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(in crate::download) enum CleanupUrlRefresh {
-    Enumerate,
-    Lookup,
-}
-
 #[derive(Default)]
 pub(in crate::download) struct CleanupRetryPlan {
     pub(in crate::download) tasks: Vec<DownloadTask>,
@@ -93,6 +91,22 @@ pub(in crate::download) struct CleanupRetryPlan {
 }
 
 impl CleanupRetryPlan {
+    /// Execute this exact refresh once, retaining URL age and lookup accounting.
+    /// Callers keep provider authentication evidence separate from transfer errors.
+    #[must_use]
+    pub(in crate::download) async fn execute(self, mut config: PassConfig<'_>) -> PassResult {
+        config.url_obtained_at = self.url_obtained_at;
+        // The first pass already reported its observations. Retry execution
+        // uses a fresh counter even when its settings came from that pass.
+        config.rate_limit_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut result = run_download_pass(config, self.tasks).await;
+        // A lookup refusal is unfinished selected work, just like a failed
+        // transfer. Return both through the existing pass-result owner.
+        result.failed.extend(self.unrefreshed);
+        result.rate_limit_observations += self.rate_limit_observations;
+        result
+    }
+
     fn observe_lookup(&mut self, batch: &RecordResolutionBatch) {
         self.rate_limit_observations = self
             .rate_limit_observations
@@ -121,7 +135,7 @@ impl CleanupRetryPlan {
 /// Refresh only the URL on already-selected tasks. Their original destination,
 /// rendition, metadata and publication authorization retain the first pass's
 /// selection evidence, including deferred unfiled exclusions.
-async fn refresh_failed_download_urls(
+pub(in crate::download) async fn refresh_failed_download_urls(
     passes: &[crate::commands::AlbumPass],
     failed_tasks: &[DownloadTask],
     shutdown_token: &CancellationToken,
@@ -385,115 +399,8 @@ async fn refresh_failed_download_urls(
     retry
 }
 
-/// Rebuild failed tasks with fresh CDN URLs, using targeted lookups after expiry.
-///
-/// The first pass may fail because signed content URLs expired before the
-/// worker reached them. Retrying the complete library after that is both slow
-/// and risky: newly-issued URLs for early tasks can age again while unrelated
-/// albums are planned. Limit cleanup to the exact asset/version/path tuples
-/// that failed so the retry pass starts consuming refreshed URLs quickly.
-pub(in crate::download) async fn build_retry_download_tasks(
-    passes: &[crate::commands::AlbumPass],
-    config: &DownloadConfig,
-    failed_tasks: &[DownloadTask],
-    refresh: CleanupUrlRefresh,
-    shutdown_token: CancellationToken,
-) -> Result<CleanupRetryPlan> {
-    if failed_tasks.is_empty() || shutdown_token.is_cancelled() {
-        return Ok(CleanupRetryPlan::default());
-    }
-
-    if matches!(refresh, CleanupUrlRefresh::Lookup) {
-        return Ok(refresh_failed_download_urls(passes, failed_tasks, &shutdown_token, None).await);
-    }
-
-    let mut pending_keys: FxHashSet<RetryTaskKey> =
-        failed_tasks.iter().map(RetryTaskKey::from).collect();
-    // Re-enumeration builds new tasks, so it must preserve the affected
-    // failure's publication-proof requirement instead of falling back to an
-    // ordinary hash-only finalization. This does not authorize a new provider
-    // generation under the old reserved failure.
-    let retained_pending_failures: FxHashMap<_, _> = failed_tasks
-        .iter()
-        .filter(|task| task.pending_cross_parent_root.is_some())
-        .map(|task| (RetryTaskKey::from(task), task))
-        .collect();
-    let retry_state_ids = retry_state_ids_by_asset_record(failed_tasks);
-    let requested_count = pending_keys.len();
-    let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
-    let mut retry = CleanupRetryPlan {
-        tasks: Vec::with_capacity(requested_count),
-        ..CleanupRetryPlan::default()
-    };
-    let mut task_planner = planner::TaskPlanner::for_download(config.state_db.as_deref()).await?;
-
-    for (pass_index, pass) in passes.iter().enumerate() {
-        if pending_keys.is_empty() || shutdown_token.is_cancelled() {
-            break;
-        }
-
-        let assets = pass.album.photos(config.recent).await?;
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "pass_index comes from enumerate() over `passes`; pass_configs is \
-                      built 1:1 from the same slice"
-        )]
-        let pass_config = &pass_configs[pass_index];
-
-        for asset in &assets {
-            if pending_keys.is_empty() || shutdown_token.is_cancelled() {
-                break;
-            }
-            let Some(state_id) = retry_state_ids.get(asset.asset_record_name()) else {
-                continue;
-            };
-            let asset = asset.clone().with_state_record_name(Arc::clone(state_id));
-            let plan = task_planner
-                .plan_download_asset(&asset, pass_config)
-                .await?;
-            if plan.filter_reason.is_some() {
-                continue;
-            }
-            let tasks = plan.tasks.into_iter().filter_map(|mut task| {
-                if let Some(failed) = retained_pending_failures.get(&RetryTaskKey::from(&task)) {
-                    if task.checksum != failed.checksum || task.size != failed.size {
-                        return None;
-                    }
-                    task.pending_cross_parent_root = failed.pending_cross_parent_root.clone();
-                }
-                Some(task)
-            });
-            take_matching_retry_tasks(tasks, &mut pending_keys, &mut retry.tasks);
-        }
-    }
-
-    if !pending_keys.is_empty() {
-        tracing::warn!(
-            requested = requested_count,
-            refreshed = retry.tasks.len(),
-            missing = pending_keys.len(),
-            "Cleanup pass could not refresh every failed task; unmatched failures remain pending"
-        );
-    }
-
-    Ok(retry)
-}
-
-/// Refresh exact selected resources through the authenticated source zone's
-/// bounded child/master lookup. Replanning and zone enumeration cannot change
-/// the task's path, rendition, metadata or publication authorization.
-pub(in crate::download) async fn build_incremental_expired_url_retry_tasks(
-    passes: &[crate::commands::AlbumPass],
-    retry_sources: &FxHashMap<RetryTaskKey, UrlRetrySource>,
-    failed_tasks: &[DownloadTask],
-    shutdown_token: CancellationToken,
-) -> CleanupRetryPlan {
-    refresh_failed_download_urls(passes, failed_tasks, &shutdown_token, Some(retry_sources)).await
-}
-
 pub(super) fn merge_expired_url_retry_result(
     pass_result: &mut PassResult,
-    expired_retry_candidates: Vec<DownloadTask>,
     retry_result: PassResult,
 ) {
     let downloaded_keys: FxHashSet<_> = retry_result
@@ -504,7 +411,6 @@ pub(super) fn merge_expired_url_retry_result(
     let mut still_failed: Vec<_> = pass_result
         .failed
         .drain(..)
-        .chain(expired_retry_candidates)
         .filter(|task| !downloaded_keys.contains(&RetryTaskKey::from(task)))
         .collect();
     still_failed.extend(retry_result.failed);
@@ -518,6 +424,7 @@ pub(super) fn merge_expired_url_retry_result(
     pass_result.auth_errors += retry_result.auth_errors;
     pass_result.exif_failures += retry_result.exif_failures;
     pass_result.state_write_failures += retry_result.state_write_failures;
+    pass_result.storage_failed |= retry_result.storage_failed;
     pass_result.bytes_downloaded += retry_result.bytes_downloaded;
     pass_result.disk_bytes_written += retry_result.disk_bytes_written;
     pass_result.rate_limit_observations += retry_result.rate_limit_observations;
@@ -563,7 +470,7 @@ pub(super) async fn refresh_stale_incremental_tasks_before_download(
         "Refreshing incremental download URLs before starting downloads"
     );
 
-    build_incremental_expired_url_retry_tasks(passes, retry_sources, &tasks, shutdown_token).await
+    refresh_failed_download_urls(passes, &tasks, &shutdown_token, Some(retry_sources)).await
 }
 
 #[cfg(test)]

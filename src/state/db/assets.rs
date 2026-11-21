@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-#[cfg(test)]
 use rusqlite::OptionalExtension;
 
 use super::asset_writes::{
@@ -19,14 +18,67 @@ use super::rows::decode_asset_date;
 use super::rows::{ASSET_COLUMNS, row_to_asset_record};
 use super::{
     AssetVerificationState, DownloadContextStateStore, DownloadStateStore, DownloadedFileRecord,
-    ReportStateStore, RetryErrorRetention, SqliteStateDb,
+    ReportStateStore, SqliteStateDb,
 };
 use crate::state::error::StateError;
 #[cfg(test)]
 use crate::state::types::AssetStatus;
-use crate::state::types::{AssetRecord, METADATA_CAPTURE_REVISION, VersionSizeKey};
+use crate::state::types::{
+    AssetRecord, HistoricalSourceState, METADATA_CAPTURE_REVISION, VersionSizeKey,
+};
+
+const HISTORICAL_RETRY_SECONDS: i64 = 3600;
 
 impl SqliteStateDb {
+    /// Reserve one bounded batch. An interrupted or inconclusive lookup becomes
+    /// eligible again without blocking never-attempted identities.
+    pub(crate) async fn reserve_historical_sources(
+        &self,
+        libraries: Vec<String>,
+        now: i64,
+    ) -> Result<Option<(String, Vec<String>)>, StateError> {
+        self.with_conn("reserve_historical_sources", move |conn| {
+            // One indexed read per selected zone; an empty queue takes no write lock.
+            let mut due = conn.prepare("SELECT retry_at FROM historical_deletion_checks WHERE library=?1 AND retry_at<=?2 ORDER BY retry_at LIMIT 1")?;
+            let mut oldest = None;
+            for zone in libraries {
+                let at:Option<i64> = due.query_row(rusqlite::params![zone,now], |row| row.get(0)).optional()?;
+                if let Some(at) = at && oldest.as_ref().is_none_or(|(prior,_)| at < *prior) { oldest=Some((at,zone)); }
+            }
+            let Some((_, library)) = oldest else { return Ok(None) };
+            let mut statement = conn.prepare("UPDATE historical_deletion_checks SET retry_at=?3
+                WHERE library=?1 AND id IN (SELECT id FROM historical_deletion_checks
+                    WHERE library=?1 AND retry_at<=?2 ORDER BY retry_at,id LIMIT 32) RETURNING id")?;
+            let ids:Vec<String> = statement.query_map(rusqlite::params![library, now, now + HISTORICAL_RETRY_SECONDS], |row| row.get(0))?.collect::<Result<_,_>>()?;
+            Ok((!ids.is_empty()).then_some((library,ids)))
+        }).await
+    }
+
+    pub(crate) async fn finish_historical_source(
+        &self,
+        library: &str,
+        id: String,
+        reserved_at: i64,
+        source: HistoricalSourceState,
+    ) -> Result<(), StateError> {
+        let library = library.to_owned();
+        self.with_conn_mut("finish_historical_source", move |conn| {
+            let tx = conn.transaction()?;
+            // Claim before applying so a superseding observation, reservation
+            // or another finisher always wins. Any guard failure rolls back.
+            if tx.execute("DELETE FROM historical_deletion_checks WHERE library=?1 AND id=?2 AND retry_at=?3", rusqlite::params![library,id,reserved_at + HISTORICAL_RETRY_SECONDS])? != 0
+                && let HistoricalSourceState::Deleted(at) = source {
+                ensure_asset_has_no_prepared_capture_repair(&tx,&library,&id,"finish_historical_source")?;
+                tx.execute("UPDATE assets SET is_deleted=1, deleted_at=COALESCE(?3,deleted_at)
+                    WHERE library=?1 AND id=?2 AND status='downloaded' AND is_deleted=0 AND source='icloud'
+                      AND NOT EXISTS (SELECT 1 FROM unattributed_legacy p WHERE p.library=assets.library AND p.asset_id=assets.id)",
+                    rusqlite::params![library,id,at.map(|d|d.timestamp())])?;
+            }
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
     #[cfg(test)]
     pub(crate) async fn should_download(
         &self,
@@ -172,6 +224,7 @@ impl SqliteStateDb {
                 local: local_checksum,
                 downloaded: download_checksum,
                 source: None,
+                embedded_fields: None,
             },
             mark_capture_repair,
         )
@@ -195,6 +248,7 @@ impl SqliteStateDb {
         let local_checksum = checksums.local.to_owned();
         let download_checksum = checksums.downloaded.map(str::to_owned);
         let source_checksum = checksums.source.map(str::to_owned);
+        let embedded_fields = checksums.embedded_fields.cloned();
 
         self.with_conn_mut("mark_downloaded", move |conn| {
             let tx = conn
@@ -247,6 +301,33 @@ impl SqliteStateDb {
                     &local_checksum,
                     source,
                 )?;
+            }
+
+            if let Some(fields) = embedded_fields.filter(|fields| *fields != Default::default()) {
+                let receipt = crate::state::types::EmbeddedMetadataReceipt {
+                    input_checksum: local_checksum.clone(),
+                    output_checksum: local_checksum.clone(),
+                    written: fields,
+                    previous: Default::default(),
+                    published: true,
+                };
+                let raw = serde_json::to_string(&receipt)
+                    .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+                // Publication, native authority and measured field ownership
+                // commit together. Identical-existing outcomes supply no fields.
+                let key = super::provider_selection::SelectionPath::from_path(&local_path).key()?;
+                let native = tx.execute(
+                    "UPDATE provider_active_destinations SET embedded_metadata_receipt=?5
+                     WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4
+                     AND current_publication=1 AND preserved_local IS NULL AND local_checksum=?6",
+                    rusqlite::params![library,id,version_size,key,raw,local_checksum],
+                )?;
+                let legacy = tx.execute(
+                    "UPDATE asset_metadata_paths SET embedded_metadata_receipt=?5
+                     WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND local_checksum=?6",
+                    rusqlite::params![library,id,version_size,local_path.to_str(),raw,local_checksum],
+                )?;
+                if native + legacy == 0 { return Err(StateError::ProviderWorkConflict); }
             }
 
             record_metadata_capture_revision(
@@ -357,13 +438,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn reset_failed(&self) -> Result<u64, StateError> {
-        let (failed, _, _) = self
-            .prepare_for_retry(None, RetryErrorRetention::Clear)
-            .await?;
-        Ok(failed)
-    }
-
+    #[cfg(test)]
     pub(crate) async fn prepare_for_retry(
         &self,
         library: Option<&str>,
@@ -1181,6 +1256,7 @@ impl DownloadStateStore for SqliteStateDb {
         local_checksum: &str,
         download_checksum: Option<&str>,
         mark_capture_repair: bool,
+        embedded_fields: &crate::state::types::EmbeddedMetadataFields,
     ) -> Result<(), StateError> {
         self.mark_downloaded_with_checksums(
             library,
@@ -1191,6 +1267,7 @@ impl DownloadStateStore for SqliteStateDb {
                 local: local_checksum,
                 downloaded: download_checksum,
                 source: download_checksum,
+                embedded_fields: Some(embedded_fields),
             },
             mark_capture_repair,
         )
@@ -1218,10 +1295,7 @@ impl DownloadStateStore for SqliteStateDb {
         SqliteStateDb::get_policy_excluded_ids_for_revalidation(self, library).await
     }
 
-    async fn reset_failed(&self) -> Result<u64, StateError> {
-        SqliteStateDb::reset_failed(self).await
-    }
-
+    #[cfg(test)]
     async fn prepare_for_retry(
         &self,
         library: Option<&str>,
@@ -1590,3 +1664,5 @@ impl DownloadContextStateStore for SqliteStateDb {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+use super::RetryErrorRetention;

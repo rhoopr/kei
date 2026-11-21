@@ -185,7 +185,7 @@ async fn reconciled_sidecar_rejects_unsafe_metadata_entries() {
 
 #[cfg(feature = "xmp")]
 #[test]
-fn plan_sidecar_write_is_comprehensive_regardless_of_flags() {
+fn plan_sidecar_write_includes_standard_fields_and_authorized_groupings() {
     let payload = rich_payload();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("photo.jpg");
@@ -193,7 +193,7 @@ fn plan_sidecar_write_is_comprehensive_regardless_of_flags() {
     let created_local = now_local() + chrono::Duration::milliseconds(629);
     let (w, source_error) = plan_sidecar_write(&path, &payload, &created_local, None);
     assert!(source_error.is_none());
-    // Every payload field should land in the sidecar write, no flag gating.
+    // Groupings have already been authorized when constructing the payload.
     assert_eq!(w.datetime.as_deref(), Some("2024-06-15T10:00:00.629"));
     assert_eq!(w.offset_time_original.as_deref(), Some("+11:00"));
     assert_eq!(w.rating, Some(4));
@@ -202,10 +202,10 @@ fn plan_sidecar_write_is_comprehensive_regardless_of_flags() {
     assert_eq!(w.description.as_deref(), Some("D"));
     assert_eq!(w.keywords.len(), 2);
     assert_eq!(w.people, vec!["Alice"]);
-    assert!(w.is_hidden);
-    assert!(w.is_archived);
-    assert_eq!(w.media_subtype.as_deref(), Some("portrait"));
-    assert_eq!(w.burst_id.as_deref(), Some("b1"));
+    assert!(!w.is_hidden);
+    assert!(!w.is_archived);
+    assert!(w.media_subtype.is_none());
+    assert!(w.burst_id.is_none());
 }
 
 #[cfg(feature = "xmp")]
@@ -269,8 +269,9 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_native_boundaries(
             });
             let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
             assert!(
-                write_sidecar_metadata(&path, payload, now_local(), Some(&checksum), ".gps-test")
+                !write_sidecar_metadata(&path, payload, now_local(), Some(&checksum), ".gps-test")
                     .await
+                    .failed
             );
             let xmp: XmpMeta =
                 std::fs::read_to_string(path.with_extension(format!("{extension}.xmp")))
@@ -451,6 +452,63 @@ async fn sidecar_write_reads_source_gps_from_dng_content() {
     }
 }
 
+/// The sidecar is a separate file, but a destination directory that rejects
+/// writes is still operational storage failure, not an ordinary retry.
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn sidecar_permission_denied_is_operational_storage_evidence() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestorePermissions {
+        path: std::path::PathBuf,
+        permissions: std::fs::Permissions,
+    }
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.path, self.permissions.clone());
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let media_dir = dir.path().join("media");
+    std::fs::create_dir(&media_dir).unwrap();
+    let media_path = media_dir.join("source.jpg");
+    std::fs::write(&media_path, minimal_jpeg_bytes()).unwrap();
+
+    let original = std::fs::metadata(&media_dir).unwrap().permissions();
+    let mut read_only = original.clone();
+    read_only.set_mode(0o555);
+    std::fs::set_permissions(&media_dir, read_only).unwrap();
+    let _restore = RestorePermissions {
+        path: media_dir.clone(),
+        permissions: original,
+    };
+    let probe = media_dir.join("write-probe");
+    if std::fs::File::create(&probe).is_ok() {
+        std::fs::remove_file(&probe).unwrap();
+        return;
+    }
+
+    let outcome = write_sidecar_metadata(
+        &media_path,
+        Arc::new(MetadataPayload {
+            title: Some("Title".into()),
+            ..MetadataPayload::default()
+        }),
+        now_local(),
+        None,
+        ".storage-test",
+    )
+    .await;
+
+    assert!(outcome.failed);
+    assert!(
+        outcome.storage_failed,
+        "permission denied writing the sidecar must surface as storage"
+    );
+    assert!(!media_path.with_extension("jpg.xmp").exists());
+}
+
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn production_sidecar_io_error_is_typed_support_evidence() {
@@ -461,7 +519,7 @@ async fn production_sidecar_io_error_is_typed_support_evidence() {
     let (layer, guard) =
         crate::support::history::start(history.clone(), serde_json::json!({})).unwrap();
     let path = dir.path().join("absent").join("PRIVATE_MEDIA.jpg");
-    let ok = write_sidecar_metadata(
+    let outcome = write_sidecar_metadata(
         &path,
         Arc::new(MetadataPayload::default()),
         now_local(),
@@ -470,7 +528,11 @@ async fn production_sidecar_io_error_is_typed_support_evidence() {
     )
     .with_subscriber(tracing_subscriber::registry().with(layer))
     .await;
-    assert!(!ok);
+    assert!(outcome.failed);
+    assert!(
+        !outcome.storage_failed,
+        "an absent sidecar parent is retryable metadata work, not storage health"
+    );
     guard.finish().await;
     let evidence = crate::support::history::test_retained_events(&history);
     assert!(evidence.iter().any(|v| v["kind"] == "support_task_error_v1"

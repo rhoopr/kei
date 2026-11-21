@@ -109,6 +109,7 @@ pub(crate) const DESIRED_KEYS: &[&str] = &[
     "extendedDescEnc",
     "adjustedMediaMetaDataEnc",
     "adjustmentSimpleDataEnc",
+    "adjustmentTimestampEnc",
     "vidComplVisibilityState",
     "customRenderedValue",
     "containerId",

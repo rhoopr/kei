@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use tokio_util::sync::CancellationToken;
 
 use crate::download::finalize::{
@@ -20,12 +18,14 @@ async fn flush_pending_state_writes_empty_is_noop() {
 
 #[tokio::test]
 async fn flush_pending_state_writes_succeeds_on_first_try() {
+    let dir = tempfile::tempdir().expect("state write fixture");
     let db = FailingDownloadStore::new(0);
     let pending = vec![PendingStateWrite {
+        embedded_fields: Default::default(),
         library: "PrimarySync".into(),
         asset_id: "A1".into(),
         version_size: VersionSizeKey::Original,
-        download_path: PathBuf::from("/tmp/codex/kei/photo.jpg"),
+        download_path: dir.path().join("photo.jpg"),
         local_checksum: "abc".into(),
         download_checksum: None,
         mark_capture_repair: false,
@@ -41,12 +41,14 @@ async fn flush_pending_state_writes_succeeds_on_first_try() {
 #[tokio::test]
 async fn flush_pending_state_writes_recovers_after_transient_failure() {
     // Fail the first attempt, succeed on retry
+    let dir = tempfile::tempdir().expect("state write fixture");
     let db = FailingDownloadStore::new(1);
     let pending = vec![PendingStateWrite {
+        embedded_fields: Default::default(),
         library: "PrimarySync".into(),
         asset_id: "A1".into(),
         version_size: VersionSizeKey::Original,
-        download_path: PathBuf::from("/tmp/codex/kei/photo.jpg"),
+        download_path: dir.path().join("photo.jpg"),
         local_checksum: "abc".into(),
         download_checksum: None,
         mark_capture_repair: false,
@@ -64,12 +66,14 @@ async fn flush_pending_state_writes_recovers_after_transient_failure() {
 #[tokio::test]
 async fn flush_pending_state_writes_reports_persistent_failure() {
     // Fail all attempts — must exceed STATE_WRITE_MAX_RETRIES
+    let dir = tempfile::tempdir().expect("state write fixture");
     let db = FailingDownloadStore::new(STATE_WRITE_MAX_RETRIES as usize);
     let pending = vec![PendingStateWrite {
+        embedded_fields: Default::default(),
         library: "PrimarySync".into(),
         asset_id: "A1".into(),
         version_size: VersionSizeKey::Original,
-        download_path: PathBuf::from("/tmp/codex/kei/photo.jpg"),
+        download_path: dir.path().join("photo.jpg"),
         local_checksum: "abc".into(),
         download_checksum: None,
         mark_capture_repair: false,
@@ -85,13 +89,15 @@ async fn flush_pending_state_writes_reports_persistent_failure() {
 async fn flush_pending_state_writes_partial_recovery() {
     // First write exhausts all STATE_WRITE_MAX_RETRIES attempts (reported as failure).
     // Second write fails once more then succeeds on retry.
+    let dir = tempfile::tempdir().expect("state write fixture");
     let db = FailingDownloadStore::new(STATE_WRITE_MAX_RETRIES as usize + 1);
     let pending = vec![
         PendingStateWrite {
+            embedded_fields: Default::default(),
             library: "PrimarySync".into(),
             asset_id: "A1".into(),
             version_size: VersionSizeKey::Original,
-            download_path: PathBuf::from("/tmp/codex/kei/photo1.jpg"),
+            download_path: dir.path().join("photo1.jpg"),
             local_checksum: "abc".into(),
             download_checksum: None,
             mark_capture_repair: false,
@@ -99,10 +105,11 @@ async fn flush_pending_state_writes_partial_recovery() {
             requires_retained: false,
         },
         PendingStateWrite {
+            embedded_fields: Default::default(),
             library: "PrimarySync".into(),
             asset_id: "A2".into(),
             version_size: VersionSizeKey::Original,
-            download_path: PathBuf::from("/tmp/codex/kei/photo2.jpg"),
+            download_path: dir.path().join("photo2.jpg"),
             local_checksum: "def".into(),
             download_checksum: None,
             mark_capture_repair: false,
@@ -122,13 +129,15 @@ async fn flush_pending_state_writes_partial_recovery() {
 async fn flush_pending_state_writes_retains_all_records() {
     // 5 pending writes. First 2 failures are transient (writes 1&2 fail once
     // each then succeed on retry). All 5 should eventually succeed.
+    let dir = tempfile::tempdir().expect("state write fixture");
     let db = FailingDownloadStore::new(2);
     let pending: Vec<PendingStateWrite> = (0..5)
         .map(|i| PendingStateWrite {
+            embedded_fields: Default::default(),
             library: "PrimarySync".into(),
             asset_id: format!("ASSET_{i}").into(),
             version_size: VersionSizeKey::Original,
-            download_path: PathBuf::from(format!("/tmp/codex/kei/photo_{i}.jpg")),
+            download_path: dir.path().join(format!("photo_{i}.jpg")),
             local_checksum: format!("ck_{i}"),
             download_checksum: Some(format!("dl_ck_{i}")),
             mark_capture_repair: false,
@@ -144,13 +153,15 @@ async fn flush_pending_state_writes_retains_all_records() {
 
 #[tokio::test(start_paused = true)]
 async fn flush_pending_state_writes_retains_only_persistent_failures() {
+    let dir = tempfile::tempdir().expect("state write fixture");
     let db = FailingDownloadStore::new(STATE_WRITE_MAX_RETRIES as usize + 1);
     let mut pending = vec![
         PendingStateWrite {
+            embedded_fields: Default::default(),
             library: "PrimarySync".into(),
             asset_id: "A1".into(),
             version_size: VersionSizeKey::Original,
-            download_path: PathBuf::from("/tmp/codex/kei/photo1.jpg"),
+            download_path: dir.path().join("photo1.jpg"),
             local_checksum: "abc".into(),
             download_checksum: None,
             mark_capture_repair: false,
@@ -158,10 +169,11 @@ async fn flush_pending_state_writes_retains_only_persistent_failures() {
             requires_retained: false,
         },
         PendingStateWrite {
+            embedded_fields: Default::default(),
             library: "PrimarySync".into(),
             asset_id: "A2".into(),
             version_size: VersionSizeKey::Original,
-            download_path: PathBuf::from("/tmp/codex/kei/photo2.jpg"),
+            download_path: dir.path().join("photo2.jpg"),
             local_checksum: "def".into(),
             download_checksum: None,
             mark_capture_repair: false,

@@ -1,0 +1,26 @@
+name: Daily live wiki check
+
+on:
+  schedule:
+    - cron: "43 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wiki:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.94.1"
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - run: |
+          git clone --depth=1 https://github.com/rhoopr/kei.wiki.git "$RUNNER_TEMP/kei-wiki"
+          scripts/check-wiki-commands.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/kei-wiki"

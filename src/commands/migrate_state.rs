@@ -15,7 +15,7 @@ pub(crate) async fn run_migrate_state(
         "Legacy adoption requires --confirm-ownership; a filename cannot prove ownership."
     );
     let (username, password, domain, directory) =
-        config::resolve_auth(globals, &args.password, toml);
+        config::resolve_auth(globals, &args.password, toml)?;
     anyhow::ensure!(
         !username.is_empty(),
         "Set your iCloud username with ICLOUD_USERNAME or [auth].username."
@@ -82,8 +82,9 @@ pub(crate) async fn run_migrate_state(
     )
     .await?;
     println!(
-        "Legacy state adopted into {}. All legacy files are preserved. Legacy encrypted credentials are not copied; re-save them with `kei password set` if needed.",
-        destination.display()
+        "Legacy state adopted into {}. All legacy files are preserved. Legacy encrypted credentials are not copied; re-save them with `{}` if needed.",
+        destination.display(),
+        cli::command_for_config("password set", globals.config_source.recovery_path())
     );
     Ok(())
 }

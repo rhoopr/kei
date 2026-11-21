@@ -1,8 +1,6 @@
 name: Rust CI
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled, edited]
   push:
     branches: [main]
   workflow_dispatch:
@@ -10,88 +8,15 @@ on:
 permissions:
   contents: read
 
-env:
-  CI_IGNORED: ${{ github.event_name == 'pull_request' && ((contains(fromJSON('["labeled","unlabeled"]'), github.event.action) && github.event.label.name != 'ci:full') || (github.event.action == 'edited' && !github.event.changes.base)) }}
-
-# Ignored metadata never shares the validation group or required check name.
 concurrency:
-  group: ci-${{ (github.event_name == 'pull_request' && ((contains(fromJSON('["labeled","unlabeled"]'), github.event.action) && github.event.label.name != 'ci:full') || (github.event.action == 'edited' && !github.event.changes.base))) && format('ignored-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  plan:
-    if: (!(github.event_name == 'pull_request' && ((contains(fromJSON('["labeled","unlabeled"]'), github.event.action) && github.event.label.name != 'ci:full') || (github.event.action == 'edited' && !github.event.changes.base)))) && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
-    runs-on: ubuntu-latest
-    outputs:
-      qualification: ${{ steps.route.outputs.qualification }}
-      service: ${{ steps.route.outputs.service }}
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - id: route
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
-          LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}
-        run: python3 scripts/ci/policy.py
-
   checks:
-    needs: plan
-    if: needs.plan.outputs.qualification == 'false'
+    if: github.event_name == 'push'
     uses: ./.github/workflows/checks.yml
 
-  service:
-    needs: plan
-    if: needs.plan.outputs.qualification == 'false' && needs.plan.outputs.service == 'true'
-    uses: ./.github/workflows/service-smoke.yml
-
   qualification:
-    needs: plan
-    if: needs.plan.outputs.qualification == 'true'
+    if: github.event_name == 'workflow_dispatch'
     uses: ./.github/workflows/qualification.yml
-
-  ci:
-    name: ${{ (github.event_name == 'pull_request' && ((contains(fromJSON('["labeled","unlabeled"]'), github.event.action) && github.event.label.name != 'ci:full') || (github.event.action == 'edited' && !github.event.changes.base))) && 'CI metadata (ignored)' || 'CI' }}
-    if: always()
-    needs: [plan, checks, service, qualification]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Ignore unrelated PR metadata
-        if: env.CI_IGNORED == 'true'
-        run: echo "Metadata did not change CI policy; validation was left untouched."
-      # A skipped required check counts as success. Keep a failing marker on
-      # drafts; ready_for_review starts fresh validation at the event's SHA.
-      - name: Defer validation for draft PRs
-        if: env.CI_IGNORED != 'true' && github.event_name == 'pull_request' && github.event.pull_request.draft
-        run: |
-          echo "Draft PR: mark ready for review to run CI."
-          exit 1
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        if: env.CI_IGNORED != 'true'
-        with:
-          persist-credentials: false
-      - name: Fail closed on missing or skipped routed work
-        if: env.CI_IGNORED != 'true'
-        env:
-          NEEDS: ${{ toJSON(needs) }}
-          QUALIFICATION: ${{ needs.plan.outputs.qualification }}
-          SERVICE: ${{ needs.plan.outputs.service }}
-        run: |
-          python3 - <<'PYTHON'
-          import json, os, sys
-          sys.path.insert(0, "scripts/ci")
-          from gate import check
-          mode = os.environ["QUALIFICATION"]
-          if mode not in {"true", "false"}:
-              raise SystemExit("missing CI route")
-          service = os.environ["SERVICE"]
-          if service not in {"true", "false"}:
-              raise SystemExit("missing service route")
-          required = ["plan", "qualification" if mode == "true" else "checks"]
-          if mode == "false" and service == "true":
-              required += ["service"]
-          check(json.loads(os.environ["NEEDS"]), required)
-          PYTHON

@@ -33,6 +33,32 @@ pub(super) use fingerprint::fingerprint_open_file_snapshot_blocking;
 pub(crate) use fingerprint::imported_path_matches_receipt;
 pub(super) use fingerprint::{RetainedPendingFile, retain_pending_file};
 pub(super) use fingerprint::{fingerprint_downloaded_path, fingerprint_regular_file};
+#[cfg(all(test, feature = "xmp", target_os = "linux"))]
+pub(super) use platform::RECONCILIATION_RENAME_FAULT;
+pub(super) use publication::PublicationOutcome;
+#[cfg(all(feature = "xmp", target_os = "linux"))]
+pub(super) use replacement_recovery::finish_owned_prepared_link;
+
+/// Inspect confined regular bytes for an explicit integrity confirmation.
+pub(crate) async fn inspect_integrity_fingerprint(
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> anyhow::Result<(String, u64)> {
+    let path = crate::fs_util::absolute_confined_path(path)?;
+    let root = crate::fs_util::absolute_confined_path(root)?;
+    anyhow::ensure!(path.starts_with(&root), "Inspection outside destination");
+    // An inspected path can come from a retained receipt. Its parent is
+    // not an independent trust anchor: pin every ancestor of the file.
+    let anchor = path
+        .ancestors()
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("Missing filesystem root"))?;
+    let fingerprint = fingerprint_downloaded_path(anchor, &path).await?;
+    Ok((
+        data_encoding::HEXLOWER.encode(&fingerprint.sha256),
+        fingerprint.size,
+    ))
+}
 #[cfg(test)]
 pub(super) use publication::rename_part_to_final;
 #[cfg_attr(
@@ -50,6 +76,7 @@ pub(super) use replacement::FinalPublication;
 pub(super) use replacement::classify_conditional_publish_error;
 #[cfg(feature = "xmp")]
 pub(super) use replacement::publish_file_if_unchanged;
+pub(super) use replacement::publish_file_if_unchanged_at_mtime_blocking;
 pub(super) use replacement::publish_file_if_unchanged_blocking;
 pub(super) use staging::{CleanupLeases, lock_download_destination};
 pub(super) use transfer::DownloadClient;

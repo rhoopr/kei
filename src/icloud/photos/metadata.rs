@@ -8,6 +8,7 @@
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+use crate::state::types::embedded_absence;
 use crate::state::{AssetMetadata, RenditionMetadata, VersionSizeKey};
 
 use super::asset::f64_to_millis_datetime;
@@ -30,6 +31,7 @@ const PROVIDER_DATA_FIELDS: &[&str] = &[
     "adjustmentRenderType",
     "adjustmentType",
     "adjustmentSimpleDataEnc",
+    "adjustmentTimestampEnc",
     "adjustedMediaMetaDataEnc",
     "vidComplDurValue",
     "vidComplDurScale",
@@ -63,8 +65,8 @@ pub fn extract(master_fields: &Value, asset_fields: &Value) -> AssetMetadata {
         // consistently without special-casing iCloud.
         meta.rating = Some(5);
     }
-    meta.is_hidden = bool_field(asset_fields, "isHidden").unwrap_or(false);
-    meta.is_deleted = bool_field(asset_fields, "isDeleted").unwrap_or(false)
+    meta.is_hidden = change_flag_is_set(asset_fields, "isHidden");
+    meta.is_deleted = change_flag_is_set(asset_fields, "isDeleted")
         || bool_field(asset_fields, "isExpunged").unwrap_or(false);
     meta.deleted_at = f64_field(asset_fields, "dateExpunged").and_then(f64_to_millis_datetime);
 
@@ -213,6 +215,58 @@ fn map_media_subtype(fields: &Value) -> Option<String> {
 
 fn collect_provider_data(master_fields: &Value, asset_fields: &Value) -> Option<String> {
     let mut obj = serde_json::Map::new();
+    let empty = |key: &str| {
+        asset_fields
+            .get(key)
+            .and_then(|field| field.get("value"))
+            .is_some_and(|value| value.is_null() || value.as_str() == Some(""))
+    };
+    let mut absent = 0_u8;
+    if ["locationV2Enc", "locationEnc", "latitude", "longitude"]
+        .into_iter()
+        .all(empty)
+    {
+        absent |= embedded_absence::GPS;
+    }
+    if bool_field(asset_fields, "isFavorite") == Some(false) {
+        absent |= embedded_absence::RATING;
+    }
+    if empty("captionEnc") {
+        absent |= embedded_absence::TITLE;
+    }
+    if empty("extendedDescEnc") && empty("captionEnc") {
+        absent |= embedded_absence::DESCRIPTION;
+    }
+    if empty("keywordsEnc")
+        || enc::decode_keywords(asset_fields).is_some_and(|values| values.is_empty())
+    {
+        absent |= embedded_absence::KEYWORDS;
+    }
+    if absent != 0 {
+        obj.insert("kei_explicit_absence".into(), json!(absent));
+    }
+    // Only the master's original resource describes unrendered original pixels.
+    // An asset-level resource takes precedence in extract_versions, so even an
+    // identically named asset resource must not inherit the master's orientation.
+    if asset_fields.get("resOriginalRes").is_none()
+        && let Some(orientation) =
+            u64_field(master_fields, "originalOrientation").filter(|value| (1..=8).contains(value))
+        && let Some(checksum) = master_fields
+            .pointer("/resOriginalRes/value/fileChecksum")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        && matches!(
+            master_fields
+                .pointer("/resOriginalFileType/value")
+                .and_then(Value::as_str),
+            Some("public.jpeg" | "public.tiff")
+        )
+    {
+        obj.insert(
+            "kei_original_orientation".into(),
+            json!({"checksum":checksum, "orientation":orientation}),
+        );
+    }
     for field in PROVIDER_DATA_FIELDS {
         if let Some(value) = extract_raw_value(asset_fields, field)
             .or_else(|| extract_raw_value(master_fields, field))
@@ -241,6 +295,50 @@ fn extract_raw_value(fields: &Value, key: &str) -> Option<Value> {
             v
         }
     })
+}
+
+/// Return only orientation evidence bound to this exact untransformed original.
+/// Legacy catalogue orientation alone is not rendition provenance.
+pub(crate) fn original_orientation(
+    metadata: &AssetMetadata,
+    version: VersionSizeKey,
+    checksum: &str,
+) -> Option<u8> {
+    if version != VersionSizeKey::Original || metadata.source.as_deref() != Some(SOURCE) {
+        return None;
+    }
+    let data: Value = serde_json::from_str(metadata.provider_data.as_deref()?).ok()?;
+    let proof = data.get("kei_original_orientation")?;
+    if proof.get("checksum")?.as_str()? != checksum || checksum.trim().is_empty() {
+        return None;
+    }
+    proof
+        .get("orientation")?
+        .as_u64()
+        .filter(|value| (1..=8).contains(value))
+        .and_then(|value| u8::try_from(value).ok())
+}
+
+/// Missing or malformed provider fields are unobserved, never clear authority.
+pub(crate) fn explicit_metadata_absence(metadata: &AssetMetadata) -> u8 {
+    if metadata.source.as_deref() != Some(SOURCE) {
+        return 0;
+    }
+    metadata
+        .provider_data
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| value.get("kei_explicit_absence").and_then(Value::as_u64))
+        .and_then(|value| u8::try_from(value).ok())
+        .unwrap_or_default()
+}
+
+/// Only boolean true and integer 1 assert a remote deletion or visibility flag.
+pub(super) fn change_flag_is_set(fields: &Value, key: &str) -> bool {
+    fields
+        .get(key)
+        .and_then(|field| field.get("value"))
+        .is_some_and(|value| value.as_bool() == Some(true) || value.as_i64() == Some(1))
 }
 
 fn bool_field(fields: &Value, key: &str) -> Option<bool> {
@@ -274,6 +372,34 @@ fn string_field(fields: &Value, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_field_absence_survives_roundtrip_without_treating_missing_as_removed() {
+        use crate::state::types::embedded_absence;
+        let unknown = super::extract(&serde_json::json!({}), &serde_json::json!({}));
+        assert_eq!(super::explicit_metadata_absence(&unknown), 0);
+        let invalid = super::extract(
+            &serde_json::json!({}),
+            &serde_json::json!({"keywordsEnc":{"value":"not-base64","type":"ENCRYPTED_BYTES"},"isFavorite":{"value":"invalid"}}),
+        );
+        assert_eq!(super::explicit_metadata_absence(&invalid), 0);
+        let cleared = super::extract(
+            &serde_json::json!({}),
+            &serde_json::json!({
+                "isFavorite":{"value":0},"captionEnc":{"value":null},"extendedDescEnc":{"value":null},"keywordsEnc":{"value":null},
+                "locationV2Enc":{"value":null},"locationEnc":{"value":null},"latitude":{"value":null},"longitude":{"value":null}
+            }),
+        );
+        let reopened = serde_json::from_str(&serde_json::to_string(&cleared).unwrap()).unwrap();
+        assert_eq!(
+            super::explicit_metadata_absence(&reopened),
+            embedded_absence::RATING
+                | embedded_absence::TITLE
+                | embedded_absence::DESCRIPTION
+                | embedded_absence::KEYWORDS
+                | embedded_absence::GPS
+        );
+        assert_eq!(cleared.compute_hash(), reopened.compute_hash());
+    }
     use super::*;
     use base64::Engine;
     use plist::Value as PlistValue;

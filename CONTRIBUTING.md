@@ -70,14 +70,13 @@ must cover interruption, retry, partial completion, and stale configuration.
 6. Review the diff for unrelated changes, unnecessary complexity, missed
    consumers, and incomplete docs.
 7. Run focused tests for the changed behavior, formatting, and lint checks.
-   Hosted PR CI owns the complete offline suites, platform checks, and routed
-   stress checks. Do not run the complete local gate merely to repeat it in CI.
+   Every PR runs the Linux baseline. Main pushes run the complete offline suites, platform tests and copies stress.
    Use `just gate` when diagnosing a failure or working without hosted CI.
    The [recipes](justfile) define the commands. See the
    [test entry points](tests/README.md#running) for focused checks.
    Live-provider and real host-service tests belong on an explicitly approved,
    isolated local fixture when the change needs them, not on every PR.
-   Read [CI qualification](docs/ci.md) for routing and release prerequisites.
+   Read [CI qualification](docs/ci.md) for the PR baseline and release prerequisites.
    Tool versions are pinned in [.github/workflows/checks.yml](.github/workflows/checks.yml).
 
 8. Open a pull request against `main`.
@@ -107,8 +106,7 @@ credentials. They are `#[ignore]` by default. See
 just test live
 ```
 
-Most changes do not need live tests. CI runs the offline suite on every pull
-request.
+Most changes do not need live tests. Every pull request runs the offline sync-safety suite.
 
 ## Pull requests and review
 

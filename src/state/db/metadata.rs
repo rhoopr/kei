@@ -169,7 +169,7 @@ pub(super) fn metadata_capture_status(
     let (unattributed_legacy_assets, unattributed_legacy_pending) =
         super::legacy_preservation::counts(conn, library)?;
     let (active_revision, pending_revision, processed, failed, last_error) = row.unwrap_or({
-        if remaining_assets > 0 || unattributed_legacy_assets > 0 {
+        if remaining_assets > 0 {
             (0, Some(target_revision), 0, 0, None)
         } else {
             (target_revision, None, 0, 0, None)
@@ -279,17 +279,28 @@ fn query_selection_and_legacy_metadata(
     let scope = libraries
         .map(|values| format!(" AND library IN ({})", sqlite_placeholders(values.len())))
         .unwrap_or_default();
+    // A frozen native writer must still match the durable metadata snapshot.
+    // Unfinished metadata-enabled native receipts exclude legacy fallback on
+    // their exact path. Completed publications and metadata-disabled generations
+    // must still allow later local metadata and membership rewrites. A completed
+    // exact current receipt also supersedes an older unfinished writer there.
     let sql = format!(
         r"WITH active AS (
         SELECT w.*, min(g.created_at) OVER writer AS ready_at, g.scope,
             json_extract(g.specification,'$.metadata_flags') AS flags,
             row_number() OVER (writer ORDER BY (w.prepared_hash IS NULL),w.generation,w.pass_key,w.child) AS representative
         FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation
-        WHERE w.admitted=1 AND w.verified_media=1 AND w.verified_metadata=0
+        WHERE w.admitted=1 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL) AND w.verified_metadata=0
             AND w.grouping_hash IS NOT NULL AND g.metadata_enabled=1 {generation_filter}
+            AND EXISTS(SELECT 1 FROM assets a WHERE a.library=w.library AND a.id=w.asset_id
+                AND a.version_size=w.version_size AND a.checksum=w.checksum
+                AND a.metadata_hash IS w.metadata_hash AND a.created_at IS w.created_at
+                AND a.added_at IS w.added_at AND a.is_deleted=0)
         WINDOW writer AS (PARTITION BY g.scope,w.library,w.asset_id,w.master,
             w.version_size,w.path,w.checksum,w.size_bytes,w.created_at,w.added_at,
             w.metadata_hash,w.local_checksum,w.source_checksum,w.grouping_hash,
+            (w.preserved_local IS NOT NULL),json_extract(w.preserved_local,'$.size'),
+            json_extract(w.preserved_local,'$.modified'),
             json_extract(g.specification,'$.metadata_flags'))
     ) SELECT kind,generation,pass_key,child,library,id,version_size,path FROM (
         SELECT 0 AS kind,'' AS generation,'' AS pass_key,'' AS child,library,id,version_size,
@@ -297,10 +308,26 @@ fn query_selection_and_legacy_metadata(
         FROM ({source}) rewrite_source WHERE metadata_write_failed_at IS NOT NULL AND status='downloaded'
             AND is_deleted=0 AND local_path IS NOT NULL {legacy_filter}
             AND NOT EXISTS(SELECT 1 FROM unattributed_legacy u WHERE u.library=rewrite_source.library AND u.asset_id=rewrite_source.id)
-            AND NOT EXISTS(SELECT 1 FROM active w WHERE w.library=rewrite_source.library AND w.asset_id=rewrite_source.id
-                AND w.version_size=rewrite_source.version_size AND w.metadata_hash IS rewrite_source.metadata_hash
-                AND w.checksum=rewrite_source.checksum AND w.compat_path=rewrite_source.local_path
-                AND json_extract(w.path,'$.encoding')='utf8' AND json_extract(w.path,'$.path')=rewrite_source.local_path)
+            AND NOT EXISTS(SELECT 1 FROM provider_active_destinations preserved
+                WHERE preserved.library=rewrite_source.library AND preserved.asset_id=rewrite_source.id
+                AND preserved.version_size=rewrite_source.version_size AND preserved.compat_path=rewrite_source.local_path
+                AND preserved.admitted=1 AND preserved.preserved_local IS NOT NULL)
+            AND NOT EXISTS(SELECT 1 FROM provider_active_destinations w
+                JOIN provider_active_generations g ON g.id=w.generation
+                WHERE w.library=rewrite_source.library AND w.asset_id=rewrite_source.id
+                AND w.version_size=rewrite_source.version_size AND w.admitted=1 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL)
+                AND w.verified_metadata=0 AND g.metadata_enabled=1
+                AND w.compat_path=rewrite_source.local_path
+                AND json_extract(w.path,'$.encoding')='utf8' AND json_extract(w.path,'$.path')=rewrite_source.local_path
+                AND NOT EXISTS(SELECT 1 FROM provider_active_destinations done
+                    WHERE done.library=w.library AND done.asset_id=w.asset_id
+                    AND done.version_size=w.version_size AND done.path=w.path
+                    AND done.admitted=1 AND done.verified_media=1 AND done.verified_metadata=1
+                    AND done.checksum=rewrite_source.checksum
+                    AND done.local_checksum IS rewrite_source.local_checksum
+                    AND done.metadata_hash IS rewrite_source.metadata_hash
+                    AND done.created_at IS rewrite_source.created_at
+                    AND done.added_at IS rewrite_source.added_at))
             AND {UNAMBIGUOUS_LEGACY_PATH}
         UNION ALL SELECT 1,generation,pass_key,child,library,asset_id,version_size,path,ready_at
             FROM active WHERE representative=1
@@ -889,9 +916,21 @@ impl SqliteStateDb {
         generation: String,
         limit: usize,
     ) -> Result<Vec<PendingMetadataRewrite>, StateError> {
+        self.pending_selection_metadata_page(owner, generation, 0, limit.min(250))
+            .await
+    }
+
+    /// Rotate through current destinations without executing historical writers.
+    pub(crate) async fn pending_selection_metadata_page(
+        &self,
+        owner: super::account::AccountOwner,
+        generation: String,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<PendingMetadataRewrite>, StateError> {
         self.with_conn("reading current selected metadata", move |conn| {
             super::account::validate_authenticated(conn, &owner)?;
-            query_selection_and_legacy_metadata(conn, None, 0, limit.min(250), Some(&generation))
+            query_selection_and_legacy_metadata(conn, None, offset, limit, Some(&generation))
         })
         .await
     }
@@ -988,6 +1027,18 @@ impl SqliteStateDb {
             let tx = conn
                 .transaction()
                 .map_err(|e| StateError::query("finish_metadata_rewrite::begin", e))?;
+            if selection_pending.selection_receipt.as_ref().is_some_and(|receipt| receipt.preserved_local.is_some()) {
+                let completed = super::provider_generations::finish_metadata_receipt(
+                    &tx, &selection_pending, local_checksum.as_deref(),
+                    completion.clears(MetadataRewriteQueue::Ordinary),
+                )?;
+                if completed == Some(true) {
+                    tx.execute("UPDATE asset_metadata_paths SET metadata_write_failed_at=NULL WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4", rusqlite::params![library,asset_id,version_size,path.to_str()])?;
+                    tx.execute("UPDATE assets SET metadata_write_failed_at=NULL WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4", rusqlite::params![library,asset_id,version_size,path.to_str()])?;
+                }
+                tx.commit()?;
+                return Ok(completed.unwrap_or(false));
+            }
             let target = metadata_rewrite_target(&tx, &library, &asset_id, &version_size, &path)?;
             let updated = if let Some(target) = target {
                 let (table, evidence) = target.sql();
@@ -1057,6 +1108,17 @@ impl SqliteStateDb {
                 local_checksum.as_deref(),
                 completion.clears(MetadataRewriteQueue::Ordinary),
             )?;
+            if selected.is_none() && updated > 0 && local_checksum.is_some() {
+                // Legacy completion has no validated native selection receipt.
+                // Retire obsolete native authority rather than lending a lossy
+                // catalogue path's output to an independent copy.
+                super::provider_generations::replace_current_publication(
+                    &tx, &library, &super::provider_selection::SelectionPath::from_path(&path).key()?, None,
+                )?;
+            }
+            if (updated > 0 || selected == Some(true)) && local_checksum.is_some() {
+                tx.execute("UPDATE asset_metadata_paths SET embedded_metadata_receipt=json_set(embedded_metadata_receipt,'$.published',json('true')) WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND json_extract(embedded_metadata_receipt,'$.output_checksum')=?5",rusqlite::params![library,asset_id,version_size,path.to_str(),local_checksum])?;
+            }
             tx.commit()
                 .map_err(|e| StateError::query("finish_metadata_rewrite::commit", e))?;
             Ok(selected.unwrap_or(updated > 0 && completion.clears(selected_queue)))
@@ -1228,12 +1290,7 @@ impl SqliteStateDb {
             })?;
             metadata_capture_retry::retire_completed(&tx, &library)?;
             let remaining = metadata_capture_remaining(&tx, &library, target_revision)?;
-            let protected: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM unattributed_legacy WHERE library=?1)",
-                [&library],
-                |row| row.get(0),
-            )?;
-            if remaining == 0 && !protected {
+            if remaining == 0 {
                 tx.execute(
                     "UPDATE metadata_capture_state SET active_revision = MAX(active_revision, ?1), \
                         pending_revision = NULL, failed_assets = 0, last_error = NULL, \
@@ -1262,9 +1319,7 @@ impl SqliteStateDb {
         let libraries = unique_sorted_strings(libraries);
         self.with_conn("has_metadata_capture_work", move |conn| {
             for library in libraries {
-                if metadata_capture_remaining(conn, &library, target_revision)? > 0
-                    || super::legacy_preservation::counts(conn, &library)?.1 > 0
-                {
+                if metadata_capture_remaining(conn, &library, target_revision)? > 0 {
                     return Ok(true);
                 }
                 let pending: bool = conn
@@ -1383,6 +1438,115 @@ impl SqliteStateDb {
 
 #[async_trait]
 impl MetadataRewriteStore for SqliteStateDb {
+    async fn recover_embedded_metadata_receipt(
+        &self,
+        pending: &PendingMetadataRewrite,
+        receipt: &crate::state::types::EmbeddedMetadataReceipt,
+        output_size: u64,
+    ) -> Result<(), StateError> {
+        let pending = pending.clone();
+        let receipt = receipt.clone();
+        let (library, id, version, path) = (
+            pending.asset.library.to_string(),
+            pending.asset.id.to_string(),
+            pending.asset.version_size.as_str().to_owned(),
+            pending
+                .asset
+                .local_path
+                .clone()
+                .ok_or(StateError::ProviderSelectionInvalid)?,
+        );
+        let raw = serde_json::to_string(&receipt)
+            .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+        let (input, output) = (
+            receipt.input_checksum.clone(),
+            receipt.output_checksum.clone(),
+        );
+        self.with_conn_mut("recover prepared field output", move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let selected = super::provider_generations::recover_metadata_field_output(&tx, &pending, &receipt, output_size)?;
+            let changed = tx.execute("UPDATE asset_metadata_paths SET local_checksum=?7
+                WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND embedded_metadata_receipt=?5
+                AND (local_checksum IS NULL OR local_checksum IN (?6,?7))
+                AND provider_checksum=(SELECT checksum FROM assets WHERE library=?1 AND id=?2 AND version_size=?3)",rusqlite::params![library,id,version,path.to_str(),raw,input,output])?;
+            if changed+selected == 0 { return Err(StateError::ProviderWorkConflict); }
+            // Preserve every retry/intent marker: the recovered bytes belong to
+            // the previous write, not necessarily today's provider metadata.
+            tx.execute("UPDATE assets SET local_checksum=?6 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND (local_checksum IS NULL OR local_checksum IN (?5,?6))",rusqlite::params![library,id,version,path.to_str(),input,output])?;
+            tx.commit()?; Ok(())
+        }).await
+    }
+    async fn embedded_metadata_receipt(
+        &self,
+        library: &str,
+        id: &str,
+        version: &str,
+        path: &Path,
+        pending: Option<&PendingMetadataRewrite>,
+    ) -> Result<Option<crate::state::types::EmbeddedMetadataReceipt>, StateError> {
+        let selected = pending.and_then(|pending| pending.selection_receipt.clone());
+        let (library, id, version, path) = (
+            library.to_owned(),
+            id.to_owned(),
+            version.to_owned(),
+            path.to_owned(),
+        );
+        self.with_conn("reading embedded field ownership", move |conn| {
+            use rusqlite::OptionalExtension;
+            let key = super::provider_selection::SelectionPath::from_path(&path).key()?;
+            let raw: Option<Option<String>> = conn.query_row("SELECT evidence FROM (
+                SELECT p.embedded_metadata_receipt AS evidence,2 AS kind FROM asset_metadata_paths p
+                JOIN assets a USING(library,id,version_size) WHERE p.library=?1 AND p.id=?2 AND p.version_size=?3
+                AND p.local_path=?4 AND p.provider_checksum=a.checksum AND p.embedded_metadata_receipt IS NOT NULL
+                UNION ALL SELECT w.embedded_metadata_receipt,1 FROM provider_active_destinations w
+                WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3 AND w.path=?5
+                AND w.current_publication=1
+                UNION ALL SELECT w.embedded_metadata_receipt,0 FROM provider_active_destinations w
+                WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3 AND w.path=?5
+                AND w.generation=?6 AND w.pass_key=?7 AND w.child=?8 AND w.admitted=1
+                AND w.embedded_metadata_receipt IS NOT NULL
+                AND (w.current_publication=1 OR json_extract(w.embedded_metadata_receipt,'$.published')=0)
+                AND (json_extract(w.embedded_metadata_receipt,'$.output_checksum')=w.local_checksum
+                     OR (json_extract(w.embedded_metadata_receipt,'$.published')=0 AND json_extract(w.embedded_metadata_receipt,'$.input_checksum')=w.local_checksum))
+                ) ORDER BY kind LIMIT 1", rusqlite::params![library,id,version,path.to_str(),key,
+                    selected.as_ref().map(|s| &s.generation),selected.as_ref().map(|s| &s.pass_key),selected.as_ref().map(|s| &s.child)], |row| row.get(0)).optional()?;
+            raw.flatten().map(|value| serde_json::from_str(&value).map_err(|_invalid| StateError::ProviderSelectionInvalid)).transpose()
+        }).await
+    }
+
+    async fn record_embedded_metadata_receipt(
+        &self,
+        pending: &PendingMetadataRewrite,
+        receipt: &crate::state::types::EmbeddedMetadataReceipt,
+    ) -> Result<(), StateError> {
+        let selected = pending.selection_receipt.clone();
+        let (library, id, version, path) = (
+            pending.asset.library.to_string(),
+            pending.asset.id.to_string(),
+            pending.asset.version_size.as_str().to_owned(),
+            pending
+                .asset
+                .local_path
+                .clone()
+                .ok_or(StateError::ProviderSelectionInvalid)?,
+        );
+        let raw = serde_json::to_string(receipt)
+            .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+        let (input, output) = (
+            receipt.input_checksum.clone(),
+            receipt.output_checksum.clone(),
+        );
+        self.with_conn_mut("recording embedded field ownership", move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let key = super::provider_selection::SelectionPath::from_path(&path).key()?;
+            let mut changed = tx.execute("UPDATE asset_metadata_paths SET embedded_metadata_receipt=?5 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND (local_checksum IS NULL OR local_checksum IN (?6,?7))", rusqlite::params![library,id,version,path.to_str(),raw,input,output])?;
+            if let Some(selected) = &selected {
+                changed += tx.execute("UPDATE provider_active_destinations SET embedded_metadata_receipt=?5 WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND admitted=1 AND local_checksum IN (?6,?7) AND generation=?8 AND pass_key=?9 AND child=?10", rusqlite::params![library,id,version,key,raw,input,output,selected.generation,selected.pass_key,selected.child])?;
+            }
+            if changed == 0 { return Err(StateError::ProviderWorkConflict); }
+            tx.commit()?; Ok(())
+        }).await
+    }
     async fn protected_legacy_paths(&self) -> Result<Vec<std::path::PathBuf>, StateError> {
         self.with_conn(
             "protected_legacy_paths",
@@ -1430,20 +1594,14 @@ impl MetadataRewriteStore for SqliteStateDb {
     > {
         SqliteStateDb::legacy_child_provenance(self, library, id, rendition).await
     }
-    async fn legacy_child_receipts(
+    async fn qualified_child_receipts(
         &self,
         library: &str,
         id: &str,
+        requires_metadata: bool,
     ) -> Result<Vec<crate::state::AssetRecord>, crate::state::error::StateError> {
-        SqliteStateDb::legacy_child_receipts(self, library, id).await
-    }
-    async fn legacy_child_receipt_refusal(
-        &self,
-        library: &str,
-        id: &str,
-        version_size: &str,
-    ) -> Result<super::LegacyChildReceiptRefusal, StateError> {
-        SqliteStateDb::legacy_child_receipt_refusal(self, library, id, version_size).await
+        self.qualified_child_receipts(library, id, requires_metadata)
+            .await
     }
     async fn legacy_preparation_snapshots(
         &self,
@@ -1467,27 +1625,6 @@ impl MetadataRewriteStore for SqliteStateDb {
     ) -> Result<bool, crate::state::error::StateError> {
         SqliteStateDb::prepare_legacy_preservation_validated(self, snapshot, files, validate_files)
             .await
-    }
-    async fn legacy_preservations(
-        &self,
-        library: &str,
-    ) -> Result<Vec<super::LegacyPreservation>, StateError> {
-        SqliteStateDb::legacy_preservations(self, library).await
-    }
-    async fn legacy_dependency_evidence(
-        &self,
-        library: &str,
-        id: &str,
-    ) -> Result<String, StateError> {
-        SqliteStateDb::legacy_dependency_evidence(self, library, id).await
-    }
-    async fn reactivate_legacy_preservation(
-        &self,
-        library: &str,
-        id: &str,
-        expected_generation: Option<i64>,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::reactivate_legacy_preservation(self, library, id, expected_generation).await
     }
 
     async fn record_metadata_write_failure(

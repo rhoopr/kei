@@ -21,7 +21,7 @@ pub(crate) mod selection_capture;
 pub(crate) mod work;
 
 mod preservation_proof;
-pub(crate) use preservation_proof::{CompleteLegacyInventory, classify_legacy_inventory_error};
+pub(crate) use preservation_proof::classify_legacy_inventory_error;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
@@ -90,6 +90,7 @@ pub struct PhotoAlbum {
     shadow_capture: Option<(super::inbox::ShadowCapture, Arc<str>)>,
     rank_capture: Option<selection_capture::RankCapture>,
     pub(crate) name: Arc<str>,
+    selector_components: Vec<String>,
     params: Arc<HashMap<String, Value>>,
     session: Box<dyn PhotosSession>,
     service_endpoint: Arc<str>,
@@ -123,6 +124,7 @@ impl Clone for PhotoAlbum {
         );
         cloned.shadow_capture = self.shadow_capture.clone();
         cloned.rank_capture = self.rank_capture.clone();
+        cloned.selector_components = self.selector_components.clone();
         cloned
     }
 }
@@ -152,6 +154,7 @@ impl PhotoAlbum {
         Self {
             shadow_capture: None,
             rank_capture: None,
+            selector_components: vec![config.name.to_string()],
             name: config.name,
             params: config.params,
             session,
@@ -167,6 +170,26 @@ impl PhotoAlbum {
         }
     }
 
+    #[must_use]
+    pub(crate) fn with_selector_components(mut self, components: Vec<String>) -> Self {
+        self.selector_components = components;
+        self
+    }
+
+    pub(crate) fn selector_components(&self) -> &[String] {
+        &self.selector_components
+    }
+
+    pub(crate) fn matches_selector(&self, selector: &str) -> bool {
+        if selector.contains('/') {
+            self.selector_components.join("/") == selector
+        } else {
+            self.selector_components
+                .last()
+                .is_some_and(|leaf| leaf == selector)
+        }
+    }
+
     /// Return the CloudKit zone name this album belongs to
     /// (e.g. `PrimarySync`, `SharedSync-<uuid>`). Falls back to an empty
     /// string if the zone_id JSON lacks a `zoneName` field, which should
@@ -176,6 +199,14 @@ impl PhotoAlbum {
             .get("zoneName")
             .and_then(|v| v.as_str())
             .unwrap_or("")
+    }
+
+    pub(crate) fn is_hidden_query(&self) -> bool {
+        self.list_type.as_ref() == "CPLAssetAndMasterHiddenByAssetDate"
+            && self.obj_type.as_ref() == "CPLAssetHiddenByAssetDate"
+            && self.container_id.is_none()
+            && self.query_filter.is_none()
+            && self.cross_zone_sources.is_empty()
     }
 
     /// Provider scope used to bind durable selection recovery to its query owners.
@@ -234,33 +265,8 @@ impl PhotoAlbum {
         self.clone_for_task_without_sources()
     }
 
-    fn has_cross_zone_hydration(&self) -> bool {
+    pub(crate) fn has_cross_zone_hydration(&self) -> bool {
         self.container_id.is_some() && !self.cross_zone_sources.is_empty()
-    }
-
-    pub(crate) fn clone_as_library_wide(&self) -> PhotoAlbum {
-        let mut album = PhotoAlbum::new(
-            PhotoAlbumConfig {
-                params: Arc::clone(&self.params),
-                service_endpoint: Arc::clone(&self.service_endpoint),
-                name: Arc::from(""),
-                list_type: Arc::from(QUERY_ALL_LIST),
-                obj_type: Arc::from(QUERY_ALL_OBJ),
-                query_filter: None,
-                page_size: self.page_size,
-                zone_id: Arc::clone(&self.zone_id),
-                retry_config: self.retry_config,
-                container_id: None,
-                cross_zone_sources: Vec::new(),
-            },
-            self.session.clone_box(),
-        );
-        album.shadow_capture = self.shadow_capture.clone();
-        album.rank_capture = self.rank_capture.clone().map(|mut capture| {
-            capture.pass_key = "global-frontier".to_owned();
-            capture
-        });
-        album
     }
 
     /// Return total item count for this album via `HyperionIndexCountLookup`.
@@ -275,8 +281,7 @@ impl PhotoAlbum {
         Self::fetch_len_many(albums).await
     }
 
-    /// Convenience wrapper over `photo_stream()` that collects all assets
-    /// into a `Vec`. Prefer `photo_stream()` when memory is a concern.
+    /// Test collector over the production stream, including its panic receipt.
     ///
     /// Fetcher panics are surfaced as an `Err` so the caller cannot mistake
     /// a truncated enumeration for a complete one. Propagating the real
@@ -284,6 +289,7 @@ impl PhotoAlbum {
     /// sentinel string is enough for the operator to know the enumeration
     /// was incomplete and to correlate with the fetcher's prior
     /// `tracing::error!` log line.
+    #[cfg(test)]
     pub async fn photos(&self, limit: Option<u32>) -> anyhow::Result<Vec<PhotoAsset>> {
         use tokio_stream::StreamExt;
         let (stream, panic_rx) = self.photo_stream(limit, None, 1);
@@ -497,7 +503,7 @@ impl PhotoAlbum {
     }
 
     fn clone_for_task_without_sources(&self) -> PhotoAlbum {
-        PhotoAlbum::new(
+        let mut cloned = PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::clone(&self.params),
                 service_endpoint: Arc::clone(&self.service_endpoint),
@@ -512,7 +518,11 @@ impl PhotoAlbum {
                 cross_zone_sources: Vec::new(),
             },
             self.session.clone_box(),
-        )
+        );
+        cloned.shadow_capture = self.shadow_capture.clone();
+        cloned.rank_capture = self.rank_capture.clone();
+        cloned.selector_components = self.selector_components.clone();
+        cloned
     }
 
     /// Share one read only inside a library sync whose albums retain the same
@@ -564,10 +574,27 @@ impl PhotoAlbum {
     ///
     /// This method is inherently sequential -- each page's syncToken feeds the next request.
     /// No parallel fetchers.
+    #[allow(
+        dead_code,
+        reason = "preserve the public event-stream interface; checkpoint owners additionally require terminal raw-page evidence"
+    )]
     pub fn changes_stream(
         &self,
         sync_token: &str,
     ) -> (ChangeStream, tokio::sync::oneshot::Receiver<String>) {
+        let (stream, token, _completion) = self.stream_changes(sync_token);
+        (stream, token)
+    }
+
+    /// Raw observation is sent only at terminal EOF, never for receiver closure.
+    pub(crate) fn changes_stream_with_completion(
+        &self,
+        sync_token: &str,
+    ) -> (
+        ChangeStream,
+        tokio::sync::oneshot::Receiver<String>,
+        tokio::sync::oneshot::Receiver<bool>,
+    ) {
         self.stream_changes(sync_token)
     }
 }

@@ -34,6 +34,7 @@ download pipeline does not parse CloudKit records.
 - Preserve `.part` writes, SHA-256 verification, no-overwrite publication,
   parent-directory fsync, and durable state finalization.
 - Local media or metadata rewrites require an explicit user option.
+- An enabled metadata setting authorizes later updates to its managed fields. Setup emits explicit choices; version-1 omissions and no-config runs stay disabled. Capture-timestamp replacement still requires explicit repair.
 - Preserve provider checkpoint gates across interruption, retry, partial work,
   config drift, and stale planning.
 - Unknown provider identity is durable retry evidence, not permission to delete
@@ -61,9 +62,9 @@ download pipeline does not parse CloudKit records.
 
 - Follow the testing contract in `CONTRIBUTING.md`; investigate every failure
   before changing product code or calling it unrelated.
-- Run focused tests while iterating. Hosted PR CI owns the complete offline
-  gate; do not replay it locally by default. Run `just gate` for offline
-  diagnosis or when hosted CI is unavailable.
+- Run focused tests while iterating. PR CI runs the Linux baseline; main pushes
+  run the full offline suites. Run `just gate` for offline diagnosis or when
+  hosted CI is unavailable.
 - Local live-provider and real host-service checks are relevance-based and
   explicitly authorized. For release prerequisites, read `docs/ci.md`.
 - Finish with `cargo fmt --all --check` and

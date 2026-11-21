@@ -8,7 +8,7 @@ source "$script_dir/lib.sh"
 run_scenario_test lib hidden_invalid_capture_date
 # Historical ownership and failed durable retry writes.
 run_scenario_test lib run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint
-run_scenario_test lib bounded_full_sync_hydrates_live_legacy_pending_master
+run_scenario_test lib bounded_full_sync_preserves_unselected_legacy_pending_master
 # Deferral, authoritative changed evidence, completion and unchanged follow-up.
 run_scenario_test lib run_cycle_metadata_capture_retry_preserves_durable_checkpoint_until_repaired
 run_scenario_test lib ambiguous_capture_repair_keeps_identity_and_checkpoint_without_full_backfill

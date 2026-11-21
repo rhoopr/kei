@@ -111,7 +111,7 @@ async fn token_equivalence_46_pass_persistent_and_moving_export_roundtrip() {
             crate::cli::SupportExportArgs {
                 output: output.clone(),
             },
-            config_path.to_str().unwrap(),
+            config_path.to_str(),
         )
         .await
         .unwrap();

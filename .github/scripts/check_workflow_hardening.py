@@ -132,9 +132,9 @@ def check_rust_ci(errors: list[str]) -> None:
         "run: python3 scripts/ci/policy.py",
         "run: python3 scripts/check-contracts",
         "LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}",
-        "if: needs.detect.outputs.coverage == 'true'",
+        "if: inputs.heavy",
         "      - coverage-head\n",
-        "check(json.loads(os.environ[\"NEEDS\"]), required)",
+        "HEAVY: ${{ inputs.heavy }}",
     ):
         if needle not in text:
             errors.append(f"checks.yml: missing required routing/gate guard: {needle}")
@@ -142,14 +142,19 @@ def check_rust_ci(errors: list[str]) -> None:
 
 def check_qualification(errors: list[str]) -> None:
     guards = {
-        "ci.yml": ["needs: [plan, checks, service, qualification]", "mode not in {\"true\", \"false\"}",
-                   "[\"plan\", \"qualification\" if mode == \"true\" else \"checks\"]",
-                   "missing service route", "required += [\"service\"]",
-                   "uses: ./.github/workflows/service-smoke.yml"],
+        "pr.yml": ["needs: [quality, clippy, smoke]", "if: always()", "name: CI",
+                   "python3 scripts/ci/gate.py quality clippy smoke",
+                   "KEI_ROUNDTRIP_BASE: ${{ github.event.pull_request.base.sha }}"],
+        "ci.yml": ["if: github.event_name == 'push'", "if: github.event_name == 'workflow_dispatch'",
+                   "uses: ./.github/workflows/qualification.yml"],
         "qualification.yml": ["needs: [quality, artifacts, service, specialized]",
                               "python3 scripts/ci/gate.py quality artifacts service specialized",
                               "cargo fetch --locked\n          just test packaging",
+                              "bash scripts/ci/seeded-fuzz.sh",
                               "python3 scripts/ci/artifact.py verify"],
+        "nightly.yml": ["needs: [broad, fuzz, audit, optimized]",
+                        "scripts/ci/gate.py broad fuzz audit optimized",
+                        "RESULT: ${{ needs.result.result }}", "bash scripts/ci/seeded-fuzz.sh"],
         "artifacts.yml": ["push: false", "labels: ${{ steps.meta.outputs.labels }}", "run_docker_packaging_smoke.sh", "run_docker_puid_smoke.sh"],
     }
     for name, markers in guards.items():
@@ -157,7 +162,8 @@ def check_qualification(errors: list[str]) -> None:
         for marker in markers:
             if marker not in text:
                 errors.append(f"{name}: missing qualification guard: {marker}")
-    for name in ("ci.yml", "checks.yml", "qualification.yml", "artifacts.yml", "nightly.yml", "nightly-health.yml"):
+    for name in ("pr.yml", "ci.yml", "checks.yml", "qualification.yml", "artifacts.yml",
+                 "nightly.yml", "nightly-health.yml", "daily-wiki.yml"):
         text = workflow_text(name)
         if re.search(r"(?:contents|packages): write|push: true|secrets: inherit", text):
             errors.append(f"{name}: qualification must not receive publication credentials")

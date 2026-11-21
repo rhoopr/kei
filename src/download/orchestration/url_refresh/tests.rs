@@ -5,10 +5,9 @@ use crate::retry::RetryConfig;
 use crate::test_helpers::TracingCapture;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use chrono::{TimeZone, Utc};
 use reqwest::Client;
 use rustc_hash::FxHashSet;
 use serde_json::{Value, json};
@@ -17,92 +16,16 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::commands::{AlbumPass, PassKind};
-use crate::download::filter::DownloadTask;
 use crate::icloud::photos::PhotosSession;
-use crate::state::{SqliteStateDb, VersionSizeKey};
-use crate::test_helpers::MockPhotosFlow;
+use crate::state::SqliteStateDb;
 
 use super::super::dispatch::download_photos_with_sync;
 use super::super::incremental::download_photos_incremental_collecting_inner;
 use super::super::models::{DownloadControls, DownloadOutcome, SyncMode};
 use super::super::test_support::{
-    album_with_session, album_with_session_and_container, changes_zone_response,
-    incremental_photo_records_with_url, mock_album, relation_delta_record, retry_test_task,
-    seed_complete_album_snapshot, test_config,
+    album_with_session, changes_zone_response, incremental_photo_records_with_url,
+    relation_delta_record, seed_complete_album_snapshot, test_config,
 };
-use super::{RetryTaskKey, take_matching_retry_tasks};
-
-#[test]
-fn cleanup_retry_filter_keeps_only_exact_failed_task_keys() {
-    let failed = retry_test_task("ASSET_A", VersionSizeKey::Original, "a.jpg");
-    let matching_refresh = DownloadTask {
-        url: "https://p01.icloud-content.com/fresh-a".into(),
-        ..failed.clone()
-    };
-    let wrong_version = retry_test_task("ASSET_A", VersionSizeKey::Medium, "a.jpg");
-    let wrong_path = retry_test_task("ASSET_A", VersionSizeKey::Original, "elsewhere/a.jpg");
-    let unrelated = retry_test_task("ASSET_B", VersionSizeKey::Original, "b.jpg");
-    let mut pending_keys: FxHashSet<RetryTaskKey> =
-        std::iter::once(RetryTaskKey::from(&failed)).collect();
-    let mut out = Vec::new();
-
-    take_matching_retry_tasks(
-        vec![
-            wrong_version,
-            wrong_path,
-            unrelated,
-            matching_refresh.clone(),
-        ],
-        &mut pending_keys,
-        &mut out,
-    );
-
-    assert!(pending_keys.is_empty());
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].asset_id.as_ref(), "ASSET_A");
-    assert_eq!(out[0].version_size, VersionSizeKey::Original);
-    assert_eq!(out[0].download_path, matching_refresh.download_path);
-    assert_eq!(
-        out[0].url.as_ref(),
-        "https://p01.icloud-content.com/fresh-a"
-    );
-}
-
-#[derive(Clone, Debug)]
-struct SharedChangesZoneSession {
-    responses: Arc<std::sync::Mutex<std::collections::VecDeque<Value>>>,
-}
-
-impl SharedChangesZoneSession {
-    fn new(responses: Vec<Value>) -> Self {
-        Self {
-            responses: Arc::new(std::sync::Mutex::new(responses.into())),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl PhotosSession for SharedChangesZoneSession {
-    async fn post(
-        &self,
-        url: &str,
-        _body: String,
-        _headers: &[(&str, &str)],
-    ) -> anyhow::Result<Value> {
-        let mut responses = self.responses.lock().expect("poisoned");
-        if url.contains("/records/lookup?") {
-            let current = responses.front().expect("fresh lookup fixture");
-            return Ok(json!({"records": current["zones"][0]["records"]}));
-        }
-        responses
-            .pop_front()
-            .ok_or_else(|| anyhow::anyhow!("unexpected extra changes/zone call"))
-    }
-
-    fn clone_box(&self) -> Box<dyn PhotosSession> {
-        Box::new(self.clone())
-    }
-}
 
 #[derive(Clone, Debug)]
 struct SplitChangesZoneSession {
@@ -195,15 +118,26 @@ impl PhotosSession for AssetOnlyExpiredUrlSession {
 
 #[derive(Clone, Debug)]
 struct PendingRetryExpiredUrlSession {
-    query_calls: Arc<AtomicUsize>,
+    expired: Arc<AtomicBool>,
+    delta_records: Option<Vec<Value>>,
     expired_records: Arc<Vec<Value>>,
     fresh_records: Arc<Vec<Value>>,
 }
 
 impl PendingRetryExpiredUrlSession {
-    fn new(expired_records: Vec<Value>, fresh_records: Vec<Value>) -> Self {
+    fn new(
+        mut expired_records: Vec<Value>,
+        mut fresh_records: Vec<Value>,
+        expired: Arc<AtomicBool>,
+    ) -> Self {
+        for record in expired_records.iter_mut().chain(fresh_records.iter_mut()) {
+            if let Some(reference) = record.pointer_mut("/fields/masterRef/value") {
+                reference["zoneID"]["ownerRecordName"] = json!("_defaultOwner");
+            }
+        }
         Self {
-            query_calls: Arc::new(AtomicUsize::new(0)),
+            expired,
+            delta_records: None,
             expired_records: Arc::new(expired_records),
             fresh_records: Arc::new(fresh_records),
         }
@@ -218,35 +152,22 @@ impl PhotosSession for PendingRetryExpiredUrlSession {
         body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
+        let records = if self.expired.load(Ordering::SeqCst) {
+            &self.fresh_records
+        } else {
+            &self.expired_records
+        };
         if url.contains("/changes/zone?") {
-            let request: Value = serde_json::from_str(&body)?;
-            let has_sync_token = request["zones"]
-                .as_array()
-                .and_then(|zones| zones.first())
-                .and_then(|zone| zone.get("syncToken"))
-                .and_then(Value::as_str)
-                .is_some();
-            let records = if has_sync_token {
-                Vec::new()
-            } else {
-                self.fresh_records.as_ref().clone()
-            };
-            return Ok(changes_zone_response(records, "zone-token-next"));
+            return Ok(changes_zone_response(
+                self.delta_records
+                    .clone()
+                    .unwrap_or_else(|| records.as_ref().clone()),
+                "zone-token-next",
+            ));
         }
-
-        if url.contains("/records/lookup?") || url.contains("/records/query?") {
-            let call = self.query_calls.fetch_add(1, Ordering::SeqCst);
-            return Ok(if call == 0 {
-                json!({
-                    "records": self.expired_records.as_ref().clone(),
-                    "syncToken": "ignored-query-token"
-                })
-            } else {
-                json!({"records": self.fresh_records.as_ref(), "syncToken": "ignored-query-token"})
-            });
-        }
-
-        Ok(json!({"records": []}))
+        super::super::test_support::SelectedMediaSession(records.clone())
+            .post(url, body, &[])
+            .await
     }
 
     fn clone_box(&self) -> Box<dyn PhotosSession> {
@@ -262,9 +183,25 @@ async fn pending_retry_expired_url_hydrates_current_records() {
     use wiremock::{Mock, ResponseTemplate};
 
     let server = crate::start_wiremock_or_skip!();
+    let expired = Arc::new(AtomicBool::new(false));
+    let expired_response = expired.clone();
+    let recovery = Arc::new(AtomicBool::new(false));
+    let recovery_response = recovery.clone();
+    let failed_transfers = Arc::new(AtomicUsize::new(0));
+    let failed_response = failed_transfers.clone();
+    let expired_transfers = Arc::new(AtomicUsize::new(0));
+    let expired_count = expired_transfers.clone();
     Mock::given(method("GET"))
         .and(path("/expired-pending.jpg"))
-        .respond_with(ResponseTemplate::new(410))
+        .respond_with(move |_: &wiremock::Request| {
+            if !recovery_response.load(Ordering::SeqCst) {
+                failed_response.fetch_add(1, Ordering::SeqCst);
+                return ResponseTemplate::new(404);
+            }
+            expired_count.fetch_add(1, Ordering::SeqCst);
+            expired_response.store(true, Ordering::SeqCst);
+            ResponseTemplate::new(410)
+        })
         .mount(&server)
         .await;
 
@@ -274,27 +211,18 @@ async fn pending_retry_expired_url_hydrates_current_records() {
         .and(path("/fresh-pending.jpg"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(body)
+                .set_body_bytes(body.clone())
                 .insert_header("content-type", "image/jpeg"),
         )
+        .expect(1)
         .mount(&server)
         .await;
 
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-    let record = crate::test_helpers::TestAssetRecord::new("PENDING_EXPIRED_URL")
-        .filename("pending-expired-url.jpg")
-        .checksum(&checksum)
-        .size(8)
-        .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
-        .build();
-    db.upsert_seen(&record).await.expect("seed pending row");
-    db.upsert_asset_master_mapping(
-        "PrimarySync",
-        "asset-PENDING_EXPIRED_URL",
-        "PENDING_EXPIRED_URL",
-    )
-    .await
-    .expect("seed asset/master mapping");
+    let dir = TempDir::new().expect("temp dir");
+    let database = dir.path().join("state.db");
+    let db = super::super::test_support::open_fixture_db(&database).await;
+    let sentinel = dir.path().join("existing.jpg");
+    std::fs::write(&sentinel, b"existing synthetic media").unwrap();
 
     let expired_url = format!("{}/expired-pending.jpg", server.uri());
     let fresh_url = format!("{}/fresh-pending.jpg", server.uri());
@@ -313,25 +241,59 @@ async fn pending_retry_expired_url_hydrates_current_records() {
         8,
     );
     fresh_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
-    let session = PendingRetryExpiredUrlSession::new(expired_records, fresh_records);
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session("PrimarySync", "", Box::new(session)),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
+    let mut session = PendingRetryExpiredUrlSession::new(expired_records, fresh_records, expired);
+    session.delta_records = Some(Vec::new());
+    let passes = vec![super::super::test_support::selected_pass_with_session(
+        &db,
+        "",
+        Box::new(session.clone()),
+    )];
 
     let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
     config.directory = Arc::from(dir.path());
     config.state_db = Some(db.clone());
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-prev".to_string(),
     };
+    let mut initial = config.clone();
+    initial.sync_mode = SyncMode::Full;
+    let failed = download_photos_with_sync(
+        &Client::new(),
+        &passes,
+        Arc::new(initial),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(failed.outcome, DownloadOutcome::PartialFailure { .. }),
+        "{failed:?}"
+    );
+    assert_eq!(failed.sync_token, None);
+    assert_eq!(failed.stats.downloaded, 0);
+    assert_eq!(
+        failed_transfers.load(Ordering::SeqCst),
+        2,
+        "initial transfer and bounded same-cycle recovery both fail"
+    );
+    assert_eq!(expired_transfers.load(Ordering::SeqCst), 0);
+    config.state_db = None;
+    drop(passes);
+    drop(db);
+    let db = super::super::test_support::open_fixture_db(&database).await;
+    config.state_db = Some(db.clone());
+    let passes = vec![super::super::test_support::selected_pass_with_session(
+        &db,
+        "",
+        Box::new(session),
+    )];
+    recovery.store(true, Ordering::SeqCst);
 
     let result = download_photos_with_sync(
         &Client::new(),
         &passes,
-        Arc::new(config),
+        Arc::new(config.clone()),
         DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
@@ -348,19 +310,58 @@ async fn pending_retry_expired_url_hydrates_current_records() {
     assert_eq!(summary.downloaded, 1);
     assert_eq!(summary.pending, 0);
     assert_eq!(summary.failed, 0);
+    assert_eq!(expired_transfers.load(Ordering::SeqCst), 1);
+    let rows = db.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id.as_ref(), "asset-PENDING_EXPIRED_URL");
+    assert_eq!(
+        std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+        body
+    );
+    let quiet = download_photos_with_sync(
+        &Client::new(),
+        &passes,
+        Arc::new(config),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(quiet.outcome, DownloadOutcome::Success),
+        "{quiet:?}"
+    );
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(quiet.sync_token.as_deref(), Some("zone-token-next"));
+    assert_eq!(expired_transfers.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+        body
+    );
+    assert_eq!(
+        std::fs::read(sentinel).unwrap(),
+        b"existing synthetic media"
+    );
 }
 
 #[tokio::test]
 async fn incremental_expired_urls_are_refreshed_and_retried_same_cycle() {
+    let (capture, _guard) = TracingCapture::install();
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
 
     let server = crate::start_wiremock_or_skip!();
+    let expired = Arc::new(AtomicBool::new(false));
+    let expired_response = expired.clone();
     Mock::given(method("GET"))
         .and(path("/expired-url-1.jpg"))
-        .respond_with(ResponseTemplate::new(410))
+        .respond_with(move |_: &wiremock::Request| {
+            expired_response.store(true, Ordering::SeqCst);
+            ResponseTemplate::new(410)
+        })
+        .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -378,15 +379,17 @@ async fn incremental_expired_urls_are_refreshed_and_retried_same_cycle() {
                 .set_body_bytes(body.clone())
                 .insert_header("content-type", "image/jpeg"),
         )
+        .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/fresh-url-2.jpg"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(body)
+                .set_body_bytes(body.clone())
                 .insert_header("content-type", "image/jpeg"),
         )
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -409,51 +412,74 @@ async fn incremental_expired_urls_are_refreshed_and_retried_same_cycle() {
         incremental_photo_records_with_url("URL_AGED_TWO", "url-aged-2.jpg", &fresh_url_2, 8);
     second_fresh[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
     fresh_records.extend(second_fresh);
+    for child in ["asset-URL_AGED_ONE", "asset-URL_AGED_TWO"] {
+        stale_records.push(relation_delta_record("container-vacation", child));
+        fresh_records.push(relation_delta_record("container-vacation", child));
+    }
 
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+    let dir = TempDir::new().expect("temp dir");
+    let sentinel = dir.path().join("existing.jpg");
+    std::fs::write(&sentinel, b"existing synthetic media").unwrap();
+    let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
     seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
-    let album_session = SharedChangesZoneSession::new(vec![
-        changes_zone_response(stale_records, "zone-token-next"),
-        changes_zone_response(fresh_records, "zone-token-next"),
-    ]);
-    let passes = vec![
-        AlbumPass {
-            kind: PassKind::Album,
-            album: album_with_session_and_container(
-                "PrimarySync",
-                "Vacation",
-                Some("container-vacation"),
-                Box::new(album_session),
-            ),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        },
-        AlbumPass {
-            kind: PassKind::Unfiled,
-            album: mock_album("", MockPhotosFlow::new().build()),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        },
-    ];
+    let album_session =
+        PendingRetryExpiredUrlSession::new(stale_records, fresh_records, expired.clone());
+    let make_passes = |session: Box<dyn PhotosSession>| {
+        let unfiled = session.clone_box();
+        let mut album = super::super::test_support::selected_pass_with_session(
+            &db,
+            "container-vacation",
+            session,
+        );
+        album.album.name = Arc::from("Vacation");
+        vec![
+            album,
+            super::super::test_support::selected_pass_with_session(&db, "", unfiled),
+        ]
+    };
+    let passes = make_passes(Box::new(album_session.clone()));
 
     let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
     config.directory = Arc::from(dir.path());
     config.concurrent_downloads = 1;
     config.state_db = Some(db.clone());
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-prev".to_string(),
     };
+    let mut initial = config.clone();
+    initial.sync_mode = SyncMode::Full;
+    let initialized = download_photos_with_sync(
+        &Client::new(),
+        &make_passes(Box::new(super::super::test_support::SelectedMediaSession(
+            Arc::new(Vec::new()),
+        ))),
+        Arc::new(initial),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(initialized.sync_token.as_deref(), Some("fixture-token"));
 
     let result = download_photos_with_sync(
         &Client::new(),
         &passes,
-        Arc::new(config),
+        Arc::new(config.clone()),
         DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
     .await
     .expect("expired incremental URLs should be refreshed and retried");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert!(
+        expired.load(Ordering::SeqCst),
+        "exercise a real expired transfer before refreshing"
+    );
+    assert!(
+        matches!(result.outcome, DownloadOutcome::Success),
+        "{result:?}\n{:?}",
+        capture.events()
+    );
     assert_eq!(result.stats.downloaded, 2);
     assert_eq!(result.stats.failed, 0);
     assert!(
@@ -464,6 +490,47 @@ async fn incremental_expired_urls_are_refreshed_and_retried_same_cycle() {
     let summary = db.get_summary().await.expect("summary");
     assert_eq!(summary.downloaded, 2);
     assert_eq!(summary.failed, 0);
+    let rows = db.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!(
+            std::fs::read(row.local_path.as_ref().unwrap()).unwrap(),
+            body
+        );
+    }
+    let quiet_session = PendingRetryExpiredUrlSession {
+        delta_records: Some(Vec::new()),
+        ..album_session
+    };
+    let mut quiet_config = config;
+    quiet_config.sync_mode = SyncMode::Incremental {
+        zone_sync_token: "zone-token-next".to_string(),
+    };
+    let quiet = download_photos_with_sync(
+        &Client::new(),
+        &make_passes(Box::new(quiet_session)),
+        Arc::new(quiet_config),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(quiet.outcome, DownloadOutcome::Success),
+        "{quiet:?}"
+    );
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(quiet.sync_token.as_deref(), Some("zone-token-next"));
+    for row in &rows {
+        assert_eq!(
+            std::fs::read(row.local_path.as_ref().unwrap()).unwrap(),
+            body
+        );
+    }
+    assert_eq!(
+        std::fs::read(sentinel).unwrap(),
+        b"existing synthetic media"
+    );
 }
 
 #[tokio::test]
@@ -717,9 +784,14 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     use wiremock::{Mock, ResponseTemplate};
 
     let server = crate::start_wiremock_or_skip!();
+    let expired = Arc::new(AtomicBool::new(false));
+    let expired_response = expired.clone();
     Mock::given(method("GET"))
         .and(path("/expired-hydrated.jpg"))
-        .respond_with(ResponseTemplate::new(410))
+        .respond_with(move |_: &wiremock::Request| {
+            expired_response.store(true, Ordering::SeqCst);
+            ResponseTemplate::new(410)
+        })
         .expect(1)
         .mount(&server)
         .await;
@@ -756,27 +828,51 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     let database = dir.path().join("state.db");
     let sentinel = dir.path().join("existing.jpg");
     std::fs::write(&sentinel, b"existing synthetic media").unwrap();
-    let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+    let db = super::super::test_support::open_fixture_db(&database).await;
     seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
-    // The first two lookups hydrate the relation with a stale URL. Only the
-    // expiry-recovery child/pair lookups observe the later fresh URL.
+    // Only a real expired transfer makes the provider's fresh URL available.
     let lookup_calls = Arc::new(AtomicUsize::new(0));
-    let album_session = AssetOnlyExpiredUrlSession {
-        delta_records: Arc::new(relation_records()),
-        lookup_records: Arc::new(stale_records),
-        hydration_records: Arc::new(fresh_records),
-        lookup_calls: lookup_calls.clone(),
+    #[derive(Clone)]
+    struct RelationUrlSession {
+        current: PendingRetryExpiredUrlSession,
+        delta: Vec<Value>,
+        lookups: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for RelationUrlSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/changes/zone?") {
+                return Ok(changes_zone_response(self.delta.clone(), "zone-token-next"));
+            }
+            if url.contains("/records/lookup?") {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+            }
+            self.current.post(url, body, headers).await
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+    let album_session = RelationUrlSession {
+        current: PendingRetryExpiredUrlSession::new(stale_records, fresh_records, expired),
+        delta: relation_records(),
+        lookups: lookup_calls.clone(),
     };
-    let passes = vec![AlbumPass {
-        kind: PassKind::Album,
-        album: album_with_session_and_container(
-            "PrimarySync",
-            "Vacation",
-            Some("container-vacation"),
-            Box::new(album_session),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
+    let pass_for = |db: &Arc<SqliteStateDb>, session: Box<dyn PhotosSession>| {
+        let mut pass = super::super::test_support::selected_pass_with_session(
+            db,
+            "container-vacation",
+            session,
+        );
+        pass.album.name = Arc::from("Vacation");
+        pass
+    };
+    let passes = vec![pass_for(&db, Box::new(album_session.clone()))];
 
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
@@ -786,6 +882,23 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-prev".to_string(),
     };
+    let mut initial = config.clone();
+    initial.sync_mode = SyncMode::Full;
+    let initialized = download_photos_with_sync(
+        &Client::new(),
+        &[pass_for(
+            &db,
+            Box::new(super::super::test_support::SelectedMediaSession(Arc::new(
+                Vec::new(),
+            ))),
+        )],
+        Arc::new(initial),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(initialized.sync_token.as_deref(), Some("fixture-token"));
 
     let result = download_photos_with_sync(
         &Client::new(),
@@ -808,10 +921,15 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     let summary = db.get_summary().await.expect("summary");
     assert_eq!(summary.downloaded, 1);
     assert_eq!(summary.failed, 0);
-    assert_eq!(lookup_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        lookup_calls.load(Ordering::SeqCst),
+        6,
+        "relation hydration, current selection confirmation and expired URL refresh each resolve the child/master pair"
+    );
     config.state_db = None;
+    drop(passes);
     drop(db);
-    let reopened = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+    let reopened = super::super::test_support::open_fixture_db(&database).await;
     let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id.as_ref(), "asset-MASTER_HYDRATED");
@@ -819,7 +937,8 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
         std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
         body
     );
-    config.state_db = Some(reopened);
+    let passes = vec![pass_for(&reopened, Box::new(album_session.clone()))];
+    config.state_db = Some(reopened.clone());
     let replayed_relation = download_photos_with_sync(
         &Client::new(),
         &passes,
@@ -836,25 +955,14 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     assert_eq!(replayed_relation.stats.downloaded, 0);
     assert_eq!(
         lookup_calls.load(Ordering::SeqCst),
-        6,
-        "a replayed relation is revalidated without downloading again"
+        10,
+        "relation hydration and current selection confirmation each resolve the pair without downloading again"
     );
-    let quiet_session = AssetOnlyExpiredUrlSession {
-        delta_records: Arc::new(Vec::new()),
-        lookup_records: Arc::new(Vec::new()),
-        hydration_records: Arc::new(Vec::new()),
-        lookup_calls: lookup_calls.clone(),
+    let quiet_session = RelationUrlSession {
+        delta: Vec::new(),
+        ..album_session
     };
-    let quiet_passes = vec![AlbumPass {
-        kind: PassKind::Album,
-        album: album_with_session_and_container(
-            "PrimarySync",
-            "Vacation",
-            Some("container-vacation"),
-            Box::new(quiet_session),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
+    let quiet_passes = vec![pass_for(&reopened, Box::new(quiet_session))];
     let quiet = download_photos_with_sync(
         &Client::new(),
         &quiet_passes,
@@ -868,7 +976,7 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     assert_eq!(quiet.stats.downloaded, 0);
     assert_eq!(
         lookup_calls.load(Ordering::SeqCst),
-        6,
+        10,
         "an empty reopened feed does not repeat hydration"
     );
     assert_eq!(
@@ -882,7 +990,7 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
 }
 
 #[tokio::test]
-async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
+async fn full_failed_task_cleanup_is_targeted_bounded_and_durable() {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -937,6 +1045,7 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
     }
 
     for recovery in [
+        "transfer_failure",
         "fresh",
         "album_fresh",
         "album_unfiled",
@@ -956,14 +1065,23 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
         let (capture, _guard) = TracingCapture::install();
         let downloads = matches!(
             recovery,
-            "fresh" | "album_fresh" | "album_unfiled" | "rate_asset" | "rate_master"
+            "transfer_failure"
+                | "fresh"
+                | "album_fresh"
+                | "album_unfiled"
+                | "rate_asset"
+                | "rate_master"
         );
         let shutdown = CancellationToken::new();
         let server = crate::start_wiremock_or_skip!();
         let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
         Mock::given(method("GET"))
             .and(path("/old.jpg"))
-            .respond_with(ResponseTemplate::new(410))
+            .respond_with(ResponseTemplate::new(if recovery == "transfer_failure" {
+                503
+            } else {
+                410
+            }))
             .expect(1)
             .mount(&server)
             .await;
@@ -1029,16 +1147,19 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
             let mut album = passes[0].clone();
             album.kind = PassKind::Album;
             album.album.name = "Album A".into();
+            album.album = album.album.with_selector_components(vec!["Album A".into()]);
             passes.insert(0, album);
         }
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("state.db");
         let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
         let mut config = test_config();
+        config.retry.max_retries = 0;
         config.directory = Arc::from(dir.path().join("media"));
         config.state_db = Some(db.clone());
         if recovery.starts_with("album_") {
             config.folder_structure = "{album}".into();
+            config.folder_structure_albums = Arc::from("{album}");
         }
         let source_pass = if recovery == "album_unfiled" {
             passes.last().unwrap()
@@ -1046,7 +1167,7 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
             &passes[0]
         };
         let stream_config = Arc::new(config.with_pass(source_pass));
-        let config = Arc::new(config);
+        let mut config = Arc::new(config);
         let client = Client::new();
         let controls = DownloadControls::download_hidden();
         let streaming = pipeline::stream_and_download_from_stream(
@@ -1060,7 +1181,10 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
         )
         .await
         .unwrap();
-        assert!(streaming.url_expired_abort);
+        assert_eq!(streaming.url_expired_abort, recovery != "transfer_failure");
+        if recovery == "transfer_failure" {
+            Arc::make_mut(&mut config).folder_structure = "changed-template".into();
+        }
         let original_path = streaming.failed[0].download_path.clone();
         if recovery == "album_cancelled" {
             shutdown.cancel();
@@ -1077,7 +1201,9 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
         .await
         .unwrap();
         assert!(
-            if recovery.starts_with("auth_") {
+            if recovery == "transfer_failure" {
+                matches!(outcome, DownloadOutcome::Success)
+            } else if recovery.starts_with("auth_") {
                 matches!(outcome, DownloadOutcome::SessionExpired { .. })
             } else {
                 matches!(outcome, DownloadOutcome::PartialFailure { .. })
@@ -1094,7 +1220,7 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
         assert_eq!(
             stats.rate_limited,
             match recovery {
-                "rate_asset" | "rate_master" => 1,
+                "transfer_failure" | "rate_asset" | "rate_master" => 1,
                 "exhausted_asset" | "exhausted_master" => 2,
                 _ => 0,
             }
@@ -1140,6 +1266,7 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
             let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].local_path.as_ref(), Some(&original_path));
+            assert!(!config.directory.join("changed-template").exists());
             if recovery == "album_fresh" {
                 assert!(original_path.starts_with(config.directory.join("Album A")));
                 assert!(!config.directory.join("full-expired.jpg").exists());
@@ -1151,19 +1278,25 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
                 std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
                 body
             );
-            let stable = pipeline::stream_and_download_from_stream(
-                &client,
-                futures_util::stream::iter(vec![Ok(fresh_asset)]),
-                &stream_config,
-                controls,
-                1,
-                CancellationToken::new(),
-                pipeline::StreamRuntime::new(None, None),
-            )
-            .await
-            .unwrap();
-            assert_eq!(stable.downloaded, 0);
-            assert!(stable.failed.is_empty());
+            for _ in 0..2 {
+                let mut stable_config = stream_config.as_ref().clone();
+                stable_config.state_db =
+                    Some(Arc::new(SqliteStateDb::open(&db_path).await.unwrap()));
+                let stable = pipeline::stream_and_download_from_stream(
+                    &client,
+                    futures_util::stream::iter(vec![Ok(fresh_asset.clone())]),
+                    &Arc::new(stable_config),
+                    controls,
+                    1,
+                    CancellationToken::new(),
+                    pipeline::StreamRuntime::new(None, None),
+                )
+                .await
+                .unwrap();
+                assert_eq!(stable.downloaded, 0);
+                assert!(stable.failed.is_empty());
+                assert_eq!(std::fs::read(&original_path).unwrap(), body);
+            }
         } else {
             assert_eq!(
                 summary.pending + summary.failed,

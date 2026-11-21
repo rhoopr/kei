@@ -103,7 +103,6 @@ struct SharedHashFields<'a> {
     force_resolution: bool,
     media: crate::config::MediaSelection,
     live_photo_mode: LivePhotoMode,
-    filename_exclude: &'a [glob::Pattern],
 }
 
 /// Hash the shared config fields into the hasher. All enum values use
@@ -130,9 +129,8 @@ fn hash_shared_fields(hasher: &mut sha2::Sha256, version: u8, f: &SharedHashFiel
     // because the enumeration hash already owns date eligibility; the legacy
     // caller supplies them only to reproduce the v2 shape.
     //
-    // Dates are truncated to day precision before hashing so that relative
-    // intervals like "20d" (resolved to now-minus-20-days at parse time)
-    // produce a stable hash across consecutive runs on the same day.
+    // Preserve day-precision instant hashing for compatibility with stored
+    // fingerprints, including historical relative-date boundaries.
     hash_optional_created_date_filter(hasher, f.skip_created_before);
     hash_optional_created_date_filter(hasher, f.skip_created_after);
     hasher.update([u8::from(f.force_resolution)]);
@@ -140,16 +138,6 @@ fn hash_shared_fields(hasher: &mut sha2::Sha256, version: u8, f: &SharedHashFiel
     hasher.update([u8::from(f.media.videos)]);
     hasher.update([u8::from(f.media.live_photos)]);
     hasher.update([f.live_photo_mode as u8]);
-    // filename_exclude patterns affect which assets are eligible
-    let mut sorted_excludes: Vec<&str> = f
-        .filename_exclude
-        .iter()
-        .map(glob::Pattern::as_str)
-        .collect();
-    sorted_excludes.sort_unstable();
-    for pattern in &sorted_excludes {
-        hash_bytes(hasher, pattern.as_bytes());
-    }
 }
 
 fn hash_optional_created_date_filter(
@@ -250,20 +238,7 @@ pub(crate) fn sync_coverage_fingerprint_json(
         .filters
         .skip_created_after
         .map(crate::config::CreatedDateFilter::fingerprint);
-    let mut filename_exclude: Vec<&str> = config
-        .download
-        .filename_exclude
-        .iter()
-        .map(glob::Pattern::as_str)
-        .collect();
-    filename_exclude.sort_unstable();
-    let coverage = if let Some(count) = config.filters.recent {
-        serde_json::json!({
-            "kind": "bounded-recent-count",
-            "count": count,
-            "recent_scope": config.filters.recent_scope,
-        })
-    } else if skip_created_before.is_some() || skip_created_after.is_some() {
+    let coverage = if skip_created_before.is_some() || skip_created_after.is_some() {
         serde_json::json!({
             "kind": "bounded-date-window",
             "skip_created_before": skip_created_before,
@@ -292,11 +267,11 @@ pub(crate) fn sync_coverage_fingerprint_json(
                 "videos": config.filters.media.videos,
                 "live_photos": config.filters.media.live_photos,
             },
-            "filename_exclude": filename_exclude,
+            "filename_exclude": [],
             "skip_created_before": skip_created_before,
             "skip_created_after": skip_created_after,
-            "recent": config.filters.recent,
-            "recent_scope": config.filters.recent_scope,
+            "recent": null,
+            "recent_scope": "global",
         },
         "coverage": coverage,
         "enum_config_hash": enum_config_hash,
@@ -353,12 +328,6 @@ pub(crate) fn inventory_scope(
         .map(String::as_str)
         .collect();
     excludes.sort_unstable();
-    let mut filenames: Vec<&str> = config
-        .filename_exclude
-        .iter()
-        .map(glob::Pattern::as_str)
-        .collect();
-    filenames.sort_unstable();
     InventoryScope(
         serde_json::json!({
             "passes": resolved,
@@ -371,13 +340,13 @@ pub(crate) fn inventory_scope(
                 "alternative": config.alternative,
                 "raw_policy": config.raw_policy as u8,
                 "force_resolution": config.force_resolution,
-                "filename_exclude": filenames,
+                "filename_exclude": [],
                 "exclude_asset_ids": excludes,
                 "skip_created_before": config.skip_created_before.map(crate::config::CreatedDateFilter::fingerprint),
                 "skip_created_after": config.skip_created_after.map(crate::config::CreatedDateFilter::fingerprint),
-                "recent": config.recent,
-                "recent_scope": config.recent_scope,
-                "retry_only": config.retry_only,
+                "recent": null,
+                "recent_scope": "global",
+                "retry_only": false,
             },
         })
         .to_string(),
@@ -435,19 +404,10 @@ fn hash_download_config_with_date_bounds(
             force_resolution: config.force_resolution,
             media: config.media,
             live_photo_mode: config.live_photo_mode,
-            filename_exclude: &config.filename_exclude,
         },
     );
-    // `recent` affects which already-downloaded assets to trust/skip
-    hash_optional_u32(&mut hasher, config.recent);
-    if config.recent.is_some() {
-        hasher.update(b"recent_scope:");
-        hasher.update(match config.recent_scope {
-            crate::cli::RecentScope::Global => b"global".as_slice(),
-            crate::cli::RecentScope::PerFilter => b"per-filter".as_slice(),
-        });
-        hasher.update(b"\0");
-    }
+    // Preserve the historical uncapped encoding for retained path receipts.
+    hash_optional_u32(&mut hasher, None);
     if config.edited_naming == crate::types::EditedNaming::Primary {
         hasher.update(b"\0kei:edited-primary:v1\0");
     }
@@ -483,28 +443,8 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     hasher.update([u8::from(config.filters.media.videos)]);
     hasher.update([u8::from(config.filters.media.live_photos)]);
     hasher.update([config.photos.live_photo_mode as u8]);
-    let mut sorted_excludes: Vec<&str> = config
-        .download
-        .filename_exclude
-        .iter()
-        .map(glob::Pattern::as_str)
-        .collect();
-    sorted_excludes.sort_unstable();
-    for pattern in &sorted_excludes {
-        hash_bytes(&mut hasher, pattern.as_bytes());
-    }
-    // Recent eligibility drift must recover assets omitted before this owner
-    // persisted scoped recovery evidence. Version 3 also forces one conservative
-    // inventory/bridge on legacy cursors, including legacy cap removal.
-    hash_optional_u32(&mut hasher, config.filters.recent);
-    if config.filters.recent.is_some() {
-        hasher.update(b"recent_scope:");
-        hasher.update(match config.filters.recent_scope {
-            crate::cli::RecentScope::Global => b"global".as_slice(),
-            crate::cli::RecentScope::PerFilter => b"per-filter".as_slice(),
-        });
-        hasher.update(b"\0");
-    }
+    // Preserve the historical uncapped cursor-compatibility encoding.
+    hash_optional_u32(&mut hasher, None);
 
     // The unfiled selector is still unsafe to classify from the current state
     // alone: switching it on can make old, never-enumerated unfiled assets
@@ -518,6 +458,10 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
 /// Decoupled from CLI parsing so the engine can be tested independently.
 #[derive(Clone)]
 pub(crate) struct DownloadConfig {
+    /// One upgrade-requested inventory guarded by retained-cursor replay.
+    pub(crate) inventory_reconciliation: bool,
+    /// A due sparse source in another selected zone needs a fresh membership scan.
+    pub(crate) sparse_membership_due: bool,
     pub(crate) sparse_targets: Arc<[crate::download::sparse_target::SelectedSparseTarget]>,
     /// Drain ordered queries to certify bounded local path work on config drift.
     /// Download eligibility and provider checkpoint bounds remain unchanged.
@@ -550,8 +494,6 @@ pub(crate) struct DownloadConfig {
     pub(crate) repair_truncated: bool,
     pub(crate) legacy_preservation_allow_hardlinks: bool,
     pub(crate) concurrent_downloads: usize,
-    pub(crate) recent: Option<u32>,
-    pub(crate) recent_scope: crate::cli::RecentScope,
     pub(crate) retry: RetryConfig,
     pub(crate) live_photo_mode: LivePhotoMode,
     pub(crate) live_resolution: AssetVersionSize,
@@ -568,18 +510,10 @@ pub(crate) struct DownloadConfig {
     pub(crate) file_match_policy: FileMatchPolicy,
     pub(crate) force_resolution: bool,
     pub(crate) keep_unicode_in_filenames: bool,
-    /// Compiled glob patterns for filename exclusion.
-    ///
-    /// Behind `Arc<[_]>` so per-pass clones share one allocation
-    /// (significant with `-a all` over 100+ albums).
-    pub(crate) filename_exclude: Arc<[glob::Pattern]>,
     /// Temp file suffix for partial downloads (e.g. `.kei-tmp`).
     pub(crate) temp_suffix: Arc<str>,
     /// State database for tracking download progress.
     pub(crate) state_db: Option<Arc<dyn DownloadStore>>,
-    /// When true (retry-failed mode), only download assets already known to the
-    /// state DB. Skip new assets discovered from iCloud that were never synced.
-    pub(crate) retry_only: bool,
     /// Incomplete provider inventory may download, but cannot certify absence.
     pub(crate) provisional: bool,
     /// Qualify managed recovery without planning or publishing local work.
@@ -599,8 +533,6 @@ pub(crate) struct DownloadConfig {
     pub(crate) library: Arc<str>,
     /// Asset IDs to exclude (from `--exclude-album` without `--album`).
     pub(crate) exclude_asset_ids: Arc<FxHashSet<String>>,
-    /// Maximum download attempts per asset before giving up (0 = unlimited).
-    pub(crate) max_download_attempts: u32,
     /// Preloaded asset→album and asset→person indices, shared across clones.
     pub(crate) asset_groupings: Arc<AssetGroupings>,
     /// Shared token-bucket limiter applied across all concurrent download
@@ -663,13 +595,26 @@ impl DownloadConfig {
     /// with `--folder-structure "{album}/..."` still produce the same
     /// on-disk tree.
     pub(crate) fn with_pass(&self, pass: &crate::commands::AlbumPass) -> Self {
-        let folder_structure = filter::folder_structure_for_pass(
+        let mut folder_structure = filter::folder_structure_for_pass(
             &self.folder_structure,
             &self.folder_structure_albums,
             &self.folder_structure_smart_folders,
             &self.library,
             pass,
         );
+        if pass.kind == crate::commands::PassKind::Album
+            && self.folder_structure_albums.contains("{album}")
+            && let Some(context) = &self.selection_context
+            && let Some(container) = pass.album.container_id()
+            && let Some(directory) = context.album_directory(container)
+        {
+            folder_structure = crate::download::paths::expand_named_token(
+                &self.folder_structure_albums,
+                "{library}",
+                Some(crate::download::paths::truncate_library_zone(&self.library)),
+            )
+            .replace("{album}", directory);
+        }
         Self {
             primary_layout_source: Some(Arc::new(pass.album.clone())),
             primary_layout_pass: Some(super::generation::pass_key(pass)),
@@ -694,16 +639,6 @@ impl DownloadConfig {
     ) -> Self {
         Self {
             exclude_asset_ids: exclude_ids,
-            ..self.clone()
-        }
-    }
-
-    pub(in crate::download) fn with_recent_scope(
-        &self,
-        recent_scope: crate::cli::RecentScope,
-    ) -> Self {
-        Self {
-            recent_scope,
             ..self.clone()
         }
     }
@@ -732,8 +667,6 @@ impl std::fmt::Debug for DownloadConfig {
                 &self.legacy_preservation_allow_hardlinks,
             )
             .field("concurrent_downloads", &self.concurrent_downloads)
-            .field("recent", &self.recent)
-            .field("recent_scope", &self.recent_scope)
             .field("retry", &self.retry)
             .field("live_photo_mode", &self.live_photo_mode)
             .field("live_resolution", &self.live_resolution)
@@ -747,15 +680,12 @@ impl std::fmt::Debug for DownloadConfig {
             .field("file_match_policy", &self.file_match_policy)
             .field("force_resolution", &self.force_resolution)
             .field("keep_unicode_in_filenames", &self.keep_unicode_in_filenames)
-            .field("filename_exclude", &self.filename_exclude)
             .field("temp_suffix", &self.temp_suffix)
             .field("state_db", &self.state_db.is_some())
-            .field("retry_only", &self.retry_only)
             .field("sync_mode", &self.sync_mode)
             .field("enum_config_hash", &self.enum_config_hash)
             .field("album_name", &self.album_name)
             .field("exclude_asset_ids_count", &self.exclude_asset_ids.len())
-            .field("max_download_attempts", &self.max_download_attempts)
             .field("bandwidth_limiter", &self.bandwidth_limiter)
             .finish()
     }
@@ -767,6 +697,7 @@ impl DownloadConfig {
     pub(crate) fn test_default() -> Self {
         use rustc_hash::FxHashSet;
         Self {
+            inventory_reconciliation: false,
             directory: Arc::from(Path::new("/nonexistent/download_filter_tests")),
             folder_structure: "{:%Y/%m/%d}".to_string(),
             folder_structure_albums: Arc::from(crate::config::DEFAULT_FOLDER_STRUCTURE_ALBUMS),
@@ -783,8 +714,6 @@ impl DownloadConfig {
             repair_truncated: false,
             legacy_preservation_allow_hardlinks: false,
             concurrent_downloads: 1,
-            recent: None,
-            recent_scope: crate::cli::RecentScope::Global,
             retry: crate::retry::RetryConfig::default(),
             live_photo_mode: LivePhotoMode::Both,
             live_resolution: AssetVersionSize::LiveOriginal,
@@ -801,18 +730,16 @@ impl DownloadConfig {
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_resolution: false,
             keep_unicode_in_filenames: false,
-            filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
             temp_suffix: Arc::from(".kei-tmp"),
             state_db: None,
             sparse_targets: Arc::from([]),
+            sparse_membership_due: false,
             complete_path_selection: false,
             selection_context: None,
             selection_run: None,
             selection_pass: None,
-            retry_only: false,
             provisional: false,
             indexing_inventory_only: false,
-            max_download_attempts: 10,
             sync_mode: SyncMode::Full,
             enum_config_hash: None,
             album_name: None,

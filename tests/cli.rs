@@ -118,11 +118,28 @@ fn sync_help_succeeds() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--friendly"))
-        .stdout(predicate::str::contains("--recent"))
+        .stdout(predicate::str::contains("--recent").not())
         .stdout(predicate::str::contains("capture-local calendar date"))
-        .stdout(predicate::str::contains("explicit datetimes"))
-        .stdout(predicate::str::contains("relative intervals"))
+        .stdout(predicate::str::contains("host-local datetimes"))
+        .stdout(predicate::str::contains("relative intervals").not())
+        .stdout(predicate::str::contains("30d").not())
         .stdout(predicate::str::contains("--download-dir").not());
+}
+
+#[test]
+fn service_and_import_help_do_not_advertise_relative_windows() {
+    for args in [
+        &["service", "run", "--help"][..],
+        &["import-existing", "--help"][..],
+    ] {
+        common::cmd()
+            .args(args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("30d").not())
+            .stdout(predicate::str::contains("Nd").not())
+            .stdout(predicate::str::contains("relative intervals").not());
+    }
 }
 
 #[test]
@@ -204,7 +221,7 @@ fn doctor_json_uses_local_config_paths_and_redacts() {
     std::fs::create_dir_all(&data).unwrap();
     let report = dir.path().join("report-doctor-secret@example.com.json");
     let config = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config,
         format!(
             "data_dir = {:?}\n\
@@ -258,6 +275,99 @@ fn doctor_json_uses_local_config_paths_and_redacts() {
             .any(|check| check["name"] == "download_dir" && check["status"] == "ok"),
         "doctor should probe configured download directory: {report:#}"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn setup_enter_default_finishes_without_sync_and_cancel_discards_answers() {
+    let status = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/shell/setup-default.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_kei"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn doctor_distinguishes_absence_and_checks_only_the_effective_password_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let file = dir.path().join("private-input");
+    let command = || {
+        let mut cmd = common::cmd();
+        cmd.env_remove("ICLOUD_PASSWORD")
+            .env_remove("ICLOUD_USERNAME")
+            .env_remove("KEI_PASSWORD_COMMAND")
+            .env_remove("KEI_PASSWORD_FILE")
+            .env("KEI_DATA_DIR", dir.path())
+            .args(["doctor", "--json", "--config"]);
+        cmd
+    };
+    let check = |cmd: &mut assert_cmd::Command, success: bool, name: &str, status: &str| {
+        let out = cmd.output().unwrap();
+        assert_eq!(out.status.success(), success, "{out:?}");
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(
+            report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["name"] == name && c["status"] == status),
+            "{report}"
+        );
+        assert!(!report.to_string().contains("private-input"));
+        assert!(!report.to_string().contains("file-secret"));
+    };
+    check(command().arg(&config), true, "config_parse", "skipped");
+    assert!(!config.exists());
+    check(
+        command().arg(dir.path().join("absent/config.toml")),
+        false,
+        "config_parse",
+        "error",
+    );
+    common::write_versioned_config(
+        &config,
+        format!(
+            "[auth]\npassword_file = {}\n",
+            common::toml_string(&file.to_string_lossy())
+        ),
+    )
+    .unwrap();
+    check(command().arg(&config), false, "password_source", "error");
+    std::fs::create_dir(&file).unwrap();
+    check(command().arg(&config), false, "password_source", "error");
+    std::fs::remove_dir(&file).unwrap();
+    check(
+        command().arg(&config).env("ICLOUD_PASSWORD", "file-secret"),
+        true,
+        "password_source",
+        "skipped",
+    );
+    let marker = dir.path().join("executed");
+    check(
+        command()
+            .arg(&config)
+            .current_dir(dir.path())
+            .env("KEI_PASSWORD_COMMAND", "echo file-secret > executed"),
+        !cfg!(windows),
+        "password_source",
+        if cfg!(windows) { "error" } else { "skipped" },
+    );
+    assert!(!marker.exists());
+    std::fs::write(&file, "file-secret").unwrap();
+    check(command().arg(&config), true, "password_source", "ok");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&file).is_err() {
+            check(command().arg(&config), false, "password_source", "error");
+        }
+    }
 }
 
 #[test]
@@ -685,7 +795,6 @@ fn removed_boolean_sync_flag_fails() {
 #[test]
 fn value_sync_flags_accepted() {
     let pairs = [
-        ("--recent", "10"),
         ("--skip-created-before", "2024-01-01"),
         ("--skip-created-after", "2025-01-01"),
     ];
@@ -970,7 +1079,7 @@ fn config_explicit_nonexistent_path_fails_at_runtime() {
         "error should mention the config file, stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("kei doctor --json"),
+        stderr.contains("kei --config '/nonexistent/explicit/config.toml' doctor --json"),
         "generic runtime errors should suggest diagnostics, stderr:\n{stderr}"
     );
     assert!(
@@ -1070,14 +1179,21 @@ fn auth_flags_rejected_on_all_subcommands() {
     }
 }
 
-// ── retry-failed shares sync flags ──────────────────────────────────
+// ── Retired retry-only selection ──────────────────────────────────
 
 #[test]
-fn retry_failed_accepts_sync_flags() {
+fn retry_failed_rejects_even_with_sync_flags() {
     common::cmd()
-        .args(["sync", "--retry-failed", "--recent", "10", "--help"])
+        .args([
+            "sync",
+            "--retry-failed",
+            "--skip-created-before",
+            "2025-01-01",
+            "--help",
+        ])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("--retry-failed is retired"));
 }
 
 #[test]
@@ -1130,7 +1246,7 @@ fn exit_code_0_on_version() {
 fn exit_code_1_on_missing_username() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config,
         format!(
             "[download]\ndirectory = {:?}\n",
@@ -1158,7 +1274,7 @@ fn exit_code_1_on_missing_username() {
 fn exit_code_3_on_empty_password_file() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config,
         format!(
             "[download]\ndirectory = {:?}\n",
@@ -1193,7 +1309,7 @@ fn exit_code_3_on_empty_password_file() {
 fn exit_code_3_on_newline_only_password_file() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
-    std::fs::write(
+    common::write_versioned_config(
         &config,
         format!(
             "[download]\ndirectory = {:?}\n",
@@ -1372,11 +1488,12 @@ fn config_setup_help_succeeds() {
 }
 
 #[test]
-fn sync_retry_failed_help_succeeds() {
+fn sync_help_does_not_advertise_retry_failed() {
     common::cmd()
-        .args(["sync", "--retry-failed", "--help"])
+        .args(["sync", "--help"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("--retry-failed").not());
 }
 
 // ── Removed legacy commands not in help ─────────────────────────────────
@@ -1476,12 +1593,15 @@ fn kei_reconcile_every_n_cycles_env_var_ignored_by_help() {
 }
 
 #[test]
-fn reconcile_help_mentions_truncated_files() {
+fn reconcile_help_explains_explicit_damage_confirmation() {
     common::cmd()
         .args(["reconcile", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("missing or truncated"));
+        .stdout(predicate::str::contains(
+            "fingerprint-pinned repair of one destination",
+        ))
+        .stdout(predicate::str::contains("--confirm-damage"));
 }
 
 // ── config show produces TOML ─────────────────────────────────────────

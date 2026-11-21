@@ -125,10 +125,21 @@ fn dry_run_install_user_does_not_write_to_xdg_config_home_override() {
     cmd.env_remove("SUDO_USER");
     cmd.env("HOME", home.path());
     cmd.env("XDG_CONFIG_HOME", xdg.path());
+    cmd.env_remove("KEI_CONFIG");
+    cmd.env_remove("KEI_DATA_DIR");
 
     cmd.args(["install", "--user", "--dry-run"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains(
+            xdg.path().join("kei/config.toml").to_str().unwrap(),
+        ));
+
+    let legacy = home.path().join(".config/kei");
+    std::fs::create_dir_all(&legacy).unwrap();
+    cmd.assert().success().stdout(predicate::str::contains(
+        legacy.join("config.toml").to_str().unwrap(),
+    ));
 
     let xdg_unit = xdg.path().join("systemd/user/kei.service");
     let home_unit = home.path().join(".config/systemd/user/kei.service");
@@ -247,7 +258,7 @@ fn uninstall_purge_removes_kei_state_dir_when_present() {
     let home = TempDir::new().unwrap();
     let kei_dir = home.path().join(".config/kei");
     std::fs::create_dir_all(&kei_dir).unwrap();
-    std::fs::write(kei_dir.join("config.toml"), "[auth]\n").unwrap();
+    common::write_versioned_config(&kei_dir.join("config.toml"), "[auth]\n").unwrap();
     std::fs::write(kei_dir.join("state.db"), b"\x00").unwrap();
 
     // Install a unit so uninstall has something to do too — but the
@@ -278,8 +289,8 @@ fn uninstall_purge_clears_encrypted_credential_file() {
     let home = TempDir::new().unwrap();
     let kei_dir = home.path().join(".config/kei");
     std::fs::create_dir_all(&kei_dir).unwrap();
-    std::fs::write(
-        kei_dir.join("config.toml"),
+    common::write_versioned_config(
+        &kei_dir.join("config.toml"),
         "[auth]\nusername = \"kei-purge-test@example.invalid\"\n",
     )
     .unwrap();

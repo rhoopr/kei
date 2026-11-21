@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
 
@@ -17,13 +17,14 @@ use super::full::{
     download_photos_full_with_token_policy,
 };
 use super::incremental::download_photos_incremental;
-use super::maintenance::{has_metadata_backfill_work, run_metadata_capture_repair};
+use super::maintenance::{
+    has_metadata_backfill_work, observe_metadata_capture, run_metadata_capture_repair,
+};
 use super::models::{
     DownloadControls, DownloadOutcome, FullEnumerationReason, SMART_FOLDER_REFRESH_FAILED_REASON,
     SyncMode, SyncResult, SyncStats, TARGETED_ALBUM_BACKFILL_FAILED_REASON,
     merge_download_outcomes,
 };
-use super::recovery::append_targeted_recovery_to_sync_result;
 use super::selection::{
     IncrementalRoutingDecision, determine_incremental_routing_decision,
     split_incremental_and_smart_folder_passes,
@@ -50,11 +51,8 @@ fn classify_incremental_error(error: &anyhow::Error) -> IncrementalErrorClass {
         return IncrementalErrorClass::SessionExpired;
     }
     if error
-        .downcast_ref::<super::recent::RecentSelectionError>()
+        .downcast_ref::<crate::icloud::photos::error::ShadowPageError>()
         .is_some()
-        || error
-            .downcast_ref::<crate::icloud::photos::error::ShadowPageError>()
-            .is_some()
     {
         return IncrementalErrorClass::CaptureRefused;
     }
@@ -95,6 +93,50 @@ fn is_transient_reqwest_error(error: &reqwest::Error) -> bool {
         .is_some_and(|status| status == 429 || status.as_u16() >= 500)
         || error.is_timeout()
         || error.is_connect()
+}
+
+/// Apply one incremental failure decision and preserve its checkpoint evidence.
+/// Captured selections retain their stricter state-refusal boundary and their
+/// existing inventory owner; ordinary selections retain their full-pass reason.
+async fn finish_incremental_attempt(
+    attempt: Result<SyncResult>,
+    client: &Client,
+    passes: &[crate::commands::AlbumPass],
+    config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
+    cancel: CancellationToken,
+) -> Result<SyncResult> {
+    let error = match attempt {
+        Ok(result) => return Ok(result),
+        Err(error) => error,
+    };
+    let class = if config.selection_context.is_some() {
+        classify_selection_incremental_error(&error)
+    } else {
+        classify_incremental_error(&error)
+    };
+    match class {
+        IncrementalErrorClass::SessionExpired
+        | IncrementalErrorClass::TransientFailure
+        | IncrementalErrorClass::CaptureRefused => return Err(error),
+        IncrementalErrorClass::TokenFallback | IncrementalErrorClass::StaticFallback => {}
+    }
+    let mut result = if config.selection_context.is_some() {
+        Box::pin(super::generation::inventory(
+            client, passes, config, controls, cancel,
+        ))
+        .await?
+    } else {
+        let reason = FullEnumerationReason::OtherStaticReason;
+        tracing::warn!(
+            error = %error,
+            full_enumeration_reason = reason.as_str(),
+            "Incremental sync failed, falling back to full enumeration"
+        );
+        download_photos_full_with_reason(client, passes, config, controls, cancel, reason).await?
+    };
+    result.checkpoint.retained_token_rejected = class == IncrementalErrorClass::TokenFallback;
+    Ok(result)
 }
 
 async fn targeted_backfill_snapshots_complete(
@@ -233,17 +275,10 @@ async fn download_photos_incremental_with_smart_folder_refresh(
         return Ok(incremental_result);
     }
 
-    let smart_folder_config =
-        if config.recent.is_some() && config.recent_scope == crate::cli::RecentScope::Global {
-            Arc::new(config.with_recent_scope(crate::cli::RecentScope::PerFilter))
-        } else {
-            Arc::clone(config)
-        };
-
     let mut smart_folder_result = download_photos_full_with_token_policy(
         download_client,
         &smart_folder_passes,
-        &smart_folder_config,
+        config,
         controls,
         shutdown_token,
         incremental_passes.is_empty(),
@@ -292,6 +327,144 @@ async fn download_photos_incremental_with_smart_folder_refresh(
     Ok(incremental_result)
 }
 
+/// Reuse the ordinary delta and inventory owners. Query tokens are EOF evidence
+/// only; the retained source cursor and terminal delta successors own replay.
+async fn reconcile_inventory(
+    client: &Client,
+    passes: &[crate::commands::AlbumPass],
+    config: &Arc<DownloadConfig>,
+    prior: &str,
+    controls: DownloadControls,
+    cancel: CancellationToken,
+) -> Result<SyncResult> {
+    let classify = |error: &anyhow::Error| {
+        if config.selection_context.is_some() {
+            classify_selection_incremental_error(error)
+        } else {
+            classify_incremental_error(error)
+        }
+    };
+    let mut rejected = false;
+    let first =
+        match download_photos_incremental(client, passes, config, prior, controls, cancel.clone())
+            .await
+        {
+            Ok(mut first) => {
+                if !first.checkpoint.completed_delta_replay
+                    || first.checkpoint.delta_successor.is_none()
+                    || matches!(first.outcome, DownloadOutcome::SessionExpired { .. })
+                    || first.checkpoint.interrupted
+                    || cancel.is_cancelled()
+                {
+                    first.sync_token = None;
+                    first.block_incremental_token("inventory_reconciliation_required");
+                    return Ok(first);
+                }
+                Some(first)
+            }
+            Err(error) => match classify(&error) {
+                class @ (IncrementalErrorClass::TokenFallback
+                | IncrementalErrorClass::StaticFallback) => {
+                    rejected = class == IncrementalErrorClass::TokenFallback;
+                    None
+                }
+                IncrementalErrorClass::SessionExpired
+                | IncrementalErrorClass::TransientFailure
+                | IncrementalErrorClass::CaptureRefused => return Err(error),
+            },
+        };
+    let mut inventory = if config.selection_context.is_some() {
+        Box::pin(super::generation::inventory(
+            client,
+            passes,
+            config,
+            controls,
+            cancel.clone(),
+        ))
+        .await?
+    } else {
+        download_photos_full_with_token(client, passes, config, controls, cancel.clone()).await?
+    };
+    // Current delta failures veto qualification, not independently identified
+    // healthy inventory work. The retained source cursor still covers any
+    // observation that the private generation owner has not admitted yet.
+    let inventory_complete = first.as_ref().is_none_or(reconciliation_work_complete)
+        && (inventory.sync_token.take().is_some()
+            || inventory.checkpoint.bounded_path_selection_complete)
+        && reconciliation_work_complete(&inventory)
+        && (!inventory.checkpoint.sync_token_blocked
+            || inventory.checkpoint.bounded_path_selection_complete);
+    let successor = first
+        .as_ref()
+        .and_then(|first| first.checkpoint.delta_successor.clone());
+    if let Some(mut first) = first {
+        inventory.outcome = merge_download_outcomes(&first.outcome, &inventory.outcome);
+        // Only the inventory's snapshots can establish absence. Earlier incidental
+        // selection work must not complete a different generation's snapshots.
+        first.deferred_album_snapshots.clear();
+        inventory.accumulate(&first);
+    }
+    if inventory_complete
+        && !cancel.is_cancelled()
+        && let Some(successor) = successor
+    {
+        match download_photos_incremental(
+            client,
+            passes,
+            config,
+            &successor,
+            controls,
+            cancel.clone(),
+        )
+        .await
+        {
+            Ok(mut replay) => {
+                let qualified = replay.checkpoint.delta_raw_records_observed == Some(false)
+                    && reconciliation_work_complete(&replay)
+                    && (!replay.checkpoint.sync_token_blocked
+                        || replay.checkpoint.bounded_path_selection_complete)
+                    && replay.checkpoint.delta_successor.is_some()
+                    && !cancel.is_cancelled();
+                inventory.sync_token = replay.sync_token.take();
+                replay.deferred_album_snapshots.clear();
+                inventory.outcome = merge_download_outcomes(&inventory.outcome, &replay.outcome);
+                inventory.accumulate(&replay);
+                inventory.checkpoint.inventory_reconciliation_complete = qualified;
+            }
+            Err(error) => match classify(&error) {
+                class @ (IncrementalErrorClass::TokenFallback
+                | IncrementalErrorClass::StaticFallback) => {
+                    // The selected inventory already ran. Do not repeat it or use
+                    // its query token as a replacement for the rejected successor.
+                    rejected = class == IncrementalErrorClass::TokenFallback;
+                }
+                IncrementalErrorClass::SessionExpired
+                | IncrementalErrorClass::TransientFailure
+                | IncrementalErrorClass::CaptureRefused => return Err(error),
+            },
+        }
+    }
+    // As with ordinary fallback, only completed inventory can reach the cycle's
+    // durable retained-checkpoint hold. It never qualifies this request.
+    inventory.checkpoint.retained_token_rejected = rejected && inventory_complete;
+    if !inventory.checkpoint.inventory_reconciliation_complete {
+        inventory.sync_token = None;
+        inventory.block_incremental_token("inventory_reconciliation_required");
+    }
+    Ok(inventory)
+}
+
+fn reconciliation_work_complete(result: &SyncResult) -> bool {
+    matches!(result.outcome, DownloadOutcome::Success)
+        && result.stats.failed == 0
+        && result.stats.exif_failures == 0
+        && result.checkpoint.state_write_failures == 0
+        && result.checkpoint.enumeration_errors == 0
+        && !result.checkpoint.enumeration_incomplete
+        && !result.checkpoint.identity_incomplete
+        && !result.checkpoint.interrupted
+}
+
 pub async fn download_photos_with_sync(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
@@ -299,12 +472,32 @@ pub async fn download_photos_with_sync(
     controls: DownloadControls,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
+    anyhow::ensure!(
+        !controls.run_mode.downloads_files() || config.state_db.is_some(),
+        "Writable sync requires a state database; use dry-run for a state-free preview"
+    );
+    if passes.is_empty() {
+        return Ok(SyncResult::from_execution(
+            DownloadOutcome::Success,
+            None,
+            SyncStats::default(),
+        ));
+    }
+    if controls.run_mode.downloads_files() && !config.provisional {
+        let context = super::generation::context(passes, &config, controls).await?.context(
+            "Writable sync requires authenticated destination ownership for every selected query; refresh authenticated library discovery or use dry-run to inspect an unsupported selection",
+        )?;
+        // This read validates the database's authenticated pin and retained root
+        // before recovery, cleanup, or any other dispatcher mutation.
+        context.current().await?;
+        super::album_directory::prepare(passes, &config, &shutdown_token).await?;
+    }
     // Bound the complete cycle's new selection/replay state at its owner,
     // preserving one opaque public future and avoiding caller-specific boxing.
     Box::pin(download_photos_with_sync_inner(
         download_client,
         passes,
-        config,
+        Arc::clone(&config),
         controls,
         shutdown_token,
     ))
@@ -349,11 +542,22 @@ async fn download_photos_with_sync_inner(
     let primary_layout_active = controls.run_mode.downloads_files() && primary_layout_requested;
     let primary_layout_preview = !controls.run_mode.downloads_files() && primary_layout_requested;
     let config = Arc::new(DownloadConfig {
+        complete_path_selection: config.complete_path_selection || config.inventory_reconciliation,
         primary_layout_active,
         primary_layout_preview,
         ..config.as_ref().clone()
     });
-    let sync_started_at = chrono::Utc::now().timestamp();
+    // Bind the validated selection before historical maintenance can schedule
+    // work. The same context also owns enumeration and publication below.
+    let config =
+        if let Some(context) = super::generation::context(passes, &config, controls).await? {
+            Arc::new(DownloadConfig {
+                selection_context: Some(Arc::new(context)),
+                ..config.as_ref().clone()
+            })
+        } else {
+            config
+        };
     super::generation::freeze_before_sync(passes, &config, controls).await?;
     if matches!(controls.run_mode, super::models::DownloadRunMode::Download) {
         let protected = crate::download::legacy_preservation::protected_replacement_paths(
@@ -369,15 +573,21 @@ async fn download_photos_with_sync_inner(
     if controls.run_mode.downloads_files() {
         cleanup_orphan_part_files(&config).await;
     }
-    if matches!(config.sync_mode, SyncMode::Incremental { .. })
+    if controls.run_mode.downloads_files()
+        && matches!(config.sync_mode, SyncMode::Incremental { .. })
         && let Some(db) = &config.state_db
     {
         backfill_asset_master_mappings_from_album_history(db.as_ref()).await;
     }
-    let metadata_capture_repair =
-        run_metadata_capture_repair(passes, &config, controls, &shutdown_token).await;
+    let metadata_capture_repair = if config.selection_context.is_some() {
+        observe_metadata_capture(&config).await
+    } else {
+        run_metadata_capture_repair(passes, &config, controls, &shutdown_token).await
+    };
     if metadata_capture_repair.auth_errors > 0 {
         return Ok(SyncResult {
+            deferred_album_snapshots: Vec::new(),
+            retry_exclusions: Default::default(),
             outcome: DownloadOutcome::SessionExpired {
                 auth_error_count: metadata_capture_repair.auth_errors,
             },
@@ -389,66 +599,18 @@ async fn download_photos_with_sync_inner(
         });
     }
 
-    // Give every non-downloaded asset a fresh start this sync:
-    // failed -> pending (with attempts reset), and stale attempt counts on
-    // pending assets cleared so the per-sync cap starts from zero.
-    if let Some(db) = &config.state_db {
-        match db.prune_source_deleted_retries(Some(&config.library)).await {
-            Ok(0) => {}
-            Ok(count) => {
-                tracing::info!(
-                    count,
-                    "Pruned source-deleted pending/failed assets from retry queue"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to prune source-deleted retry assets");
-            }
-        }
-        let error_retention = if config.repair_truncated {
-            crate::state::RetryErrorRetention::Preserve(
-                crate::commands::reconcile::FILE_TRUNCATED_REASON,
-            )
-        } else {
-            crate::state::RetryErrorRetention::Clear
-        };
-        match db
-            .prepare_for_retry(Some(&config.library), error_retention)
+    let mut result = match &config.sync_mode {
+        SyncMode::Incremental { zone_sync_token } if config.inventory_reconciliation => {
+            Box::pin(reconcile_inventory(
+                download_client,
+                passes,
+                &config,
+                zone_sync_token,
+                controls,
+                shutdown_token.clone(),
+            ))
             .await
-        {
-            Ok((failed, stale, _)) => {
-                if failed > 0 {
-                    tracing::debug!(count = failed, "Reset failed assets for retry");
-                }
-                if stale > 0 {
-                    tracing::debug!(
-                        count = stale,
-                        "Cleared stale attempt counts on pending assets"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to reset assets for retry");
-            }
         }
-    }
-
-    let config =
-        if let Some(context) = super::generation::context(passes, &config, controls).await? {
-            Arc::new(DownloadConfig {
-                selection_context: Some(Arc::new(context)),
-                ..config.as_ref().clone()
-            })
-        } else {
-            config
-        };
-
-    if !primary_layout_active {
-        super::queue_projection::admit_retained_work(passes, &config, controls, &shutdown_token)
-            .await?;
-    }
-
-    let result = match &config.sync_mode {
         SyncMode::Full if config.selection_context.is_some() => {
             Box::pin(super::generation::inventory(
                 download_client,
@@ -460,7 +622,7 @@ async fn download_photos_with_sync_inner(
             .await
         }
         SyncMode::Incremental { zone_sync_token } if config.selection_context.is_some() => {
-            match download_photos_incremental(
+            let attempt = download_photos_incremental(
                 download_client,
                 passes,
                 &config,
@@ -468,31 +630,16 @@ async fn download_photos_with_sync_inner(
                 controls,
                 shutdown_token.clone(),
             )
+            .await;
+            finish_incremental_attempt(
+                attempt,
+                download_client,
+                passes,
+                &config,
+                controls,
+                shutdown_token.clone(),
+            )
             .await
-            {
-                Ok(result) => Ok(result),
-                Err(error) => match classify_selection_incremental_error(&error) {
-                    class @ (IncrementalErrorClass::TokenFallback
-                    | IncrementalErrorClass::StaticFallback) => {
-                        Box::pin(super::generation::inventory(
-                            download_client,
-                            passes,
-                            &config,
-                            controls,
-                            shutdown_token.clone(),
-                        ))
-                        .await
-                        .map(|mut result| {
-                            result.checkpoint.retained_token_rejected =
-                                class == IncrementalErrorClass::TokenFallback;
-                            result
-                        })
-                    }
-                    IncrementalErrorClass::SessionExpired
-                    | IncrementalErrorClass::TransientFailure
-                    | IncrementalErrorClass::CaptureRefused => Err(error),
-                },
-            }
         }
         SyncMode::Full => {
             download_photos_full_with_token(
@@ -568,10 +715,7 @@ async fn download_photos_with_sync_inner(
                     let has_smart_folder_pass = passes
                         .iter()
                         .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder);
-                    let recent_selection = super::recent::active(&config)
-                        .await
-                        .map_err(super::recent::RecentSelectionError)?;
-                    let incremental_result = if has_smart_folder_pass && !recent_selection {
+                    let incremental_result = if has_smart_folder_pass {
                         download_photos_incremental_with_smart_folder_refresh(
                             download_client,
                             passes,
@@ -592,37 +736,15 @@ async fn download_photos_with_sync_inner(
                         )
                         .await
                     };
-                    match incremental_result {
-                        Ok(result) => Ok(result),
-                        Err(e) => match classify_incremental_error(&e) {
-                            class @ (IncrementalErrorClass::TokenFallback
-                            | IncrementalErrorClass::StaticFallback) => {
-                                let reason = FullEnumerationReason::OtherStaticReason;
-                                tracing::warn!(
-                                    error = %e,
-                                    full_enumeration_reason = reason.as_str(),
-                                    "Incremental sync failed, falling back to full enumeration"
-                                );
-                                download_photos_full_with_reason(
-                                    download_client,
-                                    passes,
-                                    &config,
-                                    controls,
-                                    shutdown_token.clone(),
-                                    reason,
-                                )
-                                .await
-                                .map(|mut result| {
-                                    result.checkpoint.retained_token_rejected =
-                                        class == IncrementalErrorClass::TokenFallback;
-                                    result
-                                })
-                            }
-                            IncrementalErrorClass::SessionExpired
-                            | IncrementalErrorClass::TransientFailure
-                            | IncrementalErrorClass::CaptureRefused => Err(e),
-                        },
-                    }
+                    finish_incremental_attempt(
+                        incremental_result,
+                        download_client,
+                        passes,
+                        &config,
+                        controls,
+                        shutdown_token.clone(),
+                    )
+                    .await
                 }
             }
         }
@@ -647,18 +769,70 @@ async fn download_photos_with_sync_inner(
         })
     })?;
 
-    let mut result = append_targeted_recovery_to_sync_result(
-        download_client,
-        passes,
-        &config,
-        controls,
-        shutdown_token.clone(),
-        result,
-    )
-    .await?;
+    if matches!(result.outcome, DownloadOutcome::SessionExpired { .. })
+        && controls.run_mode.downloads_files()
+        && let Some(db) = &config.state_db
+    {
+        // Discovery and retained replay can return session expiry without
+        // starting a streaming run. Persist the final invocation outcome even
+        // when an earlier empty pipeline recorded a successful subpass.
+        result.checkpoint.enumeration_errors = result.checkpoint.enumeration_errors.max(1);
+        result.checkpoint.enumeration_incomplete = true;
+        result.checkpoint.project(&mut result.stats);
+        let recorded = async {
+            let run = db.start_sync_run().await?;
+            db.complete_sync_run(
+                run,
+                &crate::state::SyncRunStats {
+                    assets_seen: result.stats.assets_seen,
+                    assets_downloaded: u64::try_from(result.stats.downloaded).unwrap_or(u64::MAX),
+                    assets_failed: u64::try_from(result.stats.failed).unwrap_or(u64::MAX),
+                    enumeration_errors: u64::try_from(result.stats.enumeration_errors)
+                        .unwrap_or(u64::MAX),
+                    interrupted: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = recorded {
+            tracing::warn!(%error, "Failed to retain provider session failure status");
+            result.checkpoint.state_write_failures += 1;
+            result.stats.state_write_failures += 1;
+        }
+    }
+
+    // Current selection already owns admission, replay and completion of every
+    // selected destination. Aggregate rendition retry cannot add authority here.
+    // Authenticated previews use the same selection boundary without creating
+    // durable work; a historical retry tail would count selected media twice.
+    let mut current_selection_preview = !controls.run_mode.downloads_files();
+    if current_selection_preview {
+        for pass in passes {
+            if pass.album.current_selection_scope()?.is_none() {
+                current_selection_preview = false;
+                break;
+            }
+        }
+    }
+    let mut result = if controls.run_mode.downloads_files() || current_selection_preview {
+        result
+    } else {
+        super::recovery::append_targeted_recovery_to_sync_result(
+            download_client,
+            passes,
+            &config,
+            controls,
+            shutdown_token.clone(),
+            result,
+        )
+        .await?
+    };
 
     let repair_outcome = if metadata_capture_repair.failures > 0
-        || metadata_capture_repair.stats.metadata_capture_unresolved > 0
+        || ((config.refresh_metadata || config.selection_context.is_none())
+            && metadata_capture_repair.stats.metadata_capture_unresolved > 0)
     {
         DownloadOutcome::PartialFailure {
             failed_count: metadata_capture_repair.failures.max(1),
@@ -667,6 +841,8 @@ async fn download_photos_with_sync_inner(
         DownloadOutcome::Success
     };
     let repair = SyncResult {
+        deferred_album_snapshots: Vec::new(),
+        retry_exclusions: Default::default(),
         outcome: repair_outcome,
         sync_token: None,
         stats: metadata_capture_repair.stats,
@@ -682,36 +858,7 @@ async fn download_photos_with_sync_inner(
         result.sync_token = None;
     }
 
-    // Managed publication can complete the newly captured source in this cycle.
-    // Keep the existing bounded admission owner, but run it after capture so an
-    // otherwise quiet reopen does not need to hydrate yesterday's completed work.
-    if primary_layout_active
-        && matches!(result.outcome, DownloadOutcome::Success)
-        && !shutdown_token.is_cancelled()
-    {
-        super::queue_projection::admit_retained_work(passes, &config, controls, &shutdown_token)
-            .await?;
-    }
     super::generation::hold_retained_debt(passes, &config, controls, &mut result).await?;
-
-    // Pending is transient — anything still pending after a complete sync either
-    // wasn't enumerated or failed silently. Skip on interrupt where pending is expected.
-    if let Some(db) = &config.state_db
-        && !shutdown_token.is_cancelled()
-    {
-        match db.promote_pending_to_failed(sync_started_at).await {
-            Ok(promoted) if promoted > 0 => {
-                tracing::warn!(
-                    count = promoted,
-                    "Promoted unresolved pending assets to failed"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to promote pending assets");
-            }
-            _ => {}
-        }
-    }
 
     Ok(result)
 }

@@ -2,17 +2,32 @@
 use std::sync::Arc;
 
 use base64::Engine as _;
+use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use crate::sync_loop::test_support::{
-    FailingMetadataSetDb, full_album_page_with_download, make_full_album_with_boxed_session,
-    make_run_cycle_config, make_run_cycle_download_config_builder,
-    make_run_cycle_library_state_with_album, make_shared_session_for_run_cycle,
+    full_album_page_with_download, make_owned_cycle_album, make_run_cycle_config,
+    make_run_cycle_download_config_builder, make_run_cycle_library_state_with_album,
+    make_shared_session_for_run_cycle,
 };
 use crate::{download, state};
+
+async fn adopt_released(database: &std::path::Path) {
+    let legacy = database.with_extension("legacy.db");
+    std::fs::rename(database, &legacy).unwrap();
+    let owner = state::db::account::AccountOwner::authenticated(
+        "runner@example.invalid",
+        "com",
+        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"runner-fixture"}})).unwrap(),
+    )
+    .unwrap();
+    state::db::account::adopt_legacy(&legacy, database, &owner, "runner@example.invalid", "com")
+        .await
+        .unwrap();
+}
 
 #[derive(Clone, Debug)]
 struct UpgradeSession {
@@ -28,6 +43,22 @@ impl crate::icloud::photos::PhotosSession for UpgradeSession {
         body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<serde_json::Value> {
+        if url.contains("/records/query/batch?") {
+            return Ok(crate::sync_loop::test_support::album_count_response(1));
+        }
+        if url.contains("/records/query?") {
+            let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                .unwrap_or(0);
+            return Ok(
+                serde_json::json!({"records": if offset == 0 { self.records.clone() } else { serde_json::json!([]) }, "syncToken":"after"}),
+            );
+        }
         if url.contains("/changes/zone?") {
             let records = if self.quiet {
                 serde_json::json!([])
@@ -50,7 +81,20 @@ impl crate::icloud::photos::PhotosSession for UpgradeSession {
                 ["asset-recovered", "recovered"].contains(&record["recordName"].as_str().unwrap())
             );
         }
-        Ok(serde_json::json!({"records":self.records}))
+        let requested = request["records"].as_array().unwrap();
+        let records: Vec<_> = requested
+            .iter()
+            .map(|wanted| {
+                self.records
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|record| record["recordName"] == wanted["recordName"])
+                    .expect("requested fixture identity exists")
+                    .clone()
+            })
+            .collect();
+        Ok(serde_json::json!({"records":records}))
     }
 
     fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
@@ -127,32 +171,34 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
         INSERT INTO metadata VALUES ('sync_token:PrimarySync','before');
         INSERT INTO sync_runs(started_at,completed_at,status) VALUES (1700000000,1700000001,'complete');").unwrap();
     drop(conn);
+    adopt_released(&database).await;
     let original = media.join("retained-original.jpg");
     let sidecar = media.join("retained-original.xmp");
     std::fs::write(&original, b"synthetic retained original").unwrap();
     std::fs::write(&sidecar, b"synthetic independent metadata").unwrap();
     let config = make_run_cycle_config();
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    let (capture, _trace_guard) = crate::test_helpers::TracingCapture::install();
     let mut recovered_path = None;
     for cycle in 0..3 {
         {
-            let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
-            let db: Arc<dyn download::DownloadStore> = if cycle == 0 {
-                Arc::new(
-                    FailingMetadataSetDb::without_set_failure(
-                        inner.clone(),
-                        "injected upgrade recovery failure",
-                    )
-                    .with_upsert_seen_failure(),
-                )
+            let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
+            let conn = rusqlite::Connection::open(&database).unwrap();
+            if cycle == 0 {
+                conn.execute_batch("CREATE TRIGGER fail_upgrade_recovery BEFORE INSERT ON assets WHEN NEW.id='asset-recovered' BEGIN SELECT RAISE(ABORT, 'injected upgrade recovery failure'); END;").unwrap();
             } else {
-                inner.clone()
-            };
+                conn.execute_batch("DROP TRIGGER IF EXISTS fail_upgrade_recovery;")
+                    .unwrap();
+            }
+            drop(conn);
+            let db: Arc<dyn download::DownloadStore> = inner.clone();
             let primary = make_run_cycle_library_state_with_album(
                 "PrimarySync",
                 "sync_token:PrimarySync",
-                make_full_album_with_boxed_session(
+                make_owned_cycle_album(
+                    &inner,
                     "PrimarySync",
+                    "private",
                     Box::new(UpgradeSession {
                         records: records.clone(),
                         quiet: cycle == 2,
@@ -164,7 +210,6 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
                 &[&primary],
                 &config,
                 Some(db.as_ref()),
-                false,
                 &builder,
                 download::DownloadControls::download_hidden(),
                 &shared_session,
@@ -173,6 +218,12 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
             .await
             .unwrap();
             if cycle == 0 {
+                assert!(
+                    capture.contains_event(|event| event
+                        .field("error")
+                        .is_some_and(|error| error.contains("injected upgrade recovery failure"))),
+                    "the native SQLite fault must execute after valid current confirmation"
+                );
                 assert!(
                     result.failed_count > 0 || result.stats.state_write_failures > 0,
                     "{result:?}"
@@ -196,24 +247,34 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
         ).unwrap();
         assert_eq!(
             status,
-            if cycle == 0 { "pending" } else { "downloaded" },
+            if cycle == 0 { "failed" } else { "downloaded" },
             "cycle {cycle}"
         );
-        let token: String = conn
+        let token: Option<String> = conn
             .query_row(
                 "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
                 [],
                 |r| r.get(0),
             )
+            .optional()
             .unwrap();
         assert_eq!(
-            token,
-            if cycle == 0 { "before" } else { "after" },
+            token.as_deref(),
+            if cycle == 0 { None } else { Some("after") },
             "cycle {cycle}"
         );
+        assert_eq!(
+            conn.query_row::<String, _, _>(
+                "SELECT value FROM historical_v030_checkpoints WHERE key='sync_token:PrimarySync'",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            "before"
+        );
         assert_eq!(conn.query_row("SELECT master_record_name FROM asset_master_mappings WHERE library='PrimarySync' AND asset_record_name='asset-recovered'", [], |r| r.get::<_, String>(0)).unwrap(), "recovered");
-        // Retry routing resets failed to pending before attempting the write.
-        // Pending remains durable work, never a falsely completed download.
+        // The native admission fault rolls back the attempted queue insert.
+        // The released failed row remains unchanged until current work commits.
         if cycle == 0 {
             assert!(local_path.is_none());
         }
@@ -306,6 +367,7 @@ async fn released_v0240_metadata_policy_selection_restart_preserves_siblings() {
     };
     let before = immutable_rows(&conn);
     drop(conn);
+    adopt_released(&database).await;
     let unrelated = dir.path().join("unrelated.xmp");
     std::fs::write(&unrelated, b"independent user metadata").unwrap();
     let deleted_sidecar = dir.path().join("deleted.jpg.xmp");
@@ -326,17 +388,18 @@ async fn released_v0240_metadata_policy_selection_restart_preserves_siblings() {
             vec!["PrimarySync", "SharedSync-synthetic"]
         };
         {
-            let db = state::SqliteStateDb::open(&database).await.unwrap();
+            let db = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
             assert_eq!(
                 download::drain_pending_metadata_rewrites(
-                    &db,
+                    db.as_ref(),
                     &metadata,
                     download::CaptureTimestampRepair::Preserve,
                     &scope,
                     Arc::from(".metadata-tmp"),
                     &CancellationToken::new(),
                 )
-                .await,
+                .await
+                .failed,
                 0,
                 "cycle {cycle}"
             );
@@ -411,14 +474,10 @@ async fn released_v0240_metadata_policy_selection_restart_preserves_siblings() {
             ("PrimarySync", "primary-before"),
             ("SharedSync-synthetic", "shared-before"),
         ] {
-            assert_eq!(
-                conn.query_row(
-                    "SELECT value FROM metadata WHERE key=?1",
-                    [format!("sync_token:{library}")],
-                    |row| row.get::<_, String>(0)
-                )
-                .unwrap(),
-                token
+            crate::test_helpers::assert_checkpoint_evidence(
+                &conn,
+                &format!("sync_token:{library}"),
+                token,
             );
         }
         assert_eq!(

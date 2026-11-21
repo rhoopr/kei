@@ -197,6 +197,7 @@ pub(crate) async fn attempt_reauth(
         crate::personality::Mode::Off,
         input_mode,
         Some(generation),
+        auth::AuthPersistence::Writable,
     )
     .await?;
 
@@ -283,8 +284,7 @@ async fn read_required_session_signal(session_path: &Path) -> anyhow::Result<Aut
         };
         anyhow::anyhow!(
             "Cannot wait for 2FA submission because session metadata file is {reason}: {path}. \
-             Run `kei login get-code`, then `kei login submit-code <CODE>`, and restart the \
-             service or rerun kei. Error: {e}",
+             Complete the 2FA steps printed above and restart the service or rerun kei. Error: {e}",
             path = session_path.display()
         )
     })?;
@@ -374,8 +374,7 @@ async fn wait_for_2fa_submit_until(
             );
             anyhow::bail!(
                 "Timed out after {timeout_secs}s waiting for 2FA submission via persisted auth \
-                 state under {path}. Run `kei login get-code`, then `kei login submit-code \
-                 <CODE>`, and restart the service or rerun kei.",
+                 state under {path}. Complete the 2FA steps printed above and restart the service or rerun kei.",
                 timeout_secs = config.timeout.as_secs(),
                 path = cookie_dir.display()
             );
@@ -698,6 +697,10 @@ impl PassScope {
 pub(crate) struct CollectionContext {
     pub(crate) collection_album_names: std::collections::BTreeSet<String>,
     pub(crate) selected_smart_folder_names: Vec<String>,
+    pub(crate) deleted_album_bindings: Vec<(
+        String,
+        crate::state::db::provider_generations::BoundAlbumSelection,
+    )>,
 }
 
 pub(crate) fn smart_selector_active(selection: &crate::selection::Selection) -> bool {
@@ -758,6 +761,17 @@ pub(crate) async fn build_collection_context(
     selection: &crate::selection::Selection,
     collection_libraries: &[icloud::photos::PhotoLibrary],
 ) -> anyhow::Result<CollectionContext> {
+    build_collection_context_for_sync(selection, collection_libraries, None).await
+}
+
+pub(crate) async fn build_collection_context_for_sync(
+    selection: &crate::selection::Selection,
+    collection_libraries: &[icloud::photos::PhotoLibrary],
+    recovery: Option<(
+        &crate::state::SqliteStateDb,
+        &crate::state::db::account::AccountOwner,
+    )>,
+) -> anyhow::Result<CollectionContext> {
     use crate::selection::AlbumSelector;
 
     let smart_names = smart_folder_name_set();
@@ -765,12 +779,96 @@ pub(crate) async fn build_collection_context(
         pick_selected_smart_folder_names(&selection.smart_folders, &smart_names)?;
 
     let mut collection_album_names = std::collections::BTreeSet::new();
+    let mut live_containers = std::collections::BTreeSet::new();
+    let mut deleted_album_bindings = Vec::new();
     if selection.albums_explicit && !matches!(selection.albums, AlbumSelector::None) {
         for library in collection_libraries {
             let album_map = library.albums().await?;
-            for name in album_map.keys() {
-                if !smart_names.contains(name.as_str()) {
+            for album in album_map.values().flatten() {
+                if let Some(container) = album.container_id() {
+                    live_containers.insert((library.zone_name().to_owned(), container.to_owned()));
+                }
+            }
+            for (name, entries) in &album_map {
+                if entries.iter().any(|album| album.container_id().is_some()) {
                     collection_album_names.insert(name.clone());
+                    for album in entries
+                        .iter()
+                        .filter(|album| album.container_id().is_some())
+                    {
+                        if let Some(leaf) = album.selector_components().last() {
+                            collection_album_names.insert(leaf.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if let (AlbumSelector::Named { included, excluded }, Some((db, owner))) =
+            (&selection.albums, recovery)
+        {
+            let missing: Vec<_> = included
+                .iter()
+                .filter(|name| !excluded.contains(*name) && !collection_album_names.contains(*name))
+                .collect();
+            if !missing.is_empty() {
+                let mut prior = Vec::new();
+                for library in collection_libraries {
+                    for bound in db
+                        .bound_album_selections(
+                            owner.clone(),
+                            library.selection_zone().clone(),
+                            library.selection_database().to_owned(),
+                        )
+                        .await?
+                    {
+                        prior.push((library, bound));
+                    }
+                }
+                for name in missing {
+                    let matching: Vec<_> = prior
+                        .iter()
+                        .filter(|(_, bound)| {
+                            if name.contains('/') {
+                                bound.components.join("/") == *name
+                            } else {
+                                bound.components.last() == Some(name)
+                            }
+                        })
+                        .collect();
+                    if matching.is_empty() {
+                        continue;
+                    }
+                    if name.contains('/') {
+                        let mut zones = std::collections::BTreeSet::new();
+                        anyhow::ensure!(
+                            matching
+                                .iter()
+                                .all(|(library, _)| zones.insert(library.zone_name())),
+                            "Qualified album selector `{name}` is ambiguous in its prior bindings"
+                        );
+                    }
+                    let mut confirmed = Vec::new();
+                    for (library, bound) in matching {
+                        if live_containers
+                            .contains(&(library.zone_name().to_owned(), bound.container_id.clone()))
+                        {
+                            confirmed.clear();
+                            break;
+                        }
+                        if !bound.deleted
+                            && !library.confirms_album_deleted(&bound.container_id).await?
+                        {
+                            confirmed.clear();
+                            break;
+                        }
+                        let mut bound = bound.clone();
+                        bound.deleted = true;
+                        confirmed.push((library.zone_name().to_owned(), bound));
+                    }
+                    if !confirmed.is_empty() {
+                        collection_album_names.insert(name.clone());
+                        deleted_album_bindings.extend(confirmed);
+                    }
                 }
             }
         }
@@ -779,11 +877,23 @@ pub(crate) async fn build_collection_context(
             &collection_album_names,
             &smart_names,
         )?;
+        if let Some((db, _)) = recovery {
+            let mut recorded = std::collections::BTreeSet::new();
+            for (library, binding) in &deleted_album_bindings {
+                if recorded.insert((library, &binding.container_id)) {
+                    db.mark_album_container_deleted(library, &binding.container_id)
+                        .await?;
+                    db.invalidate_album_membership_snapshot(library, &binding.container_id)
+                        .await?;
+                }
+            }
+        }
     }
 
     Ok(CollectionContext {
         collection_album_names,
         selected_smart_folder_names,
+        deleted_album_bindings,
     })
 }
 
@@ -800,7 +910,7 @@ fn validate_collection_album_selector(
         }
         AlbumSelector::Named { included, excluded } => {
             for name in included {
-                if smart_names.contains(name.as_str()) {
+                if smart_names.contains(name.as_str()) && !collection_album_names.contains(name) {
                     anyhow::bail!(
                         "`{name}` is a smart folder. Use `--smart-folder {name}` instead of `--album {name}`."
                     );
@@ -1043,11 +1153,23 @@ pub(crate) async fn resolve_passes_for_scope(
         return Ok(AlbumPlan { passes: Vec::new() });
     }
 
-    let mut album_map = if album_active || smart_active {
+    let discovered = if album_active || smart_active {
         library.albums().await?
     } else {
         std::collections::HashMap::new()
     };
+    let mut album_map = std::collections::HashMap::<String, Vec<icloud::photos::PhotoAlbum>>::new();
+    let mut smart_map = std::collections::HashMap::<String, Vec<icloud::photos::PhotoAlbum>>::new();
+    for (name, entries) in discovered {
+        for album in entries {
+            let target = if album.container_id().is_some() {
+                &mut album_map
+            } else {
+                &mut smart_map
+            };
+            target.entry(name.clone()).or_default().push(album);
+        }
+    }
     let smart_names = smart_folder_name_set();
 
     let selected_album_names = if album_active {
@@ -1067,7 +1189,7 @@ pub(crate) async fn resolve_passes_for_scope(
     let selected_smart_names = if smart_active {
         pick_collection_scoped_smart_folder_names_for_library(
             library,
-            &album_map,
+            &smart_map,
             &collection_context.selected_smart_folder_names,
         )
     } else {
@@ -1075,6 +1197,9 @@ pub(crate) async fn resolve_passes_for_scope(
     };
 
     let empty = empty_exclude_ids();
+    for albums in album_map.values_mut() {
+        albums.retain(|album| album_matches_selection(album, &selection.albums));
+    }
     let mut passes: Vec<AlbumPass> = Vec::new();
     let cross_zone_album_sources: Vec<icloud::photos::PhotoAlbum> = cross_zone_libraries
         .iter()
@@ -1093,7 +1218,7 @@ pub(crate) async fn resolve_passes_for_scope(
         &mut passes,
     );
     drain_named_into_passes(
-        &mut album_map,
+        &mut smart_map,
         selected_smart_names,
         PassKind::SmartFolder,
         &empty,
@@ -1114,31 +1239,37 @@ pub(crate) async fn resolve_passes_for_scope(
 
 fn pick_collection_scoped_album_names_for_library(
     selector: &crate::selection::AlbumSelector,
-    album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
+    album_map: &std::collections::HashMap<String, Vec<icloud::photos::PhotoAlbum>>,
     smart_names: &rustc_hash::FxHashSet<&'static str>,
     collection_album_names: &std::collections::BTreeSet<String>,
 ) -> anyhow::Result<Vec<String>> {
     use crate::selection::AlbumSelector;
+    validate_qualified_album_selectors(selector, album_map)?;
 
     match selector {
         AlbumSelector::None => Ok(Vec::new()),
         AlbumSelector::All { excluded } => {
             bail_unknown_excluded_collection_albums(excluded, collection_album_names)?;
             Ok(album_map
-                .keys()
-                .filter(|name| {
-                    !smart_names.contains(name.as_str()) && !excluded.contains(name.as_str())
+                .iter()
+                .filter(|(_, albums)| {
+                    albums
+                        .iter()
+                        .any(|album| album_matches_selection(album, selector))
                 })
-                .cloned()
+                .map(|(name, _)| name.clone())
                 .collect())
         }
-        AlbumSelector::Named { included, excluded } => {
+        AlbumSelector::Named { .. } => {
             validate_collection_album_selector(selector, collection_album_names, smart_names)?;
-            Ok(included
+            Ok(album_map
                 .iter()
-                .filter(|name| !excluded.contains(*name))
-                .filter(|name| album_map.contains_key(name.as_str()))
-                .cloned()
+                .filter(|(_, albums)| {
+                    albums
+                        .iter()
+                        .any(|album| album_matches_selection(album, selector))
+                })
+                .map(|(name, _)| name.clone())
                 .collect())
         }
     }
@@ -1146,7 +1277,7 @@ fn pick_collection_scoped_album_names_for_library(
 
 fn pick_collection_scoped_smart_folder_names_for_library(
     library: &icloud::photos::PhotoLibrary,
-    album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
+    album_map: &std::collections::HashMap<String, Vec<icloud::photos::PhotoAlbum>>,
     selected_smart_folder_names: &[String],
 ) -> Vec<String> {
     selected_smart_folder_names
@@ -1172,26 +1303,33 @@ fn pick_collection_scoped_smart_folder_names_for_library(
 /// correct it).
 fn pick_album_names(
     selector: &crate::selection::AlbumSelector,
-    album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
+    album_map: &std::collections::HashMap<String, Vec<icloud::photos::PhotoAlbum>>,
     smart_names: &rustc_hash::FxHashSet<&'static str>,
 ) -> anyhow::Result<Vec<String>> {
     use crate::selection::AlbumSelector;
+    validate_qualified_album_selectors(selector, album_map)?;
     match selector {
         AlbumSelector::None => Ok(Vec::new()),
         AlbumSelector::All { excluded } => {
-            bail_unknown_excluded_albums(excluded, album_map, smart_names)?;
+            bail_unknown_excluded_albums(excluded, album_map)?;
             Ok(album_map
-                .keys()
-                .filter(|name| {
-                    !smart_names.contains(name.as_str()) && !excluded.contains(name.as_str())
+                .iter()
+                .filter(|(_, albums)| {
+                    albums
+                        .iter()
+                        .any(|album| album_matches_selection(album, selector))
                 })
-                .cloned()
+                .map(|(name, _)| name.clone())
                 .collect())
         }
         AlbumSelector::Named { included, excluded } => {
             let mut chosen = Vec::with_capacity(included.len());
             for name in included {
-                if smart_names.contains(name.as_str()) {
+                let matches: Vec<_> = album_map
+                    .iter()
+                    .filter(|(_, albums)| albums.iter().any(|album| album.matches_selector(name)))
+                    .collect();
+                if smart_names.contains(name.as_str()) && matches.is_empty() {
                     anyhow::bail!(
                         "`{name}` is a smart folder. Use `--smart-folder {name}` instead of `--album {name}`."
                     );
@@ -1199,21 +1337,72 @@ fn pick_album_names(
                 if excluded.contains(name) {
                     continue;
                 }
-                if album_map.contains_key(name.as_str()) {
-                    chosen.push(name.clone());
+                if !matches.is_empty() {
+                    chosen.extend(
+                        matches
+                            .into_iter()
+                            .filter(|(_, albums)| {
+                                albums
+                                    .iter()
+                                    .any(|album| album_matches_selection(album, selector))
+                            })
+                            .map(|(key, _)| key.clone()),
+                    );
                 } else {
-                    let mut available: Vec<&String> = album_map
-                        .keys()
-                        .filter(|k| !smart_names.contains(k.as_str()))
-                        .collect();
+                    let mut available: Vec<&String> = album_map.keys().collect();
                     available.sort();
                     anyhow::bail!("Album `{name}` was not found. Available albums: {available:?}");
                 }
             }
-            bail_unknown_excluded_albums(excluded, album_map, smart_names)?;
+            bail_unknown_excluded_albums(excluded, album_map)?;
             Ok(chosen)
         }
     }
+}
+
+fn album_matches_selection(
+    album: &icloud::photos::PhotoAlbum,
+    selector: &crate::selection::AlbumSelector,
+) -> bool {
+    use crate::selection::AlbumSelector;
+    let excluded = match selector {
+        AlbumSelector::None => return false,
+        AlbumSelector::All { excluded } => excluded,
+        AlbumSelector::Named { included, excluded } => {
+            if !included.iter().any(|name| album.matches_selector(name)) {
+                return false;
+            }
+            excluded
+        }
+    };
+    !excluded.iter().any(|name| album.matches_selector(name))
+}
+
+fn validate_qualified_album_selectors(
+    selector: &crate::selection::AlbumSelector,
+    albums: &std::collections::HashMap<String, Vec<icloud::photos::PhotoAlbum>>,
+) -> anyhow::Result<()> {
+    use crate::selection::AlbumSelector;
+    let (included, excluded) = match selector {
+        AlbumSelector::None => return Ok(()),
+        AlbumSelector::All { excluded } => (None, excluded),
+        AlbumSelector::Named { included, excluded } => (Some(included), excluded),
+    };
+    for name in included.into_iter().flatten().chain(excluded) {
+        if name.contains('/') {
+            anyhow::ensure!(
+                albums
+                    .values()
+                    .flatten()
+                    .filter(|album| album.matches_selector(name))
+                    .take(2)
+                    .count()
+                    < 2,
+                "Qualified album selector `{name}` is ambiguous in this library"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Bail on excluded album names that don't exist. A typo in `--album '!Family'`
@@ -1221,15 +1410,15 @@ fn pick_album_names(
 /// surfacing it as a hard error keeps the user's intent honest.
 fn bail_unknown_excluded_albums(
     excluded: &std::collections::BTreeSet<String>,
-    album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
-    smart_names: &rustc_hash::FxHashSet<&'static str>,
+    album_map: &std::collections::HashMap<String, Vec<icloud::photos::PhotoAlbum>>,
 ) -> anyhow::Result<()> {
     for name in excluded {
-        if !album_map.contains_key(name.as_str()) {
-            let mut available: Vec<&String> = album_map
-                .keys()
-                .filter(|k| !smart_names.contains(k.as_str()))
-                .collect();
+        if !album_map
+            .values()
+            .flatten()
+            .any(|album| album.matches_selector(name))
+        {
+            let mut available: Vec<&String> = album_map.keys().collect();
             available.sort();
             anyhow::bail!("Excluded album `{name}` was not found. Available albums: {available:?}");
         }
@@ -1255,7 +1444,7 @@ fn bail_excluded_not_a_smart_folder(
 /// for missing-album handling retained from the old preflight resolver.
 #[cfg(test)]
 async fn compute_unfiled_exclude_ids(
-    album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
+    album_map: &std::collections::HashMap<String, Vec<icloud::photos::PhotoAlbum>>,
     selected_album_names: &[String],
 ) -> anyhow::Result<rustc_hash::FxHashSet<String>> {
     use futures_util::{StreamExt, TryStreamExt};
@@ -1273,7 +1462,7 @@ async fn compute_unfiled_exclude_ids(
         Vec::with_capacity(selected_album_names.len());
     for name in selected_album_names {
         match album_map.get(name.as_str()) {
-            Some(album) => tuples.push((name, album)),
+            Some(albums) => tuples.extend(albums.iter().map(|album| (name, album))),
             None => anyhow::bail!(
                 "Selected album '{name}' missing from library album map at \
                  unfiled-exclusion time"
@@ -1304,7 +1493,7 @@ async fn compute_unfiled_exclude_ids(
 /// from `remove` should be impossible (`pick_*` validates membership) but
 /// is logged + skipped to keep the resolver out of unwrap territory.
 fn drain_named_into_passes(
-    album_map: &mut std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
+    album_map: &mut std::collections::HashMap<String, Vec<icloud::photos::PhotoAlbum>>,
     mut names: Vec<String>,
     kind: PassKind,
     empty_excludes: &std::sync::Arc<rustc_hash::FxHashSet<String>>,
@@ -1312,25 +1501,28 @@ fn drain_named_into_passes(
     passes: &mut Vec<AlbumPass>,
 ) {
     names.sort();
+    names.dedup();
     for name in names {
-        let Some(album) = album_map.remove(name.as_str()) else {
+        let Some(albums) = album_map.remove(name.as_str()) else {
             tracing::warn!(category = ?kind, name = %name, "Selected entry disappeared from map, skipping");
             continue;
         };
-        let album = if kind == PassKind::Album && !cross_zone_sources.is_empty() {
-            let sources = cross_zone_sources
-                .iter()
-                .map(|source| source.clone_for_cross_zone_source())
-                .collect();
-            album.with_cross_zone_sources(sources)
-        } else {
-            album
-        };
-        passes.push(AlbumPass {
-            kind,
-            album,
-            exclude_ids: std::sync::Arc::clone(empty_excludes),
-        });
+        for album in albums {
+            let album = if kind == PassKind::Album && !cross_zone_sources.is_empty() {
+                let sources = cross_zone_sources
+                    .iter()
+                    .map(|source| source.clone_for_cross_zone_source())
+                    .collect();
+                album.with_cross_zone_sources(sources)
+            } else {
+                album
+            };
+            passes.push(AlbumPass {
+                kind,
+                album,
+                exclude_ids: std::sync::Arc::clone(empty_excludes),
+            });
+        }
     }
 }
 
@@ -1406,6 +1598,265 @@ mod tests {
             poll_interval: Duration::from_millis(10),
             timeout,
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_hierarchy_matches_raw_leaf_or_qualified_path() {
+        fn node(id: &str, name: &str, kind: i64, parent: Option<&str>) -> serde_json::Value {
+            let mut record = folder_record(id, name);
+            record["fields"]["albumType"] = serde_json::json!({"value":kind,"type":"INT64"});
+            if let Some(parent) = parent {
+                record["fields"]["parentId"] = serde_json::json!({"value":parent,"type":"STRING"});
+            }
+            record
+        }
+        for (included, excluded, expected) in [
+            ("Trips", None, vec!["album-family", "album-work"]),
+            ("Family/Trips", None, vec!["album-family"]),
+            ("Trips", Some("Family/Trips"), vec!["album-work"]),
+            ("Family/Trips", Some("Trips"), vec![]),
+        ] {
+            let root = serde_json::json!({"records":[node("folder-work", "Work", 3, None),node("folder-family", "Family", 3, None)]});
+            let work = serde_json::json!({"records":[node("album-work", "Trips", 0, Some("folder-work"))]});
+            let family = serde_json::json!({"records":[node("album-family", "Trips", 0, Some("folder-family"))]});
+            let library = stub_library(
+                MockPhotosSession::new()
+                    .ok(root.clone())
+                    .ok(work.clone())
+                    .ok(family.clone())
+                    .ok(root)
+                    .ok(work)
+                    .ok(family),
+            );
+            let mut selection = selection_with_albums(
+                AlbumSelector::Named {
+                    included: names(&[included]),
+                    excluded: excluded.map_or_else(BTreeSet::new, |name| names(&[name])),
+                },
+                false,
+            );
+            selection.albums_explicit = true;
+            let context = build_collection_context(&selection, std::slice::from_ref(&library))
+                .await
+                .unwrap();
+            let plan = resolve_passes_for_scope(
+                &library,
+                &selection,
+                PassScope {
+                    include_albums: true,
+                    include_smart_folders: false,
+                    include_unfiled: false,
+                },
+                &context,
+                &[],
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                plan.passes
+                    .iter()
+                    .map(|pass| pass.album.container_id().unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for pass in plan.passes {
+                assert_eq!(pass.album.selector_components().len(), 2);
+                assert_eq!(
+                    pass.album.clone().selector_components(),
+                    pass.album.selector_components()
+                );
+                assert!(pass.album.name.ends_with("/Trips"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_duplicate_album_names_preserve_identity_and_exclusions() {
+        for explicit in [false, true] {
+            for reverse in [false, true] {
+                for (selector, expected) in [
+                    (
+                        AlbumSelector::Named {
+                            included: names(&["Trips"]),
+                            excluded: BTreeSet::new(),
+                        },
+                        vec!["container-a", "container-b"],
+                    ),
+                    (
+                        AlbumSelector::All {
+                            excluded: names(&["Other"]),
+                        },
+                        vec!["container-a", "container-b"],
+                    ),
+                    (
+                        AlbumSelector::Named {
+                            included: names(&["Trips"]),
+                            excluded: names(&["Trips"]),
+                        },
+                        vec![],
+                    ),
+                    (
+                        AlbumSelector::All {
+                            excluded: names(&["Trips"]),
+                        },
+                        vec!["container-c"],
+                    ),
+                ] {
+                    let mut records = vec![
+                        folder_record("container-b", "Trips"),
+                        folder_record("container-a", "Trips"),
+                        folder_record("container-c", "Other"),
+                    ];
+                    if reverse {
+                        records.reverse();
+                    }
+                    let response = serde_json::json!({"records": records});
+                    let library =
+                        stub_library(MockPhotosSession::new().ok(response.clone()).ok(response));
+                    let mut selection = selection_with_albums(selector, false);
+                    selection.albums_explicit = explicit;
+                    let context =
+                        build_collection_context(&selection, std::slice::from_ref(&library))
+                            .await
+                            .unwrap();
+                    let plan = resolve_passes_for_scope(
+                        &library,
+                        &selection,
+                        PassScope {
+                            include_albums: true,
+                            include_smart_folders: false,
+                            include_unfiled: false,
+                        },
+                        &context,
+                        &[],
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        plan.passes
+                            .iter()
+                            .map(|pass| pass.album.container_id().unwrap())
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                    let keys: BTreeSet<_> = plan
+                        .passes
+                        .iter()
+                        .map(|pass| pass.album.selection_scope().to_string())
+                        .collect();
+                    assert_eq!(
+                        keys.len(),
+                        plan.passes.len(),
+                        "distinct containers need distinct durable pass identities"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_album_and_smart_folder_same_name_remain_separate() {
+        let library = stub_library(
+            MockPhotosSession::new()
+                .ok(serde_json::json!({"records": [folder_record("container-a", "Favorites")]})),
+        );
+        let mut selection = selection_with_albums(
+            AlbumSelector::Named {
+                included: names(&["Favorites"]),
+                excluded: BTreeSet::new(),
+            },
+            false,
+        );
+        selection.smart_folders = SmartFolderSelector::Named {
+            included: names(&["Favorites"]),
+            excluded: BTreeSet::new(),
+        };
+        let plan = resolve_passes(&library, &selection, &[]).await.unwrap();
+        assert_eq!(plan.passes.len(), 2);
+        assert_eq!(plan.passes[0].kind, PassKind::Album);
+        assert_eq!(plan.passes[0].album.container_id(), Some("container-a"));
+        assert_eq!(plan.passes[1].kind, PassKind::SmartFolder);
+        assert_eq!(plan.passes[1].album.container_id(), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_literal_slash_is_not_invented_ancestry() {
+        for (selector, expected) in [
+            (
+                AlbumSelector::Named {
+                    included: names(&["Trips"]),
+                    excluded: BTreeSet::new(),
+                },
+                "nested",
+            ),
+            (
+                AlbumSelector::All {
+                    excluded: names(&["Trips"]),
+                },
+                "literal",
+            ),
+        ] {
+            let mut folder = folder_record("folder", "Family");
+            folder["fields"]["albumType"]["value"] = serde_json::json!(3);
+            let mut nested = folder_record("nested", "Trips");
+            nested["fields"]["parentId"] = serde_json::json!({"value":"folder","type":"STRING"});
+            let library = stub_library(MockPhotosSession::new()
+                .ok(serde_json::json!({"records":[folder,folder_record("literal","Family/Trips")]}))
+                .ok(serde_json::json!({"records":[nested]})));
+            let plan = resolve_passes(&library, &selection_with_albums(selector, false), &[])
+                .await
+                .unwrap();
+            assert_eq!(plan.passes.len(), 1);
+            assert_eq!(plan.passes[0].album.container_id(), Some(expected));
+            assert_eq!(
+                plan.passes[0].album.selector_components().len(),
+                if expected == "nested" { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_raw_names_survive_sanitization_collisions() {
+        let library = stub_library(MockPhotosSession::new().ok(serde_json::json!({"records":[folder_record("album-a", "Trips:2026"), folder_record("album-b", "Trips?2026")]})));
+        let plan = resolve_passes(
+            &library,
+            &selection_with_albums(
+                AlbumSelector::All {
+                    excluded: BTreeSet::new(),
+                },
+                false,
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.passes.len(), 2);
+        assert_eq!(plan.passes[0].album.name, plan.passes[1].album.name);
+        assert_ne!(
+            plan.passes[0].album.container_id(),
+            plan.passes[1].album.container_id()
+        );
+        assert!(plan.passes[0].album.matches_selector("Trips:2026"));
+        assert!(!plan.passes[0].album.matches_selector("Trips_2026"));
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_qualified_duplicate_path_refuses_ambiguity() {
+        let library = stub_library(MockPhotosSession::new().ok(serde_json::json!({"records":[folder_record("album-a", "Family/Trips"), folder_record("album-b", "Family/Trips")]})));
+        let selection = selection_with_albums(
+            AlbumSelector::Named {
+                included: names(&["Family/Trips"]),
+                excluded: BTreeSet::new(),
+            },
+            false,
+        );
+        assert!(
+            resolve_passes(&library, &selection, &[])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
     }
 
     fn classify_auth_retry_error_for(err: auth::error::AuthError) -> AuthRetryErrorClass {
@@ -1701,10 +2152,7 @@ mod tests {
             msg.contains("session metadata file is missing"),
             "msg: {msg}"
         );
-        assert!(
-            msg.contains("kei login get-code") && msg.contains("kei login submit-code <CODE>"),
-            "msg: {msg}"
-        );
+        assert!(msg.contains("restart the service"), "msg: {msg}");
         assert_eq!(auth_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1795,8 +2243,9 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(album_name);
         serde_json::json!({
             "recordName": record_name,
-            "recordType": "CPLAlbumByPositionLive",
+            "recordType": "CPLAlbum",
             "fields": {
+                "albumType": {"value": 0, "type": "INT64"},
                 "albumNameEnc": {"value": encoded},
                 "isDeleted": {"value": false}
             }
@@ -2473,6 +2922,7 @@ libraries = ["shared"]
         )
         .unwrap();
         let globals = crate::config::GlobalArgs {
+            config_source: Default::default(),
             username: None,
             domain: None,
             data_dir: Some(cookie_dir.path().to_string_lossy().into_owned()),

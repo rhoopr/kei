@@ -19,8 +19,8 @@ class HardeningTests(unittest.TestCase):
                 return subprocess.run(["python3", str(script)], cwd=work, capture_output=True, text=True, check=False)
             self.assertEqual(check().returncode, 0)
             for name, old, new, expected in [
-                ("ci.yml", "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5", "actions/checkout@main", "not pinned"),
-                ("ci.yml", "needs: [plan, checks, service, qualification]", "needs: [plan]", "missing qualification guard"),
+                ("pr.yml", "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5", "actions/checkout@main", "not pinned"),
+                ("pr.yml", "needs: [quality, clippy, smoke]", "needs: [quality, clippy]", "missing qualification guard"),
                 ("qualification.yml", "needs: [quality, artifacts, service, specialized]", "needs: [quality]", "missing qualification guard"),
                 ("qualification.yml", "cargo fetch --locked", "echo missing bootstrap", "missing qualification guard"),
                 ("release.yml", "github.ref == 'refs/heads/main'", "true", "missing publication-resume guard"),
@@ -31,8 +31,10 @@ class HardeningTests(unittest.TestCase):
                 ("service-smoke.yml", "service-smoke-${{ github.workflow }}-", "service-smoke-${{ github.workflow }}-${{ github.run_id }}-", "cancel obsolete runs"),
                 ("service-smoke.yml", "  workflow_call:", "  workflow_call:\n  pull_request:", "reusable only"),
                 ("checks.yml", "run: python3 scripts/check-contracts", "run: echo skipped contracts", "missing required routing/gate guard"),
-                ("ci.yml", 'required += ["service"]', 'required += []', "missing qualification guard"),
+                ("ci.yml", "uses: ./.github/workflows/qualification.yml", "uses: ./.github/workflows/checks.yml", "missing qualification guard"),
                 ("nightly.yml", "contents: read", "contents: write", "publication credentials"),
+                ("nightly.yml", "gate.py broad fuzz audit optimized", "gate.py broad audit optimized", "missing qualification guard"),
+                ("pr.yml", "KEI_ROUNDTRIP_BASE: ${{ github.event.pull_request.base.sha }}", "KEI_ROUNDTRIP_BASE: origin/main", "missing qualification guard"),
             ]:
                 path = work / ".github/workflows" / name
                 original = path.read_text()

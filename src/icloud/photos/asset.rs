@@ -269,14 +269,31 @@ pub struct PhotoAsset {
     // pipeline's metadata-hash comparisons) can share the same
     // allocation via refcount bumps. Immutable after construction.
     asset_metadata: Arc<AssetMetadata>,
+    hidden_membership: Option<bool>,
     rendition_facts: Arc<[(VersionSizeKey, RenditionMetadata)]>,
     versions: VersionsMap,
     malformed_resources: Arc<[MalformedResource]>,
     // f64 primitives
     asset_date_ms: Option<f64>,
     added_date_ms: Option<f64>,
+    adjusted_still_modified: Option<DateTime<Utc>>,
     // Small enum (1 byte)
     item_type_val: Option<AssetItemType>,
+}
+
+fn hidden_membership(fields: &Value) -> Option<bool> {
+    let field = fields.get("isHidden")?;
+    if field
+        .get("type")
+        .is_some_and(|ty| !matches!(ty.as_str(), Some("INT64" | "NUMBER_INT64")))
+    {
+        return None;
+    }
+    match field.get("value")?.as_i64()? {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
 }
 
 /// Decode filename from `CloudKit`'s `filenameEnc` field.
@@ -535,6 +552,71 @@ fn is_test_loopback_host(host: &str) -> bool {
 }
 
 impl PhotoAsset {
+    /// Only a current adjusted still sourced from CPLAsset has proven edit time.
+    /// Original, alternative and video resource clocks remain unknown.
+    pub(crate) fn media_modified_at(&self, version: VersionSizeKey) -> Option<DateTime<Utc>> {
+        (version == VersionSizeKey::Adjusted
+            && self.versions.iter().any(|(key, resource)| {
+                *key == AssetVersionSize::Adjusted
+                    && item_type_from_str(&resource.asset_type) == Some(AssetItemType::Image)
+            }))
+        .then_some(self.adjusted_still_modified)
+        .flatten()
+    }
+    /// Compare parsed planning evidence while allowing signed URL renewal.
+    /// URL aliasing between versions remains significant to rendition selection.
+    pub(crate) fn same_download_observation(&self, other: &Self) -> bool {
+        let same_float = |a: Option<f64>, b: Option<f64>| match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits(),
+            _ => false,
+        };
+        self.record_name == other.record_name
+            && self.asset_record_name == other.asset_record_name
+            && self.state_record_name == other.state_record_name
+            && self.source_zone == other.source_zone
+            && self.filename == other.filename
+            && self.item_type_val == other.item_type_val
+            && same_float(self.asset_date_ms, other.asset_date_ms)
+            && same_float(self.added_date_ms, other.added_date_ms)
+            && self.adjusted_still_modified == other.adjusted_still_modified
+            && self.asset_metadata.same_observation(&other.asset_metadata)
+            && self.malformed_resources == other.malformed_resources
+            && self.rendition_facts.len() == other.rendition_facts.len()
+            && self
+                .rendition_facts
+                .iter()
+                .zip(other.rendition_facts.iter())
+                .all(|((ak, a), (bk, b))| {
+                    ak == bk
+                        && a.checksum == b.checksum
+                        && a.width == b.width
+                        && a.height == b.height
+                        && same_float(a.duration_secs, b.duration_secs)
+                })
+            && self.versions.len() == other.versions.len()
+            && self
+                .versions
+                .iter()
+                .zip(other.versions.iter())
+                .all(|((ak, a), (bk, b))| {
+                    ak == bk
+                        && a.size == b.size
+                        && a.checksum == b.checksum
+                        && a.asset_type == b.asset_type
+                })
+            && self
+                .versions
+                .iter()
+                .zip(other.versions.iter())
+                .all(|((_, a), (_, b))| {
+                    self.versions
+                        .iter()
+                        .zip(other.versions.iter())
+                        .all(|((_, ax), (_, bx))| (a.url == ax.url) == (b.url == bx.url))
+                })
+    }
+
     /// Construct from raw JSON values (used by tests).
     #[cfg(test)]
     pub fn new(master_record: Value, asset_record: Value) -> Self {
@@ -545,6 +627,10 @@ impl PhotoAsset {
         let item_type_val = Some(resolve_item_type(&master_fields, filename.as_deref()));
         let asset_date_ms = asset_fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset_fields["addedDate"]["value"].as_f64();
+        let adjusted_still_modified = (item_type_val != Some(AssetItemType::Movie)
+            && asset_fields.get("resJPEGFullRes").is_some())
+        .then(|| enc::decode_adjustment_timestamp(&asset_fields))
+        .flatten();
         let (versions, malformed_resources) =
             extract_versions(item_type_val, &master_fields, &asset_fields, &record_name);
         let asset_metadata = Arc::new(metadata::extract(&master_fields, &asset_fields));
@@ -559,12 +645,14 @@ impl PhotoAsset {
             asset_record_name,
             state_record_name: None,
             source_zone: None,
+            hidden_membership: hidden_membership(&asset_fields),
             filename,
             asset_metadata,
             rendition_facts,
             item_type_val,
             asset_date_ms,
             added_date_ms,
+            adjusted_still_modified,
             versions,
             malformed_resources: Arc::from(malformed_resources.into_boxed_slice()),
         }
@@ -628,12 +716,18 @@ impl PhotoAsset {
         let asset_metadata = Arc::new(metadata::extract(&master.fields, &asset.fields));
         let rendition_facts =
             metadata::extract_renditions(item_type_val, &master.fields, &asset.fields);
+        let adjusted_still_modified = (item_type_val != Some(AssetItemType::Movie)
+            && asset.fields.get("resJPEGFullRes").is_some())
+        .then(|| enc::decode_adjustment_timestamp(&asset.fields))
+        .flatten();
         Self {
             record_name: Arc::from(master.record_name),
             asset_record_name: Arc::from(asset.record_name.as_str()),
             state_record_name: None,
             source_zone,
+            hidden_membership: hidden_membership(&asset.fields),
             filename,
+            adjusted_still_modified,
             asset_metadata,
             rendition_facts,
             item_type_val,
@@ -647,6 +741,10 @@ impl PhotoAsset {
     /// Metadata extracted at construction time.
     pub fn metadata(&self) -> &AssetMetadata {
         &self.asset_metadata
+    }
+
+    pub(crate) fn hidden_membership(&self) -> Option<bool> {
+        self.hidden_membership
     }
 
     /// Project the selected provider rendition. Unsupported keys retain
@@ -820,34 +918,20 @@ impl std::fmt::Display for PhotoAsset {
 
 /// Classify a `CloudKit` record from `changes/zone` into a `ChangeReason`.
 ///
-/// Detection logic (from empirical API testing):
-/// - `record.deleted == Some(true)` --> `HardDeleted` (purged, recordType unknown)
-/// - `fields.isDeleted.value == 1` --> `SoftDeleted` (trashed, recoverable)
-/// - `fields.isHidden.value == 1` --> Hidden
-/// - Otherwise --> Modified (caller checks state DB for Created/Restored/Unhidden)
-///
-/// Note: "Restored" and "Unhidden" require knowledge of previous state, which this
-/// function does NOT have. Those cases return `Modified`; the caller (download pipeline)
-/// should check the state DB to distinguish them.
+/// Hard deletion takes precedence over trash, then hidden status. Otherwise
+/// return `Created`: distinguishing new, restored, and unhidden records requires
+/// the caller's prior state.
 pub(crate) fn classify_change_reason(record: &Record) -> ChangeReason {
     // Hard delete: record.deleted == true
     if record.deleted == Some(true) {
         return ChangeReason::HardDeleted;
     }
 
-    // Soft delete: fields.isDeleted.value == 1
-    if let Some(is_deleted) = record.fields.get("isDeleted")
-        && let Some(val) = is_deleted.get("value")
-        && val.as_i64() == Some(1)
-    {
+    if metadata::change_flag_is_set(&record.fields, "isDeleted") {
         return ChangeReason::SoftDeleted;
     }
 
-    // Hidden: fields.isHidden.value == 1
-    if let Some(is_hidden) = record.fields.get("isHidden")
-        && let Some(val) = is_hidden.get("value")
-        && val.as_i64() == Some(1)
-    {
+    if metadata::change_flag_is_set(&record.fields, "isHidden") {
         return ChangeReason::Hidden;
     }
 
@@ -877,14 +961,19 @@ fn parse_album_delta(record: &Record, reason: ChangeReason) -> ChangeEvent {
         reason,
         ChangeReason::HardDeleted | ChangeReason::SoftDeleted
     );
-    let album_name = enc::decode_string(&record.fields, "albumNameEnc")
-        .or_else(|| field_value_str(&record.fields, "albumName").map(ToOwned::to_owned))
-        .unwrap_or_else(|| record.record_name.clone());
     let mut event = ChangeEvent::new(
         record.record_name.clone().into_boxed_str(),
         Some(record.record_type.clone().into_boxed_str()),
         reason,
     );
+    let album_name = match enc::album_name(&record.fields) {
+        Some(name) => name,
+        None if is_deleted => String::new(),
+        None => {
+            event.token_unsafe_reason = Some("album_name_unavailable");
+            return event;
+        }
+    };
     event.album = Some(AlbumContainerDelta {
         container_id: record.record_name.clone().into_boxed_str(),
         album_name: crate::download::paths::sanitize_path_component(&album_name).into_boxed_str(),
@@ -1199,6 +1288,20 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn sparse_hidden_membership_requires_an_explicit_binary_flag() {
+        for (field, expected) in [
+            (json!({"value": 0}), Some(false)),
+            (json!({"type":"INT64","value":1}), Some(true)),
+            (json!({"type":"STRING","value":0}), None),
+            (json!({"value":"0"}), None),
+            (json!({"value":2}), None),
+            (json!(null), None),
+        ] {
+            assert_eq!(hidden_membership(&json!({"isHidden": field})), expected);
+        }
+    }
+
+    #[test]
     fn sparse_share_evidence_is_preserved_without_guessing_a_master() {
         let raw = crate::test_helpers::sparse_shared_asset_record();
         let mut buffer = DeltaRecordBuffer::new();
@@ -1394,6 +1497,42 @@ mod tests {
                 &serde_json::from_value(asset).unwrap(),
             ),
         ]
+    }
+
+    #[test]
+    fn media_edit_time_is_only_asset_owned_adjusted_still() {
+        use base64::Engine as _;
+        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut bytes = Vec::new();
+        plist::Value::Date(time.into())
+            .to_writer_binary(&mut bytes)
+            .unwrap();
+        let resource = json!({"value":{"size":10,"downloadURL":"https://p01.icloud-content.com/edit.jpg","fileChecksum":"edited"}});
+        let fields = json!({
+            "resJPEGFullRes":resource,
+            "resJPEGFullFileType":{"value":"public.jpeg"},
+            "adjustmentTimestampEnc":{"type":"ENCRYPTED_BYTES","value":base64::engine::general_purpose::STANDARD.encode(bytes)}
+        });
+        for asset in rendition_assets(json!({"itemType":{"value":"public.jpeg"}}), fields.clone()) {
+            assert_eq!(
+                asset.media_modified_at(VersionSizeKey::Adjusted),
+                Some(time.into())
+            );
+            for key in [
+                VersionSizeKey::Original,
+                VersionSizeKey::Alternative,
+                VersionSizeKey::LiveAdjusted,
+                VersionSizeKey::LiveOriginal,
+            ] {
+                assert_eq!(asset.media_modified_at(key), None);
+            }
+        }
+        for asset in rendition_assets(fields.clone(), json!({})) {
+            assert_eq!(asset.media_modified_at(VersionSizeKey::Adjusted), None);
+        }
+        for asset in rendition_assets(json!({"itemType":{"value":"public.mpeg-4"}}), fields) {
+            assert_eq!(asset.media_modified_at(VersionSizeKey::Adjusted), None);
+        }
     }
 
     #[test]
@@ -2102,6 +2241,38 @@ mod tests {
     }
 
     #[test]
+    fn classify_change_flags_agree_with_asset_metadata() {
+        for (value, asserted) in [
+            (json!(true), true),
+            (json!(1), true),
+            (json!(false), false),
+            (json!(0), false),
+            (json!(2), false),
+            (json!("true"), false),
+        ] {
+            for (field, reason) in [
+                ("isDeleted", ChangeReason::SoftDeleted),
+                ("isHidden", ChangeReason::Hidden),
+            ] {
+                let record = make_record("CPLAsset", json!({(field): {"value": value}}), None);
+                let meta = metadata::extract(&json!({}), &record.fields);
+                assert_eq!(meta.is_deleted, asserted && field == "isDeleted");
+                assert_eq!(meta.is_hidden, asserted && field == "isHidden");
+                let expected = if asserted {
+                    reason
+                } else {
+                    ChangeReason::Created
+                };
+                assert_eq!(
+                    classify_change_reason(&record),
+                    expected,
+                    "{field}: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_classify_is_deleted_null_value() {
         // isDeleted field present but value is null -- should NOT be SoftDeleted
         let record = make_record(
@@ -2509,6 +2680,38 @@ mod tests {
         // Flush should still be empty since album/relation records are not buffered.
         let flushed = buffer.flush();
         assert!(flushed.is_empty());
+    }
+
+    #[test]
+    fn album_delta_unusable_name_holds_token_but_tombstone_keeps_identity() {
+        for fields in [
+            json!({}),
+            json!({"albumNameEnc": {"value": "not base64"}}),
+            json!({"albumNameEnc": {"type": "STRING", "value": "   "}}),
+        ] {
+            for deleted in [false, true] {
+                let mut buffer = DeltaRecordBuffer::new();
+                let events = buffer.process_records(vec![Record {
+                    record_name: "private-id".into(),
+                    record_type: "CPLAlbum".into(),
+                    fields: fields.clone(),
+                    deleted: deleted.then_some(true),
+                }]);
+                assert_eq!(events.len(), 1);
+                if deleted {
+                    let album = events[0].album.as_ref().unwrap();
+                    assert!(album.is_deleted);
+                    assert_eq!(album.container_id.as_ref(), "private-id");
+                    assert!(events[0].token_unsafe_reason.is_none());
+                } else {
+                    assert!(events[0].album.is_none());
+                    assert_eq!(
+                        events[0].token_unsafe_reason,
+                        Some("album_name_unavailable")
+                    );
+                }
+            }
+        }
     }
 
     #[test]

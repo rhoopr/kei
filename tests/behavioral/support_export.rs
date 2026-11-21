@@ -335,7 +335,7 @@ fn support_history_survives_a_real_process_restart_without_new_sync() {
     std::fs::create_dir(&media).unwrap();
     let config = root.path().join("config.toml");
     let report = root.path().join("private-report.json");
-    std::fs::write(&config, format!("[auth]\nusername=\"private-user@example.invalid\"\n[download]\ndirectory={}\n[report]\njson={}\n",crate::common::toml_string(&media.display().to_string()),crate::common::toml_string(&report.display().to_string()))).unwrap();
+    crate::common::write_versioned_config(&config, format!("[auth]\nusername=\"private-user@example.invalid\"\n[download]\ndirectory={}\n[report]\njson={}\n",crate::common::toml_string(&media.display().to_string()),crate::common::toml_string(&report.display().to_string()))).unwrap();
     clean_cmd()
         .env("KEI_DATA_DIR", &data)
         .env("KEI_UNSTABLE_FAKE_SYNC_REPORT_FOR_TESTS", "1")

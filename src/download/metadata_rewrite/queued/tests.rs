@@ -22,6 +22,286 @@ use chrono::{FixedOffset, TimeZone};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+#[tokio::test]
+async fn retained_prepared_description_recovers_before_replanning_current_intent() {
+    use crate::state::MetadataRewriteStore;
+    for next in ["B", "C"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.jpg");
+        std::fs::write(
+            &path,
+            include_bytes!("../../../../tests/data/media/pattern.jpg"),
+        )
+        .unwrap();
+        let dbpath = dir.path().join("state.db");
+        let db = crate::state::SqliteStateDb::open(&dbpath).await.unwrap();
+        let metadata = |text: &str| {
+            crate::icloud::photos::metadata::extract(
+                &serde_json::json!({}),
+                &serde_json::json!({"extendedDescEnc":{"value":text,"type":"STRING"},"captionEnc":{"value":"","type":"STRING"}}),
+            )
+        };
+        let mut record = crate::test_helpers::TestAssetRecord::new("recover-fields")
+            .filename("photo.jpg")
+            .metadata(metadata("B"))
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "recover-fields",
+            "original",
+            &path,
+            &checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "recover-fields", "original")
+            .await
+            .unwrap();
+        db.acquire_lock("fail field finalization").unwrap().execute_batch("CREATE TEMP TRIGGER fail_field_finalization BEFORE UPDATE OF local_checksum ON assets WHEN NEW.local_checksum IS NOT NULL BEGIN SELECT RAISE(ABORT,'field finalization failure'); END;").unwrap();
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            run_pending(&db, MetadataFlags::DESCRIPTION, ".test".into(), &cancel)
+                .await
+                .failed,
+            1
+        );
+        let prepared = db
+            .embedded_metadata_receipt("PrimarySync", "recover-fields", "original", &path, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!prepared.published);
+        assert_eq!(prepared.written.description.as_deref(), Some("B"));
+        assert_eq!(
+            crate::download::file::compute_sha256(&path).await.unwrap(),
+            prepared.output_checksum
+        );
+        drop(db);
+        let db = crate::state::SqliteStateDb::open(&dbpath).await.unwrap();
+        record.metadata = Arc::new(metadata(next));
+        db.upsert_seen(&record).await.unwrap();
+        db.record_metadata_write_failure("PrimarySync", "recover-fields", "original")
+            .await
+            .unwrap();
+        let result = run_pending(&db, MetadataFlags::DESCRIPTION, ".test".into(), &cancel).await;
+        assert_eq!(result.failed, 0, "{next}");
+        let owned = db
+            .embedded_metadata_receipt("PrimarySync", "recover-fields", "original", &path, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(owned.published);
+        assert_eq!(owned.written.description.as_deref(), Some(next));
+        assert_eq!(
+            owned.output_checksum,
+            crate::download::file::compute_sha256(&path).await.unwrap()
+        );
+        assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
+        record.metadata = Arc::new(metadata(""));
+        db.upsert_seen(&record).await.unwrap();
+        db.record_metadata_write_failure("PrimarySync", "recover-fields", "original")
+            .await
+            .unwrap();
+        assert_eq!(
+            run_pending(&db, MetadataFlags::DESCRIPTION, ".test".into(), &cancel)
+                .await
+                .failed,
+            0
+        );
+        let native = little_exif::metadata::Metadata::new_from_path(&path).unwrap();
+        assert!(
+            native
+                .get_tag(&little_exif::exif_tag::ExifTag::ImageDescription(
+                    String::new()
+                ))
+                .next()
+                .is_none()
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        drop(db);
+        for _ in 0..2 {
+            let db = crate::state::SqliteStateDb::open(&dbpath).await.unwrap();
+            assert_eq!(
+                run_pending(&db, MetadataFlags::DESCRIPTION, ".test".into(), &cancel)
+                    .await
+                    .failed,
+                0
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn embedded_clear_requires_actual_write_and_current_value_match_across_reopen() {
+    use crate::state::MetadataRewriteStore;
+    use little_exif::{exif_tag::ExifTag, metadata::Metadata};
+    for case in [
+        "owned",
+        "identical",
+        "user-edited",
+        "disabled",
+        "unobserved",
+        "failure",
+        "finalize-failure",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.jpg");
+        std::fs::write(
+            &path,
+            include_bytes!("../../../../tests/data/media/pattern.jpg"),
+        )
+        .unwrap();
+        let mut original = Metadata::new_from_path(&path).unwrap_or_else(|_| Metadata::new());
+        original.set_tag(ExifTag::Artist("camera artist".into()));
+        original.write_to_file(&path).unwrap();
+        if case == "identical" {
+            crate::download::metadata::apply_metadata(
+                &path,
+                &crate::download::metadata::MetadataWrite {
+                    description: Some("cloud caption".into()),
+                    ..Default::default()
+                },
+                ".test",
+            )
+            .unwrap();
+        }
+        let dbpath = dir.path().join("state.db");
+        let db = crate::state::SqliteStateDb::open(&dbpath).await.unwrap();
+        let metadata = crate::icloud::photos::metadata::extract(
+            &serde_json::json!({}),
+            &serde_json::json!({
+                "extendedDescEnc":{"value":"cloud caption","type":"STRING"},
+                "captionEnc":{"value":"","type":"STRING"}
+            }),
+        );
+        let mut record = crate::test_helpers::TestAssetRecord::new("clear-owned")
+            .filename("photo.jpg")
+            .metadata(metadata)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "clear-owned",
+            "original",
+            &path,
+            &checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "clear-owned", "original")
+            .await
+            .unwrap();
+        let flags = MetadataFlags::DESCRIPTION;
+        let cancel = CancellationToken::new();
+        run_pending(&db, flags, ".test".into(), &cancel).await;
+        let receipt = db
+            .embedded_metadata_receipt("PrimarySync", "clear-owned", "original", &path, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipt.written.description.as_deref(),
+            if case == "identical" {
+                None
+            } else {
+                Some("cloud caption")
+            }
+        );
+        if case == "user-edited" {
+            crate::download::metadata::apply_metadata(
+                &path,
+                &crate::download::metadata::MetadataWrite {
+                    description: Some("user caption".into()),
+                    ..Default::default()
+                },
+                ".test",
+            )
+            .unwrap();
+            let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                "clear-owned",
+                "original",
+                &path,
+                &checksum,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        record.metadata = Arc::new(crate::icloud::photos::metadata::extract(
+            &serde_json::json!({}),
+            &if case == "unobserved" {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({"extendedDescEnc":{"value":"","type":"STRING"},"captionEnc":{"value":"","type":"STRING"}})
+            },
+        ));
+        db.upsert_seen(&record).await.unwrap();
+        db.record_metadata_write_failure("PrimarySync", "clear-owned", "original")
+            .await
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        if case == "failure" {
+            db.acquire_lock("inject ownership receipt failure").unwrap().execute_batch("CREATE TEMP TRIGGER fail_field_evidence BEFORE UPDATE OF embedded_metadata_receipt ON asset_metadata_paths BEGIN SELECT RAISE(ABORT,'field proof failure'); END;").unwrap();
+            run_pending(&db, flags, ".test".into(), &cancel).await;
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(!db.get_metadata_retry_markers().await.unwrap().is_empty());
+        }
+        if case == "finalize-failure" {
+            db.acquire_lock("inject field finalization failure").unwrap().execute_batch("CREATE TEMP TRIGGER fail_field_finalization BEFORE UPDATE OF local_checksum ON assets WHEN NEW.local_checksum IS NOT NULL BEGIN SELECT RAISE(ABORT,'field finalization failure'); END;").unwrap();
+            let result = run_pending(&db, flags, ".test".into(), &cancel).await;
+            assert_eq!(result.failed, 1);
+            assert_ne!(std::fs::read(&path).unwrap(), before);
+            assert!(!db.get_metadata_retry_markers().await.unwrap().is_empty());
+        }
+        drop(db);
+        let mut quiet = None;
+        for attempt in 0..3 {
+            let db = crate::state::SqliteStateDb::open(&dbpath).await.unwrap();
+            let selected = if case == "disabled" {
+                MetadataFlags::empty()
+            } else {
+                flags
+            };
+            run_pending(&db, selected, ".test".into(), &cancel).await;
+            let native = Metadata::new_from_path(&path).unwrap();
+            let description = native
+                .get_tag(&ExifTag::ImageDescription(String::new()))
+                .find_map(|tag| match tag {
+                    ExifTag::ImageDescription(value) => Some(value.as_str()),
+                    _ => None,
+                });
+            assert_eq!(
+                description,
+                match case {
+                    "owned" | "failure" | "finalize-failure" => None,
+                    "user-edited" => Some("user caption"),
+                    _ => Some("cloud caption"),
+                },
+                "{case}/{attempt}"
+            );
+            assert!(
+                matches!(native.get_tag(&ExifTag::Artist(String::new())).next(), Some(ExifTag::Artist(value)) if value == "camera artist")
+            );
+            assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+            let bytes = std::fs::read(&path).unwrap();
+            if let Some(prior) = &quiet {
+                assert_eq!(&bytes, prior);
+            }
+            quiet = Some(bytes);
+        }
+    }
+}
 #[cfg(feature = "xmp")]
 use xmp_toolkit::{XmpMeta, xmp_ns};
 
@@ -363,7 +643,7 @@ async fn refresh_drain_repairs_a_state_recorded_host_local_timestamp() {
     )
     .await;
 
-    assert_eq!(residual, 0);
+    assert_eq!(residual.failed, 0);
     assert!(
         db.get_pending_metadata_rewrites(1)
             .await
@@ -440,7 +720,7 @@ async fn capture_repair_recovers_publication_after_state_finalisation_failure() 
     )
     .await;
 
-    assert_eq!(first, 1);
+    assert_eq!(first.failed, 1);
     let pending = db
         .get_pending_metadata_rewrites_page_for_queue(
             MetadataRewriteQueue::CaptureRepair,
@@ -480,7 +760,7 @@ async fn capture_repair_recovers_publication_after_state_finalisation_failure() 
     )
     .await;
 
-    assert_eq!(second, 0);
+    assert_eq!(second.failed, 0);
     assert_eq!(std::fs::read(&photo_path).unwrap(), published);
     assert_eq!(
         stored_checksums(&reopened).await,
@@ -519,7 +799,8 @@ async fn capture_repair_recovers_publication_after_state_finalisation_failure() 
             Arc::from(".metadata-test"),
             &CancellationToken::new(),
         )
-        .await,
+        .await
+        .failed,
         0
     );
     assert!(
@@ -614,7 +895,7 @@ async fn capture_repair_reprepares_an_unpublished_receipt() {
     )
     .await;
 
-    assert_eq!(residual, 0);
+    assert_eq!(residual.failed, 0);
     assert!(
         db.get_pending_metadata_rewrites_page_for_queue(
             MetadataRewriteQueue::CaptureRepair,
@@ -694,7 +975,7 @@ async fn capture_timestamp_repair_requires_a_recorded_local_checksum() {
     )
     .await;
 
-    assert_eq!(residual, 1);
+    assert_eq!(residual.failed, 1);
     assert_eq!(db.get_pending_metadata_rewrites(1).await.unwrap().len(), 1);
     assert_eq!(
         std::fs::read(&photo_path).unwrap(),
@@ -758,7 +1039,7 @@ async fn capture_timestamp_repair_without_offset_keeps_marker_pending() {
     )
     .await;
 
-    assert_eq!(residual, 1);
+    assert_eq!(residual.failed, 1);
     assert_eq!(db.get_pending_metadata_rewrites(1).await.unwrap().len(), 1);
     assert_eq!(
         db.get_pending_metadata_rewrites_page_for_queue(
@@ -786,7 +1067,7 @@ async fn capture_timestamp_repair_without_offset_keeps_marker_pending() {
     )
     .await;
 
-    assert_eq!(ordinary_residual, 0);
+    assert_eq!(ordinary_residual.failed, 0);
     assert!(
         db.get_pending_metadata_rewrites(1)
             .await
@@ -862,7 +1143,7 @@ async fn ordinary_embed_waits_for_pending_capture_repair() {
     )
     .await;
 
-    assert_eq!(residual, 1);
+    assert_eq!(residual.failed, 1);
     assert_eq!(std::fs::read(&photo_path).unwrap(), before);
     assert_eq!(db.get_pending_metadata_rewrites(1).await.unwrap().len(), 1);
     assert_eq!(
@@ -931,7 +1212,7 @@ async fn capture_timestamp_repair_defers_unsupported_heif_without_xmp() {
     )
     .await;
 
-    assert_eq!(residual, 1);
+    assert_eq!(residual.failed, 1);
     assert_eq!(db.get_pending_metadata_rewrites(1).await.unwrap().len(), 1);
     assert_eq!(std::fs::read(&photo_path).unwrap(), source);
 }
@@ -996,7 +1277,7 @@ async fn refresh_drain_repairs_native_heif_capture_time_before_retiring_marker()
         )
         .await;
 
-        assert_eq!(residual, 0);
+        assert_eq!(residual.failed, 0);
         assert!(
             db.get_pending_metadata_rewrites(1)
                 .await
@@ -1104,7 +1385,7 @@ async fn heif_capture_repair_writes_missing_xmp_before_retiring_marker() {
     )
     .await;
 
-    assert_eq!(residual, 0);
+    assert_eq!(residual.failed, 0);
     assert!(
         db.get_pending_metadata_rewrites(1)
             .await
@@ -1190,7 +1471,7 @@ async fn heif_capture_repair_without_native_exif_keeps_marker_pending() {
         )
         .await;
 
-        assert_eq!(residual, 1);
+        assert_eq!(residual.failed, 1);
         assert_eq!(
             db.get_pending_metadata_rewrites(1).await.unwrap().len(),
             1,
@@ -1501,6 +1782,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_rewrite_and_retry(
             &checksum,
             Some(&checksum),
             false,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -2130,7 +2412,11 @@ async fn run_pending_matches_normal_grouped_xmp_payload() {
             .or_default()
             .push(person);
     }
-    let normal_payload = normal_groupings.metadata_payload("GROUPED", &record.metadata);
+    let flags = MetadataFlags::EMBED_XMP
+        | MetadataFlags::XMP_SIDECAR
+        | MetadataFlags::INCLUDE_ALBUMS
+        | MetadataFlags::INCLUDE_PEOPLE;
+    let normal_payload = normal_groupings.metadata_payload("GROUPED", &record.metadata, flags);
     assert_eq!(normal_payload.keywords, vec!["beach", "Vacation"]);
     assert_eq!(normal_payload.people, vec!["Alice"]);
 
@@ -2144,7 +2430,7 @@ async fn run_pending_matches_normal_grouped_xmp_payload() {
         sidecar_path: Some(&normal_path),
         payload: Arc::new(normal_payload),
         created_local: record.metadata.capture_local(record.created_at),
-        flags: MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR,
+        flags,
         capture_timestamp_repair: CaptureTimestampRepair::Preserve,
         temp_suffix: ".meta-tmp",
     })
@@ -2163,7 +2449,7 @@ async fn run_pending_matches_normal_grouped_xmp_payload() {
 
     let pass = run_pending(
         &db,
-        MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR,
+        flags,
         Arc::from(".meta-tmp"),
         &CancellationToken::new(),
     )
@@ -2553,7 +2839,7 @@ async fn drain_scope_skips_unselected_and_soft_deleted_failures() {
     )
     .await;
     assert_eq!(
-        residual, 0,
+        residual.failed, 0,
         "unselected and soft-deleted failures must not fail the selected repair"
     );
     let pending = db.get_pending_metadata_rewrites(32).await.unwrap();
@@ -2612,7 +2898,7 @@ async fn drain_reports_residual_on_cancellation() {
     )
     .await;
     assert!(
-        residual >= 1,
+        residual.failed >= 1,
         "a cancelled drain must report a non-zero residual so the sync exits non-zero"
     );
 }
@@ -2666,7 +2952,7 @@ async fn drain_stops_when_rewrite_marker_cannot_be_cleared() {
     )
     .await;
 
-    assert_eq!(residual, 1);
+    assert_eq!(residual.failed, 1);
     assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
 }
 
@@ -2710,6 +2996,10 @@ async fn drain_refuses_to_rewrite_a_file_that_drifted_from_its_checksum() {
         pass.failed, 1,
         "a refused rewrite is unfinished work, not a clean pass"
     );
+    assert!(
+        !pass.storage_failed,
+        "drift is a data-integrity refusal, not operational storage health"
+    );
     let (local, download) = stored_checksums(&db).await;
     assert_eq!(
         local.as_deref(),
@@ -2721,6 +3011,99 @@ async fn drain_refuses_to_rewrite_a_file_that_drifted_from_its_checksum() {
         db.get_pending_metadata_rewrites(10).await.unwrap().len(),
         1,
         "the marker stays because the metadata never reached the file"
+    );
+}
+
+/// A destination directory that rejects writes is operational storage
+/// failure, distinct from the writer's ordinary metadata failures. The marker
+/// must survive so a later cycle can retry once capacity or access returns.
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn drain_reports_permission_denied_storage_and_retains_marker() {
+    use crate::config::MetadataConfig;
+    use crate::download::DownloadStore;
+    use crate::state::SqliteStateDb;
+    use crate::state::types::AssetMetadata;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestorePermissions {
+        path: PathBuf,
+        permissions: std::fs::Permissions,
+    }
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.path, self.permissions.clone());
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let media_dir = dir.path().join("media");
+    std::fs::create_dir(&media_dir).unwrap();
+    let path = media_dir.join("photo.jpg");
+    std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
+    let recorded = crate::download::file::compute_sha256(&path).await.unwrap();
+    let db = SqliteStateDb::open(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+    seed_downloaded_marker(
+        &db,
+        "STORAGE_DENIED",
+        "photo.jpg",
+        &path,
+        &recorded,
+        AssetMetadata {
+            rating: Some(3),
+            metadata_hash: Some("storage-denied-hash".into()),
+            ..AssetMetadata::default()
+        },
+        None,
+    )
+    .await;
+
+    let original = std::fs::metadata(&media_dir).unwrap().permissions();
+    let mut read_only = original.clone();
+    read_only.set_mode(0o555);
+    std::fs::set_permissions(&media_dir, read_only).unwrap();
+    let _restore = RestorePermissions {
+        path: media_dir.clone(),
+        permissions: original,
+    };
+    // Root and some capability-bearing accounts can still write here; without
+    // an enforced denial this is not a production-path storage fixture.
+    let probe = media_dir.join("write-probe");
+    if std::fs::File::create(&probe).is_ok() {
+        std::fs::remove_file(&probe).unwrap();
+        return;
+    }
+
+    let outcome = crate::download::drain_pending_metadata_rewrites(
+        &db as &dyn DownloadStore,
+        &MetadataConfig {
+            set_exif_rating: true,
+            embed_xmp: true,
+            ..MetadataConfig::default()
+        },
+        CaptureTimestampRepair::Preserve,
+        &["PrimarySync"],
+        Arc::from(".meta-tmp"),
+        &CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(outcome.failed, 1);
+    assert!(
+        outcome.storage_failed,
+        "permission denied on the metadata destination must surface as storage"
+    );
+    assert_eq!(
+        db.get_pending_metadata_rewrites(10).await.unwrap().len(),
+        1,
+        "a storage failure leaves the rewrite marker for a later cycle"
+    );
+    assert_eq!(
+        crate::download::file::compute_sha256(&path).await.unwrap(),
+        recorded,
+        "a refused write leaves the media bytes unchanged"
     );
 }
 
@@ -3221,7 +3604,8 @@ async fn capture_queue_pagination_counts_retired_capture_debt() {
             .unwrap();
         queue_capture_repair(&db, &record).await;
     }
-    std::fs::create_dir(dir.path().join("A0000.jpg.xmp")).unwrap();
+    // Fail one sidecar parse without simulating a volume-wide I/O failure.
+    std::fs::write(dir.path().join("A0000.jpg.xmp"), [0xff]).unwrap();
 
     let residual = crate::download::drain_pending_metadata_rewrites(
         &db as &dyn DownloadStore,
@@ -3237,7 +3621,7 @@ async fn capture_queue_pagination_counts_retired_capture_debt() {
     )
     .await;
 
-    assert_eq!(residual, 1);
+    assert_eq!(residual.failed, 1);
     assert!(
         db.get_pending_metadata_rewrites_page_for_queue(
             MetadataRewriteQueue::CaptureRepair,
@@ -3432,7 +3816,7 @@ async fn drain_reaches_newer_marker_after_retained_batch() {
         &token,
     )
     .await;
-    assert_eq!(residual, METADATA_REWRITE_BATCH);
+    assert_eq!(residual.failed, METADATA_REWRITE_BATCH);
     let pending = db
         .get_pending_metadata_rewrites(METADATA_REWRITE_BATCH + 1)
         .await

@@ -23,6 +23,7 @@ if [ -z "${ICLOUD_USERNAME:-}" ] && [ -f "$PROJECT_DIR/.env" ]; then
 fi
 
 kei_require_env() {
+    kei_live_fixed_date >/dev/null || exit 1
     if [ -z "${ICLOUD_USERNAME:-}" ] || [ -z "${ICLOUD_PASSWORD:-}" ]; then
         echo "ABORT: ICLOUD_USERNAME and ICLOUD_PASSWORD must be set (via .env or environment)."
         exit 1
@@ -71,16 +72,45 @@ kei_db_path() {
 }
 
 kei_live_filters() {
-    cat "$PROJECT_DIR/tests/data/live-selection.toml"
+    local bounds
+    bounds=$(kei_live_date_filters) || return 1
+    sed '/^\[import_sample\]/,$d' "$PROJECT_DIR/tests/data/live-selection.toml"
+    printf '%s\n' "$bounds"
 }
 
-# import-existing reads its scan cap from --recent, not filters.recent.
+kei_live_date_filters() {
+    local bound
+    bound=$(kei_live_fixed_date) || return 1
+    printf 'skip_created_before = "%s"\n' "$bound"
+    if [[ ${KEI_LIVE_SKIP_CREATED_AFTER+x} ]]; then
+        printf 'skip_created_after = "%s"\n' "$KEI_LIVE_SKIP_CREATED_AFTER"
+    fi
+}
+
+# Import-only sampling is separate from sync's mandatory fixed bound.
 kei_live_recent() {
     awk '$1 == "recent" && $2 == "=" { print $3 }' "$PROJECT_DIR/tests/data/live-selection.toml"
 }
 
+kei_live_fixed_date() {
+    python3 - "${KEI_LIVE_SKIP_CREATED_BEFORE:-}" "${KEI_LIVE_SKIP_CREATED_AFTER-}" "${KEI_LIVE_SKIP_CREATED_AFTER+x}" <<'PY'
+import datetime
+import sys
+before, after, has_after = sys.argv[1:]
+for key, value in [("BEFORE", before)] + ([("AFTER", after)] if has_after else []):
+    try:
+        assert len(value) == 10 and datetime.date.fromisoformat(value).isoformat() == value
+    except (AssertionError, ValueError):
+        sys.exit(f"Set KEI_LIVE_SKIP_CREATED_{key} to an explicit fixed YYYY-MM-DD before live tests")
+if has_after and before > after:
+    sys.exit("live fixed lower date must not be after the upper date")
+print(before)
+PY
+}
+
 # No download or shared-state mutation. Fail before account-dependent suites.
 kei_preflight_selection() (
+    kei_live_fixed_date >/dev/null || exit 1
     local work config output count
     work=$(mktemp -d "${TMPDIR:-/tmp}/kei-live-selection-XXXXXX") || exit 1
     trap 'rm -rf "$work"' EXIT
@@ -93,7 +123,7 @@ kei_preflight_selection() (
     count=$(printf '%s\n' "$output" | awk 'NF { count++ } END { print count+0 }')
     echo "Live selection: primary library, albums=none, unfiled=true; eligible filenames=$count" >&2
     if [ "$count" -eq 0 ]; then
-        echo "ABORT: empty bounded live selection. Add at least one eligible recent asset. Selection:" >&2
+        echo "ABORT: empty bounded live selection. Select a fixed date range containing at least one eligible asset. Selection:" >&2
         kei_live_filters >&2
         exit 1
     fi
@@ -119,6 +149,7 @@ kei_append_toml_fragment() {
 }
 
 kei_write_sync_config() {
+    kei_live_fixed_date >/dev/null || return 1
     local data_dir="${1:?data dir required}"
     local download_dir="${2:?download dir required}"
     local download_extra="${KEI_SYNC_DOWNLOAD_TOML:-}"
@@ -127,6 +158,7 @@ kei_write_sync_config() {
     local config="$data_dir/.kei-shell-sync-$$.toml"
     mkdir -p "$data_dir"
     {
+        echo "config_version = 1"
         echo "[download]"
         printf 'directory = %s\n' "$(kei_toml_string "$download_dir")"
         kei_append_toml_fragment "$download_extra"
@@ -175,6 +207,7 @@ kei_release_bin() {
 # circuit skips cargo's own freshness check (a warm but noop cargo call
 # is ~300-500ms) on the common up-to-date path.
 kei_require_release_binary() {
+    kei_live_fixed_date >/dev/null || return 1
     local bin
     bin="$(kei_release_bin)"
     local needs_build=0
@@ -196,6 +229,7 @@ kei_require_release_binary() {
 # success so callers don't reach into `_KEI_PASS`; exits the script on a
 # bad session so we don't cascade 12 subsequent sync failures.
 kei_preflight_session() {
+    kei_live_fixed_date >/dev/null || exit 1
     local bin cookies out
     bin="$(kei_release_bin)"
     cookies="$(kei_cookie_dir)"

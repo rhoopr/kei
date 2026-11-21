@@ -128,6 +128,7 @@ jobs:
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           body: ${{ steps.release_notes.outputs.notes }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             candidate/*.tar.gz
             candidate/*.zip
@@ -250,7 +251,7 @@ jobs:
     needs: [release, containers, resume_containers]
     if: |
       always() && (
-        (needs.release.result == 'success' && needs.containers.result == 'success') ||
+        (needs.release.result == 'success' && needs.containers.result == 'success' && !contains(github.ref_name, '-')) ||
         needs.resume_containers.result == 'success'
       )
     runs-on: ubuntu-latest

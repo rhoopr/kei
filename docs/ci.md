@@ -1,132 +1,22 @@
 # CI qualification
 
-PR checks gate ordinary correctness. Release qualification gates publication.
-Nightly qualification detects regressions before release day. All results
-refer to one exact commit. A skipped check is not a passing check.
+## PR baseline
 
-## Coverage contract
+[PR baseline](../.github/workflows/pr.yml) runs the same three Linux jobs in parallel for every PR, including drafts. Paths, labels and repository variables do not select work.
 
-| Check | Ordinary PR | Relevant PR or full override | Nightly and release |
-|-------|-------------|------------------------------|---------------------|
-| Format, Clippy, rustdoc, roundtrip, security, lockfile | Required for applicable changes | Required | Required |
-| Script/workflow lint, workflow hardening, typos | Required | Required | Required |
-| Linux all-feature and no-default offline suites | Required for code changes | Required | Required |
-| Scenario catalogs and safety-contract checks | Required for applicable changes | Required | Required |
-| Windows/macOS builds and platform smoke | Required for code changes | Required | Required |
-| Full Windows/macOS offline suites | Required when Rust tests change | Required for platform-sensitive changes | Required |
-| Compact copies/reseed safety fixture | Part of ordinary suite | Required | Required |
-| 300-writer copies stress | Not required | Required for scale-sensitive changes | Required |
-| Instrumented coverage | Not merge-critical | Available through full qualification | Required report, not a percentage threshold |
-| Nightly unused-dependency analysis | Not required | Full qualification | Required |
-| Fuzz build and bounded seeded fuzz runs | Not required | Full qualification | Required |
-| Optimized offline regression tests | Not required | Full qualification | Required |
-| Five release archives and extracted-binary smoke | Not required | Full qualification | Required |
-| Both container architectures, entrypoint and service smoke | Relevant smoke only | Full qualification | Required |
-| Live provider, live shell, release-binary import, real host service | Never on untrusted PRs | Protected maintainer qualification only | Separate exact-commit evidence for releases |
+| Job | What it checks |
+|-----|----------------|
+| Repository checks | Rust formatting, the serializer roundtrip diff against the PR event's base SHA, shell/Python/workflow lint, the safety contract catalog, workflow hardening and CI policy tests. |
+| Clippy | `cargo clippy --locked --all-targets --all-features -- -D warnings`. |
+| Sync safety | Two threads in one all-feature library harness run the transfer, checkpoint, bundled sync fixture, asset parsing, destination path, SQLite state/schema, import, filtering and selection groups, plus named safety contracts and a compact copies/reseed fixture. Run `bash scripts/ci/pr-smoke.sh` locally. Each group must contribute a passing test; the original three publication and retry cases must pass by name. |
 
-Full qualification must enumerate ignored tests. Live tests remain opt-in and
-single-threaded. Do not substitute an unfiltered `--ignored` run for this
-inventory. Cross-zone fixtures and unavailable host platforms need an explicit
-applicability decision, not a silent skip.
+Branch protection requires `CI`. It passes only when all three jobs succeed for the PR merge commit. New runs supersede old runs for the same PR. The target is seven minutes from PR update to the required result for 90% of updates. Track cold and warm builds and code-changing PRs separately.
 
-The local `just gate` and `just full-test` commands retain their existing
-contracts. CI reuses their owners and test routes; it does not claim that an
-offline workflow performed live provider or real host-service validation.
+## Broader checks
 
-## Local work
+Pushes to `main` run the full Linux, macOS and Windows offline suites, Linux no-default-feature checks, copies stress, docs and dependency audit. To qualify a feature branch before merging, dispatch **Heavy qualification** for that branch. Qualification adds native service smoke, coverage, unused-dependency analysis, bounded fuzzing, optimized tests, five release archives and two container architectures. It lists ignored tests without running credentialed tests.
 
-Before opening a PR, run focused tests for the changed behavior plus formatting
-and lint checks. Do not replay the complete offline gate locally. PR CI owns
-that evidence. Use local live-provider and real service checks only when the
-change needs them and the isolated fixtures are approved. `just gate` remains
-available for diagnosis or work without hosted CI.
-
-## PR routing
-
-Draft validation events skip routing, quality checks, qualification, and native
-service smoke, including when labeled `ci:full`. The required `CI` job still runs
-as a small failing marker: skipped required checks count as success on GitHub.
-Marking the PR ready for review starts validation for that event's exact merge
-commit, even if the head has not changed. A new head starts a new run.
-
-Converting a ready PR back to draft starts the failing marker and uses the
-existing PR concurrency group to supersede the older run. Marking it ready again
-requires a fresh successful `CI`; draft skips never satisfy that check.
-Unrelated label additions/removals and title/body edits use a run-specific
-concurrency group and a different check name, `CI metadata (ignored)`. They
-neither cancel active validation nor create a skipped or successful `CI`.
-Adding or removing `ci:full` and editing the base branch start validation in the
-normal PR group. Retargets use that event's base and merge commit. Main
-pushes, manual qualification, nightly runs, and releases keep their existing
-routes. The repository does not currently enable a merge queue.
-GitHub does not guarantee concurrency ordering during rapid transitions. If a
-ready run is superseded, retrigger validation for the current head; cancelled or
-missing work cannot pass the required check.
-
-The required check stays `CI`. A failed, cancelled, missing, or unexpectedly
-skipped required job fails that check. The `ci:full` label runs full
-qualification. Cargo/build inputs, fuzz inputs, container code, artifact and
-qualification/release workflows, the core `ci.yml`/`checks.yml` orchestrators,
-and unknown inputs also select it. Their heavy branches need execution coverage.
-Known notification/advisory clients and their workflows, routing/gate helpers, and
-`scripts/ci/test_*.py` keep the always-on Python tests, workflow hardening,
-script/workflow lint, cheap safety-contract validation, and typos without
-building Rust. Architecture-only edits therefore validate the contract catalog.
-New unclassified helpers still select full qualification.
-
-Recognized Rust test files keep the Linux all-feature and no-default suites
-and full Windows/macOS offline suites. Other code changes keep Linux suites with
-macOS/Windows build and CLI/media/service smoke; filesystem, state,
-configuration, and service changes select full platform tests. Narrow
-scenario/roundtrip/stress runners keep the ordinary Rust matrix without
-selecting release artifacts or fuzzing. The contract checker itself runs in the
-always-on workflow-hardening job.
-The large copies stress test follows its runtime owners:
-download, state, Photos provider, sync, configuration, retry, selection,
-filesystem/shared types, command service types, media fixtures, and its own
-queue-projection fixture. CLI entrypoints, unrelated commands, authentication,
-and other unit-test modules do not select it by themselves. The compact
-copies/reseed fixtures remain in ordinary offline tests.
-
-Routing uses filenames, not PR descriptions or semantic diff parsing. Changes
-inside shared runtime files still select stress even when a particular change
-is diagnostic. For example, #984 retains stress because it changes Photos
-hydration and session code; #985's reset command and unrelated test modules
-skip stress while keeping the full platform tests selected by its entrypoints.
-New files within stress runtime owners select stress conservatively. Renames
-consider both old and new paths. Full/heavy overrides, unknown top-level
-inputs, main pushes, and scheduled qualification retain stress. Its runner and
-Rust check orchestration also select stress. The broad-PR rollout fallback adds
-platform suites, coverage and unused-dependency checks for Rust changes, but
-cannot make an unrelated unit-test module or notification script select stress.
-Docs-only PRs retain workflow/script lint, safety-contract validation and typos.
-
-Native release-binary service smoke is routed through the required `CI` graph
-for service, service/status command, CLI, config and shared entrypoint changes.
-A selected missing, skipped, cancelled or failed smoke fails `CI`. Heavy
-qualification owns the same smoke internally; ordinary CI calls it only when
-qualification is off. The reusable service workflow has no independent PR
-trigger, so each validation runs its native smoke matrix at most once.
-
-For the exact file sets in #1000, #997, #991 and #1001, routing now selects
-ordinary Rust checks for #1000's Rust tests and only the always-on checks for the
-advisory-only PRs. All four skip full qualification and copies stress. These
-path-matrix cases, positive build/runtime controls and missing/skipped aggregate
-controls are covered by `scripts/ci/test_policy.py` and `test_draft_pr.py`.
-
-## Rollout
-
-Keep the existing PR workload until the replacement qualification route,
-publication guards, and nightly run have passed. Activate lighter PR routing
-only after that evidence exists. `CI_LIGHT_PR_ENABLED` defaults to unset, which
-retains the broad PR checks. After merge, run Nightly qualification on main,
-verify its complete artifact receipt, then enable the variable with value
-`true`. Observe the first scheduled run and freshness check. Record cold and
-warm timings separately. Clear the variable to restore broad PR checks.
-
-Release publication must consume the artifacts that passed qualification.
-GitHub release assets, GHCR version/latest tags, and Homebrew updates all depend
-on that result. Nightly and manual rehearsals have no publishing permissions.
+Heavy qualification also runs on Sundays at 03:23 UTC as a read-only release rehearsal. Release tags always rerun it on the release commit and require separate local evidence before publishing. Neither a nightly result nor a weekly rehearsal qualifies a different commit. For local development, run focused tests for the behavior you changed. `just gate` remains available for offline diagnosis.
 
 ## Local release prerequisites
 
@@ -162,14 +52,18 @@ Nightly results do not replace this requirement.
 
 ## Nightly operation
 
-`Nightly qualification` runs on main at 07:23 UTC each day (03:23 EDT or
-02:23 EST). It runs even when the commit is unchanged, since dependencies and
-runner images can change. It has no publication permission. Manual dispatch on
-main uses the same route; manual Heavy qualification can test a feature branch
-without publishing or posting notifications.
+`Nightly qualification` runs on `main` at 12:05 a.m. New York time every day. A manual dispatch on `main` uses the same four independent jobs, pinned to the event SHA:
 
-`Nightly freshness` checks at 19:23 UTC. A missing, failed, cancelled, or stale
-completed run opens one incident issue. Incidents carry `bug`, `@infra`, `@test`,
+- **Main push CI evidence:** require the latest `Rust CI` push run for that SHA and its shared checks result to have succeeded. A missing, running, cancelled or failed run is a gap; nightly reports it instead of replaying the platform matrix. If the push run was still running, rerun nightly after it finishes.
+- **Seeded fuzzing:** build every registered target and run each with its available seeds, including on an unchanged commit.
+- **RustSec audit:** check the locked dependencies against the current advisory database every day.
+- **Optimized library tests:** run the all-feature release-mode library suite unless a prior successful nightly on the same SHA actually ran and passed it. A skipped test step is not evidence. If no qualifying result is found in the bounded history, run the tests.
+
+All four jobs must succeed for the nightly incident reporter to signal recovery. Nightly does not build release candidates. The **Daily live wiki check** runs separately at 06:43 UTC and reports documentation drift on its own Actions run. Heavy qualification still checks the wiki before a release.
+
+`Nightly freshness` checks at 2:05 a.m. New York time. It inspects the newest scheduled or manually dispatched nightly on `main`. That run must have been created since the most recent 12:05 a.m. slot and finished successfully. A missing run, a still-running job, a failure, or yesterday's success cannot pass. Both schedules follow the local clock; when the spring transition skips the 2 a.m. hour, GitHub advances the check to 3 a.m.
+
+An unhealthy check opens one incident issue. Incidents carry `bug`, `@infra`, `@test`,
 and `nightly fail` labels. Missing labels are added to an existing incident
 without replacing its other labels; the reporter creates `nightly fail` if needed.
 
@@ -188,13 +82,12 @@ After a qualification run has completed, the missing identity includes that run,
 so closing a missing incident before a later recovery does not hide a new
 missing episode.
 Suppression changes notifications only; the checks still report failure.
-Recovery adds a comment and closes the incident. A completed run must have
-started within 36 hours. Both notification jobs share the `nightly-incident`
+Recovery adds a comment and closes the incident. Both notification jobs share the `nightly-incident`
 concurrency group, so incident updates stay serialized. Scheduled Actions can be
 delayed or disabled; this second schedule detects missing qualification runs but
 is not an external availability monitor for GitHub itself.
 
-Reports and candidate artifacts are retained for 14 days. PR, nightly, and
+Heavy qualification reports and candidate artifacts are retained for 14 days. PR, nightly, and
 release concurrency groups are separate. Nightly work cannot cancel a release.
 
 ## Advisory OpenCode review

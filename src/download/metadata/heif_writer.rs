@@ -60,7 +60,10 @@ pub(super) fn prepare_metadata_heif(
             }
             None => XmpMeta::new().context("Could not create XMP metadata")?,
         };
+        let before = super::xmp_fields::embedded_fields(&meta);
         apply_to_xmp(&mut meta, write)?;
+        let embedded_fields =
+            write.ownership_after(&before, &super::xmp_fields::embedded_fields(&meta));
         let xmp = meta.to_string().into_bytes();
         // Neither the parsed source packet nor its toolkit graph is needed
         // during streaming or independent output validation.
@@ -187,6 +190,8 @@ pub(super) fn prepare_metadata_heif(
             .with_context(|| format!("Could not fsync permissions on {}", tmp_path.display()))?;
         drop(file);
         Ok(PreparedMetadataFile {
+            required_mtime: None,
+            embedded_fields: Box::new(embedded_fields),
             guard,
             expected_input: expected,
             expected_output: rewritten_fingerprint,

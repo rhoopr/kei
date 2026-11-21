@@ -6,7 +6,10 @@ use std::sync::Arc;
 
 use super::PhotoAlbum;
 use crate::icloud::photos::asset::{PhotoAsset, RequiredAssetFields};
-use crate::icloud::photos::{changes_json, cloudkit, inbox::ShadowCapture, queries, session};
+#[cfg(test)]
+use crate::icloud::photos::inbox::ShadowCapture;
+use crate::icloud::photos::{changes_json, cloudkit, queries, session};
+use crate::state::db::provider_selection::SelectionMediaSource;
 
 pub(crate) struct CurrentCatalogAsset {
     pub(crate) asset: PhotoAsset,
@@ -97,7 +100,12 @@ pub(crate) fn current_asset(
 }
 
 pub(crate) fn same_selected_facts(left: &PhotoAsset, right: &PhotoAsset) -> bool {
-    left.asset_record_name() == right.asset_record_name()
+    // Unscoped rank observations inherit their validated query scope at the
+    // caller. Two explicit media sources cannot prove each other's identity.
+    left.source_zone()
+        .zip(right.source_zone())
+        .is_none_or(|(left, right)| left == right)
+        && left.asset_record_name() == right.asset_record_name()
         && left.id() == right.id()
         && left.created() == right.created()
         && left.added_date() == right.added_date()
@@ -118,8 +126,109 @@ pub(crate) fn same_selected_facts(left: &PhotoAsset, right: &PhotoAsset) -> bool
 }
 
 impl PhotoAlbum {
+    /// Confirm a selected observation in its bound source, rather than treating
+    /// equal child names in the membership and media libraries as one identity.
+    pub(crate) async fn confirm_selected_asset(
+        &self,
+        observed: &PhotoAsset,
+    ) -> Result<CurrentCatalogAsset> {
+        let source = self.selected_media_album(observed)?;
+        self.bound_media_source(source)?;
+        source
+            .confirm_catalog_asset(observed.asset_record_name())
+            .await
+    }
+
+    pub(crate) fn selected_media_source(
+        &self,
+        observed: &PhotoAsset,
+    ) -> Result<SelectionMediaSource> {
+        self.bound_media_source(self.selected_media_album(observed)?)
+    }
+
+    /// Freeze only sources sharing this selection's authenticated account/store.
+    pub(crate) fn selection_media_sources(&self) -> Result<Vec<SelectionMediaSource>> {
+        let mut zones = rustc_hash::FxHashSet::default();
+        zones.insert(self.zone_name());
+        let mut sources = Vec::with_capacity(self.cross_zone_sources.len());
+        for album in &self.cross_zone_sources {
+            anyhow::ensure!(
+                zones.insert(album.zone_name()),
+                "Selected source is ambiguous"
+            );
+            sources.push(self.bound_media_source(album)?);
+        }
+        sources.sort_by(|left, right| left.scope.cmp(&right.scope));
+        Ok(sources)
+    }
+
+    pub(crate) async fn confirm_selection_identity(
+        &self,
+        child: &str,
+        binding: &SelectionMediaSource,
+    ) -> Result<CurrentCatalogAsset> {
+        let zone = binding
+            .zone
+            .get("zoneName")
+            .and_then(Value::as_str)
+            .context("Selected media source has no zone")?;
+        let source = self.media_album(zone)?;
+        anyhow::ensure!(
+            self.bound_media_source(source)? == *binding,
+            "Selected media source binding changed"
+        );
+        source.confirm_catalog_asset(child).await
+    }
+
+    fn selected_media_album(&self, observed: &PhotoAsset) -> Result<&Self> {
+        let zone = observed
+            .source_zone()
+            // Owner-zone rank observations inherit their authenticated query
+            // scope; hydration attaches an explicit source to foreign assets.
+            .or_else(|| self.zone_id.get("zoneName").and_then(Value::as_str))
+            .context("Selected observation has no provider source")?;
+        self.media_album(zone)
+    }
+
+    fn media_album(&self, zone: &str) -> Result<&Self> {
+        let source = if self.zone_id.get("zoneName").and_then(Value::as_str) == Some(zone) {
+            self
+        } else {
+            let mut sources = self.cross_zone_sources.iter().filter(|source| {
+                source.zone_id.get("zoneName").and_then(Value::as_str) == Some(zone)
+            });
+            let source = sources
+                .next()
+                .context("Selected source is not bound to this album")?;
+            anyhow::ensure!(sources.next().is_none(), "Selected source is ambiguous");
+            source
+        };
+        Ok(source)
+    }
+
+    fn bound_media_source(&self, source: &Self) -> Result<SelectionMediaSource> {
+        let (owner, _, _) = self
+            .owned_selection_scope()?
+            .context("Selection owner is not authenticated")?;
+        let (media_owner, scope, zone) = source
+            .owned_selection_scope()?
+            .context("Selected media source is not authenticated")?;
+        anyhow::ensure!(
+            owner.owner == media_owner.owner
+                && Arc::ptr_eq(&owner.db, &media_owner.db)
+                && owner.scope("private", &zone)? == media_owner.scope("private", &zone)?,
+            "Selected media source ownership mismatch"
+        );
+        anyhow::ensure!(
+            !source.zone_name().trim().is_empty(),
+            "Selected media source has no zone"
+        );
+        Ok(SelectionMediaSource { scope, zone })
+    }
+
     /// This first work stage admits only an unambiguous private library-wide
     /// source. Other passes retain their source facts for later qualification.
+    #[cfg(test)]
     pub(crate) fn catalog_work_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {
         let Some((capture, database)) = &self.shadow_capture else {
             return Ok(None);

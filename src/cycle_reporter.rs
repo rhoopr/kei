@@ -122,9 +122,11 @@ impl CycleStatus {
     }
 }
 
-/// Classify the completed sync cycle once for every output surface.
+/// Classify backup completion for reports and notifications. Process health
+/// separately observes storage, state and authentication failures.
 ///
-/// Priority: `session_expired` > `interrupted` > `partial_failure` > `success`.
+/// Priority: session expiry, storage failure, interruption, unfinished work,
+/// success. Storage cancellation is a failed cycle, not a user interruption.
 ///
 /// Session expiration is the actionable operator signal even if some downloads
 /// also failed. Interruption beats partial failure because cancellation can
@@ -136,10 +138,11 @@ pub(crate) fn classify_cycle(
 ) -> CycleStatus {
     if session_expired {
         CycleStatus::SessionExpired
+    } else if stats.storage_failed {
+        CycleStatus::Failed
     } else if stats.interrupted {
         CycleStatus::Interrupted
-    } else if failed_count > 0 || stats.identity_incomplete || stats.unattributed_legacy_pending > 0
-    {
+    } else if failed_count > 0 || stats.identity_incomplete || stats.selected_work_remaining {
         CycleStatus::Failed
     } else {
         CycleStatus::Success
@@ -168,7 +171,7 @@ where
     /// gauges and `health.json` need fresh timestamps, but cycle counters,
     /// duration, reports, and completion notifications must not change.
     pub(crate) async fn report_skipped_watch_cycle(&self, health: &mut HealthStatus) {
-        let unresolved = if let Some(db) = self.state_db {
+        let observation = if let Some(db) = self.state_db {
             db.get_summary().await.map(|summary| {
                 health.unattributed_legacy_assets = summary
                     .metadata_capture
@@ -180,21 +183,12 @@ where
                     .iter()
                     .map(|capture| capture.unattributed_legacy_pending)
                     .sum();
-                summary.unresolved_identity_zones > 0
-                    || summary.metadata_capture.iter().any(|capture| {
-                        capture.unresolved_assets > 0 || capture.unattributed_legacy_pending > 0
-                    })
             })
         } else {
-            Ok(false)
+            Ok(())
         };
-        match unresolved {
-            Ok(false) => health.record_success(),
-            Ok(true) if health.unattributed_legacy_pending > 0 => {
-                health.record_failure("legacy current-work certification remains incomplete");
-            }
-            Ok(true) => health
-                .record_failure("unresolved asset identity; provider checkpoint replay required"),
+        match observation {
+            Ok(()) => health.record_success(),
             Err(error) => {
                 tracing::warn!(error = %error, "Could not inspect durable identity evidence for idle health");
                 health.record_failure("could not inspect unresolved asset identity evidence");
@@ -212,9 +206,12 @@ where
         health: &mut HealthStatus,
         input: CycleFacts<'_>,
     ) {
-        crate::support::complete(input.stats, input.status.as_report_str());
         let friendly_summary = self.friendly_summary().await;
         self.report_friendly_output(&input, friendly_summary.as_ref());
+        if self.run_options.dry_run {
+            return;
+        }
+        crate::support::complete(input.stats, input.status.as_report_str());
         self.update_health(health, &input);
         self.update_metrics(health, &input, friendly_summary.as_ref())
             .await;
@@ -268,21 +265,14 @@ where
     fn update_health(&self, health: &mut HealthStatus, input: &CycleFacts<'_>) {
         health.unattributed_legacy_assets = input.stats.unattributed_legacy_assets;
         health.unattributed_legacy_pending = input.stats.unattributed_legacy_pending;
-        match input.status {
-            CycleStatus::Success => health.record_success(),
-            CycleStatus::Failed if input.stats.identity_incomplete => {
-                health.record_failure(
-                    "unresolved asset identity; provider checkpoint replay required",
-                );
-            }
-            CycleStatus::Failed if input.stats.unattributed_legacy_pending > 0 => {
-                health.record_failure("legacy current-work certification remains incomplete");
-            }
-            CycleStatus::Failed => {
-                health.record_failure(&format!("{} sync failures", input.failed_count));
-            }
-            CycleStatus::SessionExpired => health.record_failure("session expired"),
-            CycleStatus::Interrupted => health.record_failure("sync interrupted"),
+        if input.status == CycleStatus::SessionExpired {
+            health.record_failure("session expired");
+        } else if input.stats.storage_failed {
+            health.record_failure("storage unavailable");
+        } else if input.stats.state_write_failures > 0 {
+            health.record_failure(&format!("{} sync failures", input.failed_count));
+        } else {
+            health.record_success();
         }
         health.write(self.health_dir);
     }
@@ -421,6 +411,7 @@ mod tests {
     fn run_options() -> RunOptions {
         let download_dir = tempfile::tempdir().unwrap();
         let globals = crate::config::GlobalArgs {
+            config_source: Default::default(),
             username: Some("reporter@example.com".to_string()),
             domain: None,
             data_dir: None,
@@ -495,7 +486,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unresolved_identity_does_not_advance_health_success() {
+    async fn retry_completeness_and_storage_auth_health_over_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("report.json");
+        let notifier = Notifier::new(None);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (handle, task, addr) = crate::metrics::spawn_server(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            0,
+            cancel.clone(),
+            Some(chrono::Duration::seconds(60)),
+        )
+        .unwrap();
+        let reporter = reporter_with_surfaces(
+            dir.path(),
+            Some(&report_path),
+            &notifier,
+            None,
+            Some(&handle),
+        );
+        let client = reqwest::Client::new();
+        let mut health = HealthStatus::new();
+        for (stats, expired, status, report_status) in [
+            (
+                SyncStats {
+                    selected_work_remaining: true,
+                    ..SyncStats::default()
+                },
+                false,
+                200,
+                "partial_failure",
+            ),
+            (
+                SyncStats {
+                    failed: 1,
+                    ..SyncStats::default()
+                },
+                false,
+                200,
+                "partial_failure",
+            ),
+            (
+                SyncStats {
+                    storage_failed: true,
+                    failed: 1,
+                    ..SyncStats::default()
+                },
+                false,
+                503,
+                "partial_failure",
+            ),
+            (SyncStats::default(), true, 503, "session_expired"),
+            (SyncStats::default(), false, 200, "success"),
+            (
+                SyncStats {
+                    state_write_failures: 1,
+                    failed: 1,
+                    ..SyncStats::default()
+                },
+                false,
+                503,
+                "partial_failure",
+            ),
+            (SyncStats::default(), false, 200, "success"),
+        ] {
+            report_cycle(&reporter, &mut health, &stats, stats.failed, expired).await;
+            assert_eq!(parse_json(&report_path)["status"], report_status);
+            let response = client
+                .get(format!("http://{addr}/healthz"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            if status == 200 {
+                assert_eq!(health.consecutive_failures, 0);
+                assert!(health.last_error.is_none());
+            }
+        }
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unresolved_identity_reports_incomplete_but_keeps_process_healthy() {
         let dir = tempfile::tempdir().unwrap();
         let report_path = dir.path().join("sync_report.json");
         let notifier = Notifier::new(None);
@@ -515,22 +588,16 @@ mod tests {
         assert_eq!(report["stats"]["downloaded"], 1);
         assert_eq!(report["stats"]["interrupted"], false);
         assert_eq!(report["stats"]["sync_token_blocked"], true);
-        assert_eq!(health.last_success_at, previous);
-        assert_eq!(health.consecutive_failures, 1);
-        assert!(
-            health
-                .last_error
-                .as_deref()
-                .unwrap()
-                .contains("unresolved asset identity")
-        );
+        assert!(health.last_success_at >= previous);
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.last_error.is_none());
 
         // A later held cycle still reports and accumulates failures; the hold
         // is not a process crash or an interruption.
         report_cycle(&reporter, &mut health, &stats, 0, false).await;
         assert_eq!(parse_json(&report_path)["status"], "partial_failure");
-        assert_eq!(health.last_success_at, previous);
-        assert_eq!(health.consecutive_failures, 2);
+        assert!(health.last_success_at >= previous);
+        assert_eq!(health.consecutive_failures, 0);
 
         // Intentional bounded holds without unresolved identity remain
         // successful even though the checkpoint stays blocked.
@@ -554,33 +621,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_legacy_certification_fails_reporting_until_current_proof_completes() {
+    async fn historical_legacy_counters_do_not_fail_completed_reporting() {
         let dir = tempfile::tempdir().unwrap();
         let report_path = dir.path().join("report.json");
         let notifier = Notifier::new(None);
         let reporter = reporter(dir.path(), Some(&report_path), &notifier);
         let mut health = HealthStatus::new();
         health.record_success();
-        let previous = health.last_success_at;
-        let mut stats = SyncStats {
+        let previous = Some(chrono::Utc::now() - chrono::Duration::days(1));
+        health.last_success_at = previous;
+        let stats = SyncStats {
             unattributed_legacy_assets: 15,
             unattributed_legacy_pending: 15,
-            sync_token_blocked: true,
             ..SyncStats::default()
         };
         report_cycle(&reporter, &mut health, &stats, 0, false).await;
-        assert_eq!(parse_json(&report_path)["status"], "partial_failure");
-        assert_eq!(health.last_success_at, previous);
-        assert_eq!(health.consecutive_failures, 1);
-        assert!(
-            health
-                .last_error
-                .as_deref()
-                .unwrap()
-                .contains("certification")
+        assert_eq!(parse_json(&report_path)["status"], "success");
+        assert!(health.last_success_at > previous);
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.last_error.is_none());
+        assert_eq!(
+            parse_json(&report_path)["stats"]["unattributed_legacy_pending"],
+            15
         );
-        stats.unattributed_legacy_pending = 0;
-        stats.sync_token_blocked = false;
         report_cycle(&reporter, &mut health, &stats, 0, false).await;
         assert_eq!(parse_json(&report_path)["status"], "success");
         assert_eq!(health.consecutive_failures, 0);
@@ -824,8 +887,8 @@ mod tests {
                 failed_count: 2,
                 session_expired: false,
                 expected_report_status: "partial_failure",
-                expected_health_failures: 1,
-                expected_health_error: Some("2 sync failures"),
+                expected_health_failures: 0,
+                expected_health_error: None,
                 expected_notification: "sync_failed",
                 expected_notification_message: "2 sync failures",
                 expected_db_status: "complete",
@@ -846,8 +909,8 @@ mod tests {
                 failed_count: 3,
                 session_expired: false,
                 expected_report_status: "partial_failure",
-                expected_health_failures: 1,
-                expected_health_error: Some("3 sync failures"),
+                expected_health_failures: 0,
+                expected_health_error: None,
                 expected_notification: "sync_failed",
                 expected_notification_message: "3 sync failures",
                 expected_db_status: "complete",
@@ -1163,8 +1226,8 @@ mod tests {
         report_cycle(&reporter, &mut health, &stats, 3, false).await;
 
         let health_json = parse_json(&dir.path().join("health.json"));
-        assert_eq!(health_json["consecutive_failures"], 1);
-        assert_eq!(health_json["last_error"], "3 sync failures");
+        assert_eq!(health_json["consecutive_failures"], 0);
+        assert!(health_json["last_error"].is_null());
         let report_json = parse_json(&report_path);
         assert_eq!(report_json["status"], "partial_failure");
         assert_eq!(report_json["stats"]["failed"], 3);
@@ -1202,14 +1265,14 @@ mod tests {
         report_cycle(&reporter, &mut health, &stats, 0, false).await;
 
         let health_json = parse_json(&dir.path().join("health.json"));
-        assert_eq!(health_json["consecutive_failures"], 1);
-        assert_eq!(health_json["last_error"], "sync interrupted");
+        assert_eq!(health_json["consecutive_failures"], 0);
+        assert!(health_json["last_error"].is_null());
         let report_json = parse_json(&report_path);
         assert_eq!(report_json["status"], "interrupted");
     }
 
     #[tokio::test]
-    async fn skipped_watch_cycle_retains_unselected_zone_identity_failure() {
+    async fn skipped_watch_cycle_keeps_unselected_zone_identity_debt_healthy() {
         let dir = tempfile::tempdir().unwrap();
         let db = state::SqliteStateDb::open_in_memory().unwrap();
         db.set_metadata(&state::unresolved_identity_key("unselected-zone"), "1")
@@ -1221,19 +1284,14 @@ mod tests {
         health.record_success();
         let previous = health.last_success_at;
         reporter.report_skipped_watch_cycle(&mut health).await;
-        assert_eq!(health.last_success_at, previous);
-        assert_eq!(health.consecutive_failures, 1);
-        assert!(
-            health
-                .last_error
-                .as_deref()
-                .unwrap()
-                .contains("unresolved asset identity")
-        );
+        assert!(health.last_success_at >= previous);
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.last_error.is_none());
+        assert_eq!(db.get_summary().await.unwrap().unresolved_identity_zones, 1);
     }
 
     #[tokio::test]
-    async fn metadata_capture_retry_keeps_idle_health_incomplete() {
+    async fn metadata_capture_retry_keeps_idle_process_healthy() {
         let dir = tempfile::tempdir().unwrap();
         let db = state::SqliteStateDb::open_in_memory().unwrap();
         let row = crate::test_helpers::TestAssetRecord::new("private-legacy")
@@ -1270,8 +1328,8 @@ mod tests {
         health.record_success();
         let previous = health.last_success_at;
         reporter.report_skipped_watch_cycle(&mut health).await;
-        assert_eq!(health.last_success_at, previous);
-        assert_eq!(health.consecutive_failures, 1);
+        assert!(health.last_success_at >= previous);
+        assert_eq!(health.consecutive_failures, 0);
         db.set_metadata_capture_revision_for_test("unselected-zone", "private-legacy", 1);
         db.complete_metadata_capture_revision("unselected-zone", 1)
             .await
@@ -1281,7 +1339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_legacy_certification_keeps_idle_health_incomplete() {
+    async fn historical_legacy_counters_do_not_fail_idle_health() {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("state.db");
         let db = state::SqliteStateDb::open(&database).await.unwrap();
@@ -1301,8 +1359,8 @@ mod tests {
         )
         .await
         .unwrap();
-        // Seed the durable reporting states only. Production activation and its
-        // transaction fences are exercised by the reopened cycle fixtures.
+        // Seed reporting history only; current production transitions are proved
+        // separately by the reopened cycle fixtures.
         let conn = rusqlite::Connection::open(&database).unwrap();
         conn.execute("INSERT INTO unattributed_legacy VALUES ('unselected-zone','legacy',1,'{}','[]',0,NULL)", []).unwrap();
         let summary = db.get_summary().await.unwrap();
@@ -1313,22 +1371,14 @@ mod tests {
         let reporter = reporter_with_surfaces(dir.path(), None, &notifier, Some(&db), None);
         let mut health = HealthStatus::new();
         health.record_success();
-        let previous = health.last_success_at;
+        let previous = Some(chrono::Utc::now() - chrono::Duration::days(1));
+        health.last_success_at = previous;
         reporter.report_skipped_watch_cycle(&mut health).await;
-        assert_eq!(health.last_success_at, previous);
-        assert_eq!(health.consecutive_failures, 1);
-        assert!(
-            health
-                .last_error
-                .as_deref()
-                .unwrap()
-                .contains("certification")
-        );
-        let dependencies = db
-            .legacy_dependency_evidence("unselected-zone", "legacy")
-            .await
-            .unwrap();
-        conn.execute("INSERT INTO unattributed_legacy_proofs VALUES ('unselected-zone','legacy',1,1,?1,'{}','config','prior','next',0)", [dependencies]).unwrap();
+        assert!(health.last_success_at > previous);
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.last_error.is_none());
+        assert_eq!(health.unattributed_legacy_pending, 1);
+        conn.execute("INSERT INTO unattributed_legacy_proofs VALUES ('unselected-zone','legacy',1,1,'stale dependencies','future bytes','config','prior','next',0)", []).unwrap();
         conn.execute(
             "UPDATE unattributed_legacy SET active_generation=1 WHERE library='unselected-zone'",
             [],

@@ -2,7 +2,6 @@
 
 //! Bounded, replayable event orderings across metadata-capture recovery.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -13,14 +12,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use crate::download;
 use crate::sync_cycle::run_cycle;
 use crate::sync_loop::test_support::{
     MutableCaptureSession, RUN_CYCLE_ASSET_DATE_MS, RunCycleDownloadConfigOptions,
-    full_album_page_with_download, make_full_album_with_boxed_session, make_run_cycle_config,
+    full_album_page_with_download, make_owned_cycle_album, make_run_cycle_config,
     make_run_cycle_download_config_builder_with_options, make_run_cycle_library_state_with_album,
-    make_shared_session_for_run_cycle, media_without_photo_downloads,
+    make_shared_session_for_run_cycle, open_owned_cycle_db,
 };
-use crate::{download, state};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 enum Event {
@@ -39,11 +38,55 @@ enum Event {
 }
 
 async fn run_capture_history(seed: u64, trace: &[Event]) {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    #[derive(Clone, Debug)]
+    struct SequenceSession {
+        session: MutableCaptureSession,
+        changed: bool,
+        token: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::icloud::photos::PhotosSession for SequenceSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            headers: &[(&str, &str)],
+        ) -> anyhow::Result<serde_json::Value> {
+            if url.contains("/changes/zone?") {
+                let request: serde_json::Value = serde_json::from_str(&body)?;
+                let records = if !self.changed || request["zones"][0]["syncToken"] == self.token {
+                    Vec::new()
+                } else {
+                    self.session.records.lock().unwrap().clone()
+                };
+                return Ok(json!({"zones": [{
+                    "zoneID": {"zoneName": self.session.zone, "ownerRecordName": "_defaultOwner"},
+                    "syncToken": self.token, "moreComing": false,
+                    "records": records
+                }]}));
+            }
+            let mut response = self.session.post(url, body, headers).await?;
+            if url.contains("/records/query?") {
+                response["syncToken"] = json!(self.token);
+            }
+            Ok(response)
+        }
+
+        fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
     const ZONE: &str = "SharedSync-SEQUENCE";
     const MASTER: &str = "master-sequence";
     const CHILD: &str = "asset-master-sequence";
     const TOKEN_KEY: &str = "sync_token:SharedSync-SEQUENCE";
-    const CHECKSUM: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     const RECOVERED_DATE: i64 = RUN_CYCLE_ASSET_DATE_MS + 42 * 86_400_000;
 
     let dir = tempfile::tempdir().unwrap();
@@ -51,20 +94,29 @@ async fn run_capture_history(seed: u64, trace: &[Event]) {
     let media = dir.path().join("media");
     std::fs::create_dir(&media).unwrap();
     let media_path = media.join("legacy.jpg");
-    let original_bytes = vec![0u8; 1024];
+    let original_bytes =
+        b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9".to_vec();
+    let checksum =
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&original_bytes));
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/photo.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(original_bytes.clone()))
+        .mount(&server)
+        .await;
     std::fs::write(&media_path, &original_bytes).unwrap();
     let sidecar = media.join("unrelated.xmp");
     std::fs::write(&sidecar, b"private sidecar bytes").unwrap();
     let original_date = chrono::DateTime::from_timestamp(1_600_000_000, 0).unwrap();
     {
-        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        let db = open_owned_cycle_db(&database).await;
         let row = crate::test_helpers::TestAssetRecord::new(MASTER)
             .library(ZONE)
             .filename("legacy.jpg")
             .created_at(original_date)
             .added_at(chrono::DateTime::from_timestamp_millis(RUN_CYCLE_ASSET_DATE_MS).unwrap())
-            .size(1024)
-            .checksum(CHECKSUM)
+            .size(original_bytes.len() as u64)
+            .checksum(&checksum)
             .build();
         db.upsert_seen(&row).await.unwrap();
         db.mark_downloaded(
@@ -80,32 +132,61 @@ async fn run_capture_history(seed: u64, trace: &[Event]) {
         db.upsert_asset_master_mapping(ZONE, CHILD, MASTER)
             .await
             .unwrap();
+        db.upsert_asset_master_mapping(ZONE, "historical-absent-child", MASTER)
+            .await
+            .unwrap();
         db.set_metadata_capture_revision_for_test(ZONE, MASTER, 0);
         db.set_metadata(TOKEN_KEY, "zone-tok-prev").await.unwrap();
+        let historical = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(historical.len(), 1);
+        assert_eq!(historical[0].id.as_ref(), MASTER);
+        assert!(!historical[0].metadata.is_hidden);
+        assert!(!historical[0].metadata.is_favorite);
     }
 
     let lookups = Arc::new(AtomicUsize::new(0));
     let config = make_run_cycle_config();
     let (_session_dir, session) = make_shared_session_for_run_cycle().await;
     let mut completed_lookups = None;
-    for (step, event) in trace.iter().copied().enumerate() {
+    let mut completed_outputs = None;
+    let mut checkpoint = "zone-tok-prev".to_owned();
+    let mut current_date = RUN_CYCLE_ASSET_DATE_MS;
+    // Admit the selected child through a real production download before
+    // exercising malformed updates and failed current metadata transactions.
+    for (step, event) in std::iter::once(Event::Deferred)
+        .chain(trace.iter().copied())
+        .enumerate()
+    {
         eprintln!("seed={seed} step={step} event={event:?} trace={trace:?}");
         let repaired = matches!(event, Event::Recover | Event::Steady);
         let cancel = CancellationToken::new();
+        // Failed steps retain the old cursor, so alternating two token values
+        // can incorrectly describe a later mutation as an unchanged delta.
+        let token = if repaired {
+            "zone-tok-recovered".to_owned()
+        } else {
+            format!("sequence-{seed}-{step}")
+        };
         let mut page = full_album_page_with_download(
             ZONE,
             MASTER,
-            "zone-tok-new",
-            "https://p01.icloud-content.com/photo.jpg",
-            1024,
-            CHECKSUM,
+            &token,
+            &format!("{}/photo.jpg", server.uri()),
+            original_bytes.len() as u64,
+            &checksum,
         );
         let fields = &mut page["records"][1]["fields"];
+        fields["masterRef"]["value"]["zoneID"]["ownerRecordName"] = json!("_defaultOwner");
         fields["isHidden"] = json!({"value": 1, "type": "INT64"});
         fields["isFavorite"] = json!({"value": 1, "type": "INT64"});
+        if !matches!(event, Event::Deferred | Event::Recover | Event::Steady) {
+            // A rejected date, identity, or transaction must reject the flags
+            // from that same snapshot too, rather than partially refreshing it.
+            fields["isFavorite"]["value"] = json!(0);
+        }
         // Valid fault attempts use a different date from the final recovery.
         fields["assetDate"] = json!({
-            "value": if repaired { RECOVERED_DATE } else { RUN_CYCLE_ASSET_DATE_MS },
+            "value": if repaired { RECOVERED_DATE } else if matches!(event, Event::FailRefresh | Event::InterruptLookup) { RECOVERED_DATE + 86_400_000 } else { RUN_CYCLE_ASSET_DATE_MS },
             "type": "TIMESTAMP"
         });
         match event {
@@ -125,6 +206,10 @@ async fn run_capture_history(seed: u64, trace: &[Event]) {
         if matches!(event, Event::MissingChild) {
             page["records"].as_array_mut().unwrap().truncate(1);
         }
+        // InterruptLookup retains the usable master/child pair and an eligible
+        // media resource. Its changed date and revision require confirmation;
+        // cancellation occurs inside the provider lookup, before those facts
+        // may replace the previously committed date and flags.
         if matches!(event, Event::Ambiguous) {
             let mut sibling = page["records"][1].clone();
             sibling["recordName"] = json!("valid-sibling");
@@ -133,36 +218,45 @@ async fn run_capture_history(seed: u64, trace: &[Event]) {
                 json!({"value": RUN_CYCLE_ASSET_DATE_MS, "type": "TIMESTAMP"});
             page["records"].as_array_mut().unwrap().push(sibling);
         }
+        for record in page["records"].as_array_mut().unwrap() {
+            record["recordChangeTag"] = json!(if repaired {
+                "sequence-recovered".to_owned()
+            } else {
+                format!("sequence-{step}")
+            });
+        }
         {
             let conn = rusqlite::Connection::open(&database).unwrap();
             conn.execute_batch("DROP TRIGGER IF EXISTS fail_sequence_refresh")
                 .unwrap();
-            if step == 2 {
-                // Advance the existing deadline, without sleeping or changing
-                // production retry policy. Provider-only changes do not
-                // invalidate a still-current durable retry fingerprint.
-                conn.execute("UPDATE metadata_capture_retries SET next_retry_at=0", [])
-                    .unwrap();
-            }
             if matches!(event, Event::FailRefresh) {
                 conn.execute_batch(
-                    "CREATE TRIGGER fail_sequence_refresh BEFORE UPDATE OF created_at ON assets BEGIN SELECT RAISE(ABORT, 'injected sequence refresh failure'); END;"
+                    "CREATE TRIGGER fail_sequence_refresh BEFORE UPDATE OF created_at ON assets WHEN OLD.id='asset-master-sequence' BEGIN SELECT RAISE(ABORT, 'injected sequence refresh failure'); END;"
                 ).unwrap();
             }
         }
-        let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        let inner = open_owned_cycle_db(&database).await;
         let db = inner.clone() as Arc<dyn download::DownloadStore>;
         let library = make_run_cycle_library_state_with_album(
             ZONE,
             TOKEN_KEY,
-            make_full_album_with_boxed_session(
+            make_owned_cycle_album(
+                &inner,
                 ZONE,
-                Box::new(MutableCaptureSession {
-                    zone: ZONE,
-                    records: Arc::new(Mutex::new(page["records"].as_array().unwrap().clone())),
-                    repair_requests: lookups.clone(),
-                    cancel_after_lookup: matches!(event, Event::InterruptLookup)
-                        .then(|| cancel.clone()),
+                "shared",
+                Box::new(SequenceSession {
+                    changed: !matches!(event, Event::Steady),
+                    token: token.clone(),
+                    session: MutableCaptureSession {
+                        // SequenceSession supplies the opaque per-event cursor
+                        // for delta and query responses; lookup has no cursor.
+                        token: "sequence-inner-unused",
+                        zone: ZONE,
+                        records: Arc::new(Mutex::new(page["records"].as_array().unwrap().clone())),
+                        repair_requests: lookups.clone(),
+                        cancel_after_lookup: matches!(event, Event::InterruptLookup)
+                            .then(|| cancel.clone()),
+                    },
                 }),
             ),
         );
@@ -170,16 +264,19 @@ async fn run_capture_history(seed: u64, trace: &[Event]) {
             &media,
             db.clone(),
             RunCycleDownloadConfigOptions {
-                media: media_without_photo_downloads(),
-                recent: matches!(event, Event::FilteredInvalid).then_some(1),
+                skip_created_before: matches!(event, Event::FilteredInvalid).then_some(
+                    crate::config::CreatedDateFilter::CaptureDate(
+                        chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                    ),
+                ),
                 ..RunCycleDownloadConfigOptions::default()
             },
         );
+        let lookups_before = lookups.load(Ordering::SeqCst);
         let result = Box::pin(run_cycle(
             &[&library],
             &config,
             Some(db.as_ref()),
-            false,
             &build,
             download::DownloadControls::download_hidden(),
             &session,
@@ -188,89 +285,79 @@ async fn run_capture_history(seed: u64, trace: &[Event]) {
         .await
         .unwrap();
         drop(build);
+        drop(library);
         drop(db);
         drop(inner);
 
         // Oracle: fixture facts, independent of the production selector and
         // counters. The final cycle is reopened too, not only intermediate ones.
-        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        let db = open_owned_cycle_db(&database).await;
         let rows = db.get_downloaded_page(0, 10).await.unwrap();
-        assert_eq!(rows.len(), 1, "downloaded row count");
-        assert_eq!(rows[0].id.as_ref(), MASTER, "legacy row identity");
+        let legacy = rows
+            .iter()
+            .find(|row| row.id.as_ref() == MASTER)
+            .expect("historical receipt retained");
         assert_eq!(
-            rows[0].created_at,
-            if repaired {
-                chrono::DateTime::from_timestamp_millis(RECOVERED_DATE).unwrap()
-            } else {
-                original_date
-            },
-            "capture date requires valid committed evidence"
+            legacy.created_at, original_date,
+            "historical capture date is not selected work"
         );
         assert_eq!(
-            rows[0].added_at.unwrap().timestamp_millis(),
+            legacy.added_at.unwrap().timestamp_millis(),
             RUN_CYCLE_ASSET_DATE_MS,
             "addition date preserved"
         );
         assert_eq!(
-            rows[0].checksum.as_ref(),
-            CHECKSUM,
+            legacy.checksum.as_ref(),
+            checksum,
             "provider checksum preserved"
         );
         assert_eq!(
-            rows[0].local_path.as_deref(),
+            legacy.local_path.as_deref(),
             Some(media_path.as_path()),
             "tracked path preserved"
         );
-        assert_eq!(
-            rows[0].metadata.is_hidden, repaired,
-            "hidden metadata changes only on recovery"
+        assert!(!legacy.metadata.is_hidden);
+        assert!(!legacy.metadata.is_favorite);
+        assert!(
+            db.get_legacy_master_state_owners()
+                .await
+                .unwrap()
+                .is_empty(),
+            "current child cannot adopt ambiguous history"
         );
-        assert_eq!(
-            rows[0].metadata.is_favorite, repaired,
-            "favorite metadata changes only on recovery"
-        );
-        assert_eq!(
-            db.get_legacy_master_state_owners().await.unwrap(),
-            if step >= 2 {
-                HashSet::from([(ZONE.to_string(), MASTER.to_string(), CHILD.to_string())])
+        let selected_complete = matches!(event, Event::Deferred | Event::Recover | Event::Steady);
+        if selected_complete {
+            checkpoint.clone_from(&token);
+            current_date = if repaired {
+                RECOVERED_DATE
             } else {
-                HashSet::new()
-            },
-            "exact legacy ownership"
-        );
+                RUN_CYCLE_ASSET_DATE_MS
+            };
+        }
         assert_eq!(
             db.get_metadata(TOKEN_KEY).await.unwrap().as_deref(),
-            Some(if repaired {
-                "zone-tok-new"
-            } else {
-                "zone-tok-prev"
-            }),
-            "checkpoint requires completed capture"
+            Some(checkpoint.as_str()),
+            "checkpoint requires completed selected work"
         );
-        let summary = db.get_summary().await.unwrap();
         assert_eq!(
-            (
-                summary.downloaded,
-                summary.pending,
-                summary.policy_excluded,
-                summary.source_deleted
-            ),
-            (1, 0, 0, 0),
-            "durable status counts"
+            result.stats.sync_token_blocked, !selected_complete,
+            "selected source/update gate"
         );
-        let capture = summary
-            .metadata_capture
+        let current = rows
             .iter()
-            .find(|item| item.library == ZONE)
-            .unwrap();
+            .find(|row| row.id.as_ref() == CHILD)
+            .expect("production-admitted child receipt");
         assert_eq!(
-            capture.pending_revision,
-            if repaired {
-                None
-            } else {
-                Some(state::METADATA_CAPTURE_REVISION)
-            },
-            "pending capture revision"
+            current.created_at.timestamp_millis(),
+            current_date,
+            "malformed or failed updates cannot replace the durable date"
+        );
+        assert!(current.metadata.is_hidden);
+        assert!(current.metadata.is_favorite);
+        assert_ne!(current.local_path.as_deref(), Some(media_path.as_path()));
+        assert_eq!(
+            std::fs::read(current.local_path.as_ref().unwrap()).unwrap(),
+            original_bytes
         );
         assert!(
             db.get_pending_metadata_rewrites(10)
@@ -283,15 +370,7 @@ async fn run_capture_history(seed: u64, trace: &[Event]) {
             "SELECT revision FROM asset_metadata_capture_revisions WHERE library=?1 AND asset_id=?2",
             [ZONE, MASTER], |row| row.get(0),
         ).unwrap();
-        assert_eq!(
-            revision,
-            if repaired {
-                state::METADATA_CAPTURE_REVISION
-            } else {
-                0
-            },
-            "asset capture receipt"
-        );
+        assert_eq!(revision, 0, "historical capture receipt preserved");
         let retries: i64 = conn
             .query_row(
                 "SELECT count(*) FROM metadata_capture_retries WHERE library=?1 AND asset_id=?2",
@@ -300,9 +379,8 @@ async fn run_capture_history(seed: u64, trace: &[Event]) {
             )
             .unwrap();
         assert_eq!(
-            retries,
-            i64::from(!repaired),
-            "retry evidence retained until recovery"
+            retries, 0,
+            "historical-only rows must not manufacture retries"
         );
         assert_eq!(
             std::fs::read(&media_path).unwrap(),
@@ -314,65 +392,69 @@ async fn run_capture_history(seed: u64, trace: &[Event]) {
             b"private sidecar bytes",
             "unrelated sidecar bytes"
         );
+        let source: Option<String> = conn.query_row(
+            "SELECT source_checksum FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND local_path=?3",
+            rusqlite::params![ZONE, CHILD, current.local_path.as_ref().unwrap().to_str().unwrap()],
+            |row| row.get(0),
+        ).unwrap();
         assert_eq!(
-            std::fs::read_dir(&media).unwrap().count(),
-            2,
-            "no extra media files"
-        );
-        assert_eq!(result.stats.downloaded, 0, "no media downloads");
-        assert_eq!(
-            result.stats.metadata_capture_refreshed,
-            usize::from(matches!(event, Event::Recover)),
-            "one successful capture refresh"
+            source,
+            Some(data_encoding::HEXLOWER.encode(&Sha256::digest(&original_bytes)))
         );
         if matches!(event, Event::FailRefresh) {
-            assert_eq!(
-                result.stats.metadata_capture_failures, 1,
-                "refresh failure reported"
-            );
             assert!(
-                capture
-                    .last_error
-                    .as_deref()
-                    .unwrap()
-                    .contains("injected sequence refresh failure")
+                result.stats.state_write_failures > 0 || result.failed_count > 0,
+                "selected metadata write failure reported"
             );
         }
         if matches!(event, Event::InterruptLookup) {
+            assert!(
+                lookups.load(Ordering::SeqCst) > lookups_before,
+                "interruption must reach the provider lookup boundary"
+            );
             assert!(cancel.is_cancelled());
             assert!(result.stats.interrupted);
-        }
-        if matches!(event, Event::Deferred) {
-            // The provider now has one valid child, but the client has not
-            // observed that change. Backoff must survive restart until due.
-            assert_eq!(
-                result.stats.metadata_capture_deferred, 1,
-                "retry remains deferred"
-            );
-            assert_eq!(
-                lookups.load(Ordering::SeqCst),
-                2,
-                "no lookup during deferral"
-            );
         }
         if repaired {
             assert_eq!(result.failed_count, 0, "recovery failure count");
             assert!(!result.stats.identity_incomplete);
-            assert_eq!(
-                result.stats.metadata_capture_remaining, 0,
-                "finite capture recovery"
-            );
             let requests = lookups.load(Ordering::SeqCst);
             if let Some(previous) = completed_lookups {
                 assert_eq!(requests, previous, "quiet stable tail");
             }
             completed_lookups = Some(requests);
+            let outputs: std::collections::BTreeMap<_, _> = rows
+                .iter()
+                .map(|row| {
+                    let path = row.local_path.as_ref().unwrap();
+                    (path.clone(), std::fs::read(path).unwrap())
+                })
+                .collect();
+            assert_eq!(
+                outputs.len(),
+                rows.len(),
+                "siblings retain independent publication paths"
+            );
+            if let Some(previous) = &completed_outputs {
+                assert_eq!(
+                    &outputs, previous,
+                    "quiet tail preserves all published paths and bytes"
+                );
+            }
+            completed_outputs = Some(outputs);
+            if matches!(event, Event::Steady) {
+                assert_eq!(result.stats.downloaded, 0, "quiet selected download tail");
+                assert_eq!(
+                    result.stats.metadata_capture_refreshed, 0,
+                    "quiet capture tail"
+                );
+            }
         }
     }
 }
 
 async fn run_capture_recovery_sequence(seed: u64) {
-    // The prefix reaches a durable owner with an uncommitted metadata refresh.
+    // The prefix reaches an independently downloaded child, then fails a selected refresh.
     // Every shuffle then regresses provider evidence or interrupts recovery.
     // Recovery is deliberately separate from fault selection, so liveness has
     // a fixed bound and cannot be excused by an unlucky generated schedule.

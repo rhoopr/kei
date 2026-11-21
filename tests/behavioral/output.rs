@@ -13,7 +13,7 @@ fn sync_report_json_offline_binary_boundary_writes_current_schema() {
     let report_path = dir.path().join("sync_report.json");
     let config_path = dir.path().join("config.toml");
     let username = "offline-report@example.com";
-    std::fs::write(
+    common::write_versioned_config(
         &config_path,
         format!(
             "\
@@ -26,7 +26,7 @@ folder_structure = \"%Y/%m/%d\"
 threads = 3
 
 [filters]
-media = [\"photos\", \"videos\"]
+exclude = [\"live-photo-stills\", \"live-photo-videos\"]
 
 [report]
 json = {report_path}
@@ -173,7 +173,7 @@ fn status_shows_counts() {
 }
 
 #[test]
-fn status_shows_safe_backup_summary_after_clean_sync() {
+fn status_reports_recorded_sync_facts_after_clean_sync() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
     let conn = create_state_db(dir.path(), username);
@@ -214,8 +214,19 @@ fn status_shows_safe_backup_summary_after_clean_sync() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(
-            "Backup status: safe - last sync completed and no pending or failed assets are recorded"
+            "Backup record: last sync completed and no pending or failed assets are recorded"
         ),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "Scope: recorded local state only; this does not establish iCloud completeness or verify local media checksums."
+        ),
+        "stdout: {stdout}"
+    );
+    assert!(!stdout.contains("Backup status: safe"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("Backup status: unsafe"),
         "stdout: {stdout}"
     );
 }
@@ -254,12 +265,72 @@ fn status_reports_metadata_capture_retry_without_private_evidence() {
         "{stdout}"
     );
     assert!(stdout.contains("19 failed"), "{stdout}");
-    assert!(stdout.contains("Backup status: unsafe"), "{stdout}");
+    assert!(stdout.contains("Backup record:"), "{stdout}");
+    assert!(
+        stdout.contains("19 metadata capture failures recorded"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "Scope: recorded local state only; this does not establish iCloud completeness or verify local media checksums."
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Backup status: safe"), "{stdout}");
+    assert!(!stdout.contains("Backup status: unsafe"), "{stdout}");
     assert!(!stdout.contains("private-legacy"));
 }
 
 #[test]
-fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
+fn status_distinguishes_archived_sparse_evidence_from_current_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    conn.execute("INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at) VALUES ('PrimarySync','old-only',?1,?1,1,1)", [r#"[1,"private-target","SharedSync-private","private-owner"]"#]).unwrap();
+    conn.pragma_update(None, "user_version", 37).unwrap();
+    let status = || {
+        let out = clean_cmd()
+            .env("ICLOUD_USERNAME", username)
+            .env("KEI_DATA_DIR", dir.path())
+            .arg("status")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(out).unwrap()
+    };
+    // First open migrates the row; the second process must still report it.
+    status();
+    let output = status();
+    assert_eq!(conn.query_row("SELECT count(*) FROM historical_v030_unresolved_sparse_identities WHERE source_record_name='old-only'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    assert!(
+        !output.contains("Sparse identity recovery: 1 unresolved"),
+        "{output}"
+    );
+    let archived = "Archived sparse references: 1 (preserved at upgrade; not active retries)";
+    assert!(output.lines().any(|line| line == archived), "{output}");
+    conn.execute("INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at) VALUES ('PrimarySync','fresh-source','fresh-evidence','fresh-evidence',2,2)", []).unwrap();
+    let both = status();
+    assert!(both.lines().any(|line| line == archived), "{both}");
+    assert!(
+        both.contains("Sparse identity recovery: 1 unresolved"),
+        "{both}"
+    );
+    for private in [
+        "old-only",
+        "private-target",
+        "SharedSync-private",
+        "private-owner",
+        "fresh-source",
+        "fresh-evidence",
+    ] {
+        assert!(!both.contains(private), "{both}");
+    }
+}
+
+#[test]
+fn status_reports_unresolved_identity_as_recorded_work() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
     let conn = create_state_db(dir.path(), username);
@@ -287,7 +358,9 @@ fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
         .clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Backup status: unsafe - unresolved asset identity in 1 provider zone"),
+        stdout.contains(
+            "Backup record: unresolved asset identity in 1 provider zone; checkpoint replay is required"
+        ),
         "{stdout}"
     );
     assert!(stdout.contains("preserved"), "{stdout}");
@@ -299,6 +372,8 @@ fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
         assert!(!stdout.contains(private), "{stdout}");
     }
     assert!(!stdout.contains("SharedSync-private"), "{stdout}");
+    assert!(!stdout.contains("Backup status: safe"), "{stdout}");
+    assert!(!stdout.contains("Backup status: unsafe"), "{stdout}");
     conn.execute(
         "DELETE FROM metadata WHERE key = 'unresolved_asset_identity:PrimarySync'",
         [],
@@ -313,7 +388,12 @@ fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
         .get_output()
         .clone();
     // A missing marker must not hide retained per-source work.
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Backup status: unsafe"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Sparse identity recovery: 1 unresolved, 1 deferred until retry"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Unresolved asset identity in"), "{stdout}");
     conn.execute("DELETE FROM unresolved_sparse_identities", [])
         .unwrap();
     let output = clean_cmd()
@@ -325,12 +405,18 @@ fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Backup status: safe"));
-    assert!(!stdout.contains("Sparse identity recovery:"));
+    assert!(
+        stdout.contains(
+            "Backup record: last sync completed and no pending or failed assets are recorded"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Sparse identity recovery:"), "{stdout}");
+    assert!(!stdout.contains("Archived sparse references:"), "{stdout}");
 }
 
 #[test]
-fn status_treats_policy_excluded_assets_as_safe_and_visible() {
+fn status_treats_policy_excluded_assets_as_recorded_history() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
     let conn = create_state_db(dir.path(), username);
@@ -366,14 +452,19 @@ fn status_treats_policy_excluded_assets_as_safe_and_visible() {
     assert!(stdout.contains("Policy excluded: 1"), "stdout: {stdout}");
     assert!(
         stdout.contains(
-            "Backup status: safe - last sync completed and no pending or failed assets are recorded"
+            "Backup record: last sync completed and no pending or failed assets are recorded"
         ),
+        "stdout: {stdout}"
+    );
+    assert!(!stdout.contains("Backup status: safe"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("Backup status: unsafe"),
         "stdout: {stdout}"
     );
 }
 
 #[test]
-fn status_shows_unsafe_backup_summary_with_last_run_reasons() {
+fn status_reports_last_sync_failures_as_recorded_facts() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
     let conn = create_state_db(dir.path(), username);
@@ -408,8 +499,13 @@ fn status_shows_unsafe_backup_summary_with_last_run_reasons() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(
-            "Backup status: unsafe - 1 asset failed in the last sync; 2 enumeration errors occurred in the last sync; 1 failed asset remains; 1 pending asset remains"
+            "Backup record: 1 asset failed in the last sync; 2 enumeration errors occurred in the last sync; 1 failed asset remains; 1 pending asset remains"
         ),
+        "stdout: {stdout}"
+    );
+    assert!(!stdout.contains("Backup status: safe"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("Backup status: unsafe"),
         "stdout: {stdout}"
     );
 }
@@ -1050,7 +1146,26 @@ fn status_retained_checkpoint_holds_show_actionable_redacted_guidance_after_othe
             !stdout.contains("Provider checkpoint: current"),
             "{action}: {stdout}"
         );
-        assert!(stdout.contains("Backup status: unsafe - retained provider history is unavailable; recovery evidence is required"), "{action}: {stdout}");
+        assert!(
+            stdout.contains(
+                "Backup record: retained provider history is unavailable; recovery evidence is required"
+            ),
+            "{action}: {stdout}"
+        );
+        assert!(
+            stdout.contains(
+                "Scope: recorded local state only; this does not establish iCloud completeness or verify local media checksums."
+            ),
+            "{action}: {stdout}"
+        );
+        assert!(
+            !stdout.contains("Backup status: safe"),
+            "{action}: {stdout}"
+        );
+        assert!(
+            !stdout.contains("Backup status: unsafe"),
+            "{action}: {stdout}"
+        );
         assert!(
             stdout
                 .lines()

@@ -5,6 +5,10 @@ use crate::icloud::photos::album::test_support::{
     changes_asset, changes_master, make_album_with_session,
 };
 use crate::state::SqliteStateDb;
+use crate::test_helpers::{
+    assert_no_retired_inbox_archive, assert_no_temporary_backup_bundles,
+    recovery_bundle_connections, snapshot_database,
+};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -79,20 +83,15 @@ fn seed(db: &SqliteStateDb) {
 
 async fn unchanged(db: &SqliteStateDb, media: &std::path::Path) {
     assert_eq!(std::fs::read(media).unwrap(), b"existing-media");
-    assert_eq!(
-        db.get_metadata("sync_token:PrimarySync")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("saved")
-    );
-    assert_eq!(
-        db.get_metadata("pending_sync_token:old:PrimarySync")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("old-debt")
-    );
+    {
+        let conn = db.acquire_lock("checkpoint evidence").unwrap();
+        crate::test_helpers::assert_checkpoint_evidence(&conn, "sync_token:PrimarySync", "saved");
+        crate::test_helpers::assert_checkpoint_evidence(
+            &conn,
+            "pending_sync_token:old:PrimarySync",
+            "old-debt",
+        );
+    }
     assert_eq!(db.get_summary().await.unwrap().downloaded, 1);
     assert_eq!(
         db.acquire_lock("unknown bytes remain")
@@ -104,7 +103,7 @@ async fn unchanged(db: &SqliteStateDb, media: &std::path::Path) {
 }
 
 #[tokio::test]
-async fn catalog_projection_replays_schema29_sources_losslessly_through_two_quiet_reopens() {
+async fn catalog_projection_fresh_start_rebuilds_current_sources_through_two_quiet_reopens() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("owned.db");
     let media = directory.path().join("kept.jpg");
@@ -118,11 +117,30 @@ async fn catalog_projection_replays_schema29_sources_losslessly_through_two_quie
         [0, 0, 0, 0],
         "capture alone is the pre-projection control"
     );
-    db.acquire_lock("synthetic schema29 pending source").unwrap().execute_batch("DROP TABLE provider_catalog_pages; DROP TABLE provider_catalog_debt; DROP TABLE provider_catalog_references; DROP TABLE provider_catalog_records; PRAGMA user_version=29;").unwrap();
+    db.acquire_lock("synthetic schema29 pending source").unwrap().execute_batch("DROP TABLE provider_selection_sources; DROP TABLE provider_work_obligations; DROP TABLE provider_work_retries; DROP TABLE provider_work_receipts; DROP TABLE provider_catalog_pages; DROP TABLE provider_catalog_debt; DROP TABLE provider_catalog_references; DROP TABLE provider_catalog_records; PRAGMA user_version=29;").unwrap();
     drop(db);
+    // A successful upgrade removes its own temporary bundle; capture the exact
+    // schema-29 source before the first production reopen.
+    let pre_upgrade = snapshot_database(&path);
     let mut frozen = None;
-    for _ in 0..2 {
+    for cycle in 0..2 {
         let db = open(&path).await;
+        assert_no_temporary_backup_bundles(directory.path());
+        if cycle == 0 {
+            assert_eq!(counts(&db), [0, 0, 0, 0]);
+            assert_no_retired_inbox_archive(&db.acquire_lock("live inbox archive").unwrap());
+            assert_eq!(
+                pre_upgrade
+                    .query_row::<Vec<u8>, _, _>(
+                        "SELECT body FROM provider_shadow_pages",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                original
+            );
+            retain(&db, original.clone(), "private").await;
+        }
         capture(&db)
             .replay_catalog(&CancellationToken::new())
             .await
@@ -434,7 +452,7 @@ async fn catalog_projection_migration_conflict_preserves_schema29_source_and_unk
     let original = body("PrimarySync", "v1");
     retain(&db, original.clone(), "private").await;
     db.acquire_lock("synthetic catalog migration conflict").unwrap().execute_batch(
-        "DROP TABLE provider_catalog_pages; DROP TABLE provider_catalog_debt; DROP TABLE provider_catalog_references; DROP TABLE provider_catalog_records; CREATE TABLE provider_catalog_pages(page_id INTEGER,projector_version INTEGER,body_hash TEXT,record_count INTEGER,reference_count INTEGER,debt_count INTEGER,charged_bytes INTEGER,future_blob BLOB); INSERT INTO provider_catalog_pages(future_blob) VALUES(X'0011FF'); PRAGMA user_version=29;"
+        "DROP TABLE provider_selection_sources; DROP TABLE provider_work_obligations; DROP TABLE provider_work_retries; DROP TABLE provider_work_receipts; DROP TABLE provider_catalog_pages; DROP TABLE provider_catalog_debt; DROP TABLE provider_catalog_references; DROP TABLE provider_catalog_records; CREATE TABLE provider_catalog_pages(page_id INTEGER,projector_version INTEGER,body_hash TEXT,record_count INTEGER,reference_count INTEGER,debt_count INTEGER,charged_bytes INTEGER,future_blob BLOB); INSERT INTO provider_catalog_pages(future_blob) VALUES(X'0011FF'); PRAGMA user_version=29;"
     ).unwrap();
     drop(db);
     for _ in 0..2 {
@@ -502,13 +520,39 @@ async fn catalog_projection_migration_conflict_preserves_schema29_source_and_unk
         .unwrap()
         .execute_batch("DROP TABLE provider_catalog_pages")
         .unwrap();
+    let prior = recovery_bundle_connections(directory.path());
+    assert_eq!(
+        prior.len(),
+        2,
+        "both failed migrations must retain their complete bundle"
+    );
     for _ in 0..2 {
         let db = open(&path).await;
         capture(&db)
             .replay_catalog(&CancellationToken::new())
             .await
             .unwrap();
-        assert_eq!(counts(&db), [7, 4, 7, 1]);
+        assert_eq!(counts(&db), [0, 0, 0, 0]);
+        assert_no_retired_inbox_archive(&db.acquire_lock("live inbox archive").unwrap());
+        let retained = recovery_bundle_connections(directory.path());
+        assert_eq!(
+            retained.len(),
+            prior.len(),
+            "a successful upgrade removes only its own temporary bundle"
+        );
+        for snapshot in &retained {
+            assert_eq!(
+                snapshot
+                    .query_row::<Vec<u8>, _, _>(
+                        "SELECT body FROM provider_shadow_pages",
+                        [],
+                        |row| { row.get(0) }
+                    )
+                    .unwrap(),
+                original,
+                "prior failed-migration bundles must retain the pre-upgrade source"
+            );
+        }
         unchanged(&db, &media).await;
     }
 }
@@ -1126,14 +1170,16 @@ async fn full_budget_accepts_equivalent_repeat_and_refuses_distinct_change() {
     let error = capture.capture(changed).await.expect_err("full inbox");
     assert!(format!("{error:#}").contains("inbox is full"));
     assert_eq!(transport_counts(&db), (1, 1, 1));
-    let receipt: i64 = db
-        .acquire_lock("refused change keeps receipt")
+    let retained_pages: i64 = db
+        .acquire_lock("refused change keeps original page")
         .unwrap()
-        .query_row("SELECT page_id FROM provider_shadow_receipts", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT count(*) FROM provider_shadow_pages WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
-    assert_eq!(receipt, 1);
+    assert_eq!(retained_pages, 1);
 }
 
 #[tokio::test]

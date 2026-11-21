@@ -2,12 +2,11 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::commands::PassKind;
 use crate::download::DownloadOutcome;
 use crate::types::{FileMatchPolicy, LivePhotoMovFilenamePolicy, RawPolicy};
 
+use super::cycle_passes;
 use super::support::Harness;
-use super::{cycle_passes, pass};
 
 #[tokio::test]
 async fn bundled_filename_and_folder_policies() {
@@ -47,11 +46,7 @@ async fn bundled_filename_and_folder_policies() {
             "2023/Photo.JPG"
         };
         for round in 0..2 {
-            let mut pass = pass(records.clone());
-            if album {
-                pass.kind = PassKind::Album;
-                pass.album.name = Arc::from("Controlled");
-            }
+            let pass = h.pass(if album { "Controlled" } else { "" }, records.clone());
             let result = cycle_passes(&h.config, &[pass]).await;
             assert!(
                 matches!(result.outcome, DownloadOutcome::Success),
@@ -82,17 +77,10 @@ async fn bundled_raw_and_companion_naming() {
             .await;
         records[0]["fields"]["resOriginalAltRes"] = h.resource("raw", "media/pattern.dng", 1).await;
         records[0]["fields"]["resOriginalAltFileType"] = json!({"value": "com.adobe.raw-image"});
-        let expected = if policy == RawPolicy::PreferRaw {
-            vec![
-                ("Pair.DNG", "media/pattern.dng"),
-                ("Pair_alt.JPG", "media/pattern.jpg"),
-            ]
-        } else {
-            vec![
-                ("Pair.JPG", "media/pattern.jpg"),
-                ("Pair_RAW.DNG", "media/pattern.dng"),
-            ]
-        };
+        let expected = vec![
+            ("Pair.JPG", "media/pattern.jpg"),
+            ("Pair_RAW.DNG", "media/pattern.dng"),
+        ];
         h.stable(records, &expected).await;
     }
     for policy in [

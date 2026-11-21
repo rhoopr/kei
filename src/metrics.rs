@@ -54,7 +54,7 @@ pub(crate) static MARK_DOWNLOADED_ZERO_ROWS: LazyLock<Counter> = LazyLock::new(C
 /// the buggy call site is found. Mirrors `MARK_DOWNLOADED_ZERO_ROWS`.
 pub(crate) static MARK_FAILED_ZERO_ROWS: LazyLock<Counter> = LazyLock::new(Counter::default);
 
-const UNHEALTHY_CONSECUTIVE_FAILURES: u32 = 5;
+const UNHEALTHY_CONSECUTIVE_FAILURES: u32 = 1;
 const STARTING_HEALTH_BODY: &str = r#"{"status":"no sync cycle completed yet"}"#;
 
 // ── Label types ──────────────────────────────────────────────────────────────
@@ -1280,13 +1280,15 @@ mod tests {
         // because we have no anchor timestamp yet; failures alone drive 503.
         let handle = MetricsHandle::new(None);
         let mut h = HealthStatus::new();
-        h.record_failure("first ever");
         handle.update(&SyncStats::default(), &h).await;
         set_threshold(&handle, Some(chrono::Duration::seconds(1))).await;
 
         let (status, _body) = render_healthz(&handle).await;
-        // 1 consecutive failure is below 5, and last_success is None, so 200
         assert_eq!(status, axum::http::StatusCode::OK);
+        h.record_failure("first ever");
+        handle.update(&SyncStats::default(), &h).await;
+        let (status, _body) = render_healthz(&handle).await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     // ── DB-backed gauges ──────────────────────────────────────────────────────

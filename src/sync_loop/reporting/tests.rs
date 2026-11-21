@@ -14,10 +14,11 @@ fn refresh_tail_outcome_feeds_ledger_and_cycle_reporting() {
         db_sync_token_advance_safe: true,
     };
 
-    merge_refresh_tail_outcome(&mut cycle_result, 2, false);
+    merge_refresh_tail_outcome(&mut cycle_result, 2, true, false);
 
     assert_eq!(cycle_result.failed_count, 3);
     assert_eq!(cycle_result.stats.failed, 3);
+    assert!(cycle_result.stats.storage_failed);
     let ledger = sync_run_stats_from_cycle(&cycle_result);
     assert_eq!(ledger.assets_failed, 3);
     let facts = crate::cycle_reporter::CycleFacts::new(
