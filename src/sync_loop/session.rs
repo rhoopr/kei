@@ -37,10 +37,16 @@ fn classify_sync_auth_error(err: &anyhow::Error) -> SyncAuthErrorClass {
     }
 }
 
-fn two_factor_recovery_message(username: &str) -> String {
-    format!(
-        "2FA required for {username}. Run `kei login get-code`, then `kei login submit-code <CODE>`."
-    )
+fn notify_two_factor_required(config: &config::Config, notifier: &Notifier) {
+    let instructions = crate::cli::two_factor_instructions(config.runtime.config_path.as_deref());
+    tracing::warn!(message = %instructions, "2FA required");
+    notifier.notify(
+        notifications::Event::TwoFaRequired,
+        "Two-factor authentication required. Follow the instructions on the sync host.",
+        &config.auth.username,
+        None,
+        None,
+    );
 }
 
 /// Classify whether an error from `init_photos_service` or
@@ -307,15 +313,7 @@ async fn notify_and_wait_for_2fa(
     input_mode: crate::InputMode,
     expected_generation: Option<auth::session::SessionGeneration>,
 ) -> anyhow::Result<auth::AuthResult> {
-    let msg = two_factor_recovery_message(&config.auth.username);
-    tracing::warn!(message = %msg, "2FA required");
-    notifier.notify(
-        notifications::Event::TwoFaRequired,
-        &msg,
-        &config.auth.username,
-        None,
-        None,
-    );
+    notify_two_factor_required(config, notifier);
     wait_and_retry_2fa(
         &config.auth.cookie_directory,
         &config.auth.username,
@@ -413,15 +411,7 @@ pub(super) async fn authenticate_initial_session(
             if !super::should_wait_for_2fa(is_watch_mode, &e) {
                 return Err(e);
             }
-            let msg = two_factor_recovery_message(&config.auth.username);
-            tracing::warn!(message = %msg, "2FA required");
-            notifier.notify(
-                notifications::Event::TwoFaRequired,
-                &msg,
-                &config.auth.username,
-                None,
-                None,
-            );
+            notify_two_factor_required(config, notifier);
             wait_and_retry_2fa(
                 &config.auth.cookie_directory,
                 &config.auth.username,
@@ -534,7 +524,8 @@ pub(super) async fn recover_expired_cycle(
     *reauth_attempts += 1;
     if *reauth_attempts >= MAX_REAUTH_ATTEMPTS {
         anyhow::bail!(
-            "Your iCloud session expired and kei could not refresh it after {MAX_REAUTH_ATTEMPTS} attempts. Run `kei login` and try again."
+            "Your iCloud session expired and kei could not refresh it after {MAX_REAUTH_ATTEMPTS} attempts. Run `{}` and try again.",
+            crate::cli::command_for_config("login", config.runtime.config_path.as_deref())
         );
     }
     tracing::warn!(
@@ -563,15 +554,7 @@ pub(super) async fn recover_expired_cycle(
             // can't exhaust the limit.
             *reauth_attempts -= 1;
 
-            let msg = two_factor_recovery_message(&config.auth.username);
-            tracing::warn!(message = %msg, "2FA required");
-            notifier.notify(
-                notifications::Event::TwoFaRequired,
-                &msg,
-                &config.auth.username,
-                None,
-                None,
-            );
+            notify_two_factor_required(config, notifier);
             if !super::should_wait_for_2fa(is_watch_mode, &e) {
                 return Err(e);
             }

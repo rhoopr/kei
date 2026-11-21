@@ -7,6 +7,7 @@ async fn sync_startup_refuses_unproven_identity_before_creating_state() {
     let directory = root.path().join("not-created");
     let config = crate::config::ConfigSource::Absent {
         path: root.path().join("config.toml"),
+        explicitly_selected: false,
     };
     for identity in [
         AccountOwner::configured("synthetic@example.invalid", "com"),
@@ -33,6 +34,7 @@ async fn sync_startup_reopens_owned_state_and_preserves_unowned_legacy_evidence(
     let root = tempfile::tempdir().unwrap();
     let config = crate::config::ConfigSource::Absent {
         path: root.path().join("config.toml"),
+        explicitly_selected: false,
     };
     let identity = owner("synthetic@example.invalid", "com", "provider");
     let legacy = root.path().join(format!(

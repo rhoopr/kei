@@ -13,6 +13,7 @@ pub(crate) enum ConfigSource {
     },
     Absent {
         path: PathBuf,
+        explicitly_selected: bool,
     },
 }
 
@@ -23,6 +24,19 @@ impl std::fmt::Debug for ConfigSource {
             Self::File { .. } => "ConfigSource::File(<private>)",
             Self::Absent { .. } => "ConfigSource::Absent(<private>)",
         })
+    }
+}
+
+impl ConfigSource {
+    pub(crate) fn recovery_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::File { path, .. }
+            | Self::Absent {
+                path,
+                explicitly_selected: true,
+            } => Some(path),
+            Self::Absent { .. } | Self::Unavailable => None,
+        }
     }
 }
 
@@ -41,7 +55,8 @@ mod tests {
             format!(
                 "{:?}",
                 ConfigSource::Absent {
-                    path: "private-account/config.toml".into()
+                    path: "private-account/config.toml".into(),
+                    explicitly_selected: false,
                 }
             ),
             "ConfigSource::Absent(<private>)"

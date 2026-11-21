@@ -331,6 +331,7 @@ struct PartialSyncError(usize);
 enum ExitClassification {
     Partial,
     Auth,
+    TwoFactor,
     TerminalAuth,
     Other,
 }
@@ -339,7 +340,7 @@ impl ExitClassification {
     const fn exit_code(self) -> u8 {
         match self {
             Self::Partial => EXIT_PARTIAL,
-            Self::Auth => EXIT_AUTH,
+            Self::Auth | Self::TwoFactor => EXIT_AUTH,
             Self::TerminalAuth => EXIT_TERMINAL_AUTH,
             Self::Other => 1,
         }
@@ -358,7 +359,7 @@ fn classify_exit_error(e: &anyhow::Error) -> ExitClassification {
     if e.downcast_ref::<auth::error::AuthError>()
         .is_some_and(auth::error::AuthError::is_two_factor_required)
     {
-        ExitClassification::Auth
+        ExitClassification::TwoFactor
     } else if e
         .downcast_ref::<auth::error::AuthError>()
         .is_some_and(auth::error::AuthError::is_terminal_apple_auth)
@@ -685,7 +686,8 @@ pub fn main_inner() -> ExitCode {
         .build()
         .expect("Failed to create tokio runtime");
 
-    match rt.block_on(run(env_password, input_mode)) {
+    let mut recovery_config = None;
+    match rt.block_on(run(env_password, input_mode, &mut recovery_config)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             if let Some(parse_exit) = classify_cli_parse_exit(&e) {
@@ -712,9 +714,18 @@ pub fn main_inner() -> ExitCode {
                 )]
                 {
                     eprintln!("Error: {e:#}");
+                    if classification == ExitClassification::TwoFactor {
+                        eprintln!(
+                            "{}",
+                            cli::two_factor_instructions(recovery_config.as_deref())
+                        );
+                    }
                     if classification.should_suggest_diagnostics() {
                         eprintln!();
-                        eprintln!("Run `kei doctor --json` for a redacted diagnostic report.");
+                        eprintln!(
+                            "Run `{}` for a redacted diagnostic report.",
+                            cli::command_for_config("doctor --json", recovery_config.as_deref())
+                        );
                         eprintln!("Report bugs: https://github.com/rhoopr/kei/issues");
                     }
                 }
@@ -724,7 +735,11 @@ pub fn main_inner() -> ExitCode {
     }
 }
 
-async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Result<()> {
+async fn run(
+    env_password: Option<String>,
+    input_mode: InputMode,
+    recovery_config: &mut Option<PathBuf>,
+) -> anyhow::Result<()> {
     let cli = cli::parse_cli_with_sources(std::env::args_os()).map_err(|e| anyhow::anyhow!(e))?;
     // Export has its own input path: no runtime config construction, logging,
     // credentials, service hooks, or network-capable command dispatch.
@@ -737,7 +752,18 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
         return inventory_diagnostic::run(&config::bootstrap_config(cli.config.as_deref())?.0)
             .await;
     }
+    // Diagnostics can be shared with support. Don't echo a private config path
+    // in their stderr fallback after the command has redacted its report.
+    if !matches!(cli.command, cli::Command::Doctor(_)) {
+        *recovery_config = cli.config.as_deref().map(config::expand_tilde);
+    }
     let config = load_startup_config(&cli)?;
+    if let Command::Config {
+        action: cli::ConfigAction::Setup { output: Some(path) },
+    } = &cli.command
+    {
+        *recovery_config = Some(config::expand_tilde(path));
+    }
     let output = resolve_startup_output(&cli, config.toml.as_ref());
 
     // Keep the guard until dispatch returns so fast commands drain their logs.
@@ -835,7 +861,7 @@ fn load_startup_config(cli: &cli::Cli) -> anyhow::Result<StartupConfig> {
         !config_path.exists() && config_path.parent().is_some_and(std::path::Path::is_dir);
     let config_required = config_explicitly_set && !can_auto_create;
     let is_doctor_command = matches!(cli.command, cli::Command::Doctor(_));
-    let (toml_config, source, toml_config_error) =
+    let (toml_config, mut source, toml_config_error) =
         match config::load_toml_config_with_source(&config_path, config_required) {
             Ok((config, source)) => (config, source, None),
             Err(e) if is_doctor_command => {
@@ -843,6 +869,14 @@ fn load_startup_config(cli: &cli::Cli) -> anyhow::Result<StartupConfig> {
             }
             Err(e) => return Err(e),
         };
+
+    if let config::ConfigSource::Absent {
+        explicitly_selected,
+        ..
+    } = &mut source
+    {
+        *explicitly_selected = config_explicitly_set;
+    }
 
     Ok(StartupConfig {
         source,
@@ -1232,6 +1266,7 @@ mod tests {
         let err = load_startup_config(&cli).err().unwrap().to_string();
         assert!(err.contains("Failed to parse config file"));
         cli.command = Command::Doctor(cli::DoctorArgs {
+            has_env_password: false,
             missing_reference_inventory: false,
             json: true,
             live: false,
@@ -1849,7 +1884,7 @@ mod tests {
     fn classify_exit_error_two_factor_required_uses_auth_failure() {
         let e: anyhow::Error = auth::error::AuthError::TwoFactorRequired.into();
         let c = classify_exit_error(&e);
-        assert_eq!(c, ExitClassification::Auth);
+        assert_eq!(c, ExitClassification::TwoFactor);
         assert_eq!(c.exit_code(), EXIT_AUTH);
         assert!(c.should_log());
     }
@@ -1937,7 +1972,7 @@ mod tests {
             .context("during startup");
         assert_eq!(
             classify_exit_error(&e),
-            ExitClassification::Auth,
+            ExitClassification::TwoFactor,
             "context-wrapped 2FA-required must keep the documented auth exit code"
         );
 
@@ -1968,7 +2003,7 @@ mod tests {
         assert_eq!(
             sorted.len(),
             codes.len(),
-            "every exit classification must map to a distinct code; got {codes:?}"
+            "documented partial, auth, terminal-auth and generic exit codes must be distinct; got {codes:?}"
         );
     }
 }

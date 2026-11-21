@@ -65,7 +65,7 @@ For a new installation on your computer, run:
 kei config setup
 ```
 
-Choose an empty destination such as `~/Photos/kei-first-backup`, your main library, and **Manually when needed**. Save a small fixed capture-date range containing photos you recognize. Check the selected albums, file types and destination folders before saving. At **Want to kick off your first sync right now?**, answer **no** so you can check the range before starting. The default answer, **yes**, immediately runs one sync using your saved choices.
+Choose an empty destination such as `~/Photos/kei-first-backup`, your main library, and **Manually when needed**. Save a small fixed capture-date range containing photos you recognize. Check the selected albums, file types and destination folders before saving. Answer **no** to the final sync prompt to review the config before starting. On this branch, **no** is the default. In v0.26.0 the default is **yes**. Leaving before the write discards the wizard answers.
 
 If you choose watch mode instead, the setup wizard still runs only once. Later `kei sync` commands can use the repeat interval you saved.
 
@@ -84,7 +84,7 @@ The range limits capture dates, not file count. Album copies, Live Photo videos 
 
 1. Read the sync summary and warnings. Failed or unfinished work still needs attention, even if some files downloaded successfully.
 2. Open the destination in your file manager. Look for the recent photos you expected in the album and date folders, and open a photo and video if you selected both. Live Photos normally include a still image and a MOV video.
-3. Run `kei status` to check progress. A clean result does not mean you selected every item or version in iCloud. You can also run `kei verify --checksums` to check saved files against their recorded checksums. That check cannot tell you whether the backup includes everything in iCloud or repair damaged files.
+3. Run `kei status` to check recorded progress. It does not inspect the files or determine whether your selection covers all of iCloud. Run `kei verify --checksums` to compare saved files with their recorded local checksums. A present file without a baseline has not been checksum-verified. A difference may be an intentional edit.
 
 Photos are saved in the folder set by `[download].directory`. On a fresh install, kei uses `$XDG_CONFIG_HOME/kei` if `XDG_CONFIG_HOME` is an absolute path. Otherwise it uses `~/.config/kei`. If only the legacy `~/.config/kei` directory exists, kei keeps using it. If both directories exist and point to different locations, automatic discovery stops and lists both. Inspect them before moving anything.
 
@@ -141,7 +141,7 @@ For a bug or confusing result, open an [issue](https://github.com/rhoopr/kei/iss
 
 Some repair commands change kei's saved state or replace files. Read [Backup maintenance](docs/backup-maintenance.md) first. Don't delete state or conflicting files just to clear a warning. When preserving older files, kei normally refuses files with hardlinks, where several paths refer to the same file. The [hardlink waiver](docs/backup-maintenance.md#legacy-preservation-and-hardlinks) allows this case, but a change through one path can affect the others. It does not prevent kei from writing to files.
 
-Historical legacy coverage certificates are no longer required for current sync or process health. Their stored counters remain visible, and unresolved historical attribution can still mean `Backup status: unsafe` without failing an otherwise successful current sync. The old `reconcile trust-legacy-files plan/apply` commands refuse without changing state or media; use `kei sync` instead. Ownership, protected files and current retry work remain guarded. See [historical legacy evidence](docs/backup-maintenance.md#historical-legacy-evidence) for the distinction and remaining limits.
+Historical legacy coverage certificates are no longer required for current sync or process health. Status lists unresolved historical attribution separately from the current sync outcome. The old `reconcile trust-legacy-files plan/apply` commands refuse without changing state or media; use `kei sync` instead. Ownership, protected files and current retry work remain guarded. See [historical legacy evidence](docs/backup-maintenance.md#historical-legacy-evidence) for the distinction and remaining limits.
 
 ## What kei gives you
 

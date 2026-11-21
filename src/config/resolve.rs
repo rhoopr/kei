@@ -423,7 +423,12 @@ impl Config {
         let toml_auth = toml.and_then(|t| t.auth.as_ref());
         anyhow::ensure!(
             !sync.repair_truncated,
-            "--repair-truncated cannot distinguish damage from local edits. Use `kei reconcile --inspect-path PATH` and confirm that destination's fingerprint with --confirm-damage, then run `kei sync`."
+            "--repair-truncated cannot distinguish damage from local edits. Use `{}` and confirm that destination's fingerprint with --confirm-damage, then run `{}`.",
+            crate::cli::command_for_config(
+                "reconcile --inspect-path PATH",
+                globals.config_source.recovery_path()
+            ),
+            crate::cli::command_for_config("sync", globals.config_source.recovery_path())
         );
 
         // `[auth].password` is no longer accepted. Plaintext passwords in config
@@ -433,8 +438,12 @@ impl Config {
             anyhow::bail!(
                 "The config file sets `[auth].password`, which kei no longer accepts. \
                  Plaintext passwords in config files are a security risk. \
-                 Use one of: `kei password set` (OS keyring or encrypted file), \
-                 `[auth] password_file`, or `[auth] password_command` instead."
+                 Use one of: `{}` (OS keyring or encrypted file), \
+                 `[auth] password_file`, or `[auth] password_command` instead.",
+                crate::cli::command_for_config(
+                    "password set",
+                    globals.config_source.recovery_path()
+                )
             );
         }
 
@@ -836,6 +845,7 @@ impl Config {
                 strict: toml_import.and_then(|i| i.strict).unwrap_or(false),
             },
             runtime: RuntimeConfig {
+                config_path: globals.config_source.recovery_path().map(PathBuf::from),
                 dry_run: sync.dry_run,
                 only_print_filenames: sync.only_print_filenames,
                 refresh_metadata: sync.refresh_metadata,

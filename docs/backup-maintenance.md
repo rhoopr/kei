@@ -168,7 +168,7 @@ Status, sync reports and health JSON retain their existing field names:
 - `unattributed_legacy_assets` counts preserved legacy records with unknown attribution, not paths or renditions.
 - `unattributed_legacy_pending` counts those records without a stored coverage certificate at their recorded generation. The historical name is retained for compatibility; this is not pending sync work. The count does not revalidate configuration, file contents or certificate dependencies.
 
-Unresolved historical attribution still makes `kei status` say `Backup status: unsafe`. That means historical completeness is unproven; it does not by itself fail a current sync, increment health failures or prevent a successful health update. Current transfer, metadata, identity, enumeration and state-write failures keep their existing retry and checkpoint effects. A healthy process is not proof of a complete backup.
+`kei status` reports unresolved historical attribution. That means historical completeness is unproven; it does not by itself fail a current sync, increment health failures or prevent a successful health update. Current transfer, metadata, identity, enumeration and state-write failures keep their existing retry and checkpoint effects. A healthy process is not proof of a complete backup.
 
 The old [`reconcile trust-legacy-files plan/apply` commands](trusted-legacy-files.md) now refuse early and direct you to `kei sync`. They create no plan or trust declaration. Existing declarations remain stored history, not provider verification or new ownership permission.
 

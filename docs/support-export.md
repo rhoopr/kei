@@ -6,10 +6,47 @@ Run this with the same configuration and data directory as your sync process:
 kei support-export --output kei-support.json
 ```
 
-For Docker, use the existing container and mounted configuration:
+## First-backup Compose service
+
+Use the same Compose directory, project, image, mounts, and environment as your [first backup](docker-first-backup.md). Stop between sync cycles if possible and leave the stopped container in place:
 
 ```sh
-docker exec kei kei --config /config/config.toml support-export --output /config/kei-support.json
+docker compose stop kei
+```
+
+Check `docker compose ps -a kei` and the last lines of `docker compose logs kei`. If the process was killed during a cycle, mention the interruption in your report. Do not start another sync to improve the evidence.
+
+Use the same locally installed image as the stopped container. If you use a moving tag such as `latest`, compare `docker inspect --format '{{.Image}}' "$(docker compose ps -aq kei)"` with `docker image inspect --format '{{.Id}}' ghcr.io/rhoopr/kei:latest` (substitute your configured image). If they differ, pin the service image for the export to the stopped container's exact image before continuing.
+
+Choose a new output filename under the writable config mount. Replace `UID:GID` with the service's numeric PUID and PGID, or `0:0` for the default root setup. Run the binary directly to bypass ownership initialization:
+
+```sh
+docker compose run --rm --no-deps --pull never --user UID:GID --entrypoint /usr/local/bin/kei kei --config /config/config.toml support-export --output /config/kei-support.json
+```
+
+Review `./config/kei-support.json` locally before sharing it. Note the UTC time and restart the original container even if collection failed:
+
+```sh
+docker compose start kei
+docker compose logs --since 10m kei
+```
+
+After the next cycle, check the recorded backup result with the same `UID:GID` as the export:
+
+```sh
+docker compose exec --user UID:GID kei kei --config /config/config.toml status
+```
+
+Look for `Last sync completed` later than the restart. Check the last sync for errors or interruption and the `Pending` and `Failed` asset counts for unfinished work. If a cycle is still running, check again after it finishes. If the logs say kei skipped a cycle because no selected library changed, the last completion time can stay unchanged.
+
+Use `last_success_at` and `consecutive_failures` in `./config/health.json` (or your configured data directory) to monitor process health. On development builds a partial backup can still advance `last_success_at` and leave `consecutive_failures` at zero. For the daily service, check both health and the recorded backup result each day unless you have tested alerts for stale cycles and incomplete backups.
+
+## Other Docker installations
+
+For a named running container, use the numeric user that owns its state:
+
+```sh
+docker exec --user UID:GID kei kei --config /config/config.toml support-export --output /config/kei-support.json
 ```
 
 Fresh container launches also skip ownership initialization for this command,

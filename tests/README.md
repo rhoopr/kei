@@ -22,6 +22,8 @@ explains what runs where. Follow the
 behavior changes, and failure investigation. This guide owns the
 [state-transition proof](#state-transition-proof) and suite-specific setup.
 
+On Unix, `cargo test --test cli setup_enter_default` drives the real wizard through a Python 3 pseudo-terminal with a temporary home and a deferred password file. It checks cancellation before saving and the default first-sync choice without contacting Apple or using a keyring.
+
 ## Layout
 
 ```
@@ -719,7 +721,7 @@ Request-clear transaction failure, cancellation, changed configuration and chang
 
 Legacy coverage certificates are retained history, not current completion or checkpoint authority. When adapting fixtures, keep their original discovery, ownership, path, media, metadata and failure stimuli. Replace certification-only assertions; do not remove a current observation just because the retired route used to discover it. A current write failure must remain reachable through a production owner rather than an inactive proof writer.
 
-Require current-item progress with preserved historical rows, protected originals, missing certificates and changed historical evidence. Historical counters alone must not fail a cycle, prevent a health success or cause repeated inventories. `unattributed_legacy_pending` now inventories missing stored certificates at the recorded generation without dependency revalidation. Preserve the separate `Backup status: unsafe` historical-completeness warning and all current retry, unresolved-identity, metadata and checkpoint failure oracles.
+Require current-item progress with preserved historical rows, protected originals, missing certificates and changed historical evidence. Historical counters alone must not fail a cycle, prevent a health success or cause repeated inventories. `unattributed_legacy_pending` now inventories missing stored certificates at the recorded generation without dependency revalidation. Preserve status reporting of unresolved historical attribution and all current retry, unresolved-identity, metadata and checkpoint failure oracles.
 
 Retired `reconcile trust-legacy-files plan/apply` cases must prove early actionable refusal with existing declarations, configuration, state and media unchanged. Historical declarations are setup evidence, not a successful new trust operation or verified source provenance. Preserve real current discovery, healthy-peer progress and current-failure recovery in former trust fixtures. Use reopened state and quiet follow-up cycles where applicable; record actual test entry points and results only after the adapted production paths have run.
 

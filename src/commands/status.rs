@@ -224,13 +224,15 @@ pub(crate) async fn run_status(
     Ok(())
 }
 
+const BACKUP_RECORD_SCOPE: &str = "Scope: recorded local state only; this does not establish iCloud completeness or verify local media checksums.";
+
 pub(crate) fn backup_status_line(summary: &state::types::SyncSummary) -> String {
     if summary.active_sync_started.is_some() {
-        return "Backup status: unsafe - sync is currently in progress".to_string();
+        return backup_record("sync is currently in progress");
     }
 
     if summary.last_sync_started.is_none() {
-        return "Backup status: unsafe - no sync has completed yet".to_string();
+        return backup_record("no sync has completed yet");
     }
 
     let mut reasons = Vec::new();
@@ -350,11 +352,14 @@ pub(crate) fn backup_status_line(summary: &state::types::SyncSummary) -> String 
     }
 
     if reasons.is_empty() {
-        "Backup status: safe - last sync completed and no pending or failed assets are recorded"
-            .to_string()
+        backup_record("last sync completed and no pending or failed assets are recorded")
     } else {
-        format!("Backup status: unsafe - {}", reasons.join("; "))
+        backup_record(&reasons.join("; "))
     }
+}
+
+fn backup_record(headline: &str) -> String {
+    format!("Backup record: {headline}\n  {BACKUP_RECORD_SCOPE}")
 }
 
 fn count_phrase(count: u64, singular: &str) -> String {

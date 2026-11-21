@@ -289,7 +289,7 @@ fn verify_after_sync_reports_results() {
             .stdout(
                 predicate::str::contains("Verifying")
                     .and(predicate::str::contains("Results:"))
-                    .and(predicate::str::contains("Verified:")),
+                    .and(predicate::str::contains("Present, not checksum-verified:")),
             );
     });
 }
@@ -318,7 +318,7 @@ fn verify_checksums_after_sync() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
             .assert()
             .success()
-            .stdout(predicate::str::contains("Verified:"));
+            .stdout(predicate::str::contains("Checksum verified:"));
     });
 }
 
@@ -392,7 +392,7 @@ fn verify_checksums_detects_corruption() {
             .failure()
             .stdout(
                 predicate::str::contains("DIFFERENT")
-                    .and(predicate::str::contains("Different or unreadable:")),
+                    .and(predicate::str::contains("Different checksum:")),
             );
     });
 }

@@ -1135,15 +1135,15 @@ fn verify_checksums_passes_after_import() {
             .get_output()
             .clone();
         let stdout = String::from_utf8_lossy(&verify_out.stdout);
-        // verify prints "Verified:  N" on success. If it printed
-        // "Mismatched: K" with K>0, that indicates DB local_checksum
-        // diverges from re-hashing on disk.
+        // verify prints a checksum-verified count on success. A positive
+        // different-checksum count indicates DB local_checksum diverges
+        // from re-hashing on disk.
         assert!(
-            stdout.contains("Verified:"),
-            "verify did not print Verified line:\n{stdout}",
+            stdout.contains("Checksum verified:"),
+            "verify did not print a checksum-verified line:\n{stdout}",
         );
         assert!(
-            !stdout.contains("Mismatched:") || stdout.contains("Mismatched:  0"),
+            stdout.contains("Different checksum:             0"),
             "verify reported checksum mismatches after import:\n{stdout}",
         );
     });

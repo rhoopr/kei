@@ -169,7 +169,7 @@ fn write_bundle(
             serde_json::json!({"kind": "file", "path_display": path.display().to_string(),
                 "path_native_hex": native_path(path), "sha256": digest(&bundle.join("config.toml"))?})
         }
-        ConfigSource::Absent { path } => serde_json::json!({"kind": "absent",
+        ConfigSource::Absent { path, .. } => serde_json::json!({"kind": "absent",
             "path_display": path.display().to_string(), "path_native_hex": native_path(path)}),
         ConfigSource::Unavailable => {
             return Err(std::io::Error::other("startup config context unavailable"));

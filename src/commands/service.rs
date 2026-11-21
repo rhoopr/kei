@@ -284,8 +284,7 @@ async fn read_required_session_signal(session_path: &Path) -> anyhow::Result<Aut
         };
         anyhow::anyhow!(
             "Cannot wait for 2FA submission because session metadata file is {reason}: {path}. \
-             Run `kei login get-code`, then `kei login submit-code <CODE>`, and restart the \
-             service or rerun kei. Error: {e}",
+             Complete the 2FA steps printed above and restart the service or rerun kei. Error: {e}",
             path = session_path.display()
         )
     })?;
@@ -375,8 +374,7 @@ async fn wait_for_2fa_submit_until(
             );
             anyhow::bail!(
                 "Timed out after {timeout_secs}s waiting for 2FA submission via persisted auth \
-                 state under {path}. Run `kei login get-code`, then `kei login submit-code \
-                 <CODE>`, and restart the service or rerun kei.",
+                 state under {path}. Complete the 2FA steps printed above and restart the service or rerun kei.",
                 timeout_secs = config.timeout.as_secs(),
                 path = cookie_dir.display()
             );
@@ -2154,10 +2152,7 @@ mod tests {
             msg.contains("session metadata file is missing"),
             "msg: {msg}"
         );
-        assert!(
-            msg.contains("kei login get-code") && msg.contains("kei login submit-code <CODE>"),
-            "msg: {msg}"
-        );
+        assert!(msg.contains("restart the service"), "msg: {msg}");
         assert_eq!(auth_calls.load(Ordering::SeqCst), 0);
     }
 

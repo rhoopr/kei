@@ -22,6 +22,8 @@ For a specific component, see the [module index](architecture/module-index.md). 
 
 **Startup.** Dispatch resolves configuration before opening account-owned state. `src/config/paths.rs` discovers one application root so a new XDG setting cannot silently split existing credentials and state. Ambiguous roots fail closed. Linux service installation records the resolved config path and path overrides. The writable state opener verifies schema upgrades and retires their temporary backups before post-upgrade inbox compaction. See [startup, account ownership, and schema backups](architecture/startup.md).
 
+**Offline inspection.** Doctor distinguishes a loaded config, an absent file, and a load error. Its password-file check tests read access without reading the secret or invoking a password command. Status describes recorded sync work; verify compares local bytes only when requested and a checksum baseline exists.
+
 **Sync.** The runner resolves the session, libraries, and pass plans. Each cycle dispatches work per library, evaluates source progress per zone, and reports the result to watch control. A cursor records where to resume; the retained inbox holds source observations; destination receipts record local work. None substitutes for the others. See [provider capture and destination replay](architecture/provider-replay.md) and [checkpoint decisions and enumeration](architecture/checkpoints.md).
 
 A sparse change in PrimarySync can depend on a scoped Shared scan from the same cycle. If a Hidden-only scan has no decision for the exact Shared asset, its current `isHidden` field can establish membership. Every selected destination still requires a verified local copy before the source checkpoint advances.

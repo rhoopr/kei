@@ -235,8 +235,16 @@ pub(crate) fn run_setup(
     println!();
     println!("Hey! Let's get kei set up.");
     println!();
-    println!("A few quick questions, then you'll be syncing.");
-    println!("Press Enter to accept a default — it's always a safe bet.");
+    println!("For specific albums, have their exact, case-sensitive names ready.");
+    if config_path.is_file() {
+        println!(
+            "To look them up first, use `{}`.",
+            crate::cli::command_for_config("list albums", Some(config_path))
+        );
+    } else {
+        println!("For a new account, look up album names in Photos before continuing.");
+    }
+    println!("Leaving before the final write discards your answers.");
     println!();
 
     // Check for existing config
@@ -285,7 +293,7 @@ pub(crate) fn run_setup(
     section_header("Running mode");
     ask_running_mode(&mut answers)?;
     if answers.watch_interval.is_some() {
-        check("Set-and-forget. Kei will keep an eye on things.");
+        check("Watch interval selected. Setup does not install a background service.");
     }
 
     // Step 9: Extras
@@ -332,15 +340,57 @@ pub(crate) fn run_setup(
     check("Config saved.");
     println!();
     println!("  Config  →  {}", config_path.display());
-    print_secret_summary(&answers, &write_result);
+    for line in secret_summary_lines(&answers, &write_result, Some(config_path)) {
+        println!("{line}");
+    }
     println!();
     let bold = Style::new().bold();
-    println!("{}", bold.apply_to("You're all set."));
+    println!("  Destination: {}", answers.directory);
+    println!(
+        "  Libraries: {}; albums: {}; include unfiled: {}",
+        if answers.libraries.is_empty() {
+            "primary".into()
+        } else {
+            answers.libraries.join(", ")
+        },
+        if answers.albums.is_empty() {
+            "all".into()
+        } else {
+            answers.albums.join(", ")
+        },
+        answers.unfiled.unwrap_or(crate::config::unfiled_default())
+    );
+    println!(
+        "  Capture dates: {} through {}",
+        answers
+            .skip_created_before
+            .as_deref()
+            .unwrap_or("no lower limit"),
+        answers
+            .skip_created_after
+            .as_deref()
+            .unwrap_or("no upper limit")
+    );
+    if !answers.smart_folders.is_empty() {
+        println!("  Smart folders: {}", answers.smart_folders.join(", "));
+    }
+    if !answers.exclude.is_empty() {
+        println!(
+            "  Excluded media: {}",
+            answers
+                .exclude
+                .iter()
+                .map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!("  No sync or login has been attempted by setup.");
     if answers.watch_interval.is_some() {
         println!();
         println!(
             "  {} to run continuously in the background.",
-            bold.apply_to(format!("kei install --config {}", config_path.display()))
+            bold.apply_to(crate::cli::command_for_config("install", Some(config_path)))
         );
     }
     println!();
@@ -348,7 +398,7 @@ pub(crate) fn run_setup(
     // Offer to sync now
     let sync_now = Confirm::new()
         .with_prompt("Want to kick off your first sync right now?")
-        .default(true)
+        .default(false)
         .interact()?;
 
     if sync_now {
@@ -367,7 +417,10 @@ pub(crate) fn run_setup(
         if let Some(env_path) = &write_result.env_path {
             print_load_env_snippet(env_path);
         }
-        println!("  {}", sync_command_for_config(config_path));
+        println!(
+            "  {}",
+            crate::cli::command_for_config("sync", Some(config_path))
+        );
         println!();
         Ok(SetupResult::Done)
     }
@@ -398,15 +451,6 @@ fn library_template_or_default(template: Option<&str>, default: &str) -> String 
     ensure_library_token(template.unwrap_or(default))
 }
 
-fn single_quoted_shell(value: &str) -> String {
-    format!("'{}'", shell_single_quote_escape(value))
-}
-
-fn sync_command_for_config(config_path: &Path) -> String {
-    let path = config_path.to_string_lossy();
-    format!("kei --config {} sync", single_quoted_shell(&path))
-}
-
 /// Print the right "load .env into this shell" command for the user's shell.
 /// Detects the shell from `$SHELL`. Defaults to the bash/zsh form because
 /// it's the most common on Linux and macOS; calls out fish explicitly because
@@ -417,7 +461,10 @@ fn print_load_env_snippet(env_path: &Path) {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    let env_display = env_path.display();
+    let env_arg = format!(
+        "'{}'",
+        shell_single_quote_escape(&env_path.to_string_lossy())
+    );
     match shell_name {
         "fish" => {
             // fish doesn't have `set -a`, and the .env file's single-quoted
@@ -426,11 +473,11 @@ fn print_load_env_snippet(env_path: &Path) {
             // bash do the parsing, then exec fish so the inherited env
             // carries through.
             println!("  # fish: load .env via a bash subshell, then continue in fish");
-            println!("  bash -c 'set -a; source {env_display}; set +a; exec fish'");
+            println!("  bash -c 'set -a; source \"$1\"; set +a; exec fish' bash {env_arg}");
         }
         _ => {
             // bash / zsh / sh / dash / ksh: POSIX `set -a` + source.
-            println!("  set -a; source {env_display}; set +a");
+            println!("  set -a; . {env_arg}; set +a");
         }
     }
 }
@@ -537,13 +584,11 @@ fn set_restricted_permissions(path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("Could not set secure permissions on {}", path.display()))
 }
 
-fn print_secret_summary(answers: &SetupAnswers, write_result: &SetupWriteResult) {
-    for line in secret_summary_lines(answers, write_result) {
-        println!("{line}");
-    }
-}
-
-fn secret_summary_lines(answers: &SetupAnswers, write_result: &SetupWriteResult) -> Vec<String> {
+fn secret_summary_lines(
+    answers: &SetupAnswers,
+    write_result: &SetupWriteResult,
+    config: Option<&Path>,
+) -> Vec<String> {
     match &answers.secret_source {
         SetupSecretSource::CredentialStore => {
             let backend = write_result
@@ -552,15 +597,20 @@ fn secret_summary_lines(answers: &SetupAnswers, write_result: &SetupWriteResult)
                 .unwrap_or("credential-store");
             vec![
                 format!("  Secrets →  {backend} backend"),
-                "             Use `kei password backend` to check it or `kei password set` to change it."
-                    .to_string(),
+                format!(
+                    "             Use `{}` to check it or `{}` to change it.",
+                    crate::cli::command_for_config("password backend", config),
+                    crate::cli::command_for_config("password set", config)
+                ),
             ]
         }
         SetupSecretSource::PasswordFile(path) => {
-            vec![format!("  Secrets →  password file: {path}")]
+            vec![format!(
+                "  Secrets →  password file: {path} (access not checked; run doctor on the sync host)"
+            )]
         }
         SetupSecretSource::PasswordCommand(_) => {
-            vec!["  Secrets →  password command from config".to_string()]
+            vec!["  Secrets →  password command from config (not executed)".to_string()]
         }
         SetupSecretSource::EnvFile => {
             if let Some(env_path) = &write_result.env_path {
@@ -776,8 +826,6 @@ fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         // (v0.13), so a single comma-separated entry would silently break any
         // album whose name contains a comma.
         println!("  Enter one album per line. Press Enter on a blank line to finish.");
-        println!("  Names are case-sensitive and must match iCloud exactly. If you're unsure,");
-        println!("  cancel now (Ctrl+C), run `kei list albums`, and re-run `kei config setup`.");
         loop {
             let prompt = if answers.albums.is_empty() {
                 "Album name".to_string()
@@ -792,6 +840,13 @@ fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
                 .default(String::new())
                 .show_default(false)
                 .allow_empty(true)
+                .validate_with(|name: &String| {
+                    if answers.albums.is_empty() && name.trim().is_empty() {
+                        Err("Enter at least one album name.")
+                    } else {
+                        Ok(())
+                    }
+                })
                 .interact_text()?;
             let trimmed = name.trim();
             if trimmed.is_empty() {
@@ -1691,12 +1746,16 @@ mod tests {
     #[test]
     fn sync_command_for_config_shell_quotes_paths() {
         assert_eq!(
-            sync_command_for_config(Path::new("/tmp/kei config.toml")),
+            crate::cli::command_for_config("sync", Some(Path::new("/tmp/kei config.toml"))),
             "kei --config '/tmp/kei config.toml' sync"
         );
         assert_eq!(
-            sync_command_for_config(Path::new("/tmp/rob's-config.toml")),
-            "kei --config '/tmp/rob'\\''s-config.toml' sync"
+            crate::cli::command_for_config("sync", Some(Path::new("/tmp/rob's-config.toml"))),
+            if cfg!(windows) {
+                "kei --config '/tmp/rob''s-config.toml' sync"
+            } else {
+                "kei --config '/tmp/rob'\\''s-config.toml' sync"
+            }
         );
     }
 
@@ -1895,7 +1954,7 @@ mod tests {
         assert_eq!(result.credential_backend, Some(CredentialBackend::Keyring));
         assert!(result.env_path.is_none());
         assert!(!dir.path().join(".env").exists());
-        let summary = secret_summary_lines(&answers, &result);
+        let summary = secret_summary_lines(&answers, &result, None);
         assert_eq!(summary[0], "  Secrets →  keyring backend");
         assert!(
             summary[1].contains("kei password backend"),
@@ -1941,7 +2000,7 @@ mod tests {
         );
         assert!(result.env_path.is_none());
 
-        let summary = secret_summary_lines(&answers, &result);
+        let summary = secret_summary_lines(&answers, &result, None);
         assert_eq!(summary[0], "  Secrets →  encrypted-file backend");
         assert!(
             summary[1].contains("kei password backend"),
@@ -2584,7 +2643,7 @@ mod tests {
                     credential_backend: None,
                     env_path: None,
                 },
-                vec!["  Secrets →  password file: /run/secrets/icloud".to_string()],
+                vec!["  Secrets →  password file: /run/secrets/icloud (access not checked; run doctor on the sync host)".to_string()],
             ),
             (
                 SetupSecretSource::PasswordCommand("op read item kei".to_string()),
@@ -2592,7 +2651,7 @@ mod tests {
                     credential_backend: None,
                     env_path: None,
                 },
-                vec!["  Secrets →  password command from config".to_string()],
+                vec!["  Secrets →  password command from config (not executed)".to_string()],
             ),
             (
                 SetupSecretSource::EnvFile,
@@ -2612,7 +2671,7 @@ mod tests {
             };
 
             assert_eq!(
-                secret_summary_lines(&answers, &write_result),
+                secret_summary_lines(&answers, &write_result, None),
                 expected,
                 "unexpected secret summary for {:?}",
                 answers.secret_source

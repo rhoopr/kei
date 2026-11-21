@@ -278,6 +278,99 @@ fn doctor_json_uses_local_config_paths_and_redacts() {
 }
 
 #[test]
+#[cfg(unix)]
+fn setup_enter_default_finishes_without_sync_and_cancel_discards_answers() {
+    let status = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/shell/setup-default.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_kei"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn doctor_distinguishes_absence_and_checks_only_the_effective_password_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let file = dir.path().join("private-input");
+    let command = || {
+        let mut cmd = common::cmd();
+        cmd.env_remove("ICLOUD_PASSWORD")
+            .env_remove("ICLOUD_USERNAME")
+            .env_remove("KEI_PASSWORD_COMMAND")
+            .env_remove("KEI_PASSWORD_FILE")
+            .env("KEI_DATA_DIR", dir.path())
+            .args(["doctor", "--json", "--config"]);
+        cmd
+    };
+    let check = |cmd: &mut assert_cmd::Command, success: bool, name: &str, status: &str| {
+        let out = cmd.output().unwrap();
+        assert_eq!(out.status.success(), success, "{out:?}");
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(
+            report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["name"] == name && c["status"] == status),
+            "{report}"
+        );
+        assert!(!report.to_string().contains("private-input"));
+        assert!(!report.to_string().contains("file-secret"));
+    };
+    check(command().arg(&config), true, "config_parse", "skipped");
+    assert!(!config.exists());
+    check(
+        command().arg(dir.path().join("absent/config.toml")),
+        false,
+        "config_parse",
+        "error",
+    );
+    common::write_versioned_config(
+        &config,
+        format!(
+            "[auth]\npassword_file = {}\n",
+            common::toml_string(&file.to_string_lossy())
+        ),
+    )
+    .unwrap();
+    check(command().arg(&config), false, "password_source", "error");
+    std::fs::create_dir(&file).unwrap();
+    check(command().arg(&config), false, "password_source", "error");
+    std::fs::remove_dir(&file).unwrap();
+    check(
+        command().arg(&config).env("ICLOUD_PASSWORD", "file-secret"),
+        true,
+        "password_source",
+        "skipped",
+    );
+    let marker = dir.path().join("executed");
+    check(
+        command()
+            .arg(&config)
+            .current_dir(dir.path())
+            .env("KEI_PASSWORD_COMMAND", "echo file-secret > executed"),
+        !cfg!(windows),
+        "password_source",
+        if cfg!(windows) { "error" } else { "skipped" },
+    );
+    assert!(!marker.exists());
+    std::fs::write(&file, "file-secret").unwrap();
+    check(command().arg(&config), true, "password_source", "ok");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&file).is_err() {
+            check(command().arg(&config), false, "password_source", "error");
+        }
+    }
+}
+
+#[test]
 fn doctor_invalid_config_reports_redacted_json_error() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("invalid.toml");
@@ -986,7 +1079,7 @@ fn config_explicit_nonexistent_path_fails_at_runtime() {
         "error should mention the config file, stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("kei doctor --json"),
+        stderr.contains("kei --config '/nonexistent/explicit/config.toml' doctor --json"),
         "generic runtime errors should suggest diagnostics, stderr:\n{stderr}"
     );
     assert!(
