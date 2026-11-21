@@ -440,7 +440,7 @@ pub(super) fn guard_projected_generation(
         params![record.library,record.id,record.version_size.as_str(),record.checksum,i64::try_from(record.size_bytes).ok(),encode_asset_date(record.created_at),record.added_at.map(encode_asset_date),metadata_hash],|r|r.get(0),
     )?;
     if conflict {
-        Err(StateError::ProviderWorkConflict)
+        Err(StateError::ProviderWorkConflict("unfinished_asset_changed"))
     } else {
         Ok(())
     }
@@ -458,7 +458,9 @@ pub(super) fn guard_projected_mapping(
     }
     let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_work_obligations w JOIN provider_work_receipts r USING(page_id,ordinal,config_hash,confirmation_hash) JOIN assets a ON a.library=w.library AND a.id=w.asset_id AND a.version_size=w.version_size WHERE a.library=?1 AND a.id=?2 AND {UNFINISHED_GENERATION} AND r.master_record_name<>?3)"),params![library,child,master],|r|r.get(0))?;
     if conflict {
-        Err(StateError::ProviderWorkConflict)
+        Err(StateError::ProviderWorkConflict(
+            "unfinished_mapping_changed",
+        ))
     } else {
         Ok(())
     }
@@ -481,7 +483,9 @@ pub(super) fn guard_projected_metadata(
     }
     let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_work_obligations w JOIN assets a ON a.library=w.library AND a.id=w.asset_id AND a.version_size=w.version_size WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND {UNFINISHED_GENERATION} AND (w.metadata_hash IS NOT ?4 OR w.created_at IS NOT ?5 OR w.added_at IS NOT ?6))"),params![library,asset,version,metadata.metadata_hash.as_deref(),created,added],|r|r.get(0))?;
     if conflict {
-        Err(StateError::ProviderWorkConflict)
+        Err(StateError::ProviderWorkConflict(
+            "unfinished_metadata_changed",
+        ))
     } else {
         Ok(())
     }

@@ -122,6 +122,7 @@ pub(crate) struct PreservedLocal {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SelectionMetadataReceipt {
+    pub(crate) writer_output: Option<WriterOutput>,
     pub(crate) generation: String,
     pub(crate) pass_key: String,
     pub(crate) child: String,
@@ -129,6 +130,13 @@ pub(crate) struct SelectionMetadataReceipt {
     pub(crate) metadata_flags: u16,
     pub(crate) prepared: Option<(String, u64)>,
     pub(crate) preserved_local: Option<PreservedLocal>,
+}
+
+/// Output verified by the configured writer in addition to the installed media hash.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub(crate) enum WriterOutput {
+    EmbeddedOnly,
+    Sidecar([u8; 32]),
 }
 
 /// One queued metadata rewrite and its independently persisted capture debt.

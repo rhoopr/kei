@@ -22,7 +22,10 @@ use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
 
 mod rank_retirement;
+mod writer_output;
+pub(crate) use super::contracts::WriterOutput;
 use rank_retirement::load_rank_proof;
+pub(crate) use writer_output::WriterKey;
 
 // Limit one generation evidence write; retained history never spends this allowance.
 pub(crate) const MAX_GENERATION_BYTES: u64 = 512 * 1024 * 1024;
@@ -307,7 +310,7 @@ fn managed_predecessors(
     }
     for supplied in layouts {
         if encode(&cancelled_layout(conn, &supplied.operation)?)? != encode(supplied)? {
-            return Err(StateError::ProviderWorkConflict);
+            return Err(StateError::ProviderWorkConflict("cancelled_layout_changed"));
         }
     }
     let keys: Vec<String> = conn.prepare("SELECT DISTINCT d.generation FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE g.scope=?1 AND g.config_hash=?2 AND d.pass_key=?3 AND d.child=?4 AND d.admission='admitted' AND d.generation<>?5 AND EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR (g.metadata_enabled=1 AND w.verified_metadata=0))) ORDER BY g.created_at LIMIT 17")?
@@ -1790,7 +1793,7 @@ impl SqliteStateDb {
     ) -> Result<ActiveGeneration, StateError> {
         self.with_conn_mut("starting selection generation",move|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;validate_spec(&spec)?;validate_current_deleted_selection(&tx,&spec)?;
-            if basis(&tx,&spec.scope)?!=spec.basis {return Err(StateError::ProviderWorkConflict)}
+            if basis(&tx,&spec.scope)?!=spec.basis {return Err(StateError::ProviderWorkConflict("selection_basis_changed"))}
             freeze_interrupted_groupings(&tx, &spec.scope)?;
             let bytes=encode(&spec)?;let (account,provider)=owner_keys(&tx)?;
             let id=format!("{:032x}",rand::random::<u128>());
@@ -2538,10 +2541,10 @@ impl SqliteStateDb {
             if let Some((previous,admission))=&existing {
                 let old=load_decision(&tx,&root,&d.pass_key,&d.child)?;
                 resolving=admission=="deferred" && old.decision.outcome==SelectionOutcome::Deferred && old.decision.confirmation.is_none() && manifest.decision.confirmation.is_some() && !root.sealed && old.sources.iter().all(|source|manifest.sources.contains(source));
-                if previous!=&bytes && !resolving {return Err(StateError::ProviderWorkConflict)}
+                if previous!=&bytes && !resolving {return Err(StateError::ProviderWorkConflict("frozen_manifest_changed"))}
                 if resolving {
                     if old.decision.media_source != manifest.decision.media_source {
-                        return Err(StateError::ProviderWorkConflict);
+                        return Err(StateError::ProviderWorkConflict("media_source_changed"));
                     }
                     let observed=observed_asset(&tx,&root,&old)?;
                     let current=crate::icloud::photos::current_asset(manifest.decision.confirmation.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,&d.child,d.master.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,manifest.media_zone(&root)).map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
@@ -2571,14 +2574,14 @@ impl SqliteStateDb {
                     }
                 }
                 if changed_basis && !resolving && admission=="deferred" && old.decision.confirmation.is_some() {
-                    let Some(fresh)=fresh_confirmation.as_deref().filter(|body|body.len()<=MAX_CHUNK_BYTES) else {return Err(StateError::ProviderWorkConflict)};
+                    let Some(fresh)=fresh_confirmation.as_deref().filter(|body|body.len()<=MAX_CHUNK_BYTES) else {return Err(StateError::ProviderWorkConflict("fresh_confirmation_unavailable"))};
                     let master=old.decision.master.as_deref().ok_or(StateError::ProviderSelectionInvalid)?;
                     let previous=crate::icloud::photos::current_asset(old.decision.confirmation.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,&d.child,master,old.media_zone(&root)).map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
                     let current=crate::icloud::photos::current_asset(fresh,&d.child,master,manifest.media_zone(&root)).map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
-                    if !crate::icloud::photos::same_selected_facts(&previous,&current) {return Err(StateError::ProviderWorkConflict)}
+                    if !crate::icloud::photos::same_selected_facts(&previous,&current) {return Err(StateError::ProviderWorkConflict("confirmed_facts_changed"))}
                 }
                 if admission!="deferred" {tx.commit()?;return Ok(GenerationProjection {admitted:admission=="admitted",reason:String::new()})}
-            } else if root.sealed {return invalid()} else if changed_basis {return Err(StateError::ProviderWorkConflict)}
+            } else if root.sealed {return invalid()} else if changed_basis {return Err(StateError::ProviderWorkConflict("selection_basis_changed"))}
             // This check and admission share the immediate transaction. Two
             // producers cannot freeze one physical path for different albums or
             // smart folders. Every deferred retry rechecks ownership, including
@@ -2588,7 +2591,7 @@ impl SqliteStateDb {
             if root.spec.profile.get(INDEPENDENT_ALBUM_COPIES)==Some(&Value::Bool(true)) && matches!(pass(&root,&d.pass_key)?.get("kind").and_then(Value::as_str), Some("Album" | "SmartFolder")) {
                 for destination in &d.destinations {
                     if album_path_claimed(&tx, &root.spec.scope, &d.pass_key, &destination.path)? {
-                        return Err(StateError::ProviderWorkConflict);
+                        return Err(StateError::ProviderWorkConflict("album_path_claimed"));
                     }
                 }
             }
@@ -2598,11 +2601,11 @@ impl SqliteStateDb {
             }
             let mut staged = false;
             if existing.is_none() && !layouts.is_empty() && d.outcome == SelectionOutcome::Selected && d.reason.is_empty() {
-                let fresh = fresh_confirmation.as_deref().ok_or(StateError::ProviderWorkConflict)?;
-                let master = d.master.as_deref().ok_or(StateError::ProviderWorkConflict)?;
+                let fresh = fresh_confirmation.as_deref().ok_or(StateError::ProviderWorkConflict("fresh_confirmation_unavailable"))?;
+                let master = d.master.as_deref().ok_or(StateError::ProviderWorkConflict("master_unconfirmed"))?;
                 let current = crate::icloud::photos::current_asset(fresh, &d.child, master, manifest.media_zone(&root)).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
                 let selected = crate::icloud::photos::current_asset(d.confirmation.as_deref().ok_or(StateError::ProviderSelectionInvalid)?, &d.child, master, manifest.media_zone(&root)).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
-                if !crate::icloud::photos::same_selected_facts(&current, &selected) { return Err(StateError::ProviderWorkConflict); }
+                if !crate::icloud::photos::same_selected_facts(&current, &selected) { return Err(StateError::ProviderWorkConflict("confirmed_facts_changed")); }
                 let predecessors = managed_predecessors(&tx, &root, &manifest, &layouts)?;
                 if !predecessors.is_empty() {
                     insert_selection_rows(&tx, &root, &manifest, ("admitted", ""), capacity)?;
@@ -2627,12 +2630,12 @@ impl SqliteStateDb {
                 if blocked {reason="identity_conflict".to_owned()}
                 for record in &records {
                     match super::provider_work::guard_projected_generation(&tx,record) {
-                        Ok(())=>{},Err(StateError::ProviderWorkConflict)=>{reason="unfinished_generation_conflict".to_owned();break},Err(error)=>return Err(error),
+                        Ok(())=>{},Err(StateError::ProviderWorkConflict(_))=>{reason="unfinished_generation_conflict".to_owned();break},Err(error)=>return Err(error),
                     }
                 }
                 if let Some(master)=&d.master {
                     match super::provider_work::guard_projected_mapping(&tx,manifest.media_zone(&root).get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&d.child,master) {
-                        Ok(())=>{},Err(StateError::ProviderWorkConflict)=>reason="unfinished_mapping_conflict".to_owned(),Err(error)=>return Err(error),
+                        Ok(())=>{},Err(StateError::ProviderWorkConflict(_))=>reason="unfinished_mapping_conflict".to_owned(),Err(error)=>return Err(error),
                     }
                 }
             }
@@ -2645,7 +2648,7 @@ impl SqliteStateDb {
                 if conflict {reason="unfinished_grouping_conflict".to_owned()}
             }
             let admitted=d.outcome==SelectionOutcome::Selected && reason.is_empty();
-            if staged && !admitted { return Err(StateError::ProviderWorkConflict); }
+            if staged && !admitted { return Err(StateError::ProviderWorkConflict("layout_successor_deferred")); }
             let admission=if admitted {"admitted"} else if d.outcome==SelectionOutcome::Excluded {"excluded"} else {"deferred"};
             if !staged && (existing.is_none() || resolving) {
                 insert_selection_rows(&tx, &root, &manifest, (admission, &reason), capacity)?;
@@ -2689,13 +2692,13 @@ impl SqliteStateDb {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
             let root=load_generation(&tx,&generation)?;
             validate_current_deleted_selection(&tx,&root.spec)?;
-            if basis(&tx,&root.spec.scope)?!=root.spec.basis {return Err(StateError::ProviderWorkConflict)}
+            if basis(&tx,&root.spec.scope)?!=root.spec.basis {return Err(StateError::ProviderWorkConflict("selection_basis_changed"))}
             if !root.sealed {
                 let assets:Vec<(String,String)>=tx.prepare("SELECT DISTINCT library,asset_id FROM provider_active_destinations WHERE generation=?1")?.query_map([&generation],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
                 for (library,asset) in assets {
                     let hash=grouping_hash(&tx,&library,&asset)?;
                     let drift:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND library=?2 AND asset_id=?3 AND grouping_hash IS NOT NULL AND grouping_hash<>?4)",params![generation,library,asset,hash],|r|r.get(0))?;
-                    if drift {return Err(StateError::ProviderWorkConflict)}
+                    if drift {return Err(StateError::ProviderWorkConflict("frozen_grouping_changed"))}
                     freeze_asset_intents(&tx,&root,&library,&asset,&hash)?;
                 }
             }
@@ -3443,7 +3446,7 @@ pub(super) fn guard_groupings(
     let current = grouping_hash(conn, library, asset)?;
     let conflict:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND g.metadata_enabled=1 AND w.verified_metadata=0 AND w.grouping_hash IS NOT NULL AND w.grouping_hash IS NOT ?3)",params![library,asset,current],|r|r.get(0))?;
     if conflict {
-        Err(StateError::ProviderWorkConflict)
+        Err(StateError::ProviderWorkConflict("frozen_grouping_changed"))
     } else {
         Ok(())
     }
@@ -3507,7 +3510,7 @@ pub(super) fn guard_generation(conn: &Connection, record: &AssetRecord) -> Resul
         .unwrap_or_else(|| record.metadata.compute_hash());
     let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3 AND {UNFINISHED} AND (w.checksum<>?4 OR w.size_bytes IS NOT ?5 OR w.created_at IS NOT ?6 OR w.added_at IS NOT ?7 OR w.metadata_hash<>?8))"),params![record.library,record.id,record.version_size.as_str(),record.checksum,i64::try_from(record.size_bytes).ok(),encode_asset_date(record.created_at),record.added_at.map(encode_asset_date),hash],|r|r.get(0))?;
     if conflict {
-        Err(StateError::ProviderWorkConflict)
+        Err(StateError::ProviderWorkConflict("unfinished_asset_changed"))
     } else {
         Ok(())
     }
@@ -3522,7 +3525,9 @@ pub(super) fn guard_mapping(
     validate_identity_decisions(conn, library, child)?;
     let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.child=?2 AND w.master<>?3 AND {UNFINISHED})"),params![library,child,master],|r|r.get(0))?;
     if conflict {
-        Err(StateError::ProviderWorkConflict)
+        Err(StateError::ProviderWorkConflict(
+            "unfinished_mapping_changed",
+        ))
     } else {
         Ok(())
     }
@@ -3544,7 +3549,9 @@ pub(super) fn guard_metadata(
         .unwrap_or_else(|| metadata.compute_hash());
     let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3 AND {UNFINISHED} AND (w.metadata_hash<>?4 OR w.created_at IS NOT ?5 OR w.added_at IS NOT ?6))"),params![library,asset,version,hash,created,added],|r|r.get(0))?;
     if conflict {
-        Err(StateError::ProviderWorkConflict)
+        Err(StateError::ProviderWorkConflict(
+            "unfinished_metadata_changed",
+        ))
     } else {
         Ok(())
     }
@@ -3620,7 +3627,7 @@ fn record_layout_destination_for_generation(
             continue;
         }
         if root.spec.metadata_flags & flags != root.spec.metadata_flags {
-            return Err(StateError::ProviderWorkConflict);
+            return Err(StateError::ProviderWorkConflict("managed_recipe_changed"));
         }
         let manifest = load_decision(conn, &root, &key, &child)?;
         let destination = manifest
@@ -3706,7 +3713,7 @@ impl SqliteStateDb {
                 params![binding.family,binding.library,binding.child,binding.generation], |row| row.get(0),
             )?;
             if stored != encode(&binding)? {
-                return Err(StateError::ProviderWorkConflict);
+                return Err(StateError::ProviderWorkConflict("managed_binding_changed"));
             }
             for file in &binding.files {
                 let selected: bool = tx.query_row(
@@ -4044,7 +4051,7 @@ pub(super) fn metadata_receipt(
         .and_then(Value::as_str)
         .ok_or(StateError::ProviderSelectionInvalid)?;
     if grouping_hash(conn, library, &manifest.state_id)? != group {
-        return Err(StateError::ProviderWorkConflict);
+        return Err(StateError::ProviderWorkConflict("frozen_grouping_changed"));
     }
     let mut asset=conn.query_row(&format!("SELECT {} FROM assets WHERE library=?1 AND id=?2 AND version_size=?3 AND checksum=?4 AND metadata_hash=?5 AND is_deleted=0",super::rows::ASSET_COLUMNS),params![library,manifest.state_id,version,destination.checksum,destination.metadata_hash],super::rows::row_to_asset_record)?;
     asset.local_path = Some(destination.path.to_path());
@@ -4056,6 +4063,7 @@ pub(super) fn metadata_receipt(
         capture_repair_receipt: None,
         source_checksum: source,
         selection_receipt: Some(super::contracts::SelectionMetadataReceipt {
+            writer_output: None,
             preserved_local: preserved_local(conn, &root, &manifest, destination)?,
             generation: generation.to_owned(),
             pass_key: key.to_owned(),
@@ -4101,7 +4109,7 @@ pub(super) fn recover_metadata_field_output(
                 || r.metadata_flags != receipt.metadata_flags
         })
     {
-        return Err(StateError::ProviderWorkConflict);
+        return Err(StateError::ProviderWorkConflict("embedded_input_changed"));
     }
     let preserved = receipt
         .preserved_local
@@ -4123,7 +4131,7 @@ pub(super) fn recover_metadata_field_output(
         AND generation=?8 AND pass_key=?9 AND child=?10 AND (preserved_local IS NULL)=(?11 IS NULL)
         AND local_checksum IN (?6,?7)", params![pending.asset.library,pending.asset.id,pending.asset.version_size.as_str(),path,raw,fields.input_checksum,fields.output_checksum,receipt.generation,receipt.pass_key,receipt.child,preserved])?;
     if changed != 1 {
-        return Err(StateError::ProviderWorkConflict);
+        return Err(StateError::ProviderWorkConflict("embedded_output_changed"));
     }
     let destination = manifest
         .decision
@@ -4155,7 +4163,9 @@ pub(super) fn finish_metadata_receipt(
     if root.spec.metadata_flags != receipt.metadata_flags
         || grouping_hash(conn, &pending.asset.library, &manifest.state_id)? != receipt.grouping_hash
     {
-        return Err(StateError::ProviderWorkConflict);
+        return Err(StateError::ProviderWorkConflict(
+            "writer_dependencies_changed",
+        ));
     }
     let path = super::provider_selection::SelectionPath::from_path(
         pending
@@ -4175,7 +4185,7 @@ pub(super) fn finish_metadata_receipt(
         })
         .ok_or(StateError::ProviderSelectionInvalid)?;
     if prepared_metadata(conn, &root, &manifest, selected_destination)? != receipt.prepared {
-        return Err(StateError::ProviderWorkConflict);
+        return Err(StateError::ProviderWorkConflict("prepared_receipt_changed"));
     }
     if local.is_some()
         && local != pending.asset.local_checksum.as_deref()
@@ -4190,7 +4200,7 @@ pub(super) fn finish_metadata_receipt(
         if preserved_local(conn, &root, &manifest, selected_destination)?.as_ref() != Some(expected)
             || pending.source_checksum.is_some()
         {
-            return Err(StateError::ProviderWorkConflict);
+            return Err(StateError::ProviderWorkConflict("preserved_input_changed"));
         }
         let mut updated = expected.clone();
         if let Some(local) = local {
@@ -4211,6 +4221,17 @@ pub(super) fn finish_metadata_receipt(
         conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,local_checksum=COALESCE(?8,local_checksum),verified_metadata=CASE WHEN ?9=1 THEN 1 ELSE verified_metadata END WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=1 AND verified_metadata=0 AND local_checksum IS ?6 AND grouping_hash=?7 AND source_checksum IS ?10 AND metadata_hash IS ?11 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=provider_active_destinations.library AND a.id=provider_active_destinations.asset_id AND a.version_size=provider_active_destinations.version_size AND a.checksum=provider_active_destinations.checksum AND a.metadata_hash=provider_active_destinations.metadata_hash AND a.created_at IS provider_active_destinations.created_at AND a.added_at IS provider_active_destinations.added_at AND a.is_deleted=0)",params![receipt.generation,receipt.pass_key,receipt.child,pending.asset.version_size.as_str(),path,pending.asset.local_checksum,receipt.grouping_hash,local,complete,pending.source_checksum,pending.asset.metadata.metadata_hash])?
     };
     if changed > 0 && receipt.preserved_local.is_none() {
+        if complete && let (Some(packet), Some(output)) = (receipt.writer_output, local) {
+            writer_output::record(
+                conn,
+                pending,
+                &root,
+                &manifest,
+                selected_destination,
+                output,
+                packet,
+            )?;
+        }
         if let Some(prepared) = receipt.prepared.as_ref()
             && local == Some(prepared.0.as_str())
         {

@@ -10,6 +10,7 @@ use std::sync::Arc;
 #[cfg(feature = "xmp")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct SidecarWriteOutcome {
+    pub(super) output: Option<[u8; 32]>,
     pub(super) failed: bool,
     pub(super) storage_failed: bool,
 }
@@ -18,6 +19,7 @@ pub(super) struct SidecarWriteOutcome {
 impl SidecarWriteOutcome {
     fn failure(error: &anyhow::Error) -> Self {
         Self {
+            output: None,
             failed: true,
             storage_failed: super::is_operational_storage_error(error),
         }
@@ -51,6 +53,7 @@ pub(super) async fn write_sidecar_metadata(
                 target: "kei::download::metadata_rewrite",
                 error = %error, "XMP sidecar planning task panicked");
             return SidecarWriteOutcome {
+                output: None,
                 failed: true,
                 storage_failed: false,
             };
@@ -80,14 +83,17 @@ pub(super) async fn write_sidecar_metadata(
     ))
     .await
     {
-        Ok(()) => {
+        Ok(output) => {
             crate::support::observe_metadata(
                 path,
                 "support_metadata_v1",
                 serde_json::json!({"operation":"sidecar","applied":true}),
             );
             let Some(error) = source_error else {
-                return SidecarWriteOutcome::default();
+                return SidecarWriteOutcome {
+                    output,
+                    ..Default::default()
+                };
             };
             crate::support::metadata_error(path, "source_gps", &error, Some(true));
             tracing::warn!(

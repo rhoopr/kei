@@ -250,27 +250,43 @@ const DEFERRED_UNFILED_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const DEFERRED_UNFILED_HEARTBEAT_ASSETS: u64 = 1_000;
 
 #[derive(Debug)]
-struct DeferredUnfiledHeartbeat {
-    library: Arc<str>,
+struct UnfiledHeartbeat {
+    library: &'static str,
+    label: &'static str,
     expected_assets: Option<u64>,
-    started: Instant,
-    last_log: Instant,
+    // Tokio's clock so the periodic stream wrapper honours paused time in
+    // tests and stays aligned with `tokio::time::sleep_until`.
+    started: tokio::time::Instant,
+    last_log: tokio::time::Instant,
     last_logged_assets: u64,
     assets_enumerated: u64,
 }
 
-impl DeferredUnfiledHeartbeat {
-    fn start(library: Arc<str>, expected_assets: Option<u64>) -> Self {
-        let now = Instant::now();
+/// Fixed progress label for a provider zone. Shared zone names carry provider
+/// identifiers, so logs may only say PrimarySync, Shared, or Other.
+fn progress_library_label(zone_name: &str) -> &'static str {
+    if zone_name == crate::icloud::photos::PRIMARY_ZONE_NAME {
+        "PrimarySync"
+    } else if crate::icloud::photos::is_shared_zone(zone_name) {
+        "Shared"
+    } else {
+        "Other"
+    }
+}
+
+impl UnfiledHeartbeat {
+    fn start(library: &'static str, expected_assets: Option<u64>, label: &'static str) -> Self {
+        let now = tokio::time::Instant::now();
         tracing::info!(
-            library = %library,
+            library,
             pass_type = "unfiled",
-            expected_assets = ?expected_assets,
+            ?expected_assets,
             assets_enumerated = 0_u64,
-            "Deferred unfiled enumeration started"
+            "{label} enumeration started"
         );
         Self {
             library,
+            label,
             expected_assets,
             started: now,
             last_log: now,
@@ -281,7 +297,7 @@ impl DeferredUnfiledHeartbeat {
 
     fn record_asset(&mut self) {
         self.assets_enumerated = self.assets_enumerated.saturating_add(1);
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let asset_delta = self
             .assets_enumerated
             .saturating_sub(self.last_logged_assets);
@@ -291,49 +307,76 @@ impl DeferredUnfiledHeartbeat {
             return;
         }
 
-        self.last_log = now;
-        self.last_logged_assets = self.assets_enumerated;
-        tracing::info!(
-            library = %self.library,
-            pass_type = "unfiled",
-            assets_enumerated = self.assets_enumerated,
-            expected_assets = ?self.expected_assets,
-            elapsed = %format_duration(self.started.elapsed()),
-            "Deferred unfiled enumeration progress"
-        );
+        self.log_progress(now);
     }
 
-    fn complete(&self) {
+    fn next_progress_deadline(&self) -> tokio::time::Instant {
+        self.last_log + DEFERRED_UNFILED_HEARTBEAT_INTERVAL
+    }
+
+    fn log_progress(&mut self, now: tokio::time::Instant) {
+        self.last_log = now;
+        self.last_logged_assets = self.assets_enumerated;
+        self.log("progress");
+    }
+
+    fn log(&self, event: &'static str) {
         tracing::info!(
-            library = %self.library,
-            pass_type = "unfiled",
-            assets_enumerated = self.assets_enumerated,
-            expected_assets = ?self.expected_assets,
-            elapsed = %format_duration(self.started.elapsed()),
-            "Deferred unfiled enumeration complete"
+            library = %self.library, pass_type = "unfiled", assets_enumerated = self.assets_enumerated,
+            expected_assets = ?self.expected_assets, elapsed = %format_duration(self.started.elapsed()),
+            "{} enumeration {event}", self.label
         );
     }
 }
 
-fn track_deferred_unfiled_heartbeat(
+/// Report unfiled enumeration progress every interval, or every
+/// `DEFERRED_UNFILED_HEARTBEAT_ASSETS` assets when the stream is fast. The
+/// timer lives inside the stream future instead of a detached task: dropping
+/// the stream stops it immediately, a cancelled run stops logging while it
+/// drains, and a stall in the provider stream still emits progress.
+fn track_unfiled_heartbeat(
     stream: DownloadPhotoStream,
-    library: Arc<str>,
+    library: &'static str,
     expected_assets: Option<u64>,
+    label: &'static str,
+    shutdown: CancellationToken,
 ) -> DownloadPhotoStream {
-    let heartbeat = DeferredUnfiledHeartbeat::start(library, expected_assets);
+    let heartbeat = UnfiledHeartbeat::start(library, expected_assets, label);
     Box::pin(stream::unfold(
-        (stream, heartbeat),
-        |(mut stream, mut heartbeat)| async move {
-            match stream.next().await {
-                Some(item) => {
-                    if item.is_ok() {
-                        heartbeat.record_asset();
-                    }
-                    Some((item, (stream, heartbeat)))
+        (stream, heartbeat, shutdown),
+        |(mut stream, mut heartbeat, shutdown)| async move {
+            loop {
+                if shutdown.is_cancelled() {
+                    // Shutdown already started: pass remaining records
+                    // through without claiming progress or completion.
+                    return stream
+                        .next()
+                        .await
+                        .map(|item| (item, (stream, heartbeat, shutdown)));
                 }
-                None => {
-                    heartbeat.complete();
-                    None
+                let deadline = heartbeat.next_progress_deadline();
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => {
+                        // Re-check on the next loop and stop the timer.
+                    }
+                    () = tokio::time::sleep_until(deadline) => {
+                        heartbeat.log_progress(tokio::time::Instant::now());
+                    }
+                    item = stream.next() => {
+                        return match item {
+                            Some(item) => {
+                                if item.is_ok() {
+                                    heartbeat.record_asset();
+                                }
+                                Some((item, (stream, heartbeat, shutdown)))
+                            }
+                            None => {
+                                heartbeat.log("complete");
+                                None
+                            }
+                        };
+                    }
                 }
             }
         },
@@ -894,6 +937,9 @@ pub(super) async fn download_photos_full_with_token_policy(
     let len_errors = pass_count_plan.len_errors;
     let display_total = pass_counts.iter().sum();
     let deferred_unfiled = deferred_unfiled_index(passes);
+    // A plan with only the library-wide unfiled pass has no album pass to
+    // anchor `deferred_unfiled`, so it needs its own progress heartbeat.
+    let unfiled_only = matches!(passes, [pass] if pass.kind == crate::commands::PassKind::Unfiled);
     let bounds_truncated = Arc::new(AtomicBool::new(false));
     let strict_empty_tail_errors = (config.complete_path_selection
         || config.skip_created_before.is_none())
@@ -1001,6 +1047,17 @@ pub(super) async fn download_photos_full_with_token_policy(
                     );
 
                     let stream = initial_order.wrap(stream, pass_index);
+                    let stream = if unfiled_only {
+                        track_unfiled_heartbeat(
+                            stream,
+                            progress_library_label(pass.album.zone_name()),
+                            *total_count,
+                            "Unfiled",
+                            shutdown_token.clone(),
+                        )
+                    } else {
+                        stream
+                    };
                     if pass.kind == crate::commands::PassKind::Album
                         && let Some(deferred_ids) = deferred_ids
                     {
@@ -1125,21 +1182,26 @@ pub(super) async fn download_photos_full_with_token_policy(
                         controls,
                         strict_empty_tail_errors,
                     );
-                    let library = Arc::<str>::from(pass.album.zone_name());
+                    let library = progress_library_label(pass.album.zone_name());
                     let stream = filter_stream_to_enumeration_bounds(
                         stream,
                         config,
                         Arc::clone(&bounds_truncated),
                         shutdown_token.clone(),
                     );
-                    let stream =
-                        track_deferred_unfiled_heartbeat(stream, library, stream_total_count)
-                            .filter(move |item| {
-                                let keep = item.as_ref().map_or(true, |asset| {
-                                    !excluded_ids.contains(asset.asset_record_name())
-                                });
-                                std::future::ready(keep)
-                            });
+                    let stream = track_unfiled_heartbeat(
+                        stream,
+                        library,
+                        stream_total_count,
+                        "Deferred unfiled",
+                        shutdown_token.clone(),
+                    )
+                    .filter(move |item| {
+                        let keep = item.as_ref().map_or(true, |asset| {
+                            !excluded_ids.contains(asset.asset_record_name())
+                        });
+                        std::future::ready(keep)
+                    });
                     let stream = initial_order.wrap(Box::pin(stream), index);
                     let pass_result = run_full_pass_stream(
                         download_client.clone(),
@@ -1239,7 +1301,21 @@ pub(super) async fn download_photos_full_with_token_policy(
             })
             .collect();
 
-        let combined = stream::select_all(streams);
+        let combined: DownloadPhotoStream = if unfiled_only {
+            let library = passes
+                .first()
+                .map(|pass| progress_library_label(pass.album.zone_name()))
+                .unwrap_or("Other");
+            track_unfiled_heartbeat(
+                Box::pin(stream::select_all(streams)),
+                library,
+                pass_stream_counts.first().copied().flatten(),
+                "Unfiled",
+                shutdown_token.clone(),
+            )
+        } else {
+            Box::pin(stream::select_all(streams))
+        };
         // Merged-stream branch already runs as a single call, so it creates
         // one bar internally; no shared-bar plumbing needed.
         let result = stream_full_inventory(

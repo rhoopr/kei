@@ -42,6 +42,8 @@ Selection evidence limits apply to individual writes and validation operations. 
 
 Writable sync may retire raw enumeration responses only after verifying the selection seal and finding no unfinished identity, destination, metadata, or repair work. Compact rank proofs preserve the original seal and source links.
 
+A new selection can reuse a native metadata writer's completed output after checking the installed media and any configured XMP packet against its destination, source, configuration and frozen grouping. Reuse does not confer publication ownership. Prepared writes, preserved local files, managed layouts and explicit refresh or repair keep their existing recovery paths.
+
 File publication must preserve existing media unless replacement has exact authorization. Metadata writers must verify their input before replacement. A failed write leaves enough evidence to retry without overwriting a concurrent edit.
 
 Keep secrets and provider identifiers out of logs and reports. See [diagnostic evidence](architecture/support.md) for redaction, offline collection, and interpretation limits.

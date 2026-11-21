@@ -176,7 +176,7 @@ pub(crate) async fn write_sidecar(
     media_path: &Path,
     write: &MetadataWrite,
     temp_suffix: &str,
-) -> Result<()> {
+) -> Result<Option<[u8; 32]>> {
     let media_path = media_path.to_path_buf();
     let write = write.clone();
     let temp_suffix = temp_suffix.to_owned();
@@ -186,15 +186,18 @@ pub(crate) async fn write_sidecar(
     .await
     .context("XMP sidecar preparation task panicked")??;
     let Some(prepared) = prepared else {
-        return Ok(());
+        return Ok(None);
     };
     let prepared = match prepared {
         PreparedSidecar::Publish(prepared) => prepared,
         PreparedSidecar::Unchanged(snapshot) => {
-            tokio::task::spawn_blocking(move || snapshot.validate())
-                .await
-                .context("Unchanged XMP sidecar validation task panicked")??;
-            return Ok(());
+            let output = tokio::task::spawn_blocking(move || {
+                snapshot.validate()?;
+                fingerprint_bytes(&snapshot.bytes)
+            })
+            .await
+            .context("Unchanged XMP sidecar validation task panicked")??;
+            return Ok(Some(output.sha256));
         }
     };
 
@@ -234,7 +237,7 @@ pub(crate) async fn write_sidecar(
         });
     }
     tracing::debug!(target: "kei::download::metadata", path = %prepared.sidecar_path.display(), "Wrote XMP sidecar");
-    Ok(())
+    Ok(Some(prepared.output.sha256))
 }
 
 enum PreparedSidecar {
@@ -246,7 +249,6 @@ struct SidecarPublication {
     tmp_path: PathBuf,
     sidecar_path: PathBuf,
     expected: Option<crate::download::file::ExistingFileFingerprint>,
-    #[cfg(target_os = "linux")]
     output: crate::download::file::ExistingFileFingerprint,
     #[cfg(target_os = "linux")]
     identity: crate::fs_util::FileIdentity,
@@ -347,7 +349,6 @@ fn prepare_sidecar_write(
         tmp_path,
         sidecar_path,
         expected,
-        #[cfg(target_os = "linux")]
         output: fingerprint_bytes(&bytes)?,
         #[cfg(target_os = "linux")]
         identity: crate::fs_util::file_identity(&temp)?,

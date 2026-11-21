@@ -327,7 +327,7 @@ impl SqliteStateDb {
                      WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND local_checksum=?6",
                     rusqlite::params![library,id,version_size,local_path.to_str(),raw,local_checksum],
                 )?;
-                if native + legacy == 0 { return Err(StateError::ProviderWorkConflict); }
+                if native + legacy == 0 { return Err(StateError::ProviderWorkConflict("metadata_input_changed")); }
             }
 
             record_metadata_capture_revision(
