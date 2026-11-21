@@ -260,7 +260,7 @@ os.execv(os.environ["REAL_GIT"], [os.environ["REAL_GIT"], *args])
 
     def test_repository_contract_keeps_historical_and_live_pins_separate(self):
         contract = json.loads((ROOT / "docs/wiki-contract.json").read_text())
-        self.assertEqual(contract["wiki_revision"], "c51f350bba04688b0d5f9abad1f469ea0bac5a59")
+        self.assertEqual(contract["wiki_revision"], "6d16f933eb216edf6a25a8799ae5d90dd3daca09")
         self.assertEqual([(p["heading"], p["version"], p["source_revision"]) for p in contract["live_home_profiles"]], [
             ("Stable v0.25.3 commands", "0.25.3", "a2081bfd109993c76f34ac13b12ee15b48c86008"),
             ("Commands", "0.30.0-beta.1", "43c900b8b3e065aa86d79856b4f97965b60ee2d9"),
