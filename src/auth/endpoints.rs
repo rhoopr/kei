@@ -9,6 +9,22 @@ pub struct Endpoints {
     pub setup: &'static str,
 }
 
+// Test-only override used by production-path tests that need a local
+// authentication server. Scoped to one task so unrelated parallel tests keep
+// the real Apple endpoints.
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_BASE: String;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_test_endpoint<F>(base: &str, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TEST_BASE.scope(base.to_owned(), future).await
+}
+
 impl Endpoints {
     /// Test-only constructor that builds an `Endpoints` pointing at a
     /// user-supplied base URL (e.g. a wiremock server). All four fields
@@ -32,6 +48,10 @@ impl Endpoints {
     ///
     /// Supported domains: "com" (international), "cn" (China mainland).
     pub fn for_domain(domain: &str) -> anyhow::Result<Self> {
+        #[cfg(test)]
+        if let Ok(base) = TEST_BASE.try_with(Clone::clone) {
+            return Ok(Self::for_test_base(&base));
+        }
         match domain {
             "com" => Ok(Self {
                 auth_root: "https://idmsa.apple.com",

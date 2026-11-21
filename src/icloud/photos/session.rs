@@ -331,11 +331,9 @@ impl PhotosSession for crate::auth::SharedSession {
 /// present, so callers can honor the server-provided delay on 429/503
 /// instead of falling back to exponential backoff alone.
 ///
-/// `body` carries a truncated copy of the response body so downstream
-/// error mapping (e.g. detecting "no auth method found" in a CloudKit 401
-/// that typically indicates FIDO/security keys on the account) can read
-/// the payload without re-requesting. Truncated to keep memory bounded
-/// when CloudKit occasionally returns large HTML error pages.
+/// `body` lets library initialization recognize "no auth method found" in a
+/// CloudKit 401 without another request. It is truncated to bound memory use
+/// when CloudKit returns a large HTML error page.
 #[derive(Debug, thiserror::Error)]
 #[error("Apple returned HTTP {status} for {url}")]
 pub(crate) struct HttpStatusError {
@@ -1676,11 +1674,11 @@ mod tests {
         }
     }
 
-    /// The FIDO failure mode from issue #221: CloudKit returns 401 with
+    /// CloudKit can return 401 with
     /// `"no auth method found"` in the JSON body. A real reqwest client
     /// posting to a wiremock endpoint must surface that body on the
     /// resulting `HttpStatusError` so the library.rs mapping can log
-    /// the security-key hint.
+    /// the account troubleshooting hint.
     #[tokio::test]
     async fn wiremock_401_preserves_body_in_http_status_error() {
         if crate::test_helpers::skip_if_loopback_bind_blocked(
@@ -1711,10 +1709,10 @@ mod tests {
         let preserved = http_err
             .body
             .as_deref()
-            .expect("401 body must be preserved for downstream FIDO/auth diagnostics");
+            .expect("401 body must be preserved for downstream auth diagnostics");
         assert!(
             preserved.contains("no auth method found"),
-            "preserved body must include the FIDO-indicating signal, got: {preserved}"
+            "preserved body must include the CloudKit reason, got: {preserved}"
         );
     }
 
