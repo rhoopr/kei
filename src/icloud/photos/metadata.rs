@@ -65,8 +65,8 @@ pub fn extract(master_fields: &Value, asset_fields: &Value) -> AssetMetadata {
         // consistently without special-casing iCloud.
         meta.rating = Some(5);
     }
-    meta.is_hidden = bool_field(asset_fields, "isHidden").unwrap_or(false);
-    meta.is_deleted = bool_field(asset_fields, "isDeleted").unwrap_or(false)
+    meta.is_hidden = change_flag_is_set(asset_fields, "isHidden");
+    meta.is_deleted = change_flag_is_set(asset_fields, "isDeleted")
         || bool_field(asset_fields, "isExpunged").unwrap_or(false);
     meta.deleted_at = f64_field(asset_fields, "dateExpunged").and_then(f64_to_millis_datetime);
 
@@ -331,6 +331,14 @@ pub(crate) fn explicit_metadata_absence(metadata: &AssetMetadata) -> u8 {
         .and_then(|value| value.get("kei_explicit_absence").and_then(Value::as_u64))
         .and_then(|value| u8::try_from(value).ok())
         .unwrap_or_default()
+}
+
+/// Only boolean true and integer 1 assert a remote deletion or visibility flag.
+pub(super) fn change_flag_is_set(fields: &Value, key: &str) -> bool {
+    fields
+        .get(key)
+        .and_then(|field| field.get("value"))
+        .is_some_and(|value| value.as_bool() == Some(true) || value.as_i64() == Some(1))
 }
 
 fn bool_field(fields: &Value, key: &str) -> Option<bool> {
