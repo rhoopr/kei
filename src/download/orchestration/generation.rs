@@ -2574,14 +2574,23 @@ pub(super) async fn after_delta(
         config.indexing_inventory_cursor,
         Some(IndexingWindow::AwaitReplay)
     );
-    let retry_mismatch = indexing_replay
+    // Replaying a sealed generation cannot supply a missing pass token.
+    let retry_pass_tokens = indexing_replay
         && root.as_ref().is_some_and(|root| {
-            root.checkpoint_veto.as_deref() == Some("icloud_sync_token_mismatch")
+            matches!(
+                root.checkpoint_veto.as_deref(),
+                Some(
+                    "icloud_sync_token_mismatch"
+                        | "icloud_sync_token_missing"
+                        | "icloud_blank_sync_token"
+                        | "kei_internal_token_receiver_dropped"
+                )
+            )
         });
     let mut selected = match root {
         Some(root)
             if !refresh_selection
-                && !retry_mismatch
+                && !retry_pass_tokens
                 && (root.sealed
                     || context
                         .capture

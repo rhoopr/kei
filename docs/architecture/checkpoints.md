@@ -48,7 +48,7 @@ the watch database shortcut across reopen. Only normal checkpoint promotion
 removes replay debt, including aggregate config-drift promotion. Rejection of
 the retained cursor preserves the existing checkpoint gates.
 
-If replay needs a fresh album inventory, its completed delta supplies the starting boundary. A quiet terminal read can qualify that inventory, but only the applied delta's successor can advance the cursor. If the zone changes during that scan, the next replay retries the inventory instead of reusing its failed token proof.
+If replay needs a fresh album inventory, its completed delta supplies the starting boundary. A quiet terminal read can qualify that inventory, but only the applied delta's successor can advance the cursor. If a pass fails to return a usable token or the zone changes during a split-token scan, the next replay retries the inventory instead of reusing its failed token proof.
 
 Bounded coverage, interruption, failed transfers or
 metadata, stale scope, missing proof, state-write failure, and readiness

@@ -221,7 +221,7 @@ async fn indexing_split_pass_tokens_require_quiet_inventory_then_replay_retained
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
     let hold = indexing_reconciliation_key(ZONE);
     let replay = crate::sync_cycle::indexing_replay_key(ZONE);
-    for round in 0..7 {
+    for round in 0..8 {
         let db = indexing_db(&database).await;
         if round == 0 {
             db.set_metadata(CURSOR, "trusted-before").await.unwrap();
@@ -235,7 +235,7 @@ async fn indexing_split_pass_tokens_require_quiet_inventory_then_replay_retained
         }
         let cancel = CancellationToken::new();
         let mut source = provider("FINISHED", &[], "");
-        if round == 0 || round == 4 {
+        if round == 0 || round == 5 {
             // Raw provider activity matters even when no asset event is emitted.
             source.change_records =
                 Arc::new(vec![json!({"recordType":"Unknown","recordName":"other"})]);
@@ -244,7 +244,11 @@ async fn indexing_split_pass_tokens_require_quiet_inventory_then_replay_retained
         }
         let mut selected = library(&source, &db).await;
         let mut album = source.clone();
-        album.query_token = if round == 1 { "" } else { "other-query" };
+        album.query_token = if matches!(round, 1 | 4) {
+            ""
+        } else {
+            "other-query"
+        };
         selected.plan.passes.insert(
             0,
             crate::commands::AlbumPass {
@@ -284,14 +288,14 @@ async fn indexing_split_pass_tokens_require_quiet_inventory_then_replay_retained
         );
         assert_eq!(
             db.get_metadata(&replay).await.unwrap().is_some(),
-            round == 3 || round == 4,
+            (3..=5).contains(&round),
             "round {round}: {:?}, requests: {:?}",
             result.stats,
             source.changes.lock().unwrap()
         );
         assert_eq!(
             db.get_metadata(CURSOR).await.unwrap().as_deref(),
-            Some(if round < 5 {
+            Some(if round < 6 {
                 "trusted-before"
             } else {
                 "trusted-after"
@@ -302,13 +306,18 @@ async fn indexing_split_pass_tokens_require_quiet_inventory_then_replay_retained
                 *source.changes.lock().unwrap(),
                 ["trusted-before", "trusted-after"]
             );
-        } else if round == 4 || round == 5 {
+        } else if round == 4 {
+            // Even the same-cycle retry lacked a token. Keep replay debt on disk.
+            assert_eq!(result.stats.same_cycle_recovery_attempts, 1);
+            assert_eq!(*source.changes.lock().unwrap(), ["trusted-before"]);
+            assert!(!result.can_advance_database_checkpoint());
+        } else if round == 5 || round == 6 {
             assert_eq!(
                 *source.changes.lock().unwrap(),
                 ["trusted-before", "trusted-after"]
             );
-            assert_eq!(result.can_advance_database_checkpoint(), round == 5);
-        } else if round == 6 {
+            assert_eq!(result.can_advance_database_checkpoint(), round == 6);
+        } else if round == 7 {
             assert_eq!(*source.changes.lock().unwrap(), ["trusted-after"]);
             assert_eq!(source.queries.load(Ordering::SeqCst), 0);
             assert!(result.can_advance_database_checkpoint());
