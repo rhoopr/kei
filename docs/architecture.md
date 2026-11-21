@@ -42,7 +42,7 @@ Selection evidence limits apply to individual writes and validation operations. 
 
 Writable sync may retire raw enumeration responses only after verifying the selection seal and finding no unfinished identity, destination, metadata, or repair work. Compact rank proofs preserve the original seal and source links.
 
-A new selection filters previous metadata writers by scope, configuration and destination inputs before reading files. It can reuse completed work only when the installed media, any configured XMP packet, frozen grouping and effective capture offset match the writer's proof. Reuse does not confer publication ownership. Prepared writes, preserved local files, managed layouts and explicit refresh or repair keep their existing recovery paths.
+A new selection filters previous metadata writers by scope, configuration and destination inputs before reading files. It can reuse completed work only when the installed media, any configured XMP packet, frozen grouping and effective capture offset match the writer's proof. Before committing completion, it rechecks the retained files' identities and contents. A failed check leaves the destination and its aliases pending. Reuse does not confer publication ownership. Prepared writes, preserved local files, managed layouts and explicit refresh or repair keep their existing recovery paths.
 
 File publication must preserve existing media unless replacement has exact authorization. Metadata writers must verify their input before replacement. A failed write leaves enough evidence to retry without overwriting a concurrent edit.
 

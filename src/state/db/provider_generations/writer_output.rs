@@ -113,6 +113,7 @@ impl SqliteStateDb {
         key: WriterKey,
         media: String,
         packet: WriterOutput,
+        files_still_match: impl FnOnce() -> bool + Send + 'static,
     ) -> Result<(), StateError> {
         self.with_conn_mut("confirming unchanged writer output", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -151,6 +152,10 @@ impl SqliteStateDb {
                 load_decision(&tx, &load_generation(&tx, &gen_id)?, &pass, &child)?;
                 // Passing no publication checksum retains the original publication owner.
                 finish_metadata_receipt(&tx,&pending,None,true)?;
+                // Roll back the destination and all aliases if the measured files drifted.
+                if !files_still_match() {
+                    return Ok(());
+                }
             }
             tx.commit()?;
             Ok(())

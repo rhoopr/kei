@@ -1999,6 +1999,7 @@ const METADATA_WRITER_BUDGET: usize = 500;
 tokio::task_local! {
     // Scoped to one fixture future, so parallel tests retain production limits.
     pub(super) static TEST_METADATA_WRITER_BUDGET: usize;
+    pub(super) static TEST_AFTER_WRITER_SNAPSHOT: fn(&std::path::Path);
 }
 
 fn metadata_writer_limits() -> (usize, usize) {
@@ -2193,15 +2194,15 @@ async fn reuse_writer_outputs(
             }
             let path = key.native_path()?;
             // Missing, changed or unreadable files go through the ordinary bounded writer.
-            let Ok(media) =
-                crate::download::file::fingerprint_downloaded_path(&config.directory, &path).await
+            let Ok(Some(media)) =
+                crate::download::file::retain_pending_file(&config.directory, &path).await
             else {
                 continue;
             };
-            let packet = if flags.contains(crate::download::pipeline::MetadataFlags::XMP_SIDECAR) {
-                let mut sidecar = path.into_os_string();
+            let sidecar = if flags.contains(crate::download::pipeline::MetadataFlags::XMP_SIDECAR) {
+                let mut sidecar = path.as_os_str().to_owned();
                 sidecar.push(".xmp");
-                let Ok(packet) = crate::download::file::fingerprint_downloaded_path(
+                let Ok(Some(packet)) = crate::download::file::retain_pending_file(
                     &config.directory,
                     std::path::Path::new(&sidecar),
                 )
@@ -2209,16 +2210,27 @@ async fn reuse_writer_outputs(
                 else {
                     continue;
                 };
-                WriterOutput::Sidecar(packet.sha256)
+                Some(packet)
             } else {
-                WriterOutput::EmbeddedOnly
+                None
             };
+            #[cfg(test)]
+            let _ = TEST_AFTER_WRITER_SNAPSHOT.try_with(|edit| edit(&path));
+            let packet = sidecar.as_ref().map_or(WriterOutput::EmbeddedOnly, |file| {
+                WriterOutput::Sidecar(file.fingerprint.sha256)
+            });
             db.reuse_writer_output(
                 owner.clone(),
                 generation.to_owned(),
                 key,
-                data_encoding::HEXLOWER.encode(&media.sha256),
+                data_encoding::HEXLOWER.encode(&media.fingerprint.sha256),
                 packet,
+                move || {
+                    media.validate_blocking().is_ok()
+                        && sidecar.is_none_or(|file| {
+                            file.validate_blocking().is_ok() && media.validate_stamp().is_ok()
+                        })
+                },
             )
             .await?;
         }

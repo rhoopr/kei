@@ -99,6 +99,16 @@ impl RetainedPendingFile {
         self.path.validate_identity(identity)?;
         Ok(())
     }
+
+    /// Recheck the public entry after validating its companion file.
+    pub(in crate::download) fn validate_stamp(&self) -> anyhow::Result<()> {
+        let current = self.path.validate_identity(self.identity()?)?.metadata()?;
+        anyhow::ensure!(
+            current.len() == self.fingerprint.size && current.modified().ok() == self.modified,
+            "Reserved file changed during finalization"
+        );
+        Ok(())
+    }
 }
 
 /// Missing regular files may be downloaded; unsafe entries must not be adopted.

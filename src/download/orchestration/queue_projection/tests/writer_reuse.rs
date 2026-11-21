@@ -9,6 +9,95 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
+#[tokio::test]
+async fn writer_reuse_rechecks_installed_files_before_completion() {
+    use crate::download::orchestration::generation::TEST_AFTER_WRITER_SNAPSHOT;
+    use std::path::Path;
+
+    const MEDIA: &[u8] = include_bytes!("../../../../../tests/data/media/pattern.jpg");
+    fn edit_media(path: &Path) {
+        // Same inode, length and mtime: only rechecking contents catches this edit.
+        let mut file = std::fs::File::options().write(true).open(path).unwrap();
+        let modified = file.metadata().unwrap().modified().unwrap();
+        std::io::Write::write_all(&mut file, b"edit").unwrap();
+        file.set_modified(modified).unwrap();
+    }
+    fn replace_packet(path: &Path) {
+        // Same contents at a different inode: the retained entry is gone.
+        let mut packet = path.as_os_str().to_owned();
+        packet.push(".xmp");
+        let replacement = path.with_extension("replacement");
+        std::fs::copy(&packet, &replacement).unwrap();
+        std::fs::File::open(&replacement)
+            .unwrap()
+            .set_modified(std::fs::metadata(&packet).unwrap().modified().unwrap())
+            .unwrap();
+        std::fs::rename(replacement, packet).unwrap();
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(2)
+        .mount(&server)
+        .await;
+    for edit in [edit_media as fn(&Path), replace_packet] {
+        let mut f = Fixture::new().await;
+        f.config.folder_structure_albums = Arc::from("copies");
+        f.config.metadata.xmp_sidecar = true;
+        f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":server.uri(),"size":MEDIA.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(MEDIA))});
+        for cycle in 0..3 {
+            if cycle > 0 {
+                f = super::reopen_destination_fixture(f).await;
+            }
+            if cycle < 2 {
+                f.capture(
+                    vec![
+                        json!({"recordName":format!("opaque-{cycle}"),"recordType":"FutureOpaque"}),
+                    ],
+                    &format!("basis-{cycle}"),
+                )
+                .await;
+            }
+            let client = reqwest::Client::new();
+            let pass = destination_pass(&f, "A");
+            let sync = crate::download::download_photos_with_sync(
+                &client,
+                std::slice::from_ref(&pass),
+                Arc::new(f.config.clone()),
+                controls(),
+                CancellationToken::new(),
+            );
+            let sync = TEST_METADATA_WRITER_BUDGET.scope(usize::from(cycle == 0), Box::pin(sync));
+            let result = if cycle == 1 {
+                TEST_AFTER_WRITER_SNAPSHOT.scope(edit, sync).await
+            } else {
+                sync.await
+            }
+            .unwrap();
+            assert_eq!(result.stats.downloaded, usize::from(cycle == 0));
+            assert_eq!(result.stats.selected_work_remaining, cycle == 1);
+            let conn = f.db.acquire_lock("check durable writer debt").unwrap();
+            let pending: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_metadata=0", [], |r| r.get(0)).unwrap();
+            assert_eq!(pending, i64::from(cycle == 1));
+            if cycle == 1 {
+                assert!(result.checkpoint.sync_token_blocked);
+                let key: String = conn
+                    .query_row(
+                        "SELECT path FROM provider_active_destinations WHERE verified_metadata=0",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let path = serde_json::from_str::<super::SelectionPath>(&key)
+                    .unwrap()
+                    .to_path();
+                // Restore the fixture's media for the zero-budget retry after reopen.
+                std::fs::write(path, MEDIA).unwrap();
+            }
+        }
+    }
+}
+
 // Independent processes give chrono a real host timezone change without
 // changing the environment of any other test. All phases share the backup.
 #[tokio::test]
