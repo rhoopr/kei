@@ -19,7 +19,7 @@ class HardeningTests(unittest.TestCase):
                 return subprocess.run(["python3", str(script)], cwd=work, capture_output=True, text=True, check=False)
             self.assertEqual(check().returncode, 0)
             for name, old, new, expected in [
-                ("pr.yml", "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5", "actions/checkout@main", "not pinned"),
+                ("pr.yml", "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", "actions/checkout@main", "not pinned"),
                 ("pr.yml", "needs: [quality, clippy, smoke]", "needs: [quality, clippy]", "missing qualification guard"),
                 ("qualification.yml", "needs: [quality, artifacts, service, specialized]", "needs: [quality]", "missing qualification guard"),
                 ("qualification.yml", "cargo fetch --locked", "echo missing bootstrap", "missing qualification guard"),
