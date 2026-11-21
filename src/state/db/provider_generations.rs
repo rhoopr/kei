@@ -1872,7 +1872,7 @@ impl SqliteStateDb {
                     if candidate.as_deref() == Some(child.as_str()) {
                         selected.push(RankSource {
                             page_id: page.clone(),
-                            ordinal: ordinal.try_into().map_err(|_| StateError::ProviderSelectionInvalid)?,
+                            ordinal: ordinal.try_into().map_err(|_overflow| StateError::ProviderSelectionInvalid)?,
                         });
                     }
                 }
