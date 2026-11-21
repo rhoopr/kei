@@ -1837,14 +1837,44 @@ impl SqliteStateDb {
         key: String,
         child: String,
     ) -> Result<Vec<RankSource>, StateError> {
-        self.with_conn("reading selection source links",move|conn|{
-            account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;pass(&root,&key)?;
-            let rows=conn.prepare("SELECT r.page_id,r.ordinal FROM provider_selection_rank_records r JOIN provider_selection_rank_pages p ON p.id=r.page_id WHERE p.generation=?1 AND p.pass_key=?2 AND (r.record_name=?3 OR r.record_type='CPLContainerRelation') ORDER BY r.page_id,r.ordinal")?.query_map(params![generation,key,child],|r|Ok(RankSource{page_id:r.get(0)?,ordinal:r.get(1)?}))?.collect::<Result<Vec<_>,_>>()?;
-            let mut proofs = RankProofs::new(conn, &root);
+        self.selection_rank_sources_with_budget(owner, generation, key, child, MAX_VALIDATION_BYTES)
+            .await
+    }
+
+    pub(crate) async fn selection_rank_sources_with_budget(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        key: String,
+        child: String,
+        capacity: usize,
+    ) -> Result<Vec<RankSource>, StateError> {
+        self.with_conn("reading selection source links", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            account::validate_authenticated(&tx, &owner)?;
+            let root = load_generation(&tx, &generation)?;
+            pass(&root, &key)?;
+            let mut stmt = tx.prepare("SELECT DISTINCT r.page_id FROM provider_selection_rank_records r JOIN provider_selection_rank_pages p ON p.id=r.page_id WHERE p.generation=?1 AND p.pass_key=?2 AND (r.record_name=?3 OR r.record_type='CPLContainerRelation') ORDER BY r.page_id")?;
+            let pages = stmt.query_map(params![generation, key, child], |r| r.get::<_, String>(0))?;
             let mut selected = Vec::new();
-            for source in rows {
-                if proofs.matches_source(&source, &key, &child)? {
-                    selected.push(source);
+            for page in pages {
+                let page = page?;
+                // Discover sources one page at a time: unrelated relations
+                // do not spend the next page's validation allowance.
+                if rank_input_bytes(&tx, &page)? > capacity {
+                    return Err(StateError::ProviderSelectionFull);
+                }
+                let proof = load_rank_proof(&tx, &root, &page)?;
+                if proof.pass_key != key {
+                    return invalid();
+                }
+                for (ordinal, candidate) in proof.selected_children.iter().enumerate() {
+                    if candidate.as_deref() == Some(child.as_str()) {
+                        selected.push(RankSource {
+                            page_id: page.clone(),
+                            ordinal: ordinal.try_into().map_err(|_| StateError::ProviderSelectionInvalid)?,
+                        });
+                    }
                 }
             }
             Ok(selected)

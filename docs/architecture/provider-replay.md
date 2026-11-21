@@ -311,10 +311,11 @@ scheduling visits one due old root per cycle, at most 64 decisions and 16 MiB of
 serialized manifests, with a persisted continuation and retry deadlines. Within
 that transaction, each unique original rank page is strictly decoded and its
 complete ordered record index audited once. Compact page proofs are discarded
-when the operation ends; new reads use a stable read transaction. Each validation
-operation can read up to 512 MiB of unique serialized input, without retaining all
+when the operation ends; new reads use a stable read transaction. Each replay
+validation operation can read up to 512 MiB of unique serialized input, without retaining all
 parsed pages. Original-fact reconstruction separately limits retained serialized
 page inputs to 64 MiB; unavailable bounded evidence remains deferred debt.
+Album source discovery checks candidate pages one at a time in the same read transaction and retains only matching ordinals. Unrelated membership pages do not spend a child's decision-validation allowance.
 The current generation receives a bounded priority metadata lane; remaining writers
 share the existing physical writer budget and persisted general continuation.
 HTTP 401, 403 and 421 current-confirmation failures stop additional hydration in

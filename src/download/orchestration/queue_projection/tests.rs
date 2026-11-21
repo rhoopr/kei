@@ -5434,6 +5434,79 @@ async fn explicit_media_source_cannot_rebind_retained_membership_evidence() {
 }
 
 #[tokio::test]
+async fn membership_source_lookup_spans_validation_windows_after_reopen() {
+    use crate::state::db::provider_generations::{MAX_GENERATION_BYTES, RankSource};
+    let (f, root, manifest, _) = active_pending_fixture().await;
+    let key = manifest.decision.pass_key;
+    let request =
+        crate::icloud::photos::queries::build_changes_zone_request(&root.spec.zone, None, 200);
+    let mut capacity = 0;
+    let mut expected = Vec::new();
+    for (page, children) in [
+        ["target", "other", "target"],
+        ["other", "other", "other"],
+        ["other", "target", "other"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let records: Vec<_> = children.iter().enumerate().map(|(ordinal, child)| json!({
+            "recordName": format!("relation-{page}-{ordinal}"), "recordType":"CPLContainerRelation",
+            "fields":{"containerId":{"type":"STRING","value":"A"},"itemId":{"type":"STRING","value":child}}
+        })).collect();
+        let body = serde_json::to_vec(&json!({"zones":[{
+            "zoneID":root.spec.zone,"syncToken":format!("page-{page}"),"moreComing":false,"records":records
+        }]})).unwrap();
+        capacity = capacity.max(serde_json::to_vec(&request).unwrap().len() + body.len());
+        f.db.capture_selection_rank_page(
+            owner(),
+            root.id.clone(),
+            key.clone(),
+            request.clone(),
+            body.clone(),
+            MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap();
+        let id: String =
+            f.db.acquire_lock("original membership page id")
+                .unwrap()
+                .query_row(
+                    "SELECT id FROM provider_selection_rank_pages WHERE generation=?1 AND body=?2",
+                    rusqlite::params![root.id, body],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        for (ordinal, child) in children.iter().enumerate() {
+            if *child == "target" {
+                expected.push(RankSource {
+                    page_id: id.clone(),
+                    ordinal: ordinal.try_into().unwrap(),
+                });
+            }
+        }
+    }
+    expected.sort_by(|a, b| (&a.page_id, a.ordinal).cmp(&(&b.page_id, b.ordinal)));
+    let db = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+        .await
+        .unwrap();
+    let lookup = |budget| {
+        db.selection_rank_sources_with_budget(
+            owner(),
+            root.id.clone(),
+            key.clone(),
+            "target".into(),
+            budget,
+        )
+    };
+    assert_eq!(lookup(capacity).await.unwrap(), expected);
+    assert!(matches!(
+        lookup(capacity - 1).await,
+        Err(crate::state::error::StateError::ProviderSelectionFull)
+    ));
+}
+
+#[tokio::test]
 async fn original_membership_pages_reuse_selection_capture_and_survive_reopen() {
     use crate::state::db::provider_generations::MAX_GENERATION_BYTES;
     let (f, root, mut manifest, records) = active_pending_fixture().await;
