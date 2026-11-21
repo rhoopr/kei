@@ -1962,6 +1962,7 @@ mod wiremock_tests {
             state_db: None,
             provisional: false,
             indexing_inventory_only: false,
+            indexing_inventory_cursor: None,
             sync_mode: SyncMode::Full,
             enum_config_hash: None,
             album_name: None,

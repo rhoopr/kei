@@ -56,6 +56,7 @@ struct IndexingSession {
     change_records: Arc<Vec<Value>>,
     reject_cursor: bool,
     successor: &'static str,
+    query_token: &'static str,
 }
 
 #[async_trait::async_trait]
@@ -140,7 +141,7 @@ impl PhotosSession for IndexingSession {
             .unwrap_or(0);
         Ok(
             json!({"records":if offset == 0 && !(self.catalog.is_some() && body.contains("album-A")) { self.records.as_ref().clone() } else { Vec::new() },
-            "syncToken":"query-candidate"}),
+            "syncToken":self.query_token}),
         )
     }
     fn clone_box(&self) -> Box<dyn PhotosSession> {
@@ -179,6 +180,7 @@ fn provider(readiness: &'static str, ids: &[&str], base: &str) -> IndexingSessio
         change_records: Arc::new(Vec::new()),
         reject_cursor: false,
         successor: "trusted-after",
+        query_token: "query-candidate",
     }
 }
 
@@ -207,6 +209,120 @@ async fn library(
     .unwrap();
     library.library.shadow_capture = Some(indexing_capture(db));
     library
+}
+
+#[tokio::test]
+async fn indexing_split_pass_tokens_require_quiet_inventory_then_replay_retained_cursor() {
+    let root = tempfile::tempdir().unwrap();
+    let database = root.path().join("state.db");
+    let media = root.path().join("media");
+    std::fs::create_dir(&media).unwrap();
+    let config = make_run_cycle_config();
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let hold = indexing_reconciliation_key(ZONE);
+    let replay = crate::sync_cycle::indexing_replay_key(ZONE);
+    for round in 0..8 {
+        let db = indexing_db(&database).await;
+        if round == 0 {
+            db.set_metadata(CURSOR, "trusted-before").await.unwrap();
+            db.set_metadata(&hold, "1").await.unwrap();
+            db.set_metadata(
+                ENUM_CONFIG_HASH_KEY,
+                &download::compute_config_hash(&config),
+            )
+            .await
+            .unwrap();
+        }
+        let cancel = CancellationToken::new();
+        let mut source = provider("FINISHED", &[], "");
+        if round == 0 || round == 5 {
+            // Raw provider activity matters even when no asset event is emitted.
+            source.change_records =
+                Arc::new(vec![json!({"recordType":"Unknown","recordName":"other"})]);
+        } else if round == 2 {
+            source.interrupt = Some(cancel.clone());
+        }
+        let mut selected = library(&source, &db).await;
+        let mut album = source.clone();
+        album.query_token = if matches!(round, 1 | 4) {
+            ""
+        } else {
+            "other-query"
+        };
+        selected.plan.passes.insert(
+            0,
+            crate::commands::AlbumPass {
+                kind: crate::commands::PassKind::Album,
+                album: library(&album, &db)
+                    .await
+                    .library
+                    .albums()
+                    .await
+                    .unwrap()
+                    .remove("A")
+                    .unwrap()
+                    .pop()
+                    .unwrap(),
+                exclude_ids: Arc::default(),
+            },
+        );
+        selected.pass_scope.include_albums = true;
+        let store: Arc<dyn download::DownloadStore> = db.clone();
+        let build = make_run_cycle_download_config_builder(&media, store.clone());
+        let result = run_cycle(
+            &[&selected],
+            &config,
+            Some(store.as_ref()),
+            &build,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_metadata(&hold).await.unwrap().is_some(),
+            round < 3,
+            "round {round}: {:?}",
+            result.stats
+        );
+        assert_eq!(
+            db.get_metadata(&replay).await.unwrap().is_some(),
+            (3..=5).contains(&round),
+            "round {round}: {:?}, requests: {:?}",
+            result.stats,
+            source.changes.lock().unwrap()
+        );
+        assert_eq!(
+            db.get_metadata(CURSOR).await.unwrap().as_deref(),
+            Some(if round < 6 {
+                "trusted-before"
+            } else {
+                "trusted-after"
+            })
+        );
+        if round == 3 {
+            assert_eq!(
+                *source.changes.lock().unwrap(),
+                ["trusted-before", "trusted-after"]
+            );
+        } else if round == 4 {
+            // Even the same-cycle retry lacked a token. Keep replay debt on disk.
+            assert_eq!(result.stats.same_cycle_recovery_attempts, 1);
+            assert_eq!(*source.changes.lock().unwrap(), ["trusted-before"]);
+            assert!(!result.can_advance_database_checkpoint());
+        } else if round == 5 || round == 6 {
+            assert_eq!(
+                *source.changes.lock().unwrap(),
+                ["trusted-before", "trusted-after"]
+            );
+            assert_eq!(result.can_advance_database_checkpoint(), round == 6);
+        } else if round == 7 {
+            assert_eq!(*source.changes.lock().unwrap(), ["trusted-after"]);
+            assert_eq!(source.queries.load(Ordering::SeqCst), 0);
+            assert!(result.can_advance_database_checkpoint());
+        }
+    }
 }
 
 #[tokio::test]
@@ -973,7 +1089,15 @@ async fn indexing_running_plan_cannot_qualify_after_late_finished_probe() {
             round == 0
         );
         assert_eq!(db.get_downloaded_page(0, 10).await.unwrap().len(), round);
-        assert!(provider.changes.lock().unwrap().is_empty());
+        if round == 0 {
+            assert!(provider.changes.lock().unwrap().is_empty());
+        } else {
+            assert_eq!(
+                *provider.changes.lock().unwrap(),
+                ["trusted-before"],
+                "only the fresh FINISHED plan can observe the starting boundary"
+            );
+        }
     }
     server.verify().await;
 }

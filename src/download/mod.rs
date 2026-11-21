@@ -28,7 +28,7 @@ pub(crate) use filter::{AssetGroupings, determine_media_type};
 mod orchestration;
 
 pub(crate) use orchestration::config::{
-    DOWNLOAD_CONFIG_HASH_KEY, DownloadConfig, InventoryScope, compute_config_hash,
+    DOWNLOAD_CONFIG_HASH_KEY, DownloadConfig, IndexingWindow, InventoryScope, compute_config_hash,
     hash_download_config, hash_legacy_download_config, inventory_scope,
     sync_coverage_fingerprint_json,
 };

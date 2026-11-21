@@ -269,6 +269,18 @@ impl PhotoAlbum {
         self.container_id.is_some() && !self.cross_zone_sources.is_empty()
     }
 
+    pub(crate) fn covered_by_change_feed(&self, source: &Self) -> bool {
+        matches!((&self.shadow_capture, &source.shadow_capture),
+            (Some((left, database)), Some((right, other))) if left.owner == right.owner && database == other)
+            && super::has_explicit_owner(self.zone_id.get("ownerRecordName"))
+            && self.zone_id == source.zone_id
+            && self.service_endpoint == source.service_endpoint
+            && self
+                .cross_zone_sources
+                .iter()
+                .all(|album| album.covered_by_change_feed(source))
+    }
+
     /// Return total item count for this album via `HyperionIndexCountLookup`.
     pub async fn len(&self) -> anyhow::Result<u64> {
         self.fetch_len().await
