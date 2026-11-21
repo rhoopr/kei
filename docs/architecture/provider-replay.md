@@ -311,10 +311,11 @@ scheduling visits one due old root per cycle, at most 64 decisions and 16 MiB of
 serialized manifests, with a persisted continuation and retry deadlines. Within
 that transaction, each unique original rank page is strictly decoded and its
 complete ordered record index audited once. Compact page proofs are discarded
-when the operation ends; new reads use a stable read transaction. The existing
-512 MiB evidence quota bounds unique serialized input, without retaining all
+when the operation ends; new reads use a stable read transaction. Each replay
+validation operation can read up to 512 MiB of unique serialized input, without retaining all
 parsed pages. Original-fact reconstruction separately limits retained serialized
 page inputs to 64 MiB; unavailable bounded evidence remains deferred debt.
+Album source discovery checks candidate pages one at a time in the same read transaction and retains only matching ordinals. Unrelated membership pages do not spend a child's decision-validation allowance.
 The current generation receives a bounded priority metadata lane; remaining writers
 share the existing physical writer budget and persisted general continuation.
 HTTP 401, 403 and 421 current-confirmation failures stop additional hydration in
@@ -332,12 +333,9 @@ keys require an exact key match. A refreshed URL cannot replace frozen selection
 publication authorization. A transient per-invocation registry composes failed
 historical and current runs; it is not durable identity or a separate memory quota.
 
-The active store has a separate 512 MiB logical evidence charge budget and
-16 MiB page/manifest limits. Capacity refusal rolls back the whole observation or
-projection; no partial page can authorize progress. No records or debt are
-pruned. Logical charges do not bound physical SQLite files or WAL usage. Seals
-and retained source audits can still read substantial history; no fixed startup
-latency or constant total decode-work guarantee is advertised.
+The active store grows with the selected library. Existing evidence does not consume the allowance for the next write, including after an interrupted sync. Each individual charge is limited to 512 MiB; pages and manifests retain their 16 MiB limits. A failed write rolls back the whole observation or projection. No partial page can authorize progress. Logical charges do not bound SQLite file or WAL size.
+
+During writable sync, the generation owner verifies the seal of each checkpoint-ready generation in scope before retiring its raw rank responses. Deferred identities, unfinished destinations or metadata, prepared outputs, and confirmed repairs keep the original responses. For a settled generation, the transaction replaces each response with its ordered selected-child list. A receipt binds that list and the complete ordered record index to the original page ID. Source checks and seal verification use this receipt on reopen. The original confirmation inside each decision still supplies asset and rendition evidence for later repair. Checkpoints, files, and publication receipts are untouched.
 
 A later sealed, checkpoint-ready generation can supersede an unverified planned path when it has completed the same pass, child, master and rendition at a different path. Scope, configuration, provider checksum, size, metadata and dates must match. The earlier row stays admitted and unverified as historical evidence; it is neither deleted nor marked published. That row no longer creates retained replay work, asset-write conflicts or checkpoint debt. Prepared metadata outputs, incomplete current publications and deferred identities retain their guards. Scheduling validates the scope's retained decision proofs in the same read transaction before using this rule.
 

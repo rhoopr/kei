@@ -258,6 +258,15 @@ async fn current_debt_prepared_output_fences_an_existing_selected_path_across_co
     let prepared: String = f.db.acquire_lock("actual unresolved prepared output").unwrap()
         .query_row("SELECT generation FROM provider_active_destinations WHERE prepared_hash IS NOT NULL AND verified_metadata=0", [], |row| row.get(0)).unwrap();
     let evidence = historical_evidence(&f, &prepared);
+    let immutable_proof = |f: &Fixture| {
+        f.db.acquire_lock("original decision and page identities").unwrap().prepare(
+            "SELECT specification FROM provider_active_generations WHERE id=?1
+             UNION ALL SELECT manifest FROM provider_active_decisions WHERE generation=?1
+             UNION ALL SELECT CAST(id AS BLOB) FROM provider_selection_rank_pages WHERE generation=?1 ORDER BY 1"
+        ).unwrap().query_map([&prepared], |row| row.get::<_, Vec<u8>>(0)).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap()
+    };
+    let frozen = immutable_proof(&f);
     let path = f.config.directory.join("A/changed.JPG");
     let bytes = std::fs::read(&path).unwrap();
     assert_ne!(bytes, MEDIA);
@@ -321,7 +330,13 @@ async fn current_debt_prepared_output_fences_an_existing_selected_path_across_co
                 .await
                 .unwrap()
         );
-        assert_eq!(historical_evidence(&f, &prepared), evidence);
+        // Only the resolved writer's rank bodies may now be retired. The
+        // exact decision, original page identities, and output remain frozen.
+        assert_eq!(immutable_proof(&f), frozen);
+        let retired: bool = f.db.acquire_lock("settled prepared generation")
+            .unwrap().query_row("SELECT count(*)>0 AND count(*)=count(retired_proof_hash) FROM provider_selection_rank_pages WHERE generation=?1",
+                [&prepared], |row| row.get(0)).unwrap();
+        assert!(retired);
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert_eq!(
             std::fs::metadata(&path).unwrap().modified().unwrap(),

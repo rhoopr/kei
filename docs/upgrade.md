@@ -1,6 +1,6 @@
 # Upgrade an existing kei backup
 
-These steps apply to v0.30 (schema 45). If you are installing v0.26.0, use the [guide at the v0.26.0 tag](https://github.com/rhoopr/kei/blob/v0.26.0/docs/v0.26.0-upgrade.md). For another older release, read the documentation at its tag.
+These steps apply to v0.30 (schema 46). If you are installing v0.26.0, use the [guide at the v0.26.0 tag](https://github.com/rhoopr/kei/blob/v0.26.0/docs/v0.26.0-upgrade.md). For another older release, read the documentation at its tag.
 
 1. Before opening state, even with `kei status`, stop every writer, including watch processes, services and containers. Back up the configuration, entire data directory (including SQLite journal, WAL and SHM files), and media tree (including sidecars and hidden history) together. Verify the copy and retain the previous binary or image. To roll back, stop every writer and restore that matched set before starting the older binary.
 2. Work on a copy of your config. Follow the [rendition-policy migration](rendition-policy-migration.md) before adding `config_version = 1`. Review the edits, RAW/JPEG renditions and Live Photo components that your first sync can download. If you previously used `edited_naming = "primary"`, see [edited filenames and existing layouts](edited-primary.md).
@@ -12,3 +12,5 @@ These steps apply to v0.30 (schema 45). If you are installing v0.26.0, use the [
 Every schema upgrade needs room for a temporary copy of the database and configuration beside the live database. After committing the upgrade, kei reopens the database and checks the account, schema version, SQLite integrity and foreign keys. Once those checks pass, it deletes that upgrade's temporary bundle. If migration or verification fails, keep the bundle and follow its `restore.txt`. Older backups stay untouched. Keep your own backup from step 1 if you want to roll back after a successful upgrade.
 
 Schema 45 retires the old v0.26 provider responses. On RC and beta upgrades it removes the three old inbox archive tables from the live database. After releasing the temporary backup, kei compacts the live file if at least 8 MiB can be reclaimed and logs its size before and after. If another connection is using the database or disk space is too low, sync can proceed and the next writable open retries.
+
+Schema 46 lets a normal sync release enumeration responses for completed selections. An interrupted baseline keeps its evidence and can grow past the old 512 MiB limit. Resume with `kei sync` using the same state. SQLite can reuse space released by completed selections even if the database file stays the same size.

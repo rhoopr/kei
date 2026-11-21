@@ -36,6 +36,10 @@ A sparse change in PrimarySync can depend on a scoped Shared scan from the same 
 
 Keep the previous checkpoint on incomplete token proof, interruption, stale planning, or non-durable recovery. Unknown provider identity keeps work pending. A verified local copy does not prove that the provider deleted its source.
 
+Selection evidence limits apply to individual writes and validation operations. Retained history does not consume the next library's or restarted baseline's write allowance.
+
+Writable sync may retire raw enumeration responses only after verifying the selection seal and finding no unfinished identity, destination, metadata, or repair work. Compact rank proofs preserve the original seal and source links.
+
 File publication must preserve existing media unless replacement has exact authorization. Metadata writers must verify their input before replacement. A failed write leaves enough evidence to retry without overwriting a concurrent edit.
 
 Keep secrets and provider identifiers out of logs and reports. See [diagnostic evidence](architecture/support.md) for redaction, offline collection, and interpretation limits.

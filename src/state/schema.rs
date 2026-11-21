@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 45;
+pub(crate) const SCHEMA_VERSION: i32 = 46;
 const FRESH_START_VERSION: i32 = 38;
 const RETIRED_INBOX: [&str; 3] = [
     "provider_shadow_receipts",
@@ -1581,6 +1581,18 @@ pub(crate) fn migrate_to_version(
                     mark_inbox_compaction(conn)?;
                 }
             }
+        }
+        46 => {
+            if !column_exists(conn, "provider_selection_rank_pages", "retired_proof_hash")? {
+                conn.execute_batch(
+                    "ALTER TABLE provider_selection_rank_pages ADD COLUMN retired_proof_hash TEXT
+                    CHECK(retired_proof_hash IS NULL OR length(retired_proof_hash)=64);",
+                )?;
+            }
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_selection_rank_unretired ON provider_selection_rank_pages(generation)
+                 WHERE retired_proof_hash IS NULL;",
+            )?;
         }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
