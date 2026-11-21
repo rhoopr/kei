@@ -472,6 +472,9 @@ fn heif_valid_avif_large_idat_and_opaque_meta_preserve_codec_with_bounded_heap()
                 heif::locate_exif_tiff(&mut source, source_len).unwrap(),
                 None
             );
+            // The rewrites below replace this file. An open handle would make an
+            // NFS client keep the displaced original as `.nfsXXXX` in the journal.
+            drop(source);
             assert!(probe.datetime_original.is_none());
             assert_heap_bound(&probe_heap, "valid AVIF probe with large meta child");
             if reserve > 8 * 1024 * 1024 {

@@ -734,8 +734,8 @@ impl DownloadedFile {
             retained.path.sibling(&destination)
         })
         .await??;
-        let outcome =
-            publish_part_to_final(self.retained.path.path(), final_path, publication).await?;
+        let part_path = self.retained.path.path().to_path_buf();
+        let (outcome, part) = publish_part_to_final(&part_path, final_path, publication).await?;
         let retained = Arc::clone(&self.retained);
         self.retained = tokio::task::spawn_blocking(move || {
             let mut file = final_confined.open_regular()?;
@@ -765,6 +765,15 @@ impl DownloadedFile {
             }))
         })
         .await??;
+        // The verified handle on the `.part` was released when `retained` was
+        // replaced, so retiring the name left by a link publication cannot
+        // make an NFS client keep it as `.nfsXXXX`.
+        #[cfg(unix)]
+        if part == super::PartName::Linked {
+            super::retire_linked_part(&part_path).await;
+        }
+        #[cfg(not(unix))]
+        let _ = part;
         Ok(outcome)
     }
 }

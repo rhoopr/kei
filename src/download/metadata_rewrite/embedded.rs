@@ -206,7 +206,7 @@ pub(super) async fn publish_embed_metadata(
             tracing::warn!(
                 target: "kei::download::metadata_rewrite",
                 path = %path.display(),
-                error = %error,
+                error = format!("{error:#}"),
                 retained_paths = ?disposition.retained_paths,
                 "Failed to publish metadata"
             );

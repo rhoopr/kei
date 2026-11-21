@@ -121,8 +121,13 @@ removal. Only `ENOTEMPTY` from removal of a reverified empty, manifest-less
 journal is deferred with a warning; publication still verifies the target and
 removes only its matching prepared inode and bytes. Unknown entries, changed
 bytes or namespaces, other removal errors, and directory fsync failures remain
-errors. Empty journal recovery applies the same bounded cleanup. Historical
-prepared files are not swept by this path. NFS mounts with `nolock` do not
+errors. On NFS a journal entry unlinked while open stays as `.nfsXXXX`. Cleanup
+accepts it only when its inode is one the cleanup just unlinked, waits briefly
+for the client to retire it, then defers directory removal as for `ENOTEMPTY`.
+`ESTALE` from the journal directory is retried a bounded number of times,
+re-verifying each pass. Empty journal recovery applies the same bounded
+cleanup, and historical prepared files are not swept by this path. NFS mounts
+with `nolock` do not
 provide cross-host locking; do not run kei on the same destination from
 multiple NFS clients. Recovery does not authorize provider checkpoint progress
 or downloaded-state finalization by itself.

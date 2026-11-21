@@ -6,6 +6,8 @@ use std::path::Path;
 use tokio::fs;
 
 use crate::fs_util::ConfinedPath;
+#[cfg(target_os = "linux")]
+use crate::fs_util::RemovalKind;
 
 #[cfg(all(test, feature = "xmp", target_os = "linux"))]
 thread_local! {
@@ -23,10 +25,64 @@ pub(super) fn fsync_parent_dir_best_effort_blocking(path: &Path) {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+static LINK_FALLBACK_ROOTS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(all(test, target_os = "linux"))]
+fn link_fallback_forced(path: &Path) -> bool {
+    LINK_FALLBACK_ROOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|root| path.starts_with(root))
+}
+
+/// Makes no-replace publication under `root` behave as on a filesystem that
+/// rejects `RENAME_NOREPLACE` (NFS) until dropped. Scoped to a path so parallel
+/// tests and blocking-pool threads are unaffected.
+#[cfg(all(test, target_os = "linux"))]
+pub(in crate::download) struct ForcedLinkFallback(std::path::PathBuf);
+
+#[cfg(all(test, target_os = "linux"))]
+impl ForcedLinkFallback {
+    pub(in crate::download) fn new(root: &Path) -> Self {
+        LINK_FALLBACK_ROOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(root.to_path_buf());
+        Self(root.to_path_buf())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for ForcedLinkFallback {
+    fn drop(&mut self) {
+        let mut roots = LINK_FALLBACK_ROOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(position) = roots.iter().position(|root| *root == self.0) {
+            roots.remove(position);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::download) enum PublishResult {
     Published,
     DestinationExists,
+}
+
+/// Whether the `.part` name survives a no-replace publication. Link publication
+/// leaves it for the caller, which must close its own handle on the file before
+/// retiring the name: unlinking an open file makes an NFS client keep it as
+/// `.nfsXXXX`, leaving a second link on the published file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a link publication leaves the .part name for the caller to retire"]
+pub(in crate::download) enum PartName {
+    Gone,
+    #[cfg(unix)]
+    Linked,
 }
 
 /// A retirement move must consume the source atomically. Link publication is
@@ -37,7 +93,7 @@ pub(in crate::download) fn move_layout_confined(
 ) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        renameat2_confined_blocking(source, destination, libc::RENAME_NOREPLACE)
+        rename_noreplace_confined(source, destination)
     }
     #[cfg(target_os = "macos")]
     {
@@ -54,6 +110,101 @@ pub(in crate::download) fn move_layout_confined(
             "Conditional alias retirement is unsupported on this platform",
         ))
     }
+}
+
+/// Move between public names. A filesystem with `RENAME_NOREPLACE` keeps the
+/// atomic no-replace rename, so no foreign entry can be replaced unnoticed.
+///
+/// NFS rejects that flag, so the fallback publishes the source entry under the
+/// destination name and proves that name before removing the source. Removing
+/// the source first would destroy the only bytes when a foreign writer replaces
+/// the destination in between.
+pub(in crate::download) fn move_noreplace_confined(
+    source: &ConfinedPath,
+    destination: &ConfinedPath,
+) -> std::io::Result<()> {
+    let moved = move_layout_confined(source, destination);
+    #[cfg(target_os = "linux")]
+    if let Err(error) = &moved
+        && is_renameat2_unsupported(error)
+    {
+        return move_noreplace_without_renameat2(source, destination);
+    }
+    moved
+}
+
+/// A directory is claimed with an exclusive empty directory that only our own
+/// rename may replace. A file is linked first, and its source name is removed
+/// only once the destination is verified to hold that same entry.
+#[cfg(target_os = "linux")]
+fn move_noreplace_without_renameat2(
+    source: &ConfinedPath,
+    destination: &ConfinedPath,
+) -> std::io::Result<()> {
+    match source.open_directory() {
+        Ok(_) => {
+            let claim = destination.create_new_directory()?;
+            let claimed = crate::fs_util::file_identity(&claim)?;
+            match renameat2_confined_blocking(source, destination, 0) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // A foreign writer may own the name by now; keep its entry
+                    // and remove only the empty claim this call created.
+                    let _ = destination.remove_verified(claimed, RemovalKind::EmptyDirectory);
+                    Err(error)
+                }
+            }
+        }
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {
+            // The retained parents are the authority: an ancestor may have moved
+            // since these paths were opened.
+            let identity = source.retained_entry_identity()?;
+            hard_link_confined(source, destination)?;
+            if destination.retained_entry_identity()? != identity {
+                return Err(std::io::Error::other(
+                    "Move destination no longer holds the moved entry",
+                ));
+            }
+            source.remove_verified(identity, RemovalKind::File)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Move an obsolete alias into a private retirement slot: a unique name this
+/// process creates and has never used, so there is no foreign entry to replace.
+/// A filesystem without `RENAME_NOREPLACE` (NFS) therefore gets a plain rename,
+/// as `replacement_recovery::move_to_owned_slot` does for journal slots. Never
+/// use this to restore a public name; that keeps `move_noreplace_confined`.
+pub(in crate::download) fn retire_layout_confined(
+    source: &ConfinedPath,
+    slot: &ConfinedPath,
+) -> std::io::Result<()> {
+    let moved = move_layout_confined(source, slot);
+    #[cfg(target_os = "linux")]
+    if let Err(error) = &moved
+        && is_renameat2_unsupported(error)
+    {
+        if slot.entry_exists()? {
+            return Err(std::io::ErrorKind::AlreadyExists.into());
+        }
+        return renameat2_confined_blocking(source, slot, 0);
+    }
+    moved
+}
+
+/// `RENAME_NOREPLACE` rename. Tests can make it report the `EINVAL` an NFS
+/// client returns, to exercise the fallbacks without an NFS mount.
+#[cfg(target_os = "linux")]
+fn rename_noreplace_confined(
+    source: &ConfinedPath,
+    destination: &ConfinedPath,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if link_fallback_forced(source.path()) {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    renameat2_confined_blocking(source, destination, libc::RENAME_NOREPLACE)
 }
 
 /// Exchange only entries in the retained, no-follow parent capabilities.
@@ -86,14 +237,13 @@ pub(in crate::download) fn publish_reconciliation_part_blocking(
     destination: &ConfinedPath,
 ) -> std::io::Result<PublishResult> {
     #[cfg(target_os = "linux")]
-    let result =
-        renameat2_confined_blocking(part, destination, libc::RENAME_NOREPLACE).or_else(|error| {
-            if is_renameat2_unsupported(&error) {
-                hard_link_confined(part, destination)
-            } else {
-                Err(error)
-            }
-        });
+    let result = rename_noreplace_confined(part, destination).or_else(|error| {
+        if is_renameat2_unsupported(&error) {
+            hard_link_confined(part, destination)
+        } else {
+            Err(error)
+        }
+    });
     #[cfg(target_os = "macos")]
     let result = rename_confined_macos(part, destination, libc::RENAME_EXCL);
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
@@ -188,11 +338,24 @@ fn rename_confined_macos(
     }
 }
 
-#[cfg(target_os = "linux")]
+/// Publish and retire the `.part` name, for callers that hold no handle on it.
+#[cfg(unix)]
 pub(super) async fn publish_part_no_replace(
     part_path: &Path,
     final_path: &Path,
 ) -> std::io::Result<PublishResult> {
+    let (result, part) = publish_part_no_replace_keeping_link(part_path, final_path).await?;
+    if part == PartName::Linked {
+        retire_linked_part(part_path).await;
+    }
+    Ok(result)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) async fn publish_part_no_replace_keeping_link(
+    part_path: &Path,
+    final_path: &Path,
+) -> std::io::Result<(PublishResult, PartName)> {
     let part = part_path.to_path_buf();
     let final_path_buf = final_path.to_path_buf();
     let rename_result =
@@ -201,19 +364,25 @@ pub(super) async fn publish_part_no_replace(
             .map_err(std::io::Error::other)?;
 
     match rename_result {
-        Ok(()) => Ok(PublishResult::Published),
+        Ok(()) => Ok((PublishResult::Published, PartName::Gone)),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(PublishResult::DestinationExists)
+            Ok((PublishResult::DestinationExists, PartName::Gone))
         }
         Err(e) if is_renameat2_unsupported(&e) => publish_part_by_hard_link(part_path, final_path)
             .await
-            .or_else(|link_err| destination_exists_or(link_err, final_path)),
-        Err(e) => destination_exists_or(e, final_path),
+            .or_else(|link_err| {
+                destination_exists_or(link_err, final_path).map(|result| (result, PartName::Gone))
+            }),
+        Err(e) => destination_exists_or(e, final_path).map(|result| (result, PartName::Gone)),
     }
 }
 
 #[cfg(target_os = "linux")]
 fn renameat2_no_replace_blocking(part_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if link_fallback_forced(part_path) {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
     renameat2_blocking(part_path, final_path, libc::RENAME_NOREPLACE)
 }
 
@@ -268,13 +437,15 @@ pub(super) fn is_renameat2_unsupported(e: &std::io::Error) -> bool {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-pub(super) async fn publish_part_no_replace(
+pub(super) async fn publish_part_no_replace_keeping_link(
     part_path: &Path,
     final_path: &Path,
-) -> std::io::Result<PublishResult> {
+) -> std::io::Result<(PublishResult, PartName)> {
     publish_part_by_hard_link(part_path, final_path)
         .await
-        .or_else(|link_err| destination_exists_or(link_err, final_path))
+        .or_else(|link_err| {
+            destination_exists_or(link_err, final_path).map(|result| (result, PartName::Gone))
+        })
 }
 
 #[cfg(target_os = "macos")]
@@ -300,23 +471,37 @@ pub(super) fn rename_exchange_blocking(part_path: &Path, final_path: &Path) -> s
 async fn publish_part_by_hard_link(
     part_path: &Path,
     final_path: &Path,
-) -> std::io::Result<PublishResult> {
+) -> std::io::Result<(PublishResult, PartName)> {
     match fs::hard_link(part_path, final_path).await {
-        Ok(()) => {
-            if let Err(rm_err) = fs::remove_file(part_path).await {
-                tracing::warn!(target: "kei::download::file",
-                    path = %part_path.display(),
-                    error = %rm_err,
-                    "Failed to remove published .part file after no-overwrite hard link"
-                );
-            }
-            Ok(PublishResult::Published)
-        }
+        Ok(()) => Ok((PublishResult::Published, PartName::Linked)),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(PublishResult::DestinationExists)
+            Ok((PublishResult::DestinationExists, PartName::Gone))
         }
         Err(e) => Err(e),
     }
+}
+
+/// Remove the `.part` name that link publication left behind. The caller must
+/// have closed its own handles on the file first.
+#[cfg(unix)]
+pub(in crate::download) async fn retire_linked_part(part_path: &Path) {
+    if let Err(rm_err) = fs::remove_file(part_path).await {
+        tracing::warn!(target: "kei::download::file",
+            path = %part_path.display(),
+            error = %rm_err,
+            "Failed to remove published .part file after no-overwrite hard link"
+        );
+    }
+}
+
+#[cfg(windows)]
+pub(super) async fn publish_part_no_replace_keeping_link(
+    part_path: &Path,
+    final_path: &Path,
+) -> std::io::Result<(PublishResult, PartName)> {
+    publish_part_no_replace(part_path, final_path)
+        .await
+        .map(|result| (result, PartName::Gone))
 }
 
 #[cfg(windows)]

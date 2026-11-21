@@ -124,8 +124,11 @@ pub(in crate::download) fn write_reconciled_sidecar(
         let mut file = temp.create_new_regular()?;
         std::io::Write::write_all(&mut file, &bytes)?;
         file.sync_all()?;
-        let identity = crate::fs_util::file_identity(&file)?;
-        temp.validate_identity(identity)?;
+        let temp_identity = crate::fs_util::file_identity(&file)?;
+        temp.validate_identity(temp_identity)?;
+        // Publication may unlink the temporary name, so release the handle
+        // first: unlinking an open file leaves an NFS `.nfsXXXX` link behind.
+        drop(file);
         let publication =
             crate::download::file::publish_reconciliation_part_blocking(&temp, &destination)?;
         #[cfg(all(test, target_os = "linux"))]
@@ -134,12 +137,11 @@ pub(in crate::download) fn write_reconciled_sidecar(
         }
         match publication {
             crate::download::file::PublishResult::Published => {
-                #[cfg(target_os = "linux")]
-                crate::download::file::finish_owned_prepared_link(
+                crate::download::file::retire_published_temp_link(
                     &temp,
                     &destination,
                     fingerprint_bytes(&bytes)?,
-                    identity,
+                    temp_identity,
                 )?;
             }
             // A competing writer won. Accept only an identical packet below.
@@ -1295,5 +1297,61 @@ mod tests {
         let sidecar = dir.join("untouched.jpg.xmp");
         fs::remove_file(&sidecar).ok();
         fs::remove_file(&media_path).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_reconciled_sidecar_publishes_exactly_one_name(root: &Path) {
+        use std::os::unix::fs::MetadataExt;
+
+        let source = root.join("source.jpg");
+        fs::write(&source, b"media").unwrap();
+        let write = MetadataWrite {
+            rating: Some(4),
+            ..MetadataWrite::default()
+        };
+        write_sidecar_with_default_suffix(&source, &write).unwrap();
+        let destination = root.join("nested/destination.jpg");
+        let copy = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(crate::download::file::copy_local_file_no_replace(
+                root,
+                &source,
+                &destination,
+                ".part",
+            ))
+            .unwrap()
+            .unwrap();
+        super::write_reconciled_sidecar(&copy, || anyhow::bail!("source sidecar exists"), ".part")
+            .unwrap();
+        assert_eq!(
+            fs::metadata(root.join("nested/destination.jpg.xmp"))
+                .unwrap()
+                .nlink(),
+            1
+        );
+        let mut names: Vec<_> = fs::read_dir(root.join("nested"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["destination.jpg", "destination.jpg.xmp"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn link_fallback_reconciled_sidecar_retires_its_temporary_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let _fallback = crate::download::file::ForcedLinkFallback::new(dir.path());
+        assert_reconciled_sidecar_publishes_exactly_one_name(dir.path());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nfs_reconciled_sidecar_publishes_exactly_one_name() {
+        let Some(dir) = crate::test_helpers::nfs_test_dir("nfs_reconciled_sidecar") else {
+            return;
+        };
+        assert_reconciled_sidecar_publishes_exactly_one_name(dir.path());
     }
 }

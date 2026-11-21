@@ -249,6 +249,74 @@ pub(crate) fn skip_if_loopback_bind_blocked(test_name: &str) -> bool {
     }
 }
 
+/// Scratch directory on the NFS mount named by `KEI_NFS_TEST_DIR`, or `None`
+/// (skip) when it is unset. A path that is not on NFS panics, so a misconfigured
+/// run cannot pass without exercising NFS.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn nfs_test_dir(test_name: &str) -> Option<tempfile::TempDir> {
+    nfs_test_dir_from("KEI_NFS_TEST_DIR", test_name)
+}
+
+/// Like [`nfs_test_dir`] for a directory named by another variable, skipping
+/// when it is unset. A path that is not on NFS panics, so a misconfigured run
+/// cannot pass without exercising NFS.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn nfs_test_dir_from(variable: &str, test_name: &str) -> Option<tempfile::TempDir> {
+    let base = std::path::PathBuf::from(std::env::var_os(variable)?)
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("{variable} must exist: {error}"));
+    let fs_type = mount_type(&base, variable);
+    assert!(
+        fs_type.starts_with("nfs"),
+        "{variable} must be on NFS, found {fs_type}"
+    );
+    eprintln!("{test_name}: running on {fs_type} at {}", base.display());
+    Some(tempfile::tempdir_in(base).expect("create scratch directory on NFS"))
+}
+
+/// Scratch directory on the filesystem named by `KEI_NFS_NOLINK_TEST_DIR`, or
+/// `None` (skip) when it is unset. The mount type is not asserted: the helper
+/// proves the property the caller needs by attempting a hard link, so a
+/// filesystem that accepts one panics instead of skipping the refusal path.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn no_link_test_dir(test_name: &str) -> Option<tempfile::TempDir> {
+    let variable = "KEI_NFS_NOLINK_TEST_DIR";
+    let base = std::path::PathBuf::from(std::env::var_os(variable)?)
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("{variable} must exist: {error}"));
+    let fs_type = mount_type(&base, variable);
+    let directory = tempfile::tempdir_in(&base).expect("create scratch directory");
+    let source = directory.path().join("hard-link-probe");
+    std::fs::write(&source, b"probe").expect("write hard-link probe");
+    let linked = directory.path().join("hard-link-probe.linked");
+    assert!(
+        std::fs::hard_link(&source, &linked).is_err(),
+        "{test_name}: {variable} must refuse hard links, found {fs_type} at {}",
+        base.display()
+    );
+    std::fs::remove_file(&source).expect("remove hard-link probe");
+    eprintln!("{test_name}: running on {fs_type} at {}", base.display());
+    Some(directory)
+}
+
+/// Mount type of the filesystem holding `base`, from its longest matching
+/// `/proc/mounts` entry.
+#[cfg(all(test, target_os = "linux"))]
+fn mount_type(base: &std::path::Path, variable: &str) -> String {
+    let mounts = std::fs::read_to_string("/proc/mounts").expect("read /proc/mounts");
+    mounts
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let (_, mount_point, fs_type) = (fields.next()?, fields.next()?, fields.next()?);
+            base.starts_with(mount_point)
+                .then(|| (mount_point.len(), fs_type.to_owned()))
+        })
+        .max_by_key(|(length, _)| *length)
+        .map(|(_, fs_type)| fs_type)
+        .unwrap_or_else(|| panic!("{variable} is not under any mount"))
+}
+
 #[cfg(test)]
 pub(crate) async fn start_wiremock_or_skip(test_name: &str) -> Option<wiremock::MockServer> {
     if skip_if_loopback_bind_blocked(test_name) {

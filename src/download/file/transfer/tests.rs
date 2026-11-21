@@ -403,6 +403,109 @@ async fn attempt_download_happy_path_writes_and_renames() {
     assert_eq!(std::fs::read(&download_path).unwrap(), jpeg_body);
 }
 
+/// A download that publishes through the link fallback must leave exactly one
+/// name behind, with no link held open by the returned `DownloadedFile`.
+#[cfg(target_os = "linux")]
+async fn assert_download_leaves_exactly_one_name(dir: &std::path::Path) {
+    use std::os::unix::fs::MetadataExt;
+
+    let jpeg_body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+    let client = StubDownloadClient::ok(&jpeg_body);
+    let download_path = dir.join("one-name.jpg");
+    let part_path = dir.join("one-name.part");
+    let written = attempt_download(
+        &client,
+        "http://stub",
+        &download_path,
+        &part_path,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(written, jpeg_body.len() as u64);
+    assert_eq!(std::fs::metadata(&download_path).unwrap().nlink(), 1);
+    let names: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["one-name.jpg"]);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn link_fallback_download_leaves_exactly_one_name() {
+    let dir = TempDir::new().unwrap();
+    let _fallback = super::super::platform::ForcedLinkFallback::new(dir.path());
+    assert_download_leaves_exactly_one_name(dir.path()).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn nfs_download_leaves_exactly_one_name() {
+    let Some(dir) = crate::test_helpers::nfs_test_dir("nfs_download") else {
+        return;
+    };
+    assert_download_leaves_exactly_one_name(dir.path()).await;
+}
+
+/// Unlinking the `.part` while kei still holds its handle makes an NFS client
+/// keep it as `.nfsXXXX` for a moment, during which the published file reports
+/// two links and a crash would leave the stray link behind. A poller watches
+/// the directory for that entry across many publications.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn nfs_download_never_exposes_a_silly_renamed_part() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let Some(dir) = crate::test_helpers::nfs_test_dir("nfs_download_silly_rename") else {
+        return;
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let (root, stop, seen) = (dir.path().to_path_buf(), stop.clone(), seen.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let leftover = std::fs::read_dir(&root).is_ok_and(|entries| {
+                    entries
+                        .flatten()
+                        .any(|entry| entry.file_name().as_encoded_bytes().starts_with(b".nfs"))
+                });
+                if leftover {
+                    seen.store(true, Ordering::Relaxed);
+                }
+            }
+        })
+    };
+    let jpeg_body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+    for round in 0..200 {
+        let client = StubDownloadClient::ok(&jpeg_body);
+        let download_path = dir.path().join(format!("silly-{round}.jpg"));
+        let part_path = dir.path().join(format!("silly-{round}.part"));
+        attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    watcher.join().unwrap();
+    assert!(
+        !seen.load(Ordering::Relaxed),
+        "a silly-renamed `.nfs` entry appeared while publishing"
+    );
+}
+
 #[tokio::test]
 async fn attempt_download_skip_rename_leaves_part_file() {
     let jpeg_body = [0xFF, 0xD8, 0xFF, 0xE0];

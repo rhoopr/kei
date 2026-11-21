@@ -35,7 +35,8 @@ The release receipt and removal of the raw body commit together. Original hashes
 
 SQLite WAL `NORMAL`
 remains unchanged; a successful commit does not promise that every acknowledged
-observation survives power loss. Network filesystems are not newly qualified.
+observation survives power loss. Keep this state off network filesystems; see
+[network filesystems](publication.md#network-filesystems).
 
 Schema 36 adds a private-only canonical transport index. The provider adapter
 recomputes evidence from the retained page after account validation. It

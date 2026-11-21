@@ -95,10 +95,10 @@ pub(crate) use validation::local_file_size_matches_state;
 )]
 pub(super) use self::{
     fingerprint::ExistingFileSnapshot, fingerprint::fingerprint_file,
-    fingerprint::fingerprint_regular_file_snapshot_blocking, platform::PublishResult,
-    platform::publish_reconciliation_part_blocking, publication::FinalPathCollision,
-    publication::publish_part_to_final, replacement::ConditionalPublishErrorDisposition,
-    transfer::DownloadResponse,
+    fingerprint::fingerprint_regular_file_snapshot_blocking, platform::PartName,
+    platform::PublishResult, platform::publish_reconciliation_part_blocking,
+    publication::FinalPathCollision, publication::publish_part_to_final,
+    replacement::ConditionalPublishErrorDisposition, transfer::DownloadResponse,
 };
 
 /// Recover interrupted fallback publications before normal download work.
@@ -125,6 +125,32 @@ pub(super) fn cleanup_prepared_sidecar(
     identity: crate::fs_util::FileIdentity,
 ) -> anyhow::Result<()> {
     replacement_recovery::cleanup_prepared(path, expected, identity)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) use platform::ForcedLinkFallback;
+#[cfg(unix)]
+pub(super) use platform::retire_linked_part;
+
+/// Retire the temporary name that link-based no-replace publication leaves
+/// behind, once both names are verified as one inode with the expected bytes.
+/// Rename-based publication leaves nothing to retire. Close every handle on
+/// `temp` first: unlinking an open file leaves an NFS `.nfsXXXX` link behind.
+pub(super) fn retire_published_temp_link(
+    temp: &crate::fs_util::ConfinedPath,
+    destination: &crate::fs_util::ConfinedPath,
+    expected: ExistingFileFingerprint,
+    identity: crate::fs_util::FileIdentity,
+) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        replacement_recovery::finish_owned_prepared_link(temp, destination, expected, identity)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (temp, destination, expected, identity);
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]

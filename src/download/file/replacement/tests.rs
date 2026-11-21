@@ -72,7 +72,7 @@ async fn approved_truncated_publish_replaces_only_expected_bytes() {
         .unwrap();
     let expected = fingerprint_file(&final_path).await.unwrap();
 
-    let outcome = publish_part_to_final(
+    let (outcome, _) = publish_part_to_final(
         &part,
         &final_path,
         FinalPublication::ReplaceTruncated(expected),
