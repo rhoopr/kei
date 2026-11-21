@@ -789,7 +789,8 @@ where
                     .ok()
                     == Some(before)
             {
-                receipt.writer_output = Some(WriterOutput::Sidecar(packet));
+                receipt.writer_output =
+                    Some((WriterOutput::Sidecar(packet), *created_local.offset()));
             }
             storage_failed |= sidecar.storage_failed;
         }
@@ -844,7 +845,7 @@ where
             && final_fingerprint.is_some()
             && let Some(receipt) = pending_for_finish.selection_receipt.as_mut()
         {
-            receipt.writer_output = Some(WriterOutput::EmbeddedOnly);
+            receipt.writer_output = Some((WriterOutput::EmbeddedOnly, *created_local.offset()));
         }
         if let Some(preserved) = preserved_local {
             let current_time = tokio::fs::metadata(&path)

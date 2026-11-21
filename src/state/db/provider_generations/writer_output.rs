@@ -15,14 +15,14 @@ fn proof(
     manifest: &ActiveDecision,
     dest: &SelectionDestination,
     media: &str,
-    packet: WriterOutput,
+    (packet, offset): (WriterOutput, chrono::FixedOffset),
 ) -> Result<String, StateError> {
     let receipt = pending
         .selection_receipt
         .as_ref()
         .ok_or(StateError::ProviderSelectionInvalid)?;
     Ok(digest(&encode(&(
-        "native-metadata-writer-v1",
+        "native-metadata-writer-v2",
         (
             &root.spec.scope,
             &root.spec.config_hash,
@@ -38,6 +38,7 @@ fn proof(
         dest,
         &receipt.grouping_hash,
         pending.asset.created_at,
+        offset.local_minus_utc(),
         pending.asset.added_at,
         media,
         &pending.source_checksum,
@@ -52,9 +53,9 @@ pub(super) fn record(
     manifest: &ActiveDecision,
     dest: &SelectionDestination,
     media: &str,
-    packet: WriterOutput,
+    output: (WriterOutput, chrono::FixedOffset),
 ) -> Result<(), StateError> {
-    let checked = proof(pending, root, manifest, dest, media, packet)?;
+    let checked = proof(pending, root, manifest, dest, media, output)?;
     conn.execute("UPDATE provider_active_destinations SET writer_output_proof=?6 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND verified_metadata=1",
         params![root.id,manifest.decision.pass_key,manifest.decision.child,dest.version_size,dest.path.key()?,checked])?;
     Ok(())
@@ -86,10 +87,20 @@ impl SqliteStateDb {
         self.with_conn("finding previous writer outputs", move |conn| {
             account::validate_authenticated(conn, &owner)?;
             Ok(conn.prepare("SELECT pass_key,child,version_size,path FROM provider_active_destinations w
+                JOIN provider_active_generations g ON g.id=w.generation
                 WHERE generation=?1 AND (pass_key,child,version_size,path)>(?2,?3,?4,?5)
                 AND admitted=1 AND verified_media=1 AND verified_metadata=0 AND grouping_hash IS NOT NULL AND prepared_hash IS NULL AND preserved_local IS NULL
                 AND EXISTS (SELECT 1 FROM assets a WHERE a.library=w.library AND a.id=w.asset_id AND a.version_size=w.version_size AND a.checksum=w.checksum AND a.metadata_hash IS w.metadata_hash AND a.created_at IS w.created_at AND a.added_at IS w.added_at AND a.is_deleted=0)
-                AND EXISTS (SELECT 1 FROM provider_active_destinations old WHERE old.library=w.library AND old.asset_id=w.asset_id AND old.path=w.path AND old.writer_output_proof IS NOT NULL AND old.verified_metadata=1)
+                AND EXISTS (SELECT 1 FROM provider_active_destinations old
+                    JOIN provider_active_generations prior ON prior.id=old.generation
+                    WHERE old.library=w.library AND old.asset_id=w.asset_id AND old.path=w.path
+                    AND prior.scope=g.scope AND prior.config_hash=g.config_hash
+                    AND old.pass_key=w.pass_key AND old.child=w.child AND old.master=w.master AND old.version_size=w.version_size
+                    AND old.grouping_hash=w.grouping_hash AND old.metadata_hash=w.metadata_hash AND old.checksum=w.checksum
+                    AND old.size_bytes=w.size_bytes AND old.created_at=w.created_at AND old.added_at IS w.added_at
+                    AND old.source_checksum IS w.source_checksum AND old.local_checksum=w.local_checksum
+                    AND old.writer_output_proof IS NOT NULL AND old.verified_media=1 AND old.verified_metadata=1
+                    AND old.prepared_hash IS NULL AND old.preserved_local IS NULL)
                 ORDER BY pass_key,child,version_size,path LIMIT 64")?
                 .query_map(params![generation,after.pass,after.child,after.version,after.path], |r| Ok(WriterKey {pass:r.get(0)?,child:r.get(1)?,version:r.get(2)?,path:r.get(3)?}))?.collect::<Result<_,_>>()?)
         }).await
@@ -128,7 +139,8 @@ impl SqliteStateDb {
                 Err(StateError::ProviderWorkConflict(_)) => return Ok(()),
                 Err(error) => return Err(error),
             };
-            let checked = proof(&pending, &root, &manifest, dest, &media, packet)?;
+            let offset = *pending.asset.metadata.capture_local(pending.asset.created_at).offset();
+            let checked = proof(&pending, &root, &manifest, dest, &media, (packet, offset))?;
             let prior: Option<(String,String,String)> = tx.query_row(
                 "SELECT generation,pass_key,child FROM provider_active_destinations
                  WHERE library=?1 AND asset_id=?2 AND path=?3 AND writer_output_proof=?4

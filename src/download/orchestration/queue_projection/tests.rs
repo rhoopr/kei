@@ -1,6 +1,8 @@
 #![cfg(test)]
 
 mod current_debt;
+#[cfg(all(unix, feature = "xmp"))]
+mod writer_reuse;
 
 use super::{admit_retained_work, config_hash, has_due_retained_work};
 use crate::commands::{AlbumPass, PassKind};

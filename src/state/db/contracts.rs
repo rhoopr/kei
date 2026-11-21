@@ -122,7 +122,8 @@ pub(crate) struct PreservedLocal {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SelectionMetadataReceipt {
-    pub(crate) writer_output: Option<WriterOutput>,
+    /// Installed output and the capture offset used by that writer invocation.
+    pub(crate) writer_output: Option<(WriterOutput, chrono::FixedOffset)>,
     pub(crate) generation: String,
     pub(crate) pass_key: String,
     pub(crate) child: String,
