@@ -2194,15 +2194,15 @@ async fn reuse_writer_outputs(
             }
             let path = key.native_path()?;
             // Missing, changed or unreadable files go through the ordinary bounded writer.
-            let Ok(Some(media)) =
-                crate::download::file::retain_pending_file(&config.directory, &path).await
+            let Ok(media) =
+                crate::download::file::WriterSnapshot::read(&config.directory, &path).await
             else {
                 continue;
             };
             let sidecar = if flags.contains(crate::download::pipeline::MetadataFlags::XMP_SIDECAR) {
                 let mut sidecar = path.as_os_str().to_owned();
                 sidecar.push(".xmp");
-                let Ok(Some(packet)) = crate::download::file::retain_pending_file(
+                let Ok(packet) = crate::download::file::WriterSnapshot::read(
                     &config.directory,
                     std::path::Path::new(&sidecar),
                 )
@@ -2217,19 +2217,19 @@ async fn reuse_writer_outputs(
             #[cfg(test)]
             let _ = TEST_AFTER_WRITER_SNAPSHOT.try_with(|edit| edit(&path));
             let packet = sidecar.as_ref().map_or(WriterOutput::EmbeddedOnly, |file| {
-                WriterOutput::Sidecar(file.fingerprint.sha256)
+                WriterOutput::Sidecar(file.sha256)
             });
             db.reuse_writer_output(
                 owner.clone(),
                 generation.to_owned(),
                 key,
-                data_encoding::HEXLOWER.encode(&media.fingerprint.sha256),
+                data_encoding::HEXLOWER.encode(&media.sha256),
                 packet,
                 move || {
-                    media.validate_blocking().is_ok()
-                        && sidecar.is_none_or(|file| {
-                            file.validate_blocking().is_ok() && media.validate_stamp().is_ok()
-                        })
+                    sidecar
+                        .as_ref()
+                        .is_none_or(|file| file.still_matches().is_ok())
+                        && media.still_matches().is_ok()
                 },
             )
             .await?;

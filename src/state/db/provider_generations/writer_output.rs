@@ -113,7 +113,8 @@ impl SqliteStateDb {
         key: WriterKey,
         media: String,
         packet: WriterOutput,
-        files_still_match: impl FnOnce() -> bool + Send + 'static,
+        // Borrow the retained handles for the check; keep them live through commit.
+        files_still_match: impl Fn() -> bool + Send + 'static,
     ) -> Result<(), StateError> {
         self.with_conn_mut("confirming unchanged writer output", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;

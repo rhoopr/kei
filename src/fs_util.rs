@@ -194,6 +194,8 @@ pub(crate) enum ConfinedParents {
 #[derive(Clone, Copy)]
 enum ConfinedAccess {
     Read,
+    #[cfg(windows)]
+    StableRead,
     Metadata,
     Append,
 }
@@ -304,6 +306,13 @@ impl ConfinedPath {
     pub(crate) fn open_regular(&self) -> std::io::Result<std::fs::File> {
         self.validate_namespace()?;
         self.open_regular_with_access(ConfinedAccess::Read)
+    }
+
+    /// Hold a Windows writer-output snapshot without sharing writes or deletion.
+    #[cfg(windows)]
+    pub(crate) fn open_stable_read(&self) -> std::io::Result<std::fs::File> {
+        self.validate_namespace()?;
+        self.open_regular_with_access(ConfinedAccess::StableRead)
     }
 
     /// Identity of the entry itself, including a user-owned symbolic link.
@@ -656,11 +665,17 @@ impl ConfinedPath {
             drop(probe);
             let file = std::fs::OpenOptions::new()
                 .access_mode(match access {
-                    ConfinedAccess::Read => FILE_GENERIC_READ | FILE_READ_ATTRIBUTES,
+                    ConfinedAccess::Read | ConfinedAccess::StableRead => {
+                        FILE_GENERIC_READ | FILE_READ_ATTRIBUTES
+                    }
                     ConfinedAccess::Metadata => FILE_GENERIC_READ | FILE_WRITE_ATTRIBUTES,
                     ConfinedAccess::Append => FILE_GENERIC_READ | FILE_APPEND_DATA,
                 })
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .share_mode(if matches!(access, ConfinedAccess::StableRead) {
+                    FILE_SHARE_READ
+                } else {
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                })
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(&self.path)?;
             ensure_windows_regular(&file, &self.path)?;

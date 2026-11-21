@@ -16,7 +16,7 @@ async fn writer_reuse_rechecks_installed_files_before_completion() {
 
     const MEDIA: &[u8] = include_bytes!("../../../../../tests/data/media/pattern.jpg");
     fn edit_media(path: &Path) {
-        // Same inode, length and mtime: only rechecking contents catches this edit.
+        // Change bytes without changing identity, length or mtime.
         let mut file = std::fs::File::options().write(true).open(path).unwrap();
         let modified = file.metadata().unwrap().modified().unwrap();
         std::io::Write::write_all(&mut file, b"edit").unwrap();
@@ -40,7 +40,7 @@ async fn writer_reuse_rechecks_installed_files_before_completion() {
         .expect(2)
         .mount(&server)
         .await;
-    for edit in [edit_media as fn(&Path), replace_packet] {
+    for edit_during_packet_hash in [true, false] {
         let mut f = Fixture::new().await;
         f.config.folder_structure_albums = Arc::from("copies");
         f.config.metadata.xmp_sidecar = true;
@@ -68,8 +68,38 @@ async fn writer_reuse_rechecks_installed_files_before_completion() {
                 CancellationToken::new(),
             );
             let sync = TEST_METADATA_WRITER_BUDGET.scope(usize::from(cycle == 0), Box::pin(sync));
-            let result = if cycle == 1 {
-                TEST_AFTER_WRITER_SNAPSHOT.scope(edit, sync).await
+            let result = if cycle == 1 && edit_during_packet_hash {
+                let db = f.db.clone();
+                crate::download::file::WRITER_HASH_HOOK
+                    .scope(
+                        Arc::new(move |path| {
+                            // Pause the hash and require a write on the shared
+                            // connection to finish before reading any more bytes.
+                            let is_packet = path.extension().is_some_and(|ext| ext == "xmp");
+                            let key = if is_packet {
+                                "packet_hash_probe"
+                            } else {
+                                "media_hash_probe"
+                            };
+                            tokio::runtime::Handle::current().block_on(async {
+                                tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    db.set_metadata(key, "committed"),
+                                )
+                                .await
+                                .unwrap()
+                                .unwrap();
+                            });
+                            if is_packet {
+                                // The media hash is already complete.
+                                edit_media(&path.with_extension(""));
+                            }
+                        }),
+                        sync,
+                    )
+                    .await
+            } else if cycle == 1 {
+                TEST_AFTER_WRITER_SNAPSHOT.scope(replace_packet, sync).await
             } else {
                 sync.await
             }
@@ -77,6 +107,16 @@ async fn writer_reuse_rechecks_installed_files_before_completion() {
             assert_eq!(result.stats.downloaded, usize::from(cycle == 0));
             assert_eq!(result.stats.selected_work_remaining, cycle == 1);
             let conn = f.db.acquire_lock("check durable writer debt").unwrap();
+            if edit_during_packet_hash && cycle > 0 {
+                let markers: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM metadata WHERE key IN ('packet_hash_probe','media_hash_probe') AND value='committed'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(markers, 2);
+            }
             let pending: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_metadata=0", [], |r| r.get(0)).unwrap();
             assert_eq!(pending, i64::from(cycle == 1));
             if cycle == 1 {
@@ -91,6 +131,9 @@ async fn writer_reuse_rechecks_installed_files_before_completion() {
                 let path = serde_json::from_str::<super::SelectionPath>(&key)
                     .unwrap()
                     .to_path();
+                if edit_during_packet_hash {
+                    assert!(std::fs::read(&path).unwrap().starts_with(b"edit"));
+                }
                 // Restore the fixture's media for the zero-budget retry after reopen.
                 std::fs::write(path, MEDIA).unwrap();
             }

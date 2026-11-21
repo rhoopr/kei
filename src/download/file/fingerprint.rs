@@ -99,14 +99,92 @@ impl RetainedPendingFile {
         self.path.validate_identity(identity)?;
         Ok(())
     }
+}
 
-    /// Recheck the public entry after validating its companion file.
-    pub(in crate::download) fn validate_stamp(&self) -> anyhow::Result<()> {
-        let current = self.path.validate_identity(self.identity()?)?.metadata()?;
+/// A writer output hashed before opening the completion transaction.
+pub(in crate::download) struct WriterSnapshot {
+    path: ConfinedPath,
+    file: std::fs::File,
+    pub(in crate::download) sha256: [u8; 32],
+    #[cfg(unix)]
+    change_time: (i64, i64),
+}
+
+#[cfg(unix)]
+fn change_time(file: &std::fs::File) -> std::io::Result<(i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok((metadata.ctime(), metadata.ctime_nsec()))
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(in crate::download) static WRITER_HASH_HOOK: Arc<dyn Fn(&Path) + Send + Sync>;
+}
+
+impl WriterSnapshot {
+    pub(in crate::download) async fn read(root: &Path, path: &Path) -> anyhow::Result<Self> {
+        let root = root.to_owned();
+        let path = path.to_owned();
+        #[cfg(test)]
+        let hook = WRITER_HASH_HOOK.try_with(Arc::clone).ok();
+        tokio::task::spawn_blocking(move || {
+            let path = ConfinedPath::open(&root, &path, ConfinedParents::Existing)?;
+            #[cfg(windows)]
+            let mut file = path.open_stable_read()?;
+            #[cfg(unix)]
+            let mut file = path.open_regular()?;
+            #[cfg(unix)]
+            let change_time = {
+                let stamp = change_time(&file)?;
+                // Coarse or unknown timestamps cannot distinguish a same-tick edit.
+                anyhow::ensure!(
+                    stamp.1 > 0,
+                    "No subsecond inode change time for writer reuse"
+                );
+                let changed = chrono::DateTime::from_timestamp(stamp.0, u32::try_from(stamp.1)?)
+                    .context("Invalid inode change time")?;
+                let age = (chrono::Utc::now() - changed)
+                    .to_std()
+                    .context("Future inode change time")?;
+                // Start hashing outside the observed timestamp's clock tick.
+                // Older library files never wait. An edit before the hash starts
+                // must still pass the writer's SHA-256 check.
+                if let Some(remaining) = std::time::Duration::from_secs(1).checked_sub(age) {
+                    std::thread::sleep(remaining);
+                }
+                stamp
+            };
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook(path.path());
+            }
+            let sha256 = fingerprint_open_file_snapshot_blocking(&mut file, path.path())?
+                .fingerprint
+                .sha256;
+            Ok(Self {
+                path,
+                file,
+                sha256,
+                #[cfg(unix)]
+                change_time,
+            })
+        })
+        .await?
+    }
+
+    /// Bounded namespace and change checks only. Never read file contents here.
+    pub(in crate::download) fn still_matches(&self) -> anyhow::Result<()> {
+        let current = self
+            .path
+            .validate_identity(crate::fs_util::file_identity(&self.file)?)?;
+        #[cfg(unix)]
         anyhow::ensure!(
-            current.len() == self.fingerprint.size && current.modified().ok() == self.modified,
-            "Reserved file changed during finalization"
+            change_time(&current)? == self.change_time,
+            "Writer output changed"
         );
+        #[cfg(windows)]
+        drop(current); // The retained handle still excludes writes and replacement.
         Ok(())
     }
 }
