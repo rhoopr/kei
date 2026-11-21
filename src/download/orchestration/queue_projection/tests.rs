@@ -6657,6 +6657,234 @@ async fn private_selection_committed_corruption_refuses_pending_publication_proo
 }
 
 #[tokio::test]
+async fn private_selection_rank_retirement_keeps_sealed_unfinished_destinations() {
+    let (f, root, manifest, _) = Box::pin(active_pending_fixture()).await;
+    f.db.seal_selection_generation(owner(), root.id.clone(), true, None)
+        .await
+        .unwrap();
+    f.db.freeze_interrupted_selection(owner(), root.spec.scope)
+        .await
+        .unwrap();
+    let retained =
+        f.db.selection_decision(
+            owner(),
+            root.id.clone(),
+            manifest.decision.pass_key.clone(),
+            manifest.decision.child.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained, manifest);
+    let original: bool = f.db.acquire_lock("verify pending selection still has original pages").unwrap()
+        .query_row("SELECT count(*)>0 AND count(*)=sum(retired_proof_hash IS NULL) FROM provider_selection_rank_pages WHERE generation=?1",
+            [&root.id], |r| r.get(0)).unwrap();
+    assert!(original);
+}
+
+#[tokio::test]
+async fn private_selection_rank_retirement_rolls_back_then_reopens_schema_45() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let media = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
+    Mock::given(method("GET"))
+        .and(path("/settled"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("copies");
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL":format!("{}/settled",server.uri()), "size": media.len(),
+        "fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    let unfinished = destination_pass(&f, "B");
+    let neighbor = super::super::generation::begin_frozen_fixture(
+        std::slice::from_ref(&unfinished),
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    let key = super::super::generation::pass_key(&unfinished);
+    assert_eq!(
+        unfinished
+            .album
+            .with_rank_capture(&neighbor.id, &key)
+            .photos(None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let page_bodies =
+        |db: &SqliteStateDb, generation: &str| {
+            db.acquire_lock("original rank bytes").unwrap().prepare(
+            "SELECT body FROM provider_selection_rank_pages WHERE generation=?1 ORDER BY id"
+        ).unwrap().query_map([generation], |r| r.get::<_, Vec<u8>>(0)).unwrap()
+        .collect::<Result<Vec<_>, _>>().unwrap()
+        };
+    let untouched = page_bodies(&f.db, &neighbor.id);
+    f.db.acquire_lock("interrupt after first receipt").unwrap().execute_batch(
+        "CREATE TRIGGER stop_retirement BEFORE UPDATE OF retired_proof_hash ON provider_selection_rank_pages
+         WHEN EXISTS(SELECT 1 FROM provider_selection_rank_pages WHERE retired_proof_hash IS NOT NULL)
+         BEGIN SELECT RAISE(ABORT,'interrupted rank retirement'); END;"
+    ).unwrap();
+    let client = reqwest::Client::new();
+    let error = crate::download::download_photos_with_sync(
+        &client,
+        &[destination_pass(&f, "A")],
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("interrupted rank retirement"),
+        "{error:#}"
+    );
+    let settled: String = {
+        let conn =
+            f.db.acquire_lock("verify rollback; model a schema-45 upgrade")
+                .unwrap();
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_selection_rank_pages WHERE retired_proof_hash IS NOT NULL", [], |r| r.get(0)).unwrap(), 0);
+        conn.execute_batch("DROP TRIGGER stop_retirement; DROP INDEX idx_selection_rank_unretired;
+            ALTER TABLE provider_selection_rank_pages DROP COLUMN retired_proof_hash; PRAGMA user_version=45;").unwrap();
+        conn.query_row(
+            "SELECT id FROM provider_active_generations WHERE sealed=1 AND checkpoint_ready=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let before = page_bodies(&f.db, &settled);
+    f = reopen_destination_fixture(f).await;
+    let result = crate::download::download_photos_with_sync(
+        &client,
+        std::slice::from_ref(&f.pass),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(!result.checkpoint.sync_token_blocked, "{result:?}");
+    assert_eq!(result.stats.downloaded, 0);
+    assert_eq!(page_bodies(&f.db, &neighbor.id), untouched);
+    let after = page_bodies(&f.db, &settled);
+    assert_eq!(after.len(), before.len());
+    assert!(after.iter().map(Vec::len).sum::<usize>() < before.iter().map(Vec::len).sum());
+    for (old, new) in before.iter().zip(&after) {
+        assert_ne!(old, new);
+    }
+    f.preserved().await;
+    f = reopen_destination_fixture(f).await;
+    let quiet = crate::download::download_photos_with_sync(
+        &client,
+        std::slice::from_ref(&f.pass),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(!quiet.checkpoint.sync_token_blocked, "{quiet:?}");
+    assert_eq!(page_bodies(&f.db, &settled), after);
+    f.db.acquire_lock("damage a retired proof").unwrap().execute(
+        "UPDATE provider_selection_rank_pages SET body=X'5B5D' WHERE generation=?1 AND length(body)>2", [&settled],
+    ).map(|changed| assert!(changed > 0)).unwrap();
+    let invalid = crate::download::download_photos_with_sync(
+        &client,
+        std::slice::from_ref(&f.pass),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        invalid.downcast_ref::<crate::state::error::StateError>(),
+        Some(crate::state::error::StateError::ProviderSelectionInvalid)
+    ));
+}
+
+#[tokio::test]
+async fn private_selection_resumes_and_seals_above_former_store_limit() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let media = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
+    Mock::given(method("GET"))
+        .and(path("/selected"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("copies");
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL": format!("{}/selected", server.uri()), "size": media.len(),
+        "fileChecksum": data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    let root = crate::download::orchestration::generation::begin_frozen_fixture(
+        &[destination_pass(&f, "A")],
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    // Model the saved logical charge of an interrupted baseline without a 512 MiB fixture.
+    f.db.acquire_lock("seed retained evidence charge")
+        .unwrap()
+        .execute(
+            "UPDATE provider_active_generations SET charged_bytes=536870912 WHERE id=?1",
+            [&root.id],
+        )
+        .unwrap();
+    f = reopen_destination_fixture(f).await;
+    f.config.sync_mode = crate::download::SyncMode::Full;
+    let result = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        std::slice::from_ref(&f.pass),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.stats.downloaded, 1, "{result:?}");
+    assert_eq!(result.stats.state_write_failures, 0);
+    assert!(result.sync_token.is_some(), "{result:?}");
+    assert!(!result.checkpoint.sync_token_blocked);
+    let sealed: bool =
+        f.db.acquire_lock("verify original generation completed")
+            .unwrap()
+            .query_row(
+                "SELECT sealed AND checkpoint_ready FROM provider_active_generations WHERE id=?1",
+                [&root.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert!(sealed);
+    assert!(f.count("provider_selection_rank_pages") > 0);
+    assert_eq!(f.count("provider_active_decisions"), 1);
+    crate::download::orchestration::generation::begin_frozen_fixture(
+        &[destination_pass(&f, "B")],
+        &f.config,
+        controls(),
+    )
+    .await
+    .unwrap();
+    f.preserved().await;
+}
+
+#[tokio::test]
 async fn private_selection_projection_capacity_and_final_write_fault_are_atomic() {
     let (f, root, manifest, records) = Box::pin(active_pending_fixture()).await;
     let queue = f.queue();

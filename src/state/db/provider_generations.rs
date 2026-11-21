@@ -21,6 +21,10 @@ use super::rows::{decode_asset_date, encode_asset_date};
 use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
 
+mod rank_retirement;
+use rank_retirement::load_rank_proof;
+
+// Limit one generation evidence write; retained history never spends this allowance.
 pub(crate) const MAX_GENERATION_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const INDEPENDENT_ALBUM_COPIES: &str = "independent_album_copies";
 const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
@@ -385,7 +389,7 @@ fn insert_selection_rows(
             + 256,
     )
     .map_err(|_invalid| StateError::ProviderSelectionFull)?;
-    charge(conn, charged, capacity)?;
+    check_write_charge(charged, capacity)?;
     conn.execute("INSERT INTO provider_active_decisions(generation,pass_key,child,manifest,manifest_hash,outcome,admission,reason,charged_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(generation,pass_key,child) DO UPDATE SET manifest=excluded.manifest,manifest_hash=excluded.manifest_hash,outcome=excluded.outcome,admission=excluded.admission,reason=excluded.reason,attempts=CASE WHEN excluded.admission='deferred' THEN provider_active_decisions.attempts ELSE 0 END,next_retry_at=CASE WHEN excluded.admission='deferred' THEN provider_active_decisions.next_retry_at ELSE 0 END,charged_bytes=provider_active_decisions.charged_bytes+excluded.charged_bytes",params![generation,d.pass_key,d.child,bytes,hash,outcome_name(d.outcome),admission,reason,i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?])?;
     for source in &manifest.sources {
         conn.execute("INSERT OR IGNORE INTO provider_active_sources(generation,pass_key,child,page_id,ordinal) VALUES(?1,?2,?3,?4,?5)",params![generation,d.pass_key,d.child,source.page_id,source.ordinal])?;
@@ -1221,13 +1225,8 @@ fn refresh_progress_hash(
     Ok(())
 }
 
-fn charge(conn: &Connection, additional: u64, capacity: u64) -> Result<(), StateError> {
-    let used:i64=conn.query_row("SELECT COALESCE((SELECT SUM(charged_bytes) FROM provider_active_generations),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_selection_rank_pages),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_active_decisions),0)",[],|r|r.get(0))?;
-    if additional
-        > capacity.saturating_sub(
-            u64::try_from(used).map_err(|_invalid| StateError::ProviderSelectionInvalid)?,
-        )
-    {
+fn check_write_charge(additional: u64, capacity: u64) -> Result<(), StateError> {
+    if additional > capacity {
         return Err(StateError::ProviderSelectionFull);
     }
     Ok(())
@@ -1357,8 +1356,7 @@ fn load_rank(
 }
 
 /// Compact raw/index proofs live only within one owning operation. Parsed pages
-/// are released immediately. The existing evidence quota bounds all unique raw
-/// inputs; this does not introduce a smaller historical eligibility threshold.
+/// are released immediately. Validation bounds unique raw inputs per operation.
 struct RankProofs<'a> {
     conn: &'a Connection,
     root: &'a ActiveGeneration,
@@ -1401,15 +1399,8 @@ impl<'a> RankProofs<'a> {
             if additional > self.capacity.saturating_sub(self.bytes) {
                 return Err(StateError::ProviderSelectionFull);
             }
-            let page = load_rank(self.conn, self.root, &source.page_id)?;
-            self.pages.insert(
-                source.page_id.clone(),
-                SelectionSourceProof {
-                    pass_key: page.pass_key,
-                    selected_children: page.selected_children,
-                    membership: page.membership,
-                },
-            );
+            let proof = load_rank_proof(self.conn, self.root, &source.page_id)?;
+            self.pages.insert(source.page_id.clone(), proof);
             self.bytes += additional;
         }
         let ordinal = usize::try_from(source.ordinal)
@@ -1705,7 +1696,7 @@ impl SqliteStateDb {
             validate_generation_headers(&tx)?;
             freeze_interrupted_groupings(&tx, &scope)?;
             tx.commit()?;
-            Ok(())
+            rank_retirement::retire_completed(conn, &owner, &scope)
         })
         .await
     }
@@ -1804,7 +1795,7 @@ impl SqliteStateDb {
             let bytes=encode(&spec)?;let (account,provider)=owner_keys(&tx)?;
             let id=format!("{:032x}",rand::random::<u128>());
             let charged=u64::try_from(bytes.len()+id.len()+account.len()+provider.len()+spec.scope.len()+spec.config_hash.len()+spec.basis.len()+128).map_err(|_invalid|StateError::ProviderSelectionFull)?;
-            charge(&tx,charged,capacity)?;
+            check_write_charge(charged,capacity)?;
             tx.execute("INSERT INTO provider_active_generations(id,account_key,provider_key,scope,config_hash,basis,specification,specification_hash,created_at,charged_bytes,metadata_enabled) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![id,account,provider,spec.scope,spec.config_hash,spec.basis,bytes,digest(&bytes),Utc::now().timestamp_millis(),i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?,spec.metadata_enabled])?;
             let out=load_generation(&tx,&id)?;tx.commit()?;Ok(out)
         }).await
@@ -1826,11 +1817,11 @@ impl SqliteStateDb {
             let request=encode(&request)?;let request_hash=digest(&request);let body_hash=digest(&body);
             let id=digest(&encode(&(&generation,&key,&request_hash,&body_hash))?);
             let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_selection_rank_pages WHERE id=?1)",[&id],|r|r.get(0))?;
-            if exists {load_rank(&tx,&root,&id)?;tx.commit()?;return Ok(())}
+            if exists {load_rank_proof(&tx,&root,&id)?;tx.commit()?;return Ok(())}
             if root.sealed {return invalid()}
             let records=response.get("records").and_then(Value::as_array).ok_or(StateError::ProviderSelectionInvalid)?;
             let charged=u64::try_from(request.len()+body.len()+generation.len()+key.len()+id.len()+records.iter().map(|r|r.get("recordName").and_then(Value::as_str).map_or(0,str::len)+r.get("recordType").and_then(Value::as_str).map_or(0,str::len)+id.len()+32).sum::<usize>()+256).map_err(|_invalid|StateError::ProviderSelectionFull)?;
-            charge(&tx,charged,capacity)?;
+            check_write_charge(charged,capacity)?;
             tx.execute("INSERT INTO provider_selection_rank_pages(id,generation,pass_key,request,request_hash,body,body_hash,charged_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![id,generation,key,request,request_hash,body,body_hash,i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?])?;
             for (ordinal,record) in records.iter().enumerate() {
                 tx.execute("INSERT INTO provider_selection_rank_records(page_id,ordinal,record_name,record_type,deleted) VALUES(?1,?2,?3,?4,?5)",params![id,i64::try_from(ordinal).map_err(|_invalid|StateError::ProviderSelectionFull)?,record.get("recordName").and_then(Value::as_str),record.get("recordType").and_then(Value::as_str),record.get("deleted").and_then(Value::as_bool).unwrap_or(false)])?;
@@ -2590,7 +2581,7 @@ impl SqliteStateDb {
                         let prior_reason: String = tx.query_row("SELECT reason FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3", params![old_root.id,old.decision.pass_key,old.decision.child], |row| row.get(0))?;
                         let proof = ManagedSuccessor { generation: generation.clone(), manifest_hash: hash.clone(), operation: operation.operation.clone(), operation_hash: digest(&encode(&operation)?), prior_reason };
                         let reason = format!("{MANAGED_SUCCESSOR_PREFIX}{}", String::from_utf8(encode(&proof)?).map_err(|_invalid| StateError::ProviderSelectionInvalid)?);
-                        charge(&tx, u64::try_from(reason.len()).map_err(|_invalid| StateError::ProviderSelectionFull)?, capacity)?;
+                        check_write_charge(u64::try_from(reason.len()).map_err(|_invalid| StateError::ProviderSelectionFull)?, capacity)?;
                         tx.execute("UPDATE provider_active_decisions SET admission='excluded',reason=?4,charged_bytes=charged_bytes+?5 WHERE generation=?1 AND pass_key=?2 AND child=?3", params![old_root.id,old.decision.pass_key,old.decision.child,reason,i64::try_from(reason.len()).map_err(|_invalid| StateError::ProviderSelectionFull)?])?;
                         tx.execute("UPDATE provider_active_destinations SET admitted=0 WHERE generation=?1 AND pass_key=?2 AND child=?3", params![old_root.id,old.decision.pass_key,old.decision.child])?;
                         refresh_admission_hash(&tx, &old_root, &old.decision.pass_key, &old.decision.child)?;
@@ -3304,6 +3295,19 @@ fn seal_hash(
     ready: bool,
     veto: Option<&str>,
 ) -> Result<String, StateError> {
+    seal_hash_with_pages(conn, root, ready, veto, |page| {
+        load_rank_proof(conn, root, page)?;
+        Ok(())
+    })
+}
+
+fn seal_hash_with_pages(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    ready: bool,
+    veto: Option<&str>,
+    mut verify_page: impl FnMut(&str) -> Result<(), StateError>,
+) -> Result<String, StateError> {
     let mut hash = Sha256::new();
     hash.update(encode(&(&root.spec, ready, veto))?);
     let pages: Vec<String> = conn
@@ -3314,7 +3318,7 @@ fn seal_hash(
         return invalid();
     }
     for page in pages {
-        load_rank(conn, root, &page)?;
+        verify_page(&page)?;
         hash.update(page.as_bytes());
     }
     let keys:Vec<(String,String,String)>=conn.prepare("SELECT pass_key,child,manifest_hash FROM provider_active_decisions WHERE generation=?1 ORDER BY pass_key,child")?.query_map([&root.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;

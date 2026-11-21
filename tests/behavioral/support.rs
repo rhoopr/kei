@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 45;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 46;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -113,8 +113,10 @@ CREATE TABLE IF NOT EXISTS provider_selection_rank_pages (
  pass_key TEXT NOT NULL, request BLOB NOT NULL, request_hash TEXT NOT NULL,
  body BLOB NOT NULL, body_hash TEXT NOT NULL,
  charged_bytes INTEGER NOT NULL CHECK(charged_bytes>0),
+ retired_proof_hash TEXT CHECK(retired_proof_hash IS NULL OR length(retired_proof_hash)=64),
  UNIQUE(generation,pass_key,request_hash,body_hash)
 ) WITHOUT ROWID;
+CREATE INDEX idx_selection_rank_unretired ON provider_selection_rank_pages(generation) WHERE retired_proof_hash IS NULL;
 CREATE TABLE IF NOT EXISTS provider_selection_rank_records (
  page_id TEXT NOT NULL REFERENCES provider_selection_rank_pages(id),
  ordinal INTEGER NOT NULL CHECK(ordinal>=0), record_name TEXT NOT NULL,
