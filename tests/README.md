@@ -948,7 +948,7 @@ just test packaging             # release build + archive smoke
 just test docker-full           # Docker build, PUID, multiarch, CLI/default-command smokes
 just test service               # local service-smoke wrapper
 just test PATTERN               # passes through to cargo test PATTERN
-just static-checks              # fmt, clippy, docs, audit, lint, contracts, typos
+just static-checks              # fmt, clippy, docs, dependency policy, lint, contracts, typos
 just gate                       # static checks + offline behavior tests
 just release-smoke              # fast offline release regression smoke
 just release-local              # authorized local release provider/host prerequisites

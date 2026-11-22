@@ -1516,7 +1516,7 @@ fn local_gate_includes_script_and_workflow_lint_recipes() {
         "cargo\tclippy\t--all-targets\t--no-default-features\t--\t-D\twarnings",
         "cargo\tdoc\t--no-deps\t--all-features",
         "cargo\tfetch\t--locked",
-        "cargo\taudit\t--deny\twarnings",
+        "cargo\tdeny\tcheck",
         "just\tlint-workflows",
         "just\tlint-scripts",
         "check-contracts\t",
@@ -2014,8 +2014,8 @@ fn loopback_bound_tests_keep_explicit_skip_gate() {
 }
 
 #[test]
-fn audit_ignores_carry_removal_triggers() {
-    let audit = repo_file(".cargo/audit.toml");
+fn deny_ignores_carry_removal_triggers() {
+    let deny = repo_file("deny.toml");
 
     for expected in [
         "https://github.com/rhoopr/kei/issues/1066 removes chrono from the tree",
@@ -2023,8 +2023,8 @@ fn audit_ignores_carry_removal_triggers() {
         "Remove these ignores once plist and little_exif can both resolve",
     ] {
         assert!(
-            audit.contains(expected),
-            "audit ignore must document removal trigger: {expected}"
+            deny.contains(expected),
+            "deny ignore must document removal trigger: {expected}"
         );
     }
 }
