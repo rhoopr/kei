@@ -1604,23 +1604,20 @@ fn aggregate_ci_depends_on_no_default_feature_gate() {
 }
 
 #[test]
-fn rust_ci_runs_on_main_push_without_pr_only_coverage() {
+fn rust_ci_runs_on_main_push_without_ci_coverage() {
     let ci = repo_file(".github/workflows/checks.yml");
     assert!(repo_file(".github/workflows/ci.yml").contains("  push:\n    branches: [main]"));
     assert!(ci.contains("  workflow_call:"));
     assert!(ci.contains("LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}"));
+    for stale in ["coverage-head", "coverage-base", "coverage-comment"] {
+        assert!(
+            !ci.contains(stale),
+            "shared checks must not carry dead CI coverage surface: {stale}"
+        );
+    }
     assert!(
-        ci.split_once("  coverage-head:\n")
-            .unwrap()
-            .1
-            .contains("if: inputs.heavy")
-    );
-    assert!(ci.contains("      - coverage-head\n"));
-    assert!(
-        !ci.split_once("  ci:\n")
-            .unwrap()
-            .1
-            .contains("      - coverage\n")
+        !ci.contains("--no-report"),
+        "shared checks must not run a non-gating coverage invocation"
     );
 }
 
@@ -1653,13 +1650,6 @@ fn copies_stress_runs_in_main_and_qualification_checks() {
         repo_file("justfile")
             .matches(" -- --skip download::orchestration::queue_projection::tests::private_600_")
             .count(),
-        2
-    );
-    assert_eq!(
-        ci.matches(
-            "--no-report -- --skip download::orchestration::queue_projection::tests::private_600_"
-        )
-        .count(),
         2
     );
 }
