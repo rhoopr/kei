@@ -56,7 +56,7 @@ Nightly results do not replace this requirement.
 
 - **Main push CI evidence:** require the latest `Rust CI` push run for that SHA and its shared checks result to have succeeded. A missing, running, cancelled or failed run is a gap; nightly reports it instead of replaying the platform matrix. If the push run was still running, rerun nightly after it finishes.
 - **Seeded fuzzing:** build every registered target and run each with its available seeds for 120 seconds per target, including on an unchanged commit. The job restores the `fuzz/corpus` cache from earlier nights and saves it after the run. Heavy qualification runs its own fixed-budget fuzz pass from checked-in seeds without the nightly cache.
-- **Dependency policy:** enforce `deny.toml` every day, covering advisories from the current RustSec database, license allow lists, duplicate bans, and source restrictions.
+- **Dependency policy:** enforce `deny.toml` every day, covering advisories from the current RustSec database, license allow lists, duplicate-version warnings, and source restrictions.
 - **Optimized library tests:** run the all-feature release-mode library suite unless a prior successful nightly on the same SHA actually ran and passed it. A skipped test step is not evidence. If no qualifying result is found in the bounded history, run the tests.
 
 All four jobs must succeed for the nightly incident reporter to signal recovery. Nightly does not build release candidates. The **Daily live wiki check** runs separately at 06:43 UTC and reports documentation drift on its own Actions run. Heavy qualification still checks the wiki before a release.
