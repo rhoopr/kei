@@ -67,14 +67,16 @@ jobs:
 
   audit:
     if: github.ref == 'refs/heads/main'
-    name: RustSec audit
+    name: Dependency policy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@b7d831ec1a6ef0d81d27cf61932d92140b2271d4 # cargo-audit
-      - run: cargo audit --deny warnings
+      - uses: taiki-e/install-action@b7d831ec1a6ef0d81d27cf61932d92140b2271d4 # cargo-deny
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
 
   optimized:
     name: Optimized library tests

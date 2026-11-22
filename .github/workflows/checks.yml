@@ -480,16 +480,18 @@ jobs:
             pr_head_sha.txt
           retention-days: 14
 
-  # Checks dependencies against the RustSec Advisory Database
-  # Catches known security vulnerabilities in your dependency tree
+  # Enforces the dependency policy in deny.toml: advisories, licenses, bans,
+  # and sources.
   security:
-    name: Security Audit
+    name: Dependency policy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      - uses: taiki-e/install-action@b7d831ec1a6ef0d81d27cf61932d92140b2271d4 # cargo-audit
-      # Ignore list + rationale: .cargo/audit.toml.
-      - run: cargo audit --deny warnings
+      - uses: taiki-e/install-action@b7d831ec1a6ef0d81d27cf61932d92140b2271d4 # cargo-deny
+        with:
+          tool: cargo-deny
+      # Ignore list + rationale: deny.toml.
+      - run: cargo deny check
 
   # Check the contract catalog and guard against mutable action refs and privileged manual publishes.
   workflow-hardening:
