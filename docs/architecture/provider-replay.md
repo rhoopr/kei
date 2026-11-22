@@ -199,7 +199,11 @@ Managed-layout completion does not re-enter legacy catalog admission. Destinatio
 
 Managed inventory projects selected destinations before publishing files. After collection freezes membership and native metadata intent, the existing bounded destination replay runs the managed journal with current stored groupings. Native acknowledgement requires the exact binding, metadata recipe and verified media/sidecar fingerprints under destination locks. A journal commit alone cannot complete native metadata before its intent exists. Preserved unselected originals retain their journal protection without acquiring a current selection obligation.
 
-Ordinary authenticated current selection reads historical metadata-capture summaries for reporting without scheduling historical repair or using unresolved historical counts to block its checkpoint. Selected identity, publication and metadata obligations still gate advancement. Explicit refresh and compatibility execution retain their capture-repair policy. Historical rows, retry evidence and ownership records remain durable.
+Ordinary authenticated current selection reads historical metadata-capture summaries for reporting without scheduling historical repair or using unresolved historical counts to block its checkpoint. Unresolved provider identity and publication obligations still gate advancement. Explicit refresh and compatibility execution retain their capture-repair policy. Historical rows, retry evidence and ownership records remain durable.
+
+For ordinary sync, the runner processes all selected libraries and their eligible checkpoints before running queued metadata writers. A sealed, checkpoint-ready selection can release its token while metadata remains pending if the writer can recover the exact destination and catalogue input from SQLite. Missing media without an accepted local disposition, unconfirmed grouping changes, missing writer evidence and conflicting repairs still hold the token. The checkpoint decision never marks a destination's metadata verified or retires its source evidence.
+
+The local phase reads bounded pages from the selected generation and eligible legacy paths. It checks writer settings, destination ownership and file evidence again before publication. A quiet watch poll can run the local phase without a new rank inventory. After a page, a due provider poll takes priority; cancellation or storage and state failures leave unfinished receipts in SQLite. A failed local write cannot roll back an already committed zone token.
 
 Selection replay reuses independently verified destination publications before task execution. A remaining destination task bypasses rendition-wide on-disk adoption and uses normal transfer/publication finalization. This lets a landed file recover after a failed finalization transaction without marking only the aggregate asset row complete and stranding its destination obligation. No-overwrite publication and exact-path completion guards remain active.
 
@@ -324,7 +328,7 @@ validation operation can read up to 512 MiB of unique serialized input, without 
 parsed pages. Original-fact reconstruction separately limits retained serialized
 page inputs to 64 MiB; unavailable bounded evidence remains deferred debt.
 Album source discovery checks candidate pages one at a time in the same read transaction and retains only matching ordinals. Unrelated membership pages do not spend a child's decision-validation allowance.
-The current generation receives a bounded priority metadata lane; remaining writers
+Inline dispatch without a post-sync runner receives a bounded priority metadata lane; remaining writers
 share the existing physical writer budget and persisted general continuation.
 HTTP 401, 403 and 421 current-confirmation failures stop additional hydration in
 the selected run and preserve the existing bounded reauthentication route.

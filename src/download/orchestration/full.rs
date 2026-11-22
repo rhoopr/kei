@@ -1810,6 +1810,7 @@ pub(super) async fn download_photos_full_with_token_policy(
         && !streaming_result.storage_failed
         && !config.indexing_inventory_only
         && !config.refresh_metadata
+        && !config.post_sync_metadata
         && config.selection_run.is_none()
         && metadata_flags.has_any_write()
         && let Some(db) = &config.state_db

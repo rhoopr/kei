@@ -4158,6 +4158,109 @@ async fn shared_grouping_handoff_fences_loaded_legacy_and_settles_both_passes() 
     );
 }
 
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn local_backfill_reopens_after_primary_completion_and_skips_replaced_media() {
+    use crate::download::orchestration::generation::{
+        TEST_METADATA_WRITER_BUDGET, drain_local_backfill,
+    };
+    use sha2::{Digest, Sha256};
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+    let mut f = Fixture::new().await;
+    f.config.metadata.xmp_sidecar = true;
+    f.config.post_sync_metadata = true;
+    let server = MockServer::start().await;
+    let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.as_slice()))
+        .expect(4)
+        .mount(&server)
+        .await;
+    *f.session.records.lock().unwrap()=(0..4).flat_map(|n|{
+        let mut pair=records(&format!("local-{n}"),CURRENT,"Backfill caption");
+        pair[0]["fields"]["filenameEnc"]["value"]=json!(format!("local-{n}.jpg"));
+        pair[0]["fields"]["resOriginalRes"]["value"]=json!({"downloadURL":server.uri(),"size":bytes.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(bytes))});pair
+    }).collect();
+    let cancel = CancellationToken::new();
+    let passes = [destination_pass(&f, "A")];
+    let result = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes,
+        Arc::new(f.config.clone()),
+        controls(),
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.stats.downloaded, 4);
+    assert!(
+        result.sync_token.is_some() && !result.checkpoint.sync_token_blocked,
+        "{result:?}"
+    );
+    let pending = |f: &Fixture| {
+        f.db.acquire_lock("local writer receipts").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=0",[],|r|r.get(0)).unwrap()
+    };
+    assert_eq!(pending(&f), 4);
+    let paths = {
+        let conn = f.db.acquire_lock("backfill paths").unwrap();
+        conn.prepare("SELECT compat_path FROM provider_active_destinations ORDER BY asset_id")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0).map(std::path::PathBuf::from))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    drop(passes);
+    f = reopen_destination_fixture(f).await;
+    let passes = [destination_pass(&f, "A")];
+    let counts = || {
+        (
+            f.session.rank_calls.load(Ordering::SeqCst),
+            f.session.calls.load(Ordering::SeqCst),
+        )
+    };
+    let before = counts();
+    assert_eq!(
+        crate::download::has_due_selection_work(&passes, &f.config, controls())
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    // Force actual sidecar creation, then put different bytes at the first
+    // path. A stale writer must leave it alone and still reach later pages.
+    for path in &paths {
+        std::fs::remove_file(path.with_extension("JPG.xmp")).unwrap();
+    }
+    std::fs::write(&paths[0], b"new rendition").unwrap();
+    let mut cursor = Default::default();
+    let run = TEST_METADATA_WRITER_BUDGET
+        .scope(
+            1,
+            drain_local_backfill(
+                &passes,
+                &f.config,
+                &f.db,
+                controls(),
+                &cancel,
+                None,
+                &mut cursor,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(run.failed, 1);
+    assert_eq!(pending(&f), 1);
+    assert!(!paths[0].with_extension("JPG.xmp").exists());
+    for path in &paths[1..] {
+        assert!(
+            std::fs::read_to_string(path.with_extension("JPG.xmp"))
+                .unwrap()
+                .contains("Backfill caption")
+        );
+    }
+    assert_eq!(before, counts());
+}
+
 async fn historical_shared_album_successor_fixture(metadata: bool) {
     use crate::state::db::provider_generations::{INDEPENDENT_ALBUM_COPIES, MAX_GENERATION_BYTES};
     use sha2::{Digest, Sha256};

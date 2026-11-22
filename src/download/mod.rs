@@ -35,6 +35,7 @@ pub(crate) use orchestration::config::{
 pub(crate) use orchestration::context::{ClaimedLegacyMasterStates, DownloadContext};
 use orchestration::context::{RecordedLocalFile, preload_download_context};
 pub use orchestration::dispatch::download_photos_with_sync;
+pub(crate) use orchestration::generation::drain_local_backfill;
 pub(crate) use orchestration::generation::has_due as has_due_selection_work;
 pub(crate) use orchestration::generation::recover_deleted_album_selection;
 pub(crate) use orchestration::maintenance::{

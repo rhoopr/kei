@@ -467,6 +467,9 @@ pub(crate) enum IndexingWindow {
 /// Decoupled from CLI parsing so the engine can be tested independently.
 #[derive(Clone)]
 pub(crate) struct DownloadConfig {
+    /// The runner owns a local writer phase after all selected zones and
+    /// their database checkpoint. Standalone dispatch must finish its own work.
+    pub(crate) post_sync_metadata: bool,
     /// One upgrade-requested inventory guarded by retained-cursor replay.
     pub(crate) inventory_reconciliation: bool,
     /// A due sparse source in another selected zone needs a fresh membership scan.
@@ -709,6 +712,7 @@ impl DownloadConfig {
         use rustc_hash::FxHashSet;
         Self {
             inventory_reconciliation: false,
+            post_sync_metadata: false,
             directory: Arc::from(Path::new("/nonexistent/download_filter_tests")),
             folder_structure: "{:%Y/%m/%d}".to_string(),
             folder_structure_albums: Arc::from(crate::config::DEFAULT_FOLDER_STRUCTURE_ALBUMS),

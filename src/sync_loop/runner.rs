@@ -436,6 +436,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let cfg_folder_structure_smart_folders: Arc<str> =
         Arc::from(config.download.folder_structure_smart_folders.as_str());
     let enum_config_hash: Arc<str> = download::compute_config_hash(&config).into();
+    let post_sync_metadata = !config.runtime.refresh_metadata
+        && download::metadata_rewrite::writers_enabled(&config.metadata)
+        && capture_timestamp_repair == download::CaptureTimestampRepair::Preserve
+        && !config.runtime.dry_run
+        && !config.runtime.only_print_filenames;
 
     let build_download_config = |sync_mode: download::SyncMode,
                                  exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>,
@@ -443,6 +448,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                                  library: Arc<str>|
      -> Arc<download::DownloadConfig> {
         Arc::new(download::DownloadConfig {
+            post_sync_metadata,
             inventory_reconciliation: false,
             directory: Arc::clone(&cfg_directory),
             folder_structure: config.download.folder_structure.clone(),
@@ -618,6 +624,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // breadcrumb. Cycle 1 is the first iteration of this loop, cycle 2 is the
     // first re-entry under `--watch`, etc.
     let mut cycle_index: u64 = 0;
+    let mut backfill_cursors = std::collections::HashMap::new();
     if is_watch_mode {
         match config.watch.reconcile_every_n_cycles {
             Some(n) if n > 0 => tracing::info!(
@@ -691,8 +698,13 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             && !config.runtime.only_print_filenames
             && let Some(db) = state_db.as_deref()
         {
-            include_pending_local_work(&mut watch_precheck, db, &config.metadata, &library_states)
-                .await;
+            include_pending_local_work(
+                &mut watch_precheck,
+                db,
+                (!post_sync_metadata).then_some(&config.metadata),
+                &library_states,
+            )
+            .await;
             include_pending_provider_work(
                 &mut watch_precheck,
                 &library_states,
@@ -703,6 +715,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         }
 
         let current_work_complete;
+        let mut backfill_safe = true;
         if matches!(watch_precheck, WatchPrecheck::SkipAll) {
             current_work_complete = true;
             cycle_reporter.report_skipped_watch_cycle(&mut health).await;
@@ -812,6 +825,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 cycle_result.session_expired,
                 cycle_started_at.elapsed(),
             );
+            backfill_safe = !cycle_result.stats.storage_failed
+                && cycle_result.stats.state_write_failures == 0
+                && !cycle_result.session_expired;
             current_work_complete = facts.status == crate::cycle_reporter::CycleStatus::Success;
             cycle_reporter
                 .report_completed_cycle(&mut health, facts)
@@ -838,12 +854,87 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                         cumulative = cumulative_failed_count,
                         "Some sync failures occurred this cycle, will retry next cycle"
                     );
-                } else {
-                    return Err(PartialSyncError(cycle_result.failed_count).into());
                 }
             } else {
                 reauth_attempts = 0;
             }
+        }
+
+        // The zone decisions and (where eligible) the database precheck token
+        // are already durable. Local failures cannot revoke those checkpoints.
+        let backfill_started = std::time::Instant::now();
+        let deadline = config
+            .watch
+            .interval
+            .and_then(|secs| backfill_started.checked_add(std::time::Duration::from_secs(secs)));
+        if post_sync_metadata
+            && backfill_safe
+            && let Some(db) = startup_db.as_deref()
+        {
+            // A large first library must not consume every watch interval.
+            let start = usize::try_from(cycle_index - 1)
+                .unwrap_or(0)
+                .checked_rem(library_states.len())
+                .unwrap_or(0);
+            for library in library_states
+                .iter()
+                .cycle()
+                .skip(start)
+                .take(library_states.len())
+            {
+                if shutdown_token.is_cancelled()
+                    || deadline.is_some_and(|due| std::time::Instant::now() >= due)
+                {
+                    break;
+                }
+                if library.plan_is_stale {
+                    continue;
+                }
+                let local_config = build_download_config(
+                    download::SyncMode::Full,
+                    Arc::default(),
+                    Arc::default(),
+                    Arc::from(library.zone_name.as_str()),
+                );
+                let cursor = backfill_cursors
+                    .entry(library.zone_name.clone())
+                    .or_default();
+                match Box::pin(download::drain_local_backfill(
+                    &library.plan.passes,
+                    &local_config,
+                    db,
+                    download_controls,
+                    &shutdown_token,
+                    deadline,
+                    cursor,
+                ))
+                .await
+                {
+                    Ok(outcome) if outcome.storage_failed => {
+                        tracing::warn!(
+                            "Local metadata backfill stopped on a storage failure; pending work was retained"
+                        );
+                        cumulative_failed_count = cumulative_failed_count.saturating_add(1);
+                        break;
+                    }
+                    Ok(outcome) if outcome.failed > 0 => {
+                        tracing::warn!(
+                            pending = outcome.failed,
+                            "Local metadata remains pending; provider checkpoints are unchanged"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error,"Local metadata backfill stopped; pending work was retained");
+                        cumulative_failed_count = cumulative_failed_count.saturating_add(1);
+                        break;
+                    }
+                }
+            }
+        }
+        let backfill_elapsed = backfill_started.elapsed();
+        if !is_watch_mode && cumulative_failed_count > 0 {
+            return Err(PartialSyncError(cumulative_failed_count).into());
         }
 
         if current_work_complete
@@ -886,7 +977,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             sd_notifier.notify_status(&format!("Waiting {interval} seconds..."));
             tracing::info!(interval_secs = interval, "Waiting before next cycle");
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+                () = tokio::time::sleep(std::time::Duration::from_secs(interval).saturating_sub(backfill_elapsed)) => {}
                 () = shutdown_token.cancelled() => {
                     tracing::info!("Shutdown during wait, exiting...");
                     break;

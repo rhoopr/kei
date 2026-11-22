@@ -81,10 +81,11 @@ impl WatchPrecheck {
 pub(super) async fn include_pending_local_work(
     watch_precheck: &mut WatchPrecheck,
     db: &dyn download::DownloadStore,
-    metadata: &config::MetadataConfig,
+    inline_metadata: Option<&config::MetadataConfig>,
     library_states: &[LibraryState],
 ) {
-    let rewrite_writers_enabled = download::metadata_rewrite::writers_enabled(metadata);
+    let rewrite_writers_enabled =
+        inline_metadata.is_some_and(download::metadata_rewrite::writers_enabled);
     let mut local_work_zones = rustc_hash::FxHashSet::default();
     for library in library_states {
         let zone = library.zone_name.as_str();
