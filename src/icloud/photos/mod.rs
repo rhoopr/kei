@@ -545,7 +545,9 @@ impl PhotosService {
     }
 }
 
-pub(crate) use album::selection_capture::{selection_membership_child, validated_selection_page};
+pub(crate) use album::selection_capture::{
+    selected_album_name, selection_membership_child, validated_selection_page,
+};
 
 #[cfg(test)]
 mod tests {

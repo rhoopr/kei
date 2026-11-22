@@ -1,6 +1,6 @@
 # Upgrade an existing kei backup
 
-These steps apply to v0.30 (schema 48). If you are installing v0.26.0, use the [guide at the v0.26.0 tag](https://github.com/rhoopr/kei/blob/v0.26.0/docs/v0.26.0-upgrade.md). For another older release, read the documentation at its tag.
+These steps apply to v0.30 (schema 49). If you are installing v0.26.0, use the [guide at the v0.26.0 tag](https://github.com/rhoopr/kei/blob/v0.26.0/docs/v0.26.0-upgrade.md). For another older release, read the documentation at its tag.
 
 1. Before opening state, even with `kei status`, stop every writer, including watch processes, services and containers. Back up the configuration, entire data directory (including SQLite journal, WAL and SHM files), and media tree (including sidecars and hidden history) together. Verify the copy and retain the previous binary or image. To roll back, stop every writer and restore that matched set before starting the older binary.
 2. Work on a copy of your config. Follow the [rendition-policy migration](rendition-policy-migration.md) before adding `config_version = 1`. Review the edits, RAW/JPEG renditions and Live Photo components that your first sync can download. If you previously used `edited_naming = "primary"`, see [edited filenames and existing layouts](edited-primary.md).
@@ -18,3 +18,5 @@ Schema 46 lets a normal sync release enumeration responses for completed selecti
 Schema 47 records the output of a successful metadata writer, including the XMP packet when sidecars are enabled. Existing rows start without this proof. Normal sync builds it as it drains pending metadata.
 
 Schema 48 indexes membership pages and destination identities so a sync can look up one asset without scanning unrelated records. The migration marks historical membership pages from their retained records. Every rank page and record stays in place.
+
+Schema 49 adds a nullable successor-generation reference to active destination rows for metadata ownership. Existing rows keep their values and start without a successor. The migration does not infer one from historical destinations or their verification state.

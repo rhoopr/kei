@@ -1002,6 +1002,24 @@ pub enum SourceMetadataRecovery {
 /// Metadata rewrite markers and hashes.
 #[async_trait]
 pub trait MetadataRewriteStore: Send + Sync {
+    /// Leave metadata on this path to its selected writer when a frozen
+    /// grouping disagrees. Media publication has independent authority.
+    async fn grouping_writer_pending(
+        &self,
+        _library: &str,
+        _asset: &str,
+        _version: &str,
+        _path: &Path,
+    ) -> Result<bool, StateError> {
+        Ok(false)
+    }
+    /// Recheck ownership under the destination lock before a queued writer touches files.
+    async fn claim_selection_writer(
+        &self,
+        pending: &PendingMetadataRewrite,
+    ) -> Result<bool, StateError> {
+        Ok(pending.selection_receipt.is_none())
+    }
     /// Accept an exact previously prepared output without completing current intent.
     async fn recover_embedded_metadata_receipt(
         &self,

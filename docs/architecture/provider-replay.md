@@ -265,6 +265,14 @@ An immediate projection transaction commits the validated decision, source
 links, per-pass/rendition/path obligations, existing queue records, mappings and
 grouping changes together. Unfinished old versions and frozen grouping/writer
 intent fence incompatible newer work. Independent healthy work can proceed.
+A changed grouping alone does not block a missing media download. Under the
+destination lock, a selected metadata writer can take over an older intent
+when a confirmed album membership explains the entire grouping change and
+both intents identify the same resource, path and metadata settings. The old
+row retains its frozen hash and media receipt. Only the writer's normal
+completion settles the replacement. A display name, an unfiled observation
+or an unexplained people change cannot authorize the transfer. A prepared
+output stays with the writer that prepared it.
 Current query coverage is sealed only from that generation's own evidence;
 replaying a newer inventory cannot seal an interrupted old window. Configuration
 or source changes create a distinct generation or require existing validated

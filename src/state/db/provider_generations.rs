@@ -21,7 +21,9 @@ use super::rows::{decode_asset_date, encode_asset_date};
 use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
 
+mod grouping_handoff;
 mod rank_retirement;
+pub(super) use grouping_handoff::claim_writer;
 mod writer_output;
 pub(crate) use super::contracts::WriterOutput;
 use rank_retirement::load_rank_proof;
@@ -954,6 +956,7 @@ type DestinationProofRow = (
     Option<String>,
     bool,
     bool,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -2149,9 +2152,9 @@ fn validate_decision_rows(
     }
     for destination in &d.destinations {
         let photo = photo.ok_or(StateError::ProviderSelectionInvalid)?;
-        let (group, intent, media, metadata, local, source, progress): DestinationProofRow = conn
+        let (group, intent, media, metadata, local, source, progress, successor): DestinationProofRow = conn
             .prepare_cached(
-                "SELECT grouping_hash,intent_hash,verified_media,verified_metadata,local_checksum,source_checksum,progress_hash
+                "SELECT grouping_hash,intent_hash,verified_media,verified_metadata,local_checksum,source_checksum,progress_hash,metadata_successor
                  FROM provider_active_destinations
                  WHERE generation=?1 AND pass_key=?2 AND child=?3 AND asset_id=?4 AND version_size=?5 AND path=?6
                    AND checksum=?7 AND size_bytes=?8 AND metadata_hash=?9 AND master=?10 AND library=?11 AND compat_path=?12
@@ -2165,10 +2168,21 @@ fn validate_decision_rows(
                     destination.metadata_hash, d.master, manifest.media_zone(root).get("zoneName").and_then(Value::as_str),
                     destination.path.to_path().to_string_lossy(), superseded, admission=="admitted",
                     encode_asset_date(photo.created()), encode_asset_date(photo.added_date())],
-                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)),
+                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)),
             )
             .optional()?
             .ok_or(StateError::ProviderSelectionInvalid)?;
+        if let Some(link) = successor {
+            grouping_handoff::validate_link(
+                conn,
+                &root.id,
+                &d.pass_key,
+                &d.child,
+                &destination.version_size,
+                &destination.path.key()?,
+                &link,
+            )?;
+        }
         match (&group, &intent) {
             (None, None) if !root.sealed => {}
             (Some(group), Some(stored))
@@ -2548,7 +2562,7 @@ impl SqliteStateDb {
             let mut statement=conn.prepare("SELECT pass_key,child FROM provider_active_decisions WHERE generation=?1")?;
             let mut rows=statement.query([&generation])?;
             while let Some(row)=rows.next()? {let key:String=row.get(0)?;let child:String=row.get(1)?;load_decision_with_sources(conn,&root,&key,&child,false)?;}
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission<>'excluded' AND next_retry_at>?2) AND NOT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) AND NOT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND ((verified_media=0 AND preserved_local IS NULL) OR (?3=1 AND verified_metadata=0)))",params![generation,Utc::now().timestamp(),root.spec.metadata_enabled],|r|r.get(0))?)
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission<>'excluded' AND next_retry_at>?2) AND NOT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) AND NOT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND ((verified_media=0 AND preserved_local IS NULL) OR (?3=1 AND verified_metadata=0 AND metadata_successor IS NULL)))",params![generation,Utc::now().timestamp(),root.spec.metadata_enabled],|r|r.get(0))?)
         }).await
     }
 
@@ -2739,7 +2753,7 @@ impl SqliteStateDb {
             let album=selected_pass.pointer("/scope/name").and_then(Value::as_str).filter(|name|!name.is_empty() && selected_pass.get("kind").and_then(Value::as_str)!=Some("Unfiled"));
             if d.outcome==SelectionOutcome::Selected
                 && let Some(album)=album {
-                let conflict:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND g.metadata_enabled=1 AND w.verified_metadata=0 AND w.grouping_hash IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM asset_albums WHERE library=?1 AND asset_id=?2 AND album_name=?3)",params![manifest.media_zone(&root).get("zoneName").and_then(Value::as_str),manifest.state_id,album],|r|r.get(0))?;
+                let conflict:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND g.metadata_enabled=1 AND w.verified_metadata=0 AND w.prepared_hash IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM asset_albums WHERE library=?1 AND asset_id=?2 AND album_name=?3)",params![manifest.media_zone(&root).get("zoneName").and_then(Value::as_str),manifest.state_id,album],|r|r.get(0))?;
                 if conflict {reason="unfinished_grouping_conflict".to_owned()}
             }
             let admitted=d.outcome==SelectionOutcome::Selected && reason.is_empty();
@@ -2761,10 +2775,11 @@ impl SqliteStateDb {
                     }
                 }
                 tx.execute("INSERT INTO asset_master_mappings(library,asset_record_name,master_record_name,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(library,asset_record_name) DO UPDATE SET master_record_name=excluded.master_record_name,updated_at=excluded.updated_at",params![library,d.child,d.master,now])?;
-                if let Some(album)=album {
-                    tx.execute("INSERT OR IGNORE INTO asset_albums(library,asset_id,album_name,source) VALUES(?1,?2,?3,'icloud')",params![library,manifest.state_id,album])?;
-                }
+                let inserted_album = if let Some(album)=album {
+                    tx.execute("INSERT OR IGNORE INTO asset_albums(library,asset_id,album_name,source) VALUES(?1,?2,?3,'icloud')",params![library,manifest.state_id,album])? > 0
+                } else {false};
                 refresh_asset_album_groupings_tx(&tx,library,&manifest.state_id,None)?;
+                if inserted_album { guard_groupings(&tx,library,&manifest.state_id)?; }
                 tx.execute("UPDATE provider_active_destinations SET admitted=1 WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child])?;
             }
             let attempts:u32=tx.query_row("SELECT attempts FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child],|r|r.get(0))?;
@@ -2816,7 +2831,7 @@ impl SqliteStateDb {
     ) -> Result<Vec<ActiveDecision>, StateError> {
         self.with_conn("reading unfinished selected destinations",move|conn|{
             account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;pass(&root,&key)?;
-            let children:Vec<String>=conn.prepare("SELECT d.child FROM provider_active_decisions d WHERE d.generation=?1 AND d.pass_key=?2 AND (?3 IS NULL OR d.child>?3) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR (?5=1 AND w.verified_metadata=0)))) ORDER BY d.child LIMIT ?6")?.query_map(params![generation,key,after,Utc::now().timestamp(),root.spec.metadata_enabled,limit],|r|r.get(0))?.collect::<Result<_,_>>()?;
+            let children:Vec<String>=conn.prepare("SELECT d.child FROM provider_active_decisions d WHERE d.generation=?1 AND d.pass_key=?2 AND (?3 IS NULL OR d.child>?3) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR (?5=1 AND w.verified_metadata=0 AND w.metadata_successor IS NULL)))) ORDER BY d.child LIMIT ?6")?.query_map(params![generation,key,after,Utc::now().timestamp(),root.spec.metadata_enabled,limit],|r|r.get(0))?.collect::<Result<_,_>>()?;
             children.iter().map(|child|load_decision(conn,&root,&key,child)).collect()
         }).await
     }
@@ -2828,7 +2843,7 @@ impl SqliteStateDb {
     ) -> Result<bool, StateError> {
         self.with_conn("inspecting destination wake-up",move|conn|{
             account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND ((verified_media=0 AND preserved_local IS NULL) OR (?3=1 AND verified_metadata=0)))",params![generation,Utc::now().timestamp(),root.spec.metadata_enabled],|r|r.get(0))?)
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND ((verified_media=0 AND preserved_local IS NULL) OR (?3=1 AND verified_metadata=0 AND metadata_successor IS NULL)))",params![generation,Utc::now().timestamp(),root.spec.metadata_enabled],|r|r.get(0))?)
         }).await
     }
 }
@@ -3469,6 +3484,21 @@ pub(super) fn grouping_hash(
     library: &str,
     asset: &str,
 ) -> Result<String, StateError> {
+    Ok(digest(&encode(&grouping_names(conn, library, asset)?)?))
+}
+
+pub(crate) fn writer_grouping_hash(
+    albums: &[String],
+    people: &[String],
+) -> Result<String, StateError> {
+    Ok(digest(&encode(&[albums, people])?))
+}
+
+fn grouping_names(
+    conn: &Connection,
+    library: &str,
+    asset: &str,
+) -> Result<Vec<Vec<String>>, StateError> {
     let mut groups = Vec::new();
     for (table, column) in [
         ("asset_albums", "album_name"),
@@ -3482,7 +3512,7 @@ pub(super) fn grouping_hash(
             .collect::<Result<_, _>>()?;
         groups.push(names);
     }
-    Ok(digest(&encode(&groups)?))
+    Ok(groups)
 }
 
 fn freeze_asset_intents(
@@ -3541,7 +3571,7 @@ pub(super) fn guard_groupings(
 ) -> Result<(), StateError> {
     validate_identity_decisions(conn, library, asset)?;
     let current = grouping_hash(conn, library, asset)?;
-    let conflict:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND g.metadata_enabled=1 AND w.verified_metadata=0 AND w.grouping_hash IS NOT NULL AND w.grouping_hash IS NOT ?3)",params![library,asset,current],|r|r.get(0))?;
+    let conflict:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND g.metadata_enabled=1 AND w.verified_metadata=0 AND w.prepared_hash IS NOT NULL AND w.grouping_hash IS NOT ?3)",params![library,asset,current],|r|r.get(0))?;
     if conflict {
         Err(StateError::ProviderWorkConflict("frozen_grouping_changed"))
     } else {
@@ -3585,7 +3615,7 @@ const CURRENT_SELECTION_CONFIGURATION: &str = "g.scope=?1 AND g.config_hash=?2";
 // this rendition at its current path. Keep every old row and prepared output.
 // Callers validate generation/decision proofs before relying on these columns.
 const UNFINISHED: &str = "w.admitted=1
-    AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR (g.metadata_enabled=1 AND w.verified_metadata=0))
+    AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR (g.metadata_enabled=1 AND w.verified_metadata=0 AND w.metadata_successor IS NULL))
     AND NOT (w.verified_media=0 AND w.preserved_local IS NULL AND w.prepared_hash IS NULL AND EXISTS (
         SELECT 1 FROM provider_active_destinations current
         JOIN provider_active_generations newer ON newer.id=current.generation
@@ -4145,6 +4175,25 @@ pub(super) fn metadata_receipt(
     version: &str,
     path_key: &str,
 ) -> Result<super::PendingMetadataRewrite, StateError> {
+    let pending = queued_metadata_receipt(conn, generation, key, child, version, path_key)?;
+    let receipt = pending
+        .selection_receipt
+        .as_ref()
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    if grouping_hash(conn, &pending.asset.library, &pending.asset.id)? != receipt.grouping_hash {
+        return Err(StateError::ProviderWorkConflict("frozen_grouping_changed"));
+    }
+    Ok(pending)
+}
+
+pub(super) fn queued_metadata_receipt(
+    conn: &Connection,
+    generation: &str,
+    key: &str,
+    child: &str,
+    version: &str,
+    path_key: &str,
+) -> Result<super::PendingMetadataRewrite, StateError> {
     let root = load_generation(conn, generation)?;
     let manifest = load_decision(conn, &root, key, child)?;
     let destination = manifest
@@ -4153,15 +4202,12 @@ pub(super) fn metadata_receipt(
         .iter()
         .find(|d| d.version_size == version && d.path.key().ok().as_deref() == Some(path_key))
         .ok_or(StateError::ProviderSelectionInvalid)?;
-    let (local,source,group):(String,Option<String>,String)=conn.query_row("SELECT local_checksum,source_checksum,grouping_hash FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL) AND verified_metadata=0",params![generation,key,child,version,path_key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    let (local,source,group):(String,Option<String>,String)=conn.query_row("SELECT local_checksum,source_checksum,grouping_hash FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL) AND verified_metadata=0 AND metadata_successor IS NULL",params![generation,key,child,version,path_key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     let library = manifest
         .media_zone(&root)
         .get("zoneName")
         .and_then(Value::as_str)
         .ok_or(StateError::ProviderSelectionInvalid)?;
-    if grouping_hash(conn, library, &manifest.state_id)? != group {
-        return Err(StateError::ProviderWorkConflict("frozen_grouping_changed"));
-    }
     let mut asset=conn.query_row(&format!("SELECT {} FROM assets WHERE library=?1 AND id=?2 AND version_size=?3 AND checksum=?4 AND metadata_hash=?5 AND is_deleted=0",super::rows::ASSET_COLUMNS),params![library,manifest.state_id,version,destination.checksum,destination.metadata_hash],super::rows::row_to_asset_record)?;
     asset.local_path = Some(destination.path.to_path());
     asset.local_checksum = Some(local.clone());
@@ -4284,6 +4330,10 @@ pub(super) fn finish_metadata_receipt(
             .ok_or(StateError::ProviderSelectionInvalid)?,
     )
     .key()?;
+    if conn.query_row("SELECT metadata_successor IS NOT NULL FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+        params![root.id,receipt.pass_key,receipt.child,pending.asset.version_size.as_str(),path], |r|r.get::<_,bool>(0))? {
+        return Err(StateError::ProviderWorkConflict("metadata_writer_replaced"));
+    }
     let selected_destination = manifest
         .decision
         .destinations
@@ -4378,7 +4428,7 @@ pub(super) fn finish_metadata_receipt(
         // A single physical write can satisfy multiple passes only when every
         // frozen input and writer dependency is exactly compatible. Different
         // native paths always retain independent publication obligations.
-        let mut statement=conn.prepare("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND checksum=?5 AND metadata_hash IS ?6 AND created_at IS ?7 AND added_at IS ?8 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL) AND verified_metadata=0 AND local_checksum IS ?9 AND source_checksum IS ?10 AND grouping_hash=?11 AND size_bytes=?12 ORDER BY generation,pass_key,child")?;
+        let mut statement=conn.prepare("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND checksum=?5 AND metadata_hash IS ?6 AND created_at IS ?7 AND added_at IS ?8 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL) AND verified_metadata=0 AND metadata_successor IS NULL AND local_checksum IS ?9 AND source_checksum IS ?10 AND grouping_hash=?11 AND size_bytes=?12 ORDER BY generation,pass_key,child")?;
         let aliases = statement.query_map(
             params![
                 pending.asset.library,

@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 48;
+pub(crate) const SCHEMA_VERSION: i32 = 49;
 const FRESH_START_VERSION: i32 = 38;
 const RETIRED_INBOX: [&str; 3] = [
     "provider_shadow_receipts",
@@ -1622,6 +1622,16 @@ pub(crate) fn migrate_to_version(
                    ON provider_active_destinations(child,library);",
             )?;
         }
+        49 => {
+            // Nullable successor generation reference for metadata ownership.
+            // The migration cannot infer that relationship from historical
+            // rows, so every existing destination starts without one.
+            if !column_exists(conn, "provider_active_destinations", "metadata_successor")? {
+                conn.execute_batch(
+                    "ALTER TABLE provider_active_destinations ADD COLUMN metadata_successor TEXT;",
+                )?;
+            }
+        }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -2691,6 +2701,62 @@ mod tests {
                 (1, "relation".into(), Some("CPLContainerRelation".into())),
             ],
             "the schema migration must preserve every historical rank row"
+        );
+    }
+
+    #[test]
+    fn metadata_successor_migration_preserves_historical_destinations_and_unverified_state() {
+        let conn = historical_provider_fixture(48);
+        conn.execute(
+            "UPDATE provider_active_destinations
+                SET admitted=1, verified_media=0, verified_metadata=0,
+                    checksum='old-resource', local_checksum='local-bytes'
+              WHERE generation='old'",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let successor: Option<String> = conn
+            .query_row(
+                "SELECT metadata_successor FROM provider_active_destinations WHERE generation='old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            successor, None,
+            "historical destinations must start without a successor generation"
+        );
+        let retained: (String, String, String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT path,checksum,local_checksum,admitted,verified_media,verified_metadata
+                   FROM provider_active_destinations WHERE generation='old'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            retained,
+            (
+                "retained-native-path".into(),
+                "old-resource".into(),
+                "local-bytes".into(),
+                1,
+                0,
+                0
+            ),
+            "the migration must retain destination identity and its unverified state"
         );
     }
 

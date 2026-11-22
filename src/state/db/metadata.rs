@@ -258,6 +258,33 @@ fn query_pending_metadata_rewrites(
         .map_err(|e| StateError::query("get_pending_metadata_rewrites_for_queue", e))
 }
 
+/// Used both to select legacy rows and to validate an already loaded row
+/// under the physical writer lock. A completed older publication cannot
+/// stand in for a newer writer that has not finished.
+const LEGACY_WRITER_AVAILABLE: &str = "NOT EXISTS(SELECT 1 FROM unattributed_legacy u WHERE u.library=rewrite_source.library AND u.asset_id=rewrite_source.id)
+    AND NOT EXISTS(SELECT 1 FROM provider_active_destinations preserved
+        WHERE preserved.library=rewrite_source.library AND preserved.asset_id=rewrite_source.id
+        AND preserved.version_size=rewrite_source.version_size AND preserved.compat_path=rewrite_source.local_path
+        AND preserved.admitted=1 AND preserved.preserved_local IS NOT NULL)
+    AND NOT EXISTS(SELECT 1 FROM provider_active_destinations w
+        JOIN provider_active_generations g ON g.id=w.generation
+        WHERE w.library=rewrite_source.library AND w.asset_id=rewrite_source.id
+        AND w.version_size=rewrite_source.version_size AND w.admitted=1 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL)
+        AND w.verified_metadata=0 AND w.metadata_successor IS NULL AND g.metadata_enabled=1
+        AND w.compat_path=rewrite_source.local_path
+        AND json_extract(w.path,'$.encoding')='utf8' AND json_extract(w.path,'$.path')=rewrite_source.local_path
+        AND NOT EXISTS(SELECT 1 FROM provider_active_destinations done
+            JOIN provider_active_generations newer ON newer.id=done.generation
+            WHERE newer.scope=g.scope AND newer.created_at>g.created_at
+            AND done.library=w.library AND done.asset_id=w.asset_id
+            AND done.version_size=w.version_size AND done.path=w.path
+            AND done.admitted=1 AND done.verified_media=1 AND done.verified_metadata=1
+            AND done.checksum=rewrite_source.checksum
+            AND done.local_checksum IS rewrite_source.local_checksum
+            AND done.metadata_hash IS rewrite_source.metadata_hash
+            AND done.created_at IS rewrite_source.created_at
+            AND done.added_at IS rewrite_source.added_at))";
+
 /// One bounded ordered page across existing TEXT receipts and exact active
 /// destinations; each active candidate is revalidated before reaching the writer.
 type MetadataCandidate = (bool, String, String, String, String, String, String, String);
@@ -290,7 +317,7 @@ fn query_selection_and_legacy_metadata(
             json_extract(g.specification,'$.metadata_flags') AS flags,
             row_number() OVER (writer ORDER BY (w.prepared_hash IS NULL),w.generation,w.pass_key,w.child) AS representative
         FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation
-        WHERE w.admitted=1 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL) AND w.verified_metadata=0
+        WHERE w.admitted=1 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL) AND w.verified_metadata=0 AND w.metadata_successor IS NULL
             AND w.grouping_hash IS NOT NULL AND g.metadata_enabled=1 {generation_filter}
             AND EXISTS(SELECT 1 FROM assets a WHERE a.library=w.library AND a.id=w.asset_id
                 AND a.version_size=w.version_size AND a.checksum=w.checksum
@@ -307,28 +334,7 @@ fn query_selection_and_legacy_metadata(
             local_path AS path,metadata_write_failed_at * 1000 AS ready
         FROM ({source}) rewrite_source WHERE metadata_write_failed_at IS NOT NULL AND status='downloaded'
             AND is_deleted=0 AND local_path IS NOT NULL {legacy_filter}
-            AND NOT EXISTS(SELECT 1 FROM unattributed_legacy u WHERE u.library=rewrite_source.library AND u.asset_id=rewrite_source.id)
-            AND NOT EXISTS(SELECT 1 FROM provider_active_destinations preserved
-                WHERE preserved.library=rewrite_source.library AND preserved.asset_id=rewrite_source.id
-                AND preserved.version_size=rewrite_source.version_size AND preserved.compat_path=rewrite_source.local_path
-                AND preserved.admitted=1 AND preserved.preserved_local IS NOT NULL)
-            AND NOT EXISTS(SELECT 1 FROM provider_active_destinations w
-                JOIN provider_active_generations g ON g.id=w.generation
-                WHERE w.library=rewrite_source.library AND w.asset_id=rewrite_source.id
-                AND w.version_size=rewrite_source.version_size AND w.admitted=1 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL)
-                AND w.verified_metadata=0 AND g.metadata_enabled=1
-                AND w.compat_path=rewrite_source.local_path
-                AND json_extract(w.path,'$.encoding')='utf8' AND json_extract(w.path,'$.path')=rewrite_source.local_path
-                AND NOT EXISTS(SELECT 1 FROM provider_active_destinations done
-                    WHERE done.library=w.library AND done.asset_id=w.asset_id
-                    AND done.version_size=w.version_size AND done.path=w.path
-                    AND done.admitted=1 AND done.verified_media=1 AND done.verified_metadata=1
-                    AND done.checksum=rewrite_source.checksum
-                    AND done.local_checksum IS rewrite_source.local_checksum
-                    AND done.metadata_hash IS rewrite_source.metadata_hash
-                    AND done.created_at IS rewrite_source.created_at
-                    AND done.added_at IS rewrite_source.added_at))
-            AND {UNAMBIGUOUS_LEGACY_PATH}
+            AND {LEGACY_WRITER_AVAILABLE} AND {UNAMBIGUOUS_LEGACY_PATH}
         UNION ALL SELECT 1,generation,pass_key,child,library,asset_id,version_size,path,ready_at
             FROM active WHERE representative=1
     ) WHERE 1=1 {scope} ORDER BY ready,library,id,version_size,path,generation,pass_key LIMIT ? OFFSET ?"
@@ -364,7 +370,7 @@ fn query_selection_and_legacy_metadata(
     let mut pending = Vec::with_capacity(candidates.len());
     for (active, generation, key, child, library, id, version, path) in candidates {
         if active {
-            let candidate = super::provider_generations::metadata_receipt(
+            let candidate = super::provider_generations::queued_metadata_receipt(
                 conn,
                 &generation,
                 &key,
@@ -1438,6 +1444,58 @@ impl SqliteStateDb {
 
 #[async_trait]
 impl MetadataRewriteStore for SqliteStateDb {
+    async fn grouping_writer_pending(
+        &self,
+        library: &str,
+        asset: &str,
+        version: &str,
+        path: &Path,
+    ) -> Result<bool, StateError> {
+        let (library, asset, version, path) = (
+            library.to_owned(),
+            asset.to_owned(),
+            version.to_owned(),
+            super::provider_selection::SelectionPath::from_path(path).key()?,
+        );
+        self.with_conn("checking frozen destination before immediate metadata",move |conn|{
+            let tx=conn.unchecked_transaction()?;
+            let mut stmt=tx.prepare("SELECT DISTINCT grouping_hash FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND admitted=1 AND verified_metadata=0 AND metadata_successor IS NULL AND grouping_hash IS NOT NULL")?;
+            let mut rows=stmt.query(rusqlite::params![library,asset,version,path])?;
+            let Some(row)=rows.next()? else {return Ok(false)};
+            let frozen:String=row.get(0)?;
+            Ok(rows.next()?.is_some() || frozen!=super::provider_generations::grouping_hash(&tx,&library,&asset)?)
+        }).await
+    }
+    async fn claim_selection_writer(
+        &self,
+        pending: &PendingMetadataRewrite,
+    ) -> Result<bool, StateError> {
+        let pending = pending.clone();
+        if pending.selection_receipt.is_none() {
+            return self.with_conn("checking queued legacy metadata owner",move |conn| {
+                let asset=&pending.asset;
+                let source=metadata_rewrite_source_sql();
+                let sql=format!("SELECT {ASSET_COLUMNS},capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size,source_checksum
+                    FROM ({source}) rewrite_source WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4
+                    AND checksum=?5 AND metadata_hash IS ?6 AND local_checksum IS ?7 AND status='downloaded' AND is_deleted=0
+                    AND (metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL)
+                    AND {LEGACY_WRITER_AVAILABLE} AND {UNAMBIGUOUS_LEGACY_PATH}");
+                let current=conn.query_row(&sql,rusqlite::params![asset.library,asset.id,asset.version_size.as_str(),
+                    asset.local_path.as_deref().and_then(Path::to_str),asset.checksum,asset.metadata.metadata_hash,asset.local_checksum],
+                    row_to_pending_metadata_rewrite).optional()?;
+                Ok(current.is_some_and(|row|row.capture_repair_receipt==pending.capture_repair_receipt && row.source_checksum==pending.source_checksum))
+            }).await;
+        }
+        self.with_conn_mut("claiming selected grouping writer", move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !super::provider_generations::claim_writer(&tx, &pending)? {
+                return Ok(false);
+            }
+            tx.commit()?;
+            Ok(true)
+        })
+        .await
+    }
     async fn recover_embedded_metadata_receipt(
         &self,
         pending: &PendingMetadataRewrite,
