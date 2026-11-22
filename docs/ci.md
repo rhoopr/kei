@@ -14,9 +14,9 @@ Branch protection requires `CI`. It passes only when all three jobs succeed for 
 
 ## Broader checks
 
-Pushes to `main` run the full Linux, macOS and Windows offline suites, Linux no-default-feature checks, copies stress, docs and dependency audit. To qualify a feature branch before merging, dispatch **Heavy qualification** for that branch. Qualification adds native service smoke, coverage, unused-dependency analysis, bounded fuzzing, optimized tests, five release archives and two container architectures. It lists ignored tests without running credentialed tests.
+Pushes to `main` run the full Linux, macOS and Windows offline suites, Linux no-default-feature checks, copies stress, docs and dependency audit. To qualify a feature branch before merging, dispatch **Heavy qualification** for that branch. A manual **Rust CI** dispatch runs only the shared checks. Qualification adds native service smoke, coverage, unused-dependency analysis, bounded fuzzing, optimized tests, five release archives and two container architectures. It lists ignored tests without running credentialed tests.
 
-Heavy qualification also runs on Sundays at 03:23 UTC as a read-only release rehearsal. Release tags always rerun it on the release commit and require separate local evidence before publishing. Neither a nightly result nor a weekly rehearsal qualifies a different commit. For local development, run focused tests for the behavior you changed. `just gate` remains available for offline diagnosis.
+Heavy qualification runs on release tags and on manual dispatch of **Heavy qualification**. It has no timer: a weekly copy of the same `main` work would duplicate the push suite and nightly coverage without qualifying a new commit. Release tags always rerun it on the release commit and require separate local evidence before publishing. Neither a nightly result nor a manual rehearsal qualifies a different commit. For local development, run focused tests for the behavior you changed. `just gate` remains available for offline diagnosis.
 
 ## Local release prerequisites
 

@@ -14,9 +14,4 @@ concurrency:
 
 jobs:
   checks:
-    if: github.event_name == 'push'
     uses: ./.github/workflows/checks.yml
-
-  qualification:
-    if: github.event_name == 'workflow_dispatch'
-    uses: ./.github/workflows/qualification.yml
