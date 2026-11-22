@@ -1751,6 +1751,97 @@ fn release_homebrew_downloads_fail_fast_and_verify_checksums() {
 }
 
 #[test]
+fn release_attests_archives_and_published_container_digests() {
+    let release = repo_file(".github/workflows/release.yml");
+    let hardening = repo_file(".github/scripts/check_workflow_hardening.py");
+    let action = "actions/attest-build-provenance";
+    let action_sha = "977bb373ede98d70efdf65b84cb5f73e068dcc2a";
+
+    assert_eq!(
+        release.matches(&format!("{action}@{action_sha}")).count(),
+        5,
+        "release must pin one provenance attestation for the archives and each container architecture"
+    );
+    assert_eq!(
+        release.matches("id-token: write").count(),
+        3,
+        "release, containers, and resume_containers must grant id-token: write"
+    );
+    assert_eq!(
+        release.matches("attestations: write").count(),
+        3,
+        "release, containers, and resume_containers must grant attestations: write"
+    );
+    assert_eq!(
+        release.matches("push-to-registry: true").count(),
+        4,
+        "each container attestation must push its bundle to the registry"
+    );
+
+    for expected in [
+        "subject-path: |",
+        "candidate/*.tar.gz",
+        "candidate/*.zip",
+        "candidate/SHA256SUMS.txt",
+        r#"docker buildx imagetools inspect "$image:$version-$arch" --format '{{json .Manifest}}'"#,
+        "jq -r .digest",
+        "subject-name: ghcr.io/${{ github.repository }}",
+        "subject-digest: ${{ steps.publish.outputs.amd64 }}",
+        "subject-digest: ${{ steps.publish.outputs.arm64 }}",
+    ] {
+        assert!(
+            release.contains(expected),
+            "release provenance is missing pinned evidence: {expected}"
+        );
+    }
+    assert_eq!(
+        release
+            .matches("subject-digest: ${{ steps.publish.outputs.amd64 }}")
+            .count(),
+        2,
+        "both publication jobs must attest the amd64 digest"
+    );
+    assert_eq!(
+        release
+            .matches("subject-digest: ${{ steps.publish.outputs.arm64 }}")
+            .count(),
+        2,
+        "both publication jobs must attest the arm64 digest"
+    );
+
+    let checksums = release
+        .find("sha256sum -- *.tar.gz *.zip > SHA256SUMS.txt")
+        .expect("release must generate checksums");
+    let archive_attestation = release
+        .find("subject-path: |")
+        .expect("release must attest the archive bytes");
+    let upload = release
+        .find("- name: Upload release assets")
+        .expect("release must upload the archives");
+    assert!(
+        checksums < archive_attestation && archive_attestation < upload,
+        "archive attestation must run after checksums and before upload"
+    );
+
+    for expected in [
+        action,
+        action_sha,
+        "id-token: write",
+        "attestations: write",
+        "subject-path: |",
+        "subject-digest: ${{ steps.publish.outputs.amd64 }}",
+        "subject-digest: ${{ steps.publish.outputs.arm64 }}",
+        "push-to-registry: true",
+        "jq -r .digest",
+    ] {
+        assert!(
+            hardening.contains(expected),
+            "workflow hardening must fail closed on release provenance: {expected}"
+        );
+    }
+}
+
+#[test]
 fn service_smoke_is_required_in_heavy_qualification() {
     let service_smoke = repo_file(".github/workflows/service-smoke.yml");
     let qualification = repo_file(".github/workflows/qualification.yml");

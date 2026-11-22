@@ -50,6 +50,26 @@ The attestation is a maintainer trust boundary, not independent proof that local
 commands ran. Keep the underlying evidence. A new commit requires a new run.
 Nightly results do not replace this requirement.
 
+## Release provenance
+
+A release tag publishes GitHub build provenance for the five release archives and `SHA256SUMS.txt`, and for each published container image digest. The archive step attests the candidate bytes after checksum generation and before upload. The container jobs attest the `amd64` and `arm64` registry manifest digests after each push. They do not attest version tags, stable aliases, or `latest`. The resume path captures and attests the digests it publishes the same way.
+
+This is separate from the local release attestation in [Local release prerequisites](#local-release-prerequisites). The local record covers maintainer-run provider and host-service evidence for the release commit. Build provenance records the repository and workflow that produced the artifacts.
+
+Verify a downloaded archive with:
+
+```sh
+gh attestation verify kei-linux-x86_64.tar.gz --repo rhoopr/kei
+```
+
+Verify a container image by digest with:
+
+```sh
+gh attestation verify oci://ghcr.io/rhoopr/kei@sha256:DIGEST --repo rhoopr/kei
+```
+
+Both commands need an authenticated `gh` client.
+
 ## Nightly operation
 
 `Nightly qualification` runs on `main` at 12:05 a.m. New York time every day. A manual dispatch on `main` uses the same four independent jobs, pinned to the event SHA:
