@@ -1,6 +1,5 @@
 """Each workflow must own a distinct trigger and route to the right caller."""
 
-import re
 import unittest
 from pathlib import Path
 
