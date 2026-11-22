@@ -25,6 +25,8 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: -Dwarnings
+      FUZZ_MAX_TOTAL_TIME: "180"
+      FUZZ_TIMEOUT: "10"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:

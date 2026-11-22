@@ -33,9 +33,11 @@ jobs:
     if: github.ref == 'refs/heads/main'
     name: Seeded fuzzing
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       RUSTFLAGS: -Dwarnings
+      FUZZ_MAX_TOTAL_TIME: "120"
+      FUZZ_TIMEOUT: "10"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -49,7 +51,19 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo +1.94.1 install --locked cargo-fuzz --version 0.13.1
+      - name: Prepare the fuzz corpus directory
+        run: mkdir -p fuzz/corpus
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-
       - run: bash scripts/ci/seeded-fuzz.sh
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        if: always()
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
 
   audit:
     if: github.ref == 'refs/heads/main'
