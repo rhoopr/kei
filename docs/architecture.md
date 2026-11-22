@@ -44,6 +44,8 @@ Keep the previous checkpoint on incomplete token proof, interruption, stale plan
 
 Selection evidence limits apply to individual writes and validation operations. Retained history does not consume the next library's or restarted baseline's write allowance.
 
+Once selection freezes a destination, a downloaded receipt at a different path cannot satisfy it. With stable source evidence, a missing selected copy stays due until kei publishes it at the promised path or records proof that resolves that destination.
+
 Writable sync may retire raw enumeration responses only after verifying the selection seal and finding no unfinished identity, destination, metadata, or repair work. Compact rank proofs preserve the original seal and source links.
 
 A new selection filters previous metadata writers by scope, configuration and destination inputs before reading files. It hashes the installed media and any configured XMP packet before opening the SQLite write transaction. Reuse requires matching hashes, frozen grouping and effective capture offset. At commit, kei checks both retained file identities. On Unix it also checks the inode change times sampled before hashing. On Windows the retained handles exclude writes and replacement. If kei cannot verify either file, the destination and its aliases stay pending for the ordinary writer. Reuse does not confer publication ownership. Prepared writes, preserved local files, managed layouts and explicit refresh or repair keep their existing recovery paths.
