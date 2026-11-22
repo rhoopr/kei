@@ -3207,7 +3207,7 @@ async fn persisted_grouping_fixture(unexplained_person: bool) {
             f.db.acquire_lock("persist Library B grouping disagreement")
                 .unwrap();
         let (id, group, media, metadata): (String,String,bool,bool) = conn.query_row(
-            "SELECT generation,grouping_hash,verified_media,verified_metadata FROM provider_active_destinations WHERE child='asset-m' AND compat_path LIKE '%/albums/A/%' AND admitted=1",[],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            "SELECT generation,grouping_hash,verified_media,verified_metadata FROM provider_active_destinations WHERE child='asset-m' AND replace(compat_path,char(92),'/') LIKE '%/albums/A/%' AND admitted=1",[],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
         assert_eq!(group, format!("{:x}", Sha256::digest(b"[[],[]]")));
         assert!(!media && !metadata);
         conn.execute_batch("DROP TRIGGER fixture_empty_group;
@@ -3316,7 +3316,7 @@ async fn persisted_grouping_fixture(unexplained_person: bool) {
         assert!(media.with_file_name(format!("{name}.xmp")).is_file());
     }
     let old_group:String=f.db.acquire_lock("unchanged historical intent").unwrap().query_row(
-        "SELECT grouping_hash FROM provider_active_destinations WHERE generation=? AND compat_path LIKE '%/albums/A/%'",[historical],|r|r.get(0)).unwrap();
+        "SELECT grouping_hash FROM provider_active_destinations WHERE generation=? AND replace(compat_path,char(92),'/') LIKE '%/albums/A/%'",[historical],|r|r.get(0)).unwrap();
     assert_eq!(old_group, format!("{:x}", Sha256::digest(b"[[],[]]")));
     f = reopen_destination_fixture(f).await;
     let quiet = run(&f).await;
@@ -4038,7 +4038,7 @@ async fn shared_grouping_handoff_fences_loaded_legacy_and_settles_both_passes() 
         .as_object_mut()
         .unwrap()
         .remove(INDEPENDENT_ALBUM_COPIES);
-    let path = f.config.directory.join("copies/changed.JPG");
+    let path = f.config.directory.join("copies").join("changed.JPG");
     let sidecar = path.with_file_name("changed.JPG.xmp");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let mut legacy = None;
