@@ -144,8 +144,6 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
     // extension gate is based on the intended final path before download,
     // then the writer sniffs the downloaded part bytes so the temp suffix
     // does not hide the media type.
-    let needs_embed = metadata_flags.any_embed()
-        && crate::download::metadata::is_embed_writable_path(&task.download_path);
     let owned_part_path = crate::download::file::temp_download_path(
         &task.download_path,
         &task.checksum,
@@ -157,6 +155,23 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
         context.shutdown_token,
     )
     .await?;
+    let metadata_flags = if metadata_flags.has_any_write()
+        && let Some(db) = context.state_db
+        && db
+            .grouping_writer_pending(
+                &task.library,
+                &task.asset_id,
+                task.version_size.as_str(),
+                &task.download_path,
+            )
+            .await?
+    {
+        MetadataFlags::empty()
+    } else {
+        metadata_flags
+    };
+    let needs_embed = metadata_flags.any_embed()
+        && crate::download::metadata::is_embed_writable_path(&task.download_path);
     if context.shutdown_token.is_cancelled() {
         return Err(DownloadError::Interrupted {
             path: task.download_path.display().to_string().into(),

@@ -132,6 +132,18 @@ pub(crate) fn selection_membership_child<'a>(
     ))
 }
 
+/// The display name is grouping evidence only on a query bound to this exact
+/// container. Two such queries may legitimately return the same name.
+pub(crate) fn selected_album_name(scope: &Value) -> Option<&str> {
+    let id = scope.get("container_id")?.as_str()?;
+    let name = scope.get("name")?.as_str()?;
+    (!id.trim().is_empty() && !name.trim().is_empty()
+        && scope["list_type"] == super::QUERY_FOLDER_LIST
+        && scope["obj_type"] == format!("CPLContainerRelationNotDeletedByAssetDate:{id}")
+        && scope["query_filter"] == serde_json::json!([{"fieldName":"parentId","comparator":"EQUALS","fieldValue":{"type":"STRING","value":id}}]))
+        .then_some(name)
+}
+
 impl PhotoAlbum {
     /// Require the complete provider query definition before capturing its
     /// selection; a display name alone cannot establish smart membership.
@@ -183,17 +195,7 @@ impl PhotoAlbum {
                     && self.query_filter.is_none())
                     || self.is_supported_smart_folder()
             }
-            Some(id) => {
-                !id.trim().is_empty()
-                    && !self.name.trim().is_empty()
-                    && self.list_type.as_ref() == super::QUERY_FOLDER_LIST
-                    && self.obj_type.as_ref()
-                        == format!("CPLContainerRelationNotDeletedByAssetDate:{id}")
-                    && self.query_filter.as_deref()
-                        == Some(
-                            &serde_json::json!([{"fieldName":"parentId","comparator":"EQUALS","fieldValue":{"type":"STRING","value":id}}]),
-                        )
-            }
+            Some(_) => selected_album_name(&self.selection_scope()).is_some(),
         };
         if !supported {
             return Ok(None);

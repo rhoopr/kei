@@ -315,6 +315,35 @@ where
             deferred += 1;
             continue;
         }
+        if let Some(receipt) = &pending_rewrite.selection_receipt
+            && metadata_flags.uses_xmp_groupings()
+        {
+            let groups = groupings_by_library.get(record.library.as_ref());
+            let albums = groups
+                .and_then(|g| g.albums.get(record.id.as_ref()))
+                .map_or(&[][..], Vec::as_slice);
+            let people = groups
+                .and_then(|g| g.people.get(record.id.as_ref()))
+                .map_or(&[][..], Vec::as_slice);
+            if !crate::state::db::provider_generations::writer_grouping_hash(albums, people)
+                .is_ok_and(|hash| hash == receipt.grouping_hash)
+            {
+                deferred += 1;
+                continue;
+            }
+        }
+        match db.claim_selection_writer(&pending_rewrite).await {
+            Ok(true) => {}
+            Ok(false) => {
+                deferred += 1;
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Could not validate queued metadata writer");
+                errored += 1;
+                continue;
+            }
+        }
 
         if let Err(error) = crate::download::file::recover_metadata_replacements(&path).await {
             tracing::warn!(path = %path.display(), error = %format!("{error:#}"),

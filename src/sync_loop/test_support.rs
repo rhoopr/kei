@@ -1410,6 +1410,23 @@ impl state::MembershipStore for FailingMetadataSetDb {
 
 #[async_trait::async_trait]
 impl state::MetadataRewriteStore for FailingMetadataSetDb {
+    async fn grouping_writer_pending(
+        &self,
+        library: &str,
+        asset: &str,
+        version: &str,
+        path: &std::path::Path,
+    ) -> Result<bool, state::error::StateError> {
+        self.inner
+            .grouping_writer_pending(library, asset, version, path)
+            .await
+    }
+    async fn claim_selection_writer(
+        &self,
+        pending: &state::db::PendingMetadataRewrite,
+    ) -> Result<bool, state::error::StateError> {
+        self.inner.claim_selection_writer(pending).await
+    }
     async fn protected_legacy_paths(
         &self,
     ) -> Result<Vec<std::path::PathBuf>, crate::state::error::StateError> {

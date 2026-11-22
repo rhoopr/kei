@@ -119,7 +119,7 @@ pub(super) fn retire_completed(
         AND NOT EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=g.id
           AND (w.prepared_hash IS NOT NULL OR w.confirmed_repair IS NOT NULL OR
             (w.admitted=1 AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR
-              (g.metadata_enabled=1 AND w.verified_metadata=0))))) LIMIT 1", [scope], |row| row.get(0)).optional()?;
+              (g.metadata_enabled=1 AND w.verified_metadata=0 AND w.metadata_successor IS NULL))))) LIMIT 1", [scope], |row| row.get(0)).optional()?;
         let Some(id) = id else { return Ok(()) };
         let root = load_generation(&tx, &id)?;
         let expected: String = tx.query_row(

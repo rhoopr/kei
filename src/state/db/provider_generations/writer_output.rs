@@ -89,7 +89,7 @@ impl SqliteStateDb {
             Ok(conn.prepare("SELECT pass_key,child,version_size,path FROM provider_active_destinations w
                 JOIN provider_active_generations g ON g.id=w.generation
                 WHERE generation=?1 AND (pass_key,child,version_size,path)>(?2,?3,?4,?5)
-                AND admitted=1 AND verified_media=1 AND verified_metadata=0 AND grouping_hash IS NOT NULL AND prepared_hash IS NULL AND preserved_local IS NULL
+                AND admitted=1 AND verified_media=1 AND verified_metadata=0 AND metadata_successor IS NULL AND grouping_hash IS NOT NULL AND prepared_hash IS NULL AND preserved_local IS NULL
                 AND EXISTS (SELECT 1 FROM assets a WHERE a.library=w.library AND a.id=w.asset_id AND a.version_size=w.version_size AND a.checksum=w.checksum AND a.metadata_hash IS w.metadata_hash AND a.created_at IS w.created_at AND a.added_at IS w.added_at AND a.is_deleted=0)
                 AND EXISTS (SELECT 1 FROM provider_active_destinations old
                     JOIN provider_active_generations prior ON prior.id=old.generation
@@ -123,9 +123,10 @@ impl SqliteStateDb {
             let eligible: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM provider_active_destinations w
                  WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5
-                 AND local_checksum=?6 AND admitted=1 AND verified_media=1 AND verified_metadata=0
+                 AND local_checksum=?6 AND admitted=1 AND verified_media=1 AND verified_metadata=0 AND metadata_successor IS NULL
                  AND preserved_local IS NULL AND NOT EXISTS(SELECT 1 FROM provider_active_destinations p
-                     WHERE p.library=w.library AND p.asset_id=w.asset_id AND p.path=w.path AND p.prepared_hash IS NOT NULL))",
+                     WHERE p.library=w.library AND p.asset_id=w.asset_id AND p.path=w.path AND
+                     (p.prepared_hash IS NOT NULL OR (p.admitted=1 AND p.verified_metadata=0 AND p.metadata_successor IS NULL AND p.grouping_hash<>w.grouping_hash))))",
                 params![generation,key.pass,key.child,key.version,key.path,media], |r| r.get(0),
             )?;
             if !eligible {
