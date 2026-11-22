@@ -5311,11 +5311,7 @@ async fn primary_layout_root_template_transitions_cover_all_pass_kinds() {
             assert!(quiet.db_sync_token_advance_safe);
             // The zone delta cannot establish smart-folder membership. Current
             // selection refreshes and confirms it even when media is unchanged.
-            let expected_lookups = if pass_kind == PassKind::SmartFolder {
-                2
-            } else {
-                0
-            };
+            let expected_lookups = usize::from(pass_kind == PassKind::SmartFolder);
             assert_eq!(
                 lookups, expected_lookups,
                 "{pass_kind:?}: unexpected quiet lookup"

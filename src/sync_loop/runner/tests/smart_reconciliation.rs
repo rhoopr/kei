@@ -349,7 +349,7 @@ async fn run_cycle_current_debt_commits_successor_and_configuration_with_unknown
             // child and paired master may be looked up; A remains untouched.
             let mut requested = names.lock().unwrap()[before..].to_vec();
             requested.sort();
-            assert_eq!(requested, ["CURRENT", "asset-CURRENT", "asset-CURRENT"]);
+            assert_eq!(requested, ["CURRENT", "asset-CURRENT"]);
             assert_eq!(result.stats.downloaded, 0);
         } else {
             assert_eq!(result.stats.downloaded, 1);

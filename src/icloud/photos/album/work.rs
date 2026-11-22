@@ -40,10 +40,10 @@ fn scoped_record(record: &Value, zone: &Value) -> bool {
 }
 
 fn lookup_members(body: &[u8], names: &[&str], zone: &Value) -> Result<Vec<Value>> {
-    let value = changes_json::parse(body)?;
+    let mut value = changes_json::parse(body)?;
     let records = value
-        .get("records")
-        .and_then(Value::as_array)
+        .get_mut("records")
+        .and_then(Value::as_array_mut)
         .context("Missing current lookup records")?;
     anyhow::ensure!(
         records.len() == names.len(),
@@ -53,13 +53,14 @@ fn lookup_members(body: &[u8], names: &[&str], zone: &Value) -> Result<Vec<Value
     for name in names {
         let mut matches = records
             .iter()
-            .filter(|r| r.get("recordName").and_then(Value::as_str) == Some(name));
-        let record = matches.next().context("Missing current lookup identity")?;
+            .enumerate()
+            .filter(|(_, r)| r.get("recordName").and_then(Value::as_str) == Some(name));
+        let (index, record) = matches.next().context("Missing current lookup identity")?;
         anyhow::ensure!(
             matches.next().is_none() && scoped_record(record, zone),
             "Ambiguous or mismatched current lookup scope"
         );
-        out.push(record.clone());
+        out.push(records.swap_remove(index));
     }
     Ok(out)
 }
@@ -75,9 +76,9 @@ pub(crate) fn current_asset(
 ) -> Result<PhotoAsset> {
     anyhow::ensure!(child != master, "Ambiguous current lookup pair");
     let records = lookup_members(body, &[child, master], zone)?;
-    let [child_value, master_value] = records.as_slice() else {
-        anyhow::bail!("Incomplete current lookup pair")
-    };
+    let [child_value, master_value]: [Value; 2] = records
+        .try_into()
+        .map_err(|_unexpected_records| anyhow::anyhow!("Incomplete current lookup pair"))?;
     anyhow::ensure!(
         child_value.get("recordType").and_then(Value::as_str) == Some("CPLAsset")
             && master_value.get("recordType").and_then(Value::as_str) == Some("CPLMaster")
@@ -87,8 +88,8 @@ pub(crate) fn current_asset(
                 == Some(master),
         "Current lookup pair mismatch"
     );
-    let master: cloudkit::Record = serde_json::from_value(master_value.clone())?;
-    let child: cloudkit::Record = serde_json::from_value(child_value.clone())?;
+    let master: cloudkit::Record = serde_json::from_value(master_value)?;
+    let child: cloudkit::Record = serde_json::from_value(child_value)?;
     let photo = PhotoAsset::try_from_records(master, &child, RequiredAssetFields::Downloadable)?;
     Ok(photo
         .with_state_record_name(Arc::from(child.record_name))
@@ -134,8 +135,10 @@ impl PhotoAlbum {
     ) -> Result<CurrentCatalogAsset> {
         let source = self.selected_media_album(observed)?;
         self.bound_media_source(source)?;
+        // The observation supplies both lookup keys, not proof of their
+        // relationship. Verify that relationship in the fresh paired reply.
         source
-            .confirm_catalog_asset(observed.asset_record_name())
+            .confirm_pair(observed.asset_record_name(), observed.id())
             .await
     }
 
@@ -312,9 +315,18 @@ impl PhotoAlbum {
             )
         })
         .await??;
-        let body = self.current_lookup_body(&[child, &master]).await?;
+        self.confirm_pair(child, &master).await
+    }
+
+    async fn confirm_pair(&self, child: &str, master: &str) -> Result<CurrentCatalogAsset> {
+        anyhow::ensure!(
+            !child.trim().is_empty() && !master.trim().is_empty() && child != master,
+            "Invalid current lookup pair"
+        );
+        let body = self.current_lookup_body(&[child, master]).await?;
         let zone = self.zone_id.as_ref().clone();
         let child = child.to_owned();
+        let master = master.to_owned();
         tokio::task::spawn_blocking(move || {
             let asset = current_asset(&body, &child, &master, &zone)?;
             Ok(CurrentCatalogAsset { asset, body })

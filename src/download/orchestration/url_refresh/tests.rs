@@ -923,8 +923,8 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     assert_eq!(summary.failed, 0);
     assert_eq!(
         lookup_calls.load(Ordering::SeqCst),
-        6,
-        "relation hydration, current selection confirmation and expired URL refresh each resolve the child/master pair"
+        5,
+        "relation hydration and expired URL refresh discover the master; selection confirms the observed pair in one request"
     );
     config.state_db = None;
     drop(passes);
@@ -955,7 +955,7 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     assert_eq!(replayed_relation.stats.downloaded, 0);
     assert_eq!(
         lookup_calls.load(Ordering::SeqCst),
-        10,
+        8,
         "relation hydration and current selection confirmation each resolve the pair without downloading again"
     );
     let quiet_session = RelationUrlSession {
@@ -976,7 +976,7 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     assert_eq!(quiet.stats.downloaded, 0);
     assert_eq!(
         lookup_calls.load(Ordering::SeqCst),
-        10,
+        8,
         "an empty reopened feed does not repeat hydration"
     );
     assert_eq!(

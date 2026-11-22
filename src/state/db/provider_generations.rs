@@ -1073,18 +1073,27 @@ fn validate_generation_headers(conn: &Connection) -> Result<(), StateError> {
 }
 
 fn validate_scope_decisions(conn: &Connection, scope: &str) -> Result<(), StateError> {
-    validate_generation_headers(conn)?;
-    let mut statement = conn.prepare("SELECT d.generation,d.pass_key,d.child FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE g.scope=?1 ORDER BY d.generation,d.pass_key,d.child")?;
-    let mut rows = statement.query([scope])?;
-    while let Some(row) = rows.next()? {
+    // Each caller holds one transaction. Check every header before trusting
+    // its scope, then reuse that validated header for this generation's rows.
+    let mut generations = conn.prepare("SELECT id FROM provider_active_generations ORDER BY id")?;
+    let mut decisions = conn.prepare(
+        "SELECT pass_key,child FROM provider_active_decisions WHERE generation=?1 ORDER BY pass_key,child",
+    )?;
+    let mut roots = generations.query([])?;
+    while let Some(row) = roots.next()? {
         let root = load_generation(conn, &row.get::<_, String>(0)?)?;
-        load_decision_with_sources(
-            conn,
-            &root,
-            &row.get::<_, String>(1)?,
-            &row.get::<_, String>(2)?,
-            false,
-        )?;
+        if root.spec.scope == scope {
+            let mut rows = decisions.query([&root.id])?;
+            while let Some(row) = rows.next()? {
+                load_decision_with_sources(
+                    conn,
+                    &root,
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(1)?,
+                    false,
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -1270,10 +1279,10 @@ fn load_rank(
     root: &ActiveGeneration,
     page: &str,
 ) -> Result<SelectionSourcePage, StateError> {
-    let (request_length, body_length): (i64, i64) = conn.query_row(
-        "SELECT length(request),length(body) FROM provider_selection_rank_pages WHERE id=?1",
+    let (request_length, body_length, has_relation): (i64, i64, bool) = conn.query_row(
+        "SELECT length(request),length(body),has_relation FROM provider_selection_rank_pages WHERE id=?1",
         [page],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     if [request_length, body_length]
         .into_iter()
@@ -1318,7 +1327,10 @@ fn load_rank(
         None
     };
     let mut selected_children = Vec::with_capacity(records.len());
+    let mut observed_relation = false;
     for (ordinal, record) in records.iter().enumerate() {
+        let kind = record.get("recordType").and_then(Value::as_str);
+        observed_relation |= kind == Some("CPLContainerRelation");
         let Some(row) = rows.next()? else {
             return invalid();
         };
@@ -1329,8 +1341,7 @@ fn load_rank(
                     .get("recordName")
                     .and_then(Value::as_str)
                     .ok_or(StateError::ProviderSelectionInvalid)?
-            || row.get::<_, Option<String>>(2)?.as_deref()
-                != record.get("recordType").and_then(Value::as_str)
+            || row.get::<_, Option<String>>(2)?.as_deref() != kind
             || row.get::<_, bool>(3)?
                 != record
                     .get("deleted")
@@ -1347,7 +1358,7 @@ fn load_rank(
         };
         selected_children.push(child.map(str::to_owned));
     }
-    if rows.next()?.is_some() {
+    if rows.next()?.is_some() || has_relation != observed_relation {
         return invalid();
     }
     Ok(SelectionSourcePage {
@@ -1584,6 +1595,28 @@ fn validate_decision(
             verify_body,
             &mut RankProofs::new(conn, root),
         )
+        .map(drop)
+    }
+}
+
+fn confirmed_decision_asset(
+    manifest: &ActiveDecision,
+    root: &ActiveGeneration,
+) -> Result<Option<crate::icloud::photos::PhotoAsset>, StateError> {
+    let decision = &manifest.decision;
+    match (&decision.confirmation, &decision.master) {
+        (Some(bytes), Some(master)) if bytes.len() <= MAX_CHUNK_BYTES => {
+            crate::icloud::photos::current_asset(
+                bytes,
+                &decision.child,
+                master,
+                manifest.media_zone(root),
+            )
+            .map(Some)
+            .map_err(|_invalid| StateError::ProviderSelectionInvalid)
+        }
+        (None, None) if decision.outcome == SelectionOutcome::Deferred => Ok(None),
+        _ => invalid(),
     }
 }
 
@@ -1593,7 +1626,7 @@ fn validate_decision_with_pages(
     manifest: &ActiveDecision,
     verify_body: bool,
     pages: &mut RankProofs<'_>,
-) -> Result<(), StateError> {
+) -> Result<Option<crate::icloud::photos::PhotoAsset>, StateError> {
     let decision = &manifest.decision;
     pass(root, &decision.pass_key)?;
     validate_media_source(root, manifest)?;
@@ -1627,19 +1660,7 @@ fn validate_decision_with_pages(
         }
         pages.verify_source(source, &decision.pass_key, &decision.child)?;
     }
-    let photo = match (&decision.confirmation, &decision.master) {
-        (Some(bytes), Some(master)) if bytes.len() <= MAX_CHUNK_BYTES => Some(
-            crate::icloud::photos::current_asset(
-                bytes,
-                &decision.child,
-                master,
-                manifest.media_zone(root),
-            )
-            .map_err(|_invalid| StateError::ProviderSelectionInvalid)?,
-        ),
-        (None, None) if decision.outcome == SelectionOutcome::Deferred => None,
-        _ => return invalid(),
-    };
+    let photo = confirmed_decision_asset(manifest, root)?;
     if manifest.state_id != decision.child {
         let Some(master) = decision.master.as_deref() else {
             return invalid();
@@ -1684,7 +1705,7 @@ fn validate_decision_with_pages(
             return invalid();
         }
     }
-    Ok(())
+    Ok(photo)
 }
 
 impl SqliteStateDb {
@@ -1823,9 +1844,10 @@ impl SqliteStateDb {
             if exists {load_rank_proof(&tx,&root,&id)?;tx.commit()?;return Ok(())}
             if root.sealed {return invalid()}
             let records=response.get("records").and_then(Value::as_array).ok_or(StateError::ProviderSelectionInvalid)?;
+            let has_relation=records.iter().any(|record|record.get("recordType").and_then(Value::as_str)==Some("CPLContainerRelation"));
             let charged=u64::try_from(request.len()+body.len()+generation.len()+key.len()+id.len()+records.iter().map(|r|r.get("recordName").and_then(Value::as_str).map_or(0,str::len)+r.get("recordType").and_then(Value::as_str).map_or(0,str::len)+id.len()+32).sum::<usize>()+256).map_err(|_invalid|StateError::ProviderSelectionFull)?;
             check_write_charge(charged,capacity)?;
-            tx.execute("INSERT INTO provider_selection_rank_pages(id,generation,pass_key,request,request_hash,body,body_hash,charged_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![id,generation,key,request,request_hash,body,body_hash,i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?])?;
+            tx.execute("INSERT INTO provider_selection_rank_pages(id,generation,pass_key,request,request_hash,body,body_hash,charged_bytes,has_relation) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![id,generation,key,request,request_hash,body,body_hash,i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?,has_relation])?;
             for (ordinal,record) in records.iter().enumerate() {
                 tx.execute("INSERT INTO provider_selection_rank_records(page_id,ordinal,record_name,record_type,deleted) VALUES(?1,?2,?3,?4,?5)",params![id,i64::try_from(ordinal).map_err(|_invalid|StateError::ProviderSelectionFull)?,record.get("recordName").and_then(Value::as_str),record.get("recordType").and_then(Value::as_str),record.get("deleted").and_then(Value::as_bool).unwrap_or(false)])?;
             }
@@ -1857,7 +1879,17 @@ impl SqliteStateDb {
             account::validate_authenticated(&tx, &owner)?;
             let root = load_generation(&tx, &generation)?;
             pass(&root, &key)?;
-            let mut stmt = tx.prepare("SELECT DISTINCT r.page_id FROM provider_selection_rank_records r JOIN provider_selection_rank_pages p ON p.id=r.page_id WHERE p.generation=?1 AND p.pass_key=?2 AND (r.record_name=?3 OR r.record_type='CPLContainerRelation') ORDER BY r.page_id")?;
+            // Resolve the two source kinds independently so each branch can
+            // use its own index. The name branch probes the child index; the
+            // relation branch reads only pages marked during capture or
+            // backfilled from retained records. Neither branch walks unrelated
+            // records or the pages of an unfiled scan without relations.
+            let mut stmt = tx.prepare(
+                "SELECT r.page_id FROM provider_selection_rank_records r JOIN provider_selection_rank_pages p ON p.id=r.page_id WHERE p.generation=?1 AND p.pass_key=?2 AND r.record_name=?3
+                 UNION
+                 SELECT p.id FROM provider_selection_rank_pages p WHERE p.generation=?1 AND p.pass_key=?2 AND p.has_relation=1
+                 ORDER BY page_id",
+            )?;
             let pages = stmt.query_map(params![generation, key, child], |r| r.get::<_, String>(0))?;
             let mut selected = Vec::new();
             for page in pages {
@@ -1933,11 +1965,23 @@ fn load_decision_with_pages(
     verify_body: bool,
     pages: &mut RankProofs<'_>,
 ) -> Result<ActiveDecision, StateError> {
-    let length:i64=conn.query_row("SELECT length(manifest) FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,key,child],|r|r.get(0))?;
-    if usize::try_from(length).map_or(true, |n| n > MAX_CHUNK_BYTES) {
-        return invalid();
-    }
-    let (bytes,hash,outcome):(Vec<u8>,String,String)=conn.query_row("SELECT manifest,manifest_hash,outcome FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,key,child],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    let (bytes, hash, outcome): (Vec<u8>, String, String) = conn
+        .prepare_cached(
+            "SELECT manifest,manifest_hash,outcome FROM provider_active_decisions
+         WHERE generation=?1 AND pass_key=?2 AND child=?3 AND length(manifest)<=?4",
+        )?
+        .query_row(
+            params![
+                root.id,
+                key,
+                child,
+                i64::try_from(MAX_CHUNK_BYTES)
+                    .map_err(|_overflow| StateError::ProviderSelectionInvalid)?
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .ok_or(StateError::ProviderSelectionInvalid)?;
     if bytes.len() > MAX_CHUNK_BYTES || digest(&bytes) != hash {
         return invalid();
     }
@@ -1949,8 +1993,8 @@ fn load_decision_with_pages(
     {
         return invalid();
     }
-    validate_decision_with_pages(conn, root, &manifest, verify_body, pages)?;
-    validate_decision_rows(conn, root, &manifest)?;
+    let photo = validate_decision_with_pages(conn, root, &manifest, verify_body, pages)?;
+    validate_decision_rows(conn, root, &manifest, photo.as_ref())?;
     Ok(manifest)
 }
 
@@ -1960,10 +2004,54 @@ fn admission_hash(
     key: &str,
     child: &str,
 ) -> Result<String, StateError> {
-    let (manifest,admission,reason,attempts,deadline):(String,String,String,i64,i64)=conn.query_row("SELECT manifest_hash,admission,reason,attempts,next_retry_at FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,key,child],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
-    Ok(digest(&encode(&(
-        &root.id, key, child, manifest, admission, reason, attempts, deadline,
-    ))?))
+    AdmissionRow::load(conn, root, key, child)?.hash(root, key, child)
+}
+
+struct AdmissionRow {
+    manifest: String,
+    admission: String,
+    reason: String,
+    attempts: i64,
+    deadline: i64,
+    stored_hash: Option<String>,
+}
+
+impl AdmissionRow {
+    fn load(
+        conn: &Connection,
+        root: &ActiveGeneration,
+        key: &str,
+        child: &str,
+    ) -> Result<Self, StateError> {
+        Ok(conn
+            .prepare_cached(
+                "SELECT manifest_hash,admission,reason,attempts,next_retry_at,admission_hash
+             FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+            )?
+            .query_row(params![root.id, key, child], |r| {
+                Ok(Self {
+                    manifest: r.get(0)?,
+                    admission: r.get(1)?,
+                    reason: r.get(2)?,
+                    attempts: r.get(3)?,
+                    deadline: r.get(4)?,
+                    stored_hash: r.get(5)?,
+                })
+            })?)
+    }
+
+    fn hash(&self, root: &ActiveGeneration, key: &str, child: &str) -> Result<String, StateError> {
+        Ok(digest(&encode(&(
+            &root.id,
+            key,
+            child,
+            &self.manifest,
+            &self.admission,
+            &self.reason,
+            self.attempts,
+            self.deadline,
+        ))?))
+    }
 }
 
 fn defer_attempt(
@@ -1996,17 +2084,20 @@ fn validate_decision_rows(
     conn: &Connection,
     root: &ActiveGeneration,
     manifest: &ActiveDecision,
+    photo: Option<&crate::icloud::photos::PhotoAsset>,
 ) -> Result<(), StateError> {
     let d = &manifest.decision;
-    let stored:Option<String>=conn.query_row("SELECT admission_hash FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,d.pass_key,d.child],|r|r.get(0))?;
-    if stored.as_deref() != Some(admission_hash(conn, root, &d.pass_key, &d.child)?.as_str()) {
+    let row = AdmissionRow::load(conn, root, &d.pass_key, &d.child)?;
+    if row.stored_hash.as_deref() != Some(row.hash(root, &d.pass_key, &d.child)?.as_str()) {
         return invalid();
     }
-
-    let (admission,reason,attempts,deadline):(String,String,i64,i64)=conn.query_row(
-        "SELECT admission,reason,attempts,next_retry_at FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
-        params![root.id,d.pass_key,d.child],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
-    )?;
+    let AdmissionRow {
+        admission,
+        reason,
+        attempts,
+        deadline,
+        ..
+    } = row;
     let superseded =
         admission == "excluded" && validate_managed_successor(conn, root, manifest, &reason)?;
     let legal = match admission.as_str() {
@@ -2035,13 +2126,6 @@ fn validate_decision_rows(
     if !legal {
         return invalid();
     }
-    let dates = match (&d.confirmation, &d.master) {
-        (Some(body), Some(master)) => Some(
-            crate::icloud::photos::current_asset(body, &d.child, master, manifest.media_zone(root))
-                .map_err(|_invalid| StateError::ProviderSelectionInvalid)?,
-        ),
-        _ => None,
-    };
     for (table, count) in [
         ("provider_active_sources", manifest.sources.len()),
         ("provider_active_destinations", d.destinations.len()),
@@ -2064,16 +2148,27 @@ fn validate_decision_rows(
         }
     }
     for destination in &d.destinations {
-        let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND asset_id=?4 AND version_size=?5 AND path=?6 AND compat_path=?12 AND checksum=?7 AND size_bytes=?8 AND metadata_hash=?9 AND master=?10 AND library=?11 AND (verified_media=0 OR ((admitted=1 OR ?13) AND length(local_checksum)=64 AND length(source_checksum)=64)))",params![root.id,d.pass_key,d.child,manifest.state_id,destination.version_size,destination.path.key()?,destination.checksum,i64::try_from(destination.size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,destination.metadata_hash,d.master,manifest.media_zone(root).get("zoneName").and_then(Value::as_str),destination.path.to_path().to_string_lossy(),superseded],|r|r.get(0))?;
-        if !valid {
-            return invalid();
-        }
-        let photo = dates.as_ref().ok_or(StateError::ProviderSelectionInvalid)?;
-        let normalized:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=?6 AND created_at IS ?7 AND added_at IS ?8)",params![root.id,d.pass_key,d.child,destination.version_size,destination.path.key()?,admission=="admitted",encode_asset_date(photo.created()),Some(encode_asset_date(photo.added_date()))],|r|r.get(0))?;
-        if !normalized {
-            return invalid();
-        }
-        let (group,intent,media,metadata,local,source,progress):DestinationProofRow=conn.query_row("SELECT grouping_hash,intent_hash,verified_media,verified_metadata,local_checksum,source_checksum,progress_hash FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![root.id,d.pass_key,d.child,destination.version_size,destination.path.key()?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
+        let photo = photo.ok_or(StateError::ProviderSelectionInvalid)?;
+        let (group, intent, media, metadata, local, source, progress): DestinationProofRow = conn
+            .prepare_cached(
+                "SELECT grouping_hash,intent_hash,verified_media,verified_metadata,local_checksum,source_checksum,progress_hash
+                 FROM provider_active_destinations
+                 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND asset_id=?4 AND version_size=?5 AND path=?6
+                   AND checksum=?7 AND size_bytes=?8 AND metadata_hash=?9 AND master=?10 AND library=?11 AND compat_path=?12
+                   AND (verified_media=0 OR ((admitted=1 OR ?13) AND length(local_checksum)=64 AND length(source_checksum)=64))
+                   AND admitted=?14 AND created_at IS ?15 AND added_at IS ?16",
+            )?
+            .query_row(
+                params![root.id, d.pass_key, d.child, manifest.state_id, destination.version_size,
+                    destination.path.key()?, destination.checksum,
+                    i64::try_from(destination.size).map_err(|_invalid| StateError::ProviderSelectionInvalid)?,
+                    destination.metadata_hash, d.master, manifest.media_zone(root).get("zoneName").and_then(Value::as_str),
+                    destination.path.to_path().to_string_lossy(), superseded, admission=="admitted",
+                    encode_asset_date(photo.created()), encode_asset_date(photo.added_date())],
+                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)),
+            )
+            .optional()?
+            .ok_or(StateError::ProviderSelectionInvalid)?;
         match (&group, &intent) {
             (None, None) if !root.sealed => {}
             (Some(group), Some(stored))
@@ -2618,7 +2713,7 @@ impl SqliteStateDb {
                         tx.execute("UPDATE provider_active_decisions SET admission='excluded',reason=?4,charged_bytes=charged_bytes+?5 WHERE generation=?1 AND pass_key=?2 AND child=?3", params![old_root.id,old.decision.pass_key,old.decision.child,reason,i64::try_from(reason.len()).map_err(|_invalid| StateError::ProviderSelectionFull)?])?;
                         tx.execute("UPDATE provider_active_destinations SET admitted=0 WHERE generation=?1 AND pass_key=?2 AND child=?3", params![old_root.id,old.decision.pass_key,old.decision.child])?;
                         refresh_admission_hash(&tx, &old_root, &old.decision.pass_key, &old.decision.child)?;
-                        validate_decision_rows(&tx, &old_root, &old)?;
+                        validate_decision_rows(&tx, &old_root, &old, confirmed_decision_asset(&old, &old_root)?.as_ref())?;
                     }
                     staged = true;
                 }
@@ -2697,7 +2792,9 @@ impl SqliteStateDb {
                 let assets:Vec<(String,String)>=tx.prepare("SELECT DISTINCT library,asset_id FROM provider_active_destinations WHERE generation=?1")?.query_map([&generation],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
                 for (library,asset) in assets {
                     let hash=grouping_hash(&tx,&library,&asset)?;
-                    let drift:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND library=?2 AND asset_id=?3 AND grouping_hash IS NOT NULL AND grouping_hash<>?4)",params![generation,library,asset,hash],|r|r.get(0))?;
+                    // This probe runs once per asset. A generation-only range
+                    // scan makes sealing a large unfiled library quadratic.
+                    let drift:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations INDEXED BY idx_active_destination_identity WHERE generation=?1 AND library=?2 AND asset_id=?3 AND grouping_hash IS NOT NULL AND grouping_hash<>?4)",params![generation,library,asset,hash],|r|r.get(0))?;
                     if drift {return Err(StateError::ProviderWorkConflict("frozen_grouping_changed"))}
                     freeze_asset_intents(&tx,&root,&library,&asset,&hash)?;
                 }
@@ -3395,7 +3492,7 @@ fn freeze_asset_intents(
     asset: &str,
     group: &str,
 ) -> Result<(), StateError> {
-    let keys:Vec<(String,String)>=conn.prepare("SELECT DISTINCT pass_key,child FROM provider_active_destinations WHERE generation=?1 AND library=?2 AND asset_id=?3 ORDER BY pass_key,child")?.query_map(params![root.id,library,asset],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
+    let keys:Vec<(String,String)>=conn.prepare("SELECT DISTINCT pass_key,child FROM provider_active_destinations INDEXED BY idx_active_destination_identity WHERE generation=?1 AND library=?2 AND asset_id=?3 ORDER BY pass_key,child")?.query_map(params![root.id,library,asset],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
     for (key, child) in keys {
         let manifest = load_decision(conn, root, &key, &child)?;
         for destination in &manifest.decision.destinations {
@@ -3460,7 +3557,14 @@ fn validate_identity_decisions(
     library: &str,
     asset: &str,
 ) -> Result<(), StateError> {
-    let mut statement=conn.prepare("SELECT DISTINCT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND (asset_id=?2 OR child=?2) ORDER BY generation,pass_key,child")?;
+    // Probe both identity indexes. An OR can make SQLite scan the entire
+    // library on each admission. UNION validates each decision only once
+    // even when its asset and child identities coincide.
+    let mut statement = conn.prepare(
+        "SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2
+         UNION SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND child=?2
+         ORDER BY generation,pass_key,child",
+    )?;
     let mut rows = statement.query(params![library, asset])?;
     while let Some(row) = rows.next()? {
         let generation: String = row.get(0)?;
@@ -3690,7 +3794,12 @@ fn record_layout_destination_for_generation(
             )?;
         }
         conn.execute("UPDATE provider_active_destinations SET embedded_metadata_receipt=?6 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,record.version_size.as_str(),path,fields])?;
-        validate_decision_rows(conn, &root, &manifest)?;
+        validate_decision_rows(
+            conn,
+            &root,
+            &manifest,
+            confirmed_decision_asset(&manifest, &root)?.as_ref(),
+        )?;
     }
     Ok(())
 }
@@ -4980,6 +5089,6 @@ pub(crate) fn inspect_selection_validation_budget(
     RANK_DECODE_METRICS.with(|metrics| metrics.set((0, 0)));
     let mut pages = RankProofs::new(conn, root);
     pages.capacity = capacity;
-    let result = validate_decision_with_pages(conn, root, manifest, true, &mut pages);
+    let result = validate_decision_with_pages(conn, root, manifest, true, &mut pages).map(drop);
     (result, RANK_DECODE_METRICS.with(std::cell::Cell::get))
 }
