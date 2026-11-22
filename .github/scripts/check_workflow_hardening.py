@@ -134,6 +134,11 @@ def check_rust_ci(errors: list[str]) -> None:
         "LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}",
         "if: inputs.heavy",
         "HEAVY: ${{ inputs.heavy }}",
+        "\n  machete:\n",
+        "name: Unused dependencies (machete)",
+        "tool: cargo-machete",
+        "run: cargo machete",
+        "\n      - machete\n",
     ):
         if needle not in text:
             errors.append(f"checks.yml: missing required routing/gate guard: {needle}")

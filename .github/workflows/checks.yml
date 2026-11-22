@@ -206,6 +206,22 @@ jobs:
       - uses: taiki-e/install-action@7170fe35ac006b4d8f0bcdfba8168cf5c431a122 # cargo-udeps
       - run: cargo +"${RUST_NIGHTLY_TOOLCHAIN}" udeps --all-targets
 
+  # Fast unused-dependency check on the stable toolchain. Main pushes run this;
+  # the deeper nightly cargo-udeps analysis stays in heavy qualification.
+  machete:
+    name: Unused dependencies (machete)
+    if: inputs.heavy == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+      - uses: taiki-e/install-action@b7d831ec1a6ef0d81d27cf61932d92140b2271d4 # cargo-machete
+        with:
+          tool: cargo-machete
+      - run: cargo machete
+
   # Verifies Cargo.lock is committed and in sync with Cargo.toml
   # Ensures reproducible builds and prevents "works on my machine" issues
   lockfile:
@@ -287,6 +303,7 @@ jobs:
       - docs
       - catalogs
       - unused-deps
+      - machete
       - lockfile
       - security
       - workflow-hardening
