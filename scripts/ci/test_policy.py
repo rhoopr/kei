@@ -20,10 +20,9 @@ class PolicyTests(unittest.TestCase):
         jobs = ["fmt", "roundtrip", "clippy", "test_no_default", "test", "docs", "catalogs", "lockfile",
                 "security", "copies-stress", "workflow-hardening", "script-lint", "typos"]
         for heavy, light in [(False, True), (False, False), (True, True), (True, False)]:
-            required = jobs + (["coverage-head"] if heavy else []) + (
-                ["unused-deps"] if heavy or not light else [])
+            required = jobs + (["unused-deps"] if heavy or not light else [])
             needs = {name: {"result": "success" if name in required else "skipped"}
-                     for name in jobs + ["coverage-head", "unused-deps"]}
+                     for name in jobs + ["unused-deps"]}
 
             with self.subTest(heavy=heavy, light=light):
                 self.assertEqual(run_gate(needs, heavy, light), 0)
