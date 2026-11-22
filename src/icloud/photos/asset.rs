@@ -3586,6 +3586,7 @@ mod tests {
         for u in [
             "",
             "ftp://p01.icloud-content.com/path",
+            "blob:https://p01.icloud-content.com/path",
             "http://p01.icloud-content.com/path",
             "https://evil.example.com/x",
             "not-a-url",
