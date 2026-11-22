@@ -12,6 +12,8 @@ def required(heavy: bool, light_enabled: bool) -> list[str]:
         "workflow-hardening", "script-lint", "typos", "fmt", "roundtrip", "clippy",
         "test_no_default", "test", "docs", "catalogs", "lockfile", "security", "copies-stress",
     ]
+    if not heavy:
+        jobs.append("machete")
     if heavy or not light_enabled:
         jobs.append("unused-deps")
     return jobs

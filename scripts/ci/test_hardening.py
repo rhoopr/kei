@@ -31,6 +31,7 @@ class HardeningTests(unittest.TestCase):
                 ("service-smoke.yml", "service-smoke-${{ github.workflow }}-", "service-smoke-${{ github.workflow }}-${{ github.run_id }}-", "cancel obsolete runs"),
                 ("service-smoke.yml", "  workflow_call:", "  workflow_call:\n  pull_request:", "reusable only"),
                 ("checks.yml", "run: python3 scripts/check-contracts", "run: echo skipped contracts", "missing required routing/gate guard"),
+                ("checks.yml", "tool: cargo-machete", "tool: cargo-audit", "missing required routing/gate guard"),
                 ("ci.yml", "uses: ./.github/workflows/checks.yml", "uses: ./.github/workflows/qualification.yml", "must call checks.yml, not qualification.yml"),
                 ("qualification.yml", "on:\n  workflow_call:\n", "on:\n  schedule:\n    - cron: \"23 3 * * 0\"\n  workflow_call:\n", "must not run on a schedule"),
                 ("nightly.yml", "contents: read", "contents: write", "publication credentials"),
