@@ -55,7 +55,7 @@ Nightly results do not replace this requirement.
 `Nightly qualification` runs on `main` at 12:05 a.m. New York time every day. A manual dispatch on `main` uses the same four independent jobs, pinned to the event SHA:
 
 - **Main push CI evidence:** require the latest `Rust CI` push run for that SHA and its shared checks result to have succeeded. A missing, running, cancelled or failed run is a gap; nightly reports it instead of replaying the platform matrix. If the push run was still running, rerun nightly after it finishes.
-- **Seeded fuzzing:** build every registered target and run each with its available seeds, including on an unchanged commit.
+- **Seeded fuzzing:** build every registered target and run each with its available seeds for 120 seconds per target, including on an unchanged commit. The job restores the `fuzz/corpus` cache from earlier nights and saves it after the run. Heavy qualification runs its own fixed-budget fuzz pass from checked-in seeds without the nightly cache.
 - **RustSec audit:** check the locked dependencies against the current advisory database every day.
 - **Optimized library tests:** run the all-feature release-mode library suite unless a prior successful nightly on the same SHA actually ran and passed it. A skipped test step is not evidence. If no qualifying result is found in the bounded history, run the tests.
 
