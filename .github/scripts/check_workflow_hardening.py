@@ -145,8 +145,8 @@ def check_qualification(errors: list[str]) -> None:
         "pr.yml": ["needs: [quality, clippy, smoke]", "if: always()", "name: CI",
                    "python3 scripts/ci/gate.py quality clippy smoke",
                    "KEI_ROUNDTRIP_BASE: ${{ github.event.pull_request.base.sha }}"],
-        "ci.yml": ["if: github.event_name == 'push'", "if: github.event_name == 'workflow_dispatch'",
-                   "uses: ./.github/workflows/qualification.yml"],
+        "ci.yml": ["  push:\n    branches: [main]", "  workflow_dispatch:",
+                   "uses: ./.github/workflows/checks.yml"],
         "qualification.yml": ["needs: [quality, artifacts, service, specialized]",
                               "python3 scripts/ci/gate.py quality artifacts service specialized",
                               "cargo fetch --locked\n          just test packaging",
@@ -162,6 +162,10 @@ def check_qualification(errors: list[str]) -> None:
         for marker in markers:
             if marker not in text:
                 errors.append(f"{name}: missing qualification guard: {marker}")
+    if "uses: ./.github/workflows/qualification.yml" in workflow_text("ci.yml"):
+        errors.append("ci.yml: manual dispatch must call checks.yml, not qualification.yml")
+    if re.search(r"(?m)^\s*schedule\s*:", workflow_text("qualification.yml")):
+        errors.append("qualification.yml: heavy qualification must not run on a schedule")
     for name in ("pr.yml", "ci.yml", "checks.yml", "qualification.yml", "artifacts.yml",
                  "nightly.yml", "nightly-health.yml", "daily-wiki.yml"):
         text = workflow_text(name)
