@@ -1,6 +1,8 @@
 #![cfg(test)]
 
 mod current_debt;
+#[cfg(all(target_os = "linux", feature = "xmp"))]
+mod sidecar_bench;
 #[cfg(all(unix, feature = "xmp"))]
 mod writer_reuse;
 

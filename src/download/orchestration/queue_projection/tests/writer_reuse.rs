@@ -10,6 +10,78 @@ use tokio_util::sync::CancellationToken;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 #[tokio::test]
+async fn sidecar_backfill_refuses_media_changed_before_receipt_commit() {
+    use crate::download::metadata_rewrite::BEFORE_SIDECAR_RECEIPT;
+    use crate::download::orchestration::generation::drain_local_backfill;
+    use std::path::Path;
+
+    fn same_size_edit(path: &Path) {
+        let mut file = std::fs::File::options().write(true).open(path).unwrap();
+        let mtime = file.metadata().unwrap().modified().unwrap();
+        std::io::Write::write_all(&mut file, b"edit").unwrap();
+        file.set_modified(mtime).unwrap();
+    }
+    fn replace(path: &Path) {
+        let copy = path.with_extension("copy");
+        std::fs::copy(path, &copy).unwrap();
+        std::fs::rename(copy, path).unwrap();
+    }
+    let server = MockServer::start().await;
+    let media = include_bytes!("../../../../../tests/data/media/pattern.jpg");
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media.as_slice()))
+        .expect(2)
+        .mount(&server)
+        .await;
+    for edit in [same_size_edit as fn(&Path), replace] {
+        let mut f = Fixture::new().await;
+        f.config.metadata.xmp_sidecar = true;
+        f.config.post_sync_metadata = true;
+        f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":server.uri(),"size":media.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media))});
+        let passes = [destination_pass(&f, "A")];
+        let cancel = CancellationToken::new();
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &passes,
+            Arc::new(f.config.clone()),
+            controls(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.stats.downloaded, 1);
+        let pending = || {
+            f.db.acquire_lock("sidecar transaction evidence").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=0 AND writer_output_proof IS NULL",[],|r|r.get(0)).unwrap()
+        };
+        assert_eq!(pending(), 1);
+        // Input must be outside the change-time tick for retained verification.
+        tokio::time::sleep(std::time::Duration::from_millis(1050)).await;
+        let mut cursor = Default::default();
+        let result = BEFORE_SIDECAR_RECEIPT
+            .scope(
+                edit,
+                Box::pin(drain_local_backfill(
+                    &passes,
+                    &f.config,
+                    &f.db,
+                    controls(),
+                    &cancel,
+                    None,
+                    &mut cursor,
+                )),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.failed, 1);
+        assert_eq!(
+            pending(),
+            1,
+            "a changed or replaced inode must roll back receipt updates"
+        );
+    }
+}
+
+#[tokio::test]
 async fn writer_reuse_rechecks_installed_files_before_completion() {
     use crate::download::orchestration::generation::TEST_AFTER_WRITER_SNAPSHOT;
     use std::path::Path;

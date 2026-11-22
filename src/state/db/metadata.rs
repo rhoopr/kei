@@ -1187,6 +1187,28 @@ impl SqliteStateDb {
         pre_rewrite_checksum: Option<&str>,
         completion: MetadataRewriteCompletion,
     ) -> Result<bool, StateError> {
+        self.finish_metadata_rewrite_checked(
+            pending,
+            selected_queue,
+            local_checksum,
+            pre_rewrite_checksum,
+            completion,
+            || true,
+        )
+        .await
+    }
+
+    /// Check the caller's retained filesystem evidence just before commit:
+    /// an input change rolls back every catalogue and alias update together.
+    pub(crate) async fn finish_metadata_rewrite_checked(
+        &self,
+        pending: &PendingMetadataRewrite,
+        selected_queue: MetadataRewriteQueue,
+        local_checksum: Option<&str>,
+        pre_rewrite_checksum: Option<&str>,
+        completion: MetadataRewriteCompletion,
+        input_still_matches: impl Fn() -> bool + Send + 'static,
+    ) -> Result<bool, StateError> {
         let metadata_hash = pending
             .asset
             .metadata
@@ -1280,6 +1302,7 @@ impl SqliteStateDb {
                     tx.execute("UPDATE asset_metadata_paths SET metadata_write_failed_at=NULL WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4", rusqlite::params![library,asset_id,version_size,path.to_str()])?;
                     tx.execute("UPDATE assets SET metadata_write_failed_at=NULL WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4", rusqlite::params![library,asset_id,version_size,path.to_str()])?;
                 }
+                if !input_still_matches(){return Ok(false)}
                 tx.commit()?;
                 return Ok(completed.unwrap_or(false));
             }
@@ -1363,6 +1386,7 @@ impl SqliteStateDb {
             if (updated > 0 || selected == Some(true)) && local_checksum.is_some() {
                 tx.execute("UPDATE asset_metadata_paths SET embedded_metadata_receipt=json_set(embedded_metadata_receipt,'$.published',json('true')) WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND json_extract(embedded_metadata_receipt,'$.output_checksum')=?5",rusqlite::params![library,asset_id,version_size,path.to_str(),local_checksum])?;
             }
+            if !input_still_matches(){return Ok(false)}
             tx.commit()
                 .map_err(|e| StateError::query("finish_metadata_rewrite::commit", e))?;
             Ok(selected.unwrap_or(updated > 0 && completion.clears(selected_queue)))

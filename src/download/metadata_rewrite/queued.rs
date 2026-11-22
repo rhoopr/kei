@@ -10,7 +10,7 @@ use super::embedded::{
 use super::grouping::load_pending_groupings;
 use super::planning::{CaptureTimestampRepair, MetadataFlags};
 #[cfg(feature = "xmp")]
-use super::sidecar::write_sidecar_metadata;
+use super::sidecar::write_sidecar_with_source;
 use crate::download::filter::MetadataPayload;
 use crate::download::{DownloadConfig, DownloadContext};
 use crate::icloud::photos::PhotoAsset;
@@ -21,6 +21,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(all(test, unix, feature = "xmp"))]
+tokio::task_local! {
+    pub(in crate::download) static BEFORE_SIDECAR_RECEIPT: fn(&std::path::Path);
+}
 
 /// Persist a metadata-rewrite marker for each candidate version whose
 /// metadata drifted from the stored hash, or that already carries a marker
@@ -853,18 +858,37 @@ async fn write_rows<D: MembershipStore + MetadataRewriteStore + ?Sized>(
         }
 
         #[cfg(feature = "xmp")]
+        let pinned = if post_sync
+            && metadata_flags.contains(MetadataFlags::XMP_SIDECAR)
+            && !metadata_flags.any_embed()
+            && final_fingerprint.is_none()
+            && pending_for_finish.selection_receipt.is_some()
+        {
+            crate::download::file::WriterSnapshot::for_sidecar(&path)
+                .await
+                .map(Arc::new)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "xmp"))]
+        let pinned: Option<Arc<crate::download::file::WriterSnapshot>> = None;
+
+        #[cfg(feature = "xmp")]
         if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
             // Only certify a packet that was planned from the recorded media bytes.
             // In particular, a sidecar-only retry need not own the media itself.
             let certified_input = if pending_for_finish.selection_receipt.is_some() || post_sync {
-                match final_fingerprint {
-                    Some(output) => Some(output),
-                    None => crate::download::file::fingerprint_regular_file(&path)
-                        .await
-                        .ok()
-                        .filter(|measured| {
-                            Some(fingerprint_checksum(*measured)) == record.local_checksum
-                        }),
+                if let Some(output) = final_fingerprint {
+                    Some(output)
+                } else {
+                    let measured = match &pinned {
+                        Some(snapshot) => Some(snapshot.fingerprint),
+                        None => crate::download::file::fingerprint_regular_file(&path)
+                            .await
+                            .ok(),
+                    };
+                    measured
+                        .filter(|input| Some(fingerprint_checksum(*input)) == record.local_checksum)
                 }
             } else {
                 None
@@ -873,12 +897,13 @@ async fn write_rows<D: MembershipStore + MetadataRewriteStore + ?Sized>(
                 skipped_drifted += 1;
                 continue;
             }
-            let sidecar = write_sidecar_metadata(
+            let sidecar = write_sidecar_with_source(
                 &path,
                 Arc::clone(&payload),
                 created_local,
                 pending_rewrite.source_checksum.as_deref(),
                 &temp_suffix,
+                pinned.clone(),
             )
             .await;
             outcome.sidecar_failed = sidecar.failed;
@@ -886,10 +911,13 @@ async fn write_rows<D: MembershipStore + MetadataRewriteStore + ?Sized>(
                 && let Some(before) = certified_input
                 && let Some(packet) = sidecar.output
             {
-                if crate::download::file::fingerprint_regular_file(&path)
-                    .await
-                    .ok()
-                    == Some(before)
+                // The retained input is checked inside the final transaction.
+                // Otherwise we still need the second full hash.
+                if pinned.is_some()
+                    || crate::download::file::fingerprint_regular_file(&path)
+                        .await
+                        .ok()
+                        == Some(before)
                 {
                     receipt.writer_output =
                         Some((WriterOutput::Sidecar(packet), *created_local.offset()));
@@ -993,16 +1021,35 @@ async fn write_rows<D: MembershipStore + MetadataRewriteStore + ?Sized>(
             }))
             .and_then(|(after, before)| (after != before).then_some(before));
         if completion != MetadataRewriteCompletion::None || media_checksum_changed {
-            match db
-                .finish_metadata_rewrite(
-                    &pending_for_finish,
-                    selected_queue,
-                    final_checksum.as_deref(),
-                    input_checksum_for_download,
-                    completion,
-                )
-                .await
-            {
+            let retained_input = pinned.is_some();
+            let finished =
+                if let (Some(snapshot), WriterPhase::AfterSync { db, .. }) = (pinned, phase) {
+                    #[cfg(all(test, unix, feature = "xmp"))]
+                    let _ = BEFORE_SIDECAR_RECEIPT.try_with(|edit| edit(&path));
+                    db.finish_metadata_rewrite_checked(
+                        &pending_for_finish,
+                        selected_queue,
+                        final_checksum.as_deref(),
+                        input_checksum_for_download,
+                        completion,
+                        move || snapshot.still_matches().is_ok(),
+                    )
+                    .await
+                } else {
+                    db.finish_metadata_rewrite(
+                        &pending_for_finish,
+                        selected_queue,
+                        final_checksum.as_deref(),
+                        input_checksum_for_download,
+                        completion,
+                    )
+                    .await
+                };
+            match finished {
+                Ok(false) if retained_input => {
+                    skipped_unverified += 1;
+                    continue;
+                }
                 Ok(retired) => {
                     applied += usize::from(ordinary_complete);
                     retired_from_selected_queue += usize::from(retired);

@@ -149,6 +149,8 @@ that has not marked it ignored. The no-default build lacks XMP and does not
 repeat either XMP fixture; the regular all-feature matrix retains platform
 coverage for the small and boundary cases.
 
+For local writer performance, run `cargo test --release --locked --lib sidecar_only_backfill_linux_release_read_benchmark -- --ignored --nocapture --test-threads=1` on Linux. The benchmark times selected sidecar backfill for a JPEG and two MP4 sizes, with both missing and already-correct packets. Compare median elapsed time and `/proc/self/io` `rchar` on the same filesystem; `rchar` counts logical reads, including cache hits. Download and fixture setup are outside the measurement.
+
 ## Focused scenario slices
 
 Named scenario slices group existing Rust tests by risk so a change can run
