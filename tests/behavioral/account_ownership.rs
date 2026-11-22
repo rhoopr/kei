@@ -2012,8 +2012,8 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
     success(&command(root, &account, &["sync", "--no-progress-bar"]));
     assert_eq!(
         photos.lookups.load(Ordering::SeqCst),
-        calls + 3,
-        "recovery requires the child lookup and its exact child/master pair"
+        calls + 2,
+        "the refreshed rank observation supplies both keys for one paired confirmation"
     );
     let requests = server.received_requests().await.unwrap();
     let lookups: Vec<Value> = requests[recovery_requests..]
@@ -2021,26 +2021,23 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
         .filter(|request| request.url.path().ends_with("/records/lookup"))
         .map(|request| serde_json::from_slice(&request.body).unwrap())
         .collect();
-    for (lookup, names) in lookups
+    assert_eq!(lookups.len(), 1, "only the due identity is reconfirmed");
+    let lookup = &lookups[0];
+    assert_eq!(
+        lookup["zoneID"],
+        json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})
+    );
+    let actual: Vec<_> = lookup["records"]
+        .as_array()
+        .unwrap()
         .iter()
-        .zip([vec!["asset-quiet-66"], vec!["asset-quiet-66", "quiet-66"]])
-    {
-        assert_eq!(
-            lookup["zoneID"],
-            json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})
-        );
-        let actual: Vec<_> = lookup["records"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|record| record["recordName"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            actual, names,
-            "only the deferred current identity is reconfirmed"
-        );
-    }
-    assert_eq!(lookups.len(), 2);
+        .map(|record| record["recordName"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        actual,
+        ["asset-quiet-66", "quiet-66"],
+        "the exact child and master must be confirmed together"
+    );
     assert_eq!(
         count("SELECT count(*) FROM provider_active_decisions WHERE admission='deferred'"),
         0
@@ -2057,7 +2054,7 @@ async fn catalog_work_actual_service_replays_interrupted_capture_and_drains_quie
     );
     for _ in 0..2 {
         success(&command(root, &account, &["sync", "--no-progress-bar"]));
-        assert_eq!(photos.lookups.load(Ordering::SeqCst), calls + 3);
+        assert_eq!(photos.lookups.load(Ordering::SeqCst), calls + 2);
         assert_eq!(
             rows(
                 &account.path,
