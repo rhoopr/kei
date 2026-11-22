@@ -490,7 +490,7 @@ async fn run_collecting_metadata_rewrite_batch(
     run_mode: DownloadRunMode,
     shutdown_token: &CancellationToken,
 ) -> metadata_rewrite::RewritePass {
-    if !run_mode.downloads_files() {
+    if config.post_sync_metadata || !run_mode.downloads_files() {
         return metadata_rewrite::RewritePass::default();
     }
     let Some(db) = &config.state_db else {

@@ -36,6 +36,8 @@ After indexing finishes, a quiet zone change feed can establish coverage across 
 
 **Metadata.** An enabled setting authorizes later updates to its managed fields. Omitted version-1 settings and no-config runs keep writers disabled. Capture-timestamp replacement requires explicit repair. Immediate and queued writes share the stable-input and ownership requirements. See [metadata write boundaries](architecture/metadata.md).
 
+Ordinary sync commits eligible provider checkpoints before draining the local metadata queue. A verified destination with a recoverable writer receipt can still owe metadata after its zone is synced. Only the writer can settle that receipt. Missing provider evidence or failure to save the obligation still holds the checkpoint.
+
 ## Data-safety invariants
 
 Keep the previous checkpoint on incomplete token proof, interruption, stale planning, or non-durable recovery. Unknown provider identity keeps work pending. A verified local copy does not prove that the provider deleted its source.

@@ -29,7 +29,8 @@ pub(super) use immediate::{MetadataWriteRequest, write_download_metadata};
 pub(super) use planning::MetadataFlags;
 pub(crate) use planning::{CaptureTimestampRepair, writers_enabled};
 pub(super) use queued::{
-    RewritePass, run_pending, run_pending_budget, run_pending_page, run_pending_rows, tag_if_needed,
+    RewritePass, run_backfill_rows, run_pending, run_pending_budget, run_pending_page,
+    run_pending_rows, tag_if_needed,
 };
 #[cfg(feature = "xmp")]
 pub(super) use sidecar::write_reconciled_sidecar;

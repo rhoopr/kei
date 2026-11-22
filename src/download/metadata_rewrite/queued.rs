@@ -90,6 +90,7 @@ pub(in crate::download) struct RewritePass {
     /// retryable metadata failures do not set this flag.
     pub(in crate::download) storage_failed: bool,
     pub(in crate::download) retired_from_selected_queue: usize,
+    pub(in crate::download) state_failed: bool,
 }
 
 /// Process one bounded batch of persisted metadata-rewrite markers: for each
@@ -203,6 +204,57 @@ pub(in crate::download) async fn run_pending_rows<D>(
 where
     D: MembershipStore + MetadataRewriteStore + ?Sized,
 {
+    write_rows(
+        db,
+        metadata_flags,
+        capture_timestamp_repair,
+        temp_suffix,
+        shutdown_token,
+        pending,
+        WriterPhase::Inline,
+    )
+    .await
+}
+
+pub(in crate::download) async fn run_backfill_rows(
+    db: &crate::state::SqliteStateDb,
+    flags: MetadataFlags,
+    suffix: Arc<str>,
+    cancel: &CancellationToken,
+    rows: Vec<crate::state::db::PendingMetadataRewrite>,
+    generation: Option<&str>,
+) -> RewritePass {
+    write_rows(
+        db,
+        flags,
+        CaptureTimestampRepair::Preserve,
+        suffix,
+        cancel,
+        rows,
+        WriterPhase::AfterSync { db, generation },
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum WriterPhase<'a> {
+    Inline,
+    AfterSync {
+        db: &'a crate::state::SqliteStateDb,
+        generation: Option<&'a str>,
+    },
+}
+
+async fn write_rows<D: MembershipStore + MetadataRewriteStore + ?Sized>(
+    db: &D,
+    metadata_flags: MetadataFlags,
+    capture_timestamp_repair: CaptureTimestampRepair,
+    temp_suffix: Arc<str>,
+    shutdown_token: &CancellationToken,
+    pending: Vec<crate::state::db::PendingMetadataRewrite>,
+    phase: WriterPhase<'_>,
+) -> RewritePass {
+    let post_sync = matches!(phase, WriterPhase::AfterSync { .. });
     let selected_queue = if matches!(
         capture_timestamp_repair,
         CaptureTimestampRepair::ReplaceWithCaptureLocal
@@ -239,8 +291,12 @@ where
     let mut errored = 0usize;
     let mut deferred = 0usize;
     let mut storage_failed = false;
+    let mut state_failed = !grouping_read_failures.is_empty();
     let mut retired_from_selected_queue = 0usize;
     for (idx, pending_rewrite) in pending.into_iter().enumerate() {
+        if state_failed && post_sync {
+            break;
+        }
         if storage_failed {
             deferred += pending_count - idx;
             tracing::warn!(
@@ -332,7 +388,13 @@ where
                 continue;
             }
         }
-        match db.claim_selection_writer(&pending_rewrite).await {
+        let claim = match phase {
+            WriterPhase::Inline => db.claim_selection_writer(&pending_rewrite).await,
+            WriterPhase::AfterSync { db, generation } => {
+                db.claim_backfill_writer(&pending_rewrite, generation).await
+            }
+        };
+        match claim {
             Ok(true) => {}
             Ok(false) => {
                 deferred += 1;
@@ -340,6 +402,7 @@ where
             }
             Err(error) => {
                 tracing::warn!(%error, "Could not validate queued metadata writer");
+                state_failed = true;
                 errored += 1;
                 continue;
             }
@@ -415,6 +478,7 @@ where
         {
             Ok(receipt) => receipt,
             Err(error) => {
+                state_failed = true;
                 tracing::warn!(%error, "Could not read embedded field ownership");
                 errored += 1;
                 continue;
@@ -461,6 +525,7 @@ where
                     .recover_embedded_metadata_receipt(&pending_rewrite, &receipt, measured.size)
                     .await
                 {
+                    state_failed = true;
                     tracing::warn!(%error, "Could not finalize previous embedded field output");
                     errored += 1;
                     continue;
@@ -681,6 +746,7 @@ where
                         .await
                     {
                         tracing::warn!(%error, "Could not retain prepared embedded field ownership");
+                        state_failed = true;
                         errored += 1;
                         continue;
                     }
@@ -707,7 +773,8 @@ where
                                 Ok(Some(receipt)) => {
                                     pending_for_finish.selection_receipt = Some(receipt)
                                 }
-                                Ok(None) | Err(_) => {
+                                result => {
+                                    state_failed |= result.is_err();
                                     errored += 1;
                                     continue;
                                 }
@@ -735,6 +802,7 @@ where
                                     continue;
                                 }
                                 Err(error) => {
+                                    state_failed = true;
                                     tracing::warn!(
                                         target: "kei::download::metadata_rewrite",
                                         path = %path.display(),
@@ -788,7 +856,7 @@ where
         if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
             // Only certify a packet that was planned from the recorded media bytes.
             // In particular, a sidecar-only retry need not own the media itself.
-            let certified_input = if pending_for_finish.selection_receipt.is_some() {
+            let certified_input = if pending_for_finish.selection_receipt.is_some() || post_sync {
                 match final_fingerprint {
                     Some(output) => Some(output),
                     None => crate::download::file::fingerprint_regular_file(&path)
@@ -801,6 +869,10 @@ where
             } else {
                 None
             };
+            if post_sync && certified_input.is_none() {
+                skipped_drifted += 1;
+                continue;
+            }
             let sidecar = write_sidecar_metadata(
                 &path,
                 Arc::clone(&payload),
@@ -813,13 +885,18 @@ where
             if let Some(receipt) = pending_for_finish.selection_receipt.as_mut()
                 && let Some(before) = certified_input
                 && let Some(packet) = sidecar.output
-                && crate::download::file::fingerprint_regular_file(&path)
+            {
+                if crate::download::file::fingerprint_regular_file(&path)
                     .await
                     .ok()
                     == Some(before)
-            {
-                receipt.writer_output =
-                    Some((WriterOutput::Sidecar(packet), *created_local.offset()));
+                {
+                    receipt.writer_output =
+                        Some((WriterOutput::Sidecar(packet), *created_local.offset()));
+                } else if post_sync {
+                    skipped_drifted += 1;
+                    continue;
+                }
             }
             storage_failed |= sidecar.storage_failed;
         }
@@ -931,13 +1008,15 @@ where
                     retired_from_selected_queue += usize::from(retired);
                 }
                 Err(error) => {
+                    state_failed = true;
                     tracing::warn!(
                         target: "kei::download::metadata_rewrite",
                         asset_id = %record.id,
                         %error,
                         "Failed to finalise metadata rewrite state"
                     );
-                    if selected_queue == MetadataRewriteQueue::Ordinary
+                    if !post_sync
+                        && selected_queue == MetadataRewriteQueue::Ordinary
                         && pending_rewrite.selection_receipt.is_none()
                         && pending_rewrite.capture_repair_receipt.is_none()
                         && let Err(fallback_error) = db
@@ -1000,6 +1079,7 @@ where
         "Metadata rewrite pass complete"
     );
     RewritePass {
+        state_failed,
         fetched: pending_count,
         applied,
         failed: errored + deferred + skipped_drifted + skipped_unverified,

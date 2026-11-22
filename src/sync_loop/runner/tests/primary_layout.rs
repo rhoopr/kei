@@ -4112,7 +4112,7 @@ async fn primary_layout_after_database_failure(upgrade: bool) {
         crate::sync_loop::precheck::include_pending_local_work(
             &mut precheck,
             &db,
-            &crate::config::MetadataConfig::default(),
+            Some(&crate::config::MetadataConfig::default()),
             &[selected],
         )
         .await;

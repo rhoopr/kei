@@ -520,6 +520,7 @@ async fn shutdown_cancellation_exits_download_pass_promptly() {
         legacy_preservation_allow_hardlinks: false,
         concurrent_downloads: 10,
         inventory_reconciliation: false,
+        post_sync_metadata: false,
         retry: crate::retry::RetryConfig {
             max_retries: 0,
             base_delay_secs: 0,

@@ -4165,6 +4165,23 @@ impl SqliteStateDb {
     }
 }
 
+/// Validate the fresh selection that still depends on the older catalogue input.
+pub(super) fn validate_blocked_successor(
+    conn: &Connection,
+    generation: &str,
+    key: &str,
+    child: &str,
+) -> Result<(), StateError> {
+    let root = load_generation(conn, generation)?;
+    let manifest = load_decision(conn, &root, key, child)?;
+    if manifest.decision.outcome != SelectionOutcome::Selected
+        || manifest.decision.confirmation.is_none()
+    {
+        return invalid();
+    }
+    Ok(())
+}
+
 /// Adapt one exact native destination into the existing metadata write owner.
 /// Legacy path TEXT is neither decoded nor used as publication evidence.
 pub(super) fn metadata_receipt(
@@ -4722,6 +4739,48 @@ impl SqliteStateDb {
         scope: String,
         config_hash: String,
     ) -> Result<bool, StateError> {
+        self.selection_debt(owner, scope, config_hash, false).await
+    }
+
+    /// Does not include metadata that the post-checkpoint writer can recover
+    /// from the selected SQLite receipts alone.
+    pub(crate) async fn provider_selection_debt(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        config_hash: String,
+    ) -> Result<bool, StateError> {
+        self.selection_debt(owner, scope, config_hash, true).await
+    }
+
+    /// Local recovery is bound to the last inventory for this exact plan.
+    /// Advancing a provider cursor must not make its writer unreachable.
+    pub(crate) async fn local_writer_generation(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        config_hash: String,
+    ) -> Result<Option<ActiveGeneration>, StateError> {
+        self.with_conn("reading local writer inventory", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            account::validate_authenticated(&tx, &owner)?;
+            let id: Option<String> = tx
+                .query_row(LATEST_LOCAL_GENERATION, params![scope, config_hash], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            id.map(|id| load_generation(&tx, &id)).transpose()
+        })
+        .await
+    }
+
+    async fn selection_debt(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        config_hash: String,
+        local_writer_available: bool,
+    ) -> Result<bool, StateError> {
         self.with_conn("inspecting retained selection debt",move|conn|{
             let tx=conn.unchecked_transaction()?;
             account::validate_authenticated(&tx,&owner)?;
@@ -4734,11 +4793,60 @@ impl SqliteStateDb {
             // A later complete inventory accounts for its own selected repair
             // destinations. Keep historical confirmations for future matching
             // selections without charging them to the current checkpoint.
-            Ok(conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE {CURRENT_SELECTION_CONFIGURATION} AND d.admission='deferred') OR EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND (g.config_hash=?2 OR (w.prepared_hash IS NOT NULL AND EXISTS(SELECT 1 FROM provider_active_destinations selected JOIN provider_active_generations current ON current.id=selected.generation WHERE current.scope=?1 AND current.config_hash=?2 AND selected.admitted=1 AND selected.path=w.path))) AND {UNFINISHED}
-                AND NOT (w.confirmed_repair IS NOT NULL AND w.prepared_hash IS NULL AND EXISTS(SELECT 1 FROM provider_active_generations newer WHERE newer.scope=g.scope AND newer.config_hash=g.config_hash AND newer.created_at>g.created_at AND newer.sealed=1 AND newer.checkpoint_ready=1)))"),params![scope,config_hash],|r|r.get(0))?)
+            if conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE {CURRENT_SELECTION_CONFIGURATION} AND d.admission='deferred')"),params![scope,config_hash],|r|r.get::<_,bool>(0))? {return Ok(true)}
+            let debt=format!("FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND (g.config_hash=?2 OR (w.prepared_hash IS NOT NULL AND EXISTS(SELECT 1 FROM provider_active_destinations selected JOIN provider_active_generations current ON current.id=selected.generation WHERE current.scope=?1 AND current.config_hash=?2 AND selected.admitted=1 AND selected.path=w.path))) AND {UNFINISHED}
+                AND NOT (w.confirmed_repair IS NOT NULL AND w.prepared_hash IS NULL AND EXISTS(SELECT 1 FROM provider_active_generations newer WHERE newer.scope=g.scope AND newer.config_hash=g.config_hash AND newer.created_at>g.created_at AND newer.sealed=1 AND newer.checkpoint_ready=1))");
+            let unfinished:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 {debt})"),params![scope,config_hash],|r|r.get(0))?;
+            if !unfinished || !local_writer_available {return Ok(unfinished)}
+            // Refresh the local preservation cache before opening the destination
+            // cursor: rebuilding its TEMP schema would invalidate a live cursor.
+            let protected=super::legacy_preservation::protected_paths(conn)?.into_iter()
+                .map(|path|crate::fs_util::confined_path_key(&path).map_err(|_invalid_path|StateError::ProviderSelectionInvalid))
+                .collect::<Result<HashSet<_>,_>>()?;
+            // The local writer reads the latest generation and can finish
+            // compatible aliases. Don't excuse a historical-only path, a
+            // lost catalogue input, an outstanding repair, or missing media.
+            let mut stmt=conn.prepare(&format!("SELECT DISTINCT w.library,w.asset_id,CASE WHEN
+                g.config_hash=?2 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL) AND w.confirmed_repair IS NULL
+                AND w.intent_hash IS NOT NULL AND w.local_checksum IS NOT NULL
+                AND EXISTS(SELECT 1 FROM assets a WHERE a.library=w.library AND a.id=w.asset_id
+                    AND a.version_size=w.version_size AND a.checksum=w.checksum AND a.is_deleted=0
+                    AND a.metadata_hash=w.metadata_hash AND a.created_at IS w.created_at AND a.added_at IS w.added_at)
+                AND EXISTS(SELECT 1 FROM provider_active_destinations n JOIN provider_active_generations newest ON newest.id=n.generation
+                    WHERE n.generation=({LATEST_LOCAL_GENERATION}) AND newest.sealed=1 AND newest.checkpoint_ready=1
+                    AND n.pass_key=w.pass_key AND n.child=w.child AND n.version_size=w.version_size AND n.path=w.path
+                    AND n.library=w.library AND n.asset_id=w.asset_id AND n.master=w.master AND n.checksum=w.checksum
+                    AND n.size_bytes=w.size_bytes AND n.metadata_hash=w.metadata_hash AND n.added_at IS w.added_at AND n.created_at IS w.created_at
+                    AND n.admitted=1 AND (n.verified_media=1 OR n.preserved_local IS NOT NULL) AND n.verified_metadata=0 AND n.metadata_successor IS NULL
+                    AND n.confirmed_repair IS NULL AND n.preserved_local IS w.preserved_local AND n.grouping_hash=w.grouping_hash
+                    AND n.local_checksum=w.local_checksum AND n.source_checksum IS w.source_checksum
+                    AND (w.generation=n.generation OR (w.prepared_hash IS NULL AND n.prepared_hash IS NULL)))
+                THEN w.grouping_hash END,w.path {debt}"))?;
+            let mut rows=stmt.query(params![scope,config_hash])?;
+            while let Some(r)=rows.next()? {
+                let Some(group)=r.get::<_,Option<String>>(2)? else {return Ok(true)};
+                let path:super::provider_selection::SelectionPath=serde_json::from_str(&r.get::<_,String>(3)?)
+                    .map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
+                let path=path.to_path();
+                if super::primary_layout::path_is_managed(conn,&path)? {return Ok(true)}
+                if !protected.is_empty() {
+                    let mut sidecar=path.as_os_str().to_owned();
+                    sidecar.push(".xmp");
+                    for p in [path.as_path(),Path::new(&sidecar)] {
+                        if protected.contains(&crate::fs_util::confined_path_key(p).map_err(|_invalid_path|StateError::ProviderSelectionInvalid)?) {return Ok(true)}
+                    }
+                }
+                if grouping_hash(conn,&r.get::<_,String>(0)?,&r.get::<_,String>(1)?)?!=group {return Ok(true)}
+            }
+            drop(rows);
+            drop(stmt);
+            tx.commit()?;
+            Ok(false)
         }).await
     }
 }
+
+const LATEST_LOCAL_GENERATION: &str = "SELECT id FROM provider_active_generations WHERE scope=?1 AND config_hash=?2 ORDER BY created_at DESC,id DESC LIMIT 1";
 
 impl SqliteStateDb {
     /// Established destination ownership is independent of current resource proof.

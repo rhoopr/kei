@@ -2911,6 +2911,16 @@ async fn deleted_bound_album_actual_cli_redistributes_real_publications() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn private_selection_actual_cli_and_watch_reopen_independent_destination_debt() {
+    private_cli_destination_recovery(false).await;
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_cli_commits_provider_token_before_local_metadata_failure_and_restarts() {
+    private_cli_destination_recovery(true).await;
+}
+
+async fn private_cli_destination_recovery(metadata_fault: bool) {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     let server = MockServer::start().await;
@@ -2952,6 +2962,11 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
     Connection::open(&account.path).unwrap().execute_batch("DROP TABLE provider_active_sources; DROP TABLE provider_active_destinations; DROP TABLE provider_active_decisions; DROP TABLE provider_selection_rank_records; DROP TABLE provider_selection_rank_pages; DROP TABLE provider_active_generations; PRAGMA user_version=33;").unwrap();
     success(&command(root, &account, &["status"]));
     let config=std::fs::read_to_string(&account.config).unwrap().replace("[ui]","folder_structure=\"\"\nfolder_structure_albums=\"{album}\"\n[filters]\nalbums=[\"A\",\"B\"]\nunfiled=true\n[ui]");
+    let config = if metadata_fault {
+        format!("{config}[metadata]\nxmp_sidecar=true\n")
+    } else {
+        config
+    };
     // Start with a selection that binds the two directories but selects no
     // media. Precreating A and B would deliberately reserve external trees.
     std::fs::write(
@@ -3004,7 +3019,11 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
     }
     drop(conn);
     let conn = Connection::open(&account.path).unwrap();
-    conn.execute_batch("CREATE TRIGGER private_cli_destination_fault BEFORE UPDATE OF verified_media ON provider_active_destinations WHEN NEW.verified_media=1 AND replace(NEW.compat_path,char(92),'/') LIKE '%/B/%' BEGIN SELECT RAISE(ABORT,'synthetic private B receipt interruption'); END;").unwrap();
+    if metadata_fault {
+        conn.execute_batch("CREATE TRIGGER backfill_commit_fault BEFORE UPDATE OF verified_metadata ON provider_active_destinations WHEN OLD.verified_metadata=0 AND NEW.verified_metadata=1 BEGIN SELECT RAISE(ABORT,'synthetic backfill receipt failure'); END;").unwrap();
+    } else {
+        conn.execute_batch("CREATE TRIGGER private_cli_destination_fault BEFORE UPDATE OF verified_media ON provider_active_destinations WHEN NEW.verified_media=1 AND replace(NEW.compat_path,char(92),'/') LIKE '%/B/%' BEGIN SELECT RAISE(ABORT,'synthetic private B receipt interruption'); END;").unwrap();
+    }
     // Start the faulted cycle without a provider cursor, as on first sync.
     conn.execute(
         "DELETE FROM metadata WHERE key='sync_token:PrimarySync'",
@@ -3013,8 +3032,60 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
     .unwrap();
     drop(conn);
     std::fs::write(&account.config, &config).unwrap();
+    if metadata_fault {
+        let conn = Connection::open(&account.path).unwrap();
+        conn.execute_batch("CREATE TRIGGER failed_writer_intent BEFORE UPDATE OF intent_hash ON provider_active_destinations WHEN NEW.intent_hash IS NOT NULL BEGIN SELECT RAISE(ABORT,'synthetic failure to save metadata intent'); END;").unwrap();
+        let failed = command(root, &account, &["sync", "--no-progress-bar"]);
+        assert!(!failed.status.success());
+        assert!(
+            String::from_utf8_lossy(&failed.stderr)
+                .contains("synthetic failure to save metadata intent")
+        );
+        assert!(
+            !conn
+                .query_row::<bool, _, _>(
+                    "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='sync_token:PrimarySync')",
+                    [],
+                    |r| r.get(0)
+                )
+                .unwrap()
+        );
+        conn.execute_batch("DROP TRIGGER failed_writer_intent")
+            .unwrap();
+    }
     let out = command(root, &account, &["sync", "--no-progress-bar"]);
     let diagnostics = String::from_utf8_lossy(&out.stderr);
+    if metadata_fault {
+        assert!(
+            !out.status.success() && diagnostics.contains("synthetic backfill receipt failure"),
+            "{diagnostics}"
+        );
+        let conn = Connection::open(&account.path).unwrap();
+        assert!(conn.query_row::<bool,_,_>("SELECT EXISTS(SELECT 1 FROM metadata WHERE key='sync_token:PrimarySync' AND length(value)>0)",[],|r|r.get(0)).unwrap(),"{diagnostics}");
+        let remaining = || {
+            conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_media=1 AND verified_metadata=0",[],|r|r.get(0)).unwrap()
+        };
+        assert_eq!(remaining(), 5);
+        let ranks = photos.ranks.load(Ordering::SeqCst);
+        conn.execute_batch("DROP TRIGGER backfill_commit_fault")
+            .unwrap();
+        success(&command(root, &account, &["sync", "--no-progress-bar"]));
+        assert_eq!(remaining(), 0);
+        assert_eq!(
+            photos.ranks.load(Ordering::SeqCst),
+            ranks,
+            "a durable provider token must avoid a repeat inventory"
+        );
+        for (path, modified) in &seeded {
+            assert_eq!(std::fs::read(path).unwrap(), QUIET_MEDIA);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+                *modified
+            );
+            assert!(path.with_extension("JPG.xmp").is_file());
+        }
+        return;
+    }
     assert!(
         diagnostics.contains("synthetic private B receipt interruption"),
         "{diagnostics}"
@@ -3078,7 +3149,7 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
         std::fs::read(&health_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|value| value["last_sync_at"].as_str().map(str::to_owned))
+            .and_then(|value| value.get("last_sync_at")?.as_str().map(str::to_owned))
     };
     let mut last_health_stamp = health_stamp();
     assert!(
