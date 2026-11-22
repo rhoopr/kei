@@ -35,7 +35,7 @@ class NightlyFuzzTests(unittest.TestCase):
         self.assertRegex(workflow, r"(?m)^\s*path:\s*fuzz/corpus\s*$")
         self.assertRegex(
             workflow,
-            r"(?m)^\s*key:\s*fuzz-corpus-\$\{\{\s*github\.run_id\s*\}\}\s*$",
+            r"(?m)^\s*key:\s*fuzz-corpus-\$\{\{\s*github\.run_id\s*\}\}-\$\{\{\s*github\.run_attempt\s*\}\}\s*$",
         )
         self.assertRegex(workflow, r"(?m)^\s*restore-keys:\s*fuzz-corpus-\s*$")
         self.assertRegex(
