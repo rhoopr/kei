@@ -27,7 +27,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` in support to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 47;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 48;
     let production_schema = include_str!("../../src/state/schema.rs");
     assert!(
         production_schema.contains(&format!(
@@ -1220,6 +1220,7 @@ fn behavioral_helper_carries_every_migrated_column() {
         ("asset_metadata_paths", "embedded_metadata_receipt", "v41"),
         ("provider_active_destinations", "confirmed_repair", "v42"),
         ("provider_active_destinations", "writer_output_proof", "v47"),
+        ("provider_selection_rank_pages", "has_relation", "v48"),
     ] {
         assert!(
             has_column(&conn, table, column),

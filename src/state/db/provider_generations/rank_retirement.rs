@@ -22,19 +22,27 @@ fn receipt_hash(
     hash.update(encode(&("rank-retirement-v1", page, digest(payload)))?);
     let mut stmt = conn.prepare("SELECT ordinal,record_name,record_type,deleted FROM provider_selection_rank_records WHERE page_id=?1 ORDER BY ordinal")?;
     let mut rows = stmt.query([page])?;
+    let mut observed_relation = false;
     for ordinal in 0..child_count {
         let row = rows.next()?.ok_or(StateError::ProviderSelectionInvalid)?;
         if usize::try_from(row.get::<_, i64>(0)?).ok() != Some(ordinal) {
             return invalid();
         }
+        let kind = row.get::<_, Option<String>>(2)?;
+        observed_relation |= kind.as_deref() == Some("CPLContainerRelation");
         hash.update(encode(&(
             ordinal,
             row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
+            kind,
             row.get::<_, bool>(3)?,
         ))?);
     }
-    if rows.next()?.is_some() {
+    let has_relation: bool = conn.query_row(
+        "SELECT has_relation FROM provider_selection_rank_pages WHERE id=?1",
+        [page],
+        |row| row.get(0),
+    )?;
+    if rows.next()?.is_some() || observed_relation != has_relation {
         return invalid();
     }
     Ok(format!("{:x}", hash.finalize()))

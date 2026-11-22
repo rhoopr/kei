@@ -5396,6 +5396,118 @@ async fn published_confirmation_releases_only_matching_inbox_records() {
 }
 
 #[tokio::test]
+async fn rank_source_lookup_resolves_name_and_membership_branches_without_unrelated_pages() {
+    use crate::state::db::provider_generations::{MAX_GENERATION_BYTES, RankSource};
+    let (f, root, manifest, _) = active_pending_fixture().await;
+    let key = manifest.decision.pass_key.clone();
+    let child = "branch-target";
+    let direct_request: Value = {
+        let raw: Vec<u8> =
+            f.db.acquire_lock("direct rank request")
+                .unwrap()
+                .query_row(
+                    "SELECT request FROM provider_selection_rank_pages
+              WHERE generation=?1 AND instr(CAST(request AS TEXT),'zones')=0 ORDER BY id LIMIT 1",
+                    [&root.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        serde_json::from_slice(&raw).unwrap()
+    };
+    let mut direct_record = f.session.records.lock().unwrap()[0].clone();
+    direct_record["recordName"] = json!(child);
+    let direct_body = serde_json::to_vec(&json!({
+        "records":[direct_record],"syncToken":"branch-direct","moreComing":false
+    }))
+    .unwrap();
+    let mut unrelated_record = f.session.records.lock().unwrap()[0].clone();
+    unrelated_record["recordName"] = json!("unrelated-name");
+    let unrelated_body = serde_json::to_vec(&json!({
+        "records":[unrelated_record],"syncToken":"branch-unrelated","moreComing":false
+    }))
+    .unwrap();
+    let membership_request =
+        crate::icloud::photos::queries::build_changes_zone_request(&root.spec.zone, None, 200);
+    let membership_body = serde_json::to_vec(&json!({"zones":[{
+        "zoneID":root.spec.zone,"syncToken":"branch-membership","moreComing":false,
+        "records":[
+            {"recordName":"relation-branch-unrelated","recordType":"CPLContainerRelation",
+             "fields":{"containerId":{"type":"STRING","value":"A"},
+                       "itemId":{"type":"STRING","value":"unrelated-member"}}},
+            {"recordName":"relation-branch-target","recordType":"CPLContainerRelation",
+             "fields":{"containerId":{"type":"STRING","value":"A"},
+                       "itemId":{"type":"STRING","value":child}}}
+        ]
+    }]}))
+    .unwrap();
+    let other_membership_body = serde_json::to_vec(&json!({"zones":[{
+        "zoneID":root.spec.zone,"syncToken":"branch-other-membership","moreComing":false,
+        "records":[{"recordName":"relation-branch-other","recordType":"CPLContainerRelation",
+            "fields":{"containerId":{"type":"STRING","value":"A"},
+                      "itemId":{"type":"STRING","value":"other-member"}}}]
+    }]}))
+    .unwrap();
+    let mut captured = Vec::new();
+    for (request, body) in [
+        (direct_request.clone(), direct_body),
+        (direct_request, unrelated_body),
+        (membership_request.clone(), membership_body),
+        (membership_request, other_membership_body),
+    ] {
+        f.db.capture_selection_rank_page(
+            owner(),
+            root.id.clone(),
+            key.clone(),
+            request,
+            body.clone(),
+            MAX_GENERATION_BYTES,
+        )
+        .await
+        .unwrap();
+        let id: String =
+            f.db.acquire_lock("branch page id")
+                .unwrap()
+                .query_row(
+                    "SELECT id FROM provider_selection_rank_pages WHERE generation=?1 AND body=?2",
+                    rusqlite::params![root.id, body],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        captured.push(id);
+    }
+    let mut expected = vec![
+        RankSource {
+            page_id: captured[0].clone(),
+            ordinal: 0,
+        },
+        RankSource {
+            page_id: captured[2].clone(),
+            ordinal: 1,
+        },
+    ];
+    expected.sort_by(|a, b| (&a.page_id, a.ordinal).cmp(&(&b.page_id, b.ordinal)));
+    assert_eq!(
+        f.db.selection_rank_sources(owner(), root.id.clone(), key, child.into())
+            .await
+            .unwrap(),
+        expected,
+        "only the direct name match and the matching live relation are sources"
+    );
+    f.db.acquire_lock("hide membership page from source discovery")
+        .unwrap()
+        .execute(
+            "UPDATE provider_selection_rank_pages SET has_relation=0 WHERE id=?1",
+            [&captured[2]],
+        )
+        .unwrap();
+    assert!(matches!(
+        f.db.seal_selection_generation(owner(), root.id, true, None)
+            .await,
+        Err(crate::state::error::StateError::ProviderSelectionInvalid)
+    ));
+}
+
+#[tokio::test]
 async fn explicit_media_source_cannot_rebind_retained_membership_evidence() {
     use crate::state::db::provider_generations::MAX_GENERATION_BYTES;
     use crate::state::db::provider_selection::SelectionMediaSource;
@@ -7932,7 +8044,10 @@ async fn selected_confirmation_uses_bound_media_source_not_membership_library() 
     );
     assert_eq!(confirmed.asset.source_zone(), Some("SharedSync-media"));
     assert_eq!(f.session.calls.load(Ordering::SeqCst), owner_calls);
-    assert_eq!(media_session.calls.load(Ordering::SeqCst), media_calls + 2);
+    assert_eq!(media_session.calls.load(Ordering::SeqCst), media_calls + 1);
+    *media_session.corrupt.lock().unwrap() = Some("pair");
+    assert!(album.confirm_selected_asset(&observed).await.is_err());
+    *media_session.corrupt.lock().unwrap() = None;
     let binding = album.selected_media_source(&observed).unwrap();
     let mut wrong_owner = binding.clone();
     wrong_owner.zone["ownerRecordName"] = json!("OTHER_OWNER_CANARY");

@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 47;
+pub(crate) const SCHEMA_VERSION: i32 = 48;
 const FRESH_START_VERSION: i32 = 38;
 const RETIRED_INBOX: [&str; 3] = [
     "provider_shadow_receipts",
@@ -1600,6 +1600,28 @@ pub(crate) fn migrate_to_version(
             }
             conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_verified_writer_output ON provider_active_destinations(library,asset_id,path,writer_output_proof) WHERE writer_output_proof IS NOT NULL")?;
         }
+        48 => {
+            // Selection source lookup resolves the child name and membership
+            // relations independently. A per-page marker keeps relation pages
+            // discoverable without walking pages that have no relations.
+            if !column_exists(conn, "provider_selection_rank_pages", "has_relation")? {
+                conn.execute_batch(
+                    "ALTER TABLE provider_selection_rank_pages
+                        ADD COLUMN has_relation INTEGER NOT NULL DEFAULT 0
+                        CHECK(has_relation IN (0,1));",
+                )?;
+            }
+            conn.execute_batch(
+                "UPDATE provider_selection_rank_pages SET has_relation=1
+                  WHERE id IN (SELECT DISTINCT page_id FROM provider_selection_rank_records
+                               WHERE record_type='CPLContainerRelation');
+                 CREATE INDEX IF NOT EXISTS idx_selection_rank_relation_pages
+                   ON provider_selection_rank_pages(generation,pass_key)
+                   WHERE has_relation=1;
+                 CREATE INDEX IF NOT EXISTS idx_active_destination_child
+                   ON provider_active_destinations(child,library);",
+            )?;
+        }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -2610,6 +2632,66 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retained.as_deref(), Some(evidence.as_slice()));
+    }
+
+    #[test]
+    fn selection_rank_relation_index_migrates_without_dropping_history() {
+        let conn = historical_provider_fixture(47);
+        conn.execute_batch(
+            "INSERT INTO provider_selection_rank_pages
+                (id,generation,pass_key,request,request_hash,body,body_hash,charged_bytes)
+             VALUES ('page','old','pass',X'00','request-hash',X'00','body-hash',1),
+                    ('direct','old','pass',X'00','direct-request',X'00','direct-body',1);
+             INSERT INTO provider_selection_rank_records(page_id,ordinal,record_name,record_type,deleted)
+             VALUES ('page',0,'child','CPLAsset',0),('page',1,'relation','CPLContainerRelation',0),
+                    ('direct',0,'direct-child','CPLAsset',0);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let indexed: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_index_list('provider_selection_rank_pages')
+                  WHERE name='idx_selection_rank_relation_pages' AND partial=1)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            indexed,
+            "relation source lookup needs its partial pages index"
+        );
+        let flags: Vec<(String, bool)> = conn
+            .prepare("SELECT id,has_relation FROM provider_selection_rank_pages ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            flags,
+            vec![("direct".into(), false), ("page".into(), true)],
+            "backfill must mark only pages with retained relation records"
+        );
+        let retained: Vec<(i64, String, Option<String>)> = conn
+            .prepare(
+                "SELECT ordinal,record_name,record_type FROM provider_selection_rank_records
+                  WHERE page_id='page' ORDER BY ordinal",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            retained,
+            vec![
+                (0, "child".into(), Some("CPLAsset".into())),
+                (1, "relation".into(), Some("CPLContainerRelation".into())),
+            ],
+            "the schema migration must preserve every historical rank row"
+        );
     }
 
     #[test]

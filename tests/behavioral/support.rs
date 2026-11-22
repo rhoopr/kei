@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 47;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 48;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -114,9 +114,11 @@ CREATE TABLE IF NOT EXISTS provider_selection_rank_pages (
  body BLOB NOT NULL, body_hash TEXT NOT NULL,
  charged_bytes INTEGER NOT NULL CHECK(charged_bytes>0),
  retired_proof_hash TEXT CHECK(retired_proof_hash IS NULL OR length(retired_proof_hash)=64),
+ has_relation INTEGER NOT NULL DEFAULT 0 CHECK(has_relation IN (0,1)),
  UNIQUE(generation,pass_key,request_hash,body_hash)
 ) WITHOUT ROWID;
 CREATE INDEX idx_selection_rank_unretired ON provider_selection_rank_pages(generation) WHERE retired_proof_hash IS NULL;
+CREATE INDEX IF NOT EXISTS idx_selection_rank_relation_pages ON provider_selection_rank_pages(generation,pass_key) WHERE has_relation=1;
 CREATE TABLE IF NOT EXISTS provider_selection_rank_records (
  page_id TEXT NOT NULL REFERENCES provider_selection_rank_pages(id),
  ordinal INTEGER NOT NULL CHECK(ordinal>=0), record_name TEXT NOT NULL,
@@ -162,6 +164,7 @@ CREATE TABLE IF NOT EXISTS provider_active_destinations (
  FOREIGN KEY(generation,pass_key,child) REFERENCES provider_active_decisions(generation,pass_key,child)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_active_destination_identity ON provider_active_destinations(library,asset_id,version_size,admitted,verified_media,verified_metadata);
+CREATE INDEX IF NOT EXISTS idx_active_destination_child ON provider_active_destinations(child,library);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_current_native_publication ON provider_active_destinations(library,path) WHERE current_publication=1;
 CREATE INDEX IF NOT EXISTS idx_verified_writer_output ON provider_active_destinations(library,asset_id,path,writer_output_proof) WHERE writer_output_proof IS NOT NULL;
 
