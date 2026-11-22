@@ -3325,6 +3325,116 @@ async fn persisted_grouping_fixture(unexplained_person: bool) {
 }
 
 #[tokio::test]
+async fn unfiled_frozen_destinations_converge_with_short_legacy_receipts() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mut f = Fixture::new().await;
+    f.config.folder_structure.clear();
+    #[cfg(feature = "xmp")]
+    {
+        f.config.metadata.xmp_sidecar = true;
+    }
+    let server = MockServer::start().await;
+    let mut current = Vec::new();
+    let items = [("m", "solo"), ("c", "shared"), ("d", "shared")];
+    let payload =
+        |id: &str| [b"\xff\xd8\xff\xe0legacy fixture ".as_slice(), id.as_bytes()].concat();
+    for (id, stem) in items {
+        let bytes = payload(id);
+        let mut pair = records(id, CURRENT, "current");
+        pair[0]["fields"]["filenameEnc"]["value"] = json!(format!("{stem}-long-{id}.JPG"));
+        pair[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/{id}",server.uri()),"size":bytes.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(&bytes))});
+        current.extend(pair);
+    }
+    *f.session.records.lock().unwrap() = current;
+    let run = |f: &Fixture| {
+        let pass = unfiled_destination_pass(f, &[]);
+        let config = Arc::new(f.config.clone());
+        async move {
+            crate::download::download_photos_with_sync(
+                &reqwest::Client::new(),
+                &[pass],
+                config,
+                controls(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // No media endpoint yet: freeze genuine declarations without fabricating their proofs.
+    let interrupted = run(&f).await;
+    assert!(interrupted.checkpoint.sync_token_blocked, "{interrupted:?}");
+    for (id, stem) in items {
+        let bytes = payload(id);
+        let short = f.config.directory.join(format!("{stem}.JPG"));
+        if !short.exists() {
+            std::fs::write(&short, &bytes).unwrap();
+        }
+        let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(&bytes));
+        f.db.mark_downloaded(
+            "PrimarySync",
+            &format!("asset-{id}"),
+            "original",
+            &short,
+            &hash,
+            Some(&hash),
+        )
+        .await
+        .unwrap();
+        Mock::given(method("GET"))
+            .and(path(format!("/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let mut repaired = Vec::new();
+    for cycle in 0..2 {
+        f = reopen_destination_fixture(f).await;
+        let result = run(&f).await;
+        assert_eq!(
+            result.stats.downloaded,
+            if cycle == 0 { 3 } else { 0 },
+            "{result:?}"
+        );
+        assert!(!result.checkpoint.sync_token_blocked, "{result:?}");
+        assert_eq!(result.sync_token.as_deref(), Some("quiet-zone-cursor"));
+        assert!(!result.stats.selected_work_remaining);
+        if cycle == 1 {
+            assert!(!result.full_enumeration_ran);
+        }
+        let mut installed = Vec::new();
+        for (id, stem) in items {
+            let name = format!("{stem}-long-{id}.JPG");
+            let path = f.config.directory.join(&name);
+            assert_eq!(std::fs::read(&path).unwrap(), payload(id));
+            installed.push(std::fs::metadata(&path).unwrap().modified().unwrap());
+            #[cfg(feature = "xmp")]
+            installed.push(
+                std::fs::metadata(path.with_file_name(format!("{name}.xmp")))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+            );
+        }
+        if cycle == 0 {
+            repaired = installed;
+        } else {
+            assert_eq!(installed, repaired);
+        }
+        for (id, stem) in &items[..2] {
+            assert_eq!(
+                std::fs::read(f.config.directory.join(format!("{stem}.JPG"))).unwrap(),
+                payload(id)
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn private_completed_album_copy_is_repaired_independently_after_reopen() {
     Box::pin(completed_album_copy_reopen_fixture(
         false,
@@ -9923,37 +10033,39 @@ fn session_recovery_passes(f: &Fixture, multi: bool) -> Vec<AlbumPass> {
     let mut passes = vec![destination_pass(f, "A")];
     if multi {
         passes.push(destination_pass(f, "B"));
-        let mut album = PhotoAlbum::new(
-            PhotoAlbumConfig {
-                params: Arc::new(std::collections::HashMap::new()),
-                service_endpoint: Arc::from("https://example.invalid"),
-                name: Arc::from(""),
-                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
-                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
-                query_filter: None,
-                page_size: 2,
-                zone_id: Arc::new(
-                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}),
-                ),
-                retry_config: crate::retry::RetryConfig::default(),
-                container_id: None,
-                cross_zone_sources: Vec::new(),
-            },
-            Box::new(DestinationSelectionSession(f.session.clone())),
-        );
-        album.set_shadow_capture(f.capture.clone(), Arc::from("private"));
-        passes.push(AlbumPass {
-            kind: PassKind::Unfiled,
-            album,
-            exclude_ids: Arc::new(
-                ["m", "asset-m", "c", "asset-c"]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
-            ),
-        });
+        passes.push(unfiled_destination_pass(
+            f,
+            &["m", "asset-m", "c", "asset-c"],
+        ));
     }
     passes
+}
+
+fn unfiled_destination_pass(f: &Fixture, excluded: &[&str]) -> AlbumPass {
+    let mut album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: Arc::from("https://example.invalid"),
+            name: Arc::from(""),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 2,
+            zone_id: Arc::new(
+                json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}),
+            ),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(DestinationSelectionSession(f.session.clone())),
+    );
+    album.set_shadow_capture(f.capture.clone(), Arc::from("private"));
+    AlbumPass {
+        kind: PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::new(excluded.iter().copied().map(str::to_owned).collect()),
+    }
 }
 
 async fn private_lookup_session_recovery(multi: bool) {

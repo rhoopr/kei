@@ -143,7 +143,7 @@ The regular Linux CI test job checks this catalog so a rename, lost ignore
 marker, or feature change cannot silently remove the stress proof.
 
 `Copies stress` runs once with all features on Linux on main pushes and during heavy qualification. The [PR baseline](../docs/ci.md#pr-baseline) runs the compact copies/reseed fixture as part of the sync-safety suite. Run the explicit stress command for local scale diagnosis.
-CI coverage and `just cov patch` explicitly skip the test on head and base,
+`just cov patch` explicitly skips the test on head and base,
 including an older base
 that has not marked it ignored. The no-default build lacks XMP and does not
 repeat either XMP fixture; the regular all-feature matrix retains platform
@@ -926,7 +926,7 @@ Finalization rejects missing or skipped required offline phases and failed
 phase records. Live and platform skips remain explicit, not test coverage.
 
 Linux tooling tests in `branch_static` require `just` on `PATH`; CI installs
-its pinned version before both complete Rust suites and coverage runs. Other
+its pinned version before both complete Rust suites. Other
 platforms retain their existing Rust test coverage; executable dispatcher
 fixtures are Linux-only.
 

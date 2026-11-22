@@ -133,7 +133,6 @@ def check_rust_ci(errors: list[str]) -> None:
         "run: python3 scripts/check-contracts",
         "LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}",
         "if: inputs.heavy",
-        "      - coverage-head\n",
         "HEAVY: ${{ inputs.heavy }}",
     ):
         if needle not in text:
@@ -181,13 +180,6 @@ def check_service_smoke(errors: list[str]) -> None:
         errors.append("service-smoke.yml: service smoke must be reusable only; CI owns routing")
 
 
-def check_coverage_comment(errors: list[str]) -> None:
-    text = workflow_text("coverage-comment.yml")
-    for needle in ("Validate coverage comment artifact", "gt 60000", "@<!-- -->"):
-        if needle not in text:
-            errors.append(f"coverage-comment.yml: missing artifact hardening marker: {needle}")
-
-
 def check_windows_stack_link_arg(errors: list[str]) -> None:
     text = Path("build.rs").read_text()
     if 'cargo:rustc-link-arg=/STACK:4194304' not in text:
@@ -206,7 +198,6 @@ def main() -> int:
     check_rust_ci(errors)
     check_qualification(errors)
     check_service_smoke(errors)
-    check_coverage_comment(errors)
     check_windows_stack_link_arg(errors)
 
     if errors:
