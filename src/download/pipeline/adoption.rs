@@ -1103,11 +1103,9 @@ pub(in crate::download) async fn state_confirmed_current_path_exists(
     task_planner: &mut TaskPlanner,
 ) -> Option<PathBuf> {
     let matches_destination = |path: &std::path::Path| {
-        !config
-            .selection_run
-            .as_ref()
-            .is_some_and(|run| run.independent_album(config))
-            || path == task.download_path
+        // Projection already chose the physical copy. A valid receipt for a
+        // different path cannot satisfy the remaining task, even for unfiled.
+        config.selection_run.is_none() || path == task.download_path
     };
     if let Some(recorded_file) =
         ctx.downloaded_file(&task.library, &task.asset_id, task.version_size)
