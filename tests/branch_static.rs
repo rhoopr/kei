@@ -1759,23 +1759,23 @@ fn release_attests_archives_and_published_container_digests() {
 
     assert_eq!(
         release.matches(&format!("{action}@{action_sha}")).count(),
-        5,
-        "release must pin one provenance attestation for the archives and each container architecture"
+        3,
+        "the archive and tag-time container jobs must pin one provenance attestation each"
     );
     assert_eq!(
         release.matches("id-token: write").count(),
-        3,
-        "release, containers, and resume_containers must grant id-token: write"
+        2,
+        "the tag-time release and containers jobs must grant id-token: write"
     );
     assert_eq!(
         release.matches("attestations: write").count(),
-        3,
-        "release, containers, and resume_containers must grant attestations: write"
+        2,
+        "the tag-time release and containers jobs must grant attestations: write"
     );
     assert_eq!(
         release.matches("push-to-registry: true").count(),
-        4,
-        "each container attestation must push its bundle to the registry"
+        2,
+        "each tag-time container attestation must push its bundle to the registry"
     );
 
     for expected in [
@@ -1798,15 +1798,15 @@ fn release_attests_archives_and_published_container_digests() {
         release
             .matches("subject-digest: ${{ steps.publish.outputs.amd64 }}")
             .count(),
-        2,
-        "both publication jobs must attest the amd64 digest"
+        1,
+        "the tag-time containers job must attest the amd64 digest"
     );
     assert_eq!(
         release
             .matches("subject-digest: ${{ steps.publish.outputs.arm64 }}")
             .count(),
-        2,
-        "both publication jobs must attest the arm64 digest"
+        1,
+        "the tag-time containers job must attest the arm64 digest"
     );
 
     let checksums = release

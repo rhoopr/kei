@@ -219,8 +219,6 @@ jobs:
       actions: read
       contents: read
       packages: write
-      id-token: write
-      attestations: write
     outputs:
       tag: ${{ steps.validate.outputs.tag }}
     steps:
@@ -267,7 +265,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish the verified retained images without rebuilding
-        id: publish
         working-directory: qualified
         env:
           RELEASE_TAG: ${{ steps.validate.outputs.tag }}
@@ -281,29 +278,9 @@ jobs:
             env GITHUB_SHA="$RELEASE_SHA" python3 ../scripts/ci/artifact.py verify-loaded-container "$arch"
             docker tag kei:candidate "$image:$version-$arch"
             docker push "$image:$version-$arch"
-            digest=$(docker buildx imagetools inspect "$image:$version-$arch" --format '{{json .Manifest}}' | jq -r .digest)
-            if [[ -z "$digest" || "$digest" == "null" ]]; then
-              echo "::error::missing registry manifest digest for $image:$version-$arch"
-              exit 1
-            fi
-            echo "$arch=$digest" >> "$GITHUB_OUTPUT"
           done
           docker buildx imagetools create -t "$image:$version" "$image:$version-amd64" "$image:$version-arm64"
           docker buildx imagetools create -t "$image:${version%.*}" -t "$image:latest" "$image:$version"
-
-      - name: Attest amd64 image provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
-        with:
-          subject-name: ghcr.io/${{ github.repository }}
-          subject-digest: ${{ steps.publish.outputs.amd64 }}
-          push-to-registry: true
-
-      - name: Attest arm64 image provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
-        with:
-          subject-name: ghcr.io/${{ github.repository }}
-          subject-digest: ${{ steps.publish.outputs.arm64 }}
-          push-to-registry: true
 
   homebrew:
     needs: [release, containers, resume_containers]

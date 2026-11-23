@@ -52,7 +52,9 @@ Nightly results do not replace this requirement.
 
 ## Release provenance
 
-A release tag publishes GitHub build provenance for the five release archives and `SHA256SUMS.txt`, and for each published container image digest. The archive step attests the candidate bytes after checksum generation and before upload. The container jobs attest the `amd64` and `arm64` registry manifest digests after each push. They do not attest version tags, stable aliases, or `latest`. The resume path captures and attests the digests it publishes the same way.
+A release tag publishes GitHub build provenance for the five release archives and `SHA256SUMS.txt`, and for the `amd64` and `arm64` container image digests published by the tag-time release run. The archive step attests the candidate bytes after checksum generation and before upload. The tag-time container job attests the registry manifest digests it publishes. It does not attest version tags, stable aliases, or `latest`.
+
+The resume path republishes retained images but does not create a new build-provenance attestation, because it is not their build run. If the original tag-time container attestation did not complete, the resume path does not fabricate one.
 
 This is separate from the local release attestation in [Local release prerequisites](#local-release-prerequisites). The local record covers maintainer-run provider and host-service evidence for the release commit. Build provenance records the repository and workflow that produced the artifacts.
 
@@ -68,7 +70,7 @@ Verify a container image by digest with:
 gh attestation verify oci://ghcr.io/rhoopr/kei@sha256:DIGEST --repo rhoopr/kei
 ```
 
-Both commands need an authenticated `gh` client.
+Both commands need an authenticated `gh` client. Container verification also needs access to the GHCR image referenced by the digest.
 
 ## Nightly operation
 

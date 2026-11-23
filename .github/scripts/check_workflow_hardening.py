@@ -129,9 +129,9 @@ def check_release(errors: list[str]) -> None:
         "actions/attest-build-provenance@"
         "977bb373ede98d70efdf65b84cb5f73e068dcc2a"
     )
-    if text.count(attestation_action) != 5:
+    if text.count(attestation_action) != 3:
         errors.append(
-            "release.yml: archive and both container jobs must pin the "
+            "release.yml: the archive and tag-time container jobs must pin the "
             "build-provenance attestation action"
         )
     checksums = text.find("sha256sum -- *.tar.gz *.zip > SHA256SUMS.txt")
@@ -155,26 +155,26 @@ def check_release(errors: list[str]) -> None:
         if needle not in text:
             errors.append(f"release.yml: missing release provenance guard: {needle}")
     for permission in ("id-token: write", "attestations: write"):
-        if text.count(permission) != 3:
+        if text.count(permission) != 2:
             errors.append(
-                "release.yml: release, containers, and resume_containers "
+                "release.yml: the tag-time release and containers jobs "
                 f"must grant {permission}"
             )
     if text.count("subject-path: |") != 1:
         errors.append(
             "release.yml: archive attestation must use subject-path for the released files"
         )
-    if text.count("subject-digest: ${{ steps.publish.outputs.amd64 }}") != 2:
+    if text.count("subject-digest: ${{ steps.publish.outputs.amd64 }}") != 1:
         errors.append(
-            "release.yml: containers and resume_containers must attest the amd64 digest"
+            "release.yml: the tag-time containers job must attest the amd64 digest"
         )
-    if text.count("subject-digest: ${{ steps.publish.outputs.arm64 }}") != 2:
+    if text.count("subject-digest: ${{ steps.publish.outputs.arm64 }}") != 1:
         errors.append(
-            "release.yml: containers and resume_containers must attest the arm64 digest"
+            "release.yml: the tag-time containers job must attest the arm64 digest"
         )
-    if text.count("push-to-registry: true") != 4:
+    if text.count("push-to-registry: true") != 2:
         errors.append(
-            "release.yml: each container attestation must push to the registry"
+            "release.yml: each tag-time container attestation must push to the registry"
         )
 
 
