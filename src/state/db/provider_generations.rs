@@ -1282,18 +1282,17 @@ fn load_rank(
     root: &ActiveGeneration,
     page: &str,
 ) -> Result<SelectionSourcePage, StateError> {
-    let (request_length, body_length, has_relation): (i64, i64, bool) = conn.query_row(
-        "SELECT length(request),length(body),has_relation FROM provider_selection_rank_pages WHERE id=?1",
-        [page],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
-    if [request_length, body_length]
-        .into_iter()
-        .any(|n| usize::try_from(n).map_or(true, |n| n > MAX_CHUNK_BYTES))
-    {
-        return invalid();
-    }
-    let (generation,key,request,request_hash,body,body_hash):(String,String,Vec<u8>,String,Vec<u8>,String)=conn.query_row("SELECT generation,pass_key,request,request_hash,body,body_hash FROM provider_selection_rank_pages WHERE id=?1",[page],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+    // Filter before materializing the blobs, including for unbudgeted callers
+    // such as retirement. Read the relation flag from the same row.
+    let limit =
+        i64::try_from(MAX_CHUNK_BYTES).map_err(|_overflow| StateError::ProviderSelectionInvalid)?;
+    let (generation, key, request, request_hash, body, body_hash, has_relation):
+        (String, String, Vec<u8>, String, Vec<u8>, String, bool) = conn.query_row(
+        "SELECT generation,pass_key,request,request_hash,body,body_hash,has_relation
+         FROM provider_selection_rank_pages WHERE id=?1 AND length(request)<=?2 AND length(body)<=?2",
+        params![page, limit],
+        |row| row.try_into(),
+    ).optional()?.ok_or(StateError::ProviderSelectionInvalid)?;
     if generation != root.id
         || request.len() > MAX_CHUNK_BYTES
         || body.len() > MAX_CHUNK_BYTES
