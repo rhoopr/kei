@@ -378,7 +378,7 @@ impl TaskPlanner {
         asset: &PhotoAsset,
         config: &DownloadConfig,
         version_size: VersionSizeKey,
-    ) -> Option<(std::path::PathBuf, super::file::ObservedFile)> {
+    ) -> Option<(std::path::PathBuf, Arc<super::file::RetainedPendingFile>)> {
         let owner = ReconciliationOwner {
             library: Arc::from(asset.source_zone().unwrap_or(&config.library)),
             asset_id: asset.state_id().into(),
@@ -452,7 +452,7 @@ impl TaskPlanner {
             self.reconciliation
                 .receipt_file_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let Ok(Some(file)) = super::file::ObservedFile::read(&config.directory, path).await
+            let Ok(Some(file)) = super::file::retain_pending_file(&config.directory, path).await
             else {
                 continue;
             };

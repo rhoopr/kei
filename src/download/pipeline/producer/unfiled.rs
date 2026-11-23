@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -21,6 +22,7 @@ const PARTIAL_BATCH_WAIT: Duration = Duration::from_millis(250);
 pub(super) fn prepare<S>(
     source: S,
     config: &DownloadConfig,
+    metrics: &super::StreamProducerMetrics,
 ) -> (
     impl Stream<Item = Observation> + use<S>,
     impl Future<Output = ()> + use<S>,
@@ -46,8 +48,26 @@ where
     };
     let run = Arc::clone(run);
     let key = key.clone();
+    let auth_errors = Arc::clone(&metrics.provider_auth_errors);
+    let enum_errors = Arc::clone(&metrics.enum_errors);
     let (tx, rx) = mpsc::channel::<Vec<Observation>>(1);
     let drive = async move {
+        let expire = || {
+            run.session_expired.store(true, Ordering::Relaxed);
+            run.held.store(true, Ordering::Relaxed);
+            auth_errors.fetch_add(1, Ordering::Relaxed);
+            enum_errors.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("Provider session expired during unfiled read-ahead");
+        };
+        // A terminal source error can follow valid observations in a partial
+        // batch. Latch it when polled, before issuing any lookup for that batch.
+        let source = source.take_while(|result| {
+            let expired = result.as_ref().is_err_and(is_session_error);
+            if expired {
+                expire();
+            }
+            future::ready(!expired)
+        });
         let groups = tokio_stream::StreamExt::chunks_timeout(
             source,
             PhotoAlbum::CONFIRMATION_BATCH_SIZE,
@@ -61,11 +81,14 @@ where
                 let Some(group) = groups.next().await else {
                     break;
                 };
+                if run.session_expired.load(Ordering::Relaxed) {
+                    break;
+                }
                 let observations: Vec<_> = group.iter().filter_map(|r| r.as_ref().ok()).collect();
                 let mut proofs = match run.prefetch_unfiled(&key, &observations).await {
                     Ok(proofs) => proofs,
                     Err(error) if is_session_error(&error) => {
-                        slot.send(vec![Err(error)]);
+                        expire();
                         break;
                     }
                     Err(_) => {

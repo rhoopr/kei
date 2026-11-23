@@ -257,7 +257,7 @@ where
     let queued_bytes_producer = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let space_warn_emitted_producer = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let (combined, prefetch) = unfiled::prepare(combined, &producer_config);
+    let (combined, prefetch) = unfiled::prepare(combined, &producer_config, &metrics);
     let produce = async move {
         let config = &producer_config;
         let metadata_writers_enabled = MetadataFlags::from(config.as_ref()).has_any_write();
@@ -404,6 +404,7 @@ where
                         if run
                             .session_expired
                             .load(std::sync::atomic::Ordering::Relaxed)
+                            && proof.is_none()
                         {
                             return skips;
                         }
@@ -418,6 +419,15 @@ where
                         let observed_child = asset.asset_record_name().to_owned();
                         let (current, body) = match run.confirm(key, &asset, proof).await {
                             Ok(confirmed) => confirmed,
+                            // Read-ahead already counted the expiry, including
+                            // when it interrupted this asset's individual retry.
+                            Err(_)
+                                if run
+                                    .session_expired
+                                    .load(std::sync::atomic::Ordering::Relaxed) =>
+                            {
+                                return skips;
+                            }
                             Err(error) => {
                                 enum_errors_producer
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

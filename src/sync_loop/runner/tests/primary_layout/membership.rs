@@ -615,6 +615,7 @@ async fn membership_preserved_local_matching_bytes_never_authorize_retirement() 
         child.clone(),
         serde_json::from_str(&path).unwrap(),
         (checksum, ORIGINAL.len() as u64, None),
+        || true,
     )
     .await
     .unwrap();
@@ -1252,6 +1253,7 @@ async fn membership_native_process_death_reopens_non_utf8_destinations() {
                 child.clone(),
                 serde_json::from_str(&path).unwrap(),
                 (checksum, ORIGINAL.len() as u64, None),
+                || true,
             )
             .await
             .unwrap();

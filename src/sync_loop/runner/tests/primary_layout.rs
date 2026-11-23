@@ -92,6 +92,7 @@ struct Session {
     indexing: Option<IndexingOptions>,
     stop_on_lookup: Option<(usize, CancellationToken)>,
     expire_on_lookup: Option<usize>,
+    expire_on_query_tail: bool,
 }
 fn versioned_records(records: &[Value]) -> Vec<Value> {
     records
@@ -202,6 +203,14 @@ impl PhotosSession for Session {
                 .and_then(|items| items.iter().find(|i| i["fieldName"] == "startRank"))
                 .and_then(|i| i["fieldValue"]["value"].as_u64())
                 .unwrap_or(0);
+            if self.expire_on_query_tail {
+                if offset > 0 {
+                    return Err(
+                        crate::icloud::error::ICloudError::SessionExpired { status: 401 }.into(),
+                    );
+                }
+                return Ok(json!({"records":&source[..4],"syncToken":"partial-query"}));
+            }
             return Ok(
                 json!({"records":if offset==0 {source} else {vec![]},"syncToken":self.indexing.as_ref().map_or(Some("query-token"), |indexing| indexing.token)}),
             );
@@ -269,6 +278,7 @@ struct CycleOptions {
     current: Option<Arc<std::sync::Mutex<Vec<Value>>>>,
     stop_on_lookup: Option<(usize, CancellationToken)>,
     expire_on_lookup: Option<usize>,
+    expire_on_query_tail: bool,
 }
 impl Default for CycleOptions {
     fn default() -> Self {
@@ -295,6 +305,7 @@ impl Default for CycleOptions {
             current: None,
             stop_on_lookup: None,
             expire_on_lookup: None,
+            expire_on_query_tail: false,
         }
     }
 }
@@ -327,6 +338,7 @@ async fn try_cycle_options(
         indexing: options.indexing.clone(),
         stop_on_lookup: options.stop_on_lookup.clone(),
         expire_on_lookup: options.expire_on_lookup,
+        expire_on_query_tail: options.expire_on_query_tail,
     };
     let owner = fixture_owner();
     let inner = Arc::new(
@@ -653,6 +665,36 @@ async fn unfiled_confirmation_interrupted_batch_resumes_from_durable_pairs_only(
         ),
         150
     );
+}
+
+#[tokio::test]
+async fn unfiled_confirmation_stops_on_expired_enumeration_tail() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let records = unfiled_records(&server, 3);
+    let (expired, lookups) = cycle_options(
+        root.path(),
+        records.clone(),
+        false,
+        EditedNaming::Suffix,
+        CycleOptions {
+            expire_on_query_tail: true,
+            ..CycleOptions::default()
+        },
+    )
+    .await;
+    assert!(expired.session_expired);
+    assert!(!expired.db_sync_token_advance_safe);
+    assert_eq!(lookups, 0, "the partial chunk must not issue a lookup");
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM provider_active_decisions"
+        ),
+        0
+    );
+    let (resumed, _) = cycle(root.path(), records, false, EditedNaming::Suffix).await;
+    assert!(resumed.db_sync_token_advance_safe);
 }
 
 #[tokio::test]
@@ -3338,6 +3380,7 @@ async fn startup_archive_adoption_flows_into_managed_sync_without_downloads() {
         indexing: None,
         stop_on_lookup: None,
         expire_on_lookup: None,
+        expire_on_query_tail: false,
     };
     let passes = [AlbumPass {
         kind: PassKind::Unfiled,

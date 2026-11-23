@@ -876,7 +876,7 @@ impl SelectionRun {
                     .albums
                     .get(key)
                     .context("Missing retained selection pass owner")?;
-                let current = album.confirm_selected_asset(&retained).await?;
+                let current = self.confirm_individually(album, &retained).await?;
                 anyhow::ensure!(
                     same_selected_facts(&retained, &current.asset),
                     "Retained selected generation differs from current proof"
@@ -907,7 +907,7 @@ impl SelectionRun {
             .context("Missing selection pass owner")?;
         let current = match prefetched {
             Some(current) if !retry_inventory => current,
-            _ => album.confirm_selected_asset(observed).await?,
+            _ => self.confirm_individually(album, observed).await?,
         };
         anyhow::ensure!(
             same_selected_facts(&current.asset, observed),
@@ -921,6 +921,18 @@ impl SelectionRun {
                 retry_observation: retry_inventory.then(|| Arc::new(observed.clone())),
             },
         ))
+    }
+
+    async fn confirm_individually(
+        &self,
+        album: &PhotoAlbum,
+        observed: &PhotoAsset,
+    ) -> Result<crate::icloud::photos::CurrentCatalogAsset> {
+        anyhow::ensure!(
+            !self.session_expired.load(Ordering::Relaxed),
+            "Selection confirmation stopped after provider session expiry"
+        );
+        album.confirm_selected_asset(observed).await
     }
 
     /// Account for an unresolved current identity without creating queue work.
@@ -1363,19 +1375,17 @@ impl SelectionRun {
                     return Ok(false);
                 }
                 if planner.managed_layout_session().is_none()
-                    && let Ok(actual) = crate::download::file::inspect_integrity_fingerprint(
+                    && let Ok(file) = crate::download::file::retain_integrity_file(
                         &config.directory,
                         &destination.path.to_path(),
                     )
                     .await
-                    && actual != confirmed
-                    && actual.1 == destination.size
+                    && file.fingerprint.size == destination.size
                     && data_encoding::BASE64
                         .decode(destination.checksum.as_bytes())
-                        .is_ok_and(|source| {
-                            source.len() == 32
-                                && data_encoding::HEXLOWER.encode(&source) == actual.0
-                        })
+                        .is_ok_and(|source| source == file.fingerprint.sha256)
+                    && (file.fingerprint.size != confirmed.1
+                        || data_encoding::HEXLOWER.encode(&file.fingerprint.sha256) != confirmed.0)
                 {
                     crate::fs_util::fsync_parent_dir_async(&destination.path.to_path()).await?;
                     // Recovery still requires the existing owner's independent
@@ -1389,7 +1399,11 @@ impl SelectionRun {
                             key.to_owned(),
                             asset.asset_record_name().to_owned(),
                             destination.path.clone(),
-                            actual,
+                            (
+                                data_encoding::HEXLOWER.encode(&file.fingerprint.sha256),
+                                file.fingerprint.size,
+                            ),
+                            move || file.selection_still_matches(),
                         )
                         .await?;
                 }
@@ -1426,10 +1440,13 @@ impl SelectionRun {
             // Projection can redirect the destination but does not write media.
             let file = match observed_files.remove(&path) {
                 Some(file) => Some(file),
-                None => crate::download::file::ObservedFile::read(&config.directory, &path).await?,
+                None => {
+                    crate::download::file::retain_pending_file(&config.directory, &path).await?
+                }
             };
             if let Some(file) = file {
                 let fingerprint = file.fingerprint;
+                let reuse_file = Arc::clone(&file);
                 crate::fs_util::fsync_parent_dir_async(&destination.path.to_path()).await?;
                 let reused = self
                     .capture
@@ -1444,6 +1461,7 @@ impl SelectionRun {
                             data_encoding::HEXLOWER.encode(&fingerprint.sha256),
                             fingerprint.size,
                         ),
+                        move || reuse_file.selection_still_matches(),
                     )
                     .await?;
                 if reused {
@@ -1515,6 +1533,7 @@ impl SelectionRun {
                                 fingerprint.size,
                                 file.modified.map(chrono::DateTime::<chrono::Utc>::from),
                             ),
+                            move || file.selection_still_matches(),
                         )
                         .await?;
                 }
@@ -1896,6 +1915,7 @@ pub(super) async fn inventory(
         && !result.checkpoint.identity_incomplete;
     let query_veto = result.stats.sync_token_blocked_reason.map(str::to_owned);
     let covered = !result.checkpoint.enumeration_incomplete
+        && !run.session_expired.load(Ordering::Relaxed)
         && result.checkpoint.enumeration_errors == 0
         && result.checkpoint.state_write_failures == 0
         && !result.checkpoint.interrupted

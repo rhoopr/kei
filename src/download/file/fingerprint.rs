@@ -63,27 +63,25 @@ pub(in crate::download) struct RetainedPendingFile {
     file: std::fs::File,
     pub(in crate::download) fingerprint: ExistingFileFingerprint,
     pub(in crate::download) modified: Option<std::time::SystemTime>,
-}
-
-/// Facts from one confined read of an existing selection destination.
-pub(in crate::download) struct ObservedFile {
-    pub(in crate::download) fingerprint: ExistingFileFingerprint,
-    pub(in crate::download) modified: Option<std::time::SystemTime>,
-}
-
-impl ObservedFile {
-    pub(in crate::download) async fn read(
-        root: &Path,
-        path: &Path,
-    ) -> anyhow::Result<Option<Self>> {
-        Ok(retain_pending_file(root, path).await?.map(|file| Self {
-            fingerprint: file.fingerprint,
-            modified: file.modified,
-        }))
-    }
+    #[cfg(unix)]
+    settled_change_time: Option<(i64, i64)>,
 }
 
 impl RetainedPendingFile {
+    /// Recheck the namespace and content at selection commit. If the sampled
+    /// inode timestamp cannot distinguish a later edit, verify the bytes again.
+    pub(in crate::download) fn selection_still_matches(&self) -> bool {
+        #[cfg(unix)]
+        if let Some(stamp) = self.settled_change_time {
+            return self
+                .identity()
+                .and_then(|id| self.path.validate_identity(id))
+                .and_then(|current| change_time(&current))
+                .is_ok_and(|current| current == stamp);
+        }
+        self.validate_blocking().is_ok()
+    }
+
     pub(super) fn identity(&self) -> std::io::Result<crate::fs_util::FileIdentity> {
         crate::fs_util::file_identity(&self.file)
     }
@@ -259,7 +257,16 @@ pub(in crate::download) async fn retain_pending_file(
         let identity = crate::fs_util::file_identity(&file)?;
         // Keep the filesystem time from the same confined handle as the bytes.
         // An unavailable time remains unknown; it is never replaced with now.
-        let modified = file.metadata()?.modified().ok();
+        let metadata = file.metadata()?;
+        let modified = metadata.modified().ok();
+        #[cfg(unix)]
+        let settled_change_time = {
+            use std::os::unix::fs::MetadataExt;
+            let sec = metadata.ctime();
+            let nanos = metadata.ctime_nsec();
+            (nanos > 0 && sec < chrono::Utc::now().timestamp().saturating_sub(1))
+                .then_some((sec, nanos))
+        };
         let fingerprint = fingerprint_open_file_snapshot_blocking(&mut file, &path)?.fingerprint;
         anyhow::ensure!(
             file.metadata()?.modified().ok() == modified,
@@ -271,6 +278,8 @@ pub(in crate::download) async fn retain_pending_file(
             file,
             fingerprint,
             modified,
+            #[cfg(unix)]
+            settled_change_time,
         })))
     })
     .await?

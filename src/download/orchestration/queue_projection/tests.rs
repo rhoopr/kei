@@ -4215,7 +4215,8 @@ async fn shared_grouping_handoff_fences_loaded_legacy_and_settles_both_passes() 
                     key,
                     "asset-m".into(),
                     SelectionPath::from_path(&path),
-                    (checksum.clone(), bytes.len() as u64)
+                    (checksum.clone(), bytes.len() as u64),
+                    || true,
                 )
                 .await
                 .unwrap()
@@ -4457,7 +4458,8 @@ async fn historical_shared_album_successor_fixture(metadata: bool) {
                 key,
                 "asset-m".into(),
                 SelectionPath::from_path(&original),
-                (checksum.clone(), media.len() as u64)
+                (checksum.clone(), media.len() as u64),
+                || true,
             )
             .await
             .unwrap()
@@ -5948,6 +5950,68 @@ async fn published_confirmation_releases_only_matching_inbox_records() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, media).unwrap();
     let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+    let observe = || crate::download::file::retain_pending_file(&f.config.directory, &path);
+    let stale = observe().await.unwrap().unwrap();
+    std::fs::rename(&path, path.with_extension("saved")).unwrap();
+    std::fs::write(&path, b"replacement").unwrap();
+    let reuse_file = Arc::clone(&stale);
+    let result =
+        f.db.reuse_selection_publication(
+            owner(),
+            root.id.clone(),
+            decision.decision.pass_key.clone(),
+            decision.decision.child.clone(),
+            dst.path.clone(),
+            (checksum.clone(), dst.size),
+            move || reuse_file.selection_still_matches(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(crate::state::error::StateError::ProviderWorkConflict(
+            "selected_file_changed"
+        ))
+    ));
+    let result =
+        f.db.preserve_selection_local(
+            owner(),
+            root.id.clone(),
+            decision.decision.pass_key.clone(),
+            decision.decision.child.clone(),
+            dst.path.clone(),
+            (checksum.clone(), dst.size, stale.modified.map(Into::into)),
+            move || stale.selection_still_matches(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(crate::state::error::StateError::ProviderWorkConflict(
+            "selected_file_changed"
+        ))
+    ));
+    assert!(
+        !f.db
+            .selection_destination_resolved(
+                owner(),
+                root.id.clone(),
+                decision.decision.pass_key.clone(),
+                decision.decision.child.clone(),
+                dst.version_size.clone()
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        f.db.provider_selection_debt(
+            owner(),
+            root.spec.scope.clone(),
+            root.spec.config_hash.clone()
+        )
+        .await
+        .unwrap()
+    );
+    std::fs::write(&path, media).unwrap();
+    let fresh = observe().await.unwrap().unwrap();
     assert!(
         f.db.reuse_selection_publication(
             owner(),
@@ -5955,7 +6019,8 @@ async fn published_confirmation_releases_only_matching_inbox_records() {
             decision.decision.pass_key,
             decision.decision.child,
             dst.path.clone(),
-            (checksum, dst.size)
+            (checksum, dst.size),
+            move || fresh.selection_still_matches(),
         )
         .await
         .unwrap()
@@ -10942,6 +11007,7 @@ async fn completed_copy_recovery(scenario: IntegrityRecovery) {
                     damaged.len() as u64,
                     None,
                 ),
+                || true,
             )
             .await
             .unwrap();
