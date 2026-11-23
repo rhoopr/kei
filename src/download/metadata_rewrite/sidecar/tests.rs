@@ -191,7 +191,7 @@ fn plan_sidecar_write_includes_standard_fields_and_authorized_groupings() {
     let path = dir.path().join("photo.jpg");
     std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
     let created_local = now_local() + chrono::Duration::milliseconds(629);
-    let (w, source_error) = plan_sidecar_write(&path, &payload, &created_local, None);
+    let (w, source_error) = plan_sidecar_write(&path, &payload, &created_local, None, None);
     assert!(source_error.is_none());
     // Groupings have already been authorized when constructing the payload.
     assert_eq!(w.datetime.as_deref(), Some("2024-06-15T10:00:00.629"));
@@ -216,7 +216,7 @@ fn plan_sidecar_write_empty_payload_yields_datetime_only() {
     let path = dir.path().join("photo.jpg");
     std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
     let (w, source_error) =
-        plan_sidecar_write(&path, &MetadataPayload::default(), &now_local(), None);
+        plan_sidecar_write(&path, &MetadataPayload::default(), &now_local(), None, None);
     assert!(source_error.is_none());
     assert!(w.datetime.is_some());
     assert!(w.gps_datetime.is_none());
@@ -287,6 +287,41 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_native_boundaries(
             );
             assert_eq!(std::fs::read(&path).unwrap(), *bytes);
         }
+    }
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn retained_sidecar_input_needs_original_provenance_for_gps_accuracy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.jpg");
+    std::fs::write(
+        &path,
+        crate::test_helpers::minimal_jpeg_with_source_gps_and_location(),
+    )
+    .unwrap();
+    let native = crate::download::metadata::read_source_gps(&path).unwrap();
+    let accuracy = native
+        .horizontal_positioning_error
+        .expect("fixture has native accuracy");
+    let payload = MetadataPayload {
+        latitude: native.latitude,
+        longitude: native.longitude,
+        ..Default::default()
+    };
+    let input = crate::download::file::WriterSnapshot::read(dir.path(), &path)
+        .await
+        .unwrap();
+    let checksum = super::fingerprint_checksum(input.fingerprint);
+    for (original, expected) in [
+        (Some(checksum.as_str()), Some(accuracy)),
+        (Some("different original"), None),
+        (None, None),
+    ] {
+        let (plan, error) =
+            plan_sidecar_write(&path, &payload, &now_local(), original, Some(&input));
+        assert!(error.is_none());
+        assert_eq!(plan.gps_h_positioning_error, expected);
     }
 }
 

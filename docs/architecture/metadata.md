@@ -314,6 +314,8 @@ file snapshot rechecks identity, parent confinement and exact bytes before
 reporting success. This avoids republishing an unchanged packet. Changed packets
 use a new temporary path so retained ambiguous bytes cannot block a later retry.
 
+For a verified selected destination that only needs a sidecar, post-sync backfill can keep the hashed media open for the GPS reader. On Unix, kei hashes the media again after writing the sidecar: a shared writable mapping can change bytes without changing the inode change time. When kei retains the file, it also rechecks its identity and change time at commit. On Windows, a retained handle that excludes writes and replacement allows kei to skip the second hash. Native GPS accuracy still requires a matching verified download checksum.
+
 ## GPS provenance
 
 Source GPS facts for sidecars are read through file-backed parsers. JPEG APP1,

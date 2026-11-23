@@ -2233,13 +2233,13 @@ async fn reuse_writer_outputs(
             #[cfg(test)]
             let _ = TEST_AFTER_WRITER_SNAPSHOT.try_with(|edit| edit(&path));
             let packet = sidecar.as_ref().map_or(WriterOutput::EmbeddedOnly, |file| {
-                WriterOutput::Sidecar(file.sha256)
+                WriterOutput::Sidecar(file.fingerprint.sha256)
             });
             db.reuse_writer_output(
                 owner.clone(),
                 generation.to_owned(),
                 key,
-                data_encoding::HEXLOWER.encode(&media.sha256),
+                data_encoding::HEXLOWER.encode(&media.fingerprint.sha256),
                 packet,
                 move || {
                     sidecar

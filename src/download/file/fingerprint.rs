@@ -105,7 +105,7 @@ impl RetainedPendingFile {
 pub(in crate::download) struct WriterSnapshot {
     path: ConfinedPath,
     file: std::fs::File,
-    pub(in crate::download) sha256: [u8; 32],
+    pub(in crate::download) fingerprint: ExistingFileFingerprint,
     #[cfg(unix)]
     change_time: (i64, i64),
 }
@@ -124,6 +124,30 @@ tokio::task_local! {
 
 impl WriterSnapshot {
     pub(in crate::download) async fn read(root: &Path, path: &Path) -> anyhow::Result<Self> {
+        Self::read_with_timing(root, path, HashTiming::WaitForTick).await
+    }
+
+    /// A freshly changed file can use the normal two hashes immediately.
+    /// Don't add a one-second wait to the backfill hot path.
+    #[cfg(feature = "xmp")]
+    pub(in crate::download) async fn for_sidecar(path: &Path) -> Option<Self> {
+        Self::read_with_timing(path.parent()?, path, HashTiming::AlreadySettled)
+            .await
+            .ok()
+    }
+
+    #[cfg(feature = "xmp")]
+    pub(in crate::download) fn source_handle(&self) -> std::io::Result<std::fs::File> {
+        self.file.try_clone()
+    }
+
+    async fn read_with_timing(
+        root: &Path,
+        path: &Path,
+        timing: HashTiming,
+    ) -> anyhow::Result<Self> {
+        #[cfg(windows)]
+        let _ = timing;
         let root = root.to_owned();
         let path = path.to_owned();
         #[cfg(test)]
@@ -151,6 +175,10 @@ impl WriterSnapshot {
                 // Older library files never wait. An edit before the hash starts
                 // must still pass the writer's SHA-256 check.
                 if let Some(remaining) = std::time::Duration::from_secs(1).checked_sub(age) {
+                    anyhow::ensure!(
+                        matches!(timing, HashTiming::WaitForTick),
+                        "Writer input changed recently"
+                    );
                     std::thread::sleep(remaining);
                 }
                 stamp
@@ -159,13 +187,12 @@ impl WriterSnapshot {
             if let Some(hook) = hook {
                 hook(path.path());
             }
-            let sha256 = fingerprint_open_file_snapshot_blocking(&mut file, path.path())?
-                .fingerprint
-                .sha256;
+            let fingerprint =
+                fingerprint_open_file_snapshot_blocking(&mut file, path.path())?.fingerprint;
             Ok(Self {
                 path,
                 file,
-                sha256,
+                fingerprint,
                 #[cfg(unix)]
                 change_time,
             })
@@ -187,6 +214,12 @@ impl WriterSnapshot {
         drop(current); // The retained handle still excludes writes and replacement.
         Ok(())
     }
+}
+
+enum HashTiming {
+    WaitForTick,
+    #[cfg(feature = "xmp")]
+    AlreadySettled,
 }
 
 /// Missing regular files may be downloaded; unsafe entries must not be adopted.

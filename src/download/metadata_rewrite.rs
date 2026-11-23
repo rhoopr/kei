@@ -35,6 +35,9 @@ pub(super) use queued::{
 #[cfg(feature = "xmp")]
 pub(super) use sidecar::write_reconciled_sidecar;
 
+#[cfg(all(test, unix, feature = "xmp"))]
+pub(super) use queued::BEFORE_SIDECAR_RECEIPT;
+
 #[cfg(all(test, feature = "xmp"))]
 pub(in crate::download) use embedded::publication_pause;
 

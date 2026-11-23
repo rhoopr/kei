@@ -9,6 +9,135 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
+#[cfg(target_os = "linux")]
+fn mapped_edit(path: &std::path::Path) -> impl Fn(&std::path::Path) + use<> {
+    use std::os::fd::AsRawFd;
+
+    struct MappedByte(*mut u8);
+    impl MappedByte {
+        fn write(&self, byte: u8) {
+            // SAFETY: this byte belongs to the writable mapping until Drop.
+            unsafe { self.0.write_volatile(byte) };
+        }
+    }
+    impl Drop for MappedByte {
+        fn drop(&mut self) {
+            // SAFETY: this guard owns the one-byte mapping and releases it once.
+            unsafe { libc::munmap(self.0.cast(), 1) };
+        }
+    }
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let original = std::fs::read(path).unwrap()[0];
+    // SAFETY: the fixture is nonempty, opened read/write, and never truncated.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            1,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(ptr, libc::MAP_FAILED);
+    let mapping = MappedByte(ptr.cast());
+    mapping.write(original); // Dirty the page before the writer samples ctime.
+    move |_| mapping.write(!original)
+}
+
+#[tokio::test]
+async fn sidecar_backfill_refuses_media_changed_before_receipt_commit() {
+    use crate::download::metadata_rewrite::BEFORE_SIDECAR_RECEIPT;
+    use crate::download::orchestration::generation::drain_local_backfill;
+    use std::path::Path;
+
+    fn same_size_edit(path: &Path) {
+        let mut file = std::fs::File::options().write(true).open(path).unwrap();
+        let mtime = file.metadata().unwrap().modified().unwrap();
+        std::io::Write::write_all(&mut file, b"edit").unwrap();
+        file.set_modified(mtime).unwrap();
+    }
+    fn replace(path: &Path) {
+        let copy = path.with_extension("copy");
+        std::fs::copy(path, &copy).unwrap();
+        std::fs::rename(copy, path).unwrap();
+    }
+    type PrepareEdit = fn(&Path) -> Box<dyn Fn(&Path)>;
+    let cases: &[PrepareEdit] = &[
+        |_| Box::new(same_size_edit),
+        |_| Box::new(replace),
+        #[cfg(target_os = "linux")]
+        |path| Box::new(mapped_edit(path)),
+    ];
+    let server = MockServer::start().await;
+    let media = include_bytes!("../../../../../tests/data/media/pattern.jpg");
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media.as_slice()))
+        .expect(cases.len() as u64)
+        .mount(&server)
+        .await;
+    for prepare_edit in cases {
+        let mut f = Fixture::new().await;
+        f.config.metadata.xmp_sidecar = true;
+        f.config.post_sync_metadata = true;
+        f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":server.uri(),"size":media.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media))});
+        let passes = [destination_pass(&f, "A")];
+        let cancel = CancellationToken::new();
+        let result = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &passes,
+            Arc::new(f.config.clone()),
+            controls(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.stats.downloaded, 1);
+        let pending = || {
+            f.db.acquire_lock("sidecar transaction evidence").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=0 AND writer_output_proof IS NULL",[],|r|r.get(0)).unwrap()
+        };
+        assert_eq!(pending(), 1);
+        let path: String =
+            f.db.acquire_lock("sidecar input")
+                .unwrap()
+                .query_row(
+                    "SELECT compat_path FROM provider_active_destinations WHERE verified_media=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        let edit = prepare_edit(Path::new(&path));
+        // Input must be outside the change-time tick for retained verification.
+        tokio::time::sleep(std::time::Duration::from_millis(1050)).await;
+        let mut cursor = Default::default();
+        let result = BEFORE_SIDECAR_RECEIPT
+            .scope(
+                edit,
+                Box::pin(drain_local_backfill(
+                    &passes,
+                    &f.config,
+                    &f.db,
+                    controls(),
+                    &cancel,
+                    None,
+                    &mut cursor,
+                )),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.failed, 1);
+        assert_eq!(
+            pending(),
+            1,
+            "a changed or replaced inode must roll back receipt updates"
+        );
+    }
+}
+
 #[tokio::test]
 async fn writer_reuse_rechecks_installed_files_before_completion() {
     use crate::download::orchestration::generation::TEST_AFTER_WRITER_SNAPSHOT;
