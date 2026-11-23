@@ -662,11 +662,6 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 .await;
         }
     }
-    let mut complete_delta_assets: Vec<PhotoAsset> = change_events
-        .iter()
-        .filter_map(IncrementalDeltaState::created_asset)
-        .cloned()
-        .collect();
     for event in &change_events {
         delta.remember_asset_mapping(event);
     }
@@ -680,12 +675,15 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     );
 
     let phase_started = Instant::now();
-    let downloadable_before_relation_hydration = downloadable_assets.len();
+    let mut hydrated_assets = Vec::new();
+    // A current generation admits its own work after the delta. Membership
+    // reads still participate in checkpoint safety on both paths.
+    let collect_downloads = config.selection_context.is_none();
     {
         let mut hydration_context = IncrementalAssetHydrationContext {
             asset_to_master: &mut delta.asset_to_master,
-            complete_delta_assets: &mut complete_delta_assets,
-            downloadable_assets: &mut downloadable_assets,
+            hydrated_assets: &mut hydrated_assets,
+            downloadable_assets: collect_downloads.then_some(&mut downloadable_assets),
             download_ctx: download_ctx.as_deref(),
             claimed_legacy_master_states: &mut claimed_legacy_master_states,
             claim_mode: legacy_owner_claim_mode,
@@ -702,28 +700,28 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         )
         .await;
     }
-    if first_download_url_obtained_at.is_none()
-        && downloadable_assets.len() > downloadable_before_relation_hydration
-    {
+    if first_download_url_obtained_at.is_none() && !downloadable_assets.is_empty() {
         first_download_url_obtained_at = Some(Instant::now());
     }
-    let hydrated_assets = downloadable_assets
-        .len()
-        .saturating_sub(downloadable_before_relation_hydration);
     tracing::debug!(
         phase_elapsed = %format_duration(phase_started.elapsed()),
         elapsed = %format_duration(started.elapsed()),
-        hydrated_assets,
+        hydrated_assets = hydrated_assets.len(),
         "Incremental relation hydration phase complete"
     );
 
-    if controls.run_mode.downloads_files() && !complete_delta_assets.is_empty() {
+    let mut metadata_assets = change_events
+        .iter()
+        .filter_map(IncrementalDeltaState::created_asset)
+        .chain(&hydrated_assets)
+        .peekable();
+    if controls.run_mode.downloads_files() && metadata_assets.peek().is_some() {
         let context = match download_ctx.take() {
             Some(context) => context,
             None => preload_download_context(config).await,
         };
         let mut refreshed_assets = FxHashSet::default();
-        for asset in &complete_delta_assets {
+        for asset in metadata_assets {
             if !refreshed_assets.insert(asset.state_id_arc()) {
                 continue;
             }
@@ -731,6 +729,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         }
         download_ctx = Some(context);
     }
+    drop(hydrated_assets);
 
     let phase_started = Instant::now();
     for event in &change_events {
@@ -747,11 +746,12 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         match route_incremental_asset_to_passes(asset, &routing, &selected_container_ids, config)
             .await
         {
-            Ok(pass_indices) => {
+            Ok(pass_indices) if collect_downloads => {
                 for pass_index in pass_indices {
                     downloadable_assets.push((asset.clone(), pass_index));
                 }
             }
+            Ok(_) => {}
             Err(e) => {
                 tracing::warn!(
                     asset_record_name = %asset.asset_record_name(),
@@ -773,6 +773,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         "Incremental routing phase complete"
     );
 
+    drop(change_events);
     let delta_summary = delta.summary;
     let completed_delta_replay = delta_summary
         .raw_records_observed

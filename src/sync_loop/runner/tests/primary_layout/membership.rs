@@ -468,6 +468,74 @@ async fn membership_cross_page_move_interrupted_reopens_without_transient_fallba
 }
 
 #[tokio::test]
+async fn membership_first_page_asset_later_page_relation_retries_once_into_album() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let delta = versioned_records(&records(&server, None));
+    let child = delta[1]["recordName"].as_str().unwrap().to_owned();
+    let mut provider = provider(Vec::new(), vec!["B"]);
+    cycle_selected(
+        root.path(),
+        provider.clone(),
+        &["B", "unfiled"],
+        crate::types::EditedNaming::Primary,
+        "{album}",
+        Vec::new(),
+    )
+    .await;
+    rewind(root.path());
+    provider.records = delta.clone();
+    provider.pages = vec![delta, vec![relation(&child, "B", false)]];
+    provider.interrupt = true;
+    let interrupted = cycle_selected(
+        root.path(),
+        provider.clone(),
+        &["B", "unfiled"],
+        crate::types::EditedNaming::Primary,
+        "{album}",
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(interrupted.stats.downloaded, 0);
+    assert!(!root.path().join("media/B/IMG_0501.JPG").exists());
+    assert!(!root.path().join("media/unfiled/IMG_0501.JPG").exists());
+    let media_gets = |requests: &[wiremock::Request]| {
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/original")
+            .count()
+    };
+    let checkpoint = || -> String {
+        rusqlite::Connection::open(root.path().join("state.db"))
+            .unwrap()
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(checkpoint(), "before-departure");
+    assert_eq!(media_gets(&server.received_requests().await.unwrap()), 0);
+    provider.interrupt = false;
+    provider.cancel = CancellationToken::new();
+    let retried = cycle_selected(
+        root.path(),
+        provider,
+        &["B", "unfiled"],
+        crate::types::EditedNaming::Primary,
+        "{album}",
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(retried.stats.downloaded, 1);
+    assert_bytes(&root.path().join("media/B/IMG_0501.JPG"), ORIGINAL);
+    assert!(!root.path().join("media/unfiled/IMG_0501.JPG").exists());
+    assert_eq!(media_gets(&server.received_requests().await.unwrap()), 1);
+    assert_eq!(checkpoint(), "membership-end");
+}
+
+#[tokio::test]
 async fn membership_container_tombstone_redistributes_without_relation_tombstone() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();

@@ -2676,8 +2676,8 @@ async fn issue958_album_groups_share_one_fallback_per_source() {
         let pass_configs: Vec<_> = passes.iter().map(|_| Arc::new(test_config())).collect();
         let mut context = super::IncrementalAssetHydrationContext {
             asset_to_master: &mut mapping,
-            complete_delta_assets: &mut complete,
-            downloadable_assets: &mut downloads,
+            hydrated_assets: &mut complete,
+            downloadable_assets: Some(&mut downloads),
             download_ctx: None,
             claimed_legacy_master_states: &mut claims,
             claim_mode: LegacyOwnerClaimMode::ReadOnly,
