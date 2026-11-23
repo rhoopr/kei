@@ -46,6 +46,7 @@ pub(super) struct FailingDownloadStore {
     pub(super) successes: AtomicUsize,
     pub(super) failed_calls: AtomicUsize,
     pub(super) downloaded_state_loads: AtomicUsize,
+    pub(super) reservation_loads: AtomicUsize,
     pub(super) track_failed_calls: bool,
     pub(super) fail_complete_sync_run: bool,
 }
@@ -58,6 +59,7 @@ impl FailingDownloadStore {
             successes: AtomicUsize::new(0),
             failed_calls: AtomicUsize::new(0),
             downloaded_state_loads: AtomicUsize::new(0),
+            reservation_loads: AtomicUsize::new(0),
             track_failed_calls: false,
             fail_complete_sync_run: false,
         }
@@ -268,6 +270,7 @@ impl crate::state::ReconciliationStateStore for FailingDownloadStore {
     async fn get_reconciliation_reservations(
         &self,
     ) -> Result<Vec<crate::state::ReconciliationReservation>, crate::state::error::StateError> {
+        self.reservation_loads.fetch_add(1, Ordering::Relaxed);
         Ok(Vec::new())
     }
 

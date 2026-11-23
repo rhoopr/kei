@@ -85,6 +85,7 @@ async fn issue_770_recovery_retained_file_rejects_changed_bytes_and_identity() {
             .unwrap()
             .unwrap();
         retained.validate().await.unwrap();
+        assert!(retained.selection_still_matches());
         if replace_inode {
             std::fs::rename(&path, root.path().join("retained.jpg")).unwrap();
             std::fs::write(&path, b"original bytes").unwrap();
@@ -99,6 +100,7 @@ async fn issue_770_recovery_retained_file_rejects_changed_bytes_and_identity() {
                 .unwrap();
         }
         assert!(retained.validate().await.is_err());
+        assert!(!retained.selection_still_matches());
     }
 }
 

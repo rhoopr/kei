@@ -13,7 +13,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-const RECORD_LOOKUP_BATCH_SIZE: usize = 100;
+pub(super) const RECORD_LOOKUP_BATCH_SIZE: usize = 100;
 
 // Response presence/error shape only. A returned record is not proof of its
 // type, owner, relationship, resources, or deletion authority.

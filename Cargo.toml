@@ -52,7 +52,8 @@ async-speed-limit = "0.4"
 # Serialization
 serde = { version = "1", features = ["derive", "rc"] }
 # Durable JSON evidence must retain float bits for exact identity checks.
-serde_json = { version = "1", features = ["float_roundtrip"] }
+# Raw values keep provider record bytes verbatim in bounded confirmations.
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
 toml = "1"
 
 # Crypto (SRP auth)

@@ -28,7 +28,13 @@ For a specific component, see the [module index](architecture/module-index.md). 
 
 A sparse change in PrimarySync can depend on a scoped Shared scan from the same cycle. If a Hidden-only scan has no decision for the exact Shared asset, its current `isHidden` field can establish membership. Every selected destination still requires a verified local copy before the source checkpoint advances.
 
-When an observation names both the child and its master, kei requests both records together from the bound media zone. It checks their identities, relationship and selected facts before acting. If only the child is known, kei first looks up its current master.
+When an observation names both the child and its master, kei requests both records together from the bound media zone. During unfiled inventory it can confirm up to 50 first-time observations per request and fetch the next batch while it processes the current one. In enumeration order, kei checks each pair's identities, relationship and selected facts before acting on that asset. If enumeration or a lookup reports an expired session, read-ahead holds the checkpoint immediately and stops new confirmation requests. A batch reply does not advance the checkpoint. If only the child is known, kei first looks up its current master.
+
+For each asset, kei reads the retry deadline and any retained selection decision in one SQLite transaction. Repair and destination planning use that decision's frozen facts. The transaction that admits a destination still checks current ownership, and a repair still needs current replacement authority.
+
+Replay scheduling looks for due work, then validates the decisions in the selected window before advancing its replay cursor. An empty search does not prove checkpoint readiness: the checkpoint debt check still validates the scope. The download producer loads path reservations and receipts on its first asset, so empty album streams can finish without building a path planner.
+
+A standalone full inventory checks retained debt at dispatch before returning a checkpoint or completed-scan marker. Inventory also checks debt earlier when a membership deletion or an incremental replay can act on its result before dispatch finishes.
 
 After indexing finishes, a quiet zone change feed can establish coverage across disagreeing album query tokens. Qualification retains the trusted cursor for replay. See [checkpoint decisions and enumeration](architecture/checkpoints.md).
 
@@ -45,6 +51,8 @@ Keep the previous checkpoint on incomplete token proof, interruption, stale plan
 Selection evidence limits apply to individual writes and validation operations. Retained history does not consume the next library's or restarted baseline's write allowance.
 
 Once selection freezes a destination, a downloaded receipt at a different path cannot satisfy it. With stable source evidence, a missing selected copy stays due until kei publishes it at the promised path or records proof that resolves that destination.
+
+When selection hashes an existing file to check a catalog receipt, it retains the confined handle. Before committing reuse or local preservation, kei checks that the path still names the same file and the bytes have not changed. On Unix, a settled inode change time can establish that the original digest still applies; otherwise kei verifies the bytes again. If projection redirects the destination, kei checks the selected file instead. The digest does not authorize a later write or carry across a restart.
 
 Writable sync may retire raw enumeration responses only after verifying the selection seal and finding no unfinished identity, destination, metadata, or repair work. Compact rank proofs preserve the original seal and source links.
 
