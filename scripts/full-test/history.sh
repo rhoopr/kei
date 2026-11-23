@@ -36,7 +36,6 @@ COLS = [
     ("Bin(MB)",    "binary_mb",             "metric",   7),
     ("Img(MB)",    "docker_image_mb",       "metric",   7),
     ("Deps",       "deps_count",            "metric",   4),
-    ("Au",         "audit_warnings",        "metric",   3),
     ("Unw",        "src_unwrap_expect",     "metric",   3),
     ("All",        "src_allow_attrs",       "metric",   3),
     ("Fuz",        "fuzz_target_count",     "metric",   3),

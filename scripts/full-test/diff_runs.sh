@@ -193,7 +193,6 @@ METRICS = [
     ("Binary",          "binary_mb",         "MB",  0.5),
     ("Docker image",    "docker_image_mb",   "MB",  2.0),
     ("Deps (Cargo.lock)", "deps_count",      "",    1),
-    ("Audit advisories", "audit_warnings",   "",    1),
     ("src/ unwrap+expect", "src_unwrap_expect", "", 1),
     ("src/ #[allow(..)]", "src_allow_attrs",  "",   1),
     ("Fuzz targets",    "fuzz_target_count", "",    1),

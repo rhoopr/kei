@@ -125,6 +125,58 @@ def check_release(errors: list[str]) -> None:
         if needle not in text:
             errors.append(f"release.yml: Homebrew updater missing checksum guard: {needle}")
 
+    attestation_action = (
+        "actions/attest-build-provenance@"
+        "977bb373ede98d70efdf65b84cb5f73e068dcc2a"
+    )
+    if text.count(attestation_action) != 3:
+        errors.append(
+            "release.yml: the archive and tag-time container jobs must pin the "
+            "build-provenance attestation action"
+        )
+    checksums = text.find("sha256sum -- *.tar.gz *.zip > SHA256SUMS.txt")
+    archive_attestation = text.find("subject-path: |")
+    upload = text.find("- name: Upload release assets")
+    if not 0 <= checksums < archive_attestation < upload:
+        errors.append(
+            "release.yml: archive attestation must run after checksums and before upload"
+        )
+    for needle in (
+        "candidate/*.tar.gz",
+        "candidate/*.zip",
+        "candidate/SHA256SUMS.txt",
+        'docker buildx imagetools inspect "$image:$version-$arch" --format \'{{json .Manifest}}\'',
+        "jq -r .digest",
+        "subject-name: ghcr.io/${{ github.repository }}",
+        "subject-digest: ${{ steps.publish.outputs.amd64 }}",
+        "subject-digest: ${{ steps.publish.outputs.arm64 }}",
+        "push-to-registry: true",
+    ):
+        if needle not in text:
+            errors.append(f"release.yml: missing release provenance guard: {needle}")
+    for permission in ("id-token: write", "attestations: write"):
+        if text.count(permission) != 2:
+            errors.append(
+                "release.yml: the tag-time release and containers jobs "
+                f"must grant {permission}"
+            )
+    if text.count("subject-path: |") != 1:
+        errors.append(
+            "release.yml: archive attestation must use subject-path for the released files"
+        )
+    if text.count("subject-digest: ${{ steps.publish.outputs.amd64 }}") != 1:
+        errors.append(
+            "release.yml: the tag-time containers job must attest the amd64 digest"
+        )
+    if text.count("subject-digest: ${{ steps.publish.outputs.arm64 }}") != 1:
+        errors.append(
+            "release.yml: the tag-time containers job must attest the arm64 digest"
+        )
+    if text.count("push-to-registry: true") != 2:
+        errors.append(
+            "release.yml: each tag-time container attestation must push to the registry"
+        )
+
 
 def check_rust_ci(errors: list[str]) -> None:
     text = workflow_text("checks.yml")

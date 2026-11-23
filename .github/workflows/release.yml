@@ -82,6 +82,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout
@@ -102,6 +104,14 @@ jobs:
         run: |
           cd candidate
           sha256sum -- *.tar.gz *.zip > SHA256SUMS.txt
+
+      - name: Attest release archives
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: |
+            candidate/*.tar.gz
+            candidate/*.zip
+            candidate/SHA256SUMS.txt
 
       - name: Generate release notes
         id: release_notes
@@ -145,6 +155,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -163,6 +175,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish the tested image IDs without rebuilding
+        id: publish
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
@@ -172,12 +185,32 @@ jobs:
             python3 scripts/ci/artifact.py verify-loaded-container "$arch"
             docker tag kei:candidate "$image:$version-$arch"
             docker push "$image:$version-$arch"
+            digest=$(docker buildx imagetools inspect "$image:$version-$arch" --format '{{json .Manifest}}' | jq -r .digest)
+            if [[ -z "$digest" || "$digest" == "null" ]]; then
+              echo "::error::missing registry manifest digest for $image:$version-$arch"
+              exit 1
+            fi
+            echo "$arch=$digest" >> "$GITHUB_OUTPUT"
           done
           docker buildx imagetools create -t "$image:$version" "$image:$version-amd64" "$image:$version-arm64"
           # Do not move stable aliases for a prerelease.
           if [[ "$version" != *-* ]]; then
             docker buildx imagetools create -t "$image:${version%.*}" -t "$image:latest" "$image:$version"
           fi
+
+      - name: Attest amd64 image provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.publish.outputs.amd64 }}
+          push-to-registry: true
+
+      - name: Attest arm64 image provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.publish.outputs.arm64 }}
+          push-to-registry: true
 
   resume_containers:
     if: github.event_name == 'workflow_dispatch' && (inputs.publication_run != '' || inputs.publication_tag != '') && github.ref == 'refs/heads/main'

@@ -6,7 +6,7 @@
 # Phases run in this order:
 #   begin_run    -- staging + concurrency guard, clears flag files
 #   prereqs      -- check_prereqs.sh; sets .live-skipped if .env / cookies bad
-#   static_checks    fmt, clippy, docs, audit, workflow/script lint, contracts, typos
+#   static_checks    fmt, clippy, docs, dependency policy, workflow/script lint, contracts, typos
 #   offline_core     all-feature/no-default tests + scenario catalog validation
 #   nightly_tools    fuzz build when available + cargo-udeps
 #   package          release build + archive smoke
