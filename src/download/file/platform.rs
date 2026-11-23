@@ -491,7 +491,7 @@ fn rename_confined_macos(
 }
 
 /// Publish and retire the `.part` name, for callers that hold no handle on it.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "xmp"))]
 pub(super) async fn publish_part_no_replace(
     part_path: &Path,
     final_path: &Path,
@@ -635,7 +635,7 @@ async fn publish_part_by_hard_link(
 
 /// Remove the `.part` name that link publication left behind. The caller must
 /// have closed its own handles on the file first.
-#[cfg(unix)]
+#[cfg(all(unix, any(test, feature = "xmp")))]
 pub(in crate::download) async fn retire_linked_part(part_path: &Path) {
     if let Err(rm_err) = fs::remove_file(part_path).await {
         tracing::warn!(target: "kei::download::file",

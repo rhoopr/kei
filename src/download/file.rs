@@ -127,7 +127,7 @@ pub(super) fn cleanup_prepared_sidecar(
     replacement_recovery::cleanup_prepared(path, expected, identity)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, target_os = "linux", feature = "xmp"))]
 pub(super) use platform::ForcedLinkFallback;
 
 /// Retire the temporary name that link-based no-replace publication leaves
