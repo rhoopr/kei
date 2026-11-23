@@ -441,6 +441,12 @@ async fn stream_with_preloaded_download_context_does_not_reload_state_db() {
     .expect("empty stream should complete");
 
     assert_eq!(
+        db.reservation_loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "an empty pass must not build a path planner"
+    );
+    assert_eq!(
         db.downloaded_state_load_count(),
         1,
         "stream should reuse the preloaded context instead of reloading the DB"

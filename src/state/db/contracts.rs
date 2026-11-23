@@ -550,6 +550,16 @@ pub trait DownloadStateStore: Send + Sync {
         version_size: &str,
         error: &str,
     ) -> Result<(), StateError>;
+    async fn mark_destination_failed(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        _destination: &Path,
+        error: &str,
+    ) -> Result<(), StateError> {
+        self.mark_failed(library, id, version_size, error).await
+    }
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError>;
     /// Return live policy-excluded identities for targeted deletion revalidation.
     ///

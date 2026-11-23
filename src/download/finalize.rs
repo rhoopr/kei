@@ -182,10 +182,11 @@ where
             crate::commands::reconcile::FILE_TRUNCATED_REASON
         }
     };
-    db.mark_failed(
+    db.mark_destination_failed(
         library,
         &task.asset_id,
         task.version_size.as_str(),
+        &task.download_path,
         durable_error,
     )
     .await

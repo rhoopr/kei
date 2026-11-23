@@ -655,6 +655,11 @@ impl ActiveDecision {
     }
 }
 
+pub(crate) enum SelectionAttempt {
+    Due(Option<Box<ActiveDecision>>),
+    Deferred,
+}
+
 fn validate_media_source(
     root: &ActiveGeneration,
     manifest: &ActiveDecision,
@@ -2430,17 +2435,52 @@ fn validate_records(
 }
 
 impl SqliteStateDb {
-    pub(crate) async fn selection_attempt_due(
+    /// Read-ahead hint only. The producer still validates the decision and its
+    /// retry deadline when consuming each observation.
+    pub(crate) async fn first_selection_observations(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        key: String,
+        children: Vec<String>,
+    ) -> Result<HashSet<String>, StateError> {
+        self.with_conn("finding new selection observations", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            let mut recorded = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3)")?;
+            let mut new = HashSet::new();
+            for child in children {
+                if !recorded.query_row(params![generation, key, child], |row| row.get::<_, bool>(0))? {
+                    new.insert(child);
+                }
+            }
+            Ok(new)
+        }).await
+    }
+
+    pub(crate) async fn selection_attempt(
         &self,
         owner: account::AccountOwner,
         generation: String,
         key: String,
         child: String,
-    ) -> Result<bool, StateError> {
-        self.with_conn("checking selection retry deadline",move|conn|{
-            account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;
-            let state:Option<(String,i64)>=conn.query_row("SELECT admission,next_retry_at FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,key,child],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-            if let Some((admission,deadline))=state {load_decision(conn,&root,&key,&child)?;Ok(admission=="excluded" || deadline<=Utc::now().timestamp())} else {Ok(true)}
+    ) -> Result<SelectionAttempt, StateError> {
+        self.with_conn("reading selection attempt", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            account::validate_authenticated(&tx, &owner)?;
+            let root = load_generation(&tx, &generation)?;
+            let due: Option<bool> = tx.query_row(
+                "SELECT admission='excluded' OR next_retry_at<=?4 FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+                params![generation, key, child, Utc::now().timestamp()], |row| row.get(0),
+            ).optional()?;
+            let attempt = match due {
+                None => SelectionAttempt::Due(None),
+                Some(due) => {
+                    let previous = load_decision(&tx, &root, &key, &child)?;
+                    if due { SelectionAttempt::Due(Some(Box::new(previous))) } else { SelectionAttempt::Deferred }
+                }
+            };
+            tx.commit()?;
+            Ok(attempt)
         }).await
     }
 
@@ -2474,7 +2514,8 @@ impl SqliteStateDb {
             let tx=conn.unchecked_transaction()?;
             let conn=&tx;
             account::validate_authenticated(conn,&owner)?;
-            validate_scope_decisions(conn, &scope)?;
+            // Discovery is not a checkpoint decision. Validate the selected
+            // root here and the due manifests when claiming the replay window.
             let id:Option<String>=conn.query_row(&format!("SELECT g.id FROM provider_active_generations g WHERE {CURRENT_SELECTION_CONFIGURATION} AND g.id<>?3 AND (EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.admission='deferred' AND d.next_retry_at<=?4) OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=g.id AND {UNFINISHED} AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child AND d.next_retry_at<=?4))) ORDER BY g.last_replayed_at,g.created_at,g.id LIMIT 1"),params![scope,config_hash,current,Utc::now().timestamp()],|r|r.get(0)).optional()?;
             id.map(|id|load_generation(conn,&id)).transpose()
         }).await
@@ -2489,7 +2530,6 @@ impl SqliteStateDb {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
             let root=load_generation(&tx,&generation)?;
             let stored:Option<String>=tx.query_row("SELECT replay_after FROM provider_active_generations WHERE id=?1",[&generation],|r|r.get(0))?;
-            validate_scope_decisions(&tx, &root.spec.scope)?;
             let after:Option<(String,String)>=stored.as_deref().map(|value|serde_json::from_str(value).map_err(|_invalid|StateError::ProviderSelectionInvalid)).transpose()?;
             let query=|after:Option<&(String,String)>|->Result<Vec<(String,String,i64)>,StateError> {
                 Ok(tx.prepare(&format!("SELECT d.pass_key,d.child,length(d.manifest) FROM provider_active_decisions d WHERE d.generation=?1 AND (?2 IS NULL OR (d.pass_key,d.child)>(?2,?3)) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND {UNFINISHED})) ORDER BY d.pass_key,d.child LIMIT 64"))?.query_map(params![generation,after.map(|a|&a.0),after.map(|a|&a.1),Utc::now().timestamp()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?)

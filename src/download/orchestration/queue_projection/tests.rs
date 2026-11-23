@@ -5891,6 +5891,42 @@ async fn active_pending_fixture() -> (
 }
 
 #[tokio::test]
+async fn selection_attempt_returns_frozen_decision_only_when_due() {
+    use crate::state::db::provider_generations::SelectionAttempt;
+    let (f, root, manifest, _) = Box::pin(active_pending_fixture()).await;
+    let key = &manifest.decision.pass_key;
+    let child = &manifest.decision.child;
+    let attempt = |name: &str| {
+        f.db.selection_attempt(owner(), root.id.clone(), key.clone(), name.into())
+    };
+    assert!(matches!(
+        attempt("unseen").await.unwrap(),
+        SelectionAttempt::Due(None)
+    ));
+    assert!(
+        matches!(attempt(child).await.unwrap(), SelectionAttempt::Due(Some(previous)) if *previous == manifest)
+    );
+    f.db.defer_selection_confirmation(owner(), root.id.clone(), key.clone(), child.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        attempt(child).await.unwrap(),
+        SelectionAttempt::Deferred
+    ));
+    f.db.acquire_lock("corrupt deferred decision")
+        .unwrap()
+        .execute(
+            "UPDATE provider_active_decisions SET manifest_hash='invalid'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        attempt(child).await.is_err(),
+        "backoff must not mask invalid retained state"
+    );
+}
+
+#[tokio::test]
 async fn published_confirmation_releases_only_matching_inbox_records() {
     use sha2::{Digest, Sha256};
     let seed = Fixture::new().await;
@@ -6886,6 +6922,49 @@ async fn frozen_raw_generation_preserves_swapped_keys_and_resource_evidence_on_r
         );
     }
     assert_eq!(f.db.get_pending().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn retained_discovery_does_not_certify_candidates_or_release_checkpoint() {
+    let (f, root, _, _) = Box::pin(active_pending_fixture()).await;
+    f.db.acquire_lock("damage a retained replay candidate")
+        .unwrap()
+        .execute(
+            "UPDATE provider_active_decisions SET manifest_hash='invalid'",
+            [],
+        )
+        .unwrap();
+    let candidate =
+        f.db.retained_selection_root(
+            owner(),
+            root.spec.scope.clone(),
+            root.spec.config_hash.clone(),
+            "other-current-generation".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidate.id, root.id);
+    assert!(
+        f.db.retained_selection_decisions(owner(), candidate.id)
+            .await
+            .is_err()
+    );
+    assert!(
+        f.db.provider_selection_debt(owner(), root.spec.scope, root.spec.config_hash)
+            .await
+            .is_err()
+    );
+    let cursor: Option<String> =
+        f.db.acquire_lock("refused replay must not advance its cursor")
+            .unwrap()
+            .query_row(
+                "SELECT replay_after FROM provider_active_generations WHERE id=?1",
+                [&root.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert!(cursor.is_none());
 }
 
 #[tokio::test]
@@ -8255,6 +8334,15 @@ async fn embedded_writer_finishes_during_reseeding_without_sidecars() {
         let pending:i64=f.db.acquire_lock("check all writer generations").unwrap().query_row("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_metadata=0",[],|r|r.get(0)).unwrap();
         assert_eq!(pending, i64::from(round == 0), "round {round}");
         assert_eq!(result.stats.selected_work_remaining, round == 0);
+        if round == 0 {
+            assert!(matches!(
+                f.config.sync_mode,
+                crate::download::SyncMode::Full
+            ));
+            assert!(result.checkpoint.sync_token_blocked);
+            assert!(result.sync_token.is_none());
+            assert!(result.checkpoint.scanned_generation.is_none());
+        }
     }
 }
 

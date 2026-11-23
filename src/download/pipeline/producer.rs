@@ -31,6 +31,8 @@ use super::adoption::{
 };
 use super::task::capture_repair_requested;
 
+mod unfiled;
+
 /// Outcome of `batch_forecast_decision` — either keep queueing, emit a
 /// one-shot warn, or stop enqueuing so the caller cancels the sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,17 +257,11 @@ where
     let queued_bytes_producer = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let space_warn_emitted_producer = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let handle = tokio::spawn(async move {
+    let (combined, prefetch) = unfiled::prepare(combined, &producer_config);
+    let produce = async move {
         let config = &producer_config;
         let metadata_writers_enabled = MetadataFlags::from(config.as_ref()).has_any_write();
-        let mut task_planner = match TaskPlanner::for_download(producer_state_db.as_deref()).await {
-            Ok(planner) => planner,
-            Err(error) => {
-                state_write_failures_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::error!(target: "kei::download::pipeline", %error, "Failed to load download path reservations");
-                return ProducerSkipSummary::default();
-            }
-        };
+        let mut planner = None;
         let mut seen_asset_record_names: FxHashSet<Arc<str>> = FxHashSet::default();
         let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
         // Skipped-asset IDs accumulated across the producer run and
@@ -372,7 +368,7 @@ where
                 },
             };
             match result {
-                Ok(mut asset) => {
+                Ok((mut asset, proof)) => {
                     if !seen_asset_record_names.insert(asset.asset_record_name_arc()) {
                         tracing::debug!(target: "kei::download::pipeline",
                             asset_id = %asset.id(),
@@ -384,6 +380,19 @@ where
                     }
 
                     assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let task_planner = match &mut planner {
+                        Some(planner) => planner,
+                        None => match TaskPlanner::for_download(producer_state_db.as_deref()).await
+                        {
+                            Ok(loaded) => planner.insert(loaded),
+                            Err(error) => {
+                                state_write_failures_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tracing::error!(target: "kei::download::pipeline", %error, "Failed to load download path reservations");
+                                return skips;
+                            }
+                        },
+                    };
                     // The pre-plan refresh has already committed the marker,
                     // so the skip sites must not re-stamp it from the stale
                     // context.
@@ -407,7 +416,7 @@ where
                             continue;
                         };
                         let observed_child = asset.asset_record_name().to_owned();
-                        let (current, body) = match run.confirm(key, &asset).await {
+                        let (current, body) = match run.confirm(key, &asset, proof).await {
                             Ok(confirmed) => confirmed,
                             Err(error) => {
                                 enum_errors_producer
@@ -478,7 +487,7 @@ where
                                 config,
                                 &asset,
                                 &download_ctx,
-                                &task_planner,
+                                task_planner,
                             )
                             .await
                             {
@@ -499,7 +508,7 @@ where
                                 config,
                                 &asset,
                                 &download_ctx,
-                                &task_planner,
+                                task_planner,
                             )
                             .await
                             {
@@ -523,7 +532,7 @@ where
                                     db.as_ref(),
                                     config,
                                     &asset,
-                                    &mut task_planner,
+                                    task_planner,
                                     derived.version_size,
                                     &producer_shutdown,
                                 )
@@ -550,7 +559,7 @@ where
                         }
                         let planned = async {
                             if let Some(plan) = run
-                                .confirmed_repair_plan(key, &asset, config, &mut task_planner)
+                                .confirmed_repair_plan(key, &asset, &body, config, task_planner)
                                 .await?
                             {
                                 selected_integrity_repair = true;
@@ -573,7 +582,7 @@ where
                         let mut selected_tasks = Vec::with_capacity(plan.tasks.len());
                         for task in std::mem::take(&mut plan.tasks) {
                             match download_ctx
-                                .plan_selected_truncation_repair(task, config, &mut task_planner)
+                                .plan_selected_truncation_repair(task, config, task_planner)
                                 .await
                             {
                                 Ok(Some(task)) => selected_tasks.push(task),
@@ -594,7 +603,7 @@ where
                         }
                         plan.tasks = selected_tasks;
                         match run
-                            .project(key, &asset, body, &mut plan, &mut task_planner, config)
+                            .project(key, &asset, body, &mut plan, task_planner, config)
                             .await
                         {
                             Ok(true) => {
@@ -686,7 +695,7 @@ where
                             config,
                             &asset,
                             &download_ctx,
-                            &task_planner,
+                            task_planner,
                         )
                         .await
                         {
@@ -926,7 +935,7 @@ where
                         config,
                         &asset,
                         &download_ctx,
-                        &mut task_planner,
+                        task_planner,
                         &plan.tasks,
                         &producer_shutdown,
                     )
@@ -984,7 +993,7 @@ where
                             config,
                             &asset,
                             &download_ctx,
-                            &mut task_planner,
+                            task_planner,
                             &recovered.retained_versions,
                         )
                         .await
@@ -1032,7 +1041,7 @@ where
                         for mut task in plan.tasks {
                             if let Err(error) = mark_reserved_pending_task(
                                 &download_ctx,
-                                &task_planner,
+                                task_planner,
                                 config,
                                 &mut task,
                             ) {
@@ -1047,7 +1056,7 @@ where
                                     config,
                                     &asset,
                                     &download_ctx,
-                                    &mut task_planner,
+                                    task_planner,
                                     &task,
                                 )
                                 .await
@@ -1135,7 +1144,7 @@ where
                                                 config,
                                                 &asset,
                                                 &task,
-                                                &mut task_planner,
+                                                task_planner,
                                             )
                                             .await
                                         {
@@ -1246,6 +1255,11 @@ where
                     enum_errors_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if is_provider_session_error(&e) {
                         provider_auth_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(run) = &config.selection_run {
+                            run.session_expired
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         tracing::warn!(target: "kei::download::pipeline",
                             "Provider session expired during enumeration; retaining checkpoint for reauthentication"
                         );
@@ -1350,7 +1364,10 @@ where
         }
 
         skips
-    });
+    };
+    // The reader is scoped to this producer. Dropping or aborting it cannot
+    // leave a detached provider task or mistake a worker panic for EOF.
+    let handle = tokio::spawn(async move { tokio::join!(produce, prefetch).0 });
 
     StreamProducer { handle, metrics }
 }

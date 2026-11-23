@@ -65,6 +65,24 @@ pub(in crate::download) struct RetainedPendingFile {
     pub(in crate::download) modified: Option<std::time::SystemTime>,
 }
 
+/// Facts from one confined read of an existing selection destination.
+pub(in crate::download) struct ObservedFile {
+    pub(in crate::download) fingerprint: ExistingFileFingerprint,
+    pub(in crate::download) modified: Option<std::time::SystemTime>,
+}
+
+impl ObservedFile {
+    pub(in crate::download) async fn read(
+        root: &Path,
+        path: &Path,
+    ) -> anyhow::Result<Option<Self>> {
+        Ok(retain_pending_file(root, path).await?.map(|file| Self {
+            fingerprint: file.fingerprint,
+            modified: file.modified,
+        }))
+    }
+}
+
 impl RetainedPendingFile {
     pub(super) fn identity(&self) -> std::io::Result<crate::fs_util::FileIdentity> {
         crate::fs_util::file_identity(&self.file)

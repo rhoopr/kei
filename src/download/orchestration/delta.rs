@@ -493,6 +493,15 @@ pub(super) struct MembershipDelta {
     pub(super) deleted_photos: FxHashSet<String>,
 }
 
+impl MembershipDelta {
+    pub(super) fn has_membership_deletions(&self) -> bool {
+        self.relations
+            .values()
+            .chain(self.containers.values())
+            .any(|deleted| *deleted)
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct IncrementalDeltaSummary {
     pub(super) membership: Box<MembershipDelta>,

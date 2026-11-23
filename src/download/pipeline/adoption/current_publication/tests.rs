@@ -123,11 +123,17 @@ async fn current_pending_publication_keeps_legacy_path_and_serializes_concurrent
     assert_eq!(status(&db), "downloaded");
     assert_eq!(fs::read(&file).unwrap(), MOVIE);
     assert_eq!(fs::read_dir(file.parent().unwrap()).unwrap().count(), 1);
+    let (selected, observed) = first
+        .verified_catalog_path(&asset, &config, VersionSizeKey::LiveOriginal)
+        .await
+        .unwrap();
+    assert_eq!(selected, file);
+    let expected: [u8; 32] = Sha256::digest(MOVIE).into();
+    assert_eq!(observed.fingerprint.sha256, expected);
+    assert_eq!(observed.fingerprint.size, MOVIE.len() as u64);
     assert_eq!(
-        first
-            .verified_downloaded_path(&asset, &config, VersionSizeKey::LiveOriginal)
-            .await,
-        Some(file)
+        observed.modified,
+        fs::metadata(file).unwrap().modified().ok()
     );
 }
 
