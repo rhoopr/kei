@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.30.0-beta.3] - 2026-11-23
+
+See the [v0.30 upgrade checklist](docs/upgrade.md) before opening an existing backup with this beta.
+
+### Changed
+
+- Sped up first-time sync of large unfiled collections by checking photos in batches. Resumed syncs also did less repeated work when checking selections and writing missing sidecars.
+- Sync saved eligible iCloud checkpoints before finishing local metadata writes. After a restart, it could finish pending sidecars without scanning the library again.
+- Added GitHub build attestations for release archives, checksums, and container images. See the [verification commands](docs/ci.md).
+
+### Fixed
+
+- Stale album or people metadata no longer blocked downloads of missing media. This update upgraded the state database to schema 49.
+- Fixed a missing-copy case where sync found a photo under its old, shorter filename and skipped the selected destination. The original file stayed in place.
+
 ## [0.30.0-beta.2] - 2026-11-21
 
 See the [v0.30 upgrade checklist](docs/upgrade.md) before opening an existing backup with this beta.
