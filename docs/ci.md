@@ -1,5 +1,16 @@
 # CI qualification
 
+## Workflow ownership
+
+| Trigger | Workflow | Owns | Does not own |
+|---------|----------|------|--------------|
+| PR | **PR baseline** | The required merge gate. | Replaying the full matrix or heavy qualification. |
+| Push to `main` | **Rust CI** | Deterministic platform suites, no-default-feature checks, copies stress, docs, and dependency policy. | Timed advisory or fuzz checks; release artifacts. |
+| Daily | **Nightly qualification** | The current advisory database, fuzz samples, release-mode canary, main push evidence, and incidents. | Replaying the full suite; building candidates. |
+| Tag or manual | **Heavy qualification** | Self-contained release evidence, service smoke, archives, containers, and the receipt. | Scheduled regression. |
+| Manual | **Live wiki check** | External wiki drift checks on demand. | Gating qualification or releases. |
+| Daily | **Nightly freshness** | Nightly freshness detection. | Qualifying releases. |
+
 ## PR baseline
 
 [PR baseline](../.github/workflows/pr.yml) runs the same three Linux jobs in parallel for every PR, including drafts. Paths, labels and repository variables do not select work.
@@ -72,6 +83,14 @@ gh attestation verify oci://ghcr.io/rhoopr/kei@sha256:DIGEST --repo rhoopr/kei
 
 Both commands need an authenticated `gh` client. Container verification also needs access to the GHCR image referenced by the digest.
 
+After the next authorized release, verify the published provenance:
+
+- Download one release archive and verify it with the archive command above.
+- Verify one published container digest with the container command above.
+- Confirm the GHCR attestations are retrievable.
+
+This is a post-publication check, not a release gate.
+
 ## Nightly operation
 
 `Nightly qualification` runs on `main` at 12:05 a.m. New York time every day. A manual dispatch on `main` uses the same four independent jobs, pinned to the event SHA:
@@ -81,7 +100,7 @@ Both commands need an authenticated `gh` client. Container verification also nee
 - **Dependency policy:** enforce `deny.toml` every day, covering advisories from the current RustSec database, license allow lists, duplicate-version warnings, and source restrictions.
 - **Optimized library tests:** run the all-feature release-mode library suite unless a prior successful nightly on the same SHA actually ran and passed it. A skipped test step is not evidence. If no qualifying result is found in the bounded history, run the tests.
 
-All four jobs must succeed for the nightly incident reporter to signal recovery. Nightly does not build release candidates. The **Daily live wiki check** runs separately at 06:43 UTC and reports documentation drift on its own Actions run. Heavy qualification still checks the wiki before a release.
+All four jobs must succeed for the nightly incident reporter to signal recovery. Nightly does not build release candidates. The **Live wiki check** runs on manual dispatch and reports documentation drift on its own Actions run. Heavy qualification still checks the wiki before a release.
 
 `Nightly freshness` checks at 2:05 a.m. New York time. It inspects the newest scheduled or manually dispatched nightly on `main`. That run must have been created since the most recent 12:05 a.m. slot and finished successfully. A missing run, a still-running job, a failure, or yesterday's success cannot pass. Both schedules follow the local clock; when the spring transition skips the 2 a.m. hour, GitHub advances the check to 3 a.m.
 
