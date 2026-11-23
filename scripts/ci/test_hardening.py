@@ -21,7 +21,8 @@ class HardeningTests(unittest.TestCase):
             for name, old, new, expected in [
                 ("pr.yml", "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", "actions/checkout@main", "not pinned"),
                 ("pr.yml", "needs: [quality, clippy, smoke]", "needs: [quality, clippy]", "missing qualification guard"),
-                ("qualification.yml", "needs: [quality, artifacts, service, specialized]", "needs: [quality]", "missing qualification guard"),
+                ("qualification.yml", "service, fuzz, optimized]", "service, optimized]", "missing qualification guard"),
+                ("qualification.yml", "gate.py quality artifacts service fuzz optimized", "gate.py quality artifacts service fuzz", "missing qualification guard"),
                 ("qualification.yml", "cargo fetch --locked", "echo missing bootstrap", "missing qualification guard"),
                 ("release.yml", "github.ref == 'refs/heads/main'", "true", "missing publication-resume guard"),
                 ("release.yml", "scripts/ci/publication.py --repo", "scripts/ci/skip.py --repo", "missing publication-resume guard"),

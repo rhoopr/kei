@@ -29,6 +29,8 @@ Pushes to `main` run the full Linux, macOS and Windows offline suites, Linux no-
 
 Heavy qualification runs on release tags and on manual dispatch of **Heavy qualification**. It has no timer: a weekly copy of the same `main` work would duplicate the push suite and nightly coverage without qualifying a new commit. Release tags always rerun it on the release commit and require separate local evidence before publishing. Neither a nightly result nor a manual rehearsal qualifies a different commit. For local development, run focused tests for the behavior you changed. `just gate` remains available for offline diagnosis.
 
+Seeded fuzzing runs in parallel with source-package and optimized library tests. Each job has a 90-minute limit. Both must pass before release artifacts can be published.
+
 ## Local release prerequisites
 
 When a maintainer explicitly requests a release, run these local prerequisites
