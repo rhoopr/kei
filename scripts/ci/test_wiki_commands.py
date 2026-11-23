@@ -274,7 +274,9 @@ os.execv(os.environ["REAL_GIT"], [os.environ["REAL_GIT"], *args])
         self.assertIn("cargo doc --no-deps --all-features", workflow)
         self.assertNotIn("cargo build", workflow)
         daily = (ROOT / ".github/workflows/daily-wiki.yml").read_text()
-        self.assertIn("  schedule:", daily)
+        self.assertIn("name: Live wiki check\n", daily)
+        self.assertIn("workflow_dispatch:", daily)
+        self.assertNotIn("schedule:", daily)
         self.assertIn('scripts/check-wiki-commands.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/kei-wiki"', daily)
 
 

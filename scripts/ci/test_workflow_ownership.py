@@ -37,6 +37,12 @@ class WorkflowOwnershipTests(unittest.TestCase):
         self.assertRegex(text, r"(?m)^\s*-\s*cron:\s*\S")
         self.assertIn("workflow_dispatch:", text)
 
+    def test_live_wiki_check_is_manual_only(self):
+        text = triggers("daily-wiki.yml")
+        self.assertEqual(text.splitlines()[0], "name: Live wiki check")
+        self.assertIn("workflow_dispatch:", text)
+        self.assertNotIn("schedule:", text)
+
     def test_release_tags_still_call_heavy_qualification(self):
         self.assertRegex(
             workflow("release.yml"),
