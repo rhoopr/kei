@@ -284,15 +284,19 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     };
     api_retry_config.validate()?;
 
-    let (shared_session, mut photos_service, libraries) = super::session::initialize_libraries(
-        auth_result,
-        api_retry_config,
-        &config,
-        &password_provider,
-        &notifier,
-        input_mode,
-    )
-    .await?;
+    let shutdown_token = shutdown::install_signal_handler(sd_notifier, config.ui.personality_mode)?;
+    let (shared_session, mut photos_service, libraries) = tokio::select! {
+        biased;
+        () = shutdown_token.cancelled() => return Ok(()),
+        result = super::session::initialize_libraries(
+            auth_result,
+            api_retry_config,
+            &config,
+            &password_provider,
+            &notifier,
+            input_mode,
+        ) => result?,
+    };
     tracing::debug!(
         count = libraries.len(),
         zones = %libraries.iter().map(|l| l.zone_name().to_string()).collect::<Vec<_>>().join(", "),
@@ -517,7 +521,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         ),
     );
 
-    let shutdown_token = shutdown::install_signal_handler(sd_notifier, config.ui.personality_mode)?;
     photos_service.replay_catalog(&shutdown_token).await?;
     if shutdown_token.is_cancelled() {
         return Ok(());
@@ -648,18 +651,19 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         // Readiness may change without changes/database events. Persist holds
         // before any shortcut and rebuild collection/pass scope while held so
         // a provisional album list cannot certify FINISHED reconciliation.
-        super::planning::refresh_indexing_library_plans_with_recovery(
-            &mut photos_service,
-            &libraries,
-            &config,
-            state_db
-                .as_deref()
-                .map(|db| db as &dyn download::DownloadStore),
-            &mut library_states,
-            &mut collection_context,
-            startup_db.as_deref().zip(account_owner.as_ref()),
-        )
-        .await?;
+        tokio::select! {
+            biased;
+            () = shutdown_token.cancelled() => break,
+            result = super::planning::refresh_indexing_library_plans_with_recovery(
+                &mut photos_service,
+                &libraries,
+                &config,
+                state_db.as_deref().map(|db| db as &dyn download::DownloadStore),
+                &mut library_states,
+                &mut collection_context,
+                startup_db.as_deref().zip(account_owner.as_ref()),
+            ) => result?,
+        }
 
         // In watch mode with incremental sync, use changes/database as a
         // cheap pre-check before refreshing album plans or running a sync.

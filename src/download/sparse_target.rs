@@ -324,7 +324,12 @@ pub(crate) async fn recover(
     if cancel.is_cancelled() || !target.controls.run_mode.downloads_files() {
         return Ok(None);
     }
-    if !target.library.check_indexing().await?
+    let finished = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Ok(None),
+        result = target.library.check_indexing() => result?,
+    };
+    if !finished
         || db
             .get_metadata(&crate::sync_cycle::indexing_reconciliation_key(
                 &target.config.library,

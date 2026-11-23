@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::auth;
 use crate::config;
 use crate::download;
+use crate::icloud::error::ICloudError;
 use crate::icloud::photos::PRIMARY_ZONE_NAME;
 use crate::state;
 
@@ -40,6 +41,8 @@ pub(crate) struct LibraryState {
     /// `changes/database` pre-check finds relevant work avoids burning album
     /// listing calls on quiet watch cycles.
     pub(crate) plan_needs_refresh: bool,
+    /// The readiness probe exhausted its retry budget on this wake.
+    pub(crate) indexing_deferred: bool,
 }
 
 /// Metadata key holding the SHA-256 of the enumeration-affecting subset of
@@ -146,6 +149,28 @@ pub(crate) async fn prepare_library_indexing(
         }
     }
     Ok((finished, hold))
+}
+
+/// Neither this zone nor a contributing source can authorize enumeration
+/// while readiness is unknown. Keep the selected zone due on the next wake.
+pub(crate) async fn indexing_for_cycle(
+    library: &LibraryState,
+    db: Option<&dyn download::DownloadStore>,
+    dry_run: bool,
+) -> anyhow::Result<Option<(bool, Option<String>)>> {
+    match prepare_library_indexing(library, db, dry_run).await {
+        Err(error) if ICloudError::indexing_unavailable(&error) => {
+            let key = indexing_reconciliation_key(&library.zone_name);
+            if !dry_run
+                && let Some(db) = db
+                && db.get_metadata(&key).await?.is_none()
+            {
+                db.set_metadata(&key, "1").await?;
+            }
+            Ok(None)
+        }
+        result => result.map(Some),
+    }
 }
 
 pub(crate) const RETAINED_CHECKPOINT_HOLD_PREFIX: &str = "retained_checkpoint_hold:";
@@ -1131,6 +1156,7 @@ async fn run_cycle_inner(
                 [pass] if pass.kind == crate::commands::PassKind::Unfiled && pass.exclude_ids.is_empty())
     };
     let mut completed_scans = rustc_hash::FxHashMap::default();
+    let mut deferred_indexing_zones = rustc_hash::FxHashSet::default();
     let mut ordered_libraries = library_states.to_vec();
     // Sparse private records in PrimarySync point into Shared libraries.
     // Let their ordinary scoped queries and local writers finish first.
@@ -1158,8 +1184,30 @@ async fn run_cycle_inner(
         }
 
         let indexing_key = indexing_reconciliation_key(&lib_state.zone_name);
-        let (indexing_finished, indexing_hold_at_start) =
-            prepare_library_indexing(lib_state, state_db, config.runtime.dry_run).await?;
+        let readiness = if lib_state.indexing_deferred {
+            None
+        } else {
+            tokio::select! {
+                biased;
+                () = shutdown_token.cancelled() => {
+                    cycle_stats.interrupted = true;
+                    db_sync_token_advance_safe = false;
+                    break;
+                }
+                result = indexing_for_cycle(lib_state, state_db, config.runtime.dry_run) => result?,
+            }
+        };
+        let Some((indexing_finished, indexing_hold_at_start)) = readiness else {
+            tracing::warn!(
+                "Indexing readiness unavailable; skipping library and preserving checkpoints"
+            );
+            deferred_indexing_zones.insert(lib_state.zone_name.as_str());
+            capture_authority_libraries.remove(&lib_state.zone_name);
+            cycle_failed_count = cycle_failed_count.saturating_add(1);
+            db_sync_token_advance_safe = false;
+            path_reconciliation_complete = false;
+            continue;
+        };
         let indexing_reconciliation = indexing_hold_at_start.is_some() || !indexing_finished;
         if !has_active_passes(lib_state) {
             db_sync_token_advance_safe &= !indexing_reconciliation;
@@ -1569,11 +1617,11 @@ async fn run_cycle_inner(
         let download_client = shared_session.read().await.download_client().clone();
         let mut sparse_targets = Vec::new();
         if download_controls.run_mode.downloads_files() {
-            for target in library_states
-                .iter()
-                .copied()
-                .filter(|target| target.zone_name != lib_state.zone_name && !target.plan_is_stale)
-            {
+            for target in library_states.iter().copied().filter(|target| {
+                target.zone_name != lib_state.zone_name
+                    && !target.plan_is_stale
+                    && !deferred_indexing_zones.contains(target.zone_name.as_str())
+            }) {
                 let Some(pass) = target.plan.passes.first() else {
                     continue;
                 };
@@ -2011,6 +2059,12 @@ async fn run_cycle_inner(
         // but do not turn ordinary interrupted sync into a new indexing hold.
         let indexing_hold_required =
             !indexing_finished || matches!(readiness_after, Some(Ok(false)) | Some(Err(_)));
+        if matches!(
+            readiness_after,
+            Some(Err(ICloudError::IndexingUnavailable(_)))
+        ) {
+            cycle_failed_count = cycle_failed_count.saturating_add(1);
+        }
         if current_inventory_qualified
             && matches!(readiness_after, Some(Ok(true)))
             && !indexing_reconciliation
@@ -2928,6 +2982,7 @@ mod tests {
             deleted_album_bindings: Vec::new(),
             plan_is_stale: false,
             plan_needs_refresh: false,
+            indexing_deferred: false,
         }
     }
 

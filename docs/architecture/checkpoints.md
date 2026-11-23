@@ -22,6 +22,8 @@ existing metadata table. Presence is the obligation, including unknown future
 payloads; no schema migration is needed. The previous trusted zone and database
 checkpoints remain unchanged. Cross-zone album sources also contribute readiness.
 
+For an unknown or missing state, kei retries the readiness probe after 5 seconds and again after 15 seconds. If neither probe returns `FINISHED` or `RUNNING`, the cycle skips the affected library and holds the database checkpoint. During startup, watch mode waits for the next interval before retrying incomplete discovery; a one-shot run reports failure. Shutdown interrupts the wait.
+
 While indexing, the download dispatcher uses full queries without incremental
 replay, retained-work admission, metadata repair, retry retirement, or album
 snapshot completion. Ordinary media still uses the existing verified publication

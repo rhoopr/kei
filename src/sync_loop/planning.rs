@@ -159,7 +159,7 @@ pub(super) async fn refresh_needed_library_plans(
     consecutive_album_refresh_failures: &mut u32,
 ) {
     for lib_state in library_states {
-        if !lib_state.plan_needs_refresh {
+        if lib_state.indexing_deferred || !lib_state.plan_needs_refresh {
             continue;
         }
         if changed_zones.is_some_and(|zones| !zones.contains(&lib_state.zone_name)) {
@@ -413,6 +413,7 @@ pub(super) async fn resolve_library_plans_with_recovery(
                 .collect(),
             plan_is_stale: false,
             plan_needs_refresh: false,
+            indexing_deferred: false,
         });
     }
     warn_if_multi_library_paths_commingle(
@@ -461,10 +462,16 @@ pub(super) async fn refresh_indexing_library_plans_with_recovery(
 ) -> anyhow::Result<()> {
     let mut indexing_hold = false;
     let mut finished_before_scope = true;
-    for library in library_states.iter() {
-        let (finished, hold) =
-            crate::sync_cycle::prepare_library_indexing(library, state_db, config.runtime.dry_run)
-                .await?;
+    for library in library_states.iter_mut() {
+        library.indexing_deferred = false;
+        let Some((finished, hold)) =
+            crate::sync_cycle::indexing_for_cycle(library, state_db, config.runtime.dry_run)
+                .await?
+        else {
+            library.indexing_deferred = true;
+            library.plan_is_stale = true;
+            continue;
+        };
         indexing_hold |= hold.is_some();
         if let Some(db) = state_db {
             indexing_hold |= db
@@ -477,6 +484,17 @@ pub(super) async fn refresh_indexing_library_plans_with_recovery(
         finished_before_scope &= finished;
     }
     if indexing_hold {
+        if library_states
+            .iter()
+            .any(|library| library.indexing_deferred)
+        {
+            // Combined collection scope cannot be rebuilt from a partial listing.
+            for library in library_states {
+                library.plan_is_stale = true;
+                library.plan_needs_refresh = false;
+            }
+            return Ok(());
+        }
         (*library_states, *collection_context) =
             resolve_library_plans_with_recovery(photos_service, libraries, config, recovery)
                 .await?;

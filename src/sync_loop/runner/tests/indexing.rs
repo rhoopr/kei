@@ -47,6 +47,8 @@ fn indexing_capture(db: &Arc<state::SqliteStateDb>) -> crate::icloud::photos::in
 #[derive(Clone)]
 struct IndexingSession {
     readiness: Arc<Mutex<&'static str>>,
+    readiness_probes: Arc<AtomicUsize>,
+    unknown_observed: Arc<tokio::sync::Notify>,
     records: Arc<Vec<Value>>,
     queries: Arc<AtomicUsize>,
     changes: Arc<Mutex<Vec<String>>>,
@@ -64,6 +66,10 @@ impl PhotosSession for IndexingSession {
     async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
         let request: Value = serde_json::from_str(&body)?;
         if request["query"]["recordType"] == "CheckIndexingState" {
+            self.readiness_probes.fetch_add(1, Ordering::SeqCst);
+            if *self.readiness.lock().unwrap() == "UNKNOWN" {
+                self.unknown_observed.notify_one();
+            }
             return Ok(
                 json!({"records":[{"fields":{"state":{"value":*self.readiness.lock().unwrap()}}}]}),
             );
@@ -171,6 +177,8 @@ fn provider(readiness: &'static str, ids: &[&str], base: &str) -> IndexingSessio
         .collect();
     IndexingSession {
         readiness: Arc::new(Mutex::new(readiness)),
+        readiness_probes: Arc::default(),
+        unknown_observed: Arc::default(),
         records: Arc::new(records),
         queries: Arc::new(AtomicUsize::new(0)),
         changes: Arc::new(Mutex::new(Vec::new())),
@@ -514,7 +522,65 @@ async fn indexing_restart_recovers_omitted_assets_and_reuses_downloaded_files() 
     server.verify().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn indexing_unknown_recovers_in_cycle_or_cancels_during_backoff() {
+    for cancel_during_backoff in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let db = indexing_db(&root.path().join("state.db")).await;
+        let config = make_run_cycle_config();
+        db.set_metadata(CURSOR, "trusted-before").await.unwrap();
+        db.set_metadata(
+            ENUM_CONFIG_HASH_KEY,
+            &download::compute_config_hash(&config),
+        )
+        .await
+        .unwrap();
+        let provider = provider("FINISHED", &[], "");
+        let selected = library(&provider, &db).await;
+        *provider.readiness.lock().unwrap() = "UNKNOWN";
+        let (_dir, session) = make_shared_session_for_run_cycle().await;
+        let build = make_run_cycle_download_config_builder(root.path(), db.clone());
+        let cancel = CancellationToken::new();
+        let libraries = [&selected];
+        let cycle = run_cycle(
+            &libraries,
+            &config,
+            Some(db.as_ref()),
+            &build,
+            download::DownloadControls::download_hidden(),
+            &session,
+            &cancel,
+        );
+        let (result, ()) = tokio::join!(cycle, async {
+            provider.unknown_observed.notified().await;
+            if cancel_during_backoff {
+                cancel.cancel();
+            } else {
+                *provider.readiness.lock().unwrap() = "FINISHED";
+            }
+        });
+        let result = result.unwrap();
+        if cancel_during_backoff {
+            assert_eq!(provider.readiness_probes.load(Ordering::SeqCst), 2);
+            assert_eq!(provider.queries.load(Ordering::SeqCst), 0);
+            assert!(provider.changes.lock().unwrap().is_empty());
+            assert_eq!(
+                db.get_metadata(CURSOR).await.unwrap().as_deref(),
+                Some("trusted-before")
+            );
+            assert!(!result.can_advance_database_checkpoint());
+        } else {
+            assert_eq!(result.failed_count, 0);
+            assert_eq!(*provider.changes.lock().unwrap(), ["trusted-before"]);
+            assert_eq!(
+                db.get_metadata(CURSOR).await.unwrap().as_deref(),
+                Some("trusted-after")
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_and_cursor() {
     for fault in [
         "malformed",
@@ -608,13 +674,13 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
             &cancel,
         )
         .await;
+        let result = result.unwrap();
+        assert!(!result.can_advance_database_checkpoint(), "{fault}");
         if fault == "unknown" {
-            assert!(result.is_err());
-        } else {
-            assert!(
-                !result.unwrap().can_advance_database_checkpoint(),
-                "{fault}"
-            );
+            assert!(result.failed_count > 0);
+            assert_eq!(provider.readiness_probes.load(Ordering::SeqCst), 4);
+            assert_eq!(provider.queries.load(Ordering::SeqCst), 0);
+            assert!(provider.changes.lock().unwrap().is_empty());
         }
         if fault == "checkpoint_write" {
             assert!(provider.queries.load(Ordering::SeqCst) > 0);
@@ -1107,8 +1173,65 @@ async fn indexing_running_plan_cannot_qualify_after_late_finished_probe() {
             .await
             .unwrap();
     assert_eq!(states[0].plan.passes.len(), 1);
-    transition.store(true, Ordering::SeqCst);
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    *provider.readiness.lock().unwrap() = "UNKNOWN";
+    tokio::time::pause();
+    let probes = provider.readiness_probes.load(Ordering::SeqCst);
+    crate::sync_loop::planning::refresh_indexing_library_plans(
+        &mut service,
+        &libraries,
+        &config,
+        Some(db.as_ref()),
+        &mut states,
+        &mut context,
+    )
+    .await
+    .unwrap();
+    assert!(states[0].indexing_deferred);
+    let build = make_run_cycle_download_config_builder(&media, db.clone());
+    let other_zone = "SharedSync-TEST";
+    let other_cursor = "sync_token:SharedSync-TEST";
+    db.set_metadata(other_cursor, "other-before").await.unwrap();
+    let independent = make_run_cycle_library_state_with_album(
+        other_zone,
+        other_cursor,
+        make_captured_cycle_album(
+            other_zone,
+            indexing_capture(&db),
+            Box::new(
+                crate::test_helpers::DynamicRecentPhotosSession::new(0)
+                    .with_zone(other_zone)
+                    .with_token("other-after"),
+            ),
+        ),
+    );
+    let deferred = run_cycle(
+        &[&states[0], &independent],
+        &config,
+        Some(db.as_ref()),
+        &build,
+        download::DownloadControls::download_hidden(),
+        &shared,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.get_metadata(other_cursor).await.unwrap().as_deref(),
+        Some("other-after")
+    );
+    assert!(deferred.failed_count > 0);
+    assert!(!deferred.can_advance_database_checkpoint());
+    assert_eq!(provider.readiness_probes.load(Ordering::SeqCst), probes + 3);
+    assert_eq!(provider.queries.load(Ordering::SeqCst), 0);
+    assert!(provider.changes.lock().unwrap().is_empty());
+    assert_eq!(
+        db.get_metadata(CURSOR).await.unwrap().as_deref(),
+        Some("trusted-before")
+    );
+    tokio::time::resume();
+    *provider.readiness.lock().unwrap() = "RUNNING";
+    transition.store(true, Ordering::SeqCst);
     for round in 0..2 {
         crate::sync_loop::planning::refresh_indexing_library_plans(
             &mut service,

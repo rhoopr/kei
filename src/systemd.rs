@@ -40,6 +40,26 @@ impl SystemdNotifier {
         self.send_impl_ready();
     }
 
+    /// The worker is alive but cannot publish a plan until discovery finishes.
+    /// Keep Type=notify in its startup phase through the next watch wake.
+    pub(crate) fn extend_discovery_wait(self, seconds: u64) {
+        #[cfg(target_os = "linux")]
+        if self.enabled {
+            // The typed sd-notify field only fits ~71 minutes in microseconds.
+            // Use the protocol's 64-bit value for a full watch interval plus
+            // the service manager's usual 90-second startup allowance.
+            let micros = seconds.saturating_add(90).saturating_mul(1_000_000);
+            if let Err(error) = sd_notify::notify(&[
+                sd_notify::NotifyState::Custom(&format!("EXTEND_TIMEOUT_USEC={micros}")),
+                sd_notify::NotifyState::Status("Waiting for iCloud indexing readiness"),
+            ]) {
+                tracing::debug!(%error, "Could not extend discovery startup timeout");
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (self, seconds);
+    }
+
     /// Send `STOPPING=1` to systemd (service shutting down).
     pub(crate) fn notify_stopping(self) {
         if !self.enabled {

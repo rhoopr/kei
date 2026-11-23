@@ -427,7 +427,12 @@ impl PhotosService {
         .await
         .map_err(|error| {
             tracing::error!(zone = %zone_name, error = %error, "Failed to load library zone");
-            anyhow::anyhow!("Could not load iCloud Photos library zone {zone_name}: {error}")
+            let message = format!("Could not load iCloud Photos library zone {zone_name}: {error}");
+            if matches!(error, ICloudError::IndexingUnavailable(_)) {
+                anyhow::Error::new(error).context(message)
+            } else {
+                anyhow::anyhow!(message)
+            }
         })?;
         if library_type == "private" && zone_name == PRIMARY_ZONE_NAME {
             library.retain_provisional_readiness_from(&self.primary_library);
@@ -887,7 +892,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn primary_discovery_default_selection_does_not_initialize_unselected_private_libraries()
     {
         let session = UnrelatedIndexingSession {
@@ -1058,7 +1063,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn primary_discovery_selected_indexing_failure_does_not_publish_ownership() {
         for owner in ["_defaultOwner", "PRIVATE_OWNER_CANARY"] {
             let session = UnrelatedIndexingSession {
@@ -1100,7 +1105,7 @@ mod tests {
                     .is_qualified_private_primary()
             );
             assert_eq!(session.discovery.listings.lock().unwrap().len(), 1);
-            assert_eq!(session.indexing_requests.lock().unwrap().len(), 3);
+            assert_eq!(session.indexing_requests.lock().unwrap().len(), 5);
         }
     }
 
@@ -1382,7 +1387,7 @@ mod tests {
         assert_eq!(libs.len(), 2, "only photo libraries, got {names:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_fetch_libraries_fails_on_non_deleted_zone_initialization_failure() {
         let session = UnknownIndexSession {
             zone_response: json!({
