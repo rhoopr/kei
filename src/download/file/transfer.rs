@@ -28,6 +28,14 @@ use super::validation::{
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    /// Runs after link publication and before the temporary name is retired, so
+    /// a test can substitute that name while retirement is still pending.
+    pub(in crate::download) static PUBLICATION_RETIREMENT_HOOK: std::cell::Cell<Option<fn(&Path)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// HTTP response from a download request.
 pub(in crate::download) struct DownloadResponse {
     pub status: u16,
@@ -705,6 +713,14 @@ impl DownloadedFile {
         final_path: &Path,
         publication: FinalPublication,
     ) -> anyhow::Result<super::publication::PublicationOutcome> {
+        // The temporary name and its inode stay the retirement authority: the
+        // verified handle is released with `self.retained` before the name is
+        // removed, but this call keeps the parent capability and identity.
+        #[cfg(unix)]
+        let (retirement_temp, retirement_identity) = (
+            self.retained.path.sibling(self.retained.path.path())?,
+            file_identity(&self.retained.file)?,
+        );
         // ReplaceFileW opens its replacement without sharing data access.
         // Keep an attribute-only identity handle before releasing the reader or
         // writer, so Windows repair publication never has an unpinned interval.
@@ -736,6 +752,40 @@ impl DownloadedFile {
         .await??;
         let part_path = self.retained.path.path().to_path_buf();
         let (outcome, part) = publish_part_to_final(&part_path, final_path, publication).await?;
+        // A link publication leaves the verified temporary bytes under the same
+        // inode, so hash that retained handle before it is released. A rename
+        // publication leaves nothing to retire and needs no extra pass.
+        #[cfg(unix)]
+        let retirement = if part == super::PartName::Linked {
+            let retained = Arc::clone(&self.retained);
+            let expected = tokio::task::spawn_blocking(move || {
+                use std::io::Seek;
+                let mut file = retained.file.try_clone()?;
+                file.rewind()?;
+                Ok::<_, anyhow::Error>(
+                    fingerprint_open_file_snapshot_blocking(&mut file, retained.path.path())?
+                        .fingerprint,
+                )
+            })
+            .await??;
+            // `sibling` retains the verified parent capability, so cleanup never
+            // rewalks the configured root after `self.retained` is replaced.
+            let destination_link = final_confined.sibling(final_confined.path())?;
+            Some((
+                retirement_temp,
+                destination_link,
+                expected,
+                retirement_identity,
+            ))
+        } else {
+            None
+        };
+        #[cfg(all(test, target_os = "linux"))]
+        if part == super::PartName::Linked
+            && let Some(hook) = PUBLICATION_RETIREMENT_HOOK.take()
+        {
+            hook(&part_path);
+        }
         let retained = Arc::clone(&self.retained);
         self.retained = tokio::task::spawn_blocking(move || {
             let mut file = final_confined.open_regular()?;
@@ -767,10 +817,15 @@ impl DownloadedFile {
         .await??;
         // The verified handle on the `.part` was released when `retained` was
         // replaced, so retiring the name left by a link publication cannot
-        // make an NFS client keep it as `.nfsXXXX`.
+        // make an NFS client keep it as `.nfsXXXX`. Both names are verified
+        // against the retained identity and bytes; a substituted name is
+        // preserved and the cleanup failure is reported.
         #[cfg(unix)]
-        if part == super::PartName::Linked {
-            super::retire_linked_part(&part_path).await;
+        if let Some((temp, destination, expected, identity)) = retirement {
+            tokio::task::spawn_blocking(move || {
+                super::retire_published_temp_link(&temp, &destination, expected, identity)
+            })
+            .await??;
         }
         #[cfg(not(unix))]
         let _ = part;

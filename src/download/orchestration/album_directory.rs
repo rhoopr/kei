@@ -28,6 +28,85 @@ fn sidecar(path: &Path) -> PathBuf {
     path.into()
 }
 
+fn claim_for(op: &AlbumDirectoryOperation, path: &Path) -> Option<crate::fs_util::FileIdentity> {
+    op.claims
+        .iter()
+        .find(|claim| claim.path.to_path() == path)
+        .map(|claim| claim.identity)
+}
+
+/// A destination collision can only be recovered by replanning from the
+/// journal's recorded source. Cancel only while that source still holds its
+/// journaled identity. The occupied destination is never removed, so the next
+/// census may leave at most an orphaned empty name behind.
+async fn cancel_unmoved_collision(
+    capture: &crate::icloud::photos::inbox::ShadowCapture,
+    op: &AlbumDirectoryOperation,
+    root: &Path,
+) -> Result<()> {
+    primary_layout::verify_album_directory(root, &op.old.path.to_path(), op.old.identity).await?;
+    capture
+        .db
+        .cancel_unmoved_album_directory(
+            capture.owner.clone(),
+            op.operation.clone(),
+            op.old.identity,
+        )
+        .await?;
+    Ok(())
+}
+
+/// True when every user entry still sits at its journaled source identity, so
+/// the independent-file fallback has not moved any of them into the installed
+/// directory yet.
+async fn user_entries_unmoved(root: &Path, op: &AlbumDirectoryOperation) -> Result<bool> {
+    for entry in &op.user_entries {
+        let (root, path) = (root.to_owned(), entry.path.to_path());
+        let identity = tokio::task::spawn_blocking(move || {
+            ConfinedPath::open(&root, &path, ConfinedParents::Existing)
+                .and_then(|confined| confined.entry_identity())
+        })
+        .await?;
+        if identity.as_ref().ok() != Some(&entry.identity) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Move one journaled entry. A directory claim is recorded in the journal
+/// before the plain rename consumes it, so replay recognises its own claim.
+async fn move_entry(
+    capture: &crate::icloud::photos::inbox::ShadowCapture,
+    operation: &str,
+    root: &Path,
+    source: &Path,
+    destination: &Path,
+    identity: crate::fs_util::FileIdentity,
+    claim: Option<crate::fs_util::FileIdentity>,
+) -> Result<()> {
+    let mut claim = claim;
+    loop {
+        match primary_layout::move_album_entry(root, source, destination, identity, claim).await? {
+            primary_layout::AlbumMove::Moved => return Ok(()),
+            primary_layout::AlbumMove::Claimed(installed) => {
+                capture
+                    .db
+                    .record_album_directory_claim(
+                        capture.owner.clone(),
+                        operation.to_owned(),
+                        SelectionPath::from_path(destination),
+                        installed,
+                    )
+                    .await?;
+                #[cfg(all(test, target_os = "linux"))]
+                crate::test_helpers::process_death_point("album-directory-claim-recorded");
+                claim = Some(installed);
+            }
+        }
+    }
+}
+
 async fn create_directory(root: PathBuf, path: PathBuf) -> Result<crate::fs_util::FileIdentity> {
     tokio::task::spawn_blocking(move || {
         let entry = ConfinedPath::open(&root, &path, ConfinedParents::Create)?;
@@ -329,6 +408,7 @@ pub(super) async fn prepare(
                 staged_directory: None,
                 directories: Vec::new(),
                 user_entries: Vec::new(),
+                claims: Vec::new(),
             };
             let sources = capture
                 .db
@@ -446,15 +526,32 @@ pub(super) async fn prepare(
                 .context("Missing external album confinement")?
                 .root
                 .to_path();
-            // Retain the journal on collisions: earlier routes may already have landed.
-            for route in &op.directories {
-                primary_layout::rename_album_directory(
+            // Once a route has landed the journal is moved and must be
+            // retained; only a collision before the first route can still be
+            // replanned from the unmoved anchor.
+            for (index, route) in op.directories.iter().enumerate() {
+                let moved = move_entry(
+                    &capture,
+                    &op.operation,
                     &route_root,
                     &route.staged.to_path(),
                     &route.next.to_path(),
                     route.identity,
+                    claim_for(&op, &route.next.to_path()),
                 )
-                .await?;
+                .await;
+                if let Err(error) = moved {
+                    if index == 0 && is_directory_collision(&error) {
+                        primary_layout::verify_album_directory(
+                            &route_root,
+                            &route.staged.to_path(),
+                            route.identity,
+                        )
+                        .await?;
+                        cancel_unmoved_collision(&capture, &op, &root).await?;
+                    }
+                    return Err(error);
+                }
                 #[cfg(all(test, target_os = "linux"))]
                 crate::test_helpers::process_death_point("album-additional-directory-published");
             }
@@ -463,11 +560,14 @@ pub(super) async fn prepare(
             primary_layout::verify_album_directory(&root, &op.old.path.to_path(), op.old.identity)
                 .await?;
             if let Some(staged) = &op.staged_directory {
-                let installed = primary_layout::rename_album_directory(
+                let installed = move_entry(
+                    &capture,
+                    &op.operation,
                     &root,
                     &staged.to_path(),
                     &op.next.path.to_path(),
                     op.next.identity,
+                    claim_for(&op, &op.next.path.to_path()),
                 )
                 .await;
                 if let Err(error) = installed {
@@ -505,7 +605,28 @@ pub(super) async fn prepare(
             // as replacement authority after this census.
             for entry in &op.user_entries {
                 let next = relocated_path(&op, &entry.path)?.to_path();
-                primary_layout::move_album_user_entry(&root, entry, &next).await?;
+                let moved = move_entry(
+                    &capture,
+                    &op.operation,
+                    &root,
+                    &entry.path.to_path(),
+                    &next,
+                    entry.identity,
+                    claim_for(&op, &next),
+                )
+                .await;
+                if let Err(error) = moved {
+                    // Cancel only while every entry is still at its source and
+                    // no routed destination has landed, so no user tree is
+                    // stranded in the installed directory.
+                    if is_directory_collision(&error)
+                        && op.directories.is_empty()
+                        && user_entries_unmoved(&root, &op).await?
+                    {
+                        cancel_unmoved_collision(&capture, &op, &root).await?;
+                    }
+                    return Err(error);
+                }
             }
             #[cfg(all(test, target_os = "linux"))]
             crate::test_helpers::process_death_point("album-files-copied");
@@ -544,11 +665,14 @@ pub(super) async fn prepare(
                 }
             }
         }
-        let moved = primary_layout::rename_album_directory(
+        let moved = move_entry(
+            &capture,
+            &op.operation,
             &root,
             &op.old.path.to_path(),
             &op.next.path.to_path(),
             op.old.identity,
+            claim_for(&op, &op.next.path.to_path()),
         )
         .await;
         if let Err(error) = moved {
@@ -584,13 +708,27 @@ pub(super) async fn prepare(
                 || primary_layout::snapshot(&root, &sidecar(&file.next.to_path())).await?
                     != file.sidecar
             {
-                primary_layout::rename_album_directory(
+                let restored = move_entry(
+                    &capture,
+                    &op.operation,
                     &root,
                     &op.next.path.to_path(),
                     &op.old.path.to_path(),
                     op.old.identity,
+                    claim_for(&op, &op.old.path.to_path()),
                 )
-                .await?;
+                .await;
+                if let Err(error) = restored {
+                    if is_directory_collision(&error) {
+                        // The album already moved, so this journal is not
+                        // unmoved and cannot be cancelled. Preserve the
+                        // occupied name and retain the recorded transition.
+                        anyhow::bail!(
+                            "Album media changed during movement and its source name is occupied; recorded transition retained: {error}"
+                        );
+                    }
+                    return Err(error);
+                }
                 capture
                     .db
                     .cancel_unmoved_album_directory(
@@ -840,6 +978,7 @@ async fn prepare_projection(
             staged_directory: None,
             directories: Vec::new(),
             user_entries: Vec::new(),
+            claims: Vec::new(),
         };
         let sources = capture
             .db
@@ -879,11 +1018,14 @@ async fn prepare_projection(
     crate::test_helpers::process_death_point("album-projection-planned");
     for (index, route) in op.directories.iter().enumerate() {
         anyhow::ensure!(!cancel.is_cancelled(), "Album projection interrupted");
-        let moved = primary_layout::rename_album_directory(
+        let moved = move_entry(
+            &capture,
+            &op.operation,
             &root,
             &route.staged.to_path(),
             &route.next.to_path(),
             route.identity,
+            claim_for(&op, &route.next.to_path()),
         )
         .await;
         if let Err(error) = moved {
@@ -897,11 +1039,14 @@ async fn prepare_projection(
                 // No media publication starts before every routed directory is
                 // installed. Restore only the previously installed identities.
                 for previous in op.directories.iter().take(index).rev() {
-                    primary_layout::rename_album_directory(
+                    move_entry(
+                        &capture,
+                        &op.operation,
                         &root,
                         &previous.next.to_path(),
                         &previous.staged.to_path(),
                         previous.identity,
+                        claim_for(&op, &previous.staged.to_path()),
                     )
                     .await?;
                 }

@@ -303,22 +303,32 @@ NFS rejects `RENAME_NOREPLACE`, so no-overwrite publication links the verified
 publication with an error that names hard-link support and keeps the `.part`
 file. Unlinking a file whose descriptor is still open leaves an NFS `.nfsXXXX`
 link and a second link count, so the owner closes every handle it holds before
-unlinking a temporary name. The hard-link refusal is unchanged.
+unlinking a temporary name. Retirement keeps the temporary name's confined
+parent, identity and verified bytes, checks both names against them, preserves a
+substituted entry and reports the failed cleanup. The hard-link refusal is
+unchanged.
 
-Alias retirement moves a managed primary into a private slot with a plain
-rename when `RENAME_NOREPLACE` is unsupported. The slot is a private name kei
-created and has never used.
+Alias retirement moves a managed primary into a private slot. Where the
+filesystem accepts `RENAME_NOREPLACE` that rename already refuses an occupied
+slot; otherwise the owner claims the slot with an exclusive hard link from the
+source and removes the source only after verifying the slot holds that entry.
 
 Moves between public names, including album directory transitions, user-entry
 moves and their restores, keep the no-replace rename where the filesystem
 supports it. NFS rejects that flag, so the owner falls back by entry type. A
-directory claims the destination with an exclusive empty directory that only
-its own plain rename may replace; a failed rename removes that claim only while
-it still has the identity the claim created. A regular file is hard-linked to
-the destination, and the source name is removed only after the destination is
-verified to hold that same identity. A foreign writer that replaces the
-destination between the link and the removal therefore keeps the moved bytes
-under its own name instead of losing them.
+directory claims the destination with an exclusive empty directory, and the
+album-directory journal records that claim's identity before the plain rename
+replaces it. Replay recognises a destination that is an empty directory with
+the recorded identity as its own claim; an entry with any other identity is
+preserved and the move refuses, so the fallback never renames over a destination
+its record does not name. A regular file is hard-linked to the destination, and
+the source name is removed only after the destination is verified to hold that
+same identity. A second private link, at a name this call alone creates, keeps
+the bytes reachable while both names are proved and is removed only after those
+checks pass. A resumed move treats an existing destination link with the
+source's identity as its own earlier link and continues. A foreign writer that
+replaces the destination between the link and the removal therefore keeps the
+moved bytes under its own name instead of losing them.
 
 ## Destination reconciliation
 
@@ -520,9 +530,9 @@ The existing layout operation and member tables store `album-directory-v1` heade
 
 Recovery checks stable authenticated container identity before its unchanged-name shortcut. If the provider renames the container again during interruption, including back to its original name, preparation finishes the recorded transition before processing the latest name and template. It does not require discovery to reproduce the intermediate name.
 
-An anchored binding remembers additional templates and their confined download root when future files can land outside its original directory. Rename planning combines the anchor census with exact selected external copies. External parent routes reuse the existing operation and member journal and force independent-file fallback. All destination directories are installed before eligible anchor user entries move. External user trees remain in place. Pending route collisions retain the journal; recovery does not cancel only the anchor after another destination has landed. Nested destination routes that leaf collision suffixes cannot separate fail before publication.
+An anchored binding remembers additional templates and their confined download root when future files can land outside its original directory. Rename planning combines the anchor census with exact selected external copies. External parent routes reuse the existing operation and member journal and force independent-file fallback. All destination directories are installed before eligible anchor user entries move. External user trees remain in place. A route or user-entry collision cancels only an unmoved journal: the source identity is verified first, so the next census replans at a fresh ordinal and the occupied destination is preserved. Once another destination has landed, recovery retains the journal and never cancels only the anchor. Nested destination routes that leaf collision suffixes cannot separate fail before publication.
 
-Replay rechecks managed bytes before moving a planned source. Local edits cancel the unmoved intent so the next census selects independent-file fallback. A byte mismatch found after movement restores the source without replacement before cancellation. The source census uses validated current native publication or current managed claims. Historical path receipts cannot supply ownership or veto current work.
+Replay rechecks managed bytes before moving a planned source. Local edits cancel the unmoved intent so the next census selects independent-file fallback. A byte mismatch found after movement restores the source without replacement before cancellation; an occupied source name refuses the restore and retains the journal. The source census uses validated current native publication or current managed claims. Historical path receipts cannot supply ownership or veto current work.
 
 Independent-file fallback creates its empty directory at a private operation-specific staging path, then journals that identity before publishing the final directory name without replacement. A crash before journaling can leave an unclaimed staging directory, but does not occupy the selected destination or grow its collision suffix. Replay after journaling recognizes the staged or installed identity. Foreign final-directory arrivals cancel only a still-unmoved staging intent and retain the original source.
 

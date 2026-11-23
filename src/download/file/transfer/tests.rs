@@ -506,6 +506,40 @@ async fn nfs_download_never_exposes_a_silly_renamed_part() {
     );
 }
 
+/// A temporary name substituted after publication must be preserved, and the
+/// failed cleanup must surface instead of a warning that leaves it behind.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn link_fallback_preserves_a_substituted_temporary_name() {
+    let dir = TempDir::new().unwrap();
+    let _fallback = super::super::platform::ForcedLinkFallback::new(dir.path());
+    let jpeg_body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+    let client = StubDownloadClient::ok(&jpeg_body);
+    let download_path = dir.path().join("substituted.jpg");
+    let part_path = dir.path().join("substituted.part");
+    super::PUBLICATION_RETIREMENT_HOOK.set(Some(|part: &Path| {
+        std::fs::remove_file(part).unwrap();
+        std::fs::write(part, b"foreign replacement").unwrap();
+    }));
+    let result = attempt_download(
+        &client,
+        "http://stub",
+        &download_path,
+        &part_path,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a substituted temporary name must not be retired"
+    );
+    assert_eq!(std::fs::read(&part_path).unwrap(), b"foreign replacement");
+    assert_eq!(std::fs::read(&download_path).unwrap(), jpeg_body);
+}
+
 #[tokio::test]
 async fn attempt_download_skip_rename_leaves_part_file() {
     let jpeg_body = [0xFF, 0xD8, 0xFF, 0xE0];

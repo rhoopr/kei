@@ -2744,6 +2744,218 @@ async fn kill_album_child(root: &std::path::Path, point: &str) {
     assert_eq!(child.wait().unwrap().signal(), Some(9));
 }
 
+/// A death between the claim's journal record and the rename that consumes it
+/// must resume through the recorded identity instead of colliding.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn album_directory_nfs_claim_process_death_resumes_its_recorded_claim() {
+    let Some(root) = crate::test_helpers::nfs_test_dir("album_directory_claim_death") else {
+        return;
+    };
+    let server = server().await;
+    let provider = records(&server, None);
+    cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        album_directory_options("Old"),
+    )
+    .await;
+    std::fs::write(
+        root.path().join("fixture-owner"),
+        b"kei-synthetic-process-death",
+    )
+    .unwrap();
+    kill_album_child(root.path(), "album-directory-claim-recorded").await;
+    assert!(
+        root.path().join("media/New").is_dir(),
+        "the interrupted fallback left its claim at the destination"
+    );
+    assert_eq!(
+        std::fs::read_dir(root.path().join("media/New"))
+            .unwrap()
+            .count(),
+        0
+    );
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let header: Vec<u8> = conn
+        .query_row(
+            "SELECT header FROM primary_layout_operations WHERE policy='album-directory-v1' AND phase='publishing'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    let op: crate::state::db::primary_layout::directory::AlbumDirectoryOperation =
+        serde_json::from_slice(&header).unwrap();
+    assert_eq!(
+        op.claims.len(),
+        1,
+        "this death seam is reachable only after the claim is journaled"
+    );
+    let claim_path = root.path().join("media/New");
+    assert_eq!(op.claims[0].path.to_path(), claim_path);
+    let installed = crate::fs_util::ConfinedPath::open(
+        root.path(),
+        &claim_path,
+        crate::fs_util::ConfinedParents::Existing,
+    )
+    .unwrap()
+    .entry_identity()
+    .unwrap();
+    assert_eq!(
+        op.claims[0].identity, installed,
+        "the journal records the installed claim's identity"
+    );
+    assert_bytes(&root.path().join("media/Old/IMG_0501.JPG"), ORIGINAL);
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            quiet,
+            EditedNaming::Primary,
+            album_directory_options("New"),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert_bytes(&root.path().join("media/New/IMG_0501.JPG"), ORIGINAL);
+        assert!(!root.path().join("media/Old").exists());
+        assert!(!root.path().join("media/New (1)").exists());
+    }
+}
+
+/// A foreign empty directory that replaced the recorded claim is preserved and
+/// the move refuses instead of renaming over it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn album_directory_nfs_claim_process_death_preserves_a_substituted_directory() {
+    let Some(root) = crate::test_helpers::nfs_test_dir("album_directory_claim_substituted") else {
+        return;
+    };
+    let server = server().await;
+    let provider = records(&server, None);
+    cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        album_directory_options("Old"),
+    )
+    .await;
+    std::fs::write(
+        root.path().join("fixture-owner"),
+        b"kei-synthetic-process-death",
+    )
+    .unwrap();
+    kill_album_child(root.path(), "album-directory-claim-recorded").await;
+    let foreign = root.path().join("media/foreign-claim");
+    std::fs::create_dir(&foreign).unwrap();
+    std::fs::rename(&foreign, root.path().join("media/New")).unwrap();
+    let result = try_cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        album_directory_options("New"),
+    )
+    .await;
+    assert!(result.is_err(), "a substituted claim must refuse the move");
+    assert!(root.path().join("media/New").is_dir());
+    assert_eq!(
+        std::fs::read_dir(root.path().join("media/New"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_bytes(&root.path().join("media/Old/IMG_0501.JPG"), ORIGINAL);
+}
+
+/// A destination claim that no journal record names must not wedge the
+/// transition. A collision before any user entry moved cancels the unmoved
+/// journal, so the next census replans at a fresh ordinal.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn album_directory_unrecorded_claim_cancels_the_unmoved_user_entry_transition() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let provider = records(&server, None);
+    cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        album_directory_options("Old"),
+    )
+    .await;
+    std::fs::write(
+        root.path().join("fixture-owner"),
+        b"kei-synthetic-process-death",
+    )
+    .unwrap();
+    std::fs::write(media.join("Old/IMG_0501.JPG"), b"local edit").unwrap();
+    std::fs::create_dir(media.join("Old/user")).unwrap();
+    std::fs::write(media.join("Old/user/note.txt"), b"user notes").unwrap();
+    kill_album_child(root.path(), "album-directory-planned").await;
+    let staged = std::fs::read_dir(&media)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".kei-album-stage-"))
+        })
+        .expect("the independent-file fallback staged its directory");
+    // A death between the claim's mkdir and its journal record leaves this
+    // empty name at a user entry's destination with no recorded identity.
+    std::fs::create_dir(staged.join("user")).unwrap();
+    let refused = try_cycle_options(
+        root.path(),
+        provider.clone(),
+        false,
+        EditedNaming::Primary,
+        album_directory_options("New"),
+    )
+    .await;
+    assert!(refused.is_err(), "the unrecorded claim refuses the move");
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_operations WHERE policy='album-directory-v1' AND phase='cancelled'"
+        ),
+        1,
+        "a collision before any user entry moved must cancel its journal"
+    );
+    assert_bytes(&media.join("Old/user/note.txt"), b"user notes");
+    for quiet in [false, true, true] {
+        let (result, _) = cycle_options(
+            root.path(),
+            provider.clone(),
+            quiet,
+            EditedNaming::Primary,
+            album_directory_options("New"),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+        assert_bytes(&media.join("Old/IMG_0501.JPG"), b"local edit");
+        assert_bytes(&media.join("New (1)/IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(&media.join("New (1)/user/note.txt"), b"user notes");
+        assert_eq!(
+            std::fs::read_dir(media.join("New/user")).unwrap().count(),
+            0,
+            "the occupied destination is preserved, never removed"
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations WHERE policy='album-directory-v1' AND phase NOT IN ('committed','cancelled')"
+            ),
+            0
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn album_directory_projection_reopens_partial_routing_and_late_collision() {

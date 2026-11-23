@@ -38,8 +38,6 @@ pub(super) use fingerprint::{fingerprint_downloaded_path, fingerprint_regular_fi
 #[cfg(all(test, feature = "xmp", target_os = "linux"))]
 pub(super) use platform::RECONCILIATION_RENAME_FAULT;
 pub(super) use publication::PublicationOutcome;
-#[cfg(all(feature = "xmp", target_os = "linux"))]
-pub(super) use replacement_recovery::finish_owned_prepared_link;
 
 /// Inspect confined regular bytes for an explicit integrity confirmation.
 pub(crate) async fn inspect_integrity_fingerprint(
@@ -131,24 +129,52 @@ pub(super) fn cleanup_prepared_sidecar(
 
 #[cfg(all(test, target_os = "linux"))]
 pub(super) use platform::ForcedLinkFallback;
-#[cfg(unix)]
-pub(super) use platform::retire_linked_part;
 
 /// Retire the temporary name that link-based no-replace publication leaves
 /// behind, once both names are verified as one inode with the expected bytes.
 /// Rename-based publication leaves nothing to retire. Close every handle on
 /// `temp` first: unlinking an open file leaves an NFS `.nfsXXXX` link behind.
+/// A substituted name is preserved and reported rather than deleted. Directory
+/// durability stays with the caller that owns that contract.
 pub(super) fn retire_published_temp_link(
     temp: &crate::fs_util::ConfinedPath,
     destination: &crate::fs_util::ConfinedPath,
     expected: ExistingFileFingerprint,
     identity: crate::fs_util::FileIdentity,
 ) -> anyhow::Result<()> {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        replacement_recovery::finish_owned_prepared_link(temp, destination, expected, identity)
+        use std::io::Seek;
+
+        // A rename publication leaves no temporary name, so there is no link to
+        // retire and nothing to verify.
+        if !temp.entry_exists()? {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            temp.retained_entry_identity()? == identity
+                && destination.retained_entry_identity()? == identity,
+            "Published temporary name changed; retaining both entries"
+        );
+        let mut file = temp.open_regular()?;
+        anyhow::ensure!(
+            crate::fs_util::file_link_count(&file)? == 2,
+            "Published temporary entry has an unexpected link count; retaining both entries"
+        );
+        file.rewind()?;
+        anyhow::ensure!(
+            fingerprint_open_file_snapshot_blocking(&mut file, temp.path())?.fingerprint
+                == expected,
+            "Published temporary bytes changed; retaining both entries"
+        );
+        // Release the handle before unlinking: NFS keeps an open-unlinked file
+        // as `.nfsXXXX`, which would leave a stray second link on the published
+        // file.
+        drop(file);
+        temp.remove_verified(identity, crate::fs_util::RemovalKind::File)?;
+        Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         let _ = (temp, destination, expected, identity);
         Ok(())

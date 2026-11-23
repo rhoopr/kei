@@ -468,9 +468,18 @@ mod tests {
                 assert_eq!(fs::read(sidecar).unwrap(), b"competing packet");
                 continue;
             }
-            result.unwrap().validate_blocking().unwrap();
+            if matches!(race, Race::Temporary) {
+                // The substituted temporary name keeps its foreign bytes and the
+                // failed cleanup is reported instead of silently accepted.
+                assert!(
+                    result.is_err(),
+                    "a substituted temporary name must be reported"
+                );
+            } else {
+                result.unwrap().validate_blocking().unwrap();
+                assert_eq!(fs::metadata(&sidecar).unwrap().nlink(), 1);
+            }
             assert_eq!(fs::read(&sidecar).unwrap(), PACKET);
-            assert_eq!(fs::metadata(sidecar).unwrap().nlink(), 1);
             let temps: Vec<_> = fs::read_dir(root.path())
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
