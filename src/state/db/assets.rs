@@ -364,10 +364,8 @@ impl SqliteStateDb {
         destination: Option<&Path>,
         error: &str,
     ) -> Result<(), StateError> {
-        let destination = destination.and_then(Path::to_str).map(str::to_owned);
         let destination_key = destination
-            .as_deref()
-            .map(|s| super::provider_selection::SelectionPath::from_path(Path::new(s)).key())
+            .map(|path| super::provider_selection::SelectionPath::from_path(path).key())
             .transpose()?;
         let library = library.to_owned();
         let id = id.to_owned();
@@ -378,12 +376,13 @@ impl SqliteStateDb {
             let rows = conn
                 .execute(
                     "UPDATE assets SET status = CASE WHEN status='downloaded' AND imported_size IS NOT NULL \
-                       AND local_path <> ?5 AND EXISTS (SELECT 1 FROM provider_active_destinations d \
+                       AND EXISTS (SELECT 1 FROM provider_active_destinations d \
                          WHERE d.library=assets.library AND d.asset_id=assets.id AND d.version_size=assets.version_size \
-                           AND d.checksum=assets.checksum AND d.path=?6 AND d.admitted=1 AND d.verified_media=0) \
+                           AND d.checksum=assets.checksum AND d.path=?5 AND d.admitted=1 AND d.verified_media=0 \
+                           AND assets.local_path <> d.compat_path) \
                        THEN status ELSE 'failed' END, download_attempts = download_attempts + 1, \
                      last_error = ?1 WHERE library = ?2 AND id = ?3 AND version_size = ?4",
-                    rusqlite::params![&error, &library, &id, &version_size, destination, destination_key],
+                    rusqlite::params![&error, &library, &id, &version_size, destination_key],
                 )
                 .map_err(|e| StateError::query("mark_failed", e))?;
 
