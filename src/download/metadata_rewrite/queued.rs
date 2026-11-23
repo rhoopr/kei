@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(all(test, unix, feature = "xmp"))]
 tokio::task_local! {
-    pub(in crate::download) static BEFORE_SIDECAR_RECEIPT: fn(&std::path::Path);
+    pub(in crate::download) static BEFORE_SIDECAR_RECEIPT: Box<dyn Fn(&std::path::Path)>;
 }
 
 /// Persist a metadata-rewrite marker for each candidate version whose
@@ -911,9 +911,11 @@ async fn write_rows<D: MembershipStore + MetadataRewriteStore + ?Sized>(
                 && let Some(before) = certified_input
                 && let Some(packet) = sidecar.output
             {
-                // The retained input is checked inside the final transaction.
-                // Otherwise we still need the second full hash.
-                if pinned.is_some()
+                #[cfg(all(test, unix))]
+                let _ = BEFORE_SIDECAR_RECEIPT.try_with(|edit| edit(&path));
+                // Only the Windows handle excludes writes. On Unix a shared
+                // mapping can change bytes without advancing the inode's ctime.
+                if (cfg!(windows) && pinned.is_some())
                     || crate::download::file::fingerprint_regular_file(&path)
                         .await
                         .ok()
@@ -1024,8 +1026,6 @@ async fn write_rows<D: MembershipStore + MetadataRewriteStore + ?Sized>(
             let retained_input = pinned.is_some();
             let finished =
                 if let (Some(snapshot), WriterPhase::AfterSync { db, .. }) = (pinned, phase) {
-                    #[cfg(all(test, unix, feature = "xmp"))]
-                    let _ = BEFORE_SIDECAR_RECEIPT.try_with(|edit| edit(&path));
                     db.finish_metadata_rewrite_checked(
                         &pending_for_finish,
                         selected_queue,

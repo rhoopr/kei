@@ -7,6 +7,8 @@ Rust source. Test modules, `tests/`, plain-text mentions of "unsafe", Cargo
 lint settings, and dependency lockfile entries are not counted. There are no
 `unsafe fn`, `unsafe impl`, or raw `extern` declarations in production code.
 
+The Linux sidecar receipt regression uses a one-byte shared mapping of its private fixture to exercise edits that do not advance ctime. The test keeps the file nonempty and the mapping writable until its guard unmaps it.
+
 ## Production code
 
 | Location | Usage | Justification | Removal assessment |
