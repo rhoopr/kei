@@ -38,6 +38,14 @@ fn link_fallback_forced(path: &Path) -> bool {
         .any(|root| path.starts_with(root))
 }
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    /// Runs after the fallback verified the destination link and before it
+    /// removes the source name, so a test can substitute that destination.
+    static MOVE_DESTINATION_LINKED_HOOK: std::cell::Cell<Option<fn(&Path)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Makes no-replace publication under `root` behave as on a filesystem that
 /// rejects `RENAME_NOREPLACE` (NFS) until dropped. Scoped to a path so parallel
 /// tests and blocking-pool threads are unaffected.
@@ -243,6 +251,10 @@ fn move_linked_file_confined(
             "Move destination no longer holds the moved entry; recovery copy retained at {}",
             recovery.path().display()
         )));
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(hook) = MOVE_DESTINATION_LINKED_HOOK.with(std::cell::Cell::take) {
+        hook(destination.path());
     }
     source.remove_verified(identity, RemovalKind::File)?;
     if destination.retained_entry_identity()? != identity {
@@ -818,6 +830,57 @@ mod linux_tests {
             std::fs::read_dir(&moved).unwrap().count(),
             1,
             "the resumed move leaves exactly one name"
+        );
+    }
+
+    /// A foreign writer that replaces the destination after the fallback proved
+    /// it keeps the moved bytes under the recovery name the error reports.
+    #[test]
+    fn move_preserves_a_substituted_destination_under_its_recovery_name() {
+        let root = tempfile::tempdir().unwrap();
+        let album = root.path().join("album");
+        let moved = root.path().join("moved");
+        std::fs::create_dir(&album).unwrap();
+        std::fs::create_dir(&moved).unwrap();
+        std::fs::write(album.join("note.txt"), b"user bytes").unwrap();
+        let _fallback = ForcedLinkFallback::new(root.path());
+        super::MOVE_DESTINATION_LINKED_HOOK.with(|hook| {
+            hook.set(Some(|destination: &Path| {
+                std::fs::remove_file(destination).unwrap();
+                std::fs::write(destination, b"foreign bytes").unwrap();
+            }))
+        });
+
+        let error = move_noreplace_confined(
+            &open(root.path(), &album.join("note.txt")),
+            &open(root.path(), &moved.join("note.txt")),
+        )
+        .expect_err("a substituted destination refuses the move");
+
+        let message = format!("{error}");
+        assert!(message.contains("recovery copy retained at"), "{message}");
+        assert!(
+            !album.join("note.txt").exists(),
+            "the source name was retired"
+        );
+        assert_eq!(
+            std::fs::read(moved.join("note.txt")).unwrap(),
+            b"foreign bytes",
+            "the substituted destination keeps its own bytes"
+        );
+        let recovery = message
+            .split("recovery copy retained at ")
+            .nth(1)
+            .expect("the error names the retained copy");
+        assert_eq!(
+            std::fs::read(recovery.trim()).unwrap(),
+            b"user bytes",
+            "the moved bytes survive under the recovery name"
+        );
+        assert_eq!(
+            std::fs::read_dir(&moved).unwrap().count(),
+            2,
+            "the substituted name and the recovery copy are both kept"
         );
     }
 }
