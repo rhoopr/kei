@@ -125,6 +125,58 @@ def check_release(errors: list[str]) -> None:
         if needle not in text:
             errors.append(f"release.yml: Homebrew updater missing checksum guard: {needle}")
 
+    attestation_action = (
+        "actions/attest-build-provenance@"
+        "977bb373ede98d70efdf65b84cb5f73e068dcc2a"
+    )
+    if text.count(attestation_action) != 3:
+        errors.append(
+            "release.yml: the archive and tag-time container jobs must pin the "
+            "build-provenance attestation action"
+        )
+    checksums = text.find("sha256sum -- *.tar.gz *.zip > SHA256SUMS.txt")
+    archive_attestation = text.find("subject-path: |")
+    upload = text.find("- name: Upload release assets")
+    if not 0 <= checksums < archive_attestation < upload:
+        errors.append(
+            "release.yml: archive attestation must run after checksums and before upload"
+        )
+    for needle in (
+        "candidate/*.tar.gz",
+        "candidate/*.zip",
+        "candidate/SHA256SUMS.txt",
+        'docker buildx imagetools inspect "$image:$version-$arch" --format \'{{json .Manifest}}\'',
+        "jq -r .digest",
+        "subject-name: ghcr.io/${{ github.repository }}",
+        "subject-digest: ${{ steps.publish.outputs.amd64 }}",
+        "subject-digest: ${{ steps.publish.outputs.arm64 }}",
+        "push-to-registry: true",
+    ):
+        if needle not in text:
+            errors.append(f"release.yml: missing release provenance guard: {needle}")
+    for permission in ("id-token: write", "attestations: write"):
+        if text.count(permission) != 2:
+            errors.append(
+                "release.yml: the tag-time release and containers jobs "
+                f"must grant {permission}"
+            )
+    if text.count("subject-path: |") != 1:
+        errors.append(
+            "release.yml: archive attestation must use subject-path for the released files"
+        )
+    if text.count("subject-digest: ${{ steps.publish.outputs.amd64 }}") != 1:
+        errors.append(
+            "release.yml: the tag-time containers job must attest the amd64 digest"
+        )
+    if text.count("subject-digest: ${{ steps.publish.outputs.arm64 }}") != 1:
+        errors.append(
+            "release.yml: the tag-time containers job must attest the arm64 digest"
+        )
+    if text.count("push-to-registry: true") != 2:
+        errors.append(
+            "release.yml: each tag-time container attestation must push to the registry"
+        )
+
 
 def check_rust_ci(errors: list[str]) -> None:
     text = workflow_text("checks.yml")
@@ -133,8 +185,12 @@ def check_rust_ci(errors: list[str]) -> None:
         "run: python3 scripts/check-contracts",
         "LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}",
         "if: inputs.heavy",
-        "      - coverage-head\n",
         "HEAVY: ${{ inputs.heavy }}",
+        "\n  machete:\n",
+        "name: Unused dependencies (machete)",
+        "tool: cargo-machete",
+        "run: cargo machete",
+        "\n      - machete\n",
     ):
         if needle not in text:
             errors.append(f"checks.yml: missing required routing/gate guard: {needle}")
@@ -145,8 +201,8 @@ def check_qualification(errors: list[str]) -> None:
         "pr.yml": ["needs: [quality, clippy, smoke]", "if: always()", "name: CI",
                    "python3 scripts/ci/gate.py quality clippy smoke",
                    "KEI_ROUNDTRIP_BASE: ${{ github.event.pull_request.base.sha }}"],
-        "ci.yml": ["if: github.event_name == 'push'", "if: github.event_name == 'workflow_dispatch'",
-                   "uses: ./.github/workflows/qualification.yml"],
+        "ci.yml": ["  push:\n    branches: [main]", "  workflow_dispatch:",
+                   "uses: ./.github/workflows/checks.yml"],
         "qualification.yml": ["needs: [quality, artifacts, service, specialized]",
                               "python3 scripts/ci/gate.py quality artifacts service specialized",
                               "cargo fetch --locked\n          just test packaging",
@@ -162,6 +218,10 @@ def check_qualification(errors: list[str]) -> None:
         for marker in markers:
             if marker not in text:
                 errors.append(f"{name}: missing qualification guard: {marker}")
+    if "uses: ./.github/workflows/qualification.yml" in workflow_text("ci.yml"):
+        errors.append("ci.yml: manual dispatch must call checks.yml, not qualification.yml")
+    if re.search(r"(?m)^\s*schedule\s*:", workflow_text("qualification.yml")):
+        errors.append("qualification.yml: heavy qualification must not run on a schedule")
     for name in ("pr.yml", "ci.yml", "checks.yml", "qualification.yml", "artifacts.yml",
                  "nightly.yml", "nightly-health.yml", "daily-wiki.yml"):
         text = workflow_text(name)
@@ -175,13 +235,6 @@ def check_service_smoke(errors: list[str]) -> None:
         errors.append("service-smoke.yml: cancel obsolete runs without cancelling another caller")
     if "  workflow_call:" not in text or "  pull_request:" in text:
         errors.append("service-smoke.yml: service smoke must be reusable only; CI owns routing")
-
-
-def check_coverage_comment(errors: list[str]) -> None:
-    text = workflow_text("coverage-comment.yml")
-    for needle in ("Validate coverage comment artifact", "gt 60000", "@<!-- -->"):
-        if needle not in text:
-            errors.append(f"coverage-comment.yml: missing artifact hardening marker: {needle}")
 
 
 def check_windows_stack_link_arg(errors: list[str]) -> None:
@@ -202,7 +255,6 @@ def main() -> int:
     check_rust_ci(errors)
     check_qualification(errors)
     check_service_smoke(errors)
-    check_coverage_comment(errors)
     check_windows_stack_link_arg(errors)
 
     if errors:

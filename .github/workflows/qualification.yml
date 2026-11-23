@@ -3,8 +3,6 @@ name: Heavy qualification
 on:
   workflow_call:
   workflow_dispatch:
-  schedule:
-    - cron: "23 3 * * 0"
 
 permissions:
   contents: read
@@ -27,8 +25,10 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: -Dwarnings
+      FUZZ_MAX_TOTAL_TIME: "180"
+      FUZZ_TIMEOUT: "10"
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -67,7 +67,7 @@ jobs:
     needs: [quality, artifacts, service, specialized]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
       - name: Require every qualification result

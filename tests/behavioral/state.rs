@@ -27,7 +27,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` in support to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 45;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 49;
     let production_schema = include_str!("../../src/state/schema.rs");
     assert!(
         production_schema.contains(&format!(
@@ -112,8 +112,18 @@ fn verify_all_files_present() {
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Verified:  1"), "stdout: {stdout}");
-    assert!(stdout.contains("Missing:   0"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Present, not checksum-verified: 1"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Missing:                        0"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Checksums were not compared"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -146,6 +156,11 @@ fn verify_detects_missing_file() {
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("MISSING"), "stdout: {stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("reconcile --inspect-path PATH"),
+        "repair hint should name the existing command: {stderr}"
+    );
 }
 
 #[test]
@@ -181,7 +196,26 @@ fn verify_checksums_match() {
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Verified:  1"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Checksum verified:              1"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Present, no checksum recorded:  0"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Different checksum:             0"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Unreadable:                     0"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Missing:                        0"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -220,8 +254,16 @@ fn verify_checksums_mismatch() {
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("Different or unreadable: 1"),
+        stdout.contains("Different checksum:             1"),
         "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Unreadable:                     0"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Checksum verified:              1"),
+        "a different file must not be reported as checksum verified: {stdout}"
     );
 }
 
@@ -266,6 +308,112 @@ fn verify_checksums_mismatch_emits_asset_id_in_output() {
             .lines()
             .any(|line| line.starts_with("DIFFERENT:") && line.contains(asset_id)),
         "expected asset id {asset_id} on the DIFFERENT line, stdout: {stdout}"
+    );
+}
+
+#[test]
+fn verify_checksums_reports_unreadable_separately_from_different() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    let different_path = dir.path().join("different.jpg");
+    std::fs::write(&different_path, b"edited bytes").unwrap();
+    let unreadable_path = dir.path().join("unreadable.jpg");
+    std::fs::create_dir(&unreadable_path).unwrap();
+
+    insert_asset(
+        &conn,
+        "DIFFERENT",
+        "downloaded",
+        "different.jpg",
+        Some(different_path.to_str().unwrap()),
+        None,
+        Some("0000000000000000000000000000000000000000000000000000000000000000"),
+    );
+    insert_asset(
+        &conn,
+        "UNREADABLE",
+        "downloaded",
+        "unreadable.jpg",
+        Some(unreadable_path.to_str().unwrap()),
+        None,
+        Some("1111111111111111111111111111111111111111111111111111111111111111"),
+    );
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["verify", "--checksums"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("DIFFERENT:") && line.contains("DIFFERENT")),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("UNREADABLE:") && line.contains("UNREADABLE")),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Different checksum:             1"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Unreadable:                     1"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Checksum verified:              0"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn verify_reports_non_file_as_unreadable_without_checksums() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    let directory_path = dir.path().join("not-media.jpg");
+    std::fs::create_dir(&directory_path).unwrap();
+    insert_asset(
+        &conn,
+        "NON_FILE",
+        "downloaded",
+        "not-media.jpg",
+        Some(directory_path.to_str().unwrap()),
+        None,
+        None,
+    );
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["verify"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("UNREADABLE:") && line.contains("NON_FILE")),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Unreadable:                     1"),
+        "stdout: {stdout}"
     );
 }
 
@@ -569,7 +717,7 @@ fn verify_empty_db() {
 }
 
 #[test]
-fn verify_checksums_no_stored_checksum_still_passes() {
+fn verify_checksums_reports_missing_baseline_without_failing() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
     let conn = create_state_db(dir.path(), username);
@@ -577,8 +725,8 @@ fn verify_checksums_no_stored_checksum_still_passes() {
     let file_path = dir.path().join("photo.jpg");
     std::fs::write(&file_path, "some content").unwrap();
 
-    // No local_checksum stored -- verify --checksums should still pass
-    // (skips verification when no checksum is stored)
+    // No local_checksum stored. Presence alone is not checksum verification,
+    // and a missing baseline must not be treated as corruption.
     insert_asset(
         &conn,
         "a1",
@@ -599,7 +747,26 @@ fn verify_checksums_no_stored_checksum_still_passes() {
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Verified:  1"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Checksum verified:              0"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Present, no checksum recorded:  1"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Different checksum:             0"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Unreadable:                     0"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("present but unchecked, not verified"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -663,8 +830,14 @@ fn verify_mixed_present_and_missing() {
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Verified:  1"), "stdout: {stdout}");
-    assert!(stdout.contains("Missing:   1"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Present, not checksum-verified: 1"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Missing:                        1"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -703,7 +876,10 @@ fn verify_truncates_issue_listing_past_cap() {
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Missing:   250"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Missing:                        250"),
+        "stdout: {stdout}"
+    );
     assert!(
         stdout.contains("... and 50 more (listing capped at 200)"),
         "truncation tail missing; stdout: {stdout}"
@@ -1043,6 +1219,9 @@ fn behavioral_helper_carries_every_migrated_column() {
         ),
         ("asset_metadata_paths", "embedded_metadata_receipt", "v41"),
         ("provider_active_destinations", "confirmed_repair", "v42"),
+        ("provider_active_destinations", "writer_output_proof", "v47"),
+        ("provider_selection_rank_pages", "has_relation", "v48"),
+        ("provider_active_destinations", "metadata_successor", "v49"),
     ] {
         assert!(
             has_column(&conn, table, column),
@@ -1276,11 +1455,18 @@ fn preserved_legacy_status_and_reconcile_keep_attribution_separate_from_failure(
         ),
         "{output}"
     );
-    assert!(output.contains("Backup status: unsafe"), "{output}");
     assert!(
-        output.contains("Backup status: unsafe - 1 preserved legacy records need attribution"),
+        output.contains("Backup record: 1 preserved legacy records need attribution"),
         "{output}"
     );
+    assert!(
+        output.contains(
+            "Scope: recorded local state only; this does not establish iCloud completeness or verify local media checksums."
+        ),
+        "{output}"
+    );
+    assert!(!output.contains("Backup status: safe"), "{output}");
+    assert!(!output.contains("Backup status: unsafe"), "{output}");
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", data_dir.path())

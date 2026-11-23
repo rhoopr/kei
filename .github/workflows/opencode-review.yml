@@ -34,7 +34,7 @@ jobs:
       contents: read
       pull-requests: read
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
@@ -77,7 +77,7 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
@@ -94,7 +94,9 @@ jobs:
 
   # Pin identities once so both reviewers inspect the same issue and main.
   issue-pin:
-    if: github.event_name == 'issues' && github.event.action == 'opened'
+    if: >-
+      github.event_name == 'issues' && github.event.action == 'opened' &&
+      github.event.issue.user.type == 'User' && github.event.issue.user.login != github.repository_owner
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     permissions:
@@ -105,7 +107,7 @@ jobs:
       head: ${{ steps.pin.outputs.head }}
       snapshot: ${{ steps.pin.outputs.snapshot }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
@@ -132,7 +134,7 @@ jobs:
       EXPECTED_MAIN_SHA: ${{ needs.issue-pin.outputs.head }}
       EXPECTED_ISSUE_SNAPSHOT: ${{ needs.issue-pin.outputs.snapshot }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
@@ -173,7 +175,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false

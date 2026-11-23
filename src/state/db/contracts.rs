@@ -122,6 +122,8 @@ pub(crate) struct PreservedLocal {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SelectionMetadataReceipt {
+    /// Installed output and the capture offset used by that writer invocation.
+    pub(crate) writer_output: Option<(WriterOutput, chrono::FixedOffset)>,
     pub(crate) generation: String,
     pub(crate) pass_key: String,
     pub(crate) child: String,
@@ -129,6 +131,13 @@ pub(crate) struct SelectionMetadataReceipt {
     pub(crate) metadata_flags: u16,
     pub(crate) prepared: Option<(String, u64)>,
     pub(crate) preserved_local: Option<PreservedLocal>,
+}
+
+/// Output verified by the configured writer in addition to the installed media hash.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub(crate) enum WriterOutput {
+    EmbeddedOnly,
+    Sidecar([u8; 32]),
 }
 
 /// One queued metadata rewrite and its independently persisted capture debt.
@@ -993,6 +1002,24 @@ pub enum SourceMetadataRecovery {
 /// Metadata rewrite markers and hashes.
 #[async_trait]
 pub trait MetadataRewriteStore: Send + Sync {
+    /// Leave metadata on this path to its selected writer when a frozen
+    /// grouping disagrees. Media publication has independent authority.
+    async fn grouping_writer_pending(
+        &self,
+        _library: &str,
+        _asset: &str,
+        _version: &str,
+        _path: &Path,
+    ) -> Result<bool, StateError> {
+        Ok(false)
+    }
+    /// Recheck ownership under the destination lock before a queued writer touches files.
+    async fn claim_selection_writer(
+        &self,
+        pending: &PendingMetadataRewrite,
+    ) -> Result<bool, StateError> {
+        Ok(pending.selection_receipt.is_none())
+    }
     /// Accept an exact previously prepared output without completing current intent.
     async fn recover_embedded_metadata_receipt(
         &self,

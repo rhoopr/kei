@@ -8,9 +8,12 @@ tree on every downloaded HEIC, and the XMP packet inside it (which goes
 through Adobe's vendored C++ XMP Toolkit). Plus user-supplied TOML
 config and corruptible on-disk state-DB enum strings.
 
-Run by hand. Not part of `just gate` or CI. The point is to leave a
-target running locally for minutes-to-hours when poking at a parser, or
-to repro a specific input.
+Run by hand for longer sessions, and in CI for a bounded pass. Nightly
+qualification runs every target for 120 seconds with the checked-in seeds,
+restoring and saving the `fuzz/corpus` cache across runs. Heavy qualification
+runs the same seeds for 180 seconds from a clean corpus without the nightly
+cache. Neither pass is part of `just gate`. Use the targets below when poking
+at a parser for minutes to hours, or to repro a specific input.
 
 ## Prereqs
 
@@ -44,8 +47,9 @@ a one-line repro:
 cargo +nightly fuzz run <target> fuzz/artifacts/<target>/crash-<hash>
 ```
 
-Corpus entries accumulate in `fuzz/corpus/<target>/`. Both directories
-are gitignored.
+Corpus entries accumulate in `fuzz/corpus/<target>/`. Nightly qualification
+restores that directory from the `fuzz-corpus-` cache and saves it after every
+run. Both directories are gitignored.
 
 ## Targets
 

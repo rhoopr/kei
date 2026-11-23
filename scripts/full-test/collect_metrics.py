@@ -14,9 +14,6 @@ Metrics:
 - src_allow_attrs     Count of #[allow(...)] attrs in src/. Per AGENTS.md,
                       must stay near zero (fix warnings, don't suppress).
 - deps_count          Crate count in Cargo.lock. Dependency-creep proxy.
-- audit_warnings      Count of `cargo audit` allowed-warning advisories
-                      (RUSTSEC IDs that pass the allowlist but still merit
-                      visibility).
 - fuzz_target_count   Number of fuzz targets under fuzz/fuzz_targets/.
 """
 from __future__ import annotations
@@ -141,27 +138,6 @@ def deps_count(repo: Path) -> int | None:
     )
 
 
-def audit_warnings() -> int | None:
-    """Run `cargo audit` and parse the allowed-warning count."""
-    try:
-        proc = subprocess.run(
-            ["cargo", "audit"],
-            check=False,
-            stderr=subprocess.STDOUT,
-            stdout=subprocess.PIPE,
-            text=True,
-        )
-        out = proc.stdout
-    except FileNotFoundError:
-        return None
-    m = re.search(r"(\d+) allowed warning", out)
-    if m:
-        return int(m.group(1))
-    # No "allowed warning" line -- count individual `Crate:` blocks as a
-    # fallback (audit always lists each match).
-    return out.count("Crate:")
-
-
 def main() -> int:
     repo = repo_root()
     os.chdir(repo)
@@ -171,7 +147,6 @@ def main() -> int:
         "src_unwrap_expect": src_unwrap_expect(repo),
         "src_allow_attrs": src_allow_attrs(repo),
         "deps_count": deps_count(repo),
-        "audit_warnings": audit_warnings(),
         "fuzz_target_count": fuzz_target_count(repo),
     }
     json.dump(metrics, sys.stdout, indent=2, sort_keys=True)

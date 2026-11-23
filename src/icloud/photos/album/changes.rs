@@ -306,11 +306,38 @@ impl PhotoAlbum {
         candidates: &[ProviderRecordId],
         shutdown_token: &CancellationToken,
     ) -> anyhow::Result<FxHashSet<ProviderRecordId>> {
+        let mut unchanged: FxHashSet<_> = candidates.iter().cloned().collect();
+        self.visit_validation_changes(sync_token, shutdown_token, |record| {
+            unchanged.remove(&ProviderRecordId::new(record.record_name.as_str()));
+        })
+        .await?;
+        Ok(unchanged)
+    }
+
+    /// Observe the source boundary without applying changes or staging a cursor.
+    /// Raw records include changes that produce no asset or membership event.
+    pub(crate) async fn indexing_boundary(
+        &self,
+        cursor: &str,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<(String, bool)> {
+        let mut changed = false;
+        let successor = self
+            .visit_validation_changes(cursor, cancel, |_| changed = true)
+            .await?;
+        Ok((successor, changed))
+    }
+
+    async fn visit_validation_changes(
+        &self,
+        sync_token: &str,
+        shutdown_token: &CancellationToken,
+        mut visit: impl FnMut(&cloudkit::Record),
+    ) -> anyhow::Result<String> {
         anyhow::ensure!(
             !sync_token.trim().is_empty(),
             "Missing validation checkpoint"
         );
-        let mut unchanged: FxHashSet<_> = candidates.iter().cloned().collect();
         let url = format!(
             "{}/changes/zone?{}",
             self.service_endpoint,
@@ -328,24 +355,27 @@ impl PhotoAlbum {
             let response = tokio::select! {
                 biased;
                 () = shutdown_token.cancelled() => anyhow::bail!("Source validation cancelled"),
-                response = session::retry_post(self.session.as_ref(), &url, &body,
+                response = session::retry_post_changes_body(self.session.as_ref(), &url, &body,
                     &[("Content-type", "text/plain")], &self.retry_config) => response?,
             };
-            let zone = ValidatedChangesPage::parse(response, &self.zone_id)?;
+            let zone = ValidatedChangesPage::parse(
+                super::super::changes_json::parse(&response)?,
+                &self.zone_id,
+            )?;
             zone.check_continuation(&mut visited)?;
             for record in &zone.records {
                 anyhow::ensure!(
                     !record.record_name.trim().is_empty(),
                     "Missing source validation record identity"
                 );
-                unchanged.remove(&ProviderRecordId::new(record.record_name.as_str()));
+                visit(record);
             }
             anyhow::ensure!(
                 !shutdown_token.is_cancelled(),
                 "Source validation cancelled"
             );
             if !zone.more_coming {
-                return Ok(unchanged);
+                return Ok(zone.sync_token);
             }
             current_token = zone.sync_token;
         }

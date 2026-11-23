@@ -1516,7 +1516,7 @@ fn local_gate_includes_script_and_workflow_lint_recipes() {
         "cargo\tclippy\t--all-targets\t--no-default-features\t--\t-D\twarnings",
         "cargo\tdoc\t--no-deps\t--all-features",
         "cargo\tfetch\t--locked",
-        "cargo\taudit\t--deny\twarnings",
+        "cargo\tdeny\tcheck",
         "just\tlint-workflows",
         "just\tlint-scripts",
         "check-contracts\t",
@@ -1604,23 +1604,20 @@ fn aggregate_ci_depends_on_no_default_feature_gate() {
 }
 
 #[test]
-fn rust_ci_runs_on_main_push_without_pr_only_coverage() {
+fn rust_ci_runs_on_main_push_without_ci_coverage() {
     let ci = repo_file(".github/workflows/checks.yml");
     assert!(repo_file(".github/workflows/ci.yml").contains("  push:\n    branches: [main]"));
     assert!(ci.contains("  workflow_call:"));
     assert!(ci.contains("LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}"));
+    for stale in ["coverage-head", "coverage-base", "coverage-comment"] {
+        assert!(
+            !ci.contains(stale),
+            "shared checks must not carry dead CI coverage surface: {stale}"
+        );
+    }
     assert!(
-        ci.split_once("  coverage-head:\n")
-            .unwrap()
-            .1
-            .contains("if: inputs.heavy")
-    );
-    assert!(ci.contains("      - coverage-head\n"));
-    assert!(
-        !ci.split_once("  ci:\n")
-            .unwrap()
-            .1
-            .contains("      - coverage\n")
+        !ci.contains("--no-report"),
+        "shared checks must not run a non-gating coverage invocation"
     );
 }
 
@@ -1653,13 +1650,6 @@ fn copies_stress_runs_in_main_and_qualification_checks() {
         repo_file("justfile")
             .matches(" -- --skip download::orchestration::queue_projection::tests::private_600_")
             .count(),
-        2
-    );
-    assert_eq!(
-        ci.matches(
-            "--no-report -- --skip download::orchestration::queue_projection::tests::private_600_"
-        )
-        .count(),
         2
     );
 }
@@ -1756,6 +1746,97 @@ fn release_homebrew_downloads_fail_fast_and_verify_checksums() {
         assert!(
             hardening.contains(expected),
             "workflow hardening script must pin release invariant: {expected}"
+        );
+    }
+}
+
+#[test]
+fn release_attests_archives_and_published_container_digests() {
+    let release = repo_file(".github/workflows/release.yml");
+    let hardening = repo_file(".github/scripts/check_workflow_hardening.py");
+    let action = "actions/attest-build-provenance";
+    let action_sha = "977bb373ede98d70efdf65b84cb5f73e068dcc2a";
+
+    assert_eq!(
+        release.matches(&format!("{action}@{action_sha}")).count(),
+        3,
+        "the archive and tag-time container jobs must pin one provenance attestation each"
+    );
+    assert_eq!(
+        release.matches("id-token: write").count(),
+        2,
+        "the tag-time release and containers jobs must grant id-token: write"
+    );
+    assert_eq!(
+        release.matches("attestations: write").count(),
+        2,
+        "the tag-time release and containers jobs must grant attestations: write"
+    );
+    assert_eq!(
+        release.matches("push-to-registry: true").count(),
+        2,
+        "each tag-time container attestation must push its bundle to the registry"
+    );
+
+    for expected in [
+        "subject-path: |",
+        "candidate/*.tar.gz",
+        "candidate/*.zip",
+        "candidate/SHA256SUMS.txt",
+        r#"docker buildx imagetools inspect "$image:$version-$arch" --format '{{json .Manifest}}'"#,
+        "jq -r .digest",
+        "subject-name: ghcr.io/${{ github.repository }}",
+        "subject-digest: ${{ steps.publish.outputs.amd64 }}",
+        "subject-digest: ${{ steps.publish.outputs.arm64 }}",
+    ] {
+        assert!(
+            release.contains(expected),
+            "release provenance is missing pinned evidence: {expected}"
+        );
+    }
+    assert_eq!(
+        release
+            .matches("subject-digest: ${{ steps.publish.outputs.amd64 }}")
+            .count(),
+        1,
+        "the tag-time containers job must attest the amd64 digest"
+    );
+    assert_eq!(
+        release
+            .matches("subject-digest: ${{ steps.publish.outputs.arm64 }}")
+            .count(),
+        1,
+        "the tag-time containers job must attest the arm64 digest"
+    );
+
+    let checksums = release
+        .find("sha256sum -- *.tar.gz *.zip > SHA256SUMS.txt")
+        .expect("release must generate checksums");
+    let archive_attestation = release
+        .find("subject-path: |")
+        .expect("release must attest the archive bytes");
+    let upload = release
+        .find("- name: Upload release assets")
+        .expect("release must upload the archives");
+    assert!(
+        checksums < archive_attestation && archive_attestation < upload,
+        "archive attestation must run after checksums and before upload"
+    );
+
+    for expected in [
+        action,
+        action_sha,
+        "id-token: write",
+        "attestations: write",
+        "subject-path: |",
+        "subject-digest: ${{ steps.publish.outputs.amd64 }}",
+        "subject-digest: ${{ steps.publish.outputs.arm64 }}",
+        "push-to-registry: true",
+        "jq -r .digest",
+    ] {
+        assert!(
+            hardening.contains(expected),
+            "workflow hardening must fail closed on release provenance: {expected}"
         );
     }
 }
@@ -1962,12 +2043,14 @@ fn roundtrip_gate_documents_heuristic_limits_and_bypass_rationale() {
 }
 
 #[test]
-fn bug_report_template_requires_web_access_and_redaction() {
+fn bug_report_template_accepts_local_reports_and_keeps_redaction_guidance() {
     let bug = repo_file(".github/ISSUE_TEMPLATE/bug_report.yml");
 
     for expected in [
-        "I have confirmed that ADP is disabled",
-        "required: true",
+        "ADP disabled and web access enabled",
+        "ADP enabled or web access disabled",
+        "Local-only issue / not applicable",
+        "- Unsure",
         "Redact Apple IDs, passwords, session cookies, bearer tokens, webhook URLs",
     ] {
         assert!(
@@ -2022,17 +2105,17 @@ fn loopback_bound_tests_keep_explicit_skip_gate() {
 }
 
 #[test]
-fn audit_ignores_carry_removal_triggers() {
-    let audit = repo_file(".cargo/audit.toml");
+fn deny_ignores_carry_removal_triggers() {
+    let deny = repo_file("deny.toml");
 
     for expected in [
+        "https://github.com/rhoopr/kei/issues/1066 removes chrono from the tree",
         "Remove this ignore once little_exif drops paste",
-        "Remove this ignore once reqwest's QUIC stack no longer pulls rand",
         "Remove these ignores once plist and little_exif can both resolve",
     ] {
         assert!(
-            audit.contains(expected),
-            "audit ignore must document removal trigger: {expected}"
+            deny.contains(expected),
+            "deny ignore must document removal trigger: {expected}"
         );
     }
 }

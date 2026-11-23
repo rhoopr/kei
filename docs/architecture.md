@@ -22,17 +22,33 @@ For a specific component, see the [module index](architecture/module-index.md). 
 
 **Startup.** Dispatch resolves configuration before opening account-owned state. `src/config/paths.rs` discovers one application root so a new XDG setting cannot silently split existing credentials and state. Ambiguous roots fail closed. Linux service installation records the resolved config path and path overrides. The writable state opener verifies schema upgrades and retires their temporary backups before post-upgrade inbox compaction. See [startup, account ownership, and schema backups](architecture/startup.md).
 
+**Offline inspection.** Doctor distinguishes a loaded config, an absent file, and a load error. Its password-file check tests read access without reading the secret or invoking a password command. Status describes recorded sync work; verify compares local bytes only when requested and a checksum baseline exists.
+
 **Sync.** The runner resolves the session, libraries, and pass plans. Each cycle dispatches work per library, evaluates source progress per zone, and reports the result to watch control. A cursor records where to resume; the retained inbox holds source observations; destination receipts record local work. None substitutes for the others. See [provider capture and destination replay](architecture/provider-replay.md) and [checkpoint decisions and enumeration](architecture/checkpoints.md).
 
 A sparse change in PrimarySync can depend on a scoped Shared scan from the same cycle. If a Hidden-only scan has no decision for the exact Shared asset, its current `isHidden` field can establish membership. Every selected destination still requires a verified local copy before the source checkpoint advances.
+
+When an observation names both the child and its master, kei requests both records together from the bound media zone. It checks their identities, relationship and selected facts before acting. If only the child is known, kei first looks up its current master.
+
+After indexing finishes, a quiet zone change feed can establish coverage across disagreeing album query tokens. Qualification retains the trusted cursor for replay. See [checkpoint decisions and enumeration](architecture/checkpoints.md).
 
 **Local delivery.** The planner selects a destination. The pipeline writes and verifies a `.part`, publishes the file, syncs the parent directory, and finalizes durable state. Import uses the shared path rules and verifies an existing file before adoption. Unresolved work needs durable retry evidence. See [publication, reconciliation, and import](architecture/publication.md).
 
 **Metadata.** An enabled setting authorizes later updates to its managed fields. Omitted version-1 settings and no-config runs keep writers disabled. Capture-timestamp replacement requires explicit repair. Immediate and queued writes share the stable-input and ownership requirements. See [metadata write boundaries](architecture/metadata.md).
 
+Ordinary sync commits eligible provider checkpoints before draining the local metadata queue. A verified destination with a recoverable writer receipt can still owe metadata after its zone is synced. Only the writer can settle that receipt. Missing provider evidence or failure to save the obligation still holds the checkpoint.
+
 ## Data-safety invariants
 
 Keep the previous checkpoint on incomplete token proof, interruption, stale planning, or non-durable recovery. Unknown provider identity keeps work pending. A verified local copy does not prove that the provider deleted its source.
+
+Selection evidence limits apply to individual writes and validation operations. Retained history does not consume the next library's or restarted baseline's write allowance.
+
+Once selection freezes a destination, a downloaded receipt at a different path cannot satisfy it. With stable source evidence, a missing selected copy stays due until kei publishes it at the promised path or records proof that resolves that destination.
+
+Writable sync may retire raw enumeration responses only after verifying the selection seal and finding no unfinished identity, destination, metadata, or repair work. Compact rank proofs preserve the original seal and source links.
+
+A new selection filters previous metadata writers by scope, configuration and destination inputs before reading files. It hashes the installed media and any configured XMP packet before opening the SQLite write transaction. Reuse requires matching hashes, frozen grouping and effective capture offset. At commit, kei checks both retained file identities. On Unix it also checks the inode change times sampled before hashing. On Windows the retained handles exclude writes and replacement. If kei cannot verify either file, the destination and its aliases stay pending for the ordinary writer. Reuse does not confer publication ownership. Prepared writes, preserved local files, managed layouts and explicit refresh or repair keep their existing recovery paths.
 
 File publication must preserve existing media unless replacement has exact authorization. Metadata writers must verify their input before replacement. A failed write leaves enough evidence to retry without overwriting a concurrent edit.
 

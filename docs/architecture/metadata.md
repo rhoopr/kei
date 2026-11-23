@@ -238,7 +238,7 @@ Current checkpoint transactions retain their source cursor, configuration, spars
 
 `status`, cycle reports and health JSON retain `unattributed_legacy_assets` and `unattributed_legacy_pending` with their existing names, types and scopes. The first counts preserved records with unknown attribution, not paths or renditions. The second counts records without a stored certificate at their recorded `active_generation`, including absent pointers. This is a presence lookup: it does not validate certificate versions, payloads, dependencies, configuration or files. Despite its historical name, it is not pending sync work. Status is per library, completed cycles total selected libraries, and skipped watch cycles report all-catalogue historical totals. Current capture `remaining`, `unresolved` and `deferred` counts, revision `processed` and `failed` tallies, and cycle metadata-capture observations keep their existing meanings.
 
-Historical attribution still makes status report `Backup status: unsafe`, because current sync success does not establish historical completeness. Historical counters alone no longer fail one-shot sync, increment cycle or health failures, prevent health's `last_success_at` update, or wake an otherwise idle watch cycle. Current identity and selected-work failures keep their ordinary effects. Primary sparse-identity recovery still requires verified source provenance; stored local trust cannot replace it.
+Status reports unresolved historical attribution separately because current sync success does not establish historical completeness. Historical counters alone no longer fail one-shot sync, increment cycle or health failures, prevent health's `last_success_at` update, or wake an otherwise idle watch cycle. Current identity and selected-work failures keep their ordinary effects. Primary sparse-identity recovery still requires verified source provenance; stored local trust cannot replace it.
 
 ## Capture repair and retry
 
@@ -318,6 +318,8 @@ complete merged packet already matches the existing bytes, a retained regular
 file snapshot rechecks identity, parent confinement and exact bytes before
 reporting success. This avoids republishing an unchanged packet. Changed packets
 use a new temporary path so retained ambiguous bytes cannot block a later retry.
+
+For a verified selected destination that only needs a sidecar, post-sync backfill can keep the hashed media open for the GPS reader. On Unix, kei hashes the media again after writing the sidecar: a shared writable mapping can change bytes without changing the inode change time. When kei retains the file, it also rechecks its identity and change time at commit. On Windows, a retained handle that excludes writes and replacement allows kei to skip the second hash. Native GPS accuracy still requires a matching verified download checksum.
 
 ## GPS provenance
 

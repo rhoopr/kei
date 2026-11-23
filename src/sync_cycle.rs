@@ -1531,6 +1531,36 @@ async fn run_cycle_inner(
                 });
         Arc::make_mut(&mut download_config).indexing_inventory_only =
             managed_indexing_recovery && indexing_finished;
+        if (indexing_reconciliation || indexing_replay_pending)
+            && indexing_finished
+            && !managed_indexing_recovery
+            && !indexing_materialization_pending
+            && !lib_state.plan_is_stale
+            && !lib_state.plan_needs_refresh
+            && checkpoint_transition_state_safe
+            && download_controls.run_mode.downloads_files()
+            && download_config.skip_created_before.is_none()
+            && download_config.skip_created_after.is_none()
+            && lib_state.plan.passes.len() > 1
+        {
+            let source = lib_state.library.all();
+            if lib_state.plan.passes.iter().all(|pass| {
+                pass.kind != crate::commands::PassKind::SmartFolder
+                    && pass.album.covered_by_change_feed(&source)
+            }) {
+                Arc::make_mut(&mut download_config).indexing_inventory_cursor =
+                    retained_cursor_at_start
+                        .as_ref()
+                        .filter(|cursor| !cursor.trim().is_empty())
+                        .map(|cursor| {
+                            if indexing_reconciliation {
+                                download::IndexingWindow::ObserveFrom(cursor.clone())
+                            } else {
+                                download::IndexingWindow::AwaitReplay
+                            }
+                        });
+            }
+        }
         if pending_download_config_hash.is_some()
             && (path_reconciliation_has_smart_folders || !historical_capture_authoritative)
         {

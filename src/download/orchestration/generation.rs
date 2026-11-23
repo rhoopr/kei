@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use super::config::{DownloadConfig, hash_download_config};
+use super::config::{DownloadConfig, IndexingWindow, hash_download_config};
 use super::delta::{IncrementalDeltaSummary, MembershipDelta};
 use super::models::{
     DownloadControls, DownloadOutcome, SyncResult, SyncStats,
@@ -149,16 +149,7 @@ pub(super) async fn hold_retained_debt(
     let Some(context) = &config.selection_context else {
         return Ok(());
     };
-    if context
-        .capture
-        .db
-        .unfinished_selection_debt(
-            context.capture.owner.clone(),
-            context.scope.clone(),
-            context.config_hash.clone(),
-        )
-        .await?
-    {
+    if context.checkpoint_debt(config).await? {
         result.block_incremental_token(DEFERRED_REASON);
         result.stats.selected_work_remaining = true;
         result.sync_token = None;
@@ -353,6 +344,24 @@ pub(crate) struct SelectionRun {
 }
 
 impl SelectionContext {
+    async fn checkpoint_debt(&self, config: &DownloadConfig) -> Result<bool> {
+        let (owner, scope, hash) = (
+            self.capture.owner.clone(),
+            self.scope.clone(),
+            self.config_hash.clone(),
+        );
+        Ok(if config.post_sync_metadata {
+            self.capture
+                .db
+                .provider_selection_debt(owner, scope, hash)
+                .await?
+        } else {
+            self.capture
+                .db
+                .unfinished_selection_debt(owner, scope, hash)
+                .await?
+        })
+    }
     async fn include_durable_membership_deletions(
         &self,
         delta: &mut MembershipDelta,
@@ -1253,7 +1262,7 @@ impl SelectionRun {
                 .await;
             match projected {
                 Ok(projection) => break projection,
-                Err(crate::state::error::StateError::ProviderWorkConflict)
+                Err(error @ crate::state::error::StateError::ProviderWorkConflict(_))
                     if !retried_collision
                         && previous
                             .as_ref()
@@ -1281,7 +1290,9 @@ impl SelectionRun {
                             changed = true;
                         }
                     }
-                    anyhow::ensure!(changed, "Selected destination admission conflict");
+                    if !changed {
+                        return Err(error.into());
+                    }
                     retried_collision = true;
                 }
                 Err(error) => return Err(error.into()),
@@ -1733,13 +1744,16 @@ pub(crate) async fn has_due(
         .db
         .retained_selection_root(
             context.capture.owner.clone(),
-            context.scope,
-            context.config_hash,
+            context.scope.clone(),
+            context.config_hash.clone(),
             root.id,
         )
         .await?
         .is_some();
-    Ok(Some(pending || retained))
+    Ok(Some(
+        (pending || retained)
+            && (!config.post_sync_metadata || context.checkpoint_debt(config).await?),
+    ))
 }
 
 pub(super) async fn inventory(
@@ -1915,7 +1929,7 @@ pub(super) async fn inventory(
             run.held.store(true, Ordering::Relaxed);
         }
     }
-    let metadata = if result.stats.storage_failed {
+    let metadata = if result.stats.storage_failed || config.post_sync_metadata {
         MetadataTailOutcome::default()
     } else {
         metadata_tail(config, &cancel, context, &run.root.id).await?
@@ -1944,15 +1958,7 @@ pub(super) async fn inventory(
         result.checkpoint.identity_incomplete = true;
         result.block_incremental_token(DEFERRED_REASON)
     }
-    result.stats.selected_work_remaining = context
-        .capture
-        .db
-        .unfinished_selection_debt(
-            context.capture.owner.clone(),
-            context.scope.clone(),
-            context.config_hash.clone(),
-        )
-        .await?;
+    result.stats.selected_work_remaining = context.checkpoint_debt(config).await?;
     if result.stats.selected_work_remaining {
         result.block_incremental_token(DEFERRED_REASON)
     }
@@ -1997,6 +2003,7 @@ const METADATA_WRITER_BUDGET: usize = 500;
 tokio::task_local! {
     // Scoped to one fixture future, so parallel tests retain production limits.
     pub(super) static TEST_METADATA_WRITER_BUDGET: usize;
+    pub(super) static TEST_AFTER_WRITER_SNAPSHOT: fn(&std::path::Path);
 }
 
 fn metadata_writer_limits() -> (usize, usize) {
@@ -2036,6 +2043,21 @@ async fn metadata_tail(
     let flags = crate::download::pipeline::MetadataFlags::from(config);
     if !flags.has_any_write() {
         return Ok(MetadataTailOutcome::default());
+    }
+    if !config.primary_layout_active
+        && !config.refresh_metadata
+        && config.capture_timestamp_repair == crate::download::CaptureTimestampRepair::Preserve
+    {
+        reuse_writer_outputs(
+            config,
+            cancel,
+            context,
+            generation,
+            flags,
+            None,
+            &mut Default::default(),
+        )
+        .await?;
     }
     let mut offset = context
         .capture
@@ -2160,6 +2182,209 @@ async fn metadata_tail(
         failed: priority.failed.saturating_add(result.failed),
         storage_failed: priority.storage_failed || result.storage_failed,
     })
+}
+
+async fn reuse_writer_outputs(
+    config: &DownloadConfig,
+    cancel: &CancellationToken,
+    context: &SelectionContext,
+    generation: &str,
+    flags: crate::download::pipeline::MetadataFlags,
+    deadline: Option<Instant>,
+    after: &mut crate::state::db::provider_generations::WriterKey,
+) -> Result<()> {
+    use crate::state::db::provider_generations::WriterOutput;
+    let db = &context.capture.db;
+    let owner = &context.capture.owner;
+    while !cancel.is_cancelled() && deadline.is_none_or(|due| Instant::now() < due) {
+        let page = db
+            .writer_output_candidates(owner.clone(), generation.to_owned(), after.clone())
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        for key in page {
+            if cancel.is_cancelled() || deadline.is_some_and(|due| Instant::now() >= due) {
+                return Ok(());
+            }
+            *after = key.clone();
+            let path = key.native_path()?;
+            // Missing, changed or unreadable files go through the ordinary bounded writer.
+            let Ok(media) =
+                crate::download::file::WriterSnapshot::read(&config.directory, &path).await
+            else {
+                continue;
+            };
+            let sidecar = if flags.contains(crate::download::pipeline::MetadataFlags::XMP_SIDECAR) {
+                let mut sidecar = path.as_os_str().to_owned();
+                sidecar.push(".xmp");
+                let Ok(packet) = crate::download::file::WriterSnapshot::read(
+                    &config.directory,
+                    std::path::Path::new(&sidecar),
+                )
+                .await
+                else {
+                    continue;
+                };
+                Some(packet)
+            } else {
+                None
+            };
+            #[cfg(test)]
+            let _ = TEST_AFTER_WRITER_SNAPSHOT.try_with(|edit| edit(&path));
+            let packet = sidecar.as_ref().map_or(WriterOutput::EmbeddedOnly, |file| {
+                WriterOutput::Sidecar(file.fingerprint.sha256)
+            });
+            db.reuse_writer_output(
+                owner.clone(),
+                generation.to_owned(),
+                key,
+                data_encoding::HEXLOWER.encode(&media.fingerprint.sha256),
+                packet,
+                move || {
+                    sidecar
+                        .as_ref()
+                        .is_none_or(|file| file.still_matches().is_ok())
+                        && media.still_matches().is_ok()
+                },
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Scheduling hints only. Losing this cursor cannot settle a receipt.
+#[derive(Default)]
+pub(crate) struct BackfillCursor {
+    generation: Option<String>,
+    reuse_after: crate::state::db::provider_generations::WriterKey,
+    offset: usize,
+}
+
+/// Reconstruct writer scope locally, including after a quiet restart.
+pub(crate) async fn drain_local_backfill(
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+    db: &crate::state::SqliteStateDb,
+    controls: DownloadControls,
+    cancel: &CancellationToken,
+    deadline: Option<Instant>,
+    cursor: &mut BackfillCursor,
+) -> Result<super::maintenance::MetadataDrainOutcome> {
+    use super::maintenance::MetadataDrainOutcome;
+    let mut outcome = MetadataDrainOutcome::default();
+    let flags = crate::download::pipeline::MetadataFlags::from(config);
+    if !config.post_sync_metadata
+        || !flags.has_any_write()
+        || !controls.run_mode.downloads_files()
+        || cancel.is_cancelled()
+    {
+        return Ok(outcome);
+    }
+    let context = context(passes, config, controls).await?;
+    let selection = if let Some(context) = context {
+        context
+            .capture
+            .db
+            .local_writer_generation(
+                context.capture.owner.clone(),
+                context.scope.clone(),
+                context.config_hash.clone(),
+            )
+            .await?
+            .map(|root| (context, root))
+    } else {
+        None
+    };
+    let generation = selection.as_ref().map(|(_, root)| root.id.clone());
+    if generation != cursor.generation {
+        *cursor = BackfillCursor {
+            generation,
+            ..Default::default()
+        };
+    }
+    if cursor.offset == 0
+        && let Some((context, root)) = &selection
+        && config.edited_naming != crate::types::EditedNaming::Primary
+        && !db.has_primary_layouts(&config.library).await?
+    {
+        reuse_writer_outputs(
+            config,
+            cancel,
+            context,
+            &root.id,
+            flags,
+            deadline,
+            &mut cursor.reuse_after,
+        )
+        .await?;
+    }
+    let mut applied = 0usize;
+    let mut started = false;
+    let root_directory = crate::fs_util::absolute_confined_path(&config.directory)?;
+    let (_, limit) = metadata_writer_limits();
+    while limit > 0 && !cancel.is_cancelled() && deadline.is_none_or(|due| Instant::now() < due) {
+        let mut rows = if let Some((context, root)) = &selection {
+            db.pending_local_metadata_page(
+                context.capture.owner.clone(),
+                root.id.clone(),
+                config.library.to_string(),
+                cursor.offset,
+                limit,
+            )
+            .await?
+        } else {
+            db.pending_legacy_metadata_page(config.library.to_string(), cursor.offset, limit)
+                .await?
+        };
+        if rows.is_empty() {
+            cursor.offset = 0;
+            cursor.reuse_after = Default::default();
+            break;
+        }
+        if !started {
+            tracing::info!("Primary sync finished; local metadata backfill pending");
+            started = true;
+        }
+        let fetched = rows.len();
+        rows.retain(|row| {
+            row.asset.local_path.as_deref().is_some_and(|path| {
+                crate::fs_util::absolute_confined_path(path)
+                    .is_ok_and(|path| path.starts_with(&root_directory))
+            })
+        });
+        let pass = Box::pin(crate::download::metadata_rewrite::run_backfill_rows(
+            db,
+            flags,
+            config.temp_suffix.clone(),
+            cancel,
+            rows,
+            cursor.generation.as_deref(),
+        ))
+        .await;
+        applied += pass.retired_from_selected_queue;
+        outcome.failed += fetched.saturating_sub(pass.retired_from_selected_queue);
+        outcome.storage_failed |= pass.storage_failed;
+        anyhow::ensure!(
+            !pass.state_failed,
+            "Metadata backfill stopped after a state error; unfinished receipts remain queued"
+        );
+        if outcome.storage_failed {
+            break;
+        }
+        // Retired rows disappeared. Move past retained rows without wrapping
+        // this invocation, even if an entire page failed to make progress.
+        cursor.offset += fetched.saturating_sub(pass.retired_from_selected_queue);
+    }
+    if applied > 0 || outcome.failed > 0 {
+        tracing::info!(
+            applied,
+            remaining_attempted = outcome.failed,
+            "Local metadata backfill pass finished"
+        );
+    }
+    Ok(outcome)
 }
 
 async fn recover_retained(
@@ -2344,26 +2569,38 @@ async fn replay(
         .context("Missing replay context")?;
     let run = context.replay_run(root.clone(), passes, false);
     let started = Instant::now();
-    let mut combined = Box::pin(recover_retained(
-        client,
-        passes,
-        config,
-        controls,
-        cancel.clone(),
-        &root,
-    ))
-    .await?;
-    replay_destinations(
-        client,
-        passes,
-        config,
-        controls,
-        &cancel,
-        &run,
-        &mut combined,
-    )
-    .await?;
-    if !combined.storage_failed {
+    let local_only = config.post_sync_metadata
+        && root.sealed
+        && root.checkpoint_ready
+        && !context.checkpoint_debt(config).await?;
+    let mut combined = if local_only {
+        crate::download::pipeline::StreamingResult {
+            enumeration_complete: true,
+            ..Default::default()
+        }
+    } else {
+        let mut primary = Box::pin(recover_retained(
+            client,
+            passes,
+            config,
+            controls,
+            cancel.clone(),
+            &root,
+        ))
+        .await?;
+        replay_destinations(
+            client,
+            passes,
+            config,
+            controls,
+            &cancel,
+            &run,
+            &mut primary,
+        )
+        .await?;
+        primary
+    };
+    if !combined.storage_failed && !config.post_sync_metadata {
         let metadata = metadata_tail(config, &cancel, context, &run.root.id).await?;
         combined.exif_failures += metadata.failed;
         combined.storage_failed |= metadata.storage_failed;
@@ -2385,15 +2622,7 @@ async fn replay(
             _ => DEFERRED_REASON,
         });
     }
-    result.stats.selected_work_remaining = context
-        .capture
-        .db
-        .unfinished_selection_debt(
-            context.capture.owner.clone(),
-            context.scope.clone(),
-            context.config_hash.clone(),
-        )
-        .await?;
+    result.stats.selected_work_remaining = context.checkpoint_debt(config).await?;
     if result.stats.selected_work_remaining {
         result.block_incremental_token(DEFERRED_REASON)
     }
@@ -2523,17 +2752,17 @@ pub(super) async fn after_delta(
         delta_result.block_incremental_token("membership_delta_incomplete");
         return Ok(delta_result);
     }
+    let delta_safe = !delta_result.checkpoint.sync_token_blocked
+        && !delta_result.checkpoint.identity_incomplete
+        && !delta_result.checkpoint.interrupted
+        && delta_result.checkpoint.state_write_failures == 0;
     if config.inventory_reconciliation {
         // The dispatcher already owns exactly one current inventory between
         // these two delta passes. Do not start another implicit generation scan
         // or replay here. Its durable request and retained source cursor remain
         // until full selected coverage plus a raw-empty replay qualify; a
         // changed replay cannot advance past newly observed unadmitted work.
-        if !delta_result.checkpoint.sync_token_blocked
-            && !delta_result.checkpoint.identity_incomplete
-            && !delta_result.checkpoint.interrupted
-            && delta_result.checkpoint.state_write_failures == 0
-        {
+        if delta_safe {
             delta_result.sync_token = delta.sync_token.clone();
             *context
                 .inventory_membership_delta
@@ -2570,9 +2799,27 @@ pub(super) async fn after_delta(
             && !context.capture.db.unfinished_selection_debt(
                 context.capture.owner.clone(), context.scope.clone(), context.config_hash.clone(),
             ).await?);
+    let indexing_replay = matches!(
+        config.indexing_inventory_cursor,
+        Some(IndexingWindow::AwaitReplay)
+    );
+    // Replaying a sealed generation cannot supply a missing pass token.
+    let retry_pass_tokens = indexing_replay
+        && root.as_ref().is_some_and(|root| {
+            matches!(
+                root.checkpoint_veto.as_deref(),
+                Some(
+                    "icloud_sync_token_mismatch"
+                        | "icloud_sync_token_missing"
+                        | "icloud_blank_sync_token"
+                        | "kei_internal_token_receiver_dropped"
+                )
+            )
+        });
     let mut selected = match root {
         Some(root)
             if !refresh_selection
+                && !retry_pass_tokens
                 && (root.sealed
                     || context
                         .capture
@@ -2582,7 +2829,18 @@ pub(super) async fn after_delta(
         {
             replay(client, passes, config, controls, cancel.clone(), root).await?
         }
-        _ => inventory(client, passes, config, controls, cancel.clone()).await?,
+        _ => {
+            let mut config = Arc::clone(config);
+            if indexing_replay
+                && delta_safe
+                && delta_result.checkpoint.completed_delta_replay
+                && let Some(cursor) = &delta.sync_token
+            {
+                Arc::make_mut(&mut config).indexing_inventory_cursor =
+                    Some(IndexingWindow::ReplayedTo(cursor.clone()));
+            }
+            inventory(client, passes, &config, controls, cancel.clone()).await?
+        }
     };
     selected.outcome = merge_download_outcomes(&selected.outcome, &delta_result.outcome);
     selected.accumulate(&delta_result);

@@ -27,10 +27,12 @@ mod validation;
 #[cfg(test)]
 mod test_support;
 
-pub(super) use fingerprint::ExistingFileFingerprint;
+#[cfg(all(test, unix, feature = "xmp"))]
+pub(super) use fingerprint::WRITER_HASH_HOOK;
 pub(crate) use fingerprint::compute_sha256;
 pub(super) use fingerprint::fingerprint_open_file_snapshot_blocking;
 pub(crate) use fingerprint::imported_path_matches_receipt;
+pub(super) use fingerprint::{ExistingFileFingerprint, WriterSnapshot};
 pub(super) use fingerprint::{RetainedPendingFile, retain_pending_file};
 pub(super) use fingerprint::{fingerprint_downloaded_path, fingerprint_regular_file};
 #[cfg(all(test, feature = "xmp", target_os = "linux"))]

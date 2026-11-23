@@ -44,6 +44,75 @@ fn historical_evidence(f: &Fixture, generation: &str) -> Vec<Vec<u8>> {
         .unwrap()
 }
 
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn local_backfill_does_not_strand_an_updated_provider_rendition() {
+    use crate::download::orchestration::generation::drain_local_backfill;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/media"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let newer = include_bytes!("../../../../../tests/data/media/pattern.jpg");
+    Mock::given(method("GET"))
+        .and(path("/update"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(newer.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.pass = destination_pass(&f, "A");
+    f.config.post_sync_metadata = true;
+    f.config.metadata.xmp_sidecar = true;
+    select(&f, "m", &server);
+    let first = cycle(&f).await;
+    assert!(first.sync_token.is_some());
+    f = reopen_destination_fixture(f).await;
+    f.pass = destination_pass(&f, "A");
+    let mut pair = records("m", CURRENT, "New caption");
+    pair[0]["fields"]["filenameEnc"]["value"] = json!("new-version.jpg");
+    pair[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/update",server.uri()),"size":newer.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(newer))});
+    *f.session.records.lock().unwrap() = pair.clone();
+    f.capture(pair, "new-version").await;
+    f.config.sync_mode = SyncMode::Full;
+    let updated = cycle(&f).await;
+    if updated.stats.downloaded == 0 {
+        let reasons: Vec<String> =
+            f.db.acquire_lock("why replacement is waiting")
+                .unwrap()
+                .prepare("SELECT reason FROM provider_active_decisions WHERE admission='deferred'")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        assert_eq!(reasons, ["unfinished_generation_conflict"]);
+    }
+    let pass = Box::pin(drain_local_backfill(
+        std::slice::from_ref(&f.pass),
+        &f.config,
+        &f.db,
+        controls(),
+        &CancellationToken::new(),
+        None,
+        &mut Default::default(),
+    ))
+    .await
+    .unwrap();
+    assert!(!pass.storage_failed);
+    if updated.stats.downloaded == 0 {
+        // A still-owned historical file may fence replacing its catalogue
+        // input, but its exact local work must remain reachable after reseed.
+        f.db.make_selection_retry_due(super::owner(), "asset-m".into())
+            .await
+            .unwrap();
+        let next = cycle(&f).await;
+        assert_eq!(next.stats.downloaded, 1, "{updated:?} {next:?}");
+    }
+}
+
 #[tokio::test]
 async fn current_debt_configuration_change_retains_unknown_history_without_cursor_authority() {
     let server = MockServer::start().await;
@@ -258,6 +327,15 @@ async fn current_debt_prepared_output_fences_an_existing_selected_path_across_co
     let prepared: String = f.db.acquire_lock("actual unresolved prepared output").unwrap()
         .query_row("SELECT generation FROM provider_active_destinations WHERE prepared_hash IS NOT NULL AND verified_metadata=0", [], |row| row.get(0)).unwrap();
     let evidence = historical_evidence(&f, &prepared);
+    let immutable_proof = |f: &Fixture| {
+        f.db.acquire_lock("original decision and page identities").unwrap().prepare(
+            "SELECT specification FROM provider_active_generations WHERE id=?1
+             UNION ALL SELECT manifest FROM provider_active_decisions WHERE generation=?1
+             UNION ALL SELECT CAST(id AS BLOB) FROM provider_selection_rank_pages WHERE generation=?1 ORDER BY 1"
+        ).unwrap().query_map([&prepared], |row| row.get::<_, Vec<u8>>(0)).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap()
+    };
+    let frozen = immutable_proof(&f);
     let path = f.config.directory.join("A/changed.JPG");
     let bytes = std::fs::read(&path).unwrap();
     assert_ne!(bytes, MEDIA);
@@ -321,7 +399,13 @@ async fn current_debt_prepared_output_fences_an_existing_selected_path_across_co
                 .await
                 .unwrap()
         );
-        assert_eq!(historical_evidence(&f, &prepared), evidence);
+        // Only the resolved writer's rank bodies may now be retired. The
+        // exact decision, original page identities, and output remain frozen.
+        assert_eq!(immutable_proof(&f), frozen);
+        let retired: bool = f.db.acquire_lock("settled prepared generation")
+            .unwrap().query_row("SELECT count(*)>0 AND count(*)=count(retired_proof_hash) FROM provider_selection_rank_pages WHERE generation=?1",
+                [&prepared], |row| row.get(0)).unwrap();
+        assert!(retired);
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert_eq!(
             std::fs::metadata(&path).unwrap().modified().unwrap(),

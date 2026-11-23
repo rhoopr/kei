@@ -33,7 +33,8 @@ pub(crate) async fn run_reset_state(
         use std::io::Write;
         if !input_mode.can_prompt() {
             anyhow::bail!(
-                "`kei reset state` needs `--yes` when stdin is not a terminal. The state database was not deleted."
+                "`{}` needs `--yes` when stdin is not a terminal. The state database was not deleted.",
+                cli::command_for_config("reset state", globals.config_source.recovery_path())
             );
         }
         println!("This will delete the state database at:");
@@ -87,7 +88,8 @@ pub(crate) async fn run_reset_sync_token(
         use std::io::Write;
         if !input_mode.can_prompt() {
             anyhow::bail!(
-                "`kei reset sync-token` needs `--yes` when stdin is not a terminal. The next sync will re-enumerate every asset, which can take a long time on a large library."
+                "`{}` needs `--yes` when stdin is not a terminal. The next sync will re-enumerate every asset, which can take a long time on a large library.",
+                cli::command_for_config("reset sync-token", globals.config_source.recovery_path())
             );
         }
         println!("This will clear stored sync tokens at:");
@@ -169,7 +171,8 @@ pub(crate) async fn run_reset_session(
         use std::io::Write;
         if !std::io::stdin().is_terminal() {
             anyhow::bail!(
-                "`kei reset session` needs `--yes` when stdin is not a terminal. This discards the local session and trust tokens, and the next `kei login` will run the full password + 2FA flow again."
+                "`{}` needs `--yes` when stdin is not a terminal. This discards the local session and trust tokens, and the next login will require password authentication and 2FA again.",
+                cli::command_for_config("reset session", globals.config_source.recovery_path())
             );
         }
         println!("This will discard the local iCloud session (including trust tokens):");
@@ -193,7 +196,10 @@ pub(crate) async fn run_reset_session(
     for path in &removed {
         println!("Removed {}", path.display());
     }
-    println!("Session reset. Run `kei login` to authenticate again.");
+    println!(
+        "Session reset. Run `{}` to authenticate again.",
+        cli::command_for_config("login", globals.config_source.recovery_path())
+    );
 
     Ok(())
 }

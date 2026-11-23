@@ -10,6 +10,7 @@ use std::sync::Arc;
 #[cfg(feature = "xmp")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct SidecarWriteOutcome {
+    pub(super) output: Option<[u8; 32]>,
     pub(super) failed: bool,
     pub(super) storage_failed: bool,
 }
@@ -18,6 +19,7 @@ pub(super) struct SidecarWriteOutcome {
 impl SidecarWriteOutcome {
     fn failure(error: &anyhow::Error) -> Self {
         Self {
+            output: None,
             failed: true,
             storage_failed: super::is_operational_storage_error(error),
         }
@@ -32,25 +34,54 @@ pub(super) async fn write_sidecar_metadata(
     source_checksum: Option<&str>,
     temp_suffix: &str,
 ) -> SidecarWriteOutcome {
+    write_sidecar_with_source(
+        path,
+        payload,
+        created_local,
+        source_checksum,
+        temp_suffix,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn write_sidecar_with_source(
+    path: &Path,
+    payload: Arc<MetadataPayload>,
+    created_local: DateTime<FixedOffset>,
+    source_checksum: Option<&str>,
+    temp_suffix: &str,
+    snapshot: Option<Arc<crate::download::file::WriterSnapshot>>,
+) -> SidecarWriteOutcome {
     let source_checksum = source_checksum.map(str::to_owned);
     let sidecar_path = path.to_path_buf();
     let log_path = sidecar_path.clone();
     let planned = tokio::task::spawn_blocking(move || {
-        plan_sidecar_write(
+        let plan = plan_sidecar_write(
             &sidecar_path,
             &payload,
             &created_local,
             source_checksum.as_deref(),
-        )
+            snapshot.as_deref(),
+        );
+        if let Some(snapshot) = snapshot {
+            snapshot.still_matches()?;
+        }
+        anyhow::Ok(plan)
     })
     .await;
     let (write, source_error) = match planned {
-        Ok(planned) => planned,
+        Ok(Ok(planned)) => planned,
+        Ok(Err(error)) => {
+            tracing::warn!(%error,"Sidecar input changed during planning; leaving metadata pending");
+            return SidecarWriteOutcome::failure(&error);
+        }
         Err(error) => {
             tracing::warn!(
                 target: "kei::download::metadata_rewrite",
                 error = %error, "XMP sidecar planning task panicked");
             return SidecarWriteOutcome {
+                output: None,
                 failed: true,
                 storage_failed: false,
             };
@@ -80,14 +111,17 @@ pub(super) async fn write_sidecar_metadata(
     ))
     .await
     {
-        Ok(()) => {
+        Ok(output) => {
             crate::support::observe_metadata(
                 path,
                 "support_metadata_v1",
                 serde_json::json!({"operation":"sidecar","applied":true}),
             );
             let Some(error) = source_error else {
-                return SidecarWriteOutcome::default();
+                return SidecarWriteOutcome {
+                    output,
+                    ..Default::default()
+                };
             };
             crate::support::metadata_error(path, "source_gps", &error, Some(true));
             tracing::warn!(
@@ -172,11 +206,21 @@ fn plan_sidecar_write(
     payload: &MetadataPayload,
     created_local: &DateTime<FixedOffset>,
     source_checksum: Option<&str>,
+    snapshot: Option<&crate::download::file::WriterSnapshot>,
 ) -> (
     crate::download::metadata::MetadataWrite,
     Option<anyhow::Error>,
 ) {
-    let (source_gps, mut source_error) = match crate::download::metadata::read_source_gps(path) {
+    let gps = match snapshot {
+        Some(s) => s
+            .source_handle()
+            .map_err(anyhow::Error::from)
+            .and_then(|mut file| {
+                crate::download::metadata::read_source_gps_from_file(&mut file, path)
+            }),
+        None => crate::download::metadata::read_source_gps(path),
+    };
+    let (source_gps, mut source_error) = match gps {
         Ok(metadata) => (metadata, None),
         Err(error) => (
             crate::download::metadata::SourceGpsMetadata::default(),
@@ -202,8 +246,13 @@ fn plan_sidecar_write(
         && source_gps.horizontal_positioning_error.is_some()
         && let Some(expected) = source_checksum
     {
-        match crate::download::file::fingerprint_regular_file_snapshot_blocking(path) {
-            Ok(actual) => fingerprint_checksum(actual.fingerprint) == expected,
+        let fingerprint = match snapshot {
+            Some(s) => Ok(s.fingerprint),
+            None => crate::download::file::fingerprint_regular_file_snapshot_blocking(path)
+                .map(|actual| actual.fingerprint),
+        };
+        match fingerprint {
+            Ok(actual) => fingerprint_checksum(actual) == expected,
             Err(error) => {
                 source_error = Some(error);
                 false

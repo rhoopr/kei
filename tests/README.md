@@ -22,6 +22,8 @@ explains what runs where. Follow the
 behavior changes, and failure investigation. This guide owns the
 [state-transition proof](#state-transition-proof) and suite-specific setup.
 
+On Unix, `cargo test --test cli setup_enter_default` drives the real wizard through a Python 3 pseudo-terminal with a temporary home and a deferred password file. It checks cancellation before saving and the default first-sync choice without contacting Apple or using a keyring.
+
 ## Layout
 
 ```
@@ -130,7 +132,7 @@ library suite and need no credentials or stored media fixtures.
 
 Ordinary `cargo test`, `just gate`, coverage, and their all-feature and
 no-default-feature runs exclude the ignored 300-photo stress case. The
-three-photo fixture checks two independent album copies per photo, two source reseeds, two quiet SQLite reopens, unchanged completed media and sidecar timestamps, logical obligations, and preserved proof. A separate three-photo, single-cycle test uses a task-scoped budget of eight writers with a reserve of four, crossing the priority/remaining scheduling branch with six physical writers. A five-writer budget exercises overflow across reseeds with the same six copies. The scheduler owner separately asserts the production 250-current/500-total limits. The 300-photo case has 600 independent physical writers. Each reseed leaves 100 current metadata receipts pending under the 500-row budget; the first unchanged cycle drains them, followed by two quiet reopens. Completed physical sidecars must remain unchanged across every later cycle, including source reseeds. Task-scoped overrides cannot affect parallel tests or production builds.
+three-photo fixture checks two independent album copies per photo, two source reseeds, two quiet SQLite reopens, unchanged completed media and sidecar timestamps, logical obligations, and preserved proof. A separate three-photo, single-cycle test uses a task-scoped budget of eight writers with a reserve of four, crossing the priority/remaining scheduling branch with six physical writers. A five-writer budget exercises overflow across reseeds with the same six copies. The scheduler owner separately asserts the production 250-current/500-total limits. The 300-photo case has 600 independent physical writers. The first cycle leaves 100 pending under the 500-row budget. The next generation must finish them while retaining valid work for the other 500. Completed physical sidecars must remain unchanged across later cycles. Task-scoped overrides cannot affect parallel tests or production builds.
 
 The collision regressions cover album/album, album/smart-folder and smart-folder/smart-folder destinations, completed-copy deletion, exact-path recovery, locally edited peer preservation, and two quiet reopens. Admission regressions cover both concurrent fresh decisions and a confirmed selected deferred decision whose path was claimed before its original blocker cleared. The latter retains its frozen declaration on conflict and recovers through a current-configuration successor. Historical shared-path receipts remain intact; the historical metadata control still requires one physical writer for two retained aliases. Current colliding-album metadata fixtures retain prepared-output corruption, writer-option drift, finalization faults and native-path controls for independent physical copies.
 
@@ -141,11 +143,13 @@ The regular Linux CI test job checks this catalog so a rename, lost ignore
 marker, or feature change cannot silently remove the stress proof.
 
 `Copies stress` runs once with all features on Linux on main pushes and during heavy qualification. The [PR baseline](../docs/ci.md#pr-baseline) runs the compact copies/reseed fixture as part of the sync-safety suite. Run the explicit stress command for local scale diagnosis.
-CI coverage and `just cov patch` explicitly skip the test on head and base,
+`just cov patch` explicitly skips the test on head and base,
 including an older base
 that has not marked it ignored. The no-default build lacks XMP and does not
 repeat either XMP fixture; the regular all-feature matrix retains platform
 coverage for the small and boundary cases.
+
+For local writer performance, run `cargo test --release --locked --lib sidecar_only_backfill_linux_release_read_benchmark -- --ignored --nocapture --test-threads=1` on Linux. The benchmark times selected sidecar backfill for a JPEG and two MP4 sizes, with both missing and already-correct packets. Compare median elapsed time and `/proc/self/io` `rchar` on the same filesystem; `rchar` counts logical reads, including cache hits. Download and fixture setup are outside the measurement.
 
 ## Focused scenario slices
 
@@ -719,7 +723,7 @@ Request-clear transaction failure, cancellation, changed configuration and chang
 
 Legacy coverage certificates are retained history, not current completion or checkpoint authority. When adapting fixtures, keep their original discovery, ownership, path, media, metadata and failure stimuli. Replace certification-only assertions; do not remove a current observation just because the retired route used to discover it. A current write failure must remain reachable through a production owner rather than an inactive proof writer.
 
-Require current-item progress with preserved historical rows, protected originals, missing certificates and changed historical evidence. Historical counters alone must not fail a cycle, prevent a health success or cause repeated inventories. `unattributed_legacy_pending` now inventories missing stored certificates at the recorded generation without dependency revalidation. Preserve the separate `Backup status: unsafe` historical-completeness warning and all current retry, unresolved-identity, metadata and checkpoint failure oracles.
+Require current-item progress with preserved historical rows, protected originals, missing certificates and changed historical evidence. Historical counters alone must not fail a cycle, prevent a health success or cause repeated inventories. `unattributed_legacy_pending` now inventories missing stored certificates at the recorded generation without dependency revalidation. Preserve status reporting of unresolved historical attribution and all current retry, unresolved-identity, metadata and checkpoint failure oracles.
 
 Retired `reconcile trust-legacy-files plan/apply` cases must prove early actionable refusal with existing declarations, configuration, state and media unchanged. Historical declarations are setup evidence, not a successful new trust operation or verified source provenance. Preserve real current discovery, healthy-peer progress and current-failure recovery in former trust fixtures. Use reopened state and quiet follow-up cycles where applicable; record actual test entry points and results only after the adapted production paths have run.
 
@@ -852,6 +856,8 @@ qualification. Retry-only known failures cannot hide unqueued omitted assets;
 a RUNNING album-plan transition must rebuild the omitted album after FINISHED.
 File-backed replay debt also bypasses an otherwise quiet watch pre-check.
 
+`indexing_split_pass_tokens_require_quiet_inventory_then_replay_retained_cursor` reopens SQLite between album-plus-unfiled scans. A raw change, a missing pass token, and interruption each retain the hold. A quiet scan with different pass tokens qualifies the inventory. During replay, a blank token and then a zone change each keep the original cursor. The next quiet inventory qualifies, and the following incremental cycle issues no inventory queries.
+
 `primary_layout::indexing` additionally starts with real managed files or an
 interrupted journal, reopens SQLite between phases, and proves RUNNING remains
 blocked under primary and recorded-layout suffix modes. FINISHED inventory is
@@ -922,7 +928,7 @@ Finalization rejects missing or skipped required offline phases and failed
 phase records. Live and platform skips remain explicit, not test coverage.
 
 Linux tooling tests in `branch_static` require `just` on `PATH`; CI installs
-its pinned version before both complete Rust suites and coverage runs. Other
+its pinned version before both complete Rust suites. Other
 platforms retain their existing Rust test coverage; executable dispatcher
 fixtures are Linux-only.
 
@@ -944,7 +950,7 @@ just test packaging             # release build + archive smoke
 just test docker-full           # Docker build, PUID, multiarch, CLI/default-command smokes
 just test service               # local service-smoke wrapper
 just test PATTERN               # passes through to cargo test PATTERN
-just static-checks              # fmt, clippy, docs, audit, lint, contracts, typos
+just static-checks              # fmt, clippy, docs, dependency policy, lint, contracts, typos
 just gate                       # static checks + offline behavior tests
 just release-smoke              # fast offline release regression smoke
 just release-local              # authorized local release provider/host prerequisites

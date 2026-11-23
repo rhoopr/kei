@@ -454,10 +454,22 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     finalize_hash(hasher)
 }
 
+/// Evidence available before a multi-pass indexing inventory. Observation
+/// never consumes a source change; only an applied delta can offer a successor.
+#[derive(Clone)]
+pub(crate) enum IndexingWindow {
+    ObserveFrom(String),
+    AwaitReplay,
+    ReplayedTo(String),
+}
+
 /// Subset of application config consumed by the download engine.
 /// Decoupled from CLI parsing so the engine can be tested independently.
 #[derive(Clone)]
 pub(crate) struct DownloadConfig {
+    /// The runner owns a local writer phase after all selected zones and
+    /// their database checkpoint. Standalone dispatch must finish its own work.
+    pub(crate) post_sync_metadata: bool,
     /// One upgrade-requested inventory guarded by retained-cursor replay.
     pub(crate) inventory_reconciliation: bool,
     /// A due sparse source in another selected zone needs a fresh membership scan.
@@ -518,6 +530,8 @@ pub(crate) struct DownloadConfig {
     pub(crate) provisional: bool,
     /// Qualify managed recovery without planning or publishing local work.
     pub(crate) indexing_inventory_only: bool,
+    /// Trusted replay origin available for a FINISHED, single-zone indexing inventory.
+    pub(crate) indexing_inventory_cursor: Option<IndexingWindow>,
     /// Sync mode: full enumeration or incremental delta via syncToken.
     pub(crate) sync_mode: SyncMode,
     /// Hash of enumeration-affecting config. Full album snapshots persist this
@@ -698,6 +712,7 @@ impl DownloadConfig {
         use rustc_hash::FxHashSet;
         Self {
             inventory_reconciliation: false,
+            post_sync_metadata: false,
             directory: Arc::from(Path::new("/nonexistent/download_filter_tests")),
             folder_structure: "{:%Y/%m/%d}".to_string(),
             folder_structure_albums: Arc::from(crate::config::DEFAULT_FOLDER_STRUCTURE_ALBUMS),
@@ -740,6 +755,7 @@ impl DownloadConfig {
             selection_pass: None,
             provisional: false,
             indexing_inventory_only: false,
+            indexing_inventory_cursor: None,
             sync_mode: SyncMode::Full,
             enum_config_hash: None,
             album_name: None,

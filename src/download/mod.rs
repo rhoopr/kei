@@ -28,13 +28,14 @@ pub(crate) use filter::{AssetGroupings, determine_media_type};
 mod orchestration;
 
 pub(crate) use orchestration::config::{
-    DOWNLOAD_CONFIG_HASH_KEY, DownloadConfig, InventoryScope, compute_config_hash,
+    DOWNLOAD_CONFIG_HASH_KEY, DownloadConfig, IndexingWindow, InventoryScope, compute_config_hash,
     hash_download_config, hash_legacy_download_config, inventory_scope,
     sync_coverage_fingerprint_json,
 };
 pub(crate) use orchestration::context::{ClaimedLegacyMasterStates, DownloadContext};
 use orchestration::context::{RecordedLocalFile, preload_download_context};
 pub use orchestration::dispatch::download_photos_with_sync;
+pub(crate) use orchestration::generation::drain_local_backfill;
 pub(crate) use orchestration::generation::has_due as has_due_selection_work;
 pub(crate) use orchestration::generation::recover_deleted_album_selection;
 pub(crate) use orchestration::maintenance::{

@@ -17,7 +17,7 @@ static-checks:
     cargo clippy --all-targets --no-default-features -- -D warnings
     RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
     cargo fetch --locked
-    cargo audit --deny warnings
+    cargo deny check
     just lint-workflows
     just lint-scripts
     scripts/check-contracts
@@ -585,7 +585,7 @@ doctor:
     fi
     have_cmd cargo-fuzz
     have_cargo_subcommand udeps "cargo-udeps"
-    have_cargo_subcommand audit "cargo-audit"
+    have_cargo_subcommand deny "cargo-deny"
     have_cargo_subcommand llvm-cov "cargo-llvm-cov"
     have_cmd typos
     have_cmd docker

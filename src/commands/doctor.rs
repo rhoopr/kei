@@ -232,7 +232,13 @@ pub(crate) async fn run_doctor(
     redactor.add(&username);
 
     let mut checks = Vec::new();
-    checks.push(check_config_parse(config_load_error.as_deref()));
+    checks.push(check_config_parse(
+        config_load_error.as_deref(),
+        toml.is_some(),
+    ));
+    if config_load_error.is_none() {
+        checks.push(check_password_source(args.has_env_password, toml).await);
+    }
     checks.push(check_download_dir(toml));
     checks.push(
         check_state_db(
@@ -280,12 +286,81 @@ pub(crate) async fn run_doctor(
     Ok(())
 }
 
-fn check_config_parse(error: Option<&str>) -> DoctorCheck {
+async fn check_password_source(direct: bool, toml: Option<&config::TomlConfig>) -> DoctorCheck {
+    let auth = toml.and_then(|t| t.auth.as_ref());
+    let env = cli::PasswordArgs {
+        password_file: std::env::var("KEI_PASSWORD_FILE").ok(),
+        password_command: std::env::var("KEI_PASSWORD_COMMAND").ok(),
+        ..Default::default()
+    };
+    let (status, message) = if auth.is_some_and(|a| a.password.is_some()) {
+        (
+            CheckStatus::Error,
+            "sync does not accept a plaintext password in the config",
+        )
+    } else if auth.is_some_and(|a| a.password_file.is_some() && a.password_command.is_some())
+        || (env.password_file.is_some() && env.password_command.is_some())
+    {
+        (
+            CheckStatus::Error,
+            "conflicting password file and command; select one source",
+        )
+    } else if cfg!(windows) && config::resolve_password_command(&env, auth).is_some() {
+        (
+            CheckStatus::Error,
+            "password commands are not supported on Windows",
+        )
+    } else if direct {
+        (
+            CheckStatus::Skipped,
+            "direct password supplied; authentication not tested",
+        )
+    } else if config::resolve_password_command(&env, auth).is_some() {
+        (
+            CheckStatus::Skipped,
+            "password command configured; execution deferred",
+        )
+    } else if let Some(path) = config::resolve_password_file(&env, auth) {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NONBLOCK);
+        let metadata = async { options.open(path).await?.metadata().await }.await;
+        if metadata.is_ok_and(|m| m.is_file()) {
+            (
+                CheckStatus::Ok,
+                "password file accessible; contents not checked",
+            )
+        } else {
+            (
+                CheckStatus::Error,
+                "password file missing, unreadable, or not a regular file",
+            )
+        }
+    } else {
+        (
+            CheckStatus::Skipped,
+            "credential store and interactive input not checked",
+        )
+    };
+    DoctorCheck {
+        name: "password_source",
+        status,
+        message: message.into(),
+    }
+}
+
+fn check_config_parse(error: Option<&str>, loaded: bool) -> DoctorCheck {
     match error {
         Some(error) => DoctorCheck {
             name: "config_parse",
             status: CheckStatus::Error,
             message: error.to_string(),
+        },
+        None if !loaded => DoctorCheck {
+            name: "config_parse",
+            status: CheckStatus::Skipped,
+            message: "config file absent; no file parsed".to_string(),
         },
         None => DoctorCheck {
             name: "config_parse",
@@ -449,7 +524,7 @@ async fn check_live_session(username: &str, domain: &str, cookie_dir: &Path) -> 
         Ok(false) => DoctorCheck {
             name: "live_session",
             status: CheckStatus::Warning,
-            message: "saved iCloud session is not currently valid; run `kei login`".to_string(),
+            message: "saved iCloud session is not currently valid; sign in with the same config and data directory".to_string(),
         },
         Err(e) => DoctorCheck {
             name: "live_session",

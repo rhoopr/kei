@@ -10,16 +10,22 @@ use super::embedded::{
 use super::grouping::load_pending_groupings;
 use super::planning::{CaptureTimestampRepair, MetadataFlags};
 #[cfg(feature = "xmp")]
-use super::sidecar::write_sidecar_metadata;
+use super::sidecar::write_sidecar_with_source;
 use crate::download::filter::MetadataPayload;
 use crate::download::{DownloadConfig, DownloadContext};
 use crate::icloud::photos::PhotoAsset;
+use crate::state::db::provider_generations::WriterOutput;
 use crate::state::db::{CaptureRepairReceipt, MetadataRewriteCompletion, MetadataRewriteQueue};
 use crate::state::{MembershipStore, MetadataRewriteStore, VersionSizeKey};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(all(test, unix, feature = "xmp"))]
+tokio::task_local! {
+    pub(in crate::download) static BEFORE_SIDECAR_RECEIPT: Box<dyn Fn(&std::path::Path)>;
+}
 
 /// Persist a metadata-rewrite marker for each candidate version whose
 /// metadata drifted from the stored hash, or that already carries a marker
@@ -89,6 +95,7 @@ pub(in crate::download) struct RewritePass {
     /// retryable metadata failures do not set this flag.
     pub(in crate::download) storage_failed: bool,
     pub(in crate::download) retired_from_selected_queue: usize,
+    pub(in crate::download) state_failed: bool,
 }
 
 /// Process one bounded batch of persisted metadata-rewrite markers: for each
@@ -202,6 +209,57 @@ pub(in crate::download) async fn run_pending_rows<D>(
 where
     D: MembershipStore + MetadataRewriteStore + ?Sized,
 {
+    write_rows(
+        db,
+        metadata_flags,
+        capture_timestamp_repair,
+        temp_suffix,
+        shutdown_token,
+        pending,
+        WriterPhase::Inline,
+    )
+    .await
+}
+
+pub(in crate::download) async fn run_backfill_rows(
+    db: &crate::state::SqliteStateDb,
+    flags: MetadataFlags,
+    suffix: Arc<str>,
+    cancel: &CancellationToken,
+    rows: Vec<crate::state::db::PendingMetadataRewrite>,
+    generation: Option<&str>,
+) -> RewritePass {
+    write_rows(
+        db,
+        flags,
+        CaptureTimestampRepair::Preserve,
+        suffix,
+        cancel,
+        rows,
+        WriterPhase::AfterSync { db, generation },
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum WriterPhase<'a> {
+    Inline,
+    AfterSync {
+        db: &'a crate::state::SqliteStateDb,
+        generation: Option<&'a str>,
+    },
+}
+
+async fn write_rows<D: MembershipStore + MetadataRewriteStore + ?Sized>(
+    db: &D,
+    metadata_flags: MetadataFlags,
+    capture_timestamp_repair: CaptureTimestampRepair,
+    temp_suffix: Arc<str>,
+    shutdown_token: &CancellationToken,
+    pending: Vec<crate::state::db::PendingMetadataRewrite>,
+    phase: WriterPhase<'_>,
+) -> RewritePass {
+    let post_sync = matches!(phase, WriterPhase::AfterSync { .. });
     let selected_queue = if matches!(
         capture_timestamp_repair,
         CaptureTimestampRepair::ReplaceWithCaptureLocal
@@ -238,8 +296,12 @@ where
     let mut errored = 0usize;
     let mut deferred = 0usize;
     let mut storage_failed = false;
+    let mut state_failed = !grouping_read_failures.is_empty();
     let mut retired_from_selected_queue = 0usize;
     for (idx, pending_rewrite) in pending.into_iter().enumerate() {
+        if state_failed && post_sync {
+            break;
+        }
         if storage_failed {
             deferred += pending_count - idx;
             tracing::warn!(
@@ -314,6 +376,42 @@ where
             deferred += 1;
             continue;
         }
+        if let Some(receipt) = &pending_rewrite.selection_receipt
+            && metadata_flags.uses_xmp_groupings()
+        {
+            let groups = groupings_by_library.get(record.library.as_ref());
+            let albums = groups
+                .and_then(|g| g.albums.get(record.id.as_ref()))
+                .map_or(&[][..], Vec::as_slice);
+            let people = groups
+                .and_then(|g| g.people.get(record.id.as_ref()))
+                .map_or(&[][..], Vec::as_slice);
+            if !crate::state::db::provider_generations::writer_grouping_hash(albums, people)
+                .is_ok_and(|hash| hash == receipt.grouping_hash)
+            {
+                deferred += 1;
+                continue;
+            }
+        }
+        let claim = match phase {
+            WriterPhase::Inline => db.claim_selection_writer(&pending_rewrite).await,
+            WriterPhase::AfterSync { db, generation } => {
+                db.claim_backfill_writer(&pending_rewrite, generation).await
+            }
+        };
+        match claim {
+            Ok(true) => {}
+            Ok(false) => {
+                deferred += 1;
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Could not validate queued metadata writer");
+                state_failed = true;
+                errored += 1;
+                continue;
+            }
+        }
 
         if let Err(error) = crate::download::file::recover_metadata_replacements(&path).await {
             tracing::warn!(path = %path.display(), error = %format!("{error:#}"),
@@ -385,6 +483,7 @@ where
         {
             Ok(receipt) => receipt,
             Err(error) => {
+                state_failed = true;
                 tracing::warn!(%error, "Could not read embedded field ownership");
                 errored += 1;
                 continue;
@@ -431,6 +530,7 @@ where
                     .recover_embedded_metadata_receipt(&pending_rewrite, &receipt, measured.size)
                     .await
                 {
+                    state_failed = true;
                     tracing::warn!(%error, "Could not finalize previous embedded field output");
                     errored += 1;
                     continue;
@@ -651,6 +751,7 @@ where
                         .await
                     {
                         tracing::warn!(%error, "Could not retain prepared embedded field ownership");
+                        state_failed = true;
                         errored += 1;
                         continue;
                     }
@@ -677,7 +778,8 @@ where
                                 Ok(Some(receipt)) => {
                                     pending_for_finish.selection_receipt = Some(receipt)
                                 }
-                                Ok(None) | Err(_) => {
+                                result => {
+                                    state_failed |= result.is_err();
                                     errored += 1;
                                     continue;
                                 }
@@ -705,6 +807,7 @@ where
                                     continue;
                                 }
                                 Err(error) => {
+                                    state_failed = true;
                                     tracing::warn!(
                                         target: "kei::download::metadata_rewrite",
                                         path = %path.display(),
@@ -755,16 +858,76 @@ where
         }
 
         #[cfg(feature = "xmp")]
+        let pinned = if post_sync
+            && metadata_flags.contains(MetadataFlags::XMP_SIDECAR)
+            && !metadata_flags.any_embed()
+            && final_fingerprint.is_none()
+            && pending_for_finish.selection_receipt.is_some()
+        {
+            crate::download::file::WriterSnapshot::for_sidecar(&path)
+                .await
+                .map(Arc::new)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "xmp"))]
+        let pinned: Option<Arc<crate::download::file::WriterSnapshot>> = None;
+
+        #[cfg(feature = "xmp")]
         if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
-            let sidecar = write_sidecar_metadata(
+            // Only certify a packet that was planned from the recorded media bytes.
+            // In particular, a sidecar-only retry need not own the media itself.
+            let certified_input = if pending_for_finish.selection_receipt.is_some() || post_sync {
+                if let Some(output) = final_fingerprint {
+                    Some(output)
+                } else {
+                    let measured = match &pinned {
+                        Some(snapshot) => Some(snapshot.fingerprint),
+                        None => crate::download::file::fingerprint_regular_file(&path)
+                            .await
+                            .ok(),
+                    };
+                    measured
+                        .filter(|input| Some(fingerprint_checksum(*input)) == record.local_checksum)
+                }
+            } else {
+                None
+            };
+            if post_sync && certified_input.is_none() {
+                skipped_drifted += 1;
+                continue;
+            }
+            let sidecar = write_sidecar_with_source(
                 &path,
                 Arc::clone(&payload),
                 created_local,
                 pending_rewrite.source_checksum.as_deref(),
                 &temp_suffix,
+                pinned.clone(),
             )
             .await;
             outcome.sidecar_failed = sidecar.failed;
+            if let Some(receipt) = pending_for_finish.selection_receipt.as_mut()
+                && let Some(before) = certified_input
+                && let Some(packet) = sidecar.output
+            {
+                #[cfg(all(test, unix))]
+                let _ = BEFORE_SIDECAR_RECEIPT.try_with(|edit| edit(&path));
+                // Only the Windows handle excludes writes. On Unix a shared
+                // mapping can change bytes without advancing the inode's ctime.
+                if (cfg!(windows) && pinned.is_some())
+                    || crate::download::file::fingerprint_regular_file(&path)
+                        .await
+                        .ok()
+                        == Some(before)
+                {
+                    receipt.writer_output =
+                        Some((WriterOutput::Sidecar(packet), *created_local.offset()));
+                } else if post_sync {
+                    skipped_drifted += 1;
+                    continue;
+                }
+            }
             storage_failed |= sidecar.storage_failed;
         }
 
@@ -813,6 +976,13 @@ where
         }
 
         let ordinary_complete = !outcome.any_failed() && !recovered_capture_only;
+        if !metadata_flags.contains(MetadataFlags::XMP_SIDECAR)
+            && ordinary_complete
+            && final_fingerprint.is_some()
+            && let Some(receipt) = pending_for_finish.selection_receipt.as_mut()
+        {
+            receipt.writer_output = Some((WriterOutput::EmbeddedOnly, *created_local.offset()));
+        }
         if let Some(preserved) = preserved_local {
             let current_time = tokio::fs::metadata(&path)
                 .await
@@ -853,28 +1023,47 @@ where
             }))
             .and_then(|(after, before)| (after != before).then_some(before));
         if completion != MetadataRewriteCompletion::None || media_checksum_changed {
-            match db
-                .finish_metadata_rewrite(
-                    &pending_for_finish,
-                    selected_queue,
-                    final_checksum.as_deref(),
-                    input_checksum_for_download,
-                    completion,
-                )
-                .await
-            {
+            let retained_input = pinned.is_some();
+            let finished =
+                if let (Some(snapshot), WriterPhase::AfterSync { db, .. }) = (pinned, phase) {
+                    db.finish_metadata_rewrite_checked(
+                        &pending_for_finish,
+                        selected_queue,
+                        final_checksum.as_deref(),
+                        input_checksum_for_download,
+                        completion,
+                        move || snapshot.still_matches().is_ok(),
+                    )
+                    .await
+                } else {
+                    db.finish_metadata_rewrite(
+                        &pending_for_finish,
+                        selected_queue,
+                        final_checksum.as_deref(),
+                        input_checksum_for_download,
+                        completion,
+                    )
+                    .await
+                };
+            match finished {
+                Ok(false) if retained_input => {
+                    skipped_unverified += 1;
+                    continue;
+                }
                 Ok(retired) => {
                     applied += usize::from(ordinary_complete);
                     retired_from_selected_queue += usize::from(retired);
                 }
                 Err(error) => {
+                    state_failed = true;
                     tracing::warn!(
                         target: "kei::download::metadata_rewrite",
                         asset_id = %record.id,
                         %error,
                         "Failed to finalise metadata rewrite state"
                     );
-                    if selected_queue == MetadataRewriteQueue::Ordinary
+                    if !post_sync
+                        && selected_queue == MetadataRewriteQueue::Ordinary
                         && pending_rewrite.selection_receipt.is_none()
                         && pending_rewrite.capture_repair_receipt.is_none()
                         && let Err(fallback_error) = db
@@ -937,6 +1126,7 @@ where
         "Metadata rewrite pass complete"
     );
     RewritePass {
+        state_failed,
         fetched: pending_count,
         applied,
         failed: errored + deferred + skipped_drifted + skipped_unverified,

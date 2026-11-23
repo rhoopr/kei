@@ -36,11 +36,13 @@ jobs:
       statuses: read
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
-      - uses: taiki-e/install-action@b7d831ec1a6ef0d81d27cf61932d92140b2271d4 # cargo-audit
+      - uses: taiki-e/install-action@b7d831ec1a6ef0d81d27cf61932d92140b2271d4 # cargo-deny
+        with:
+          tool: cargo-deny
 
       - name: Verify tag matches Cargo.toml version
         if: github.event_name == 'push'
@@ -62,7 +64,7 @@ jobs:
           fi
 
       - name: Security audit
-        run: cargo audit --deny warnings
+        run: cargo deny check
 
       - name: Require exact-commit local prerequisites before a release
         if: github.event_name == 'push'
@@ -80,10 +82,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
 
@@ -100,6 +104,14 @@ jobs:
         run: |
           cd candidate
           sha256sum -- *.tar.gz *.zip > SHA256SUMS.txt
+
+      - name: Attest release archives
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: |
+            candidate/*.tar.gz
+            candidate/*.zip
+            candidate/SHA256SUMS.txt
 
       - name: Generate release notes
         id: release_notes
@@ -143,8 +155,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -161,6 +175,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish the tested image IDs without rebuilding
+        id: publish
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
@@ -170,12 +185,32 @@ jobs:
             python3 scripts/ci/artifact.py verify-loaded-container "$arch"
             docker tag kei:candidate "$image:$version-$arch"
             docker push "$image:$version-$arch"
+            digest=$(docker buildx imagetools inspect "$image:$version-$arch" --format '{{json .Manifest}}' | jq -r .digest)
+            if [[ -z "$digest" || "$digest" == "null" ]]; then
+              echo "::error::missing registry manifest digest for $image:$version-$arch"
+              exit 1
+            fi
+            echo "$arch=$digest" >> "$GITHUB_OUTPUT"
           done
           docker buildx imagetools create -t "$image:$version" "$image:$version-amd64" "$image:$version-arm64"
           # Do not move stable aliases for a prerelease.
           if [[ "$version" != *-* ]]; then
             docker buildx imagetools create -t "$image:${version%.*}" -t "$image:latest" "$image:$version"
           fi
+
+      - name: Attest amd64 image provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.publish.outputs.amd64 }}
+          push-to-registry: true
+
+      - name: Attest arm64 image provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.publish.outputs.arm64 }}
+          push-to-registry: true
 
   resume_containers:
     if: github.event_name == 'workflow_dispatch' && (inputs.publication_run != '' || inputs.publication_tag != '') && github.ref == 'refs/heads/main'
@@ -188,7 +223,7 @@ jobs:
       tag: ${{ steps.validate.outputs.tag }}
     steps:
       - name: Checkout trusted workflow source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
 
@@ -201,7 +236,7 @@ jobs:
         run: python3 scripts/ci/publication.py --repo "$GITHUB_REPOSITORY" --run "$PUBLICATION_RUN" --tag "$PUBLICATION_TAG"
 
       - name: Checkout the validated release commit
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ steps.validate.outputs.sha }}
           path: qualified
@@ -259,7 +294,7 @@ jobs:
       RELEASE_TAG: ${{ needs.resume_containers.result == 'success' && needs.resume_containers.outputs.tag || github.ref_name }}
     steps:
       - name: Checkout tap
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: rhoopr/homebrew-kei
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}

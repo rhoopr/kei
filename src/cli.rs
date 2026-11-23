@@ -1,7 +1,27 @@
 use crate::types::LogLevel;
 use clap::{Args, FromArgMatches, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+pub(crate) fn command_for_config(command: &str, config: Option<&Path>) -> String {
+    let Some(path) = config else {
+        return format!("kei {command}");
+    };
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    let quoted = path.replace('\'', "''"); // PowerShell literal string
+    #[cfg(not(windows))]
+    let quoted = path.replace('\'', "'\\''");
+    format!("kei --config '{quoted}' {command}")
+}
+
+pub(crate) fn two_factor_instructions(config: Option<&Path>) -> String {
+    format!(
+        "Run `{}`, then `{}`.",
+        command_for_config("login get-code", config),
+        command_for_config("login submit-code <CODE>", config)
+    )
+}
 
 /// Reject empty strings at CLI parse time.
 fn non_empty_string(s: &str) -> Result<String, String> {
@@ -258,6 +278,9 @@ pub struct StatusArgs {
 /// Arguments for local diagnostics.
 #[derive(Parser, Debug, Clone)]
 pub struct DoctorArgs {
+    /// Whether startup captured a direct sync password before scrubbing the environment.
+    #[arg(skip)]
+    pub(crate) has_env_password: bool,
     /// Inventory missing parent references using cached auth only; no media or catalogue access
     #[arg(long, requires_all = ["live", "json"])]
     pub missing_reference_inventory: bool,
@@ -343,7 +366,7 @@ pub struct ImportArgs {
 /// Arguments for the verify command.
 #[derive(Parser, Debug, Clone)]
 pub struct VerifyArgs {
-    /// Verify checksums (slower but more thorough)
+    /// Compare files with their stored local SHA-256 checksums; report missing baselines separately
     #[arg(long)]
     pub checksums: bool,
 }
@@ -884,6 +907,10 @@ impl Command {
     /// the active command carries.
     pub fn inject_env_password(&mut self, env_password: Option<String>) {
         let Some(pw) = env_password else { return };
+        if let Self::Doctor(doctor) = self {
+            doctor.has_env_password = true;
+            return;
+        }
         if let Some(args) = self.password_args_mut()
             && args.password.is_none()
         {

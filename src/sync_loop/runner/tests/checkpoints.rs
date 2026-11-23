@@ -679,6 +679,126 @@ async fn run_cycle_clean_zone_advances_despite_other_stale_plan() {
     );
 }
 
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn primary_cycle_finishes_both_libraries_before_any_local_backfill() {
+    use crate::sync_loop::test_support::{
+        MutableCaptureSession, make_owned_cycle_album, open_owned_cycle_db,
+    };
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let inner = open_owned_cycle_db(&dir.path().join("state.db")).await;
+    let store: Arc<dyn download::DownloadStore> = inner.clone();
+    let server = wiremock::MockServer::start().await;
+    let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(bytes.as_slice()))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut states = Vec::new();
+    for (zone, database) in [("PrimarySync", "private"), ("SharedSync-TEST", "shared")] {
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+        let mut page = full_album_page_with_download(
+            zone,
+            zone,
+            "current",
+            &server.uri(),
+            bytes.len() as u64,
+            &checksum,
+        );
+        page["records"][0]["fields"]["filenameEnc"]["value"] =
+            serde_json::json!(format!("{zone}.jpg"));
+        page["records"][1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+            serde_json::json!("_defaultOwner");
+        let album = make_owned_cycle_album(
+            &inner,
+            zone,
+            database,
+            Box::new(MutableCaptureSession {
+                zone,
+                token: "current",
+                cancel_after_lookup: None,
+                records: Arc::new(std::sync::Mutex::new(
+                    page["records"].as_array().unwrap().clone(),
+                )),
+                repair_requests: Default::default(),
+            }),
+        );
+        states.push(make_run_cycle_library_state_with_album(
+            zone,
+            &format!("sync_token:{zone}"),
+            album,
+        ));
+    }
+    let media_dir = tempfile::tempdir().unwrap();
+    let base = make_run_cycle_download_config_builder(media_dir.path(), store.clone());
+    let builder = |mode, excluded, groups, library| {
+        let mut config = base(mode, excluded, groups, library);
+        let c = Arc::make_mut(&mut config);
+        c.post_sync_metadata = true;
+        c.metadata.xmp_sidecar = true;
+        config
+    };
+    let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+    let cfg = make_run_cycle_config();
+    let controls = download::DownloadControls::download_hidden();
+    let cancel = CancellationToken::new();
+    let result = run_cycle(
+        &states.iter().collect::<Vec<_>>(),
+        &cfg,
+        Some(store.as_ref()),
+        &builder,
+        controls,
+        &session,
+        &cancel,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.stats.downloaded, 2, "{:?}", result.stats);
+    assert!(
+        result.can_advance_database_checkpoint(),
+        "{:?}",
+        result.stats
+    );
+    let pending = || {
+        inner.acquire_lock("retained metadata for both libraries").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_media=1 AND verified_metadata=0",[],|r|r.get(0)).unwrap()
+    };
+    assert_eq!(pending(), 2);
+    for library in &states {
+        assert_eq!(
+            store
+                .get_metadata(&library.sync_token_key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("current")
+        );
+    }
+    for library in &states {
+        let config = builder(
+            download::SyncMode::Full,
+            Arc::default(),
+            Arc::default(),
+            Arc::from(library.zone_name.as_str()),
+        );
+        let result = Box::pin(download::drain_local_backfill(
+            &library.plan.passes,
+            &config,
+            &inner,
+            controls,
+            &cancel,
+            None,
+            &mut Default::default(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(result.failed, 0);
+    }
+    assert_eq!(pending(), 0);
+}
+
 #[tokio::test]
 async fn run_cycle_stale_plan_blocks_database_precheck_token() {
     let config = make_run_cycle_config();
@@ -2294,7 +2414,7 @@ async fn run_cycle_rejected_zone_page_preserves_cursor_debt_and_media_across_res
             crate::sync_loop::precheck::include_pending_local_work(
                 &mut precheck,
                 inner.as_ref(),
-                &config.metadata,
+                Some(&config.metadata),
                 std::slice::from_ref(&library),
             )
             .await;
@@ -2592,7 +2712,7 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
                 crate::sync_loop::precheck::include_pending_local_work(
                     &mut precheck,
                     inner.as_ref(),
-                    &config.metadata,
+                    Some(&config.metadata),
                     std::slice::from_ref(&library),
                 )
                 .await;
@@ -3033,7 +3153,7 @@ async fn run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_res
             crate::sync_loop::precheck::include_pending_local_work(
                 &mut precheck,
                 inner.as_ref(),
-                &config.metadata,
+                Some(&config.metadata),
                 std::slice::from_ref(&library),
             )
             .await;

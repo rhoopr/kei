@@ -559,8 +559,8 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                 );
                 assert_eq!(
                     calls.load(Ordering::SeqCst),
-                    4,
-                    "two targeted identity reads plus two current-selection confirmation reads; quiet reopen must not repeat either"
+                    3,
+                    "two targeted identity reads plus one paired selection confirmation; quiet reopen must not repeat either"
                 );
             } else {
                 assert!(result.stats.identity_incomplete);
@@ -620,7 +620,7 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                 if cycle == 0 {
                     assert_eq!(
                         observed_calls,
-                        if selected && owner_matches { 4 } else { 0 },
+                        if selected && owner_matches { 3 } else { 0 },
                         "identity and current-selection confirmation require the exact selected owner"
                     );
                 } else {
@@ -1177,8 +1177,8 @@ async fn sparse_scoped_hidden_and_album_scan_proves_only_the_exact_shared_target
                     assert_eq!(identities.len(), 1);
                     if proof != ScopedProof::WrongOwner {
                         assert!(
-                            target_calls.load(Ordering::SeqCst) >= 2,
-                            "the negative case still performed a successful lookup"
+                            target_calls.load(Ordering::SeqCst) > 0,
+                            "the negative case still contacted the target zone"
                         );
                     }
                 }

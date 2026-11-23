@@ -1,5 +1,16 @@
 # CI qualification
 
+## Workflow ownership
+
+| Trigger | Workflow | Owns | Does not own |
+|---------|----------|------|--------------|
+| PR | **PR baseline** | The required merge gate. | Replaying the full matrix or heavy qualification. |
+| Push to `main` | **Rust CI** | Deterministic platform suites, no-default-feature checks, copies stress, docs, and dependency policy. | Timed advisory or fuzz checks; release artifacts. |
+| Daily | **Nightly qualification** | The current advisory database, fuzz samples, release-mode canary, main push evidence, and incidents. | Replaying the full suite; building candidates. |
+| Tag or manual | **Heavy qualification** | Self-contained release evidence, service smoke, archives, containers, and the receipt. | Scheduled regression. |
+| Manual | **Live wiki check** | External wiki drift checks on demand. | Gating qualification or releases. |
+| Daily | **Nightly freshness** | Nightly freshness detection. | Qualifying releases. |
+
 ## PR baseline
 
 [PR baseline](../.github/workflows/pr.yml) runs the same three Linux jobs in parallel for every PR, including drafts. Paths, labels and repository variables do not select work.
@@ -14,9 +25,9 @@ Branch protection requires `CI`. It passes only when all three jobs succeed for 
 
 ## Broader checks
 
-Pushes to `main` run the full Linux, macOS and Windows offline suites, Linux no-default-feature checks, copies stress, docs and dependency audit. To qualify a feature branch before merging, dispatch **Heavy qualification** for that branch. Qualification adds native service smoke, coverage, unused-dependency analysis, bounded fuzzing, optimized tests, five release archives and two container architectures. It lists ignored tests without running credentialed tests.
+Pushes to `main` run the full Linux, macOS and Windows offline suites, Linux no-default-feature checks, copies stress, docs, the dependency policy and a fast `cargo-machete` unused-dependency check. To qualify a feature branch before merging, dispatch **Heavy qualification** for that branch. A manual **Rust CI** dispatch runs only the shared checks. Qualification adds native service smoke, the deeper nightly-toolchain `cargo-udeps` unused-dependency analysis, bounded fuzzing, optimized tests, five release archives and two container architectures. It lists ignored tests without running credentialed tests. Coverage is a local diagnostic (`just cov`); CI does not run or gate on it.
 
-Heavy qualification also runs on Sundays at 03:23 UTC as a read-only release rehearsal. Release tags always rerun it on the release commit and require separate local evidence before publishing. Neither a nightly result nor a weekly rehearsal qualifies a different commit. For local development, run focused tests for the behavior you changed. `just gate` remains available for offline diagnosis.
+Heavy qualification runs on release tags and on manual dispatch of **Heavy qualification**. It has no timer: a weekly copy of the same `main` work would duplicate the push suite and nightly coverage without qualifying a new commit. Release tags always rerun it on the release commit and require separate local evidence before publishing. Neither a nightly result nor a manual rehearsal qualifies a different commit. For local development, run focused tests for the behavior you changed. `just gate` remains available for offline diagnosis.
 
 ## Local release prerequisites
 
@@ -50,16 +61,46 @@ The attestation is a maintainer trust boundary, not independent proof that local
 commands ran. Keep the underlying evidence. A new commit requires a new run.
 Nightly results do not replace this requirement.
 
+## Release provenance
+
+A release tag publishes GitHub build provenance for the five release archives and `SHA256SUMS.txt`, and for the `amd64` and `arm64` container image digests published by the tag-time release run. The archive step attests the candidate bytes after checksum generation and before upload. The tag-time container job attests the registry manifest digests it publishes. It does not attest version tags, stable aliases, or `latest`.
+
+The resume path republishes retained images but does not create a new build-provenance attestation, because it is not their build run. If the original tag-time container attestation did not complete, the resume path does not fabricate one.
+
+This is separate from the local release attestation in [Local release prerequisites](#local-release-prerequisites). The local record covers maintainer-run provider and host-service evidence for the release commit. Build provenance records the repository and workflow that produced the artifacts.
+
+Verify a downloaded archive with:
+
+```sh
+gh attestation verify kei-linux-x86_64.tar.gz --repo rhoopr/kei
+```
+
+Verify a container image by digest with:
+
+```sh
+gh attestation verify oci://ghcr.io/rhoopr/kei@sha256:DIGEST --repo rhoopr/kei
+```
+
+Both commands need an authenticated `gh` client. Container verification also needs access to the GHCR image referenced by the digest.
+
+After the next authorized release, verify the published provenance:
+
+- Download one release archive and verify it with the archive command above.
+- Verify one published container digest with the container command above.
+- Confirm the GHCR attestations are retrievable.
+
+This is a post-publication check, not a release gate.
+
 ## Nightly operation
 
 `Nightly qualification` runs on `main` at 12:05 a.m. New York time every day. A manual dispatch on `main` uses the same four independent jobs, pinned to the event SHA:
 
 - **Main push CI evidence:** require the latest `Rust CI` push run for that SHA and its shared checks result to have succeeded. A missing, running, cancelled or failed run is a gap; nightly reports it instead of replaying the platform matrix. If the push run was still running, rerun nightly after it finishes.
-- **Seeded fuzzing:** build every registered target and run each with its available seeds, including on an unchanged commit.
-- **RustSec audit:** check the locked dependencies against the current advisory database every day.
+- **Seeded fuzzing:** build every registered target and run each with its available seeds for 120 seconds per target, including on an unchanged commit. The job restores the `fuzz/corpus` cache from earlier nights and saves it after the run. Heavy qualification runs its own fixed-budget fuzz pass from checked-in seeds without the nightly cache.
+- **Dependency policy:** enforce `deny.toml` every day, covering advisories from the current RustSec database, license allow lists, duplicate-version warnings, and source restrictions.
 - **Optimized library tests:** run the all-feature release-mode library suite unless a prior successful nightly on the same SHA actually ran and passed it. A skipped test step is not evidence. If no qualifying result is found in the bounded history, run the tests.
 
-All four jobs must succeed for the nightly incident reporter to signal recovery. Nightly does not build release candidates. The **Daily live wiki check** runs separately at 06:43 UTC and reports documentation drift on its own Actions run. Heavy qualification still checks the wiki before a release.
+All four jobs must succeed for the nightly incident reporter to signal recovery. Nightly does not build release candidates. The **Live wiki check** runs on manual dispatch and reports documentation drift on its own Actions run. Heavy qualification still checks the wiki before a release.
 
 `Nightly freshness` checks at 2:05 a.m. New York time. It inspects the newest scheduled or manually dispatched nightly on `main`. That run must have been created since the most recent 12:05 a.m. slot and finished successfully. A missing run, a still-running job, a failure, or yesterday's success cannot pass. Both schedules follow the local clock; when the spring transition skips the 2 a.m. hour, GitHub advances the check to 3 a.m.
 

@@ -21,6 +21,15 @@ use super::rows::{decode_asset_date, encode_asset_date};
 use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
 
+mod grouping_handoff;
+mod rank_retirement;
+pub(super) use grouping_handoff::claim_writer;
+mod writer_output;
+pub(crate) use super::contracts::WriterOutput;
+use rank_retirement::load_rank_proof;
+pub(crate) use writer_output::WriterKey;
+
+// Limit one generation evidence write; retained history never spends this allowance.
 pub(crate) const MAX_GENERATION_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const INDEPENDENT_ALBUM_COPIES: &str = "independent_album_copies";
 const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
@@ -303,7 +312,7 @@ fn managed_predecessors(
     }
     for supplied in layouts {
         if encode(&cancelled_layout(conn, &supplied.operation)?)? != encode(supplied)? {
-            return Err(StateError::ProviderWorkConflict);
+            return Err(StateError::ProviderWorkConflict("cancelled_layout_changed"));
         }
     }
     let keys: Vec<String> = conn.prepare("SELECT DISTINCT d.generation FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE g.scope=?1 AND g.config_hash=?2 AND d.pass_key=?3 AND d.child=?4 AND d.admission='admitted' AND d.generation<>?5 AND EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR (g.metadata_enabled=1 AND w.verified_metadata=0))) ORDER BY g.created_at LIMIT 17")?
@@ -385,7 +394,7 @@ fn insert_selection_rows(
             + 256,
     )
     .map_err(|_invalid| StateError::ProviderSelectionFull)?;
-    charge(conn, charged, capacity)?;
+    check_write_charge(charged, capacity)?;
     conn.execute("INSERT INTO provider_active_decisions(generation,pass_key,child,manifest,manifest_hash,outcome,admission,reason,charged_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(generation,pass_key,child) DO UPDATE SET manifest=excluded.manifest,manifest_hash=excluded.manifest_hash,outcome=excluded.outcome,admission=excluded.admission,reason=excluded.reason,attempts=CASE WHEN excluded.admission='deferred' THEN provider_active_decisions.attempts ELSE 0 END,next_retry_at=CASE WHEN excluded.admission='deferred' THEN provider_active_decisions.next_retry_at ELSE 0 END,charged_bytes=provider_active_decisions.charged_bytes+excluded.charged_bytes",params![generation,d.pass_key,d.child,bytes,hash,outcome_name(d.outcome),admission,reason,i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?])?;
     for source in &manifest.sources {
         conn.execute("INSERT OR IGNORE INTO provider_active_sources(generation,pass_key,child,page_id,ordinal) VALUES(?1,?2,?3,?4,?5)",params![generation,d.pass_key,d.child,source.page_id,source.ordinal])?;
@@ -950,6 +959,7 @@ type DestinationProofRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 type GenerationRow = (
@@ -1066,18 +1076,27 @@ fn validate_generation_headers(conn: &Connection) -> Result<(), StateError> {
 }
 
 fn validate_scope_decisions(conn: &Connection, scope: &str) -> Result<(), StateError> {
-    validate_generation_headers(conn)?;
-    let mut statement = conn.prepare("SELECT d.generation,d.pass_key,d.child FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE g.scope=?1 ORDER BY d.generation,d.pass_key,d.child")?;
-    let mut rows = statement.query([scope])?;
-    while let Some(row) = rows.next()? {
+    // Each caller holds one transaction. Check every header before trusting
+    // its scope, then reuse that validated header for this generation's rows.
+    let mut generations = conn.prepare("SELECT id FROM provider_active_generations ORDER BY id")?;
+    let mut decisions = conn.prepare(
+        "SELECT pass_key,child FROM provider_active_decisions WHERE generation=?1 ORDER BY pass_key,child",
+    )?;
+    let mut roots = generations.query([])?;
+    while let Some(row) = roots.next()? {
         let root = load_generation(conn, &row.get::<_, String>(0)?)?;
-        load_decision_with_sources(
-            conn,
-            &root,
-            &row.get::<_, String>(1)?,
-            &row.get::<_, String>(2)?,
-            false,
-        )?;
+        if root.spec.scope == scope {
+            let mut rows = decisions.query([&root.id])?;
+            while let Some(row) = rows.next()? {
+                load_decision_with_sources(
+                    conn,
+                    &root,
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(1)?,
+                    false,
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -1221,13 +1240,8 @@ fn refresh_progress_hash(
     Ok(())
 }
 
-fn charge(conn: &Connection, additional: u64, capacity: u64) -> Result<(), StateError> {
-    let used:i64=conn.query_row("SELECT COALESCE((SELECT SUM(charged_bytes) FROM provider_active_generations),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_selection_rank_pages),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_active_decisions),0)",[],|r|r.get(0))?;
-    if additional
-        > capacity.saturating_sub(
-            u64::try_from(used).map_err(|_invalid| StateError::ProviderSelectionInvalid)?,
-        )
-    {
+fn check_write_charge(additional: u64, capacity: u64) -> Result<(), StateError> {
+    if additional > capacity {
         return Err(StateError::ProviderSelectionFull);
     }
     Ok(())
@@ -1268,18 +1282,17 @@ fn load_rank(
     root: &ActiveGeneration,
     page: &str,
 ) -> Result<SelectionSourcePage, StateError> {
-    let (request_length, body_length): (i64, i64) = conn.query_row(
-        "SELECT length(request),length(body) FROM provider_selection_rank_pages WHERE id=?1",
-        [page],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    if [request_length, body_length]
-        .into_iter()
-        .any(|n| usize::try_from(n).map_or(true, |n| n > MAX_CHUNK_BYTES))
-    {
-        return invalid();
-    }
-    let (generation,key,request,request_hash,body,body_hash):(String,String,Vec<u8>,String,Vec<u8>,String)=conn.query_row("SELECT generation,pass_key,request,request_hash,body,body_hash FROM provider_selection_rank_pages WHERE id=?1",[page],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+    // Filter before materializing the blobs, including for unbudgeted callers
+    // such as retirement. Read the relation flag from the same row.
+    let limit =
+        i64::try_from(MAX_CHUNK_BYTES).map_err(|_overflow| StateError::ProviderSelectionInvalid)?;
+    let (generation, key, request, request_hash, body, body_hash, has_relation):
+        (String, String, Vec<u8>, String, Vec<u8>, String, bool) = conn.query_row(
+        "SELECT generation,pass_key,request,request_hash,body,body_hash,has_relation
+         FROM provider_selection_rank_pages WHERE id=?1 AND length(request)<=?2 AND length(body)<=?2",
+        params![page, limit],
+        |row| row.try_into(),
+    ).optional()?.ok_or(StateError::ProviderSelectionInvalid)?;
     if generation != root.id
         || request.len() > MAX_CHUNK_BYTES
         || body.len() > MAX_CHUNK_BYTES
@@ -1316,7 +1329,10 @@ fn load_rank(
         None
     };
     let mut selected_children = Vec::with_capacity(records.len());
+    let mut observed_relation = false;
     for (ordinal, record) in records.iter().enumerate() {
+        let kind = record.get("recordType").and_then(Value::as_str);
+        observed_relation |= kind == Some("CPLContainerRelation");
         let Some(row) = rows.next()? else {
             return invalid();
         };
@@ -1327,8 +1343,7 @@ fn load_rank(
                     .get("recordName")
                     .and_then(Value::as_str)
                     .ok_or(StateError::ProviderSelectionInvalid)?
-            || row.get::<_, Option<String>>(2)?.as_deref()
-                != record.get("recordType").and_then(Value::as_str)
+            || row.get::<_, Option<String>>(2)?.as_deref() != kind
             || row.get::<_, bool>(3)?
                 != record
                     .get("deleted")
@@ -1345,7 +1360,7 @@ fn load_rank(
         };
         selected_children.push(child.map(str::to_owned));
     }
-    if rows.next()?.is_some() {
+    if rows.next()?.is_some() || has_relation != observed_relation {
         return invalid();
     }
     Ok(SelectionSourcePage {
@@ -1357,8 +1372,7 @@ fn load_rank(
 }
 
 /// Compact raw/index proofs live only within one owning operation. Parsed pages
-/// are released immediately. The existing evidence quota bounds all unique raw
-/// inputs; this does not introduce a smaller historical eligibility threshold.
+/// are released immediately. Validation bounds unique raw inputs per operation.
 struct RankProofs<'a> {
     conn: &'a Connection,
     root: &'a ActiveGeneration,
@@ -1401,15 +1415,8 @@ impl<'a> RankProofs<'a> {
             if additional > self.capacity.saturating_sub(self.bytes) {
                 return Err(StateError::ProviderSelectionFull);
             }
-            let page = load_rank(self.conn, self.root, &source.page_id)?;
-            self.pages.insert(
-                source.page_id.clone(),
-                SelectionSourceProof {
-                    pass_key: page.pass_key,
-                    selected_children: page.selected_children,
-                    membership: page.membership,
-                },
-            );
+            let proof = load_rank_proof(self.conn, self.root, &source.page_id)?;
+            self.pages.insert(source.page_id.clone(), proof);
             self.bytes += additional;
         }
         let ordinal = usize::try_from(source.ordinal)
@@ -1590,6 +1597,28 @@ fn validate_decision(
             verify_body,
             &mut RankProofs::new(conn, root),
         )
+        .map(drop)
+    }
+}
+
+fn confirmed_decision_asset(
+    manifest: &ActiveDecision,
+    root: &ActiveGeneration,
+) -> Result<Option<crate::icloud::photos::PhotoAsset>, StateError> {
+    let decision = &manifest.decision;
+    match (&decision.confirmation, &decision.master) {
+        (Some(bytes), Some(master)) if bytes.len() <= MAX_CHUNK_BYTES => {
+            crate::icloud::photos::current_asset(
+                bytes,
+                &decision.child,
+                master,
+                manifest.media_zone(root),
+            )
+            .map(Some)
+            .map_err(|_invalid| StateError::ProviderSelectionInvalid)
+        }
+        (None, None) if decision.outcome == SelectionOutcome::Deferred => Ok(None),
+        _ => invalid(),
     }
 }
 
@@ -1599,7 +1628,7 @@ fn validate_decision_with_pages(
     manifest: &ActiveDecision,
     verify_body: bool,
     pages: &mut RankProofs<'_>,
-) -> Result<(), StateError> {
+) -> Result<Option<crate::icloud::photos::PhotoAsset>, StateError> {
     let decision = &manifest.decision;
     pass(root, &decision.pass_key)?;
     validate_media_source(root, manifest)?;
@@ -1633,19 +1662,7 @@ fn validate_decision_with_pages(
         }
         pages.verify_source(source, &decision.pass_key, &decision.child)?;
     }
-    let photo = match (&decision.confirmation, &decision.master) {
-        (Some(bytes), Some(master)) if bytes.len() <= MAX_CHUNK_BYTES => Some(
-            crate::icloud::photos::current_asset(
-                bytes,
-                &decision.child,
-                master,
-                manifest.media_zone(root),
-            )
-            .map_err(|_invalid| StateError::ProviderSelectionInvalid)?,
-        ),
-        (None, None) if decision.outcome == SelectionOutcome::Deferred => None,
-        _ => return invalid(),
-    };
+    let photo = confirmed_decision_asset(manifest, root)?;
     if manifest.state_id != decision.child {
         let Some(master) = decision.master.as_deref() else {
             return invalid();
@@ -1690,7 +1707,7 @@ fn validate_decision_with_pages(
             return invalid();
         }
     }
-    Ok(())
+    Ok(photo)
 }
 
 impl SqliteStateDb {
@@ -1705,7 +1722,7 @@ impl SqliteStateDb {
             validate_generation_headers(&tx)?;
             freeze_interrupted_groupings(&tx, &scope)?;
             tx.commit()?;
-            Ok(())
+            rank_retirement::retire_completed(conn, &owner, &scope)
         })
         .await
     }
@@ -1799,12 +1816,12 @@ impl SqliteStateDb {
     ) -> Result<ActiveGeneration, StateError> {
         self.with_conn_mut("starting selection generation",move|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;validate_spec(&spec)?;validate_current_deleted_selection(&tx,&spec)?;
-            if basis(&tx,&spec.scope)?!=spec.basis {return Err(StateError::ProviderWorkConflict)}
+            if basis(&tx,&spec.scope)?!=spec.basis {return Err(StateError::ProviderWorkConflict("selection_basis_changed"))}
             freeze_interrupted_groupings(&tx, &spec.scope)?;
             let bytes=encode(&spec)?;let (account,provider)=owner_keys(&tx)?;
             let id=format!("{:032x}",rand::random::<u128>());
             let charged=u64::try_from(bytes.len()+id.len()+account.len()+provider.len()+spec.scope.len()+spec.config_hash.len()+spec.basis.len()+128).map_err(|_invalid|StateError::ProviderSelectionFull)?;
-            charge(&tx,charged,capacity)?;
+            check_write_charge(charged,capacity)?;
             tx.execute("INSERT INTO provider_active_generations(id,account_key,provider_key,scope,config_hash,basis,specification,specification_hash,created_at,charged_bytes,metadata_enabled) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![id,account,provider,spec.scope,spec.config_hash,spec.basis,bytes,digest(&bytes),Utc::now().timestamp_millis(),i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?,spec.metadata_enabled])?;
             let out=load_generation(&tx,&id)?;tx.commit()?;Ok(out)
         }).await
@@ -1826,12 +1843,13 @@ impl SqliteStateDb {
             let request=encode(&request)?;let request_hash=digest(&request);let body_hash=digest(&body);
             let id=digest(&encode(&(&generation,&key,&request_hash,&body_hash))?);
             let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_selection_rank_pages WHERE id=?1)",[&id],|r|r.get(0))?;
-            if exists {load_rank(&tx,&root,&id)?;tx.commit()?;return Ok(())}
+            if exists {load_rank_proof(&tx,&root,&id)?;tx.commit()?;return Ok(())}
             if root.sealed {return invalid()}
             let records=response.get("records").and_then(Value::as_array).ok_or(StateError::ProviderSelectionInvalid)?;
+            let has_relation=records.iter().any(|record|record.get("recordType").and_then(Value::as_str)==Some("CPLContainerRelation"));
             let charged=u64::try_from(request.len()+body.len()+generation.len()+key.len()+id.len()+records.iter().map(|r|r.get("recordName").and_then(Value::as_str).map_or(0,str::len)+r.get("recordType").and_then(Value::as_str).map_or(0,str::len)+id.len()+32).sum::<usize>()+256).map_err(|_invalid|StateError::ProviderSelectionFull)?;
-            charge(&tx,charged,capacity)?;
-            tx.execute("INSERT INTO provider_selection_rank_pages(id,generation,pass_key,request,request_hash,body,body_hash,charged_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![id,generation,key,request,request_hash,body,body_hash,i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?])?;
+            check_write_charge(charged,capacity)?;
+            tx.execute("INSERT INTO provider_selection_rank_pages(id,generation,pass_key,request,request_hash,body,body_hash,charged_bytes,has_relation) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![id,generation,key,request,request_hash,body,body_hash,i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?,has_relation])?;
             for (ordinal,record) in records.iter().enumerate() {
                 tx.execute("INSERT INTO provider_selection_rank_records(page_id,ordinal,record_name,record_type,deleted) VALUES(?1,?2,?3,?4,?5)",params![id,i64::try_from(ordinal).map_err(|_invalid|StateError::ProviderSelectionFull)?,record.get("recordName").and_then(Value::as_str),record.get("recordType").and_then(Value::as_str),record.get("deleted").and_then(Value::as_bool).unwrap_or(false)])?;
             }
@@ -1846,14 +1864,54 @@ impl SqliteStateDb {
         key: String,
         child: String,
     ) -> Result<Vec<RankSource>, StateError> {
-        self.with_conn("reading selection source links",move|conn|{
-            account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;pass(&root,&key)?;
-            let rows=conn.prepare("SELECT r.page_id,r.ordinal FROM provider_selection_rank_records r JOIN provider_selection_rank_pages p ON p.id=r.page_id WHERE p.generation=?1 AND p.pass_key=?2 AND (r.record_name=?3 OR r.record_type='CPLContainerRelation') ORDER BY r.page_id,r.ordinal")?.query_map(params![generation,key,child],|r|Ok(RankSource{page_id:r.get(0)?,ordinal:r.get(1)?}))?.collect::<Result<Vec<_>,_>>()?;
-            let mut proofs = RankProofs::new(conn, &root);
+        self.selection_rank_sources_with_budget(owner, generation, key, child, MAX_VALIDATION_BYTES)
+            .await
+    }
+
+    pub(crate) async fn selection_rank_sources_with_budget(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        key: String,
+        child: String,
+        capacity: usize,
+    ) -> Result<Vec<RankSource>, StateError> {
+        self.with_conn("reading selection source links", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            account::validate_authenticated(&tx, &owner)?;
+            let root = load_generation(&tx, &generation)?;
+            pass(&root, &key)?;
+            // Resolve the two source kinds independently so each branch can
+            // use its own index. The name branch probes the child index; the
+            // relation branch reads only pages marked during capture or
+            // backfilled from retained records. Neither branch walks unrelated
+            // records or the pages of an unfiled scan without relations.
+            let mut stmt = tx.prepare(
+                "SELECT r.page_id FROM provider_selection_rank_records r JOIN provider_selection_rank_pages p ON p.id=r.page_id WHERE p.generation=?1 AND p.pass_key=?2 AND r.record_name=?3
+                 UNION
+                 SELECT p.id FROM provider_selection_rank_pages p WHERE p.generation=?1 AND p.pass_key=?2 AND p.has_relation=1
+                 ORDER BY page_id",
+            )?;
+            let pages = stmt.query_map(params![generation, key, child], |r| r.get::<_, String>(0))?;
             let mut selected = Vec::new();
-            for source in rows {
-                if proofs.matches_source(&source, &key, &child)? {
-                    selected.push(source);
+            for page in pages {
+                let page = page?;
+                // Discover sources one page at a time: unrelated relations
+                // do not spend the next page's validation allowance.
+                if rank_input_bytes(&tx, &page)? > capacity {
+                    return Err(StateError::ProviderSelectionFull);
+                }
+                let proof = load_rank_proof(&tx, &root, &page)?;
+                if proof.pass_key != key {
+                    return invalid();
+                }
+                for (ordinal, candidate) in proof.selected_children.iter().enumerate() {
+                    if candidate.as_deref() == Some(child.as_str()) {
+                        selected.push(RankSource {
+                            page_id: page.clone(),
+                            ordinal: ordinal.try_into().map_err(|_overflow| StateError::ProviderSelectionInvalid)?,
+                        });
+                    }
                 }
             }
             Ok(selected)
@@ -1909,11 +1967,23 @@ fn load_decision_with_pages(
     verify_body: bool,
     pages: &mut RankProofs<'_>,
 ) -> Result<ActiveDecision, StateError> {
-    let length:i64=conn.query_row("SELECT length(manifest) FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,key,child],|r|r.get(0))?;
-    if usize::try_from(length).map_or(true, |n| n > MAX_CHUNK_BYTES) {
-        return invalid();
-    }
-    let (bytes,hash,outcome):(Vec<u8>,String,String)=conn.query_row("SELECT manifest,manifest_hash,outcome FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,key,child],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    let (bytes, hash, outcome): (Vec<u8>, String, String) = conn
+        .prepare_cached(
+            "SELECT manifest,manifest_hash,outcome FROM provider_active_decisions
+         WHERE generation=?1 AND pass_key=?2 AND child=?3 AND length(manifest)<=?4",
+        )?
+        .query_row(
+            params![
+                root.id,
+                key,
+                child,
+                i64::try_from(MAX_CHUNK_BYTES)
+                    .map_err(|_overflow| StateError::ProviderSelectionInvalid)?
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .ok_or(StateError::ProviderSelectionInvalid)?;
     if bytes.len() > MAX_CHUNK_BYTES || digest(&bytes) != hash {
         return invalid();
     }
@@ -1925,8 +1995,8 @@ fn load_decision_with_pages(
     {
         return invalid();
     }
-    validate_decision_with_pages(conn, root, &manifest, verify_body, pages)?;
-    validate_decision_rows(conn, root, &manifest)?;
+    let photo = validate_decision_with_pages(conn, root, &manifest, verify_body, pages)?;
+    validate_decision_rows(conn, root, &manifest, photo.as_ref())?;
     Ok(manifest)
 }
 
@@ -1936,10 +2006,54 @@ fn admission_hash(
     key: &str,
     child: &str,
 ) -> Result<String, StateError> {
-    let (manifest,admission,reason,attempts,deadline):(String,String,String,i64,i64)=conn.query_row("SELECT manifest_hash,admission,reason,attempts,next_retry_at FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,key,child],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
-    Ok(digest(&encode(&(
-        &root.id, key, child, manifest, admission, reason, attempts, deadline,
-    ))?))
+    AdmissionRow::load(conn, root, key, child)?.hash(root, key, child)
+}
+
+struct AdmissionRow {
+    manifest: String,
+    admission: String,
+    reason: String,
+    attempts: i64,
+    deadline: i64,
+    stored_hash: Option<String>,
+}
+
+impl AdmissionRow {
+    fn load(
+        conn: &Connection,
+        root: &ActiveGeneration,
+        key: &str,
+        child: &str,
+    ) -> Result<Self, StateError> {
+        Ok(conn
+            .prepare_cached(
+                "SELECT manifest_hash,admission,reason,attempts,next_retry_at,admission_hash
+             FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+            )?
+            .query_row(params![root.id, key, child], |r| {
+                Ok(Self {
+                    manifest: r.get(0)?,
+                    admission: r.get(1)?,
+                    reason: r.get(2)?,
+                    attempts: r.get(3)?,
+                    deadline: r.get(4)?,
+                    stored_hash: r.get(5)?,
+                })
+            })?)
+    }
+
+    fn hash(&self, root: &ActiveGeneration, key: &str, child: &str) -> Result<String, StateError> {
+        Ok(digest(&encode(&(
+            &root.id,
+            key,
+            child,
+            &self.manifest,
+            &self.admission,
+            &self.reason,
+            self.attempts,
+            self.deadline,
+        ))?))
+    }
 }
 
 fn defer_attempt(
@@ -1972,17 +2086,20 @@ fn validate_decision_rows(
     conn: &Connection,
     root: &ActiveGeneration,
     manifest: &ActiveDecision,
+    photo: Option<&crate::icloud::photos::PhotoAsset>,
 ) -> Result<(), StateError> {
     let d = &manifest.decision;
-    let stored:Option<String>=conn.query_row("SELECT admission_hash FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,d.pass_key,d.child],|r|r.get(0))?;
-    if stored.as_deref() != Some(admission_hash(conn, root, &d.pass_key, &d.child)?.as_str()) {
+    let row = AdmissionRow::load(conn, root, &d.pass_key, &d.child)?;
+    if row.stored_hash.as_deref() != Some(row.hash(root, &d.pass_key, &d.child)?.as_str()) {
         return invalid();
     }
-
-    let (admission,reason,attempts,deadline):(String,String,i64,i64)=conn.query_row(
-        "SELECT admission,reason,attempts,next_retry_at FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
-        params![root.id,d.pass_key,d.child],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
-    )?;
+    let AdmissionRow {
+        admission,
+        reason,
+        attempts,
+        deadline,
+        ..
+    } = row;
     let superseded =
         admission == "excluded" && validate_managed_successor(conn, root, manifest, &reason)?;
     let legal = match admission.as_str() {
@@ -2011,13 +2128,6 @@ fn validate_decision_rows(
     if !legal {
         return invalid();
     }
-    let dates = match (&d.confirmation, &d.master) {
-        (Some(body), Some(master)) => Some(
-            crate::icloud::photos::current_asset(body, &d.child, master, manifest.media_zone(root))
-                .map_err(|_invalid| StateError::ProviderSelectionInvalid)?,
-        ),
-        _ => None,
-    };
     for (table, count) in [
         ("provider_active_sources", manifest.sources.len()),
         ("provider_active_destinations", d.destinations.len()),
@@ -2040,16 +2150,38 @@ fn validate_decision_rows(
         }
     }
     for destination in &d.destinations {
-        let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND asset_id=?4 AND version_size=?5 AND path=?6 AND compat_path=?12 AND checksum=?7 AND size_bytes=?8 AND metadata_hash=?9 AND master=?10 AND library=?11 AND (verified_media=0 OR ((admitted=1 OR ?13) AND length(local_checksum)=64 AND length(source_checksum)=64)))",params![root.id,d.pass_key,d.child,manifest.state_id,destination.version_size,destination.path.key()?,destination.checksum,i64::try_from(destination.size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,destination.metadata_hash,d.master,manifest.media_zone(root).get("zoneName").and_then(Value::as_str),destination.path.to_path().to_string_lossy(),superseded],|r|r.get(0))?;
-        if !valid {
-            return invalid();
+        let photo = photo.ok_or(StateError::ProviderSelectionInvalid)?;
+        let (group, intent, media, metadata, local, source, progress, successor): DestinationProofRow = conn
+            .prepare_cached(
+                "SELECT grouping_hash,intent_hash,verified_media,verified_metadata,local_checksum,source_checksum,progress_hash,metadata_successor
+                 FROM provider_active_destinations
+                 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND asset_id=?4 AND version_size=?5 AND path=?6
+                   AND checksum=?7 AND size_bytes=?8 AND metadata_hash=?9 AND master=?10 AND library=?11 AND compat_path=?12
+                   AND (verified_media=0 OR ((admitted=1 OR ?13) AND length(local_checksum)=64 AND length(source_checksum)=64))
+                   AND admitted=?14 AND created_at IS ?15 AND added_at IS ?16",
+            )?
+            .query_row(
+                params![root.id, d.pass_key, d.child, manifest.state_id, destination.version_size,
+                    destination.path.key()?, destination.checksum,
+                    i64::try_from(destination.size).map_err(|_invalid| StateError::ProviderSelectionInvalid)?,
+                    destination.metadata_hash, d.master, manifest.media_zone(root).get("zoneName").and_then(Value::as_str),
+                    destination.path.to_path().to_string_lossy(), superseded, admission=="admitted",
+                    encode_asset_date(photo.created()), encode_asset_date(photo.added_date())],
+                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)),
+            )
+            .optional()?
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        if let Some(link) = successor {
+            grouping_handoff::validate_link(
+                conn,
+                &root.id,
+                &d.pass_key,
+                &d.child,
+                &destination.version_size,
+                &destination.path.key()?,
+                &link,
+            )?;
         }
-        let photo = dates.as_ref().ok_or(StateError::ProviderSelectionInvalid)?;
-        let normalized:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=?6 AND created_at IS ?7 AND added_at IS ?8)",params![root.id,d.pass_key,d.child,destination.version_size,destination.path.key()?,admission=="admitted",encode_asset_date(photo.created()),Some(encode_asset_date(photo.added_date()))],|r|r.get(0))?;
-        if !normalized {
-            return invalid();
-        }
-        let (group,intent,media,metadata,local,source,progress):DestinationProofRow=conn.query_row("SELECT grouping_hash,intent_hash,verified_media,verified_metadata,local_checksum,source_checksum,progress_hash FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![root.id,d.pass_key,d.child,destination.version_size,destination.path.key()?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
         match (&group, &intent) {
             (None, None) if !root.sealed => {}
             (Some(group), Some(stored))
@@ -2429,7 +2561,7 @@ impl SqliteStateDb {
             let mut statement=conn.prepare("SELECT pass_key,child FROM provider_active_decisions WHERE generation=?1")?;
             let mut rows=statement.query([&generation])?;
             while let Some(row)=rows.next()? {let key:String=row.get(0)?;let child:String=row.get(1)?;load_decision_with_sources(conn,&root,&key,&child,false)?;}
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission<>'excluded' AND next_retry_at>?2) AND NOT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) AND NOT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND ((verified_media=0 AND preserved_local IS NULL) OR (?3=1 AND verified_metadata=0)))",params![generation,Utc::now().timestamp(),root.spec.metadata_enabled],|r|r.get(0))?)
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission<>'excluded' AND next_retry_at>?2) AND NOT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) AND NOT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND ((verified_media=0 AND preserved_local IS NULL) OR (?3=1 AND verified_metadata=0 AND metadata_successor IS NULL)))",params![generation,Utc::now().timestamp(),root.spec.metadata_enabled],|r|r.get(0))?)
         }).await
     }
 
@@ -2517,10 +2649,10 @@ impl SqliteStateDb {
             if let Some((previous,admission))=&existing {
                 let old=load_decision(&tx,&root,&d.pass_key,&d.child)?;
                 resolving=admission=="deferred" && old.decision.outcome==SelectionOutcome::Deferred && old.decision.confirmation.is_none() && manifest.decision.confirmation.is_some() && !root.sealed && old.sources.iter().all(|source|manifest.sources.contains(source));
-                if previous!=&bytes && !resolving {return Err(StateError::ProviderWorkConflict)}
+                if previous!=&bytes && !resolving {return Err(StateError::ProviderWorkConflict("frozen_manifest_changed"))}
                 if resolving {
                     if old.decision.media_source != manifest.decision.media_source {
-                        return Err(StateError::ProviderWorkConflict);
+                        return Err(StateError::ProviderWorkConflict("media_source_changed"));
                     }
                     let observed=observed_asset(&tx,&root,&old)?;
                     let current=crate::icloud::photos::current_asset(manifest.decision.confirmation.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,&d.child,d.master.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,manifest.media_zone(&root)).map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
@@ -2550,14 +2682,14 @@ impl SqliteStateDb {
                     }
                 }
                 if changed_basis && !resolving && admission=="deferred" && old.decision.confirmation.is_some() {
-                    let Some(fresh)=fresh_confirmation.as_deref().filter(|body|body.len()<=MAX_CHUNK_BYTES) else {return Err(StateError::ProviderWorkConflict)};
+                    let Some(fresh)=fresh_confirmation.as_deref().filter(|body|body.len()<=MAX_CHUNK_BYTES) else {return Err(StateError::ProviderWorkConflict("fresh_confirmation_unavailable"))};
                     let master=old.decision.master.as_deref().ok_or(StateError::ProviderSelectionInvalid)?;
                     let previous=crate::icloud::photos::current_asset(old.decision.confirmation.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,&d.child,master,old.media_zone(&root)).map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
                     let current=crate::icloud::photos::current_asset(fresh,&d.child,master,manifest.media_zone(&root)).map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
-                    if !crate::icloud::photos::same_selected_facts(&previous,&current) {return Err(StateError::ProviderWorkConflict)}
+                    if !crate::icloud::photos::same_selected_facts(&previous,&current) {return Err(StateError::ProviderWorkConflict("confirmed_facts_changed"))}
                 }
                 if admission!="deferred" {tx.commit()?;return Ok(GenerationProjection {admitted:admission=="admitted",reason:String::new()})}
-            } else if root.sealed {return invalid()} else if changed_basis {return Err(StateError::ProviderWorkConflict)}
+            } else if root.sealed {return invalid()} else if changed_basis {return Err(StateError::ProviderWorkConflict("selection_basis_changed"))}
             // This check and admission share the immediate transaction. Two
             // producers cannot freeze one physical path for different albums or
             // smart folders. Every deferred retry rechecks ownership, including
@@ -2567,7 +2699,7 @@ impl SqliteStateDb {
             if root.spec.profile.get(INDEPENDENT_ALBUM_COPIES)==Some(&Value::Bool(true)) && matches!(pass(&root,&d.pass_key)?.get("kind").and_then(Value::as_str), Some("Album" | "SmartFolder")) {
                 for destination in &d.destinations {
                     if album_path_claimed(&tx, &root.spec.scope, &d.pass_key, &destination.path)? {
-                        return Err(StateError::ProviderWorkConflict);
+                        return Err(StateError::ProviderWorkConflict("album_path_claimed"));
                     }
                 }
             }
@@ -2577,11 +2709,11 @@ impl SqliteStateDb {
             }
             let mut staged = false;
             if existing.is_none() && !layouts.is_empty() && d.outcome == SelectionOutcome::Selected && d.reason.is_empty() {
-                let fresh = fresh_confirmation.as_deref().ok_or(StateError::ProviderWorkConflict)?;
-                let master = d.master.as_deref().ok_or(StateError::ProviderWorkConflict)?;
+                let fresh = fresh_confirmation.as_deref().ok_or(StateError::ProviderWorkConflict("fresh_confirmation_unavailable"))?;
+                let master = d.master.as_deref().ok_or(StateError::ProviderWorkConflict("master_unconfirmed"))?;
                 let current = crate::icloud::photos::current_asset(fresh, &d.child, master, manifest.media_zone(&root)).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
                 let selected = crate::icloud::photos::current_asset(d.confirmation.as_deref().ok_or(StateError::ProviderSelectionInvalid)?, &d.child, master, manifest.media_zone(&root)).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
-                if !crate::icloud::photos::same_selected_facts(&current, &selected) { return Err(StateError::ProviderWorkConflict); }
+                if !crate::icloud::photos::same_selected_facts(&current, &selected) { return Err(StateError::ProviderWorkConflict("confirmed_facts_changed")); }
                 let predecessors = managed_predecessors(&tx, &root, &manifest, &layouts)?;
                 if !predecessors.is_empty() {
                     insert_selection_rows(&tx, &root, &manifest, ("admitted", ""), capacity)?;
@@ -2590,11 +2722,11 @@ impl SqliteStateDb {
                         let prior_reason: String = tx.query_row("SELECT reason FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3", params![old_root.id,old.decision.pass_key,old.decision.child], |row| row.get(0))?;
                         let proof = ManagedSuccessor { generation: generation.clone(), manifest_hash: hash.clone(), operation: operation.operation.clone(), operation_hash: digest(&encode(&operation)?), prior_reason };
                         let reason = format!("{MANAGED_SUCCESSOR_PREFIX}{}", String::from_utf8(encode(&proof)?).map_err(|_invalid| StateError::ProviderSelectionInvalid)?);
-                        charge(&tx, u64::try_from(reason.len()).map_err(|_invalid| StateError::ProviderSelectionFull)?, capacity)?;
+                        check_write_charge(u64::try_from(reason.len()).map_err(|_invalid| StateError::ProviderSelectionFull)?, capacity)?;
                         tx.execute("UPDATE provider_active_decisions SET admission='excluded',reason=?4,charged_bytes=charged_bytes+?5 WHERE generation=?1 AND pass_key=?2 AND child=?3", params![old_root.id,old.decision.pass_key,old.decision.child,reason,i64::try_from(reason.len()).map_err(|_invalid| StateError::ProviderSelectionFull)?])?;
                         tx.execute("UPDATE provider_active_destinations SET admitted=0 WHERE generation=?1 AND pass_key=?2 AND child=?3", params![old_root.id,old.decision.pass_key,old.decision.child])?;
                         refresh_admission_hash(&tx, &old_root, &old.decision.pass_key, &old.decision.child)?;
-                        validate_decision_rows(&tx, &old_root, &old)?;
+                        validate_decision_rows(&tx, &old_root, &old, confirmed_decision_asset(&old, &old_root)?.as_ref())?;
                     }
                     staged = true;
                 }
@@ -2606,12 +2738,12 @@ impl SqliteStateDb {
                 if blocked {reason="identity_conflict".to_owned()}
                 for record in &records {
                     match super::provider_work::guard_projected_generation(&tx,record) {
-                        Ok(())=>{},Err(StateError::ProviderWorkConflict)=>{reason="unfinished_generation_conflict".to_owned();break},Err(error)=>return Err(error),
+                        Ok(())=>{},Err(StateError::ProviderWorkConflict(_))=>{reason="unfinished_generation_conflict".to_owned();break},Err(error)=>return Err(error),
                     }
                 }
                 if let Some(master)=&d.master {
                     match super::provider_work::guard_projected_mapping(&tx,manifest.media_zone(&root).get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&d.child,master) {
-                        Ok(())=>{},Err(StateError::ProviderWorkConflict)=>reason="unfinished_mapping_conflict".to_owned(),Err(error)=>return Err(error),
+                        Ok(())=>{},Err(StateError::ProviderWorkConflict(_))=>reason="unfinished_mapping_conflict".to_owned(),Err(error)=>return Err(error),
                     }
                 }
             }
@@ -2620,11 +2752,11 @@ impl SqliteStateDb {
             let album=selected_pass.pointer("/scope/name").and_then(Value::as_str).filter(|name|!name.is_empty() && selected_pass.get("kind").and_then(Value::as_str)!=Some("Unfiled"));
             if d.outcome==SelectionOutcome::Selected
                 && let Some(album)=album {
-                let conflict:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND g.metadata_enabled=1 AND w.verified_metadata=0 AND w.grouping_hash IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM asset_albums WHERE library=?1 AND asset_id=?2 AND album_name=?3)",params![manifest.media_zone(&root).get("zoneName").and_then(Value::as_str),manifest.state_id,album],|r|r.get(0))?;
+                let conflict:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND g.metadata_enabled=1 AND w.verified_metadata=0 AND w.prepared_hash IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM asset_albums WHERE library=?1 AND asset_id=?2 AND album_name=?3)",params![manifest.media_zone(&root).get("zoneName").and_then(Value::as_str),manifest.state_id,album],|r|r.get(0))?;
                 if conflict {reason="unfinished_grouping_conflict".to_owned()}
             }
             let admitted=d.outcome==SelectionOutcome::Selected && reason.is_empty();
-            if staged && !admitted { return Err(StateError::ProviderWorkConflict); }
+            if staged && !admitted { return Err(StateError::ProviderWorkConflict("layout_successor_deferred")); }
             let admission=if admitted {"admitted"} else if d.outcome==SelectionOutcome::Excluded {"excluded"} else {"deferred"};
             if !staged && (existing.is_none() || resolving) {
                 insert_selection_rows(&tx, &root, &manifest, (admission, &reason), capacity)?;
@@ -2642,10 +2774,11 @@ impl SqliteStateDb {
                     }
                 }
                 tx.execute("INSERT INTO asset_master_mappings(library,asset_record_name,master_record_name,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(library,asset_record_name) DO UPDATE SET master_record_name=excluded.master_record_name,updated_at=excluded.updated_at",params![library,d.child,d.master,now])?;
-                if let Some(album)=album {
-                    tx.execute("INSERT OR IGNORE INTO asset_albums(library,asset_id,album_name,source) VALUES(?1,?2,?3,'icloud')",params![library,manifest.state_id,album])?;
-                }
+                let inserted_album = if let Some(album)=album {
+                    tx.execute("INSERT OR IGNORE INTO asset_albums(library,asset_id,album_name,source) VALUES(?1,?2,?3,'icloud')",params![library,manifest.state_id,album])? > 0
+                } else {false};
                 refresh_asset_album_groupings_tx(&tx,library,&manifest.state_id,None)?;
+                if inserted_album { guard_groupings(&tx,library,&manifest.state_id)?; }
                 tx.execute("UPDATE provider_active_destinations SET admitted=1 WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child])?;
             }
             let attempts:u32=tx.query_row("SELECT attempts FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child],|r|r.get(0))?;
@@ -2668,13 +2801,15 @@ impl SqliteStateDb {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
             let root=load_generation(&tx,&generation)?;
             validate_current_deleted_selection(&tx,&root.spec)?;
-            if basis(&tx,&root.spec.scope)?!=root.spec.basis {return Err(StateError::ProviderWorkConflict)}
+            if basis(&tx,&root.spec.scope)?!=root.spec.basis {return Err(StateError::ProviderWorkConflict("selection_basis_changed"))}
             if !root.sealed {
                 let assets:Vec<(String,String)>=tx.prepare("SELECT DISTINCT library,asset_id FROM provider_active_destinations WHERE generation=?1")?.query_map([&generation],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
                 for (library,asset) in assets {
                     let hash=grouping_hash(&tx,&library,&asset)?;
-                    let drift:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND library=?2 AND asset_id=?3 AND grouping_hash IS NOT NULL AND grouping_hash<>?4)",params![generation,library,asset,hash],|r|r.get(0))?;
-                    if drift {return Err(StateError::ProviderWorkConflict)}
+                    // This probe runs once per asset. A generation-only range
+                    // scan makes sealing a large unfiled library quadratic.
+                    let drift:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations INDEXED BY idx_active_destination_identity WHERE generation=?1 AND library=?2 AND asset_id=?3 AND grouping_hash IS NOT NULL AND grouping_hash<>?4)",params![generation,library,asset,hash],|r|r.get(0))?;
+                    if drift {return Err(StateError::ProviderWorkConflict("frozen_grouping_changed"))}
                     freeze_asset_intents(&tx,&root,&library,&asset,&hash)?;
                 }
             }
@@ -2695,7 +2830,7 @@ impl SqliteStateDb {
     ) -> Result<Vec<ActiveDecision>, StateError> {
         self.with_conn("reading unfinished selected destinations",move|conn|{
             account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;pass(&root,&key)?;
-            let children:Vec<String>=conn.prepare("SELECT d.child FROM provider_active_decisions d WHERE d.generation=?1 AND d.pass_key=?2 AND (?3 IS NULL OR d.child>?3) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR (?5=1 AND w.verified_metadata=0)))) ORDER BY d.child LIMIT ?6")?.query_map(params![generation,key,after,Utc::now().timestamp(),root.spec.metadata_enabled,limit],|r|r.get(0))?.collect::<Result<_,_>>()?;
+            let children:Vec<String>=conn.prepare("SELECT d.child FROM provider_active_decisions d WHERE d.generation=?1 AND d.pass_key=?2 AND (?3 IS NULL OR d.child>?3) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR (?5=1 AND w.verified_metadata=0 AND w.metadata_successor IS NULL)))) ORDER BY d.child LIMIT ?6")?.query_map(params![generation,key,after,Utc::now().timestamp(),root.spec.metadata_enabled,limit],|r|r.get(0))?.collect::<Result<_,_>>()?;
             children.iter().map(|child|load_decision(conn,&root,&key,child)).collect()
         }).await
     }
@@ -2707,7 +2842,7 @@ impl SqliteStateDb {
     ) -> Result<bool, StateError> {
         self.with_conn("inspecting destination wake-up",move|conn|{
             account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND ((verified_media=0 AND preserved_local IS NULL) OR (?3=1 AND verified_metadata=0)))",params![generation,Utc::now().timestamp(),root.spec.metadata_enabled],|r|r.get(0))?)
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND ((verified_media=0 AND preserved_local IS NULL) OR (?3=1 AND verified_metadata=0 AND metadata_successor IS NULL)))",params![generation,Utc::now().timestamp(),root.spec.metadata_enabled],|r|r.get(0))?)
         }).await
     }
 }
@@ -3304,6 +3439,19 @@ fn seal_hash(
     ready: bool,
     veto: Option<&str>,
 ) -> Result<String, StateError> {
+    seal_hash_with_pages(conn, root, ready, veto, |page| {
+        load_rank_proof(conn, root, page)?;
+        Ok(())
+    })
+}
+
+fn seal_hash_with_pages(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    ready: bool,
+    veto: Option<&str>,
+    mut verify_page: impl FnMut(&str) -> Result<(), StateError>,
+) -> Result<String, StateError> {
     let mut hash = Sha256::new();
     hash.update(encode(&(&root.spec, ready, veto))?);
     let pages: Vec<String> = conn
@@ -3314,7 +3462,7 @@ fn seal_hash(
         return invalid();
     }
     for page in pages {
-        load_rank(conn, root, &page)?;
+        verify_page(&page)?;
         hash.update(page.as_bytes());
     }
     let keys:Vec<(String,String,String)>=conn.prepare("SELECT pass_key,child,manifest_hash FROM provider_active_decisions WHERE generation=?1 ORDER BY pass_key,child")?.query_map([&root.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
@@ -3335,6 +3483,21 @@ pub(super) fn grouping_hash(
     library: &str,
     asset: &str,
 ) -> Result<String, StateError> {
+    Ok(digest(&encode(&grouping_names(conn, library, asset)?)?))
+}
+
+pub(crate) fn writer_grouping_hash(
+    albums: &[String],
+    people: &[String],
+) -> Result<String, StateError> {
+    Ok(digest(&encode(&[albums, people])?))
+}
+
+fn grouping_names(
+    conn: &Connection,
+    library: &str,
+    asset: &str,
+) -> Result<Vec<Vec<String>>, StateError> {
     let mut groups = Vec::new();
     for (table, column) in [
         ("asset_albums", "album_name"),
@@ -3348,7 +3511,7 @@ pub(super) fn grouping_hash(
             .collect::<Result<_, _>>()?;
         groups.push(names);
     }
-    Ok(digest(&encode(&groups)?))
+    Ok(groups)
 }
 
 fn freeze_asset_intents(
@@ -3358,7 +3521,7 @@ fn freeze_asset_intents(
     asset: &str,
     group: &str,
 ) -> Result<(), StateError> {
-    let keys:Vec<(String,String)>=conn.prepare("SELECT DISTINCT pass_key,child FROM provider_active_destinations WHERE generation=?1 AND library=?2 AND asset_id=?3 ORDER BY pass_key,child")?.query_map(params![root.id,library,asset],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
+    let keys:Vec<(String,String)>=conn.prepare("SELECT DISTINCT pass_key,child FROM provider_active_destinations INDEXED BY idx_active_destination_identity WHERE generation=?1 AND library=?2 AND asset_id=?3 ORDER BY pass_key,child")?.query_map(params![root.id,library,asset],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
     for (key, child) in keys {
         let manifest = load_decision(conn, root, &key, &child)?;
         for destination in &manifest.decision.destinations {
@@ -3407,9 +3570,9 @@ pub(super) fn guard_groupings(
 ) -> Result<(), StateError> {
     validate_identity_decisions(conn, library, asset)?;
     let current = grouping_hash(conn, library, asset)?;
-    let conflict:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND g.metadata_enabled=1 AND w.verified_metadata=0 AND w.grouping_hash IS NOT NULL AND w.grouping_hash IS NOT ?3)",params![library,asset,current],|r|r.get(0))?;
+    let conflict:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND g.metadata_enabled=1 AND w.verified_metadata=0 AND w.prepared_hash IS NOT NULL AND w.grouping_hash IS NOT ?3)",params![library,asset,current],|r|r.get(0))?;
     if conflict {
-        Err(StateError::ProviderWorkConflict)
+        Err(StateError::ProviderWorkConflict("frozen_grouping_changed"))
     } else {
         Ok(())
     }
@@ -3423,7 +3586,14 @@ fn validate_identity_decisions(
     library: &str,
     asset: &str,
 ) -> Result<(), StateError> {
-    let mut statement=conn.prepare("SELECT DISTINCT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND (asset_id=?2 OR child=?2) ORDER BY generation,pass_key,child")?;
+    // Probe both identity indexes. An OR can make SQLite scan the entire
+    // library on each admission. UNION validates each decision only once
+    // even when its asset and child identities coincide.
+    let mut statement = conn.prepare(
+        "SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2
+         UNION SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND child=?2
+         ORDER BY generation,pass_key,child",
+    )?;
     let mut rows = statement.query(params![library, asset])?;
     while let Some(row) = rows.next()? {
         let generation: String = row.get(0)?;
@@ -3444,7 +3614,7 @@ const CURRENT_SELECTION_CONFIGURATION: &str = "g.scope=?1 AND g.config_hash=?2";
 // this rendition at its current path. Keep every old row and prepared output.
 // Callers validate generation/decision proofs before relying on these columns.
 const UNFINISHED: &str = "w.admitted=1
-    AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR (g.metadata_enabled=1 AND w.verified_metadata=0))
+    AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR (g.metadata_enabled=1 AND w.verified_metadata=0 AND w.metadata_successor IS NULL))
     AND NOT (w.verified_media=0 AND w.preserved_local IS NULL AND w.prepared_hash IS NULL AND EXISTS (
         SELECT 1 FROM provider_active_destinations current
         JOIN provider_active_generations newer ON newer.id=current.generation
@@ -3473,7 +3643,7 @@ pub(super) fn guard_generation(conn: &Connection, record: &AssetRecord) -> Resul
         .unwrap_or_else(|| record.metadata.compute_hash());
     let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3 AND {UNFINISHED} AND (w.checksum<>?4 OR w.size_bytes IS NOT ?5 OR w.created_at IS NOT ?6 OR w.added_at IS NOT ?7 OR w.metadata_hash<>?8))"),params![record.library,record.id,record.version_size.as_str(),record.checksum,i64::try_from(record.size_bytes).ok(),encode_asset_date(record.created_at),record.added_at.map(encode_asset_date),hash],|r|r.get(0))?;
     if conflict {
-        Err(StateError::ProviderWorkConflict)
+        Err(StateError::ProviderWorkConflict("unfinished_asset_changed"))
     } else {
         Ok(())
     }
@@ -3488,7 +3658,9 @@ pub(super) fn guard_mapping(
     validate_identity_decisions(conn, library, child)?;
     let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.child=?2 AND w.master<>?3 AND {UNFINISHED})"),params![library,child,master],|r|r.get(0))?;
     if conflict {
-        Err(StateError::ProviderWorkConflict)
+        Err(StateError::ProviderWorkConflict(
+            "unfinished_mapping_changed",
+        ))
     } else {
         Ok(())
     }
@@ -3510,7 +3682,9 @@ pub(super) fn guard_metadata(
         .unwrap_or_else(|| metadata.compute_hash());
     let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3 AND {UNFINISHED} AND (w.metadata_hash<>?4 OR w.created_at IS NOT ?5 OR w.added_at IS NOT ?6))"),params![library,asset,version,hash,created,added],|r|r.get(0))?;
     if conflict {
-        Err(StateError::ProviderWorkConflict)
+        Err(StateError::ProviderWorkConflict(
+            "unfinished_metadata_changed",
+        ))
     } else {
         Ok(())
     }
@@ -3586,7 +3760,7 @@ fn record_layout_destination_for_generation(
             continue;
         }
         if root.spec.metadata_flags & flags != root.spec.metadata_flags {
-            return Err(StateError::ProviderWorkConflict);
+            return Err(StateError::ProviderWorkConflict("managed_recipe_changed"));
         }
         let manifest = load_decision(conn, &root, &key, &child)?;
         let destination = manifest
@@ -3649,7 +3823,12 @@ fn record_layout_destination_for_generation(
             )?;
         }
         conn.execute("UPDATE provider_active_destinations SET embedded_metadata_receipt=?6 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,record.version_size.as_str(),path,fields])?;
-        validate_decision_rows(conn, &root, &manifest)?;
+        validate_decision_rows(
+            conn,
+            &root,
+            &manifest,
+            confirmed_decision_asset(&manifest, &root)?.as_ref(),
+        )?;
     }
     Ok(())
 }
@@ -3672,7 +3851,7 @@ impl SqliteStateDb {
                 params![binding.family,binding.library,binding.child,binding.generation], |row| row.get(0),
             )?;
             if stored != encode(&binding)? {
-                return Err(StateError::ProviderWorkConflict);
+                return Err(StateError::ProviderWorkConflict("managed_binding_changed"));
             }
             for file in &binding.files {
                 let selected: bool = tx.query_row(
@@ -3985,9 +4164,45 @@ impl SqliteStateDb {
     }
 }
 
+/// Validate the fresh selection that still depends on the older catalogue input.
+pub(super) fn validate_blocked_successor(
+    conn: &Connection,
+    generation: &str,
+    key: &str,
+    child: &str,
+) -> Result<(), StateError> {
+    let root = load_generation(conn, generation)?;
+    let manifest = load_decision(conn, &root, key, child)?;
+    if manifest.decision.outcome != SelectionOutcome::Selected
+        || manifest.decision.confirmation.is_none()
+    {
+        return invalid();
+    }
+    Ok(())
+}
+
 /// Adapt one exact native destination into the existing metadata write owner.
 /// Legacy path TEXT is neither decoded nor used as publication evidence.
 pub(super) fn metadata_receipt(
+    conn: &Connection,
+    generation: &str,
+    key: &str,
+    child: &str,
+    version: &str,
+    path_key: &str,
+) -> Result<super::PendingMetadataRewrite, StateError> {
+    let pending = queued_metadata_receipt(conn, generation, key, child, version, path_key)?;
+    let receipt = pending
+        .selection_receipt
+        .as_ref()
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    if grouping_hash(conn, &pending.asset.library, &pending.asset.id)? != receipt.grouping_hash {
+        return Err(StateError::ProviderWorkConflict("frozen_grouping_changed"));
+    }
+    Ok(pending)
+}
+
+pub(super) fn queued_metadata_receipt(
     conn: &Connection,
     generation: &str,
     key: &str,
@@ -4003,15 +4218,12 @@ pub(super) fn metadata_receipt(
         .iter()
         .find(|d| d.version_size == version && d.path.key().ok().as_deref() == Some(path_key))
         .ok_or(StateError::ProviderSelectionInvalid)?;
-    let (local,source,group):(String,Option<String>,String)=conn.query_row("SELECT local_checksum,source_checksum,grouping_hash FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL) AND verified_metadata=0",params![generation,key,child,version,path_key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    let (local,source,group):(String,Option<String>,String)=conn.query_row("SELECT local_checksum,source_checksum,grouping_hash FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL) AND verified_metadata=0 AND metadata_successor IS NULL",params![generation,key,child,version,path_key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     let library = manifest
         .media_zone(&root)
         .get("zoneName")
         .and_then(Value::as_str)
         .ok_or(StateError::ProviderSelectionInvalid)?;
-    if grouping_hash(conn, library, &manifest.state_id)? != group {
-        return Err(StateError::ProviderWorkConflict);
-    }
     let mut asset=conn.query_row(&format!("SELECT {} FROM assets WHERE library=?1 AND id=?2 AND version_size=?3 AND checksum=?4 AND metadata_hash=?5 AND is_deleted=0",super::rows::ASSET_COLUMNS),params![library,manifest.state_id,version,destination.checksum,destination.metadata_hash],super::rows::row_to_asset_record)?;
     asset.local_path = Some(destination.path.to_path());
     asset.local_checksum = Some(local.clone());
@@ -4022,6 +4234,7 @@ pub(super) fn metadata_receipt(
         capture_repair_receipt: None,
         source_checksum: source,
         selection_receipt: Some(super::contracts::SelectionMetadataReceipt {
+            writer_output: None,
             preserved_local: preserved_local(conn, &root, &manifest, destination)?,
             generation: generation.to_owned(),
             pass_key: key.to_owned(),
@@ -4067,7 +4280,7 @@ pub(super) fn recover_metadata_field_output(
                 || r.metadata_flags != receipt.metadata_flags
         })
     {
-        return Err(StateError::ProviderWorkConflict);
+        return Err(StateError::ProviderWorkConflict("embedded_input_changed"));
     }
     let preserved = receipt
         .preserved_local
@@ -4089,7 +4302,7 @@ pub(super) fn recover_metadata_field_output(
         AND generation=?8 AND pass_key=?9 AND child=?10 AND (preserved_local IS NULL)=(?11 IS NULL)
         AND local_checksum IN (?6,?7)", params![pending.asset.library,pending.asset.id,pending.asset.version_size.as_str(),path,raw,fields.input_checksum,fields.output_checksum,receipt.generation,receipt.pass_key,receipt.child,preserved])?;
     if changed != 1 {
-        return Err(StateError::ProviderWorkConflict);
+        return Err(StateError::ProviderWorkConflict("embedded_output_changed"));
     }
     let destination = manifest
         .decision
@@ -4121,7 +4334,9 @@ pub(super) fn finish_metadata_receipt(
     if root.spec.metadata_flags != receipt.metadata_flags
         || grouping_hash(conn, &pending.asset.library, &manifest.state_id)? != receipt.grouping_hash
     {
-        return Err(StateError::ProviderWorkConflict);
+        return Err(StateError::ProviderWorkConflict(
+            "writer_dependencies_changed",
+        ));
     }
     let path = super::provider_selection::SelectionPath::from_path(
         pending
@@ -4131,6 +4346,10 @@ pub(super) fn finish_metadata_receipt(
             .ok_or(StateError::ProviderSelectionInvalid)?,
     )
     .key()?;
+    if conn.query_row("SELECT metadata_successor IS NOT NULL FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+        params![root.id,receipt.pass_key,receipt.child,pending.asset.version_size.as_str(),path], |r|r.get::<_,bool>(0))? {
+        return Err(StateError::ProviderWorkConflict("metadata_writer_replaced"));
+    }
     let selected_destination = manifest
         .decision
         .destinations
@@ -4141,7 +4360,7 @@ pub(super) fn finish_metadata_receipt(
         })
         .ok_or(StateError::ProviderSelectionInvalid)?;
     if prepared_metadata(conn, &root, &manifest, selected_destination)? != receipt.prepared {
-        return Err(StateError::ProviderWorkConflict);
+        return Err(StateError::ProviderWorkConflict("prepared_receipt_changed"));
     }
     if local.is_some()
         && local != pending.asset.local_checksum.as_deref()
@@ -4156,7 +4375,7 @@ pub(super) fn finish_metadata_receipt(
         if preserved_local(conn, &root, &manifest, selected_destination)?.as_ref() != Some(expected)
             || pending.source_checksum.is_some()
         {
-            return Err(StateError::ProviderWorkConflict);
+            return Err(StateError::ProviderWorkConflict("preserved_input_changed"));
         }
         let mut updated = expected.clone();
         if let Some(local) = local {
@@ -4177,6 +4396,17 @@ pub(super) fn finish_metadata_receipt(
         conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,local_checksum=COALESCE(?8,local_checksum),verified_metadata=CASE WHEN ?9=1 THEN 1 ELSE verified_metadata END WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=1 AND verified_metadata=0 AND local_checksum IS ?6 AND grouping_hash=?7 AND source_checksum IS ?10 AND metadata_hash IS ?11 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=provider_active_destinations.library AND a.id=provider_active_destinations.asset_id AND a.version_size=provider_active_destinations.version_size AND a.checksum=provider_active_destinations.checksum AND a.metadata_hash=provider_active_destinations.metadata_hash AND a.created_at IS provider_active_destinations.created_at AND a.added_at IS provider_active_destinations.added_at AND a.is_deleted=0)",params![receipt.generation,receipt.pass_key,receipt.child,pending.asset.version_size.as_str(),path,pending.asset.local_checksum,receipt.grouping_hash,local,complete,pending.source_checksum,pending.asset.metadata.metadata_hash])?
     };
     if changed > 0 && receipt.preserved_local.is_none() {
+        if complete && let (Some(writer), Some(media)) = (receipt.writer_output, local) {
+            writer_output::record(
+                conn,
+                pending,
+                &root,
+                &manifest,
+                selected_destination,
+                media,
+                writer,
+            )?;
+        }
         if let Some(prepared) = receipt.prepared.as_ref()
             && local == Some(prepared.0.as_str())
         {
@@ -4214,7 +4444,7 @@ pub(super) fn finish_metadata_receipt(
         // A single physical write can satisfy multiple passes only when every
         // frozen input and writer dependency is exactly compatible. Different
         // native paths always retain independent publication obligations.
-        let mut statement=conn.prepare("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND checksum=?5 AND metadata_hash IS ?6 AND created_at IS ?7 AND added_at IS ?8 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL) AND verified_metadata=0 AND local_checksum IS ?9 AND source_checksum IS ?10 AND grouping_hash=?11 AND size_bytes=?12 ORDER BY generation,pass_key,child")?;
+        let mut statement=conn.prepare("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND checksum=?5 AND metadata_hash IS ?6 AND created_at IS ?7 AND added_at IS ?8 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL) AND verified_metadata=0 AND metadata_successor IS NULL AND local_checksum IS ?9 AND source_checksum IS ?10 AND grouping_hash=?11 AND size_bytes=?12 ORDER BY generation,pass_key,child")?;
         let aliases = statement.query_map(
             params![
                 pending.asset.library,
@@ -4508,6 +4738,48 @@ impl SqliteStateDb {
         scope: String,
         config_hash: String,
     ) -> Result<bool, StateError> {
+        self.selection_debt(owner, scope, config_hash, false).await
+    }
+
+    /// Does not include metadata that the post-checkpoint writer can recover
+    /// from the selected SQLite receipts alone.
+    pub(crate) async fn provider_selection_debt(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        config_hash: String,
+    ) -> Result<bool, StateError> {
+        self.selection_debt(owner, scope, config_hash, true).await
+    }
+
+    /// Local recovery is bound to the last inventory for this exact plan.
+    /// Advancing a provider cursor must not make its writer unreachable.
+    pub(crate) async fn local_writer_generation(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        config_hash: String,
+    ) -> Result<Option<ActiveGeneration>, StateError> {
+        self.with_conn("reading local writer inventory", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            account::validate_authenticated(&tx, &owner)?;
+            let id: Option<String> = tx
+                .query_row(LATEST_LOCAL_GENERATION, params![scope, config_hash], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            id.map(|id| load_generation(&tx, &id)).transpose()
+        })
+        .await
+    }
+
+    async fn selection_debt(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        config_hash: String,
+        local_writer_available: bool,
+    ) -> Result<bool, StateError> {
         self.with_conn("inspecting retained selection debt",move|conn|{
             let tx=conn.unchecked_transaction()?;
             account::validate_authenticated(&tx,&owner)?;
@@ -4520,11 +4792,60 @@ impl SqliteStateDb {
             // A later complete inventory accounts for its own selected repair
             // destinations. Keep historical confirmations for future matching
             // selections without charging them to the current checkpoint.
-            Ok(conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE {CURRENT_SELECTION_CONFIGURATION} AND d.admission='deferred') OR EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND (g.config_hash=?2 OR (w.prepared_hash IS NOT NULL AND EXISTS(SELECT 1 FROM provider_active_destinations selected JOIN provider_active_generations current ON current.id=selected.generation WHERE current.scope=?1 AND current.config_hash=?2 AND selected.admitted=1 AND selected.path=w.path))) AND {UNFINISHED}
-                AND NOT (w.confirmed_repair IS NOT NULL AND w.prepared_hash IS NULL AND EXISTS(SELECT 1 FROM provider_active_generations newer WHERE newer.scope=g.scope AND newer.config_hash=g.config_hash AND newer.created_at>g.created_at AND newer.sealed=1 AND newer.checkpoint_ready=1)))"),params![scope,config_hash],|r|r.get(0))?)
+            if conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE {CURRENT_SELECTION_CONFIGURATION} AND d.admission='deferred')"),params![scope,config_hash],|r|r.get::<_,bool>(0))? {return Ok(true)}
+            let debt=format!("FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND (g.config_hash=?2 OR (w.prepared_hash IS NOT NULL AND EXISTS(SELECT 1 FROM provider_active_destinations selected JOIN provider_active_generations current ON current.id=selected.generation WHERE current.scope=?1 AND current.config_hash=?2 AND selected.admitted=1 AND selected.path=w.path))) AND {UNFINISHED}
+                AND NOT (w.confirmed_repair IS NOT NULL AND w.prepared_hash IS NULL AND EXISTS(SELECT 1 FROM provider_active_generations newer WHERE newer.scope=g.scope AND newer.config_hash=g.config_hash AND newer.created_at>g.created_at AND newer.sealed=1 AND newer.checkpoint_ready=1))");
+            let unfinished:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 {debt})"),params![scope,config_hash],|r|r.get(0))?;
+            if !unfinished || !local_writer_available {return Ok(unfinished)}
+            // Refresh the local preservation cache before opening the destination
+            // cursor: rebuilding its TEMP schema would invalidate a live cursor.
+            let protected=super::legacy_preservation::protected_paths(conn)?.into_iter()
+                .map(|path|crate::fs_util::confined_path_key(&path).map_err(|_invalid_path|StateError::ProviderSelectionInvalid))
+                .collect::<Result<HashSet<_>,_>>()?;
+            // The local writer reads the latest generation and can finish
+            // compatible aliases. Don't excuse a historical-only path, a
+            // lost catalogue input, an outstanding repair, or missing media.
+            let mut stmt=conn.prepare(&format!("SELECT DISTINCT w.library,w.asset_id,CASE WHEN
+                g.config_hash=?2 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL) AND w.confirmed_repair IS NULL
+                AND w.intent_hash IS NOT NULL AND w.local_checksum IS NOT NULL
+                AND EXISTS(SELECT 1 FROM assets a WHERE a.library=w.library AND a.id=w.asset_id
+                    AND a.version_size=w.version_size AND a.checksum=w.checksum AND a.is_deleted=0
+                    AND a.metadata_hash=w.metadata_hash AND a.created_at IS w.created_at AND a.added_at IS w.added_at)
+                AND EXISTS(SELECT 1 FROM provider_active_destinations n JOIN provider_active_generations newest ON newest.id=n.generation
+                    WHERE n.generation=({LATEST_LOCAL_GENERATION}) AND newest.sealed=1 AND newest.checkpoint_ready=1
+                    AND n.pass_key=w.pass_key AND n.child=w.child AND n.version_size=w.version_size AND n.path=w.path
+                    AND n.library=w.library AND n.asset_id=w.asset_id AND n.master=w.master AND n.checksum=w.checksum
+                    AND n.size_bytes=w.size_bytes AND n.metadata_hash=w.metadata_hash AND n.added_at IS w.added_at AND n.created_at IS w.created_at
+                    AND n.admitted=1 AND (n.verified_media=1 OR n.preserved_local IS NOT NULL) AND n.verified_metadata=0 AND n.metadata_successor IS NULL
+                    AND n.confirmed_repair IS NULL AND n.preserved_local IS w.preserved_local AND n.grouping_hash=w.grouping_hash
+                    AND n.local_checksum=w.local_checksum AND n.source_checksum IS w.source_checksum
+                    AND (w.generation=n.generation OR (w.prepared_hash IS NULL AND n.prepared_hash IS NULL)))
+                THEN w.grouping_hash END,w.path {debt}"))?;
+            let mut rows=stmt.query(params![scope,config_hash])?;
+            while let Some(r)=rows.next()? {
+                let Some(group)=r.get::<_,Option<String>>(2)? else {return Ok(true)};
+                let path:super::provider_selection::SelectionPath=serde_json::from_str(&r.get::<_,String>(3)?)
+                    .map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
+                let path=path.to_path();
+                if super::primary_layout::path_is_managed(conn,&path)? {return Ok(true)}
+                if !protected.is_empty() {
+                    let mut sidecar=path.as_os_str().to_owned();
+                    sidecar.push(".xmp");
+                    for p in [path.as_path(),Path::new(&sidecar)] {
+                        if protected.contains(&crate::fs_util::confined_path_key(p).map_err(|_invalid_path|StateError::ProviderSelectionInvalid)?) {return Ok(true)}
+                    }
+                }
+                if grouping_hash(conn,&r.get::<_,String>(0)?,&r.get::<_,String>(1)?)?!=group {return Ok(true)}
+            }
+            drop(rows);
+            drop(stmt);
+            tx.commit()?;
+            Ok(false)
         }).await
     }
 }
+
+const LATEST_LOCAL_GENERATION: &str = "SELECT id FROM provider_active_generations WHERE scope=?1 AND config_hash=?2 ORDER BY created_at DESC,id DESC LIMIT 1";
 
 impl SqliteStateDb {
     /// Established destination ownership is independent of current resource proof.
@@ -4925,6 +5246,6 @@ pub(crate) fn inspect_selection_validation_budget(
     RANK_DECODE_METRICS.with(|metrics| metrics.set((0, 0)));
     let mut pages = RankProofs::new(conn, root);
     pages.capacity = capacity;
-    let result = validate_decision_with_pages(conn, root, manifest, true, &mut pages);
+    let result = validate_decision_with_pages(conn, root, manifest, true, &mut pages).map(drop);
     (result, RANK_DECODE_METRICS.with(std::cell::Cell::get))
 }

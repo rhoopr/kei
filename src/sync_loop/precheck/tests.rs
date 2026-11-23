@@ -124,7 +124,7 @@ async fn unresolved_identity_bypasses_watch_no_change_shortcut() {
     include_pending_local_work(
         &mut precheck,
         &db,
-        &config::MetadataConfig::default(),
+        Some(&config::MetadataConfig::default()),
         &[library],
     )
     .await;
@@ -174,7 +174,7 @@ async fn due_sparse_link_includes_its_selected_target_in_quiet_watch_cycles() {
         include_pending_local_work(
             &mut precheck,
             db.as_ref(),
-            &config::MetadataConfig::default(),
+            Some(&config::MetadataConfig::default()),
             &libraries,
         )
         .await;
@@ -203,7 +203,7 @@ async fn disabled_metadata_writers_leave_rewrite_marker_out_of_watch_work() {
     include_pending_local_work(
         &mut precheck,
         &db,
-        &config::MetadataConfig::default(),
+        Some(&config::MetadataConfig::default()),
         &[library],
     )
     .await;
@@ -238,7 +238,13 @@ async fn enabled_metadata_writer_forces_only_selected_rewrite_zone() {
     };
     let mut precheck = WatchPrecheck::SkipAll;
 
-    include_pending_local_work(&mut precheck, &db, &metadata, &[selected]).await;
+    include_pending_local_work(&mut precheck, &db, None, std::slice::from_ref(&selected)).await;
+    assert_eq!(
+        precheck,
+        WatchPrecheck::SkipAll,
+        "post-sync debt must not wake provider enumeration"
+    );
+    include_pending_local_work(&mut precheck, &db, Some(&metadata), &[selected]).await;
 
     assert!(precheck.should_sync_zone("PrimarySync"));
     assert!(!precheck.should_sync_zone("SharedSync-OTHER"));
@@ -260,7 +266,7 @@ async fn capture_revision_forces_watch_work_with_metadata_writers_disabled() {
     include_pending_local_work(
         &mut precheck,
         &db,
-        &config::MetadataConfig::default(),
+        Some(&config::MetadataConfig::default()),
         &[library],
     )
     .await;

@@ -353,6 +353,7 @@ pub struct ImportConfig {
 
 #[derive(Debug)]
 pub struct RuntimeConfig {
+    pub(crate) config_path: Option<PathBuf>,
     pub dry_run: bool,
     pub only_print_filenames: bool,
     pub refresh_metadata: bool,

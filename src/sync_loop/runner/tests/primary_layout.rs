@@ -61,7 +61,7 @@ fn second_date_records(server: &MockServer) -> Vec<Value> {
     second[0]["fields"]["filenameEnc"]["value"] = json!("IMG_0502.JPG");
     second[1]["recordName"] = json!("asset-502");
     second[1]["fields"]["masterRef"]["value"]["recordName"] = json!("502");
-    second[1]["fields"]["assetDate"]["value"] = json!(1731628800000_i64);
+    second[1]["fields"]["assetDate"]["value"] = json!(1_731_628_800_125_i64);
     second
 }
 fn records_at(uri: &str, edit: Option<(&str, &[u8])>) -> Vec<Value> {
@@ -1281,6 +1281,7 @@ async fn historical_selected_metadata_receipt_cannot_override_current_unknown_ow
     let pending = PendingMetadataRewrite {
         asset,
         selection_receipt: Some(SelectionMetadataReceipt {
+            writer_output: None,
             generation,
             pass_key,
             child,
@@ -2347,7 +2348,7 @@ async fn album_directory_projection_template_changes_apply_only_to_future_files(
 
 #[tokio::test]
 async fn album_directory_per_file_projection_handles_dates_and_embedded_tokens() {
-    for template in ["%Y/{album}/%m", "%Y/photos-{album}-selected/%m"] {
+    for template in ["%Y/{album}/%m-%3f", "%Y/photos-{album}-selected/%m"] {
         let server = server().await;
         let root = tempfile::tempdir().unwrap();
         let mut provider = records(&server, None);
@@ -4111,7 +4112,7 @@ async fn primary_layout_after_database_failure(upgrade: bool) {
         crate::sync_loop::precheck::include_pending_local_work(
             &mut precheck,
             &db,
-            &crate::config::MetadataConfig::default(),
+            Some(&crate::config::MetadataConfig::default()),
             &[selected],
         )
         .await;
@@ -5310,11 +5311,7 @@ async fn primary_layout_root_template_transitions_cover_all_pass_kinds() {
             assert!(quiet.db_sync_token_advance_safe);
             // The zone delta cannot establish smart-folder membership. Current
             // selection refreshes and confirms it even when media is unchanged.
-            let expected_lookups = if pass_kind == PassKind::SmartFolder {
-                2
-            } else {
-                0
-            };
+            let expected_lookups = usize::from(pass_kind == PassKind::SmartFolder);
             assert_eq!(
                 lookups, expected_lookups,
                 "{pass_kind:?}: unexpected quiet lookup"

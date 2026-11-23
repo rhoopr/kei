@@ -45,6 +45,7 @@ pub(super) fn write_sidecar_with_default_suffix(
     RUNTIME
         .get_or_init(|| tokio::runtime::Runtime::new().expect("sidecar test runtime"))
         .block_on(write_sidecar(path, write, ".meta-tmp"))
+        .map(|_| ())
 }
 
 #[cfg(feature = "xmp")]

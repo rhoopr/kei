@@ -75,8 +75,8 @@ pub(super) fn refresh_asset_album_groupings_tx(
             )
             .map_err(|e| StateError::query(operation, e))?;
     }
-    super::provider_generations::guard_groupings(tx, library, asset_id)?;
     if changed > 0 {
+        super::provider_generations::guard_groupings(tx, library, asset_id)?;
         mark_album_groupings_dirty_tx(tx, library, asset_id)?;
     }
     Ok(())
@@ -239,8 +239,8 @@ impl SqliteStateDb {
                     rusqlite::params![&library, &asset_id, album_name, source],
                 )
                 .map_err(|e| StateError::query("add_asset_album", e))?;
-            super::provider_generations::guard_groupings(&tx, &library, &asset_id)?;
             if changed > 0 {
+                super::provider_generations::guard_groupings(&tx, &library, &asset_id)?;
                 mark_album_groupings_dirty_tx(&tx, &library, &asset_id)?;
             }
             tx.commit()

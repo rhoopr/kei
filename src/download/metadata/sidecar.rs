@@ -178,7 +178,7 @@ pub(crate) async fn write_sidecar(
     media_path: &Path,
     write: &MetadataWrite,
     temp_suffix: &str,
-) -> Result<()> {
+) -> Result<Option<[u8; 32]>> {
     let media_path = media_path.to_path_buf();
     let write = write.clone();
     let temp_suffix = temp_suffix.to_owned();
@@ -188,15 +188,18 @@ pub(crate) async fn write_sidecar(
     .await
     .context("XMP sidecar preparation task panicked")??;
     let Some(prepared) = prepared else {
-        return Ok(());
+        return Ok(None);
     };
     let prepared = match prepared {
         PreparedSidecar::Publish(prepared) => prepared,
         PreparedSidecar::Unchanged(snapshot) => {
-            tokio::task::spawn_blocking(move || snapshot.validate())
-                .await
-                .context("Unchanged XMP sidecar validation task panicked")??;
-            return Ok(());
+            let output = tokio::task::spawn_blocking(move || {
+                snapshot.validate()?;
+                fingerprint_bytes(&snapshot.bytes)
+            })
+            .await
+            .context("Unchanged XMP sidecar validation task panicked")??;
+            return Ok(Some(output.sha256));
         }
     };
 
@@ -236,7 +239,7 @@ pub(crate) async fn write_sidecar(
         });
     }
     tracing::debug!(target: "kei::download::metadata", path = %prepared.sidecar_path.display(), "Wrote XMP sidecar");
-    Ok(())
+    Ok(Some(prepared.output.sha256))
 }
 
 enum PreparedSidecar {
@@ -248,7 +251,6 @@ struct SidecarPublication {
     tmp_path: PathBuf,
     sidecar_path: PathBuf,
     expected: Option<crate::download::file::ExistingFileFingerprint>,
-    #[cfg(target_os = "linux")]
     output: crate::download::file::ExistingFileFingerprint,
     #[cfg(target_os = "linux")]
     identity: crate::fs_util::FileIdentity,
@@ -277,58 +279,45 @@ fn prepare_sidecar_write(
     crate::download::file::recover_file_replacement(&sidecar_path)?;
     // Seed the packet with any existing sidecar content so user-authored
     // ratings / keywords / develop settings from another tool survive.
-    let (mut meta, expected, existing_bytes) = match std::fs::read(&sidecar_path) {
-        Ok(existing_bytes) => {
-            let existing = std::str::from_utf8(&existing_bytes).with_context(|| {
+    let parent = sidecar_path
+        .parent()
+        .context("Sidecar has no parent directory")?;
+    let existing = ReconciledSidecarSnapshot::read(crate::fs_util::ConfinedPath::open(
+        parent,
+        &sidecar_path,
+        crate::fs_util::ConfinedParents::Existing,
+    )?)?;
+    let mut meta = match &existing {
+        Some(snapshot) => {
+            let existing = std::str::from_utf8(&snapshot.bytes).with_context(|| {
                 format!(
                     "Existing XMP sidecar is not valid UTF-8: {}",
                     sidecar_path.display()
                 )
             })?;
-            let parsed = parse_existing_sidecar(existing).with_context(|| {
+            parse_existing_sidecar(existing).with_context(|| {
                 format!(
                     "Could not parse existing XMP sidecar {}",
                     sidecar_path.display()
                 )
-            })?;
-            let fingerprint = fingerprint_bytes(&existing_bytes)?;
-            (parsed, Some(fingerprint), Some(existing_bytes))
+            })?
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (XmpMeta::new().context("creating XmpMeta")?, None, None)
-        }
-        Err(e) => {
-            return Err(e).with_context(|| {
-                format!(
-                    "Could not read existing XMP sidecar {}",
-                    sidecar_path.display()
-                )
-            });
-        }
+        None => XmpMeta::new().context("creating XmpMeta")?,
     };
     if write.is_empty() && !meta.contains_property(KEI_XMP_NS, KEI_MANAGED_FIELDS) {
         return Ok(None);
     }
     apply_to_owned_sidecar(&mut meta, write)?;
     let bytes = meta.to_string().into_bytes();
-    if existing_bytes.as_deref() == Some(bytes.as_slice()) {
-        let parent = sidecar_path
-            .parent()
-            .context("Sidecar has no parent directory")?;
-        let path = crate::fs_util::ConfinedPath::open(
-            parent,
-            &sidecar_path,
-            crate::fs_util::ConfinedParents::Existing,
-        )?;
-        let snapshot =
-            ReconciledSidecarSnapshot::read(path)?.context("Unchanged sidecar disappeared")?;
-        anyhow::ensure!(
-            snapshot.bytes == bytes,
-            "Unchanged sidecar changed after preparation"
-        );
-        snapshot.validate()?;
-        return Ok(Some(PreparedSidecar::Unchanged(snapshot)));
-    }
+    let expected = match existing {
+        Some(snapshot) if snapshot.bytes == bytes => {
+            // The caller rechecks the original handle, path and packet bytes
+            // before returning its hash. An identical packet needs no staging.
+            return Ok(Some(PreparedSidecar::Unchanged(snapshot)));
+        }
+        Some(snapshot) => Some(fingerprint_bytes(&snapshot.bytes)?),
+        None => None,
+    };
 
     let (mut temp, tmp_path) = create_unique_sidecar_temp(&sidecar_path, temp_suffix)?;
     let guard = TmpGuard::new(&tmp_path);
@@ -349,7 +338,6 @@ fn prepare_sidecar_write(
         tmp_path,
         sidecar_path,
         expected,
-        #[cfg(target_os = "linux")]
         output: fingerprint_bytes(&bytes)?,
         #[cfg(target_os = "linux")]
         identity: crate::fs_util::file_identity(&temp)?,

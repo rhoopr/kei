@@ -18,6 +18,8 @@ filename, matching asset name, zone or checkpoint does not prove ownership.
    companions, configuration, and media.
 2. Verify independently that the complete legacy database belongs to the
    configured account. Mixed or unknown ownership is not safe to confirm.
+
+   For example, check a dated backup manifest that identifies this exact database backup and the account and realm of its sole writer. Another possible record is a service deployment history showing that only one configured account ever wrote to that isolated state volume, including across restores. A current config beside the database does not establish that history. If you cannot account for a previous writer, a restore, or a reused volume, keep the backup and stop here.
 3. Supply the exact source path and your ownership confirmation:
 
    `kei migrate-state --legacy-db /path/to/legacy.db --confirm-ownership`

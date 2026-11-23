@@ -204,6 +204,7 @@ pub(super) async fn finalize_streaming_download(
     if consumer.state_write_circuit_error.is_none()
         && !consumer.storage_failed
         && !defer_metadata_drain
+        && !config.post_sync_metadata
         && !config.refresh_metadata
         && let Some(db) = &state_db
     {

@@ -14,21 +14,25 @@ body:
       description: |
         Please attach the locally reviewed JSON file up front, if available:
         `kei --config ~/.config/kei/config.toml support-export --output kei-support.json`
-        Use your normal config and KEI_DATA_DIR. In Docker: `docker exec kei kei --config /config/config.toml support-export --output /config/kei-support.json`, then copy it from your config mount.
+        Use your normal config and KEI_DATA_DIR. For Compose or Docker, follow the [support export procedure](https://github.com/rhoopr/kei/blob/main/docs/support-export.md).
         This runs offline without a new sync, login, repair or migration and uploads nothing. It excludes credentials, personal paths, album/asset IDs, checksums and free-text errors. Partial files are useful too.
         If your version lacks the command or collection fails, submit anyway and say so here. Do not attach raw databases, auth files, config or reports.
       placeholder: Attach kei-support.json here, or explain why it is unavailable.
     validations:
       required: false
 
-  - type: checkboxes
+  - type: dropdown
     id: adp-check
     attributes:
       label: Advanced Data Protection
-      description: kei's iCloud web session needs iCloud.com Photos access. Bugs that only reproduce with web access disabled are not actionable here.
+      description: Which describes this report? You do not need to change your account security settings to file it.
       options:
-        - label: I have confirmed that ADP is disabled and "Access iCloud Data on the Web" is enabled
-          required: true
+        - ADP disabled and web access enabled
+        - ADP enabled or web access disabled
+        - Local-only issue / not applicable
+        - Unsure
+    validations:
+      required: true
 
   - type: textarea
     id: observed

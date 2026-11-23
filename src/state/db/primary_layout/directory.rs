@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 
 use super::{LayoutBinding, LayoutFingerprint, decode, encode, invalid, path_key};
 use crate::fs_util::FileIdentity;
+use crate::state::db::rows::decode_asset_date;
 use crate::state::db::{SqliteStateDb, account, provider_selection::SelectionPath};
 use crate::state::error::StateError;
 
@@ -252,16 +253,20 @@ fn sources(
             if !selected_source(conn, binding, &source)? {
                 continue;
             }
-            let date: Option<(i64, Option<i32>)> = conn.query_row("SELECT created_at,timezone_offset FROM assets WHERE library=?1 AND id=?2 AND version_size=?3", params![source.library,source.child,source.version], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
-            source.created = date.and_then(|(seconds, timezone_offset)| {
-                chrono::DateTime::from_timestamp(seconds, 0).map(|date| {
-                    crate::state::AssetMetadata {
-                        timezone_offset,
-                        ..Default::default()
-                    }
-                    .capture_local(date)
-                })
-            });
+            source.created = conn
+                .query_row(
+                    "SELECT created_at,timezone_offset FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
+                    params![source.library, source.child, source.version],
+                    |row| {
+                        let date = decode_asset_date(row.get(0)?, 0)?;
+                        Ok(crate::state::AssetMetadata {
+                            timezone_offset: row.get(1)?,
+                            ..Default::default()
+                        }
+                        .capture_local(date))
+                    },
+                )
+                .optional()?;
         }
         selected.push(source);
     }

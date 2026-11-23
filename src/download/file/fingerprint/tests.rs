@@ -2,6 +2,36 @@ use tempfile::TempDir;
 
 use super::compute_sha256;
 
+#[cfg(windows)]
+#[tokio::test]
+async fn writer_snapshot_excludes_edits_until_released() {
+    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("media");
+    std::fs::write(&path, b"seed").unwrap();
+    let writer = std::fs::File::options().write(true).open(&path).unwrap();
+    assert!(
+        super::WriterSnapshot::read(root.path(), &path)
+            .await
+            .is_err()
+    );
+    drop(writer);
+    let snapshot = super::WriterSnapshot::read(root.path(), &path)
+        .await
+        .unwrap();
+    let error = std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+    let moved = root.path().join("moved");
+    assert!(std::fs::rename(&path, &moved).is_err());
+    snapshot.still_matches().unwrap();
+    drop(snapshot);
+    std::fs::rename(path, &moved).unwrap();
+    std::fs::write(moved, b"edit").unwrap();
+}
+
 #[tokio::test]
 async fn retained_local_observation_rejects_mtime_only_race_per_copy() {
     let root = TempDir::new().unwrap();
