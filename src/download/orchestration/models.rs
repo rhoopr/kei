@@ -1005,6 +1005,7 @@ pub(super) fn merge_streaming_result(combined: &mut StreamingResult, result: Str
     combined.state_write_failures += result.state_write_failures;
     combined.storage_failed |= result.storage_failed;
     combined.enumeration_errors += result.enumeration_errors;
+    combined.url_expired |= result.url_expired;
     combined.assets_seen += result.assets_seen;
     combined.skip_summary += result.skip_summary;
     combined.bytes_downloaded += result.bytes_downloaded;
@@ -1032,7 +1033,7 @@ pub(super) fn merge_token_recovery_result(combined: &mut StreamingResult, result
     combined.bytes_downloaded += result.bytes_downloaded;
     combined.disk_bytes_written += result.disk_bytes_written;
     combined.rate_limit_observations += result.rate_limit_observations;
-    combined.url_expired_abort = combined.url_expired_abort || result.url_expired_abort;
+    combined.url_expired |= result.url_expired;
     combined.photos_downloaded += result.photos_downloaded;
     combined.videos_downloaded += result.videos_downloaded;
     combined.recap.merge(result.recap);

@@ -432,6 +432,102 @@ fn use_paged_selection(f: &mut Fixture) {
     );
 }
 
+#[tokio::test]
+async fn full_sync_410_keeps_healthy_transfers_running_before_cleanup() {
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/expired"))
+        .respond_with(ResponseTemplate::new(410))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/media"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.concurrent_downloads = 1;
+    f.db.acquire_lock("first baseline without a checkpoint")
+        .unwrap()
+        .execute("DELETE FROM metadata WHERE key=?1", [PRIMARY_KEY])
+        .unwrap();
+    f.db.set_metadata(SHARED_KEY, "shared-before")
+        .await
+        .unwrap();
+    use_paged_selection(&mut f);
+    let mut expired = selected_records("expired", &server);
+    expired[0]["fields"]["filenameEnc"]["value"] = json!("expired.jpg");
+    expired[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+        json!(format!("{}/expired", server.uri()));
+    let peers = ["one", "two"].into_iter().flat_map(|name| {
+        let mut pair = selected_records(name, &server);
+        pair[0]["fields"]["filenameEnc"]["value"] = json!(format!("{name}.jpg"));
+        pair
+    });
+    *f.session.records.lock().unwrap() = expired.into_iter().chain(peers).collect();
+
+    let config = make_run_cycle_config();
+    let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+    let first = baseline_cycle(&f, &config, &session, vec![f.pass.clone()]).await;
+    let lookups = f.session.lookup_names.lock().unwrap().clone();
+    let lookup_count = |record: &str| {
+        lookups
+            .iter()
+            .filter(|name| name.as_str() == record)
+            .count()
+    };
+    for healthy in ["asset-one", "asset-two"] {
+        assert_eq!(
+            lookup_count(healthy),
+            1,
+            "expected initial confirmation only, not cleanup: {lookups:?}"
+        );
+    }
+    assert!(lookup_count("asset-expired") > 1, "{lookups:?}");
+    assert_eq!((first.stats.downloaded, first.stats.failed), (2, 1));
+    assert_eq!(first.failed_count, 1);
+    assert!(!first.stats.interrupted);
+    assert!(first.stats.selected_work_remaining);
+    assert_eq!(f.db.get_metadata(PRIMARY_KEY).await.unwrap(), None);
+    let summary = f.db.get_summary().await.unwrap();
+    assert_eq!(
+        (summary.downloaded, summary.pending + summary.failed),
+        (2, 1)
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap()[0].url.path(),
+        "/expired",
+        "the 410 must precede healthy transfers"
+    );
+    server.verify().await;
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/expired"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for expected_downloads in [1, 0] {
+        f = reopen_destination_fixture(f).await;
+        use_paged_selection(&mut f);
+        let recovered = baseline_cycle(&f, &config, &session, vec![f.pass.clone()]).await;
+        assert_eq!(
+            recovered.stats.downloaded, expected_downloads,
+            "{recovered:?}"
+        );
+        assert_eq!(recovered.failed_count, 0);
+        assert!(f.db.get_metadata(PRIMARY_KEY).await.unwrap().is_some());
+        let rows = f.db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert_eq!(std::fs::read(row.local_path.unwrap()).unwrap(), MEDIA);
+        }
+    }
+    server.verify().await;
+}
+
 async fn settle_retained_fixture(
     f: &mut Fixture,
     selected: Vec<Value>,

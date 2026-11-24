@@ -401,9 +401,9 @@ Successful responses are serialized from parsed JSON without pretty-printing.
 Writes are best-effort, with no run subfolder or cleanup.
 Release builds without debug assertions do not include this diagnostic code.
 
-A signed URL expiry stops the current full-download batch. The pipeline retains
-failed tasks, including queued tasks cancelled by that expiry, and makes one
-cleanup attempt through targeted asset and master lookups. User shutdown stops
+A signed URL expiry stops only the affected transfer. The full-download pipeline
+lets other transfers finish and makes one cleanup attempt for failed tasks through
+targeted asset and master lookups. User shutdown stops
 cleanup lookup and download dispatch. It does not enumerate albums again to
 refresh those URLs or rebuild unfiled exclusions. Cleanup updates only the URL
 on an already-selected task, preserving its destination and publication

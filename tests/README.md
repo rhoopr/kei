@@ -1460,6 +1460,8 @@ transfer accounts for both in-flight and queued tasks after reopen. These are
 synthetic runtime proofs; they do not validate reporter data or resolve sparse
 Shared Library ownership.
 
+`cargo test --lib full_sync_410_keeps_healthy_transfers_running_before_cleanup` starts with an owned SQLite store and no PrimarySync checkpoint. An early, persistent HTTP 410 leaves one selected copy retryable while two peers publish before cleanup. The first full sync holds its checkpoint. After reopen, only the failed copy downloads and PrimarySync saves its checkpoint. An unchanged reopen makes no media requests.
+
 Primary discovery availability is covered by
 `primary_discovery_default_selection_does_not_initialize_unselected_private_libraries`:
 default selection and the selected library album query succeed with explicit

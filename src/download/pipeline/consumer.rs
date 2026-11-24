@@ -40,7 +40,7 @@ pub(super) struct StreamConsumerResult {
     pub(super) pending_state_writes: Vec<PendingStateWrite>,
     pub(super) bytes_downloaded_total: u64,
     pub(super) disk_bytes_total: u64,
-    pub(super) url_expired_abort: bool,
+    pub(super) url_expired: bool,
     pub(super) rate_limit_observations: usize,
     pub(super) photos_downloaded: usize,
     pub(super) videos_downloaded: usize,
@@ -65,14 +65,6 @@ pub(super) async fn consume_stream_download_tasks(
     let mark_capture_repair_after_download = capture_repair_requested(config);
     let pb = &shared.pb;
     let pipeline_shutdown = shared.pipeline_shutdown;
-    // A stale URL stops transfers, but destination-owned selection must still
-    // finish projecting current membership, including deferred unfiled work.
-    // Parent cancellation continues to stop both enumeration and transfers.
-    let transfer_shutdown = if config.selection_run.is_some() {
-        pipeline_shutdown.child_token()
-    } else {
-        pipeline_shutdown.clone()
-    };
     let state_db = shared.state_db;
     let temp_suffix: Arc<str> = Arc::clone(&config.temp_suffix);
     let bandwidth_limiter = config.bandwidth_limiter.clone();
@@ -84,7 +76,7 @@ pub(super) async fn consume_stream_download_tasks(
             let temp_suffix = Arc::clone(&temp_suffix);
             let rate_limit_counter = Arc::clone(&rate_limit_counter);
             let bandwidth_limiter = bandwidth_limiter.clone();
-            let shutdown_token = transfer_shutdown.clone();
+            let shutdown_token = pipeline_shutdown.clone();
             async move {
                 let result = Box::pin(download_single_task(
                     &client,
@@ -122,7 +114,7 @@ pub(super) async fn consume_stream_download_tasks(
     let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
     let mut bytes_downloaded_total: u64 = 0;
     let mut disk_bytes_total: u64 = 0;
-    let mut url_expired_abort = false;
+    let mut url_expired = false;
     let mut photos_downloaded = 0usize;
     let mut videos_downloaded = 0usize;
     let mut recap = crate::download::recap::RunRecap::default();
@@ -241,13 +233,6 @@ pub(super) async fn consume_stream_download_tasks(
                 match classify_download_task_error(&e) {
                     DownloadTaskErrorClass::Interrupted => {
                         log_interrupted_download(pb, &task, &e);
-                        // URL expiry cancels transfers, including work queued
-                        // after the task that saw 410. Keep that work for the
-                        // same cleanup attempt. User shutdown still gates
-                        // cleanup lookup and dispatch through the parent token.
-                        if url_expired_abort {
-                            failed.push(task);
-                        }
                         continue;
                     }
                     DownloadTaskErrorClass::SessionExpired => {
@@ -273,17 +258,17 @@ pub(super) async fn consume_stream_download_tasks(
                         }
                     }
                     DownloadTaskErrorClass::ExpiredUrl => {
-                        url_expired_abort = true;
-                        pb.suspend(|| {
-                            tracing::warn!(target: "kei::download::pipeline",
-                                asset_id = %task.asset_id,
-                                path = %task.download_path.display(),
-                                error = %e,
-                                "Download URL expired; aborting current URL batch"
-                            );
-                        });
+                        if !url_expired {
+                            pb.suspend(|| {
+                                tracing::warn!(target: "kei::download::pipeline",
+                                    "Download URL expired; retaining task for targeted refresh"
+                                );
+                            });
+                        }
+                        url_expired = true;
+                        // Keep the admitted retry work. Cleanup owns recording a
+                        // failed refresh transfer in state.
                         failed.push(task);
-                        transfer_shutdown.cancel();
                         continue;
                     }
                     DownloadTaskErrorClass::Other => {
@@ -324,7 +309,7 @@ pub(super) async fn consume_stream_download_tasks(
         pending_state_writes,
         bytes_downloaded_total,
         disk_bytes_total,
-        url_expired_abort,
+        url_expired,
         rate_limit_observations: rate_limit_counter.load(std::sync::atomic::Ordering::Relaxed),
         photos_downloaded,
         videos_downloaded,

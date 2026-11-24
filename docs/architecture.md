@@ -38,7 +38,7 @@ A standalone full inventory checks retained debt at dispatch before returning a 
 
 After indexing finishes, a quiet zone change feed can establish coverage across disagreeing album query tokens. Qualification retains the trusted cursor for replay. See [checkpoint decisions and enumeration](architecture/checkpoints.md).
 
-**Local delivery.** The planner selects a destination. The pipeline writes and verifies a `.part`, publishes the file, syncs the parent directory, and finalizes durable state. Import uses the shared path rules and verifies an existing file before adoption. Unresolved work needs durable retry evidence. See [publication, reconciliation, and import](architecture/publication.md).
+**Local delivery.** The planner selects a destination. The pipeline writes and verifies a `.part`, publishes the file, syncs the parent directory, and finalizes durable state. An expired download URL leaves only that transfer for cleanup; other transfers continue. Import uses the shared path rules and verifies an existing file before adoption. Unresolved work needs durable retry evidence. See [publication, reconciliation, and import](architecture/publication.md).
 
 **Metadata.** An enabled setting authorizes later updates to its managed fields. Omitted version-1 settings and no-config runs keep writers disabled. Capture-timestamp replacement requires explicit repair. Immediate and queued writes share the stable-input and ownership requirements. See [metadata write boundaries](architecture/metadata.md).
 
