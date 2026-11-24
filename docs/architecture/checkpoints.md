@@ -209,6 +209,8 @@ remain in metadata; JSON report version 3 is unchanged.
 
 Current destination debt is reported separately from checkpoint permission. The generation owner reads its existing selected-work debt after execution; the cycle owner makes one-shot sync fail while that work remains, including retries whose deadline has not arrived. Reports and notifications retain the partial-failure outcome. `cycle_reporter.rs` independently reports operational health: transfer and provider retry debt stay healthy, while state-access, storage or authentication blockers make `/healthz` fail immediately. Storage errors in transfer workers and metadata-only rewrites stop further file work for that cycle, retain unfinished tasks and markers, and leave watch mode running. These observations add no durable queue or checkpoint permission.
 
+`selection_checkpoint_hold_v1` reports one blocker from the durable selection check, even when the asset download counts are clear. `retained_generation` means the blocker is outside the newest generation for the current selection configuration. The diagnostic contains no generation IDs, asset IDs or paths.
+
 The service starts its HTTP listener after initial authentication and library initialization. During initial authentication, a readiness probe cannot connect; once the listener is running, a failed authentication cycle returns HTTP 503. Watch uses the configured interval after each cycle, including cycles that progress a bounded metadata batch. Explicit capture repair keeps its saved progress for the next run.
 
 The Photos adapter emits aggregate, fixed-label identity lookup diagnostics.

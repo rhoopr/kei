@@ -19,7 +19,7 @@ mod session;
 mod watch;
 
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 pub(crate) use planning::count_passes;
 pub(crate) use reconcile::should_reconcile_this_cycle;

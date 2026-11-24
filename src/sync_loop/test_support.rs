@@ -261,7 +261,7 @@ pub(super) fn make_named_owned_cycle_album(
     )
 }
 
-pub(super) fn make_captured_cycle_album(
+pub(crate) fn make_captured_cycle_album(
     zone: &str,
     capture: crate::icloud::photos::inbox::ShadowCapture,
     session: Box<dyn crate::icloud::photos::PhotosSession>,
@@ -320,7 +320,7 @@ pub(super) fn make_run_cycle_library_state(
     )
 }
 
-pub(super) fn make_run_cycle_library_state_with_album(
+pub(crate) fn make_run_cycle_library_state_with_album(
     zone: &str,
     sync_token_key: &str,
     album: crate::icloud::photos::PhotoAlbum,
@@ -336,7 +336,7 @@ pub(super) fn make_run_cycle_library_state_with_album(
     )
 }
 
-pub(super) fn make_run_cycle_library_state_with_passes(
+pub(crate) fn make_run_cycle_library_state_with_passes(
     zone: &str,
     sync_token_key: &str,
     passes: Vec<crate::commands::AlbumPass>,
@@ -368,7 +368,7 @@ pub(super) fn make_run_cycle_library_state_with_passes(
     }
 }
 
-pub(super) async fn make_shared_session_for_run_cycle() -> (tempfile::TempDir, auth::SharedSession)
+pub(crate) async fn make_shared_session_for_run_cycle() -> (tempfile::TempDir, auth::SharedSession)
 {
     let dir = tempfile::tempdir().expect("session tempdir");
     let session =
@@ -484,7 +484,7 @@ pub(super) fn make_recording_run_cycle_download_config_builder(
     }
 }
 
-pub(super) fn make_run_cycle_config() -> config::Config {
+pub(crate) fn make_run_cycle_config() -> config::Config {
     let data_dir = tempfile::tempdir().expect("config data dir");
     let globals = config::GlobalArgs {
         config_source: Default::default(),

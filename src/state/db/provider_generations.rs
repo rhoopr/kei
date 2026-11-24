@@ -36,6 +36,8 @@ const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 // Original serialized inputs per validation operation, not an allocator or disk bound.
 const MAX_VALIDATION_BYTES: usize = 512 * 1024 * 1024;
 const MAX_OBSERVED_BYTES: usize = 64 * 1024 * 1024;
+const RETAINED_REPLAY_DECISION_LIMIT: usize = 64;
+const RETAINED_REPLAY_CANDIDATE_LIMIT: i64 = 128;
 
 const MANAGED_SUCCESSOR_PREFIX: &str = "managed_successor:";
 
@@ -2270,6 +2272,85 @@ fn observed_asset(
     )
 }
 
+/// A deferred lookup owns no destination. A later, fully verified selection
+/// can account for that same observation without rewriting the old decision.
+fn lookup_has_verified_successor(
+    conn: &Connection,
+    old_root: &ActiveGeneration,
+    key: &str,
+    child: &str,
+) -> Result<bool, StateError> {
+    // Check one deterministic candidate. If its facts differ, keep the older
+    // work retryable rather than searching through later history for a match.
+    // Walk generation headers first so each decision probe uses its primary key.
+    let successor: Option<String> = conn
+        .query_row(
+            "SELECT g.id FROM provider_active_generations g CROSS JOIN provider_active_decisions d
+         WHERE d.generation=g.id AND d.pass_key=?1 AND d.child=?2 AND d.admission='admitted'
+           AND g.scope=?3 AND g.config_hash=?4
+           AND g.created_at>(SELECT created_at FROM provider_active_generations WHERE id=?5)
+           AND g.sealed=1 AND g.checkpoint_ready=1 AND g.checkpoint_veto IS NULL
+           AND EXISTS(SELECT 1 FROM provider_active_destinations w
+             WHERE (w.generation,w.pass_key,w.child)=(d.generation,d.pass_key,d.child))
+           AND NOT EXISTS(SELECT 1 FROM provider_active_destinations w
+             WHERE (w.generation,w.pass_key,w.child)=(d.generation,d.pass_key,d.child)
+               AND (w.admitted=0 OR w.verified_media=0 OR w.preserved_local IS NOT NULL
+                 OR w.prepared_hash IS NOT NULL OR w.confirmed_repair IS NOT NULL
+                 OR (g.metadata_enabled=1 AND w.verified_metadata=0)))
+         ORDER BY g.created_at,g.id LIMIT 1",
+            params![
+                key,
+                child,
+                old_root.spec.scope,
+                old_root.spec.config_hash,
+                old_root.id
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(successor) = successor else {
+        return Ok(false);
+    };
+    let verify = || {
+        let old = load_decision(conn, old_root, key, child)?;
+        if old.decision.outcome != SelectionOutcome::Deferred
+            || old.decision.reason != "current_lookup_unresolved"
+            || old.decision.confirmation.is_some()
+            || !old.decision.destinations.is_empty()
+            || old.decision.media_source.is_none()
+            || old.media_zone(old_root) != &old_root.spec.zone
+        {
+            return Ok(false);
+        }
+        let root = load_generation(conn, &successor)?;
+        if root.spec.zone != old_root.spec.zone
+            || root.spec.profile != old_root.spec.profile
+            || root.spec.metadata_enabled != old_root.spec.metadata_enabled
+            || root.spec.metadata_flags != old_root.spec.metadata_flags
+        {
+            return Ok(false);
+        }
+        let newer = load_decision(conn, &root, key, child)?;
+        if newer.state_id != old.state_id
+            || newer.decision.media_source != old.decision.media_source
+        {
+            return Ok(false);
+        }
+        // URL renewal is harmless, but aliasing can change which copies the
+        // planner selects even when the provider checksums are unchanged.
+        let agrees = crate::icloud::photos::PhotoAsset::same_download_observation;
+        let Some(original) = observed_asset_matching(conn, old_root, &old, agrees)? else {
+            return Ok(false);
+        };
+        Ok(confirmed_decision_asset(&newer, &root)?
+            .is_some_and(|current| agrees(&original, &current)))
+    };
+    match verify() {
+        Err(StateError::ProviderSelectionFull) => Ok(false),
+        result => result,
+    }
+}
+
 fn observed_asset_matching(
     conn: &Connection,
     root: &ActiveGeneration,
@@ -2516,8 +2597,24 @@ impl SqliteStateDb {
             account::validate_authenticated(conn,&owner)?;
             // Discovery is not a checkpoint decision. Validate the selected
             // root here and the due manifests when claiming the replay window.
-            let id:Option<String>=conn.query_row(&format!("SELECT g.id FROM provider_active_generations g WHERE {CURRENT_SELECTION_CONFIGURATION} AND g.id<>?3 AND (EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.admission='deferred' AND d.next_retry_at<=?4) OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=g.id AND {UNFINISHED} AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child AND d.next_retry_at<=?4))) ORDER BY g.last_replayed_at,g.created_at,g.id LIMIT 1"),params![scope,config_hash,current,Utc::now().timestamp()],|r|r.get(0)).optional()?;
-            id.map(|id|load_generation(conn,&id)).transpose()
+            let mut candidates=conn.prepare(&format!("SELECT g.id, EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=g.id AND {UNFINISHED} AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child AND d.next_retry_at<=?4)) AS destination_due
+                FROM provider_active_generations g WHERE {CURRENT_SELECTION_CONFIGURATION} AND g.id<>?3
+                AND (destination_due OR EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.admission='deferred' AND d.next_retry_at<=?4))
+                ORDER BY g.last_replayed_at,g.created_at,g.id"))?;
+            let now=Utc::now().timestamp();
+            let mut candidates=candidates.query(params![scope,config_hash,current,now])?;
+            let mut deferred=conn.prepare("SELECT pass_key,child,reason='current_lookup_unresolved' FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2")?;
+            while let Some(row)=candidates.next()? {
+                let root=load_generation(conn,&row.get::<_,String>(0)?)?;
+                if row.get::<_,bool>(1)? {return Ok(Some(root))}
+                let mut decisions=deferred.query(params![root.id,now])?;
+                while let Some(decision)=decisions.next()? {
+                    if !decision.get::<_,bool>(2)? || !lookup_has_verified_successor(conn,&root,&decision.get::<_,String>(0)?,&decision.get::<_,String>(1)?)? {
+                        return Ok(Some(root));
+                    }
+                }
+            }
+            Ok(None)
         }).await
     }
 
@@ -2531,23 +2628,63 @@ impl SqliteStateDb {
             let root=load_generation(&tx,&generation)?;
             let stored:Option<String>=tx.query_row("SELECT replay_after FROM provider_active_generations WHERE id=?1",[&generation],|r|r.get(0))?;
             let after:Option<(String,String)>=stored.as_deref().map(|value|serde_json::from_str(value).map_err(|_invalid|StateError::ProviderSelectionInvalid)).transpose()?;
-            let query=|after:Option<&(String,String)>|->Result<Vec<(String,String,i64)>,StateError> {
-                Ok(tx.prepare(&format!("SELECT d.pass_key,d.child,length(d.manifest) FROM provider_active_decisions d WHERE d.generation=?1 AND (?2 IS NULL OR (d.pass_key,d.child)>(?2,?3)) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND {UNFINISHED})) ORDER BY d.pass_key,d.child LIMIT 64"))?.query_map(params![generation,after.map(|a|&a.0),after.map(|a|&a.1),Utc::now().timestamp()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?)
-            };
-            let mut keys=query(after.as_ref())?;if keys.is_empty() && after.is_some() {keys=query(None)?;}
-            let mut bytes=0_usize;let mut decisions=Vec::new();let mut last=None;
-            let mut pages=RankProofs::new(&tx,&root);
-            for (key,child,length) in keys {
-                let length=usize::try_from(length).map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
-                if length>MAX_CHUNK_BYTES {return invalid()}
-                if bytes.saturating_add(length)>MAX_CHUNK_BYTES {break}
-                let decision=match load_decision_with_pages(&tx,&root,&key,&child,true,&mut pages) {
-                    Ok(decision)=>decision,
-                    Err(StateError::ProviderSelectionFull)=>break,
-                    Err(error)=>return Err(error),
-                };
-                bytes+=length;decisions.push(decision);last=Some((key,child));
+            let mut stmt = tx.prepare(&format!(
+                "SELECT d.pass_key,d.child,length(d.manifest),d.admission='deferred' AND d.reason='current_lookup_unresolved'
+                 FROM provider_active_decisions d
+                 WHERE d.generation=?1 AND (?2 IS NULL OR (d.pass_key,d.child)>(?2,?3))
+                   AND (?4 IS NULL OR (d.pass_key,d.child)<=(?4,?5))
+                   AND d.next_retry_at<=?6
+                   AND (d.admission='deferred' OR EXISTS(
+                       SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation
+                       WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND {UNFINISHED}))
+                 ORDER BY d.pass_key,d.child LIMIT ?7"
+            ))?;
+            let now = Utc::now().timestamp();
+            let mut candidates_left = RETAINED_REPLAY_CANDIDATE_LIMIT;
+            let mut bytes = 0_usize;
+            let mut decisions = Vec::new();
+            let mut last = None;
+            let mut pages = RankProofs::new(&tx, &root);
+            // A suffix filled with settled lookups is not an actionable batch.
+            // Wrap once, without reexamining the suffix or exceeding the budget.
+            'window: for (lower, upper) in [(after.as_ref(), None), (None, after.as_ref())] {
+                let mut rows = stmt.query(params![
+                    generation, lower.map(|key| &key.0), lower.map(|key| &key.1),
+                    upper.map(|key| &key.0), upper.map(|key| &key.1), now, candidates_left,
+                ])?;
+                while let Some(row) = rows.next()? {
+                    let (key, child, length, lookup): (String, String, i64, bool) =
+                        row.try_into()?;
+                    candidates_left -= 1;
+                    let length = usize::try_from(length)
+                        .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+                    if length > MAX_CHUNK_BYTES {
+                        return invalid();
+                    }
+                    if lookup && lookup_has_verified_successor(&tx, &root, &key, &child)? {
+                        last = Some((key, child));
+                        continue;
+                    }
+                    if bytes.saturating_add(length) > MAX_CHUNK_BYTES {
+                        break 'window;
+                    }
+                    let decision = match load_decision_with_pages(&tx, &root, &key, &child, true, &mut pages) {
+                        Ok(decision) => decision,
+                        Err(StateError::ProviderSelectionFull) => break 'window,
+                        Err(error) => return Err(error),
+                    };
+                    bytes += length;
+                    decisions.push(decision);
+                    last = Some((key, child));
+                    if decisions.len() == RETAINED_REPLAY_DECISION_LIMIT {
+                        break 'window;
+                    }
+                }
+                if after.is_none() || candidates_left == 0 || !decisions.is_empty() {
+                    break;
+                }
             }
+            drop(stmt);
             let cursor=last.map(|after|serde_json::to_string(&after).map_err(|_invalid|StateError::ProviderSelectionInvalid)).transpose()?.or(stored);
             tx.execute("UPDATE provider_active_generations SET replay_after=?2,last_replayed_at=?3 WHERE id=?1",params![generation,cursor,Utc::now().timestamp_millis()])?;
             tx.commit()?;Ok(decisions)
@@ -4778,6 +4915,29 @@ impl SqliteStateDb {
     }
 }
 
+pub(crate) struct SelectionCheckpointHold {
+    pub(crate) blocker: &'static str,
+    pub(crate) retained_generation: bool,
+}
+
+impl SelectionCheckpointHold {
+    fn destination(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<Self> {
+        let blocker = if row.get::<_, bool>(column)? {
+            "prepared_publication"
+        } else if row.get::<_, bool>(column + 1)? {
+            "confirmed_repair"
+        } else if row.get::<_, bool>(column + 2)? {
+            "unverified_media"
+        } else {
+            "unfinished_metadata"
+        };
+        Ok(Self {
+            blocker,
+            retained_generation: row.get(column + 3)?,
+        })
+    }
+}
+
 impl SqliteStateDb {
     /// Unfinished current-configuration obligations and identities veto the cursor.
     /// Other configurations retain physical publication guards, but uncertainty
@@ -4790,18 +4950,25 @@ impl SqliteStateDb {
         scope: String,
         config_hash: String,
     ) -> Result<bool, StateError> {
-        self.selection_debt(owner, scope, config_hash, false).await
+        Ok(self
+            .selection_checkpoint_hold(owner, scope, config_hash, false)
+            .await?
+            .is_some())
     }
 
     /// Does not include metadata that the post-checkpoint writer can recover
     /// from the selected SQLite receipts alone.
+    #[cfg(test)]
     pub(crate) async fn provider_selection_debt(
         &self,
         owner: account::AccountOwner,
         scope: String,
         config_hash: String,
     ) -> Result<bool, StateError> {
-        self.selection_debt(owner, scope, config_hash, true).await
+        Ok(self
+            .selection_checkpoint_hold(owner, scope, config_hash, true)
+            .await?
+            .is_some())
     }
 
     /// Local recovery is bound to the last inventory for this exact plan.
@@ -4825,13 +4992,14 @@ impl SqliteStateDb {
         .await
     }
 
-    async fn selection_debt(
+    /// Identify one actual blocker, without reporting identities or paths.
+    pub(crate) async fn selection_checkpoint_hold(
         &self,
         owner: account::AccountOwner,
         scope: String,
         config_hash: String,
         local_writer_available: bool,
-    ) -> Result<bool, StateError> {
+    ) -> Result<Option<SelectionCheckpointHold>, StateError> {
         self.with_conn("inspecting retained selection debt",move|conn|{
             let tx=conn.unchecked_transaction()?;
             account::validate_authenticated(&tx,&owner)?;
@@ -4844,11 +5012,28 @@ impl SqliteStateDb {
             // A later complete inventory accounts for its own selected repair
             // destinations. Keep historical confirmations for future matching
             // selections without charging them to the current checkpoint.
-            if conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE {CURRENT_SELECTION_CONFIGURATION} AND d.admission='deferred')"),params![scope,config_hash],|r|r.get::<_,bool>(0))? {return Ok(true)}
+            let retained = format!("g.id IS NOT ({LATEST_LOCAL_GENERATION})");
+            {
+                let mut stmt=conn.prepare(&format!("SELECT d.reason='current_lookup_unresolved', {retained},g.id,d.pass_key,d.child FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE {CURRENT_SELECTION_CONFIGURATION} AND d.admission='deferred'"))?;
+                let mut rows=stmt.query(params![scope,config_hash])?;
+                while let Some(row)=rows.next()? {
+                    let lookup=row.get::<_,bool>(0)?;
+                    let retained_generation=row.get(1)?;
+                    if lookup && retained_generation {
+                        let root=load_generation(conn,&row.get::<_,String>(2)?)?;
+                        if lookup_has_verified_successor(conn,&root,&row.get::<_,String>(3)?,&row.get::<_,String>(4)?)? {continue}
+                    }
+                    return Ok(Some(SelectionCheckpointHold {
+                        blocker: if lookup {"deferred_identity"} else {"deferred_admission"},
+                        retained_generation,
+                    }))
+                }
+            }
             let debt=format!("FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND (g.config_hash=?2 OR (w.prepared_hash IS NOT NULL AND EXISTS(SELECT 1 FROM provider_active_destinations selected JOIN provider_active_generations current ON current.id=selected.generation WHERE current.scope=?1 AND current.config_hash=?2 AND selected.admitted=1 AND selected.path=w.path))) AND {UNFINISHED}
                 AND NOT (w.confirmed_repair IS NOT NULL AND w.prepared_hash IS NULL AND EXISTS(SELECT 1 FROM provider_active_generations newer WHERE newer.scope=g.scope AND newer.config_hash=g.config_hash AND newer.created_at>g.created_at AND newer.sealed=1 AND newer.checkpoint_ready=1))");
-            let unfinished:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 {debt})"),params![scope,config_hash],|r|r.get(0))?;
-            if !unfinished || !local_writer_available {return Ok(unfinished)}
+            let destination_fields = format!("w.prepared_hash IS NOT NULL, w.confirmed_repair IS NOT NULL, (w.verified_media=0 AND w.preserved_local IS NULL), {retained}");
+            let unfinished = conn.query_row(&format!("SELECT {destination_fields} {debt} LIMIT 1"),params![scope,config_hash],|r|SelectionCheckpointHold::destination(r,0)).optional()?;
+            if unfinished.is_none() || !local_writer_available {return Ok(unfinished)}
             // Refresh the local preservation cache before opening the destination
             // cursor: rebuilding its TEMP schema would invalidate a live cursor.
             let protected=super::legacy_preservation::protected_paths(conn)?.into_iter()
@@ -4872,27 +5057,27 @@ impl SqliteStateDb {
                     AND n.confirmed_repair IS NULL AND n.preserved_local IS w.preserved_local AND n.grouping_hash=w.grouping_hash
                     AND n.local_checksum=w.local_checksum AND n.source_checksum IS w.source_checksum
                     AND (w.generation=n.generation OR (w.prepared_hash IS NULL AND n.prepared_hash IS NULL)))
-                THEN w.grouping_hash END,w.path {debt}"))?;
+                THEN w.grouping_hash END,w.path,{destination_fields} {debt}"))?;
             let mut rows=stmt.query(params![scope,config_hash])?;
             while let Some(r)=rows.next()? {
-                let Some(group)=r.get::<_,Option<String>>(2)? else {return Ok(true)};
+                let Some(group)=r.get::<_,Option<String>>(2)? else {return Ok(Some(SelectionCheckpointHold::destination(r,4)?))};
                 let path:super::provider_selection::SelectionPath=serde_json::from_str(&r.get::<_,String>(3)?)
                     .map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
                 let path=path.to_path();
-                if super::primary_layout::path_is_managed(conn,&path)? {return Ok(true)}
+                if super::primary_layout::path_is_managed(conn,&path)? {return Ok(Some(SelectionCheckpointHold::destination(r,4)?))}
                 if !protected.is_empty() {
                     let mut sidecar=path.as_os_str().to_owned();
                     sidecar.push(".xmp");
                     for p in [path.as_path(),Path::new(&sidecar)] {
-                        if protected.contains(&crate::fs_util::confined_path_key(p).map_err(|_invalid_path|StateError::ProviderSelectionInvalid)?) {return Ok(true)}
+                        if protected.contains(&crate::fs_util::confined_path_key(p).map_err(|_invalid_path|StateError::ProviderSelectionInvalid)?) {return Ok(Some(SelectionCheckpointHold::destination(r,4)?))}
                     }
                 }
-                if grouping_hash(conn,&r.get::<_,String>(0)?,&r.get::<_,String>(1)?)?!=group {return Ok(true)}
+                if grouping_hash(conn,&r.get::<_,String>(0)?,&r.get::<_,String>(1)?)?!=group {return Ok(Some(SelectionCheckpointHold::destination(r,4)?))}
             }
             drop(rows);
             drop(stmt);
             tx.commit()?;
-            Ok(false)
+            Ok(None)
         }).await
     }
 }
