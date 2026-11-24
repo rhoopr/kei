@@ -959,20 +959,32 @@ fn nfs_prepared_link_cleanup_leaves_a_settled_single_link() {
         )
         .unwrap();
         // Unlinking while a descriptor is open leaves a `.nfsXXXX` link behind
-        // until the client retires it, so the next check would see two links.
-        assert_eq!(
-            crate::fs_util::file_link_count(&fs::File::open(&target).unwrap()).unwrap(),
-            1,
-            "round {round}"
-        );
-        assert!(
-            !fs::read_dir(dir.path()).unwrap().any(|entry| entry
-                .unwrap()
-                .file_name()
-                .as_encoded_bytes()
-                .starts_with(b".nfs")),
-            "round {round}: silly-renamed leftover"
-        );
+        // until the client retires it, so both the count and the leftover settle
+        // rather than being immediate.
+        let mut links = 0;
+        for _ in 0..100 {
+            links = crate::fs_util::file_link_count(&fs::File::open(&target).unwrap()).unwrap();
+            if links == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(links, 1, "round {round}");
+        let mut leftover = true;
+        for _ in 0..100 {
+            leftover = fs::read_dir(dir.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b".nfs")
+            });
+            if !leftover {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!leftover, "round {round}: silly-renamed leftover");
     }
 }
 
