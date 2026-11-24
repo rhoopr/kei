@@ -2886,3 +2886,109 @@ async fn mark_downloaded_fails_when_asset_row_missing() {
         "expected AssetRowMissing with correct ids, got: {err:?}"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn destination_failure_keeps_native_path_identity_and_exact_local_path_semantics() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    use crate::state::db::provider_selection::SelectionPath;
+
+    let db = SqliteStateDb::open_in_memory().unwrap();
+    let dir = test_dir();
+    let published = dir.path().join("published.jpg");
+    let native = dir
+        .path()
+        .join(OsString::from_vec(b"native-\xff.jpg".to_vec()));
+    // (id, imported path, failed destination, expected status)
+    let cases: [(&str, &Path, Option<&Path>, &str); 3] = [
+        ("NATIVE_OTHER", &published, Some(&native), "downloaded"),
+        ("NATIVE_SAME", &native, Some(&native), "failed"),
+        ("NO_DESTINATION", &published, None, "failed"),
+    ];
+
+    for (id, imported_path, _, _) in &cases {
+        let record = TestAssetRecord::new(id)
+            .checksum(&format!("ck-{id}"))
+            .build();
+        db.import_adopt(
+            &record,
+            imported_path,
+            &format!("local-{id}"),
+            record.size_bytes,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let native_key = SelectionPath::from_path(&native).key().unwrap();
+    {
+        let conn = db.acquire_lock("seed native failure destinations").unwrap();
+        conn.execute(
+            "INSERT INTO provider_active_generations(\
+               id,account_key,provider_key,scope,config_hash,basis,metadata_enabled,\
+               specification,specification_hash,created_at,charged_bytes) \
+             VALUES('generation','account','provider','scope','config','basis',0,X'00','hash',0,1)",
+            [],
+        )
+        .unwrap();
+        for (id, ..) in cases
+            .iter()
+            .filter(|(_, _, destination, _)| destination.is_some())
+        {
+            conn.execute(
+                "INSERT INTO provider_active_decisions(\
+                   generation,pass_key,child,manifest,manifest_hash,outcome,admission,reason,charged_bytes) \
+                 VALUES('generation','pass',?1,X'00','hash','selected','admitted','',1)",
+                [id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO provider_active_destinations(\
+                   generation,pass_key,child,library,asset_id,master,version_size,path,compat_path,\
+                   checksum,size_bytes,created_at,metadata_hash,admitted,verified_media) \
+                 VALUES('generation','pass',?1,'PrimarySync',?1,'','original',?2,?3,?4,12345,0.0,'metadata',1,0)",
+                rusqlite::params![id, &native_key, native.to_string_lossy(), format!("ck-{id}")],
+            )
+            .unwrap();
+        }
+    }
+
+    for (id, _, destination, _) in &cases {
+        match destination {
+            Some(destination) => {
+                db.mark_destination_failed(
+                    "PrimarySync",
+                    id,
+                    "original",
+                    destination,
+                    "transfer failed",
+                )
+                .await
+                .unwrap();
+            }
+            None => {
+                db.mark_failed("PrimarySync", id, "original", "transfer failed")
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    let conn = db.acquire_lock("read destination failure status").unwrap();
+    for (id, _, _, expected) in &cases {
+        let (status, last_error, attempts): (String, Option<String>, u32) = conn
+            .query_row(
+                "SELECT status,last_error,download_attempts FROM assets \
+                 WHERE library='PrimarySync' AND id=?1 AND version_size='original'",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(&status, expected, "{id}");
+        assert_eq!(last_error.as_deref(), Some("transfer failed"), "{id}");
+        assert_eq!(attempts, 1, "{id}");
+    }
+}

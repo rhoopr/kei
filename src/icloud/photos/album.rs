@@ -142,6 +142,10 @@ impl std::fmt::Debug for PhotoAlbum {
 }
 
 impl PhotoAlbum {
+    /// One unfiled confirmation lookup carries a child and master per asset.
+    /// Keep the observation count within half the provider's record bound.
+    pub(crate) const CONFIRMATION_BATCH_SIZE: usize = lookup::RECORD_LOOKUP_BATCH_SIZE / 2;
+
     pub(crate) fn set_shadow_capture(
         &mut self,
         capture: super::inbox::ShadowCapture,

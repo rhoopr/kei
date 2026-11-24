@@ -2044,10 +2044,12 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
     let db = super::super::test_support::open_fixture_db(&dir.path().join("state.db")).await;
     let still = include_bytes!("../../../../tests/data/sample.heic").as_slice();
     let motion = b"\0\0\0\x14ftypqt  \0\0\0\0qt  ".as_slice();
+    // An unavailable alternate destination must not invalidate the import.
+    let media = wiremock::MockServer::start().await;
     let mut records = incremental_photo_records_with_url(
         "LIVE_DATES",
         "capture.HEIC",
-        "https://p01.icloud-content.com/capture.HEIC",
+        &format!("{}/capture.HEIC", media.uri()),
         still.len() as u64,
     );
     records[0]["fields"]["itemType"] = json!({"value": "public.heic"});
@@ -2055,7 +2057,7 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
         json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(still)));
     records[0]["fields"]["resOriginalFileType"] = json!({"value": "public.heic"});
     records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
-        "downloadURL": "https://p01.icloud-content.com/capture.MOV",
+        "downloadURL": format!("{}/capture.MOV", media.uri()),
         "fileChecksum": base64::engine::general_purpose::STANDARD.encode(Sha256::digest(motion)), "size": motion.len(),
     }});
     records[0]["fields"]["resOriginalVidComplFileType"] =
@@ -2200,6 +2202,18 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
         )
         .unwrap();
     assert_eq!(verified, 0);
+    let import: (String, String, i64) = db
+        .acquire_lock("failed sibling keeps the canonical import")
+        .unwrap()
+        .query_row(
+            "SELECT status,local_path,download_attempts FROM assets WHERE version_size='original'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(import.0, "downloaded");
+    assert_eq!(Path::new(&import.1), still_path);
+    assert!(import.2 > 0, "the failed transfer must still be recorded");
     // Restore only the test-owned corruption, then recover through normal sync.
     tokio::fs::write(still_path, still).await.unwrap();
     let recovery = download_photos_with_sync(
@@ -2407,8 +2421,9 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
         reopened
             .retained_selection_root(owner, scope, historical_config, String::new())
             .await
-            .is_err(),
-        "scheduling must validate the completion proof before suppressing old work"
+            .unwrap()
+            .is_some(),
+        "the damaged completion must not suppress discovery of retained work"
     );
 }
 

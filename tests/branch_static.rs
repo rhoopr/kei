@@ -1848,8 +1848,8 @@ fn service_smoke_is_required_in_heavy_qualification() {
     assert!(service_smoke.contains("  workflow_call:"));
     assert!(!service_smoke.contains("  pull_request:"));
     assert!(qualification.contains("uses: ./.github/workflows/service-smoke.yml"));
-    assert!(qualification.contains("needs: [quality, artifacts, service, specialized]"));
-    assert!(qualification.contains("gate.py quality artifacts service specialized"));
+    assert!(qualification.contains("needs: [quality, artifacts, service, fuzz, optimized]"));
+    assert!(qualification.contains("gate.py quality artifacts service fuzz optimized"));
 }
 
 #[test]

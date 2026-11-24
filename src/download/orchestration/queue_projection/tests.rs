@@ -4215,7 +4215,8 @@ async fn shared_grouping_handoff_fences_loaded_legacy_and_settles_both_passes() 
                     key,
                     "asset-m".into(),
                     SelectionPath::from_path(&path),
-                    (checksum.clone(), bytes.len() as u64)
+                    (checksum.clone(), bytes.len() as u64),
+                    || true,
                 )
                 .await
                 .unwrap()
@@ -4457,7 +4458,8 @@ async fn historical_shared_album_successor_fixture(metadata: bool) {
                 key,
                 "asset-m".into(),
                 SelectionPath::from_path(&original),
-                (checksum.clone(), media.len() as u64)
+                (checksum.clone(), media.len() as u64),
+                || true,
             )
             .await
             .unwrap()
@@ -5891,6 +5893,42 @@ async fn active_pending_fixture() -> (
 }
 
 #[tokio::test]
+async fn selection_attempt_returns_frozen_decision_only_when_due() {
+    use crate::state::db::provider_generations::SelectionAttempt;
+    let (f, root, manifest, _) = Box::pin(active_pending_fixture()).await;
+    let key = &manifest.decision.pass_key;
+    let child = &manifest.decision.child;
+    let attempt = |name: &str| {
+        f.db.selection_attempt(owner(), root.id.clone(), key.clone(), name.into())
+    };
+    assert!(matches!(
+        attempt("unseen").await.unwrap(),
+        SelectionAttempt::Due(None)
+    ));
+    assert!(
+        matches!(attempt(child).await.unwrap(), SelectionAttempt::Due(Some(previous)) if *previous == manifest)
+    );
+    f.db.defer_selection_confirmation(owner(), root.id.clone(), key.clone(), child.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        attempt(child).await.unwrap(),
+        SelectionAttempt::Deferred
+    ));
+    f.db.acquire_lock("corrupt deferred decision")
+        .unwrap()
+        .execute(
+            "UPDATE provider_active_decisions SET manifest_hash='invalid'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        attempt(child).await.is_err(),
+        "backoff must not mask invalid retained state"
+    );
+}
+
+#[tokio::test]
 async fn published_confirmation_releases_only_matching_inbox_records() {
     use sha2::{Digest, Sha256};
     let seed = Fixture::new().await;
@@ -5912,6 +5950,68 @@ async fn published_confirmation_releases_only_matching_inbox_records() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, media).unwrap();
     let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+    let observe = || crate::download::file::retain_pending_file(&f.config.directory, &path);
+    let stale = observe().await.unwrap().unwrap();
+    std::fs::rename(&path, path.with_extension("saved")).unwrap();
+    std::fs::write(&path, b"replacement").unwrap();
+    let reuse_file = Arc::clone(&stale);
+    let result =
+        f.db.reuse_selection_publication(
+            owner(),
+            root.id.clone(),
+            decision.decision.pass_key.clone(),
+            decision.decision.child.clone(),
+            dst.path.clone(),
+            (checksum.clone(), dst.size),
+            move || reuse_file.selection_still_matches(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(crate::state::error::StateError::ProviderWorkConflict(
+            "selected_file_changed"
+        ))
+    ));
+    let result =
+        f.db.preserve_selection_local(
+            owner(),
+            root.id.clone(),
+            decision.decision.pass_key.clone(),
+            decision.decision.child.clone(),
+            dst.path.clone(),
+            (checksum.clone(), dst.size, stale.modified.map(Into::into)),
+            move || stale.selection_still_matches(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(crate::state::error::StateError::ProviderWorkConflict(
+            "selected_file_changed"
+        ))
+    ));
+    assert!(
+        !f.db
+            .selection_destination_resolved(
+                owner(),
+                root.id.clone(),
+                decision.decision.pass_key.clone(),
+                decision.decision.child.clone(),
+                dst.version_size.clone()
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        f.db.provider_selection_debt(
+            owner(),
+            root.spec.scope.clone(),
+            root.spec.config_hash.clone()
+        )
+        .await
+        .unwrap()
+    );
+    std::fs::write(&path, media).unwrap();
+    let fresh = observe().await.unwrap().unwrap();
     assert!(
         f.db.reuse_selection_publication(
             owner(),
@@ -5919,7 +6019,8 @@ async fn published_confirmation_releases_only_matching_inbox_records() {
             decision.decision.pass_key,
             decision.decision.child,
             dst.path.clone(),
-            (checksum, dst.size)
+            (checksum, dst.size),
+            move || fresh.selection_still_matches(),
         )
         .await
         .unwrap()
@@ -6886,6 +6987,49 @@ async fn frozen_raw_generation_preserves_swapped_keys_and_resource_evidence_on_r
         );
     }
     assert_eq!(f.db.get_pending().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn retained_discovery_does_not_certify_candidates_or_release_checkpoint() {
+    let (f, root, _, _) = Box::pin(active_pending_fixture()).await;
+    f.db.acquire_lock("damage a retained replay candidate")
+        .unwrap()
+        .execute(
+            "UPDATE provider_active_decisions SET manifest_hash='invalid'",
+            [],
+        )
+        .unwrap();
+    let candidate =
+        f.db.retained_selection_root(
+            owner(),
+            root.spec.scope.clone(),
+            root.spec.config_hash.clone(),
+            "other-current-generation".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidate.id, root.id);
+    assert!(
+        f.db.retained_selection_decisions(owner(), candidate.id)
+            .await
+            .is_err()
+    );
+    assert!(
+        f.db.provider_selection_debt(owner(), root.spec.scope, root.spec.config_hash)
+            .await
+            .is_err()
+    );
+    let cursor: Option<String> =
+        f.db.acquire_lock("refused replay must not advance its cursor")
+            .unwrap()
+            .query_row(
+                "SELECT replay_after FROM provider_active_generations WHERE id=?1",
+                [&root.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert!(cursor.is_none());
 }
 
 #[tokio::test]
@@ -8255,6 +8399,15 @@ async fn embedded_writer_finishes_during_reseeding_without_sidecars() {
         let pending:i64=f.db.acquire_lock("check all writer generations").unwrap().query_row("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_metadata=0",[],|r|r.get(0)).unwrap();
         assert_eq!(pending, i64::from(round == 0), "round {round}");
         assert_eq!(result.stats.selected_work_remaining, round == 0);
+        if round == 0 {
+            assert!(matches!(
+                f.config.sync_mode,
+                crate::download::SyncMode::Full
+            ));
+            assert!(result.checkpoint.sync_token_blocked);
+            assert!(result.sync_token.is_none());
+            assert!(result.checkpoint.scanned_generation.is_none());
+        }
     }
 }
 
@@ -10808,7 +10961,9 @@ async fn completed_copy_recovery(scenario: IntegrityRecovery) {
     );
     let mut requests_before_repair = initial_requests;
     let original_metadata = std::fs::metadata(&a).unwrap();
+    let capture_mtime = std::fs::metadata(&b).unwrap().modified().unwrap();
     drop(passes);
+    let mut damaged_mtime = None;
     if scenario != IntegrityRecovery::Missing {
         let mut damaged = if scenario == IntegrityRecovery::SameSize {
             media.to_vec()
@@ -10819,6 +10974,13 @@ async fn completed_copy_recovery(scenario: IntegrityRecovery) {
             *damaged.last_mut().unwrap() ^= 1;
         }
         std::fs::write(&b, &damaged).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&b)
+            .unwrap()
+            .set_modified(capture_mtime)
+            .unwrap();
+        damaged_mtime = Some(capture_mtime);
         f = reopen_destination_fixture(f).await;
         let quiet_passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
         let quiet = crate::download::download_photos_with_sync(
@@ -10854,6 +11016,7 @@ async fn completed_copy_recovery(scenario: IntegrityRecovery) {
                     damaged.len() as u64,
                     None,
                 ),
+                || true,
             )
             .await
             .unwrap();
@@ -11188,6 +11351,11 @@ async fn completed_copy_recovery(scenario: IntegrityRecovery) {
         assert_eq!(std::fs::read(&a).unwrap(), media);
         assert_eq!(std::fs::read(&b).unwrap(), media);
         if managed {
+            let damaged_mtime = damaged_mtime.expect("managed repair has a damaged predecessor");
+            assert!(
+                std::fs::metadata(&b).unwrap().modified().unwrap() > damaged_mtime,
+                "managed repair must advance the damaged predecessor's mtime"
+            );
             let preserved: Vec<Vec<u8>> =
                 f.db.acquire_lock("managed damaged input preservation")
                     .unwrap()

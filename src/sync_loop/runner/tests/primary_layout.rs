@@ -90,6 +90,9 @@ struct Session {
     lookups: Arc<AtomicUsize>,
     current: Option<Arc<std::sync::Mutex<Vec<Value>>>>,
     indexing: Option<IndexingOptions>,
+    stop_on_lookup: Option<(usize, CancellationToken)>,
+    expire_on_lookup: Option<usize>,
+    expire_on_query_tail: bool,
 }
 fn versioned_records(records: &[Value]) -> Vec<Value> {
     records
@@ -142,7 +145,21 @@ impl PhotosSession for Session {
             );
         }
         if url.contains("/records/lookup?") {
-            self.lookups.fetch_add(1, Ordering::SeqCst);
+            let ordinal = self.lookups.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.expire_on_lookup == Some(ordinal) {
+                return Err(crate::icloud::photos::session::HttpStatusError {
+                    status: 401,
+                    url: url.to_owned(),
+                    retry_after: None,
+                    body: None,
+                }
+                .into());
+            }
+            if let Some((stop_at, token)) = &self.stop_on_lookup
+                && ordinal == *stop_at
+            {
+                token.cancel();
+            }
             let request: Value = serde_json::from_str(&body)?;
             let current = self
                 .current
@@ -186,6 +203,14 @@ impl PhotosSession for Session {
                 .and_then(|items| items.iter().find(|i| i["fieldName"] == "startRank"))
                 .and_then(|i| i["fieldValue"]["value"].as_u64())
                 .unwrap_or(0);
+            if self.expire_on_query_tail {
+                if offset > 0 {
+                    return Err(
+                        crate::icloud::error::ICloudError::SessionExpired { status: 401 }.into(),
+                    );
+                }
+                return Ok(json!({"records":&source[..4],"syncToken":"partial-query"}));
+            }
             return Ok(
                 json!({"records":if offset==0 {source} else {vec![]},"syncToken":self.indexing.as_ref().map_or(Some("query-token"), |indexing| indexing.token)}),
             );
@@ -251,6 +276,9 @@ struct CycleOptions {
     mov_policy: crate::types::LivePhotoMovFilenamePolicy,
     live_mode: crate::types::LivePhotoMode,
     current: Option<Arc<std::sync::Mutex<Vec<Value>>>>,
+    stop_on_lookup: Option<(usize, CancellationToken)>,
+    expire_on_lookup: Option<usize>,
+    expire_on_query_tail: bool,
 }
 impl Default for CycleOptions {
     fn default() -> Self {
@@ -275,6 +303,9 @@ impl Default for CycleOptions {
             mov_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
             live_mode: crate::types::LivePhotoMode::Both,
             current: None,
+            stop_on_lookup: None,
+            expire_on_lookup: None,
+            expire_on_query_tail: false,
         }
     }
 }
@@ -305,6 +336,9 @@ async fn try_cycle_options(
         lookups: lookups.clone(),
         current: options.current.clone(),
         indexing: options.indexing.clone(),
+        stop_on_lookup: options.stop_on_lookup.clone(),
+        expire_on_lookup: options.expire_on_lookup,
+        expire_on_query_tail: options.expire_on_query_tail,
     };
     let owner = fixture_owner();
     let inner = Arc::new(
@@ -521,9 +555,14 @@ async fn try_cycle_options(
         );
     }
     let shutdown = options
-        .indexing
-        .as_ref()
-        .map_or_else(CancellationToken::new, |indexing| indexing.cancel.clone());
+        .stop_on_lookup
+        .map(|(_, token)| token)
+        .unwrap_or_else(|| {
+            options
+                .indexing
+                .as_ref()
+                .map_or_else(CancellationToken::new, |indexing| indexing.cancel.clone())
+        });
     let result = Box::pin(crate::sync_cycle::run_cycle(
         &[&library],
         &config,
@@ -544,6 +583,192 @@ fn assert_bytes(path: &std::path::Path, bytes: &[u8]) {
         bytes,
         "{}",
         path.display()
+    );
+}
+
+fn unfiled_records(server: &MockServer, count: usize) -> Vec<Value> {
+    let mut observations = Vec::new();
+    for index in 0..count {
+        let mut pair = records(server, None);
+        pair[0]["recordName"] = json!(format!("master-{index}"));
+        pair[0]["fields"]["filenameEnc"]["value"] = json!(format!("image-{index}.JPG"));
+        pair[1]["recordName"] = json!(format!("child-{index}"));
+        pair[1]["fields"]["masterRef"]["value"]["recordName"] = pair[0]["recordName"].clone();
+        observations.extend(pair);
+    }
+    observations
+}
+
+#[tokio::test]
+async fn unfiled_confirmation_batches_publish_and_reopen_without_reconfirming() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let observations = unfiled_records(&server, 100);
+    let (result, lookups) = cycle(
+        root.path(),
+        observations.clone(),
+        false,
+        EditedNaming::Suffix,
+    )
+    .await;
+    assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
+    assert_eq!(lookups, 2);
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM provider_active_destinations WHERE verified_media=1"
+        ),
+        100
+    );
+    for index in 0..100 {
+        assert_bytes(
+            &root.path().join(format!("media/image-{index}.JPG")),
+            ORIGINAL,
+        );
+    }
+    let (quiet, lookups) = cycle(root.path(), observations, true, EditedNaming::Suffix).await;
+    assert!(quiet.db_sync_token_advance_safe);
+    assert_eq!((quiet.stats.downloaded, lookups), (0, 0));
+}
+
+#[tokio::test]
+async fn unfiled_confirmation_interrupted_batch_resumes_from_durable_pairs_only() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let observations = unfiled_records(&server, 150);
+    let (interrupted, _) = cycle_options(
+        root.path(),
+        observations.clone(),
+        false,
+        EditedNaming::Suffix,
+        CycleOptions {
+            stop_on_lookup: Some((3, CancellationToken::new())),
+            ..CycleOptions::default()
+        },
+    )
+    .await;
+    assert!(!interrupted.db_sync_token_advance_safe);
+    let persisted = db_count(
+        root.path(),
+        "SELECT count(*) FROM provider_active_decisions",
+    );
+    // The third lookup overlapped the ordered processing of the second
+    // batch; its prefetched pairs were never permission to commit.
+    assert!((50..100).contains(&persisted), "{persisted}");
+    let (resumed, lookups) = cycle(root.path(), observations, false, EditedNaming::Suffix).await;
+    assert!(resumed.db_sync_token_advance_safe, "{:?}", resumed.stats);
+    assert_eq!(lookups, 2);
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM provider_active_destinations WHERE verified_media=1"
+        ),
+        150
+    );
+}
+
+#[tokio::test]
+async fn unfiled_confirmation_stops_on_expired_enumeration_tail() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let records = unfiled_records(&server, 3);
+    let (expired, lookups) = cycle_options(
+        root.path(),
+        records.clone(),
+        false,
+        EditedNaming::Suffix,
+        CycleOptions {
+            expire_on_query_tail: true,
+            ..CycleOptions::default()
+        },
+    )
+    .await;
+    assert!(expired.session_expired);
+    assert!(!expired.db_sync_token_advance_safe);
+    assert_eq!(lookups, 0, "the partial chunk must not issue a lookup");
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM provider_active_decisions"
+        ),
+        0
+    );
+    let (resumed, _) = cycle(root.path(), records, false, EditedNaming::Suffix).await;
+    assert!(resumed.db_sync_token_advance_safe);
+}
+
+#[tokio::test]
+async fn unfiled_confirmation_prefetched_session_expiry_holds_checkpoint_until_reopen() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let observations = unfiled_records(&server, 100);
+    let (expired, lookups) = cycle_options(
+        root.path(),
+        observations.clone(),
+        false,
+        EditedNaming::Suffix,
+        CycleOptions {
+            expire_on_lookup: Some(2),
+            ..CycleOptions::default()
+        },
+    )
+    .await;
+    assert!(expired.session_expired);
+    assert!(!expired.db_sync_token_advance_safe);
+    assert_eq!(
+        lookups, 2,
+        "a session fault must not trigger individual fallback"
+    );
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM provider_active_decisions"
+        ),
+        50
+    );
+    let (resumed, lookups) = cycle(root.path(), observations, false, EditedNaming::Suffix).await;
+    assert!(resumed.db_sync_token_advance_safe, "{:?}", resumed.stats);
+    assert_eq!(
+        lookups, 1,
+        "only the previously unconfirmed batch needs a lookup"
+    );
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM provider_active_destinations WHERE verified_media=1"
+        ),
+        100
+    );
+}
+
+#[tokio::test]
+async fn unfiled_confirmation_refuses_wrong_zone_without_losing_valid_peer() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut observations = records(&server, None);
+    observations.extend(second_date_records(&server));
+    let mut current = observations.clone();
+    current[3]["fields"]["masterRef"]["value"]["zoneID"]["zoneName"] = json!("other");
+    let (result, _) = cycle_options(
+        root.path(),
+        observations,
+        false,
+        EditedNaming::Suffix,
+        CycleOptions {
+            current: Some(Arc::new(std::sync::Mutex::new(current))),
+            ..CycleOptions::default()
+        },
+    )
+    .await;
+    assert!(!result.db_sync_token_advance_safe);
+    assert_bytes(&root.path().join("media/IMG_0501.JPG"), ORIGINAL);
+    assert!(!root.path().join("media/IMG_0502.JPG").exists());
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM provider_active_decisions WHERE child='asset-502' AND outcome='deferred'"
+        ),
+        1
     );
 }
 
@@ -3365,6 +3590,9 @@ async fn startup_archive_adoption_flows_into_managed_sync_without_downloads() {
         lookups: Arc::new(AtomicUsize::new(0)),
         current: None,
         indexing: None,
+        stop_on_lookup: None,
+        expire_on_lookup: None,
+        expire_on_query_tail: false,
     };
     let passes = [AlbumPass {
         kind: PassKind::Unfiled,
@@ -4620,6 +4848,195 @@ async fn primary_layout_private_generations_remain_complete_across_edits() {
     }
 }
 
+#[tokio::test]
+async fn primary_layout_edit_changes_primary_mtime() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("media").join("IMG_0501.JPG");
+    let (first, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert_eq!(first.failed_count, 0, "{:?}", first.stats);
+    assert_bytes(&primary, ORIGINAL);
+    let capture = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    assert_eq!(
+        std::fs::metadata(&primary).unwrap().modified().unwrap(),
+        capture,
+        "first publication keeps the capture mtime"
+    );
+    // A no-clock edit would otherwise look newer than a backdated original and
+    // keep the capture mtime, which an mtime scanner may already have indexed.
+    std::fs::File::options()
+        .write(true)
+        .open(&primary)
+        .unwrap()
+        .set_modified(capture - std::time::Duration::from_secs(60))
+        .unwrap();
+    let (edit, _) = cycle_options(
+        root.path(),
+        records(&server, Some(("edit-one", EDIT_ONE))),
+        false,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert_eq!(edit.failed_count, 0, "{:?}", edit.stats);
+    assert_bytes(&primary, EDIT_ONE);
+    let edit_mtime = std::fs::metadata(&primary).unwrap().modified().unwrap();
+    assert!(
+        edit_mtime > capture,
+        "a replacement without an edit clock must use the publication time"
+    );
+    let (revert, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert_eq!(revert.failed_count, 0, "{:?}", revert.stats);
+    assert_bytes(&primary, ORIGINAL);
+    assert!(
+        std::fs::metadata(&primary).unwrap().modified().unwrap() > edit_mtime,
+        "a confirmed revert replaces the primary and must change its mtime again"
+    );
+    let unchanged = std::fs::metadata(&primary).unwrap().modified().unwrap();
+    let (quiet, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        true,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(
+        std::fs::metadata(&primary).unwrap().modified().unwrap(),
+        unchanged,
+        "a cycle that replaces nothing leaves the mtime alone"
+    );
+}
+
+#[tokio::test]
+async fn primary_layout_edit_takes_the_provider_edit_time_as_mtime() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("media").join("IMG_0501.JPG");
+    let edited_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_500_000);
+    let mut bplist = Vec::new();
+    plist::to_writer_binary(&mut bplist, &plist::Value::Date(edited_at.into())).unwrap();
+    let mut mtimes = Vec::new();
+    for (edit, bytes) in [
+        (None, ORIGINAL),
+        (Some(("edit-one", EDIT_ONE)), EDIT_ONE),
+        (None, ORIGINAL),
+    ] {
+        let mut page = records(&server, edit);
+        if edit.is_some() {
+            page[1]["fields"]["adjustmentTimestampEnc"] = json!({
+                "type": "ENCRYPTED_BYTES",
+                "value": base64::engine::general_purpose::STANDARD.encode(&bplist)
+            });
+        }
+        let (result, _) = cycle_options(
+            root.path(),
+            page,
+            false,
+            EditedNaming::Primary,
+            CycleOptions::default(),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert_bytes(&primary, bytes);
+        mtimes.push(std::fs::metadata(&primary).unwrap().modified().unwrap());
+    }
+    assert_eq!(
+        mtimes[1], edited_at,
+        "an edited primary takes the time Apple recorded for the edit"
+    );
+    assert!(
+        mtimes[2] > mtimes[1],
+        "a revert replaces the edited primary and must read as changed again"
+    );
+}
+
+#[tokio::test]
+async fn primary_layout_edit_first_download_keeps_capture_mtime() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("media").join("IMG_0501.JPG");
+    let edited_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_500_000);
+    let mut bplist = Vec::new();
+    plist::to_writer_binary(&mut bplist, &plist::Value::Date(edited_at.into())).unwrap();
+    let mut page = records(&server, Some(("edit-one", EDIT_ONE)));
+    page[1]["fields"]["adjustmentTimestampEnc"] = json!({
+        "type": "ENCRYPTED_BYTES",
+        "value": base64::engine::general_purpose::STANDARD.encode(&bplist)
+    });
+    let (result, _) = cycle_options(
+        root.path(),
+        page,
+        false,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+    assert_bytes(&primary, EDIT_ONE);
+    let capture = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    assert_eq!(
+        std::fs::metadata(&primary).unwrap().modified().unwrap(),
+        capture,
+        "a first download keeps the capture mtime even when the asset already carries an edit time"
+    );
+}
+
+#[tokio::test]
+async fn primary_layout_edit_revert_advances_a_future_predecessor() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("media").join("IMG_0501.JPG");
+    for (edit, bytes) in [(None, ORIGINAL), (Some(("edit-one", EDIT_ONE)), EDIT_ONE)] {
+        let (result, _) = cycle_options(
+            root.path(),
+            records(&server, edit),
+            false,
+            EditedNaming::Primary,
+            CycleOptions::default(),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert_bytes(&primary, bytes);
+    }
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&primary)
+        .unwrap()
+        .set_modified(future)
+        .unwrap();
+    let (revert, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert_eq!(revert.failed_count, 0, "{:?}", revert.stats);
+    assert_bytes(&primary, ORIGINAL);
+    assert!(
+        std::fs::metadata(&primary).unwrap().modified().unwrap() > future,
+        "a publication time must advance a future predecessor"
+    );
+}
+
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn primary_layout_preserves_sidecar_bytes_and_fences_old_metadata_queue() {
@@ -4641,6 +5058,14 @@ async fn primary_layout_preserves_sidecar_bytes_and_fences_old_metadata_queue() 
     assert_eq!(initial.failed_count, 0);
     let old_sidecar = std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap();
     assert!(!old_sidecar.is_empty());
+    let current_sidecar = media.join("IMG_0501.JPG.xmp");
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(86_400);
+    std::fs::File::options()
+        .write(true)
+        .open(&current_sidecar)
+        .unwrap()
+        .set_modified(future)
+        .unwrap();
     let (edited, _) = cycle_options(
         root.path(),
         records(&server, Some(("edit-one", EDIT_ONE))),
@@ -4654,6 +5079,14 @@ async fn primary_layout_preserves_sidecar_bytes_and_fences_old_metadata_queue() 
     assert_eq!(
         std::fs::read(media.join("IMG_0501_original.JPG.xmp")).unwrap(),
         old_sidecar
+    );
+    assert!(
+        std::fs::metadata(&current_sidecar)
+            .unwrap()
+            .modified()
+            .unwrap()
+            < future,
+        "an owned sidecar must not be republished beyond a future predecessor"
     );
     let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
     conn.execute("UPDATE asset_metadata_paths SET metadata_write_failed_at=1 WHERE version_size='original' AND local_path=?1",[media.join("IMG_0501.JPG").to_str().unwrap()]).unwrap();

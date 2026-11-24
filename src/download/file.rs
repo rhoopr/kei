@@ -44,6 +44,17 @@ pub(crate) async fn inspect_integrity_fingerprint(
     root: &std::path::Path,
     path: &std::path::Path,
 ) -> anyhow::Result<(String, u64)> {
+    let retained = retain_integrity_file(root, path).await?;
+    Ok((
+        data_encoding::HEXLOWER.encode(&retained.fingerprint.sha256),
+        retained.fingerprint.size,
+    ))
+}
+
+pub(super) async fn retain_integrity_file(
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> anyhow::Result<std::sync::Arc<RetainedPendingFile>> {
     let path = crate::fs_util::absolute_confined_path(path)?;
     let root = crate::fs_util::absolute_confined_path(root)?;
     anyhow::ensure!(path.starts_with(&root), "Inspection outside destination");
@@ -53,11 +64,9 @@ pub(crate) async fn inspect_integrity_fingerprint(
         .ancestors()
         .last()
         .ok_or_else(|| anyhow::anyhow!("Missing filesystem root"))?;
-    let fingerprint = fingerprint_downloaded_path(anchor, &path).await?;
-    Ok((
-        data_encoding::HEXLOWER.encode(&fingerprint.sha256),
-        fingerprint.size,
-    ))
+    retain_pending_file(anchor, &path)
+        .await?
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound).into())
 }
 #[cfg(test)]
 pub(super) use publication::rename_part_to_final;

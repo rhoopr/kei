@@ -655,6 +655,11 @@ impl ActiveDecision {
     }
 }
 
+pub(crate) enum SelectionAttempt {
+    Due(Option<Box<ActiveDecision>>),
+    Deferred,
+}
+
 fn validate_media_source(
     root: &ActiveGeneration,
     manifest: &ActiveDecision,
@@ -2430,17 +2435,52 @@ fn validate_records(
 }
 
 impl SqliteStateDb {
-    pub(crate) async fn selection_attempt_due(
+    /// Read-ahead hint only. The producer still validates the decision and its
+    /// retry deadline when consuming each observation.
+    pub(crate) async fn first_selection_observations(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        key: String,
+        children: Vec<String>,
+    ) -> Result<HashSet<String>, StateError> {
+        self.with_conn("finding new selection observations", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            let mut recorded = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3)")?;
+            let mut new = HashSet::new();
+            for child in children {
+                if !recorded.query_row(params![generation, key, child], |row| row.get::<_, bool>(0))? {
+                    new.insert(child);
+                }
+            }
+            Ok(new)
+        }).await
+    }
+
+    pub(crate) async fn selection_attempt(
         &self,
         owner: account::AccountOwner,
         generation: String,
         key: String,
         child: String,
-    ) -> Result<bool, StateError> {
-        self.with_conn("checking selection retry deadline",move|conn|{
-            account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;
-            let state:Option<(String,i64)>=conn.query_row("SELECT admission,next_retry_at FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,key,child],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-            if let Some((admission,deadline))=state {load_decision(conn,&root,&key,&child)?;Ok(admission=="excluded" || deadline<=Utc::now().timestamp())} else {Ok(true)}
+    ) -> Result<SelectionAttempt, StateError> {
+        self.with_conn("reading selection attempt", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            account::validate_authenticated(&tx, &owner)?;
+            let root = load_generation(&tx, &generation)?;
+            let due: Option<bool> = tx.query_row(
+                "SELECT admission='excluded' OR next_retry_at<=?4 FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+                params![generation, key, child, Utc::now().timestamp()], |row| row.get(0),
+            ).optional()?;
+            let attempt = match due {
+                None => SelectionAttempt::Due(None),
+                Some(due) => {
+                    let previous = load_decision(&tx, &root, &key, &child)?;
+                    if due { SelectionAttempt::Due(Some(Box::new(previous))) } else { SelectionAttempt::Deferred }
+                }
+            };
+            tx.commit()?;
+            Ok(attempt)
         }).await
     }
 
@@ -2474,7 +2514,8 @@ impl SqliteStateDb {
             let tx=conn.unchecked_transaction()?;
             let conn=&tx;
             account::validate_authenticated(conn,&owner)?;
-            validate_scope_decisions(conn, &scope)?;
+            // Discovery is not a checkpoint decision. Validate the selected
+            // root here and the due manifests when claiming the replay window.
             let id:Option<String>=conn.query_row(&format!("SELECT g.id FROM provider_active_generations g WHERE {CURRENT_SELECTION_CONFIGURATION} AND g.id<>?3 AND (EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.admission='deferred' AND d.next_retry_at<=?4) OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=g.id AND {UNFINISHED} AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child AND d.next_retry_at<=?4))) ORDER BY g.last_replayed_at,g.created_at,g.id LIMIT 1"),params![scope,config_hash,current,Utc::now().timestamp()],|r|r.get(0)).optional()?;
             id.map(|id|load_generation(conn,&id)).transpose()
         }).await
@@ -2489,7 +2530,6 @@ impl SqliteStateDb {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
             let root=load_generation(&tx,&generation)?;
             let stored:Option<String>=tx.query_row("SELECT replay_after FROM provider_active_generations WHERE id=?1",[&generation],|r|r.get(0))?;
-            validate_scope_decisions(&tx, &root.spec.scope)?;
             let after:Option<(String,String)>=stored.as_deref().map(|value|serde_json::from_str(value).map_err(|_invalid|StateError::ProviderSelectionInvalid)).transpose()?;
             let query=|after:Option<&(String,String)>|->Result<Vec<(String,String,i64)>,StateError> {
                 Ok(tx.prepare(&format!("SELECT d.pass_key,d.child,length(d.manifest) FROM provider_active_decisions d WHERE d.generation=?1 AND (?2 IS NULL OR (d.pass_key,d.child)>(?2,?3)) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND {UNFINISHED})) ORDER BY d.pass_key,d.child LIMIT 64"))?.query_map(params![generation,after.map(|a|&a.0),after.map(|a|&a.1),Utc::now().timestamp()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?)
@@ -3609,6 +3649,16 @@ fn validate_identity_decisions(
 // This predicate must not narrow admission or physical publication guards.
 const CURRENT_SELECTION_CONFIGURATION: &str = "g.scope=?1 AND g.config_hash=?2";
 
+fn commit_observed_destination(
+    tx: rusqlite::Transaction<'_>,
+    file_still_matches: &impl Fn() -> bool,
+) -> Result<(), StateError> {
+    if !file_still_matches() {
+        return Err(StateError::ProviderWorkConflict("selected_file_changed"));
+    }
+    Ok(tx.commit()?)
+}
+
 // A never-published path is planning evidence, not another required copy, once
 // a later complete query with the same selection and source facts has finalized
 // this rendition at its current path. Keep every old row and prepared output.
@@ -4040,6 +4090,7 @@ impl SqliteStateDb {
         child: String,
         path: super::provider_selection::SelectionPath,
         fingerprint: (String, u64),
+        file_still_matches: impl Fn() -> bool + Send + 'static,
     ) -> Result<bool, StateError> {
         let (local, size) = fingerprint;
         self.with_conn_mut("reusing exact destination publication",move|conn|{
@@ -4061,7 +4112,7 @@ impl SqliteStateDb {
                 }
                 let completed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND path=?4 AND version_size=?5 AND verified_media=1 AND preserved_local IS NULL AND local_checksum=?6 AND source_checksum=?7)",params![generation,key,child,path.key()?,selected.version_size,local,source],|row|row.get(0))?;
                 if !completed { return invalid(); }
-                tx.commit()?;
+                commit_observed_destination(tx, &file_still_matches)?;
                 return Ok(true);
             }
             let previous:Option<(String,String,String)>=tx.query_row("SELECT w.generation,w.source_checksum,w.pass_key FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.child=?3 AND w.version_size=?4 AND w.path=?5 AND w.checksum=?6 AND w.size_bytes=?7 AND w.master=?8 AND w.admitted=1 AND w.verified_media=1 AND (w.local_checksum=?9 OR (w.prepared_checksum=?9 AND w.prepared_size=?10)) ORDER BY g.created_at DESC LIMIT 1",params![root.spec.scope,key,child,selected.version_size,path.key()?,selected.checksum,i64::try_from(selected.size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,manifest.decision.master,local,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
@@ -4088,7 +4139,7 @@ impl SqliteStateDb {
                     // field handoff. They do not complete today's metadata intent.
                     tx.execute("UPDATE provider_active_destinations SET embedded_metadata_receipt=?6 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND local_checksum=?7 AND verified_media=1",params![generation,key,child,selected.version_size,path.key()?,fields,local])?;
                 }
-                tx.commit()?;return Ok(true)
+                commit_observed_destination(tx, &file_still_matches)?;return Ok(true)
             }
             let text=native.to_str();
             // Legacy metadata publication retains its original download hash
@@ -4097,7 +4148,7 @@ impl SqliteStateDb {
             let prior:Option<String>=tx.query_row("SELECT a.download_checksum FROM assets a JOIN asset_metadata_paths p USING(library,id,version_size) WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND a.status='downloaded' AND a.is_deleted=0 AND a.downloaded_at IS NOT NULL AND a.local_path=?4 AND a.local_checksum=?5 AND length(a.download_checksum)=64 AND p.local_path=a.local_path AND p.local_checksum=a.local_checksum AND p.download_checksum=a.download_checksum AND p.provider_checksum=?6 AND a.checksum=p.provider_checksum AND a.size_bytes=?7 AND (a.download_checksum<>a.local_checksum OR a.size_bytes=?8)",params![manifest.media_zone(&root).get("zoneName").and_then(Value::as_str),manifest.state_id,selected.version_size,text,local,selected.checksum,i64::try_from(selected.size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|r.get(0)).optional()?;
             if let Some(source)=prior {
                 record_destination_source(&tx,manifest.media_zone(&root).get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::PriorPublication(&source))?;
-                tx.commit()?;return Ok(true);
+                commit_observed_destination(tx, &file_still_matches)?;return Ok(true);
             }
             // A raw landed publication can outlive its failed finalization
             // transaction. Only an exact current SHA-256 source proves those
@@ -4119,7 +4170,7 @@ impl SqliteStateDb {
                     tx.execute("UPDATE asset_metadata_paths SET source_checksum=?5 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4",params![library,manifest.state_id,selected.version_size,text,local])?;
                     record_destination_source(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::RecoveredPublication(&local))?;
                     super::asset_writes::record_metadata_capture_revision(&tx,library,&manifest.state_id,crate::state::types::METADATA_CAPTURE_REVISION,now)?;
-                    tx.commit()?;
+                    commit_observed_destination(tx, &file_still_matches)?;
                     return Ok(true);
                 }
             }
@@ -4127,7 +4178,7 @@ impl SqliteStateDb {
             if let Some(source)=receipt {
                 record_destination_source(&tx,manifest.media_zone(&root).get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,
                     &manifest.decision.destinations.iter().find(|d|d.path==path).ok_or(StateError::ProviderSelectionInvalid)?.version_size,&native,&local,VerifiedDestinationSource::PriorPublication(&source))?;
-                tx.commit()?;Ok(true)
+                commit_observed_destination(tx, &file_still_matches)?;Ok(true)
             } else {
                 // An import or prior exact adoption has no download/source receipt. Its durable local
                 // fingerprint can establish media ownership without inventing
@@ -4136,7 +4187,8 @@ impl SqliteStateDb {
                 if imported {
                     record_destination_source(&tx,manifest.media_zone(&root).get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::ImportedLocal(&local))?;
                 }
-                tx.commit()?;Ok(imported)
+                if imported { commit_observed_destination(tx, &file_still_matches)?; }
+                Ok(imported)
             }
         }).await
     }
@@ -4895,6 +4947,7 @@ impl SqliteStateDb {
         child: String,
         path: super::provider_selection::SelectionPath,
         observation: (String, u64, Option<chrono::DateTime<Utc>>),
+        file_still_matches: impl Fn() -> bool + Send + 'static,
     ) -> Result<(), StateError> {
         self.with_conn_mut("preserving selected local media", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4920,7 +4973,7 @@ impl SqliteStateDb {
                 && (previous == evidence || (previous.modified == evidence.modified
                     && prepared_metadata(&tx, &root, &manifest, destination)? == Some((evidence.checksum.clone(), evidence.size))))
             {
-                tx.commit()?;
+                commit_observed_destination(tx, &file_still_matches)?;
                 return Ok(());
             }
             if evidence.checksum.len() != 64 || !evidence.checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -4929,8 +4982,7 @@ impl SqliteStateDb {
             tx.execute("UPDATE provider_active_destinations SET preserved_local=?6,verified_media=0,verified_metadata=0,local_checksum=?7,source_checksum=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1",
                 params![generation,key,child,destination.version_size,path.key()?,encode(&evidence)?,evidence.checksum])?;
             refresh_progress_hash(&tx, &root, &manifest, destination)?;
-            tx.commit()?;
-            Ok(())
+            commit_observed_destination(tx, &file_still_matches)
         }).await
     }
 

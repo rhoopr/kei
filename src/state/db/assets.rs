@@ -352,6 +352,21 @@ impl SqliteStateDb {
         version_size: &str,
         error: &str,
     ) -> Result<(), StateError> {
+        self.record_failure(library, id, version_size, None, error)
+            .await
+    }
+
+    async fn record_failure(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        destination: Option<&Path>,
+        error: &str,
+    ) -> Result<(), StateError> {
+        let destination_key = destination
+            .map(|path| super::provider_selection::SelectionPath::from_path(path).key())
+            .transpose()?;
         let library = library.to_owned();
         let id = id.to_owned();
         let version_size = version_size.to_owned();
@@ -360,9 +375,14 @@ impl SqliteStateDb {
         self.with_conn("mark_failed", move |conn| {
             let rows = conn
                 .execute(
-                    "UPDATE assets SET status = 'failed', download_attempts = download_attempts + 1, \
+                    "UPDATE assets SET status = CASE WHEN status='downloaded' AND imported_size IS NOT NULL \
+                       AND EXISTS (SELECT 1 FROM provider_active_destinations d \
+                         WHERE d.library=assets.library AND d.asset_id=assets.id AND d.version_size=assets.version_size \
+                           AND d.checksum=assets.checksum AND d.path=?5 AND d.admitted=1 AND d.verified_media=0 \
+                           AND assets.local_path <> d.compat_path) \
+                       THEN status ELSE 'failed' END, download_attempts = download_attempts + 1, \
                      last_error = ?1 WHERE library = ?2 AND id = ?3 AND version_size = ?4",
-                    rusqlite::params![&error, &library, &id, &version_size],
+                    rusqlite::params![&error, &library, &id, &version_size, destination_key],
                 )
                 .map_err(|e| StateError::query("mark_failed", e))?;
 
@@ -1282,6 +1302,18 @@ impl DownloadStateStore for SqliteStateDb {
         error: &str,
     ) -> Result<(), StateError> {
         SqliteStateDb::mark_failed(self, library, id, version_size, error).await
+    }
+
+    async fn mark_destination_failed(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        destination: &Path,
+        error: &str,
+    ) -> Result<(), StateError> {
+        self.record_failure(library, id, version_size, Some(destination), error)
+            .await
     }
 
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {

@@ -26,7 +26,7 @@ use crate::icloud::photos::{
 use crate::state::ReconciliationStateStore;
 use crate::state::db::provider_generations::{
     ActiveDecision, ActiveGeneration, AdmissionChecks, GenerationSpec, INDEPENDENT_ALBUM_COPIES,
-    MAX_GENERATION_BYTES,
+    MAX_GENERATION_BYTES, SelectionAttempt,
 };
 use crate::state::db::provider_selection::{
     SelectionDecision, SelectionDestination, SelectionOutcome, SelectionPath,
@@ -151,6 +151,7 @@ pub(super) async fn hold_retained_debt(
     };
     if context.checkpoint_debt(config).await? {
         result.block_incremental_token(DEFERRED_REASON);
+        result.checkpoint.scanned_generation = None;
         result.stats.selected_work_remaining = true;
         result.sync_token = None;
     }
@@ -321,7 +322,9 @@ pub(crate) async fn context(
 }
 
 pub(in crate::download) struct SelectionConfirmation {
-    retained: Vec<u8>,
+    // Frozen selection facts for planning only. Admission and repair authority
+    // still come from their owning transactions.
+    previous: Option<Box<ActiveDecision>>,
     fresh: Option<Vec<u8>>,
     retry_observation: Option<Arc<PhotoAsset>>,
 }
@@ -391,9 +394,7 @@ impl SelectionContext {
         delta: &MembershipDelta,
         cancel: &CancellationToken,
     ) -> Result<bool> {
-        if !delta.relations.values().any(|deleted| *deleted)
-            && !delta.containers.values().any(|deleted| *deleted)
-        {
+        if !delta.has_membership_deletions() {
             return Ok(true);
         }
         let Some(root) = self.current().await? else {
@@ -787,46 +788,80 @@ impl SelectionRun {
         Ok(())
     }
 
+    /// Fetch only first observations. A malformed or unsupported batch falls
+    /// back to independent lookups so one missing child cannot strand its peers.
+    pub(in crate::download) async fn prefetch_unfiled(
+        &self,
+        key: &str,
+        observations: &[&PhotoAsset],
+    ) -> Result<BTreeMap<String, crate::icloud::photos::CurrentCatalogAsset>> {
+        if observations.len() < 2 || self.session_expired.load(Ordering::Relaxed) {
+            return Ok(BTreeMap::new());
+        }
+        let mut new = self
+            .capture
+            .db
+            .first_selection_observations(
+                self.capture.owner.clone(),
+                self.root.id.clone(),
+                key.to_owned(),
+                observations
+                    .iter()
+                    .map(|asset| asset.asset_record_name().to_owned())
+                    .collect(),
+            )
+            .await?;
+        let candidates: Vec<_> = observations
+            .iter()
+            .copied()
+            .filter(|asset| new.remove(asset.asset_record_name()))
+            .collect();
+        if candidates.len() < 2 || self.session_expired.load(Ordering::Relaxed) {
+            return Ok(BTreeMap::new());
+        }
+        let album = self
+            .albums
+            .get(key)
+            .context("Missing selection pass owner")?;
+        let replies = album.confirm_unfiled_batch(&candidates).await?;
+        Ok(candidates
+            .into_iter()
+            .zip(replies)
+            .map(|(observed, current)| (observed.asset_record_name().to_owned(), current))
+            .collect())
+    }
+
     /// Confirm before any canonical producer mutation. Retained current proof is
     /// reused only for this root's unchanged dependency/configuration basis.
     pub(in crate::download) async fn confirm(
         &self,
         key: &str,
         observed: &PhotoAsset,
+        prefetched: Option<crate::icloud::photos::CurrentCatalogAsset>,
     ) -> Result<(PhotoAsset, SelectionConfirmation)> {
-        if !self
+        let attempt = self
             .capture
             .db
-            .selection_attempt_due(
-                self.capture.owner.clone(),
-                self.root.id.clone(),
-                key.to_owned(),
-                observed.asset_record_name().to_owned(),
-            )
-            .await?
-        {
-            return Err(SelectionRetryDeferred.into());
-        }
-        let previous = self
-            .capture
-            .db
-            .selection_decision(
+            .selection_attempt(
                 self.capture.owner.clone(),
                 self.root.id.clone(),
                 key.to_owned(),
                 observed.asset_record_name().to_owned(),
             )
             .await?;
+        let SelectionAttempt::Due(previous) = attempt else {
+            return Err(SelectionRetryDeferred.into());
+        };
         let retry_inventory = self.phase == SelectionPhase::Inventory && previous.is_some();
-        if let Some(previous) = previous
+        if let Some(prior) = previous.as_deref()
             && let (Some(body), Some(master)) =
-                (previous.decision.confirmation, previous.decision.master)
+                (&prior.decision.confirmation, &prior.decision.master)
         {
             let retained = current_asset(
-                &body,
-                &previous.decision.child,
-                &master,
-                previous
+                body,
+                &prior.decision.child,
+                master,
+                prior
                     .decision
                     .media_source
                     .as_ref()
@@ -841,7 +876,7 @@ impl SelectionRun {
                     .albums
                     .get(key)
                     .context("Missing retained selection pass owner")?;
-                let current = album.confirm_selected_asset(&retained).await?;
+                let current = self.confirm_individually(album, &retained).await?;
                 anyhow::ensure!(
                     same_selected_facts(&retained, &current.asset),
                     "Retained selected generation differs from current proof"
@@ -849,18 +884,18 @@ impl SelectionRun {
                 return Ok((
                     current
                         .asset
-                        .with_state_record_name(Arc::from(previous.state_id)),
+                        .with_state_record_name(Arc::from(prior.state_id.as_str())),
                     SelectionConfirmation {
-                        retained: body,
+                        previous,
                         fresh: Some(current.body),
                         retry_observation: None,
                     },
                 ));
             }
             return Ok((
-                retained.with_state_record_name(Arc::from(previous.state_id)),
+                retained.with_state_record_name(Arc::from(prior.state_id.as_str())),
                 SelectionConfirmation {
-                    retained: body,
+                    previous,
                     fresh: None,
                     retry_observation: None,
                 },
@@ -870,7 +905,10 @@ impl SelectionRun {
             .albums
             .get(key)
             .context("Missing selection pass owner")?;
-        let current = album.confirm_selected_asset(observed).await?;
+        let current = match prefetched {
+            Some(current) if !retry_inventory => current,
+            _ => self.confirm_individually(album, observed).await?,
+        };
         anyhow::ensure!(
             same_selected_facts(&current.asset, observed),
             "Current confirmation changed selection facts"
@@ -878,11 +916,23 @@ impl SelectionRun {
         Ok((
             current.asset,
             SelectionConfirmation {
-                retained: current.body.clone(),
+                previous,
                 fresh: Some(current.body),
                 retry_observation: retry_inventory.then(|| Arc::new(observed.clone())),
             },
         ))
+    }
+
+    async fn confirm_individually(
+        &self,
+        album: &PhotoAlbum,
+        observed: &PhotoAsset,
+    ) -> Result<crate::icloud::photos::CurrentCatalogAsset> {
+        anyhow::ensure!(
+            !self.session_expired.load(Ordering::Relaxed),
+            "Selection confirmation stopped after provider session expiry"
+        );
+        album.confirm_selected_asset(observed).await
     }
 
     /// Account for an unresolved current identity without creating queue work.
@@ -983,7 +1033,7 @@ impl SelectionRun {
         config: &DownloadConfig,
     ) -> Result<bool> {
         let SelectionConfirmation {
-            retained: body,
+            previous,
             fresh,
             retry_observation,
         } = confirmation;
@@ -994,19 +1044,10 @@ impl SelectionRun {
         } else {
             ""
         };
-        let previous = self
-            .capture
-            .db
-            .selection_decision(
-                self.capture.owner.clone(),
-                self.root.id.clone(),
-                key.to_owned(),
-                asset.asset_record_name().to_owned(),
-            )
-            .await?;
         let mut destinations = Vec::new();
         let mut records = Vec::new();
         let mut archive_paths = Vec::new();
+        let mut observed_files = BTreeMap::new();
         // A frozen historical RAW pair may use the opposite logical keys.
         // Recover that mapping from exact resource evidence, never current policy.
         let frozen_key = |provider, checksum: &str, size| -> Result<crate::state::VersionSizeKey> {
@@ -1085,10 +1126,11 @@ impl SelectionRun {
                         .to_path()
                 } else if let Some(path) = retained {
                     path
-                } else if let Some(path) = planner
-                    .verified_downloaded_path(asset, config, derived.version_size)
+                } else if let Some((path, file)) = planner
+                    .verified_catalog_path(asset, config, derived.version_size)
                     .await
                 {
+                    observed_files.insert(std::path::absolute(&path)?, file);
                     catalog_path = true;
                     path
                 } else if let Some(task) = plan
@@ -1177,10 +1219,26 @@ impl SelectionRun {
                 });
             }
         }
-        let sources = if let Some(previous) = &previous
-            && previous.decision.confirmation.is_some()
-        {
-            previous.sources.clone()
+        let (prior_body, prior_sources, media_source) = match previous {
+            Some(prior) => (
+                prior.decision.confirmation,
+                prior.sources,
+                prior.decision.media_source,
+            ),
+            None => (
+                None,
+                Vec::new(),
+                Some(
+                    self.albums
+                        .get(key)
+                        .context("Missing selected media owner")?
+                        .selected_media_source(asset)?,
+                ),
+            ),
+        };
+        let frozen = prior_body.is_some();
+        let sources = if frozen {
+            prior_sources
         } else {
             self.capture
                 .db
@@ -1199,16 +1257,12 @@ impl SelectionRun {
                 pass_key: key.to_owned(),
                 child: asset.asset_record_name().to_owned(),
                 master: Some(asset.id().to_owned()),
-                confirmation: Some(body),
-                media_source: match previous.as_ref() {
-                    Some(previous) => previous.decision.media_source.clone(),
-                    None => Some(
-                        self.albums
-                            .get(key)
-                            .context("Missing selected media owner")?
-                            .selected_media_source(asset)?,
-                    ),
-                },
+                confirmation: Some(
+                    prior_body
+                        .or_else(|| fresh.clone())
+                        .context("Missing current selection confirmation")?,
+                ),
+                media_source,
                 outcome: if reason.is_empty() {
                     SelectionOutcome::Selected
                 } else if reason == "currently_filtered" {
@@ -1264,9 +1318,7 @@ impl SelectionRun {
                 Ok(projection) => break projection,
                 Err(error @ crate::state::error::StateError::ProviderWorkConflict(_))
                     if !retried_collision
-                        && previous
-                            .as_ref()
-                            .is_none_or(|previous| previous.decision.confirmation.is_none())
+                        && !frozen
                         && planner.managed_layout_session().is_none() =>
                 {
                     let mut changed = false;
@@ -1323,19 +1375,17 @@ impl SelectionRun {
                     return Ok(false);
                 }
                 if planner.managed_layout_session().is_none()
-                    && let Ok(actual) = crate::download::file::inspect_integrity_fingerprint(
+                    && let Ok(file) = crate::download::file::retain_integrity_file(
                         &config.directory,
                         &destination.path.to_path(),
                     )
                     .await
-                    && actual != confirmed
-                    && actual.1 == destination.size
+                    && file.fingerprint.size == destination.size
                     && data_encoding::BASE64
                         .decode(destination.checksum.as_bytes())
-                        .is_ok_and(|source| {
-                            source.len() == 32
-                                && data_encoding::HEXLOWER.encode(&source) == actual.0
-                        })
+                        .is_ok_and(|source| source == file.fingerprint.sha256)
+                    && (file.fingerprint.size != confirmed.1
+                        || data_encoding::HEXLOWER.encode(&file.fingerprint.sha256) != confirmed.0)
                 {
                     crate::fs_util::fsync_parent_dir_async(&destination.path.to_path()).await?;
                     // Recovery still requires the existing owner's independent
@@ -1349,7 +1399,11 @@ impl SelectionRun {
                             key.to_owned(),
                             asset.asset_record_name().to_owned(),
                             destination.path.clone(),
-                            actual,
+                            (
+                                data_encoding::HEXLOWER.encode(&file.fingerprint.sha256),
+                                file.fingerprint.size,
+                            ),
+                            move || file.selection_still_matches(),
                         )
                         .await?;
                 }
@@ -1382,13 +1436,17 @@ impl SelectionRun {
                 // to the journal owner, which acknowledges its binding below.
                 continue;
             }
-            if let Some(retained) = crate::download::file::retain_pending_file(
-                &config.directory,
-                &destination.path.to_path(),
-            )
-            .await?
-            {
-                let fingerprint = retained.fingerprint;
+            let path = destination.path.to_path();
+            // Projection can redirect the destination but does not write media.
+            let file = match observed_files.remove(&path) {
+                Some(file) => Some(file),
+                None => {
+                    crate::download::file::retain_pending_file(&config.directory, &path).await?
+                }
+            };
+            if let Some(file) = file {
+                let fingerprint = file.fingerprint;
+                let reuse_file = Arc::clone(&file);
                 crate::fs_util::fsync_parent_dir_async(&destination.path.to_path()).await?;
                 let reused = self
                     .capture
@@ -1403,10 +1461,10 @@ impl SelectionRun {
                             data_encoding::HEXLOWER.encode(&fingerprint.sha256),
                             fingerprint.size,
                         ),
+                        move || reuse_file.selection_still_matches(),
                     )
                     .await?;
                 if reused {
-                    retained.validate().await?;
                     continue;
                 }
                 let established = self
@@ -1446,9 +1504,8 @@ impl SelectionRun {
                     .context("Invalid selected local rendition")?;
                 let cloud_newer = asset
                     .media_modified_at(version)
-                    .zip(retained.modified.map(chrono::DateTime::<chrono::Utc>::from))
+                    .zip(file.modified.map(chrono::DateTime::<chrono::Utc>::from))
                     .is_some_and(|(cloud, local)| cloud > local);
-                retained.validate().await?;
                 if unchanged || cloud_newer {
                     if let Some(task) = plan
                         .tasks
@@ -1458,7 +1515,7 @@ impl SelectionRun {
                         task.replacement_fingerprint = Some(Arc::new(
                             crate::download::file::FinalPublication::ReplaceLocal {
                                 fingerprint,
-                                modified: (!unchanged).then_some(retained.modified).flatten(),
+                                modified: (!unchanged).then_some(file.modified).flatten(),
                             },
                         ));
                     }
@@ -1474,8 +1531,9 @@ impl SelectionRun {
                             (
                                 data_encoding::HEXLOWER.encode(&fingerprint.sha256),
                                 fingerprint.size,
-                                retained.modified.map(chrono::DateTime::<chrono::Utc>::from),
+                                file.modified.map(chrono::DateTime::<chrono::Utc>::from),
                             ),
+                            move || file.selection_still_matches(),
                         )
                         .await?;
                 }
@@ -1554,6 +1612,7 @@ impl SelectionRun {
         &self,
         key: &str,
         asset: &PhotoAsset,
+        confirmation: &SelectionConfirmation,
         config: &DownloadConfig,
         planner: &mut TaskPlanner,
     ) -> Result<Option<AssetTaskPlan>> {
@@ -1564,17 +1623,7 @@ impl SelectionRun {
         {
             return Ok(None);
         }
-        let Some(previous) = self
-            .capture
-            .db
-            .selection_decision(
-                self.capture.owner.clone(),
-                self.root.id.clone(),
-                key.to_owned(),
-                asset.asset_record_name().to_owned(),
-            )
-            .await?
-        else {
+        let Some(previous) = confirmation.previous.as_deref() else {
             return Ok(None);
         };
         let mut tasks = Vec::new();
@@ -1866,6 +1915,7 @@ pub(super) async fn inventory(
         && !result.checkpoint.identity_incomplete;
     let query_veto = result.stats.sync_token_blocked_reason.map(str::to_owned);
     let covered = !result.checkpoint.enumeration_incomplete
+        && !run.session_expired.load(Ordering::Relaxed)
         && result.checkpoint.enumeration_errors == 0
         && result.checkpoint.state_write_failures == 0
         && !result.checkpoint.interrupted
@@ -1958,11 +2008,6 @@ pub(super) async fn inventory(
         result.checkpoint.identity_incomplete = true;
         result.block_incremental_token(DEFERRED_REASON)
     }
-    result.stats.selected_work_remaining = context.checkpoint_debt(config).await?;
-    if result.stats.selected_work_remaining {
-        result.block_incremental_token(DEFERRED_REASON)
-    }
-    result.checkpoint.project(&mut result.stats);
     let mut membership_delta = context
         .inventory_membership_delta
         .lock()
@@ -1972,6 +2017,18 @@ pub(super) async fn inventory(
     context
         .include_durable_membership_deletions(&mut membership_delta)
         .await?;
+    // A standalone inventory goes straight to the dispatcher's final debt gate.
+    // Check here too if a membership write or subsequent delta replay can use
+    // this result before dispatch returns.
+    if !matches!(config.sync_mode, crate::download::SyncMode::Full)
+        || membership_delta.has_membership_deletions()
+    {
+        result.stats.selected_work_remaining = context.checkpoint_debt(config).await?;
+        if result.stats.selected_work_remaining {
+            result.block_incremental_token(DEFERRED_REASON);
+        }
+    }
+    result.checkpoint.project(&mut result.stats);
     if !result.checkpoint.sync_token_blocked
         && !result.checkpoint.identity_incomplete
         && !result.checkpoint.storage_failed

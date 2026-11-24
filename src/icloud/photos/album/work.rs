@@ -1,6 +1,8 @@
 //! Current resource confirmation for retained catalog identities.
 
 use anyhow::{Context, Result};
+use rustc_hash::{FxHashMap, FxHashSet};
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -10,6 +12,9 @@ use crate::icloud::photos::asset::{PhotoAsset, RequiredAssetFields};
 use crate::icloud::photos::inbox::ShadowCapture;
 use crate::icloud::photos::{changes_json, cloudkit, queries, session};
 use crate::state::db::provider_selection::SelectionMediaSource;
+
+#[cfg(test)]
+mod tests;
 
 pub(crate) struct CurrentCatalogAsset {
     pub(crate) asset: PhotoAsset,
@@ -98,6 +103,101 @@ pub(crate) fn current_asset(
                 .and_then(Value::as_str)
                 .context("Missing current lookup zone")?,
         )))
+}
+
+#[derive(serde::Deserialize)]
+struct RawLookupResponse<'a> {
+    #[serde(borrow)]
+    records: Vec<&'a RawValue>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawRecordName {
+    #[serde(rename = "recordName")]
+    name: String,
+}
+
+/// Index the exact provider record slices from an already validated lookup
+/// response. `lookup_members` runs `changes_json` first, so duplicate keys and
+/// ambiguous identities have already been refused before this borrowed parse.
+fn raw_lookup_records(body: &[u8]) -> Result<FxHashMap<String, &RawValue>> {
+    let response: RawLookupResponse<'_> = serde_json::from_slice(body)?;
+    let mut by_name = FxHashMap::default();
+    for record in response.records {
+        let RawRecordName { name } = serde_json::from_str(record.get())?;
+        anyhow::ensure!(
+            by_name.insert(name, record).is_none(),
+            "Ambiguous or mismatched current lookup scope"
+        );
+    }
+    Ok(by_name)
+}
+
+fn pair_confirmation_body(child: &RawValue, master: &RawValue) -> Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(child.get().len() + master.get().len() + 16);
+    body.extend_from_slice(b"{\"records\":[");
+    body.extend_from_slice(child.get().as_bytes());
+    body.push(b',');
+    body.extend_from_slice(master.get().as_bytes());
+    body.extend_from_slice(b"]}");
+    anyhow::ensure!(
+        body.len() <= crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES,
+        "Current confirmation exceeded the provider evidence byte limit"
+    );
+    Ok(body)
+}
+
+fn add_pair_proof_bytes(total: &mut usize, proof_len: usize) -> Result<()> {
+    let next = total
+        .checked_add(proof_len)
+        .context("Current confirmation batch exceeded the provider evidence byte limit")?;
+    anyhow::ensure!(
+        next <= crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES,
+        "Current confirmation batch exceeded the provider evidence byte limit"
+    );
+    *total = next;
+    Ok(())
+}
+
+fn confirm_batch_response(
+    body: &[u8],
+    zone: &Value,
+    pairs: &[(String, String)],
+    names: &[String],
+) -> Result<Vec<CurrentCatalogAsset>> {
+    let requested: Vec<&str> = names.iter().map(String::as_str).collect();
+    // Strict `changes_json` duplicate-key validation and exact requested
+    // names, no extras, no omissions and no duplicates.
+    lookup_members(body, &requested, zone)?;
+    let raw = raw_lookup_records(body)?;
+    anyhow::ensure!(
+        raw.len() == names.len(),
+        "Incomplete current lookup members"
+    );
+    let mut out = Vec::with_capacity(pairs.len());
+    let mut total_proof_bytes = 0usize;
+    for (child_name, master_name) in pairs {
+        let child = raw
+            .get(child_name)
+            .copied()
+            .context("Missing current lookup child")?;
+        let master = raw
+            .get(master_name)
+            .copied()
+            .context("Missing current lookup master")?;
+        // Each returned body is independently valid for the existing current
+        // asset contract and keeps the provider's exact record bytes. Shared
+        // masters expand per child, so the whole derived batch stays within one
+        // provider page budget before any evidence is returned.
+        let confirmation = pair_confirmation_body(child, master)?;
+        add_pair_proof_bytes(&mut total_proof_bytes, confirmation.len())?;
+        let asset = current_asset(&confirmation, child_name, master_name, zone)?;
+        out.push(CurrentCatalogAsset {
+            asset,
+            body: confirmation,
+        });
+    }
+    Ok(out)
 }
 
 pub(crate) fn same_selected_facts(left: &PhotoAsset, right: &PhotoAsset) -> bool {
@@ -316,6 +416,68 @@ impl PhotoAlbum {
         })
         .await??;
         self.confirm_pair(child, &master).await
+    }
+
+    /// Confirm one bounded group of unfiled observations in their known own
+    /// source. Every member must share this album's bound zone; shared masters
+    /// are requested once. A malformed, incomplete, ambiguous, or out-of-scope
+    /// reply refuses the whole group so callers can fall back to individual
+    /// current lookups without consuming partial evidence.
+    pub(crate) async fn confirm_unfiled_batch(
+        &self,
+        observed: &[&PhotoAsset],
+    ) -> Result<Vec<CurrentCatalogAsset>> {
+        if observed.is_empty() {
+            return Ok(Vec::new());
+        }
+        anyhow::ensure!(
+            observed.len() <= Self::CONFIRMATION_BATCH_SIZE,
+            "Current confirmation batch exceeds the provider lookup bound"
+        );
+        let zone_name = self.zone_name();
+        anyhow::ensure!(
+            !zone_name.trim().is_empty(),
+            "Current confirmation has no bound provider source"
+        );
+        // The batch trusts only this album's authenticated source. Validate the
+        // account/database/scope binding once before any provider request.
+        self.bound_media_source(self)?;
+        let mut names = Vec::with_capacity(observed.len().saturating_mul(2));
+        let mut seen = FxHashSet::default();
+        let mut pairs = Vec::with_capacity(observed.len());
+        for asset in observed {
+            let child = asset.asset_record_name();
+            let master = asset.id();
+            anyhow::ensure!(
+                !child.trim().is_empty() && !master.trim().is_empty() && child != master,
+                "Invalid current lookup pair"
+            );
+            anyhow::ensure!(
+                asset.source_zone().is_none_or(|source| source == zone_name),
+                "Current confirmation observation is bound to another source"
+            );
+            for name in [child, master] {
+                if seen.insert(name) {
+                    names.push(name.to_owned());
+                }
+            }
+            pairs.push((child.to_owned(), master.to_owned()));
+        }
+        if let [(child, master)] = pairs.as_slice() {
+            return self
+                .confirm_pair(child, master)
+                .await
+                .map(|asset| vec![asset]);
+        }
+        let requested: Vec<&str> = names.iter().map(String::as_str).collect();
+        let body = self.current_lookup_body(&requested).await?;
+        anyhow::ensure!(
+            body.len() <= crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES,
+            "Current confirmation batch exceeded the provider evidence byte limit"
+        );
+        let zone = self.zone_id.as_ref().clone();
+        tokio::task::spawn_blocking(move || confirm_batch_response(&body, &zone, &pairs, &names))
+            .await?
     }
 
     async fn confirm_pair(&self, child: &str, master: &str) -> Result<CurrentCatalogAsset> {

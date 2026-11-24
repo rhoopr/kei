@@ -368,6 +368,17 @@ impl TaskPlanner {
         config: &DownloadConfig,
         version_size: VersionSizeKey,
     ) -> Option<std::path::PathBuf> {
+        self.verified_catalog_path(asset, config, version_size)
+            .await
+            .map(|(path, _)| path)
+    }
+
+    pub(super) async fn verified_catalog_path(
+        &self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        version_size: VersionSizeKey,
+    ) -> Option<(std::path::PathBuf, Arc<super::file::RetainedPendingFile>)> {
         let owner = ReconciliationOwner {
             library: Arc::from(asset.source_zone().unwrap_or(&config.library)),
             asset_id: asset.state_id().into(),
@@ -441,11 +452,11 @@ impl TaskPlanner {
             self.reconciliation
                 .receipt_file_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let Ok(fingerprint) =
-                super::file::fingerprint_downloaded_path(&config.directory, path).await
+            let Ok(Some(file)) = super::file::retain_pending_file(&config.directory, path).await
             else {
                 continue;
             };
+            let fingerprint = file.fingerprint;
             if data_encoding::HEXLOWER.encode(&fingerprint.sha256) != *checksum {
                 continue;
             }
@@ -454,7 +465,7 @@ impl TaskPlanner {
                 .as_ref()
                 .is_some_and(|downloaded| downloaded != checksum);
             if fingerprint.size == derived.size || metadata_changed_size {
-                return Some(path.clone());
+                return Some((path.clone(), file));
             }
         }
         None

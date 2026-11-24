@@ -19,7 +19,7 @@ jobs:
   service:
     uses: ./.github/workflows/service-smoke.yml
 
-  specialized:
+  fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -37,10 +37,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           toolchain: "nightly-2026-05-15"
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: qualification-fuzz
+      - name: Install bounded fuzz runner
+        run: cargo +1.94.1 install --locked cargo-fuzz --version 0.13.1
+      - name: Fuzz every registered target with checked-in seeds
+        run: bash scripts/ci/seeded-fuzz.sh
+
+  optimized:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.94.1"
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libimage-exiftool-perl
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: qualification-specialized
+          key: qualification-optimized
       - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
         with:
           version: 2026.8.10
@@ -48,10 +70,6 @@ jobs:
           mise_toml: |
             [tools]
             just = "1.50.0"
-      - name: Install bounded fuzz runner
-        run: cargo +1.94.1 install --locked cargo-fuzz --version 0.13.1
-      - name: Fuzz every registered target with checked-in seeds
-        run: bash scripts/ci/seeded-fuzz.sh
       - name: Source-package and optimized regressions
         run: |
           set -euo pipefail
@@ -64,7 +82,7 @@ jobs:
   qualified:
     name: Heavy qualification result
     if: always()
-    needs: [quality, artifacts, service, specialized]
+    needs: [quality, artifacts, service, fuzz, optimized]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -73,7 +91,7 @@ jobs:
       - name: Require every qualification result
         env:
           NEEDS: ${{ toJSON(needs) }}
-        run: python3 scripts/ci/gate.py quality artifacts service specialized
+        run: python3 scripts/ci/gate.py quality artifacts service fuzz optimized
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: candidate-*
