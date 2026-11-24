@@ -26,7 +26,7 @@ use crate::icloud::photos::{
 use crate::state::ReconciliationStateStore;
 use crate::state::db::provider_generations::{
     ActiveDecision, ActiveGeneration, AdmissionChecks, GenerationSpec, INDEPENDENT_ALBUM_COPIES,
-    MAX_GENERATION_BYTES, SelectionAttempt,
+    MAX_GENERATION_BYTES, SelectionAttempt, SelectionCheckpointHold,
 };
 use crate::state::db::provider_selection::{
     SelectionDecision, SelectionDestination, SelectionOutcome, SelectionPath,
@@ -149,7 +149,13 @@ pub(super) async fn hold_retained_debt(
     let Some(context) = &config.selection_context else {
         return Ok(());
     };
-    if context.checkpoint_debt(config).await? {
+    if let Some(hold) = context.checkpoint_hold(config).await? {
+        tracing::warn!(
+            diagnostic = "selection_checkpoint_hold_v1",
+            blocker = hold.blocker,
+            retained_generation = hold.retained_generation,
+            "Unfinished selection work holds the provider checkpoint"
+        );
         result.block_incremental_token(DEFERRED_REASON);
         result.checkpoint.scanned_generation = None;
         result.stats.selected_work_remaining = true;
@@ -348,22 +354,23 @@ pub(crate) struct SelectionRun {
 
 impl SelectionContext {
     async fn checkpoint_debt(&self, config: &DownloadConfig) -> Result<bool> {
-        let (owner, scope, hash) = (
-            self.capture.owner.clone(),
-            self.scope.clone(),
-            self.config_hash.clone(),
-        );
-        Ok(if config.post_sync_metadata {
-            self.capture
-                .db
-                .provider_selection_debt(owner, scope, hash)
-                .await?
-        } else {
-            self.capture
-                .db
-                .unfinished_selection_debt(owner, scope, hash)
-                .await?
-        })
+        Ok(self.checkpoint_hold(config).await?.is_some())
+    }
+
+    async fn checkpoint_hold(
+        &self,
+        config: &DownloadConfig,
+    ) -> Result<Option<SelectionCheckpointHold>> {
+        Ok(self
+            .capture
+            .db
+            .selection_checkpoint_hold(
+                self.capture.owner.clone(),
+                self.scope.clone(),
+                self.config_hash.clone(),
+                config.post_sync_metadata,
+            )
+            .await?)
     }
     async fn include_durable_membership_deletions(
         &self,
