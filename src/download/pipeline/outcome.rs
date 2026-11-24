@@ -47,10 +47,8 @@ pub(in crate::download) struct StreamingResult {
     /// Count of 429/503 observations during Phase 1 downloads (per retry
     /// attempt, not per unique task). Feeds SyncStats.rate_limited.
     pub(in crate::download) rate_limit_observations: usize,
-    /// True when any worker observed HTTP 410 for a signed CDN URL. Once this
-    /// happens, the rest of the current URL batch is presumed stale too, so
-    /// the pass aborts instead of hammering thousands of expired URLs.
-    pub(in crate::download) url_expired_abort: bool,
+    /// First-pass diagnostic: a worker observed an expired signed CDN URL.
+    pub(in crate::download) url_expired: bool,
     /// `true` when the producer reached the natural end of the API
     /// stream (so the `enum_in_progress:<zone>` marker can be cleared even
     /// when downstream downloads partially failed). `false` when the
@@ -141,8 +139,7 @@ pub(super) async fn finalize_streaming_download(
                     .provider_auth_errors
                     .load(std::sync::atomic::Ordering::Relaxed)
                     > 0
-                || producer_panicked
-                || consumer.url_expired_abort,
+                || producer_panicked,
             ..Default::default()
         };
         match db.complete_sync_run(run_id, &stats).await {
@@ -268,7 +265,7 @@ pub(super) async fn finalize_streaming_download(
         photos_downloaded: consumer.photos_downloaded,
         videos_downloaded: consumer.videos_downloaded,
         recap: consumer.recap,
-        url_expired_abort: consumer.url_expired_abort,
+        url_expired: consumer.url_expired,
         #[cfg(test)]
         printed_filenames: Vec::new(),
     })
@@ -278,10 +275,7 @@ fn producer_enumeration_incomplete(
     result: &StreamingResult,
     shutdown_token: &CancellationToken,
 ) -> bool {
-    !result.enumeration_complete
-        && result.assets_seen > 0
-        && !shutdown_token.is_cancelled()
-        && !result.url_expired_abort
+    !result.enumeration_complete && result.assets_seen > 0 && !shutdown_token.is_cancelled()
 }
 
 fn mark_producer_enumeration_incomplete(
@@ -369,7 +363,7 @@ pub(in crate::download) async fn build_download_result(
         serde_json::json!({
             "phase": "first", "failed": streaming_result.failed.len(), "downloaded": downloaded,
             "auth_errors": auth_errors + provider_auth_errors, "state_write_failures": state_write_failures,
-            "exif_failures": exif_failures, "url_expired": streaming_result.url_expired_abort,
+            "exif_failures": exif_failures, "url_expired": streaming_result.url_expired,
             "interrupted": shutdown_token.is_cancelled(), "elapsed_secs": started.elapsed().as_secs_f64(),
             "concurrency": config.concurrent_downloads,
         }),
@@ -420,8 +414,6 @@ pub(in crate::download) async fn build_download_result(
             tracing::info!(target: "kei::download::pipeline", "── Dry Run Summary ──");
             tracing::info!(target: "kei::download::pipeline", "  0 files would be downloaded");
             tracing::info!(target: "kei::download::pipeline", destination = %config.directory.display(), "  destination");
-        } else if streaming_result.url_expired_abort {
-            tracing::warn!(target: "kei::download::pipeline", "Download batch aborted because signed iCloud URLs expired");
         } else {
             tracing::info!(target: "kei::download::pipeline", "No new photos to download");
         }
@@ -432,7 +424,6 @@ pub(in crate::download) async fn build_download_result(
             + exif_failures
             + retry_exhausted
             + enumeration_errors
-            + usize::from(streaming_result.url_expired_abort)
             + usize::from(enumeration_incomplete);
         if failed_count > 0 {
             return Ok(finish_download_result(
@@ -481,9 +472,7 @@ pub(in crate::download) async fn build_download_result(
         ));
     }
 
-    if streaming_result.storage_failed
-        || (streaming_result.url_expired_abort && failed_tasks.is_empty())
-    {
+    if streaming_result.storage_failed {
         let retry_exhausted = skip_breakdown.retry_exhausted;
         let mut stats = crate::download::SyncStats {
             assets_seen: streaming_result.assets_seen,
@@ -681,8 +670,7 @@ pub(in crate::download) async fn build_download_result(
         + exif_failures
         + enumeration_errors
         + retry_exhausted
-        + usize::from(enumeration_incomplete)
-        + usize::from(streaming_result.url_expired_abort && failed == 0);
+        + usize::from(enumeration_incomplete);
     if total_failures > 0 {
         for task in &remaining_failed {
             tracing::error!(target: "kei::download::pipeline", asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");

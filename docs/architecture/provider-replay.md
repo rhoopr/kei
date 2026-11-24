@@ -227,7 +227,7 @@ Before selected planning, reserved cross-folder recovery uses the existing retai
 
 A provider revert can reactivate an earlier native publication at its original path. If the canonical row is pending for that version, reuse restores it only when an independent path source receipt matches the provider checksum, size and local fingerprint. The canonical transition and native destination acknowledgement share a transaction. Import-only receipts cannot create download provenance through this path.
 
-For destination-owned selection, HTTP 410 cancels the transfer batch through a child cancellation token. Enumeration continues to project current membership and run deferred unfiled passes. Cancelled transfers enter the existing exact URL-refresh cleanup with their destination bindings intact. Checkpoint release still requires complete query coverage and completed destinations. User shutdown, authentication failure and state-write circuit failure cancel both enumeration and transfers.
+For destination-owned selection, a transfer that receives HTTP 410 enters exact URL-refresh cleanup with its destination binding intact. Other transfers, enumeration and deferred unfiled passes continue. Checkpoint release still requires complete query coverage and completed destinations. User shutdown, authentication failure, storage failure and state-write circuit failure keep their existing stop rules.
 
 Authenticated current-selection previews do not append the aggregate pending-retry preview. They count or print current selected paths once and preserve historical failures without treating those failures as current preview debt. Preview sessions without authenticated selection scope retain the compatibility path.
 

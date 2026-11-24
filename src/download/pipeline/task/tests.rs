@@ -432,7 +432,7 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
 }
 
 #[tokio::test]
-async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() {
+async fn full_expired_url_cleanup_retries_only_failed_task_and_respects_shutdown() {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -463,10 +463,11 @@ async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() 
         let assets: Vec<_> = ["FIRST", "QUEUED"]
             .into_iter()
             .map(|id| {
+                let resource = if id == "FIRST" { "expired" } else { "fresh" };
                 TestPhotoAsset::new(id)
                     .filename(&format!("{id}.jpg"))
                     .orig_size(body.len() as u64)
-                    .orig_url(&format!("{}/expired.jpg", server.uri()))
+                    .orig_url(&format!("{}/{resource}.jpg", server.uri()))
                     .orig_checksum(&checksum)
                     .build()
             })
@@ -508,9 +509,13 @@ async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() 
             },
         )
         .await;
-        assert_eq!(result.url_expired_abort, !user_shutdown);
-        assert_eq!(result.failed.len(), if user_shutdown { 0 } else { 2 });
-        assert_eq!(db.get_summary().await.unwrap().pending, 2);
+        assert_eq!(result.url_expired, !user_shutdown);
+        assert_eq!(result.downloaded, usize::from(!user_shutdown));
+        assert_eq!(result.failed.len(), usize::from(!user_shutdown));
+        assert_eq!(
+            db.get_summary().await.unwrap().pending,
+            1 + u64::from(user_shutdown)
+        );
         if user_shutdown {
             server.verify().await;
             continue;
@@ -519,6 +524,7 @@ async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() 
             !shutdown.is_cancelled(),
             "URL expiry must not cancel the user token"
         );
+        assert_eq!(result.failed[0].asset_id.as_ref(), "FIRST");
         let fresh = result
             .failed
             .into_iter()
@@ -547,7 +553,7 @@ async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() 
             fresh,
         )
         .await;
-        assert_eq!(recovered.downloaded, 2);
+        assert_eq!(recovered.downloaded, 1);
         assert!(recovered.failed.is_empty());
         let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
         assert_eq!(reopened.get_summary().await.unwrap().downloaded, 2);

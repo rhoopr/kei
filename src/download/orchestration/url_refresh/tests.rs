@@ -1181,7 +1181,7 @@ async fn full_failed_task_cleanup_is_targeted_bounded_and_durable() {
         )
         .await
         .unwrap();
-        assert_eq!(streaming.url_expired_abort, recovery != "transfer_failure");
+        assert_eq!(streaming.url_expired, recovery != "transfer_failure");
         if recovery == "transfer_failure" {
             Arc::make_mut(&mut config).folder_structure = "changed-template".into();
         }
@@ -1201,14 +1201,14 @@ async fn full_failed_task_cleanup_is_targeted_bounded_and_durable() {
         .await
         .unwrap();
         assert!(
-            if recovery == "transfer_failure" {
+            if downloads {
                 matches!(outcome, DownloadOutcome::Success)
             } else if recovery.starts_with("auth_") {
                 matches!(outcome, DownloadOutcome::SessionExpired { .. })
             } else {
                 matches!(outcome, DownloadOutcome::PartialFailure { .. })
             },
-            "URL batch cancellation remains a partial run even after cleanup"
+            "cleanup outcome for {recovery}: {outcome:?}"
         );
         assert_eq!(stats.downloaded, usize::from(downloads));
         assert_eq!(stats.failed, usize::from(!downloads));

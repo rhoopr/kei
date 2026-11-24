@@ -77,33 +77,38 @@ async fn zero_downloads_with_state_write_failures_returns_partial_failure() {
 }
 
 #[tokio::test]
-async fn expired_url_abort_returns_durable_partial_failure() {
+async fn expired_url_does_not_hide_incomplete_enumeration() {
     use crate::download::DownloadOutcome;
 
     let streaming_result = StreamingResult {
+        assets_seen: 2,
         downloaded: 1,
-        url_expired_abort: true,
+        failed: expired_tasks(),
+        url_expired: true,
         ..StreamingResult::default()
     };
     let (outcome, stats) =
         build_zero_download_outcome(streaming_result, DownloadControls::download_hidden()).await;
     assert!(
-        matches!(outcome, DownloadOutcome::PartialFailure { failed_count: 1 }),
-        "expired CDN URL must stop the batch as a PartialFailure, got {outcome:?}"
+        matches!(outcome, DownloadOutcome::PartialFailure { failed_count: 2 }),
+        "both transfer failure and incomplete enumeration count, got {outcome:?}"
     );
     assert_eq!(stats.downloaded, 1);
-    assert!(
-        !stats.interrupted,
-        "a durable transfer abort is not a process interruption"
-    );
+    assert_eq!(stats.failed, 1);
+    assert!(stats.enumeration_incomplete);
+    assert!(stats.sync_token_blocked);
+    assert!(!stats.interrupted);
 }
 
 #[tokio::test]
-async fn expired_url_abort_with_zero_downloads_is_not_success() {
+async fn expired_url_without_completed_transfers_is_not_success() {
     use crate::download::DownloadOutcome;
 
     let streaming_result = StreamingResult {
-        url_expired_abort: true,
+        assets_seen: 1,
+        failed: expired_tasks(),
+        enumeration_complete: true,
+        url_expired: true,
         ..StreamingResult::default()
     };
     let (outcome, stats) =
@@ -114,7 +119,16 @@ async fn expired_url_abort_with_zero_downloads_is_not_success() {
         "expired CDN URL before any success must not be reported as a clean no-op, got {outcome:?}"
     );
     assert_eq!(stats.downloaded, 0);
+    assert_eq!(stats.failed, 1);
+    assert!(!stats.enumeration_incomplete);
     assert!(!stats.interrupted);
+}
+
+fn expired_tasks() -> Vec<crate::download::filter::DownloadTask> {
+    crate::download::filter::selected_resource_tasks(
+        &crate::test_helpers::TestPhotoAsset::new("expired").build(),
+        &crate::download::DownloadConfig::test_default(),
+    )
 }
 
 #[tokio::test]

@@ -358,7 +358,7 @@ where
         tokio::pin!(combined);
         'assets: loop {
             // User/pipeline cancellation must interrupt a pending provider tail.
-            // HTTP 410 cancels the consumer's transfer-only child, not this token.
+            // A single expired download URL does not cancel the pipeline.
             let result = tokio::select! {
                 biased;
                 () = producer_shutdown.cancelled() => break,
