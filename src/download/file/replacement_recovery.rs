@@ -271,10 +271,27 @@ fn remove_empty_directory(
         retry_stale(|_| Ok(directory.sync_parent()?))?;
         return Ok(());
     }
-    let removal = retry_stale(|retried| match unlink(directory, libc::AT_REMOVEDIR) {
-        // A stale reply can follow a removal the server completed.
-        Err(error) if retried && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        outcome => Ok(outcome?),
+    // The directory name may be recreated after a removal the server reported as
+    // stale, so every attempt re-reads the entry and acts only on the identity
+    // this journal owns.
+    let owned = match directory.entry_identity() {
+        Ok(identity) => identity,
+        // Already removed by an earlier attempt.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let removal = retry_stale(|_| {
+        match directory.entry_identity() {
+            // A stale reply can follow a removal the server completed.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Ok(current) if current == owned => {}
+            Ok(_) => {
+                anyhow::bail!("Replacement directory holds the journal name; retaining all bytes")
+            }
+            Err(error) => return Err(error.into()),
+        }
+        unlink(directory, libc::AT_REMOVEDIR)?;
+        Ok(())
     });
     if let Err(error) = removal {
         if classify_journal_io_error(&error) != Some(libc::ENOTEMPTY) {
