@@ -39,10 +39,13 @@ fn link_fallback_forced(path: &Path) -> bool {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+type MoveDestinationHook = Option<fn(&Path, &Path)>;
+
+#[cfg(all(test, target_os = "linux"))]
 thread_local! {
     /// Runs after the fallback proved the destination link and before it
     /// consumes the source name, so a test can substitute either name.
-    static MOVE_DESTINATION_LINKED_HOOK: std::cell::Cell<Option<fn(&Path, &Path)>> =
+    static MOVE_DESTINATION_LINKED_HOOK: std::cell::Cell<MoveDestinationHook> =
         const { std::cell::Cell::new(None) };
 }
 
