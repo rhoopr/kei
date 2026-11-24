@@ -2338,7 +2338,7 @@ fn lookup_has_verified_successor(
         }
         // URL renewal is harmless, but aliasing can change which copies the
         // planner selects even when the provider checksums are unchanged.
-        let agrees = crate::icloud::photos::PhotoAsset::same_download_observation;
+        let agrees = crate::icloud::photos::PhotoAsset::same_unplanned_download;
         let Some(original) = observed_asset_matching(conn, old_root, &old, agrees)? else {
             return Ok(false);
         };
@@ -2831,7 +2831,16 @@ impl SqliteStateDb {
                     if old.decision.media_source != manifest.decision.media_source {
                         return Err(StateError::ProviderWorkConflict("media_source_changed"));
                     }
-                    let observed=observed_asset(&tx,&root,&old)?;
+                    // Across a changed basis the retained pair is all that
+                    // identifies the old rendition set. Never resolve it with
+                    // a lookup that would silently drop an aliased edit. No
+                    // path was admitted, so the filename stem can change.
+                    let agrees = if changed_basis {
+                        crate::icloud::photos::PhotoAsset::same_unplanned_download
+                    } else {
+                        crate::icloud::photos::same_selected_facts
+                    };
+                    let observed=observed_asset_matching(&tx,&root,&old,agrees)?;
                     let current=crate::icloud::photos::current_asset(manifest.decision.confirmation.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,&d.child,d.master.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,manifest.media_zone(&root)).map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
                     let mut membership_only = observed.is_none() && !changed_basis && old.decision.media_source.is_some();
                     if membership_only {
@@ -2847,7 +2856,7 @@ impl SqliteStateDb {
                             None => false,
                         };
                     }
-                    if !membership_only && observed.as_ref().is_none_or(|observed|!crate::icloud::photos::same_selected_facts(observed,&current)) {
+                    if !membership_only && observed.as_ref().is_none_or(|observed|!agrees(observed,&current)) {
                         let recovered = !changed_basis && d.outcome == SelectionOutcome::Selected
                             && fresh_confirmation.as_deref() == d.confirmation.as_deref()
                             && inventory_observation.as_ref().is_some_and(|rank|crate::icloud::photos::same_selected_facts(rank,&current))
@@ -4920,6 +4929,67 @@ pub(crate) struct SelectionCheckpointHold {
     pub(crate) retained_generation: bool,
 }
 
+pub(crate) enum SelectionDebt {
+    IndependentLookup,
+    Blocking(SelectionCheckpointHold),
+}
+
+fn independently_retryable_lookup(
+    conn: &Connection,
+    old: &ActiveGeneration,
+    latest: &ActiveGeneration,
+    key: &str,
+    child: &str,
+) -> Result<bool, StateError> {
+    // recover_retained can add a confirmation only to an unsealed declaration.
+    // A different scan must already have proved its own complete query coverage.
+    // The current metadata writer also needs a destination in its own queue.
+    if old.sealed
+        || !latest.sealed
+        || !latest.checkpoint_ready
+        || latest.checkpoint_veto.is_some()
+        || old.spec.profile != latest.spec.profile
+        || old.spec.zone != latest.spec.zone
+        || old.spec.metadata_enabled
+        || latest.spec.metadata_enabled
+    {
+        return Ok(false);
+    }
+    // A conflicting later observation (including a changed rendition set)
+    // cannot be excused as an independent retry of the old version.
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM provider_active_generations g
+         CROSS JOIN json_each(CAST(g.specification AS TEXT),'$.profile.passes') p
+         CROSS JOIN provider_active_decisions d
+         WHERE g.scope=?1 AND g.config_hash=?2 AND g.id<>?3
+         AND g.created_at>=(SELECT created_at FROM provider_active_generations WHERE id=?3)
+         AND (d.generation,d.pass_key,d.child)=(g.id,json_extract(p.value,'$.key'),?4))",
+        params![old.spec.scope, old.spec.config_hash, old.id, child],
+        |r| r.get(0),
+    )? {
+        return Ok(false);
+    }
+    let manifest = load_decision(conn, old, key, child)?;
+    if manifest.decision.reason != "current_lookup_unresolved"
+        || manifest.decision.confirmation.is_some()
+        || !manifest.decision.destinations.is_empty()
+        || !manifest
+            .decision
+            .media_source
+            .as_ref()
+            .is_some_and(|s| s.scope == old.spec.scope && s.zone == old.spec.zone)
+    {
+        return Ok(false);
+    }
+    let asset = observed_asset_matching(
+        conn,
+        old,
+        &manifest,
+        crate::icloud::photos::PhotoAsset::same_download_observation,
+    )?;
+    Ok(asset.is_some_and(|a| !a.versions().is_empty() && a.malformed_resources().is_empty()))
+}
+
 impl SelectionCheckpointHold {
     fn destination(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<Self> {
         let blocker = if row.get::<_, bool>(column)? {
@@ -4939,7 +5009,8 @@ impl SelectionCheckpointHold {
 }
 
 impl SqliteStateDb {
-    /// Unfinished current-configuration obligations and identities veto the cursor.
+    /// Include unfinished current-configuration obligations, even when a lookup
+    /// can be retried without the old cursor.
     /// Other configurations retain physical publication guards, but uncertainty
     /// alone cannot hold a successor they cannot recover through current selection.
     /// Exact completed current-selection proof can supersede an unstarted old
@@ -4951,7 +5022,7 @@ impl SqliteStateDb {
         config_hash: String,
     ) -> Result<bool, StateError> {
         Ok(self
-            .selection_checkpoint_hold(owner, scope, config_hash, false)
+            .selection_debt(owner, scope, config_hash, false)
             .await?
             .is_some())
     }
@@ -4965,10 +5036,10 @@ impl SqliteStateDb {
         scope: String,
         config_hash: String,
     ) -> Result<bool, StateError> {
-        Ok(self
-            .selection_checkpoint_hold(owner, scope, config_hash, true)
-            .await?
-            .is_some())
+        Ok(matches!(
+            self.selection_debt(owner, scope, config_hash, true).await?,
+            Some(SelectionDebt::Blocking(_))
+        ))
     }
 
     /// Local recovery is bound to the last inventory for this exact plan.
@@ -4992,14 +5063,14 @@ impl SqliteStateDb {
         .await
     }
 
-    /// Identify one actual blocker, without reporting identities or paths.
-    pub(crate) async fn selection_checkpoint_hold(
+    /// Return the first checkpoint blocker in preference to independent work.
+    pub(crate) async fn selection_debt(
         &self,
         owner: account::AccountOwner,
         scope: String,
         config_hash: String,
         local_writer_available: bool,
-    ) -> Result<Option<SelectionCheckpointHold>, StateError> {
+    ) -> Result<Option<SelectionDebt>, StateError> {
         self.with_conn("inspecting retained selection debt",move|conn|{
             let tx=conn.unchecked_transaction()?;
             account::validate_authenticated(&tx,&owner)?;
@@ -5013,6 +5084,8 @@ impl SqliteStateDb {
             // destinations. Keep historical confirmations for future matching
             // selections without charging them to the current checkpoint.
             let retained = format!("g.id IS NOT ({LATEST_LOCAL_GENERATION})");
+            let mut independent = None;
+            let mut latest = None;
             {
                 let mut stmt=conn.prepare(&format!("SELECT d.reason='current_lookup_unresolved', {retained},g.id,d.pass_key,d.child FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE {CURRENT_SELECTION_CONFIGURATION} AND d.admission='deferred'"))?;
                 let mut rows=stmt.query(params![scope,config_hash])?;
@@ -5021,19 +5094,42 @@ impl SqliteStateDb {
                     let retained_generation=row.get(1)?;
                     if lookup && retained_generation {
                         let root=load_generation(conn,&row.get::<_,String>(2)?)?;
-                        if lookup_has_verified_successor(conn,&root,&row.get::<_,String>(3)?,&row.get::<_,String>(4)?)? {continue}
+                        let key:String=row.get(3)?;
+                        let child:String=row.get(4)?;
+                        if lookup_has_verified_successor(conn,&root,&key,&child)? {continue}
+                        let latest = match &latest {
+                            Some(root) => root,
+                            None => {
+                                let id:String=conn.query_row(LATEST_LOCAL_GENERATION,params![scope,config_hash],|r|r.get(0))?;
+                                let root=load_generation(conn,&id)?;
+                                if root.spec.basis!=basis(conn,&scope)? {
+                                    return Ok(Some(SelectionDebt::Blocking(SelectionCheckpointHold {
+                                        blocker:"deferred_identity", retained_generation,
+                                    })));
+                                }
+                                latest.insert(root)
+                            }
+                        };
+                        match independently_retryable_lookup(conn,&root,latest,&key,&child) {
+                            Ok(true) => {
+                                independent=Some(SelectionDebt::IndependentLookup);
+                                continue
+                            }
+                            Ok(false) | Err(StateError::ProviderSelectionFull) => {}
+                            Err(error) => return Err(error),
+                        }
                     }
-                    return Ok(Some(SelectionCheckpointHold {
+                    return Ok(Some(SelectionDebt::Blocking(SelectionCheckpointHold {
                         blocker: if lookup {"deferred_identity"} else {"deferred_admission"},
                         retained_generation,
-                    }))
+                    })))
                 }
             }
             let debt=format!("FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND (g.config_hash=?2 OR (w.prepared_hash IS NOT NULL AND EXISTS(SELECT 1 FROM provider_active_destinations selected JOIN provider_active_generations current ON current.id=selected.generation WHERE current.scope=?1 AND current.config_hash=?2 AND selected.admitted=1 AND selected.path=w.path))) AND {UNFINISHED}
                 AND NOT (w.confirmed_repair IS NOT NULL AND w.prepared_hash IS NULL AND EXISTS(SELECT 1 FROM provider_active_generations newer WHERE newer.scope=g.scope AND newer.config_hash=g.config_hash AND newer.created_at>g.created_at AND newer.sealed=1 AND newer.checkpoint_ready=1))");
             let destination_fields = format!("w.prepared_hash IS NOT NULL, w.confirmed_repair IS NOT NULL, (w.verified_media=0 AND w.preserved_local IS NULL), {retained}");
             let unfinished = conn.query_row(&format!("SELECT {destination_fields} {debt} LIMIT 1"),params![scope,config_hash],|r|SelectionCheckpointHold::destination(r,0)).optional()?;
-            if unfinished.is_none() || !local_writer_available {return Ok(unfinished)}
+            if unfinished.is_none() || !local_writer_available {return Ok(unfinished.map(SelectionDebt::Blocking).or(independent))}
             // Refresh the local preservation cache before opening the destination
             // cursor: rebuilding its TEMP schema would invalidate a live cursor.
             let protected=super::legacy_preservation::protected_paths(conn)?.into_iter()
@@ -5060,24 +5156,25 @@ impl SqliteStateDb {
                 THEN w.grouping_hash END,w.path,{destination_fields} {debt}"))?;
             let mut rows=stmt.query(params![scope,config_hash])?;
             while let Some(r)=rows.next()? {
-                let Some(group)=r.get::<_,Option<String>>(2)? else {return Ok(Some(SelectionCheckpointHold::destination(r,4)?))};
+                let blocked=|| Ok(Some(SelectionDebt::Blocking(SelectionCheckpointHold::destination(r,4)?)));
+                let Some(group)=r.get::<_,Option<String>>(2)? else {return blocked()};
                 let path:super::provider_selection::SelectionPath=serde_json::from_str(&r.get::<_,String>(3)?)
                     .map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
                 let path=path.to_path();
-                if super::primary_layout::path_is_managed(conn,&path)? {return Ok(Some(SelectionCheckpointHold::destination(r,4)?))}
+                if super::primary_layout::path_is_managed(conn,&path)? {return blocked()}
                 if !protected.is_empty() {
                     let mut sidecar=path.as_os_str().to_owned();
                     sidecar.push(".xmp");
                     for p in [path.as_path(),Path::new(&sidecar)] {
-                        if protected.contains(&crate::fs_util::confined_path_key(p).map_err(|_invalid_path|StateError::ProviderSelectionInvalid)?) {return Ok(Some(SelectionCheckpointHold::destination(r,4)?))}
+                        if protected.contains(&crate::fs_util::confined_path_key(p).map_err(|_invalid_path|StateError::ProviderSelectionInvalid)?) {return blocked()}
                     }
                 }
-                if grouping_hash(conn,&r.get::<_,String>(0)?,&r.get::<_,String>(1)?)?!=group {return Ok(Some(SelectionCheckpointHold::destination(r,4)?))}
+                if grouping_hash(conn,&r.get::<_,String>(0)?,&r.get::<_,String>(1)?)?!=group {return blocked()}
             }
             drop(rows);
             drop(stmt);
             tx.commit()?;
-            Ok(None)
+            Ok(independent)
         }).await
     }
 }

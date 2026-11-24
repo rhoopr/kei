@@ -429,10 +429,11 @@ where
                                 return skips;
                             }
                             Err(error) => {
-                                enum_errors_producer
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                match classify_selection_confirmation_error(&error) {
+                                let class = classify_selection_confirmation_error(&error);
+                                match class {
                                     SelectionConfirmationErrorClass::SessionExpired => {
+                                        enum_errors_producer
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         provider_auth_errors
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         run.session_expired
@@ -443,7 +444,8 @@ where
                                             "Current selection confirmation requires session recovery");
                                         return skips;
                                     }
-                                    SelectionConfirmationErrorClass::Refused => {
+                                    SelectionConfirmationErrorClass::Refused
+                                    | SelectionConfirmationErrorClass::RetainedLookup => {
                                         if let Err(state_error) = run
                                             .defer_confirmation(key, observed_child, Some(&asset))
                                             .await
@@ -452,10 +454,20 @@ where
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             tracing::warn!(target: "kei::download::pipeline", %state_error,
                                                 "Could not persist deferred current identity");
+                                        } else if class
+                                            == SelectionConfirmationErrorClass::RetainedLookup
+                                        {
+                                            // The query already finished. This targeted retry
+                                            // owns neither its enumeration nor its successor.
+                                            // Durable selection debt still decides the hold.
+                                            producer_pb.inc(1);
+                                            continue;
                                         }
                                     }
                                     SelectionConfirmationErrorClass::RetryDeferred => {}
                                 }
+                                enum_errors_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 run.held.store(true, std::sync::atomic::Ordering::Relaxed);
                                 tracing::warn!(target: "kei::download::pipeline", %error,
                                     "Current selection confirmation refused producer mutation");
