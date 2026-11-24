@@ -2833,9 +2833,10 @@ impl SqliteStateDb {
                     }
                     // Across a changed basis the retained pair is all that
                     // identifies the old rendition set. Never resolve it with
-                    // a lookup that would silently drop an aliased edit.
+                    // a lookup that would silently drop an aliased edit. No
+                    // path was admitted, so the filename stem can change.
                     let agrees = if changed_basis {
-                        crate::icloud::photos::PhotoAsset::same_download_observation
+                        crate::icloud::photos::PhotoAsset::same_unplanned_download
                     } else {
                         crate::icloud::photos::same_selected_facts
                     };

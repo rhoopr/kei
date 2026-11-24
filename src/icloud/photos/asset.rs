@@ -594,9 +594,9 @@ impl PhotoAsset {
         self.same_download_evidence(other) && self.filename == other.filename
     }
 
-    /// Compare an old unadmitted lookup with its verified successor.
+    /// Compare an unadmitted lookup with a verified successor or a fresh retry.
     ///
-    /// The successor may restyle the filename stem, but the terminal extension
+    /// The later observation may restyle the filename stem, but the extension
     /// remains significant: unknown UTIs keep the provider extension, and
     /// live-photo MOV companions derive their name from it. Missing,
     /// extension-less and extension-only names are not presentation-safe.

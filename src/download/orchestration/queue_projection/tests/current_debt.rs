@@ -78,7 +78,18 @@ impl PhotosSession for SplitFirstScan {
 
 #[tokio::test]
 async fn repaired_first_baseline_retains_independent_retry_across_a_zone_checkpoint() {
-    check_repaired_baseline_after_deferral(Successor::DifferentPhoto).await;
+    check_repaired_baseline_after_deferral(Successor::DifferentPhoto {
+        recovered_stem: "retained",
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn omitted_lookup_publishes_both_copies_after_filename_stem_change() {
+    check_repaired_baseline_after_deferral(Successor::DifferentPhoto {
+        recovered_stem: "restyled",
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -105,7 +116,9 @@ async fn repaired_first_baseline_keeps_hold_without_a_writer_for_the_omitted_pho
 enum Successor {
     Exact,
     Renamed,
-    DifferentPhoto,
+    DifferentPhoto {
+        recovered_stem: &'static str,
+    },
     #[cfg(feature = "xmp")]
     DifferentPhotoWithWriter,
     AliasedEdit,
@@ -145,7 +158,7 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
         .await
         .unwrap();
     select(&f, "c", &server);
-    if matches!(successor, Successor::DifferentPhoto) {
+    if matches!(successor, Successor::DifferentPhoto { .. }) {
         f.session.records.lock().unwrap()[0]["fields"]["filenameEnc"]["value"] =
             json!("retained.jpg");
     }
@@ -193,7 +206,7 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
 
     f = reopen_destination_fixture(f).await;
     let master = match successor {
-        Successor::DifferentPhoto => "m",
+        Successor::DifferentPhoto { .. } => "m",
         #[cfg(feature = "xmp")]
         Successor::DifferentPhotoWithWriter => "m",
         _ => "c",
@@ -215,7 +228,7 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
     };
     *f.session.corrupt.lock().unwrap() = None;
     // Start a new generation without changing the selection configuration.
-    let change = if matches!(successor, Successor::DifferentPhoto) {
+    let change = if matches!(successor, Successor::DifferentPhoto { .. }) {
         selected_records("m", &server)
     } else {
         vec![json!({"recordName":"new-observation","recordType":"FutureOpaque"})]
@@ -291,7 +304,7 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
             assert_eq!(historical_evidence(&f, &original), evidence);
             f = reopen_destination_fixture(f).await;
         }
-    } else if matches!(successor, Successor::DifferentPhoto) {
+    } else if let Successor::DifferentPhoto { recovered_stem } = successor {
         // The current files are B's. A is neither complete nor deleted. Its
         // exact historical pair and selected pass remain the only retry owner.
         assert_eq!(
@@ -302,7 +315,12 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
         assert!(result.stats.selected_work_remaining && result.failed_count > 0);
         assert!(!result.can_advance_database_checkpoint());
         f = Box::pin(recover_omitted_lookup(
-            f, &config, &session, &server, &original,
+            f,
+            &config,
+            &session,
+            &server,
+            &original,
+            recovered_stem,
         ))
         .await;
     } else {
@@ -352,6 +370,7 @@ async fn recover_omitted_lookup(
     session: &crate::auth::SharedSession,
     server: &MockServer,
     original: &str,
+    recovered_stem: &str,
 ) -> Fixture {
     let evidence = historical_evidence(&f, original);
     let retained = retained_inventory(&f);
@@ -444,7 +463,8 @@ async fn recover_omitted_lookup(
         .await;
     f = reopen_destination_fixture(f).await;
     select(&f, "c", server);
-    f.session.records.lock().unwrap()[0]["fields"]["filenameEnc"]["value"] = json!("retained.jpg");
+    f.session.records.lock().unwrap()[0]["fields"]["filenameEnc"]["value"] =
+        json!(format!("{recovered_stem}.jpg"));
     assert_eq!(
         crate::download::has_due_selection_work(&ordinary_passes(&f), &f.config, controls())
             .await
@@ -452,6 +472,7 @@ async fn recover_omitted_lookup(
         Some(true)
     );
     let ranks = f.session.rank_calls.load(Ordering::SeqCst);
+    let filename = format!("{recovered_stem}.JPG");
     for downloads in [2, 0] {
         let recovered = baseline_cycle(&f, config, session, ordinary_passes(&f)).await;
         assert_eq!(recovered.stats.downloaded, downloads, "{recovered:?}");
@@ -459,10 +480,11 @@ async fn recover_omitted_lookup(
         assert!(!recovered.stats.selected_work_remaining);
         assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), ranks);
         for album in ["A", "B"] {
-            assert_eq!(
-                std::fs::read(f.config.directory.join(album).join("retained.JPG")).unwrap(),
-                MEDIA
-            );
+            let folder = f.config.directory.join(album);
+            assert_eq!(std::fs::read(folder.join(&filename)).unwrap(), MEDIA);
+            if recovered_stem != "retained" {
+                assert!(!folder.join("retained.JPG").exists());
+            }
         }
         f = reopen_destination_fixture(f).await;
     }
