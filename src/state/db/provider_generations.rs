@@ -36,6 +36,8 @@ const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 // Original serialized inputs per validation operation, not an allocator or disk bound.
 const MAX_VALIDATION_BYTES: usize = 512 * 1024 * 1024;
 const MAX_OBSERVED_BYTES: usize = 64 * 1024 * 1024;
+const RETAINED_REPLAY_DECISION_LIMIT: usize = 64;
+const RETAINED_REPLAY_CANDIDATE_LIMIT: i64 = 128;
 
 const MANAGED_SUCCESSOR_PREFIX: &str = "managed_successor:";
 
@@ -2334,10 +2336,9 @@ fn lookup_has_verified_successor(
         {
             return Ok(false);
         }
-        let agrees = |a: &crate::icloud::photos::PhotoAsset,
-                      b: &crate::icloud::photos::PhotoAsset| {
-            a.filename() == b.filename() && crate::icloud::photos::same_selected_facts(a, b)
-        };
+        // URL renewal is harmless, but aliasing can change which copies the
+        // planner selects even when the provider checksums are unchanged.
+        let agrees = crate::icloud::photos::PhotoAsset::same_download_observation;
         let Some(original) = observed_asset_matching(conn, old_root, &old, agrees)? else {
             return Ok(false);
         };
@@ -2627,26 +2628,63 @@ impl SqliteStateDb {
             let root=load_generation(&tx,&generation)?;
             let stored:Option<String>=tx.query_row("SELECT replay_after FROM provider_active_generations WHERE id=?1",[&generation],|r|r.get(0))?;
             let after:Option<(String,String)>=stored.as_deref().map(|value|serde_json::from_str(value).map_err(|_invalid|StateError::ProviderSelectionInvalid)).transpose()?;
-            let query=|after:Option<&(String,String)>|->Result<Vec<(String,String,i64,bool)>,StateError> {
-                Ok(tx.prepare(&format!("SELECT d.pass_key,d.child,length(d.manifest),d.admission='deferred' AND d.reason='current_lookup_unresolved' FROM provider_active_decisions d WHERE d.generation=?1 AND (?2 IS NULL OR (d.pass_key,d.child)>(?2,?3)) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND {UNFINISHED})) ORDER BY d.pass_key,d.child LIMIT 64"))?.query_map(params![generation,after.map(|a|&a.0),after.map(|a|&a.1),Utc::now().timestamp()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<Result<_,_>>()?)
-            };
-            let mut keys=query(after.as_ref())?;if keys.is_empty() && after.is_some() {keys=query(None)?;}
-            let mut bytes=0_usize;let mut decisions=Vec::new();let mut last=None;
-            let mut pages=RankProofs::new(&tx,&root);
-            for (key,child,length,lookup) in keys {
-                let length=usize::try_from(length).map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
-                if length>MAX_CHUNK_BYTES {return invalid()}
-                if bytes.saturating_add(length)>MAX_CHUNK_BYTES {break}
-                if lookup && lookup_has_verified_successor(&tx,&root,&key,&child)? {
-                    bytes+=length;last=Some((key,child));continue;
+            let mut stmt = tx.prepare(&format!(
+                "SELECT d.pass_key,d.child,length(d.manifest),d.admission='deferred' AND d.reason='current_lookup_unresolved'
+                 FROM provider_active_decisions d
+                 WHERE d.generation=?1 AND (?2 IS NULL OR (d.pass_key,d.child)>(?2,?3))
+                   AND (?4 IS NULL OR (d.pass_key,d.child)<=(?4,?5))
+                   AND d.next_retry_at<=?6
+                   AND (d.admission='deferred' OR EXISTS(
+                       SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation
+                       WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND {UNFINISHED}))
+                 ORDER BY d.pass_key,d.child LIMIT ?7"
+            ))?;
+            let now = Utc::now().timestamp();
+            let mut candidates_left = RETAINED_REPLAY_CANDIDATE_LIMIT;
+            let mut bytes = 0_usize;
+            let mut decisions = Vec::new();
+            let mut last = None;
+            let mut pages = RankProofs::new(&tx, &root);
+            // A suffix filled with settled lookups is not an actionable batch.
+            // Wrap once, without reexamining the suffix or exceeding the budget.
+            'window: for (lower, upper) in [(after.as_ref(), None), (None, after.as_ref())] {
+                let mut rows = stmt.query(params![
+                    generation, lower.map(|key| &key.0), lower.map(|key| &key.1),
+                    upper.map(|key| &key.0), upper.map(|key| &key.1), now, candidates_left,
+                ])?;
+                while let Some(row) = rows.next()? {
+                    let (key, child, length, lookup): (String, String, i64, bool) =
+                        row.try_into()?;
+                    candidates_left -= 1;
+                    let length = usize::try_from(length)
+                        .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+                    if length > MAX_CHUNK_BYTES {
+                        return invalid();
+                    }
+                    if lookup && lookup_has_verified_successor(&tx, &root, &key, &child)? {
+                        last = Some((key, child));
+                        continue;
+                    }
+                    if bytes.saturating_add(length) > MAX_CHUNK_BYTES {
+                        break 'window;
+                    }
+                    let decision = match load_decision_with_pages(&tx, &root, &key, &child, true, &mut pages) {
+                        Ok(decision) => decision,
+                        Err(StateError::ProviderSelectionFull) => break 'window,
+                        Err(error) => return Err(error),
+                    };
+                    bytes += length;
+                    decisions.push(decision);
+                    last = Some((key, child));
+                    if decisions.len() == RETAINED_REPLAY_DECISION_LIMIT {
+                        break 'window;
+                    }
                 }
-                let decision=match load_decision_with_pages(&tx,&root,&key,&child,true,&mut pages) {
-                    Ok(decision)=>decision,
-                    Err(StateError::ProviderSelectionFull)=>break,
-                    Err(error)=>return Err(error),
-                };
-                bytes+=length;decisions.push(decision);last=Some((key,child));
+                if after.is_none() || candidates_left == 0 || !decisions.is_empty() {
+                    break;
+                }
             }
+            drop(stmt);
             let cursor=last.map(|after|serde_json::to_string(&after).map_err(|_invalid|StateError::ProviderSelectionInvalid)).transpose()?.or(stored);
             tx.execute("UPDATE provider_active_generations SET replay_after=?2,last_replayed_at=?3 WHERE id=?1",params![generation,cursor,Utc::now().timestamp_millis()])?;
             tx.commit()?;Ok(decisions)

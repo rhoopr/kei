@@ -322,13 +322,14 @@ Startup and watch can wake unfinished selected work even when the canonical
 asset row already has one downloaded destination. An unchanged completed
 coverage window reuses exact selection and publication evidence. Historical
 scheduling visits one due old root per cycle, at most 64 decisions and 16 MiB of
-serialized manifests, with a persisted continuation and retry deadlines. Within
-that transaction, each unique original rank page is strictly decoded and its
-complete ordered record index audited once. Compact page proofs are discarded
-when the operation ends; new reads use a stable read transaction. Each replay
-validation operation can read up to 512 MiB of unique serialized input, without retaining all
-parsed pages. Original-fact reconstruction separately limits retained serialized
-page inputs to 64 MiB; unavailable bounded evidence remains deferred debt.
+serialized manifests, with a persisted continuation and retry deadlines. It can
+inspect up to 128 candidates to fill that window without counting settled
+lookups as replay work. When loading actionable decisions, it shares compact
+proofs across the window so it decodes each unique original rank page and checks
+its complete ordered record index once. Proofs are discarded after the
+transaction. Each replay validation can read up to 512 MiB of unique serialized
+input without retaining all parsed pages. Reconstructing a lookup's original
+facts has a separate 64 MiB limit; insufficient evidence remains deferred debt.
 Album source discovery checks candidate pages one at a time in the same read transaction and retains only matching ordinals. Unrelated membership pages do not spend a child's decision-validation allowance.
 Inline dispatch without a post-sync runner receives a bounded priority metadata lane; remaining writers
 share the existing physical writer budget and persisted general continuation.
@@ -353,7 +354,7 @@ During writable sync, the generation owner verifies the seal of each checkpoint-
 
 A later sealed, checkpoint-ready generation can supersede an unverified planned path when it has completed the same pass, child, master and rendition at a different path. Scope, configuration, provider checksum, size, metadata and dates must match. The earlier row stays admitted and unverified as historical evidence; it is neither deleted nor marked published. That row no longer creates retained replay work, asset-write conflicts or checkpoint debt. Prepared metadata outputs and incomplete current publications retain their guards. Scheduling validates the scope's retained decision proofs in the same read transaction before using this rule.
 
-A deferred lookup with no destination can be satisfied by a later sealed, checkpoint-ready selection for the same pass, child and bound source in its own zone. Kei checks the first later candidate with fully verified media and required metadata in the same configuration. The captured identity, filename and resource facts must match. This skips replay for that decision and removes its checkpoint hold without rewriting it. Missing, changed or inconclusive evidence still requires recovery. Absence from a later selection is not proof of deletion.
+A deferred lookup with no destination can be satisfied by a later sealed, checkpoint-ready selection for the same pass, child and bound source in its own zone. Kei checks the first later candidate with fully verified media and required metadata in the same configuration. The observations must agree on the facts that determine the selected copies, including which renditions share a URL. Renewed signed URLs can still match. This skips replay for that decision and removes its checkpoint hold without rewriting it. Missing, changed or inconclusive evidence still requires recovery. Absence from a later selection is not proof of deletion.
 
 A changed managed rendition can also retire an older decision's admission after fresh authenticated confirmation of the same account, store, source, pass, child and master. Every old destination must match a cancelled pre-publication layout operation and a current selected rendition. The layout owner verifies retained media and sidecar fingerprints before projection. The projection transaction admits the successor, records its manifest and cancelled-operation hashes in the old decision's admission reason, and withdraws the old destinations' admission together. Any admission failure rolls back both changes. The original manifests, paths, retry evidence, journal members and publication receipts remain intact; retirement never marks media or metadata complete. The shared decision validator checks this proof on reopen, and the existing admitted-destination filters retain ownership of scheduling, grouping, metadata and checkpoint debt. Publishing journals, native prepared metadata outputs, unknown provenance and unrelated identities remain fenced. Managed current collection precedes historical replay so obsolete work cannot publish before this decision.
 

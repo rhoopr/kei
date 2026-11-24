@@ -91,10 +91,24 @@ async fn repaired_first_baseline_does_not_settle_a_renamed_photo() {
     check_repaired_baseline_after_deferral(Successor::Renamed).await;
 }
 
+#[tokio::test]
+async fn repaired_first_baseline_keeps_hold_when_edited_url_becomes_alias() {
+    check_repaired_baseline_after_deferral(Successor::AliasedEdit).await;
+}
+
 enum Successor {
     Exact,
     Renamed,
     DifferentPhoto,
+    AliasedEdit,
+}
+
+fn add_edited_rendition(f: &Fixture, url: &str) {
+    let mut records = f.session.records.lock().unwrap();
+    let mut resource = records[0]["fields"]["resOriginalRes"].clone();
+    resource["value"]["downloadURL"] = json!(url);
+    records[1]["fields"]["resJPEGFullRes"] = resource;
+    records[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
 }
 
 async fn check_repaired_baseline_after_deferral(successor: Successor) {
@@ -118,6 +132,19 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
         .await
         .unwrap();
     select(&f, "c", &server);
+    if matches!(successor, Successor::AliasedEdit) {
+        add_edited_rendition(&f, &format!("{}/media?edited", server.uri()));
+        let body =
+            serde_json::to_vec(&json!({"records": *f.session.records.lock().unwrap()})).unwrap();
+        let (_, _, zone) = f.pass.album.owned_selection_scope().unwrap().unwrap();
+        let observed = crate::icloud::photos::current_asset(&body, "asset-c", "c", &zone).unwrap();
+        let config = f.config.with_pass(&destination_pass(&f, "A"));
+        assert!(
+            crate::download::filter::selected_resource_tasks(&observed, &config)
+                .iter()
+                .any(|task| task.version_size == crate::state::VersionSizeKey::Adjusted)
+        );
+    }
     *f.session.corrupt.lock().unwrap() = Some("missing-c");
     let ordinary_passes = |f: &Fixture| vec![destination_pass(f, "A"), destination_pass(f, "B")];
     let first = baseline_cycle(&f, &config, &session, ordinary_passes(&f)).await;
@@ -155,6 +182,13 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
         "c"
     };
     select(&f, master, &server);
+    if matches!(successor, Successor::AliasedEdit) {
+        add_edited_rendition(&f, &format!("{}/media", server.uri()));
+    }
+    if matches!(successor, Successor::Exact) {
+        f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+            json!(format!("{}/media?renewed", server.uri()));
+    }
     let filename = if matches!(successor, Successor::Renamed) {
         f.session.records.lock().unwrap()[0]["fields"]["filenameEnc"]["value"] =
             json!("renamed.jpg");
@@ -195,6 +229,12 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
     let summary = f.db.get_summary().await.unwrap();
     assert_eq!((summary.pending, summary.failed), (0, 0));
     assert_eq!(historical_evidence(&f, &original), evidence);
+    if matches!(successor, Successor::AliasedEdit) {
+        for album in ["A", "B"] {
+            let edited = f.config.directory.join(album).join("changed_edited.JPG");
+            assert!(!edited.exists());
+        }
+    }
     if matches!(successor, Successor::Exact) {
         assert_eq!(
             f.db.get_metadata(PRIMARY_KEY).await.unwrap().as_deref(),
@@ -434,30 +474,50 @@ async fn settle_retained_fixture(
 
 #[tokio::test]
 async fn mixed_retained_lookup_batch_skips_settled_work_after_restart() {
+    check_mixed_retained_lookup_batch(1, [true, false]).await;
+}
+
+#[tokio::test]
+async fn retained_lookup_window_refills_within_candidate_budget() {
+    // 64 settled entries leave room to claim the sibling in the first cycle.
+    // 128 exhaust the separate probe budget; resume at the sibling on reopen.
+    check_mixed_retained_lookup_batch(64, [true, false]).await;
+    check_mixed_retained_lookup_batch(128, [false, true]).await;
+}
+
+async fn check_mixed_retained_lookup_batch(settled_count: u64, expected_lookups: [bool; 2]) {
     let server = crate::start_wiremock_or_skip!();
     Mock::given(method("GET"))
         .and(path("/media"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
-        .expect(1)
+        .expect(settled_count)
         .mount(&server)
         .await;
     let mut f = Fixture::new().await;
     use_paged_selection(&mut f);
-    let settled = selected_records("c", &server);
+    let names: Vec<_> = (0..settled_count).map(|n| format!("a{n:03}")).collect();
+    let settled = names
+        .iter()
+        .flat_map(|name| {
+            let mut pair = selected_records(name, &server);
+            pair[0]["fields"]["filenameEnc"]["value"] = json!(format!("{name}.jpg"));
+            pair
+        })
+        .collect();
     let unresolved = selected_records("z", &server);
     let original = settle_retained_fixture(&mut f, settled, unresolved).await;
     let evidence = historical_evidence(&f, &original);
     let retained = retained_inventory(&f);
 
     f = reopen_destination_fixture(f).await;
-    for child in ["asset-c", "asset-z"] {
-        f.db.make_selection_retry_due(super::owner(), child.into())
+    for name in names.iter().map(String::as_str).chain(["z"]) {
+        f.db.make_selection_retry_due(super::owner(), format!("asset-{name}"))
             .await
             .unwrap();
     }
     f.session.lookup_names.lock().unwrap().clear();
     let rank_calls = f.session.rank_calls.load(Ordering::SeqCst);
-    for expected_lookup in [true, false] {
+    for expected_lookup in expected_lookups {
         use_paged_selection(&mut f);
         let result = cycle(&f).await;
         assert!(result.stats.selected_work_remaining, "{result:?}");
@@ -465,7 +525,7 @@ async fn mixed_retained_lookup_batch_skips_settled_work_after_restart() {
         assert_eq!(result.stats.downloaded, 0);
         let lookups = std::mem::take(&mut *f.session.lookup_names.lock().unwrap());
         if expected_lookup {
-            assert!(lookups.iter().any(|name| name == "asset-z"));
+            assert!(lookups.iter().any(|name| name == "asset-z"), "{lookups:?}");
             assert!(
                 lookups
                     .iter()
