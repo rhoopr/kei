@@ -85,8 +85,10 @@ pub(crate) fn indexing_replay_key(zone: &str) -> String {
 
 /// Managed qualification did not queue files. This obligation forces a full
 /// managed publication pass before retained-cursor replay may discharge it.
+pub(crate) const INDEXING_MATERIALIZATION_PREFIX: &str = "indexing_materialization_required:";
+
 pub(crate) fn indexing_materialization_key(zone: &str) -> String {
-    format!("indexing_materialization_required:{zone}")
+    format!("{INDEXING_MATERIALIZATION_PREFIX}{zone}")
 }
 
 /// Observe readiness and durably retain every RUNNING observation, even if a
@@ -2040,16 +2042,16 @@ async fn run_cycle_inner(
             .await;
         }
 
-        // Readiness can regress during a long inventory. Recheck at the
-        // checkpoint boundary; even a failed probe leaves durable retry debt.
+        // A later FINISHED result cannot certify enumeration that already ran
+        // with an unknown closing observation. Leave durable retry debt instead.
         let readiness_after = tokio::select! {
             biased;
             () = shutdown_token.cancelled() => None,
             result = async {
-                let mut finished = lib_state.library.check_indexing().await?;
+                let mut finished = lib_state.library.check_indexing_once().await?;
                 for source in &lib_state.cross_zone_libraries {
                     if source.zone_name() != lib_state.zone_name {
-                        finished &= source.check_indexing().await?;
+                        finished &= source.check_indexing_once().await?;
                     }
                 }
                 Ok::<_, crate::icloud::error::ICloudError>(finished)

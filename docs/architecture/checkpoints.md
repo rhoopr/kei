@@ -22,9 +22,9 @@ existing metadata table. Presence is the obligation, including unknown future
 payloads; no schema migration is needed. The previous trusted zone and database
 checkpoints remain unchanged. Cross-zone album sources also contribute readiness.
 
-For an unknown or missing state, kei retries the library readiness probe after 5 seconds and again after 15 seconds. If neither probe returns `FINISHED` or `RUNNING`, the cycle skips the affected library and holds the database checkpoint. It can refresh independent plans and advance their zone checkpoints. Plans that need combined collection evidence cannot qualify from an incomplete listing.
+Before enumeration, kei retries an unknown or missing readiness state after 5 seconds and again after 15 seconds. If neither retry returns `FINISHED` or `RUNNING`, the cycle skips the affected library and holds the database checkpoint. It can refresh independent plans and advance their zone checkpoints. Plans that need combined collection evidence cannot qualify from an incomplete listing. An unknown or missing closing probe holds the checkpoint without retrying: a later `FINISHED` result cannot qualify work that already ran.
 
-On startup, watch mode waits for the next interval before retrying incomplete discovery and uses the normal 2FA wait if the session needs a new code. It carries earlier `RUNNING` observations into the first qualified library map so the cycle can persist the hold before checking for changes. The authenticated systemd worker signals readiness before discovery and reports indexing waits through service status. This does not start sync or the HTTP listener. A one-shot run reports discovery failure, and shutdown interrupts the waits.
+On startup, watch mode waits for the next interval before retrying incomplete discovery and uses the normal 2FA wait if the session needs a new code. It carries earlier `RUNNING` observations into the first qualified library map so the cycle can persist the hold before checking for changes. After authentication, the watch listener serves `/healthz` with no completed cycle, and systemd receives readiness before discovery. Neither signal means a sync has started. A one-shot run reports discovery failure, and shutdown interrupts the waits.
 
 While indexing, the download dispatcher uses full queries without incremental
 replay, retained-work admission, metadata repair, retry retirement, or album
@@ -51,6 +51,8 @@ source deletions. Replay presence, including an unknown future payload, bypasses
 the watch database shortcut across reopen. Only normal checkpoint promotion
 removes replay debt, including aggregate config-drift promotion. Rejection of
 the retained cursor preserves the existing checkpoint gates.
+
+`kei status` reports the provider checkpoint as preserved while any zone has indexing reconciliation, materialization, or replay debt, even if another zone advances.
 
 If replay needs a fresh album inventory, its completed delta supplies the starting boundary. A quiet terminal read can qualify that inventory, but only the applied delta's successor can advance the cursor. If a pass fails to return a usable token or the zone changes during a split-token scan, the next replay retries the inventory instead of reusing its failed token proof.
 

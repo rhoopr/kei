@@ -44,10 +44,110 @@ fn indexing_capture(db: &Arc<state::SqliteStateDb>) -> crate::icloud::photos::in
     crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), indexing_owner(), "com")
 }
 
+#[tokio::test]
+async fn indexing_watch_serves_startup_health_during_discovery() {
+    // The production runner installs signal handlers and hardens the process.
+    const CHILD: &str = "KEI_TEST_INDEXING_WATCH_HEALTH_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "sync_loop::runner::tests::indexing::indexing_watch_serves_startup_health_during_discovery"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        return;
+    }
+
+    use crate::auth::{self, session::Session};
+    let server =
+        crate::start_wiremock_or_skip!("indexing_watch_serves_startup_health_during_discovery");
+    let root = tempfile::tempdir().unwrap();
+    let username = "watch-health@example.invalid";
+    let base = server.uri();
+    let auth = serde_json::from_value(json!({
+        "dsInfo": {"dsid": "watch-health-fixture"},
+        "webservices": {"ckdatabasews": {"url": base}},
+    }))
+    .unwrap();
+    std::fs::write(
+        auth::session_file_path(root.path(), username, "com"),
+        br#"{"session_token":"fixture"}"#,
+    )
+    .unwrap();
+    let session = Session::new(root.path(), username, &base, None)
+        .await
+        .unwrap();
+    session.save_validation_cache(&auth).await;
+    drop(session);
+
+    let observed = Arc::new(tokio::sync::Notify::new());
+    let provider = observed.clone();
+    Mock::given(wiremock::matchers::path_regex("/private/records/query$"))
+        .respond_with(move |_: &wiremock::Request| {
+            provider.notify_one();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"records":[{"fields":{"state":{"value":"UNKNOWN"}}}]}))
+        })
+        .mount(&server)
+        .await;
+    let globals = crate::config::GlobalArgs {
+        config_source: Default::default(),
+        username: Some(username.to_owned()),
+        domain: None,
+        data_dir: Some(root.path().to_string_lossy().into_owned()),
+    };
+    let toml_config = serde_json::from_value(json!({
+        "config_version": 1,
+        "download": {"directory": root.path().join("media")},
+        "server": {"port": 0, "bind": "127.0.0.1"},
+        "watch": {"notify_systemd": false},
+    }))
+    .unwrap();
+    let args = crate::sync_loop::SyncArgs {
+        is_one_shot: false,
+        service_mode: true,
+        pw: Default::default(),
+        sync: Default::default(),
+        toml_config: Some(toml_config),
+        config_explicitly_set: false,
+        config_path: root.path().join("config.toml"),
+        redact_password: Arc::default(),
+        personality_mode: crate::personality::Mode::Off,
+        friendly_request: None,
+        input_mode: crate::InputMode::NoInput,
+    };
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+    let worker = auth::endpoints::with_test_endpoint(
+        &base,
+        Box::pin(crate::sync_loop::run_sync(&globals, args)),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::select! {
+            result = worker => panic!("worker exited during discovery: {result:?}"),
+            () = async {
+                observed.notified().await;
+                let port = capture.events().iter()
+                    .find(|event| event.message() == Some("HTTP server listening (serving /healthz and /metrics)"))
+                    .and_then(|event| event.field("port"))
+                    .expect("watch must bind before discovery")
+                    .to_owned();
+                let response = reqwest::get(format!("http://127.0.0.1:{port}/healthz")).await.unwrap();
+                assert_eq!(response.status(), 200);
+                assert_eq!(response.text().await.unwrap(), r#"{"status":"no sync cycle completed yet"}"#);
+            } => {}
+        }
+    }).await.expect("watch startup health check timed out");
+}
+
 #[derive(Clone)]
 struct IndexingSession {
     readiness: Arc<Mutex<&'static str>>,
     readiness_probes: Arc<AtomicUsize>,
+    unknown_at_probe: Option<usize>,
     unknown_observed: Arc<tokio::sync::Notify>,
     records: Arc<Vec<Value>>,
     queries: Arc<AtomicUsize>,
@@ -66,13 +166,16 @@ impl PhotosSession for IndexingSession {
     async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
         let request: Value = serde_json::from_str(&body)?;
         if request["query"]["recordType"] == "CheckIndexingState" {
-            self.readiness_probes.fetch_add(1, Ordering::SeqCst);
-            if *self.readiness.lock().unwrap() == "UNKNOWN" {
+            let probe = self.readiness_probes.fetch_add(1, Ordering::SeqCst) + 1;
+            let readiness = if self.unknown_at_probe == Some(probe) {
+                "UNKNOWN"
+            } else {
+                *self.readiness.lock().unwrap()
+            };
+            if readiness == "UNKNOWN" {
                 self.unknown_observed.notify_one();
             }
-            return Ok(
-                json!({"records":[{"fields":{"state":{"value":*self.readiness.lock().unwrap()}}}]}),
-            );
+            return Ok(json!({"records":[{"fields":{"state":{"value":readiness}}}]}));
         }
         if request["query"]["recordType"] == "CPLAlbumByPositionLive" {
             let finished = *self.readiness.lock().unwrap() == "FINISHED";
@@ -175,6 +278,7 @@ fn provider(readiness: &'static str, ids: &[&str], base: &str) -> IndexingSessio
     IndexingSession {
         readiness: Arc::new(Mutex::new(readiness)),
         readiness_probes: Arc::default(),
+        unknown_at_probe: None,
         unknown_observed: Arc::default(),
         records: Arc::new(records),
         queries: Arc::new(AtomicUsize::new(0)),
@@ -585,6 +689,7 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
         "checkpoint_write",
         "regressed",
         "unknown",
+        "closing_unknown",
     ] {
         let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         let root = tempfile::tempdir().unwrap();
@@ -605,7 +710,9 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
             .await
             .unwrap();
             // Unknown marker payloads remain obligations; they are not ignored.
-            db.set_metadata(&hold, "future-version").await.unwrap();
+            if fault != "closing_unknown" {
+                db.set_metadata(&hold, "future-version").await.unwrap();
+            }
             let row = crate::test_helpers::TestAssetRecord::new("old")
                 .library(ZONE)
                 .build();
@@ -655,6 +762,11 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
         if fault == "regressed" {
             provider.regress_after_query = true;
         }
+        if fault == "closing_unknown" {
+            // Construction and the start of cycle see FINISHED. Retry would
+            // also see FINISHED, but cannot qualify the completed work.
+            provider.unknown_at_probe = Some(3);
+        }
         let library = library(&provider, &inner).await;
         if fault == "unknown" {
             *provider.readiness.lock().unwrap() = "UNKNOWN";
@@ -678,6 +790,11 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
             assert_eq!(provider.readiness_probes.load(Ordering::SeqCst), 4);
             assert_eq!(provider.queries.load(Ordering::SeqCst), 0);
             assert!(provider.changes.lock().unwrap().is_empty());
+        }
+        if fault == "closing_unknown" {
+            assert_eq!(result.failed_count, 1);
+            assert_eq!(provider.readiness_probes.load(Ordering::SeqCst), 3);
+            assert_eq!(*provider.changes.lock().unwrap(), ["trusted-before"]);
         }
         if fault == "checkpoint_write" {
             assert!(provider.queries.load(Ordering::SeqCst) > 0);
@@ -1257,6 +1374,15 @@ async fn indexing_ready_peer_reconciles_and_advances_while_neighbor_is_unknown()
             // The held inventory can't activate a selection generation. The
             // first trusted replay can build one for subsequent quiet wakes.
             inventory_queries = queries;
+            assert_eq!(
+                db.get_summary()
+                    .await
+                    .unwrap()
+                    .provider_checkpoint_status
+                    .as_deref(),
+                Some("preserved"),
+                "the durable hold still applies to the aggregate status"
+            );
         } else {
             assert_eq!(
                 queries, inventory_queries,

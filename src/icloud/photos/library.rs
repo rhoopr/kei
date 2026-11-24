@@ -195,8 +195,8 @@ impl PhotoLibrary {
         }
     }
 
-    /// Check readiness without indexing backoff. Sparse lookups can run this
-    /// once per link; library-level checks own the slower retries.
+    /// Check readiness without indexing backoff. Closing checkpoint checks
+    /// cannot discard an unknown observation, and sparse lookups run per link.
     pub(crate) async fn check_indexing_once(&self) -> Result<bool, ICloudError> {
         #[cfg(test)]
         if let Some(finished) = self.stub_indexing_finished {

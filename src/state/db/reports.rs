@@ -319,6 +319,19 @@ impl SqliteStateDb {
                 }
             }
             // Zone-local holds survive another zone's successful status write.
+            let indexing_hold_exists = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM metadata WHERE substr(key,1,length(?1))=?1 \
+                 OR substr(key,1,length(?2))=?2 OR substr(key,1,length(?3))=?3)",
+                [
+                    crate::sync_cycle::INDEXING_RECONCILIATION_PREFIX,
+                    crate::sync_cycle::INDEXING_REPLAY_PREFIX,
+                    crate::sync_cycle::INDEXING_MATERIALIZATION_PREFIX,
+                ],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if indexing_hold_exists {
+                provider_checkpoint_status = Some("preserved".to_owned());
+            }
             // Malformed hold contents cannot make the operator status current.
             let retained_hold_exists = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM metadata WHERE substr(key,1,length(?1))=?1)",

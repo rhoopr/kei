@@ -285,6 +285,21 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     api_retry_config.validate()?;
 
     let shutdown_token = shutdown::install_signal_handler(sd_notifier, config.ui.personality_mode)?;
+    // Watch health must answer while authenticated discovery waits to retry.
+    // Bind before signaling readiness; cancel the listener on any startup exit.
+    let metrics_shutdown = shutdown_token.child_token();
+    let _metrics_guard = metrics_shutdown.clone().drop_guard();
+    let (metrics_handle, metrics_task) = if let Some(interval) = config.watch.interval {
+        let (handle, task, _addr) = crate::metrics::spawn_server(
+            config.server.bind,
+            config.server.port,
+            metrics_shutdown,
+            Some(chrono::Duration::seconds((interval * 2) as i64)),
+        )?;
+        (Some(handle), Some(task))
+    } else {
+        (None, None)
+    };
     // Library discovery can take a watch interval to recover. Release the
     // service manager's start job without exposing a partial sync plan.
     let _watch_start = is_watch_mode.then(|| sd_notifier.start_worker(shutdown_token.clone()));
@@ -589,28 +604,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // Friendly-mode greeting. Lands above any future bar via
     // active_bar::with_suspended; no-op in off mode. Once per process.
     crate::personality::narration::greet_to_stderr(config.ui.personality_mode, is_watch_mode);
-
-    // Spawn the HTTP server (/healthz + /metrics) only in watch mode.
-    // A one-shot sync exits before anything could scrape /healthz, so there
-    // is no value in binding the port. In watch mode, flag /healthz as stale
-    // after two missed intervals so a single slow cycle doesn't flip to 503
-    // but a stuck main loop does.
-    // Binds synchronously so a misconfigured port fails at startup.
-    let staleness_threshold = config
-        .watch
-        .interval
-        .map(|secs| chrono::Duration::seconds((secs * 2) as i64));
-    let (metrics_handle, metrics_task) = if config.watch.interval.is_some() {
-        let (h, t, _addr) = crate::metrics::spawn_server(
-            config.server.bind,
-            config.server.port,
-            shutdown_token.clone(),
-            staleness_threshold,
-        )?;
-        (Some(h), Some(t))
-    } else {
-        (None, None)
-    };
 
     let mut health = health::HealthStatus::new();
     let cycle_reporter =
