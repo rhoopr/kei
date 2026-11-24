@@ -856,6 +856,8 @@ qualification. Retry-only known failures cannot hide unqueued omitted assets;
 a RUNNING album-plan transition must rebuild the omitted album after FINISHED.
 File-backed replay debt also bypasses an otherwise quiet watch pre-check.
 
+The two-library unknown-readiness fixture starts with seeded cursors and an empty destination. It runs production planning, watch precheck, and the sync cycle through peer inventory qualification, retained-cursor replay, and a quiet wake without re-inventory. The deferred library never enumerates and the shared database checkpoint remains blocked. Synthetic startup tests retain a `RUNNING` observation across failed discovery and prove the hold survives SQLite reopen, including when 2FA is required on the retry. The systemd test captures startup status and watchdog messages on a private socket without a host service.
+
 `indexing_split_pass_tokens_require_quiet_inventory_then_replay_retained_cursor` reopens SQLite between album-plus-unfiled scans. A raw change, a missing pass token, and interruption each retain the hold. A quiet scan with different pass tokens qualifies the inventory. During replay, a blank token and then a zone change each keep the original cursor. The next quiet inventory qualifies, and the following incremental cycle issues no inventory queries.
 
 `primary_layout::indexing` additionally starts with real managed files or an

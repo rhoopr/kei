@@ -285,6 +285,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     api_retry_config.validate()?;
 
     let shutdown_token = shutdown::install_signal_handler(sd_notifier, config.ui.personality_mode)?;
+    // Library discovery can take a watch interval to recover. Release the
+    // service manager's start job without exposing a partial sync plan.
+    let _watch_start = is_watch_mode.then(|| sd_notifier.start_worker(shutdown_token.clone()));
     let (shared_session, mut photos_service, libraries) = tokio::select! {
         biased;
         () = shutdown_token.cancelled() => return Ok(()),
@@ -581,8 +584,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         &build_download_config,
         enum_config_hash.as_ref(),
     )?;
-    sd_notifier.notify_ready();
-    let _systemd_watchdog_task = sd_notifier.start_watchdog_heartbeat(shutdown_token.clone());
+    let _one_shot_start =
+        (!is_watch_mode).then(|| sd_notifier.start_worker(shutdown_token.clone()));
     // Friendly-mode greeting. Lands above any future bar via
     // active_bar::with_suspended; no-op in off mode. Once per process.
     crate::personality::narration::greet_to_stderr(config.ui.personality_mode, is_watch_mode);

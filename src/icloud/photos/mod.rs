@@ -41,7 +41,7 @@ pub(crate) use projection::{
 };
 pub use session::{PhotosSession, SyncTokenError};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -105,7 +105,42 @@ pub struct PhotosService {
     private_zones: Option<Vec<cloudkit::Zone>>,
     private_libraries: Option<HashMap<String, PhotoLibrary>>,
     shared_libraries: Option<HashMap<String, PhotoLibrary>>,
+    discovery_indexing: DiscoveryIndexing,
     retry_config: RetryConfig,
+}
+
+/// RUNNING observations from discovery, including zones initialized before a
+/// later zone failed. Keep scope only, never the session or a partial map.
+#[derive(Default)]
+pub(crate) struct DiscoveryIndexing(HashMap<String, HashSet<Value>>);
+
+impl DiscoveryIndexing {
+    fn observe(&mut self, library: &PhotoLibrary) {
+        if !library.last_indexing_finished() {
+            self.0
+                .entry(library.selection_database().to_owned())
+                .or_default()
+                .insert(library.selection_zone().clone());
+        }
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        for (database, zones) in other.0 {
+            self.0.entry(database).or_default().extend(zones);
+        }
+    }
+
+    fn retain_in(&self, library: &PhotoLibrary) {
+        let Some(zones) = self.0.get(library.selection_database()) else {
+            return;
+        };
+        if zones.contains(library.selection_zone())
+            || (library.is_qualified_private_primary()
+                && zones.contains(&json!({"zoneName": PRIMARY_ZONE_NAME})))
+        {
+            library.retain_provisional_readiness();
+        }
+    }
 }
 
 impl std::fmt::Debug for PhotosService {
@@ -126,6 +161,28 @@ fn is_photo_library_zone(zone_name: &str) -> bool {
 }
 
 impl PhotosService {
+    #[must_use]
+    pub(crate) fn take_discovery_indexing(&mut self) -> DiscoveryIndexing {
+        std::mem::take(&mut self.discovery_indexing)
+    }
+
+    pub(crate) fn retain_discovery_indexing(
+        &self,
+        observations: &DiscoveryIndexing,
+        selected: &[PhotoLibrary],
+    ) {
+        let libraries = [&self.private_libraries, &self.shared_libraries]
+            .into_iter()
+            .flatten()
+            .flat_map(|map| map.values());
+        for library in std::iter::once(&self.primary_library)
+            .chain(libraries)
+            .chain(selected)
+        {
+            observations.retain_in(library);
+        }
+    }
+
     pub(crate) async fn replay_catalog(
         &self,
         cancel: &tokio_util::sync::CancellationToken,
@@ -163,7 +220,7 @@ impl PhotosService {
 
         let params = Arc::new(params);
         let service_endpoint = Self::build_service_endpoint(&service_root, "private");
-        let zone_id = Arc::new(json!({"zoneName": "PrimarySync"}));
+        let zone_id = Arc::new(json!({"zoneName": PRIMARY_ZONE_NAME}));
 
         crate::support::observe(
             "support_discovery_v1",
@@ -181,6 +238,8 @@ impl PhotosService {
         )
         .await?;
 
+        let mut discovery_indexing = DiscoveryIndexing::default();
+        discovery_indexing.observe(&primary_library);
         Ok(Self {
             shadow_capture: None,
             service_root,
@@ -190,6 +249,7 @@ impl PhotosService {
             private_zones: None,
             private_libraries: None,
             shared_libraries: None,
+            discovery_indexing,
             retry_config,
         })
     }
@@ -306,6 +366,7 @@ impl PhotosService {
             // Publish the exact provider scope only after its readiness probe
             // succeeds. RUNNING remains provisional and cannot certify a checkpoint.
             self.primary_library = self.initialize_library(zone, "private").await?;
+            self.discovery_indexing.observe(&self.primary_library);
             observe_primary_publication(&self.primary_library);
         }
         Ok(())
@@ -321,7 +382,12 @@ impl PhotosService {
                 .private_zones
                 .as_ref()
                 .context("Private zone list was not cached")?;
-            let libs = self.initialize_libraries(zones, "private").await?;
+            let mut indexing = DiscoveryIndexing::default();
+            let libs = self
+                .initialize_libraries(zones, "private", &mut indexing)
+                .await;
+            self.discovery_indexing.extend(indexing);
+            let libs = libs?;
             if let Some(primary) = libs.get(PRIMARY_ZONE_NAME)
                 && primary.is_qualified_private_primary()
             {
@@ -341,8 +407,12 @@ impl PhotosService {
     ) -> anyhow::Result<&HashMap<String, PhotoLibrary>> {
         if self.shared_libraries.is_none() {
             let zones = self.fetch_zone_list("shared").await?;
-            let libs = self.initialize_libraries(&zones, "shared").await?;
-            self.shared_libraries = Some(libs);
+            let mut indexing = DiscoveryIndexing::default();
+            let libs = self
+                .initialize_libraries(&zones, "shared", &mut indexing)
+                .await;
+            self.discovery_indexing.extend(indexing);
+            self.shared_libraries = Some(libs?);
         }
         self.shared_libraries
             .as_ref()
@@ -454,6 +524,7 @@ impl PhotosService {
         &self,
         zones: &[cloudkit::Zone],
         library_type: &str,
+        indexing: &mut DiscoveryIndexing,
     ) -> anyhow::Result<HashMap<String, PhotoLibrary>> {
         let mut libraries = HashMap::new();
         for zone in zones {
@@ -466,6 +537,7 @@ impl PhotosService {
                 continue;
             }
             let library = self.initialize_library(zone, library_type).await?;
+            indexing.observe(&library);
             libraries.insert(zone_name.clone(), library);
         }
         Ok(libraries)
@@ -523,6 +595,7 @@ impl PhotosService {
             private_zones: None,
             private_libraries: None,
             shared_libraries: None,
+            discovery_indexing: DiscoveryIndexing::default(),
             retry_config: RetryConfig::default(),
         }
     }
@@ -545,6 +618,7 @@ impl PhotosService {
             private_zones: None,
             private_libraries: Some(private),
             shared_libraries: Some(shared),
+            discovery_indexing: DiscoveryIndexing::default(),
             retry_config: RetryConfig::default(),
         }
     }
@@ -608,6 +682,7 @@ mod tests {
             private_zones: None,
             private_libraries: None,
             shared_libraries: None,
+            discovery_indexing: DiscoveryIndexing::default(),
             retry_config: RetryConfig::default(),
         }
     }

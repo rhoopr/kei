@@ -48,7 +48,7 @@ Ordinary sync commits eligible provider checkpoints before draining the local me
 
 Keep the previous checkpoint on incomplete token proof, interruption, stale planning, or non-durable recovery. Unknown provider identity keeps work pending. A verified local copy does not prove that the provider deleted its source.
 
-Unknown indexing readiness defers the affected library after two short retries. Watch mode retries incomplete discovery before publishing a library map. See [checkpoint decisions and enumeration](architecture/checkpoints.md).
+Unknown indexing readiness defers the affected library after two short retries. Other libraries can advance their own checkpoints when their plans do not depend on it. Watch mode retries incomplete discovery before publishing a library map. See [checkpoint decisions and enumeration](architecture/checkpoints.md).
 
 Selection evidence limits apply to individual writes and validation operations. Retained history does not consume the next library's or restarted baseline's write allowance.
 

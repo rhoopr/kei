@@ -22,7 +22,9 @@ existing metadata table. Presence is the obligation, including unknown future
 payloads; no schema migration is needed. The previous trusted zone and database
 checkpoints remain unchanged. Cross-zone album sources also contribute readiness.
 
-For an unknown or missing state, kei retries the readiness probe after 5 seconds and again after 15 seconds. If neither probe returns `FINISHED` or `RUNNING`, the cycle skips the affected library and holds the database checkpoint. During startup, watch mode waits for the next interval before retrying incomplete discovery; a one-shot run reports failure. Shutdown interrupts the wait.
+For an unknown or missing state, kei retries the library readiness probe after 5 seconds and again after 15 seconds. If neither probe returns `FINISHED` or `RUNNING`, the cycle skips the affected library and holds the database checkpoint. It can refresh independent plans and advance their zone checkpoints. Plans that need combined collection evidence cannot qualify from an incomplete listing.
+
+On startup, watch mode waits for the next interval before retrying incomplete discovery and uses the normal 2FA wait if the session needs a new code. It carries earlier `RUNNING` observations into the first qualified library map so the cycle can persist the hold before checking for changes. The authenticated systemd worker signals readiness before discovery and reports indexing waits through service status. This does not start sync or the HTTP listener. A one-shot run reports discovery failure, and shutdown interrupts the waits.
 
 While indexing, the download dispatcher uses full queries without incremental
 replay, retained-work admission, metadata repair, retry retirement, or album
@@ -245,6 +247,8 @@ original delta evidence. A link alone does not authorize a target lookup.
 
 Selected sparse-target recovery is owned by
 `src/download/sparse_target.rs`. A fresh source lookup must agree with its retained link. The Photos adapter checks the target owner, zone and child/master pair. An unrestricted full-library plan can materialize missing renditions through the ordinary download pipeline.
+
+Sparse recovery checks target readiness once per link without the library-level backoff. An unavailable target leaves the link unresolved and cannot qualify the source checkpoint.
 
 For a scoped Shared selection, the cycle runs the target library before PrimarySync. A due retained link requests a fresh scan if the target would otherwise replay an older selection. Only a clean scan of the complete current plan and a successful target checkpoint can supply the selection generation used for recovery. The source checks the current child/master pair against the destinations that generation admitted, including overlapping album paths. The checkpoint transaction rechecks those publication receipts and held files.
 

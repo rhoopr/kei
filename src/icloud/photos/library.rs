@@ -171,19 +171,18 @@ impl PhotoLibrary {
     /// hold before checking readiness again.
     pub(super) fn retain_provisional_readiness_from(&self, prior: &Self) {
         if !prior.last_indexing_finished() {
-            self.indexing_finished.store(false, Ordering::Relaxed);
+            self.retain_provisional_readiness();
         }
     }
 
-    pub(crate) async fn check_indexing(&self) -> Result<bool, ICloudError> {
-        #[cfg(test)]
-        if let Some(finished) = self.stub_indexing_finished {
-            return Ok(finished);
-        }
+    pub(super) fn retain_provisional_readiness(&self) {
         self.indexing_finished.store(false, Ordering::Relaxed);
+    }
+
+    pub(crate) async fn check_indexing(&self) -> Result<bool, ICloudError> {
         let mut delays = INDEXING_RETRY_DELAYS_SECS.into_iter();
         loop {
-            match self.probe_indexing().await {
+            match self.check_indexing_once().await {
                 Err(ICloudError::IndexingUnavailable(reason)) => {
                     let Some(seconds) = delays.next() else {
                         return Err(ICloudError::IndexingUnavailable(reason));
@@ -196,7 +195,14 @@ impl PhotoLibrary {
         }
     }
 
-    async fn probe_indexing(&self) -> Result<bool, ICloudError> {
+    /// Check readiness without indexing backoff. Sparse lookups can run this
+    /// once per link; library-level checks own the slower retries.
+    pub(crate) async fn check_indexing_once(&self) -> Result<bool, ICloudError> {
+        #[cfg(test)]
+        if let Some(finished) = self.stub_indexing_finished {
+            return Ok(finished);
+        }
+        self.retain_provisional_readiness();
         let url = format!(
             "{}/records/query?{}",
             self.service_endpoint,

@@ -89,6 +89,7 @@ impl PhotosSession for IndexingSession {
             return Ok(json!({"records":records}));
         }
         if url.contains("/changes/zone?") {
+            let scope = &request["zones"][0]["zoneID"];
             let cursor = request["zones"][0]["syncToken"]
                 .as_str()
                 .unwrap_or("<bootstrap>")
@@ -96,22 +97,18 @@ impl PhotosSession for IndexingSession {
             self.changes.lock().unwrap().push(cursor);
             if request["zones"][0]["syncToken"].is_null() {
                 return Ok(json!({"zones": [{
-                    "zoneID": {"zoneName": ZONE, "ownerRecordName": "_defaultOwner"},
+                    "zoneID": scope,
                     "records": self.records.as_ref(), "syncToken": "query-candidate", "moreComing": false
                 }]}));
             }
             if self.reject_cursor {
-                return Ok(
-                    json!({"zones":[{"zoneID":{"zoneName":ZONE,"ownerRecordName":"_defaultOwner"},
-                    "serverErrorCode":"BAD_REQUEST","reason":"expired retained cursor","syncToken":"","moreComing":false}]}),
-                );
+                return Ok(json!({"zones":[{"zoneID":scope,
+                    "serverErrorCode":"BAD_REQUEST","reason":"expired retained cursor","syncToken":"","moreComing":false}]}));
             }
             // Deliberately no events for omitted assets: only a full inventory
             // can recover them, even though every incremental request succeeds.
-            return Ok(
-                json!({"zones":[{"zoneID":{"zoneName":ZONE,"ownerRecordName":"_defaultOwner"},
-                "records":self.change_records.as_ref(),"syncToken":self.successor,"moreComing":false}]}),
-            );
+            return Ok(json!({"zones":[{"zoneID":scope,
+                "records":self.change_records.as_ref(),"syncToken":self.successor,"moreComing":false}]}));
         }
         if url.contains("/records/lookup?") {
             let records: Vec<_> = request["records"].as_array().unwrap().iter().map(|wanted| {
@@ -1126,6 +1123,151 @@ async fn indexing_normal_recovery_restores_failed_and_omitted_photos_across_rest
         }
     }
     server.verify().await;
+}
+
+#[tokio::test]
+async fn indexing_ready_peer_reconciles_and_advances_while_neighbor_is_unknown() {
+    use crate::icloud::photos::PhotosService;
+    use crate::sync_loop::{planning, precheck};
+
+    const PEER: &str = "SharedSync-TEST";
+    const PEER_CURSOR: &str = "sync_token:SharedSync-TEST";
+    let root = tempfile::tempdir().unwrap();
+    let db = indexing_db(&root.path().join("state.db")).await;
+    let mut config = make_run_cycle_config();
+    config.filters.selection.albums = crate::selection::AlbumSelector::None;
+    config.filters.selection.unfiled = true;
+    config.filters.selection.libraries.shared_all = true;
+    let peer_hold = indexing_reconciliation_key(PEER);
+    let peer_replay = crate::sync_cycle::indexing_replay_key(PEER);
+    let primary_hold = indexing_reconciliation_key(ZONE);
+    for (key, value) in [
+        (CURSOR, "primary-before"),
+        (PEER_CURSOR, "peer-before"),
+        (&peer_hold, "1"),
+    ] {
+        db.set_metadata(key, value).await.unwrap();
+    }
+    let enum_hash = download::compute_config_hash(&config);
+    db.set_metadata(ENUM_CONFIG_HASH_KEY, &enum_hash)
+        .await
+        .unwrap();
+
+    let unknown = provider("FINISHED", &[], "");
+    let primary = library(&unknown, &db).await.library;
+    let ready = provider("FINISHED", &[], "");
+    let peer = PhotoLibrary::new(
+        "https://example.com".into(),
+        Arc::default(),
+        Box::new(ready.clone()),
+        Arc::new(json!({"zoneName":PEER,"ownerRecordName":"_defaultOwner"})),
+        "shared".into(),
+        retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    let libraries = vec![primary.clone(), peer.clone()];
+    let mut service = PhotosService::for_testing_with_libraries(
+        Box::new(unknown.clone()),
+        primary.clone(),
+        HashMap::from([(ZONE.to_owned(), primary)]),
+        HashMap::from([(PEER.to_owned(), peer)]),
+    );
+    service.set_shadow_capture(indexing_capture(&db));
+    let (mut states, mut context) =
+        planning::resolve_library_plans(&mut service, &libraries, &config)
+            .await
+            .unwrap();
+    assert_eq!(states.len(), 2);
+    assert!(states.iter().all(|s| s.cross_zone_libraries.is_empty()));
+    let (_dir, session) = make_shared_session_for_run_cycle().await;
+    let build = make_run_cycle_download_config_builder(root.path(), db.clone());
+    let scope =
+        precheck::DbPrecheckScope::from_config(&config, &states, &build, &enum_hash).unwrap();
+
+    *unknown.readiness.lock().unwrap() = "UNKNOWN";
+    tokio::time::pause();
+    let mut inventory_queries = 0;
+    for round in 0..3 {
+        if round > 0 {
+            for state in &mut states {
+                state.plan_needs_refresh = true;
+            }
+        }
+        planning::refresh_indexing_library_plans(
+            &mut service,
+            &libraries,
+            &config,
+            Some(db.as_ref()),
+            &mut states,
+            &mut context,
+        )
+        .await
+        .unwrap();
+        let precheck =
+            precheck::check_changes_database(Some(db.as_ref()), &states, &mut service, &scope)
+                .await;
+        assert_eq!(precheck, precheck::WatchPrecheck::proceed_all());
+        planning::refresh_needed_library_plans(
+            &mut states,
+            &config.filters.selection,
+            &context,
+            precheck.changed_zones(),
+            &mut 0,
+        )
+        .await;
+
+        let result = run_cycle(
+            &states.iter().collect::<Vec<_>>(),
+            &config,
+            Some(db.as_ref()),
+            &build,
+            download::DownloadControls::download_hidden(),
+            &session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failed_count, 1, "only the unknown library failed");
+        assert!(!result.can_advance_database_checkpoint());
+        assert_eq!(
+            db.get_metadata(CURSOR).await.unwrap().as_deref(),
+            Some("primary-before")
+        );
+        assert!(db.get_metadata(&primary_hold).await.unwrap().is_some());
+        assert_eq!(unknown.queries.load(Ordering::SeqCst), 0);
+        assert!(unknown.changes.lock().unwrap().is_empty());
+        assert!(db.get_metadata(&peer_hold).await.unwrap().is_none());
+        assert_eq!(
+            db.get_metadata(&peer_replay).await.unwrap().is_some(),
+            round == 0
+        );
+        assert_eq!(
+            db.get_metadata(PEER_CURSOR).await.unwrap().as_deref(),
+            Some(if round == 0 {
+                "peer-before"
+            } else {
+                "trusted-after"
+            })
+        );
+        let queries = ready.queries.load(Ordering::SeqCst);
+        if round == 0 {
+            assert!(queries > 0, "the peer qualified a full inventory");
+        } else if round == 1 {
+            // The held inventory can't activate a selection generation. The
+            // first trusted replay can build one for subsequent quiet wakes.
+            inventory_queries = queries;
+        } else {
+            assert_eq!(
+                queries, inventory_queries,
+                "no peer inventory on a quiet wake"
+            );
+        }
+    }
+    assert_eq!(
+        *ready.changes.lock().unwrap(),
+        ["peer-before", "trusted-after"]
+    );
 }
 
 #[tokio::test]
