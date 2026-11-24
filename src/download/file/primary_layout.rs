@@ -305,6 +305,7 @@ pub(in crate::download) struct ManagedPrimaryAuthorization {
     preserved: LayoutFingerprint,
     modified: Option<std::time::SystemTime>,
     publication_time: bool,
+    capture_time: Option<std::time::SystemTime>,
 }
 
 impl ManagedPrimaryAuthorization {
@@ -326,7 +327,8 @@ impl ManagedPrimaryAuthorization {
             preserved_path: path,
             preserved,
             modified: None,
-            publication_time: true,
+            publication_time: false,
+            capture_time: None,
         })
     }
 
@@ -344,6 +346,15 @@ impl ManagedPrimaryAuthorization {
         self.publication_time = publication_time;
         self
     }
+
+    #[must_use]
+    pub(in crate::download) fn with_capture_time(
+        mut self,
+        capture_time: Option<std::time::SystemTime>,
+    ) -> Self {
+        self.capture_time = capture_time;
+        self
+    }
 }
 
 fn set_modified_file(
@@ -358,6 +369,26 @@ fn set_modified_file(
     #[cfg(not(windows))]
     file.sync_all()?;
     Ok(file.metadata()?.modified()?)
+}
+
+/// FAT stores an odd capture second one second lower, so a staged time within
+/// two seconds of the capture is not a proven edit clock. Pre-epoch captures
+/// keep their old classification.
+fn capture_like(prepared: std::time::SystemTime, capture: std::time::SystemTime) -> bool {
+    match (
+        prepared
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs()),
+        capture
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs()),
+    ) {
+        (Some(prepared), Some(capture)) => prepared.abs_diff(capture) <= 2,
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 pub(in crate::download) async fn publish(
@@ -386,13 +417,17 @@ pub(in crate::download) async fn publish(
             let _operation=auth.operation;
             anyhow::ensure!(snapshot_confined(&part)?.as_ref()==Some(&new) && snapshot_confined(&destination)?.as_ref()==Some(&auth.expected),"Retained primary publication input changed");
             // A replacement must read as changed to consumers that detect changes by mtime:
-            // a prepared mtime newer than its predecessor (the edit time) is kept, else
-            // a publication time past the predecessor is used. A preserved local copy
-            // keeps its recorded mtime.
+            // a staged edit time newer than its predecessor is kept, else a publication
+            // time past the predecessor is used. A staged time within the capture window
+            // is not a proven edit clock, so it always takes the publication time; the
+            // window matches the two-second floor because FAT can store an odd capture
+            // second one second lower. A preserved local copy keeps its recorded mtime.
             if auth.publication_time {
                 let predecessor=destination.open_regular()?.metadata()?.modified()?;
                 let prepared_file=part.validate_for_metadata(new.identity)?;
-                if prepared_file.metadata()?.modified()?<=predecessor {
+                let prepared_modified=prepared_file.metadata()?.modified()?;
+                let staged_is_capture_like=auth.capture_time.is_some_and(|capture| capture_like(prepared_modified,capture));
+                if staged_is_capture_like || prepared_modified<=predecessor {
                     // A two-second floor clears whole-second and FAT two-second truncation.
                     let floor=predecessor.checked_add(std::time::Duration::from_secs(2)).unwrap_or_else(std::time::SystemTime::now);
                     let stored=set_modified_file(&prepared_file,std::time::SystemTime::now().max(floor))?;
@@ -667,8 +702,8 @@ fn restore_retirement(entries: &[RetirementEntry]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ManagedPrimaryAuthorization, RetirementEntry, copy_verified, publish, retire_blocking,
-        snapshot, snapshot_blocking,
+        ManagedPrimaryAuthorization, RetirementEntry, capture_like, copy_verified, publish,
+        retire_blocking, snapshot, snapshot_blocking,
     };
     use std::cell::RefCell;
 
@@ -821,6 +856,31 @@ mod tests {
         );
         assert!(!retired.exists());
     }
+    #[test]
+    fn capture_like_covers_coarse_and_pre_epoch_times() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert!(capture_like(
+            UNIX_EPOCH + Duration::from_secs(10),
+            UNIX_EPOCH + Duration::from_secs(12)
+        ));
+        assert!(capture_like(
+            UNIX_EPOCH + Duration::from_secs(10),
+            UNIX_EPOCH + Duration::from_secs(9)
+        ));
+        assert!(!capture_like(
+            UNIX_EPOCH + Duration::from_secs(13),
+            UNIX_EPOCH + Duration::from_secs(10)
+        ));
+        assert!(capture_like(
+            UNIX_EPOCH - Duration::from_secs(1),
+            UNIX_EPOCH - Duration::from_secs(2)
+        ));
+        assert!(!capture_like(
+            UNIX_EPOCH - Duration::from_secs(1),
+            UNIX_EPOCH + Duration::from_secs(1)
+        ));
+    }
+
     #[tokio::test]
     async fn contract_file_publish_no_overwrite_primary_layout_preserves_and_protects_late_writer()
     {
@@ -863,6 +923,54 @@ mod tests {
         assert_eq!(
             tokio::fs::read(&stage).await.unwrap(),
             b"new verified bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn contract_file_publish_no_overwrite_primary_layout_advances_a_coarse_capture_time() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("current.jpg");
+        let stage = root.path().join("prepared.jpg");
+        let history = root.path().join("history/old.jpg");
+        tokio::fs::write(&current, b"old owned bytes")
+            .await
+            .unwrap();
+        tokio::fs::write(&stage, b"new verified bytes")
+            .await
+            .unwrap();
+        let capture = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_001);
+        let predecessor = capture - std::time::Duration::from_secs(60);
+        let stored_capture = capture - std::time::Duration::from_secs(1);
+        for (path, time) in [(&current, predecessor), (&stage, stored_capture)] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        }
+        let old = snapshot(root.path(), &current).await.unwrap().unwrap();
+        let new = snapshot(root.path(), &stage).await.unwrap().unwrap();
+        let saved = copy_verified(root.path(), &current, &history, &old)
+            .await
+            .unwrap();
+        let authorization =
+            ManagedPrimaryAuthorization::preserved("operation".into(), old, history, saved)
+                .unwrap()
+                .with_publication_time(true)
+                .with_capture_time(Some(capture));
+        let installed = publish(root.path(), &stage, &current, &new, Some(authorization))
+            .await
+            .unwrap();
+        assert_eq!(installed.sha256, new.sha256);
+        let modified = std::fs::metadata(&current).unwrap().modified().unwrap();
+        assert!(
+            modified > capture,
+            "a coarse capture time must advance the capture"
+        );
+        assert_ne!(
+            modified, stored_capture,
+            "a capture-like staged time must not be kept"
         );
     }
 

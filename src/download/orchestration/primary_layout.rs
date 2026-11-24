@@ -1992,7 +1992,13 @@ pub(in crate::download) async fn finish(
                             preserved.fingerprint.clone(),
                         )?
                         .with_modified(old.local_modified.map(Into::into))
-                        .with_publication_time(!prepared.local_preserved),
+                        .with_publication_time(!prepared.local_preserved)
+                        .with_capture_time(
+                            member
+                                .record
+                                .as_ref()
+                                .map(|record| record.created_at.into()),
+                        ),
                     )
                 } else {
                     None

@@ -4641,35 +4641,57 @@ async fn primary_layout_edit_changes_primary_mtime() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let primary = root.path().join("media").join("IMG_0501.JPG");
-    let mut mtimes = Vec::new();
-    for (edit, bytes) in [
-        (None, ORIGINAL),
-        (Some(("edit-one", EDIT_ONE)), EDIT_ONE),
-        (None, ORIGINAL),
-    ] {
-        let (result, _) = cycle_options(
-            root.path(),
-            records(&server, edit),
-            false,
-            EditedNaming::Primary,
-            CycleOptions::default(),
-        )
-        .await;
-        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
-        assert_bytes(&primary, bytes);
-        mtimes.push(std::fs::metadata(&primary).unwrap().modified().unwrap());
-    }
+    let (first, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert_eq!(first.failed_count, 0, "{:?}", first.stats);
+    assert_bytes(&primary, ORIGINAL);
     let capture = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     assert_eq!(
-        mtimes[0], capture,
+        std::fs::metadata(&primary).unwrap().modified().unwrap(),
+        capture,
         "first publication keeps the capture mtime"
     );
+    // A no-clock edit would otherwise look newer than a backdated original and
+    // keep the capture mtime, which an mtime scanner may already have indexed.
+    std::fs::File::options()
+        .write(true)
+        .open(&primary)
+        .unwrap()
+        .set_modified(capture - std::time::Duration::from_secs(60))
+        .unwrap();
+    let (edit, _) = cycle_options(
+        root.path(),
+        records(&server, Some(("edit-one", EDIT_ONE))),
+        false,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert_eq!(edit.failed_count, 0, "{:?}", edit.stats);
+    assert_bytes(&primary, EDIT_ONE);
+    let edit_mtime = std::fs::metadata(&primary).unwrap().modified().unwrap();
     assert!(
-        mtimes[1] > capture,
-        "an edit must change the primary mtime so mtime-based consumers notice it"
+        edit_mtime > capture,
+        "a replacement without an edit clock must use the publication time"
     );
+    let (revert, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert_eq!(revert.failed_count, 0, "{:?}", revert.stats);
+    assert_bytes(&primary, ORIGINAL);
     assert!(
-        mtimes[2] > mtimes[1],
+        std::fs::metadata(&primary).unwrap().modified().unwrap() > edit_mtime,
         "a confirmed revert replaces the primary and must change its mtime again"
     );
     let unchanged = std::fs::metadata(&primary).unwrap().modified().unwrap();
@@ -4824,6 +4846,14 @@ async fn primary_layout_preserves_sidecar_bytes_and_fences_old_metadata_queue() 
     assert_eq!(initial.failed_count, 0);
     let old_sidecar = std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap();
     assert!(!old_sidecar.is_empty());
+    let current_sidecar = media.join("IMG_0501.JPG.xmp");
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(86_400);
+    std::fs::File::options()
+        .write(true)
+        .open(&current_sidecar)
+        .unwrap()
+        .set_modified(future)
+        .unwrap();
     let (edited, _) = cycle_options(
         root.path(),
         records(&server, Some(("edit-one", EDIT_ONE))),
@@ -4837,6 +4867,14 @@ async fn primary_layout_preserves_sidecar_bytes_and_fences_old_metadata_queue() 
     assert_eq!(
         std::fs::read(media.join("IMG_0501_original.JPG.xmp")).unwrap(),
         old_sidecar
+    );
+    assert!(
+        std::fs::metadata(&current_sidecar)
+            .unwrap()
+            .modified()
+            .unwrap()
+            < future,
+        "an owned sidecar must not be republished beyond a future predecessor"
     );
     let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
     conn.execute("UPDATE asset_metadata_paths SET metadata_write_failed_at=1 WHERE version_size='original' AND local_path=?1",[media.join("IMG_0501.JPG").to_str().unwrap()]).unwrap();
