@@ -115,6 +115,7 @@ fn manifest_round_trip_preserves_non_utf8_target_and_fingerprints() {
             size: 9,
             sha256: [8; 32],
         },
+        directory: None,
     };
     let bytes = serde_json::to_vec(&expected).unwrap();
     assert_eq!(
@@ -877,6 +878,40 @@ fn retry_until_journal_directory_is_gone(target: &std::path::Path) {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     recover_target(target).unwrap();
+}
+
+#[test]
+fn removal_retains_a_directory_recreated_after_a_stale_reply() {
+    let dir = TempDir::new().unwrap();
+    let journal = dir.path().join("journal");
+    fs::create_dir(&journal).unwrap();
+    let owned = confined(&journal).unwrap().entry_identity().unwrap();
+    // The server completed the removal and replied stale, and a writer recreated
+    // the name before the retry. A filler takes the freed inode first, so the
+    // recreated directory cannot be mistaken for the one this journal owns.
+    fs::remove_dir(&journal).unwrap();
+    fs::create_dir(dir.path().join("filler")).unwrap();
+    fs::create_dir(&journal).unwrap();
+
+    let error = super::remove_owned_directory(&confined(&journal).unwrap(), owned)
+        .expect_err("a recreated directory is retained");
+
+    assert!(
+        format!("{error}").contains("Replacement directory holds the journal name"),
+        "{error}"
+    );
+    assert!(journal.exists(), "the recreated directory is kept");
+}
+
+#[test]
+fn removal_treats_an_absent_directory_as_done() {
+    let dir = TempDir::new().unwrap();
+    let journal = dir.path().join("journal");
+    fs::create_dir(&journal).unwrap();
+    let owned = confined(&journal).unwrap().entry_identity().unwrap();
+    fs::remove_dir(&journal).unwrap();
+
+    super::remove_owned_directory(&confined(&journal).unwrap(), owned).unwrap();
 }
 
 #[test]

@@ -709,6 +709,18 @@ fn restore_retirement(entries: &[RetirementEntry]) {
     // Never replace a later writer; any failed restoration retains the saved
     // entry and the caller's durable journal for another recovery attempt.
     for entry in entries.iter().filter(|entry| entry.expected.is_some()) {
+        // A restore that stopped after moving the entry back leaves one of its
+        // slots behind. Prove and retire it before deciding the public name is
+        // occupied, so a reopen reaches a settled single link.
+        if let Some(expected) = &entry.expected
+            && entry.source.retained_entry_identity().ok() == Some(expected.identity)
+        {
+            let _ = super::platform::reclaim_move_slots(
+                &entry.destination,
+                &entry.source,
+                expected.identity,
+            );
+        }
         if entry.destination.entry_exists().unwrap_or(false)
             && !entry.source.entry_exists().unwrap_or(true)
         {
@@ -1145,6 +1157,39 @@ mod tests {
             1,
             "the restored entry keeps one name"
         );
+    }
+
+    /// A restore that stopped after putting the entry back leaves its slot
+    /// behind; the next pass reclaims that slot and reaches one link.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_reclaims_a_slot_left_after_the_public_name_was_restored() {
+        use super::restore_retirement;
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("photo.jpg");
+        let retired = root.path().join("private/retired");
+        std::fs::create_dir(root.path().join("private")).unwrap();
+        std::fs::write(&retired, b"saved media").unwrap();
+        let expected = snapshot_blocking(root.path(), &retired).unwrap();
+        // The restore already put the entry back and left its recovery slot.
+        std::fs::hard_link(&retired, &media).unwrap();
+        let slot = root.path().join(".kei-move-photo.jpg");
+        std::fs::hard_link(&retired, &slot).unwrap();
+        std::fs::remove_file(&retired).unwrap();
+        assert_eq!(std::fs::metadata(&media).unwrap().nlink(), 2);
+
+        let entries = [RetirementEntry::open(root.path(), &media, &retired, expected).unwrap()];
+        restore_retirement(&entries);
+
+        assert_eq!(
+            std::fs::metadata(&media).unwrap().nlink(),
+            1,
+            "the leftover slot is reclaimed"
+        );
+        assert!(!slot.exists());
+        assert_eq!(std::fs::read(&media).unwrap(), b"saved media");
     }
 
     #[test]

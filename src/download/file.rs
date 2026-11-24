@@ -201,7 +201,7 @@ pub(super) fn retire_published_temp_link(
         );
         platform::move_to_owned_slot_confined(temp, &slot)?;
         if slot.retained_entry_identity()? != identity {
-            let restored = platform::move_to_owned_slot_confined(&slot, temp);
+            let restored = platform::move_layout_confined(&slot, temp);
             anyhow::bail!(
                 "Published temporary name changed while retiring; {}",
                 match restored {

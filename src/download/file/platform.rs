@@ -123,10 +123,10 @@ pub(in crate::download) fn move_layout_confined(
     }
 }
 
-/// Move `source` into a slot this operation owns. The caller proves the slot is
-/// absent first; a filesystem that rejects `RENAME_NOREPLACE` uses a plain
-/// rename, whose only exposure is an entry created at that hidden name in the
-/// same instant.
+/// Move `source` into a slot this operation owns. The slot is created
+/// exclusively first, so the plain rename can only replace a name this call
+/// created; a filesystem that accepts `RENAME_NOREPLACE` never needs the
+/// fallback at all.
 pub(in crate::download) fn move_to_owned_slot_confined(
     source: &ConfinedPath,
     slot: &ConfinedPath,
@@ -136,7 +136,17 @@ pub(in crate::download) fn move_to_owned_slot_confined(
     if let Err(error) = &moved
         && is_renameat2_unsupported(error)
     {
-        return renameat2_confined_blocking(source, slot, 0);
+        // Reserve the name exclusively first, so the plain rename below can only
+        // replace a name this call created. The handle is closed before the
+        // rename: unlinking an open file leaves an NFS `.nfsXXXX` behind.
+        let placeholder = slot.create_new_regular()?;
+        let placeholder_identity = crate::fs_util::file_identity(&placeholder)?;
+        drop(placeholder);
+        let renamed = renameat2_confined_blocking(source, slot, 0);
+        if renamed.is_err() {
+            let _ = slot.remove_verified(placeholder_identity, crate::fs_util::RemovalKind::File);
+        }
+        return renamed;
     }
     moved
 }
@@ -238,6 +248,46 @@ pub(in crate::download) fn reclaim_move_slots(
     Ok(())
 }
 
+/// Consume the public name `source`: take it into a slot this operation owns,
+/// prove the slot holds `identity`, and remove only that slot. A name a writer
+/// replaced is restored with no-replace when the name is free, and otherwise
+/// kept in the slot.
+#[cfg(target_os = "linux")]
+fn consume_owned_name(
+    source: &ConfinedPath,
+    identity: crate::fs_util::FileIdentity,
+) -> std::io::Result<()> {
+    let quarantine = sibling_slot(source, ".kei-quarantine-")?;
+    match existing_identity(&quarantine)? {
+        // An earlier attempt already took the name into this slot.
+        Some(found) if found == identity => {}
+        Some(_) => {
+            return Err(std::io::Error::other(format!(
+                "Retired name slot holds another entry; retained at {}",
+                quarantine.path().display()
+            )));
+        }
+        None => {
+            move_to_owned_slot_confined(source, &quarantine)?;
+            if quarantine.retained_entry_identity()? != identity {
+                // A writer replaced the name after the proof. Restore it only
+                // where that cannot replace a newer entry.
+                return Err(match move_layout_confined(&quarantine, source) {
+                    Ok(()) => std::io::Error::other(
+                        "Retired source name changed while moving; substituted entry restored",
+                    ),
+                    Err(_) => std::io::Error::other(format!(
+                        "Retired source name changed while moving; substituted entry retained at {}",
+                        quarantine.path().display()
+                    )),
+                });
+            }
+        }
+    }
+    quarantine.remove_verified(identity, RemovalKind::File)?;
+    source.sync_parent()
+}
+
 /// Publish a regular file under `destination` and prove both names before the
 /// source name is consumed.
 ///
@@ -255,7 +305,6 @@ fn move_linked_file_confined(
     // these paths were opened.
     let identity = source.retained_entry_identity()?;
     let recovery = sibling_slot(destination, ".kei-move-")?;
-    let quarantine = sibling_slot(source, ".kei-quarantine-")?;
 
     // Create the recovery slot before the destination link: an interrupted move
     // then always leaves the evidence that lets a resume adopt its own names,
@@ -279,15 +328,14 @@ fn move_linked_file_confined(
     match hard_link_confined(source, destination) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if had_recovery && destination.retained_entry_identity()? == identity {
-                // This operation's own link from an earlier attempt.
-            } else {
-                if !had_recovery {
-                    // Do not leave the slot this call created behind.
-                    let _ = recovery.remove_verified(identity, RemovalKind::File);
-                }
-                return Err(error);
+            // An existing destination can never be proven ours: a hard link a
+            // user made to this inode is indistinguishable from one this
+            // operation created. Leave both names in place and report it.
+            if !had_recovery {
+                // Do not leave the slot this call created behind.
+                let _ = recovery.remove_verified(identity, RemovalKind::File);
             }
+            return Err(error);
         }
         Err(error) => return Err(error),
     }
@@ -307,34 +355,9 @@ fn move_linked_file_confined(
         hook(destination.path(), source.path());
     }
 
-    match existing_identity(&quarantine)? {
-        // An earlier attempt already took the source name into this slot.
-        Some(found) if found == identity => {}
-        Some(_) => {
-            return Err(std::io::Error::other(format!(
-                "Move quarantine slot holds another entry; retained at {}",
-                quarantine.path().display()
-            )));
-        }
-        None => {
-            move_to_owned_slot_confined(source, &quarantine)?;
-            if quarantine.retained_entry_identity()? != identity {
-                // A writer replaced the source name after the proof. Restore its
-                // entry instead of unlinking it.
-                return Err(match move_to_owned_slot_confined(&quarantine, source) {
-                    Ok(()) => std::io::Error::other(
-                        "Move source name changed while moving; substituted entry restored",
-                    ),
-                    Err(_) => std::io::Error::other(format!(
-                        "Move source name changed while moving; substituted entry retained at {}",
-                        quarantine.path().display()
-                    )),
-                });
-            }
-        }
-    }
-    quarantine.remove_verified(identity, RemovalKind::File)?;
-    source.sync_parent()?;
+    consume_owned_name(source, identity)?;
+    #[cfg(all(test, target_os = "linux"))]
+    crate::test_helpers::process_death_point("move-source-consumed");
     if destination.retained_entry_identity()? != identity {
         return Err(std::io::Error::other(format!(
             "Move destination changed after the source name was removed; recovery copy retained at {}",
@@ -377,7 +400,7 @@ pub(in crate::download) fn retire_layout_confined(
                 "Alias retirement slot no longer holds the retired entry",
             ));
         }
-        if let Err(error) = source.remove_verified(identity, RemovalKind::File) {
+        if let Err(error) = consume_owned_name(source, identity) {
             // The source still owns the bytes, so a failed retirement must not
             // leave the extra slot name behind.
             let _ = slot.remove_verified(identity, RemovalKind::File);
@@ -795,10 +818,11 @@ mod linux_tests {
         panic!("move child did not reach its process-death point");
     }
 
-    /// The death happens after the destination link and before the source name
-    /// is removed, so the resumed move must treat the existing link as its own.
+    /// A death after the destination link leaves an existing destination name
+    /// that this operation cannot prove it created, so the resumed move refuses
+    /// and keeps every name in place.
     #[test]
-    fn link_publication_process_death_resumes_the_interrupted_move() {
+    fn resume_leaves_both_names_when_it_cannot_prove_the_destination_link() {
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::process::ExitStatusExt;
 
@@ -858,19 +882,101 @@ mod linux_tests {
         assert_eq!(std::fs::read(&moved_name).unwrap(), b"user bytes");
 
         let _fallback = ForcedLinkFallback::new(root.path());
-        move_noreplace_confined(
+        let error = move_noreplace_confined(
             &open(root.path(), &source_name),
             &open(root.path(), &moved_name),
         )
-        .unwrap();
-        assert!(!source_name.exists());
-        assert_eq!(std::fs::metadata(&moved_name).unwrap().nlink(), 1);
+        .expect_err("an unproven destination link is never adopted");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&source_name).unwrap(), b"user bytes");
         assert_eq!(std::fs::read(&moved_name).unwrap(), b"user bytes");
         assert_eq!(
-            std::fs::read_dir(&moved).unwrap().count(),
-            1,
-            "the resumed move leaves exactly one name"
+            std::fs::metadata(&moved_name).unwrap().nlink(),
+            3,
+            "the source, destination and recovery names are all kept"
         );
+    }
+
+    /// A death after the source name is consumed leaves the recovery slot
+    /// behind. The next run finds the destination proven and the source gone, so
+    /// the already-landed path must reclaim that slot.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn resumed_move_reclaims_a_slot_left_after_the_source_name_went() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::process::ExitStatusExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let album = root.path().join("album");
+        let moved = root.path().join("moved");
+        std::fs::create_dir(&album).unwrap();
+        std::fs::create_dir(&moved).unwrap();
+        std::fs::write(album.join("note.txt"), b"user bytes").unwrap();
+        std::fs::write(
+            root.path().join("fixture-owner"),
+            b"kei-synthetic-process-death",
+        )
+        .unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "download::file::platform::linux_tests::move_link_process_death_child",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("KEI_TEST_PROCESS_DEATH_ROOT", root.path())
+            .env("KEI_TEST_PROCESS_DEATH_POINT", "move-source-consumed")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let ready = root.path().join("ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !ready.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("move child exited before its process-death point: {status}");
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _status = child.wait().unwrap();
+                panic!("move child did not reach its process-death point");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        child.kill().unwrap();
+        assert_eq!(child.wait().unwrap().signal(), Some(9));
+
+        let source_name = album.join("note.txt");
+        let moved_name = moved.join("note.txt");
+        assert!(
+            !source_name.exists(),
+            "the source name was consumed before the death"
+        );
+        assert_eq!(
+            std::fs::metadata(&moved_name).unwrap().nlink(),
+            2,
+            "the destination and the recovery slot survived the death"
+        );
+
+        let identity = open(root.path(), &moved_name).entry_identity().unwrap();
+        let _fallback = ForcedLinkFallback::new(root.path());
+        super::super::primary_layout::move_album_entry(
+            root.path(),
+            &source_name,
+            &moved_name,
+            identity,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&moved_name).unwrap().nlink(),
+            1,
+            "the resumed run reclaimed the slot"
+        );
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&moved_name).unwrap(), b"user bytes");
     }
 
     /// A foreign writer that replaces the destination after the fallback proved
@@ -980,21 +1086,29 @@ mod linux_tests {
         )
         .expect_err("a substituted source refuses the move");
 
-        assert!(format!("{error}").contains("substituted entry"), "{error}");
+        assert!(
+            format!("{error}").contains("substituted entry retained at"),
+            "{error}"
+        );
+        let slot = format!("{error}")
+            .split("retained at ")
+            .nth(1)
+            .expect("the error names the retained entry")
+            .trim()
+            .to_owned();
         assert_eq!(
-            std::fs::read(album.join("note.txt")).unwrap(),
+            std::fs::read(&slot).unwrap(),
             b"foreign bytes",
-            "the writer's entry is back at its name"
+            "the writer's entry is kept in the slot this move owns"
+        );
+        assert!(
+            !album.join("note.txt").exists(),
+            "no-replace restoration leaves the name alone when it cannot prove it"
         );
         assert_eq!(
             std::fs::read(moved.join("note.txt")).unwrap(),
             b"user bytes",
             "the moved bytes stay published"
-        );
-        assert_eq!(
-            std::fs::read_dir(&moved).unwrap().count(),
-            2,
-            "the destination and the recovery copy are kept"
         );
     }
 }

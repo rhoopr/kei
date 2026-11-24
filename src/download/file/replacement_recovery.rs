@@ -44,6 +44,10 @@ struct Manifest {
     target: Vec<u8>,
     original: Fingerprint,
     replacement: Fingerprint,
+    /// Identity of the journal directory this record created. Removal acts only
+    /// on it, so a directory recreated at the name is never removed.
+    #[serde(default)]
+    directory: Option<FileIdentity>,
 }
 
 struct Journal {
@@ -231,6 +235,22 @@ fn journal_remainder(manifest: &ConfinedPath, retired: &[FileIdentity]) -> Resul
     Ok(remainder)
 }
 
+/// Remove `directory` only while it still holds the identity this journal owns.
+/// A stale reply can follow a removal the server completed, so absence counts as
+/// done, and a directory recreated at the name is retained.
+fn remove_owned_directory(directory: &ConfinedPath, owned: FileIdentity) -> Result<()> {
+    match directory.entry_identity() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Ok(current) if current == owned => {}
+        Ok(_) => {
+            anyhow::bail!("Replacement directory holds the journal name; retaining all bytes")
+        }
+        Err(error) => return Err(error.into()),
+    }
+    unlink(directory, libc::AT_REMOVEDIR)?;
+    Ok(())
+}
+
 // Only a manifest-less, empty directory is terminal housekeeping. Revalidate
 // through its retained parent capability so a renamed/recreated journal or an
 // unknown entry cannot be mistaken for the completed transaction. Entries
@@ -241,6 +261,7 @@ fn remove_empty_directory(
     directory: &ConfinedPath,
     manifest: &ConfinedPath,
     retired: &[FileIdentity],
+    owned: Option<FileIdentity>,
 ) -> Result<()> {
     let verify_empty = || -> Result<Remainder> {
         retry_stale(|_| {
@@ -272,27 +293,21 @@ fn remove_empty_directory(
         return Ok(());
     }
     // The directory name may be recreated after a removal the server reported as
-    // stale, so every attempt re-reads the entry and acts only on the identity
-    // this journal owns.
-    let owned = match directory.entry_identity() {
-        Ok(identity) => identity,
-        // Already removed by an earlier attempt.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let removal = retry_stale(|_| {
-        match directory.entry_identity() {
-            // A stale reply can follow a removal the server completed.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Ok(current) if current == owned => {}
-            Ok(_) => {
-                anyhow::bail!("Replacement directory holds the journal name; retaining all bytes")
+    // stale, so removal acts only on the identity this journal recorded when it
+    // created the directory. A journal written before that record falls back to
+    // the identity of the directory it is inspecting.
+    let owned = match owned {
+        Some(owned) => owned,
+        None => {
+            tracing::warn!("Replacement journal directory identity is not recorded; inspecting it");
+            match directory.open_directory() {
+                Ok(handle) => crate::fs_util::file_identity(&handle)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
         }
-        unlink(directory, libc::AT_REMOVEDIR)?;
-        Ok(())
-    });
+    };
+    let removal = retry_stale(|_| remove_owned_directory(directory, owned));
     if let Err(error) = removal {
         if classify_journal_io_error(&error) != Some(libc::ENOTEMPTY) {
             return Err(error);
@@ -373,6 +388,7 @@ impl Journal {
             });
         }
         let manifest = confined(&directory.path().join("manifest.json"))?;
+        let directory_identity = crate::fs_util::file_identity(&directory.open_directory()?)?;
         let mut lock = manifest.create_new_regular()?;
         anyhow::ensure!(lock.try_lock_exclusive()?, "Replacement journal is busy");
         let evidence = Manifest {
@@ -385,6 +401,7 @@ impl Journal {
                 .to_vec(),
             original: expected.into(),
             replacement: replacement.into(),
+            directory: Some(directory_identity),
         };
         lock.write_all(&serde_json::to_vec(&evidence)?)?;
         lock.sync_all()?;
@@ -407,7 +424,7 @@ impl Journal {
         let Some(read) = manifest.open_optional_regular()? else {
             // mkdir may have succeeded immediately before interruption. Only
             // an empty directory can be removed; unknown contents stay intact.
-            remove_empty_directory(&directory, &manifest, &[])?;
+            remove_empty_directory(&directory, &manifest, &[], None)?;
             return Ok(None);
         };
         let expected_identity = file_identity(&read)?;
@@ -456,7 +473,7 @@ impl Journal {
             unlink(&manifest, 0)?;
             FileExt::unlock(&lock)?;
             drop(lock);
-            remove_empty_directory(&directory, &manifest, &[expected_identity])?;
+            remove_empty_directory(&directory, &manifest, &[expected_identity], None)?;
             return Ok(None);
         }
         let evidence: Manifest = serde_json::from_slice(&bytes)?;
@@ -562,7 +579,12 @@ impl Journal {
         FileExt::unlock(lock)?;
         drop(self.lock.take());
         retired.push(manifest_identity);
-        remove_empty_directory(&self.directory, &self.manifest, &retired)?;
+        remove_empty_directory(
+            &self.directory,
+            &self.manifest,
+            &retired,
+            self.evidence.directory,
+        )?;
         Ok(())
     }
 
