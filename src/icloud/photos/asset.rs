@@ -551,6 +551,31 @@ fn is_test_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1" | "[::1]" | "localhost")
 }
 
+/// Permit only a filename stem restyle with the exact same terminal extension.
+///
+/// Extension comparison is byte-exact because unknown UTIs preserve the
+/// provider extension and live-photo MOV naming inspects it. Missing,
+/// extension-less and extension-only names fall back to exact equality.
+fn same_presentation_filename(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) if a == b => true,
+        (Some(a), Some(b)) => {
+            let Some((a_stem, a_extension)) = a.rsplit_once('.') else {
+                return false;
+            };
+            let Some((b_stem, b_extension)) = b.rsplit_once('.') else {
+                return false;
+            };
+            !a_stem.is_empty()
+                && !b_stem.is_empty()
+                && !a_extension.is_empty()
+                && a_extension == b_extension
+        }
+        _ => false,
+    }
+}
+
 impl PhotoAsset {
     /// Only a current adjusted still sourced from CPLAsset has proven edit time.
     /// Original, alternative and video resource clocks remain unknown.
@@ -566,6 +591,23 @@ impl PhotoAsset {
     /// Compare parsed planning evidence while allowing signed URL renewal.
     /// URL aliasing between versions remains significant to rendition selection.
     pub(crate) fn same_download_observation(&self, other: &Self) -> bool {
+        self.same_download_evidence(other) && self.filename == other.filename
+    }
+
+    /// Compare an old unadmitted lookup with its verified successor.
+    ///
+    /// The successor may restyle the filename stem, but the terminal extension
+    /// remains significant: unknown UTIs keep the provider extension, and
+    /// live-photo MOV companions derive their name from it. Missing,
+    /// extension-less and extension-only names are not presentation-safe.
+    pub(crate) fn same_unplanned_download(&self, other: &Self) -> bool {
+        self.same_download_evidence(other)
+            && same_presentation_filename(self.filename.as_deref(), other.filename.as_deref())
+    }
+
+    /// Provider identity, rendition facts, metadata and URL aliasing. Kept
+    /// separate from filename policy so both comparators share one definition.
+    fn same_download_evidence(&self, other: &Self) -> bool {
         let same_float = |a: Option<f64>, b: Option<f64>| match (a, b) {
             (None, None) => true,
             (Some(a), Some(b)) => a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits(),
@@ -575,7 +617,6 @@ impl PhotoAsset {
             && self.asset_record_name == other.asset_record_name
             && self.state_record_name == other.state_record_name
             && self.source_zone == other.source_zone
-            && self.filename == other.filename
             && self.item_type_val == other.item_type_val
             && same_float(self.asset_date_ms, other.asset_date_ms)
             && same_float(self.added_date_ms, other.added_date_ms)
@@ -3743,5 +3784,129 @@ mod tests {
             deleted: None,
         };
         assert_eq!(classify_change_reason(&record), ChangeReason::Created);
+    }
+
+    #[test]
+    fn unplanned_download_accepts_only_same_extension_filename_restyling() {
+        let original = crate::test_helpers::TestPhotoAsset::new("COMPARE_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let renamed = crate::test_helpers::TestPhotoAsset::new("COMPARE_1")
+            .filename("IMG_0001 (1).JPG")
+            .build();
+        assert!(original.same_download_observation(&original));
+        assert!(original.same_unplanned_download(&original));
+        assert!(
+            !original.same_download_observation(&renamed),
+            "incremental dedup must keep requiring the exact filename"
+        );
+        assert!(original.same_unplanned_download(&renamed));
+
+        for filename in ["IMG_0001.HEIC", "IMG_0001.jpg", "IMG_0001", "IMG_0001."] {
+            let changed = crate::test_helpers::TestPhotoAsset::new("COMPARE_1")
+                .filename(filename)
+                .build();
+            assert!(
+                !original.same_unplanned_download(&changed),
+                "{filename} must not be a presentation-only filename change"
+            );
+        }
+    }
+
+    #[test]
+    fn unplanned_download_requires_the_shared_download_evidence() {
+        let original = crate::test_helpers::TestPhotoAsset::new("COMPARE_2")
+            .filename("IMG_0002.JPG")
+            .build();
+        let renamed = crate::test_helpers::TestPhotoAsset::new("COMPARE_2")
+            .filename("RENAMED.JPG")
+            .build();
+        assert!(original.same_unplanned_download(&renamed));
+
+        let changed_resource = crate::test_helpers::TestPhotoAsset::new("COMPARE_2")
+            .filename("RENAMED.JPG")
+            .orig_checksum("different")
+            .build();
+        let changed_metadata = crate::test_helpers::TestPhotoAsset::new("COMPARE_2")
+            .filename("RENAMED.JPG")
+            .favorite(true)
+            .build();
+        let changed_media_type = crate::test_helpers::TestPhotoAsset::new("COMPARE_2")
+            .filename("RENAMED.JPG")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .build();
+        for changed in [changed_resource, changed_metadata, changed_media_type] {
+            assert!(!original.same_unplanned_download(&changed));
+        }
+    }
+
+    #[test]
+    fn unplanned_download_still_rejects_url_alias_changes() {
+        let aliased = crate::test_helpers::TestPhotoAsset::new("COMPARE_3")
+            .filename("IMG_0003.JPG")
+            .orig_url("https://p01.icloud-content.com/shared")
+            .alt_version(
+                "https://p01.icloud-content.com/shared",
+                "alt",
+                2000,
+                "public.jpeg",
+            )
+            .build();
+        let distinct = crate::test_helpers::TestPhotoAsset::new("COMPARE_3")
+            .filename("RENAMED.JPG")
+            .orig_url("https://p01.icloud-content.com/orig")
+            .alt_version(
+                "https://p01.icloud-content.com/alt",
+                "alt",
+                2000,
+                "public.jpeg",
+            )
+            .build();
+        assert!(!aliased.same_unplanned_download(&distinct));
+    }
+
+    fn comparator_asset(record_name: &str, filename: Option<&str>) -> PhotoAsset {
+        let mut fields = json!({
+            "itemType": {"value": "public.jpeg"},
+            "resOriginalRes": {"value": {
+                "size": 1000,
+                "downloadURL": "https://p01.icloud-content.com/orig",
+                "fileChecksum": "abc123",
+            }},
+            "resOriginalFileType": {"value": "public.jpeg"},
+        });
+        if let Some(filename) = filename {
+            fields["filenameEnc"] = json!({"value": filename, "type": "STRING"});
+        }
+        make_asset(
+            json!({"recordName": record_name, "fields": fields}),
+            json!({"fields": {}}),
+        )
+    }
+
+    #[test]
+    fn unplanned_download_requires_an_unambiguous_shared_filename_shape() {
+        let absent = comparator_asset("COMPARE_4", None);
+        assert!(absent.same_unplanned_download(&absent));
+        for present in ["IMG_0004.JPG", "IMG_0004", "IMG_0004."] {
+            let asset = comparator_asset("COMPARE_4", Some(present));
+            assert!(
+                !absent.same_unplanned_download(&asset),
+                "{present} must not match a missing filename"
+            );
+        }
+
+        let no_extension = comparator_asset("COMPARE_4", Some("IMG_0004"));
+        assert!(no_extension.same_unplanned_download(&no_extension));
+        assert!(
+            !no_extension.same_unplanned_download(&comparator_asset("COMPARE_4", Some("RENAMED")))
+        );
+
+        let trailing_dot = comparator_asset("COMPARE_4", Some("IMG_0004."));
+        assert!(trailing_dot.same_unplanned_download(&trailing_dot));
+        assert!(
+            !trailing_dot.same_unplanned_download(&comparator_asset("COMPARE_4", Some("RENAMED.")))
+        );
     }
 }

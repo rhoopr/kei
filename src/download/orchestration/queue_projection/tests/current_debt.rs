@@ -77,7 +77,7 @@ impl PhotosSession for SplitFirstScan {
 }
 
 #[tokio::test]
-async fn repaired_first_baseline_token_is_held_by_an_older_deferred_selection() {
+async fn repaired_first_baseline_retains_independent_retry_across_a_zone_checkpoint() {
     check_repaired_baseline_after_deferral(Successor::DifferentPhoto).await;
 }
 
@@ -87,7 +87,7 @@ async fn repaired_first_baseline_accepts_an_exact_completed_successor() {
 }
 
 #[tokio::test]
-async fn repaired_first_baseline_does_not_settle_a_renamed_photo() {
+async fn repaired_first_baseline_accepts_a_rename_before_path_admission() {
     check_repaired_baseline_after_deferral(Successor::Renamed).await;
 }
 
@@ -96,10 +96,18 @@ async fn repaired_first_baseline_keeps_hold_when_edited_url_becomes_alias() {
     check_repaired_baseline_after_deferral(Successor::AliasedEdit).await;
 }
 
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn repaired_first_baseline_keeps_hold_without_a_writer_for_the_omitted_photo() {
+    check_repaired_baseline_after_deferral(Successor::DifferentPhotoWithWriter).await;
+}
+
 enum Successor {
     Exact,
     Renamed,
     DifferentPhoto,
+    #[cfg(feature = "xmp")]
+    DifferentPhotoWithWriter,
     AliasedEdit,
 }
 
@@ -122,6 +130,11 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
     let (trace, _guard) = crate::test_helpers::TracingCapture::install();
     let mut f = Fixture::new().await;
     f.config.folder_structure_albums = Arc::from("{album}");
+    #[cfg(feature = "xmp")]
+    if matches!(successor, Successor::DifferentPhotoWithWriter) {
+        f.config.metadata.xmp_sidecar = true;
+        f.config.post_sync_metadata = true;
+    }
     let config = make_run_cycle_config();
     let (_session_dir, session) = make_shared_session_for_run_cycle().await;
     f.db.acquire_lock("first baseline without a cursor")
@@ -132,6 +145,10 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
         .await
         .unwrap();
     select(&f, "c", &server);
+    if matches!(successor, Successor::DifferentPhoto) {
+        f.session.records.lock().unwrap()[0]["fields"]["filenameEnc"]["value"] =
+            json!("retained.jpg");
+    }
     if matches!(successor, Successor::AliasedEdit) {
         add_edited_rendition(&f, &format!("{}/media?edited", server.uri()));
         let body =
@@ -146,7 +163,6 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
         );
     }
     *f.session.corrupt.lock().unwrap() = Some("missing-c");
-    let ordinary_passes = |f: &Fixture| vec![destination_pass(f, "A"), destination_pass(f, "B")];
     let first = baseline_cycle(&f, &config, &session, ordinary_passes(&f)).await;
     assert!(first.stats.selected_work_remaining);
     assert_eq!(f.db.get_metadata(PRIMARY_KEY).await.unwrap(), None);
@@ -176,10 +192,11 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
     assert!(has_deferred_hold("false"));
 
     f = reopen_destination_fixture(f).await;
-    let master = if matches!(successor, Successor::DifferentPhoto) {
-        "m"
-    } else {
-        "c"
+    let master = match successor {
+        Successor::DifferentPhoto => "m",
+        #[cfg(feature = "xmp")]
+        Successor::DifferentPhotoWithWriter => "m",
+        _ => "c",
     };
     select(&f, master, &server);
     if matches!(successor, Successor::AliasedEdit) {
@@ -198,11 +215,12 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
     };
     *f.session.corrupt.lock().unwrap() = None;
     // Start a new generation without changing the selection configuration.
-    f.capture(
-        vec![json!({"recordName":"new-observation","recordType":"FutureOpaque"})],
-        "change",
-    )
-    .await;
+    let change = if matches!(successor, Successor::DifferentPhoto) {
+        selected_records("m", &server)
+    } else {
+        vec![json!({"recordName":"new-observation","recordType":"FutureOpaque"})]
+    };
+    f.capture(change, "change").await;
     let mut split = destination_pass_with_session(
         &f.session,
         "B",
@@ -235,7 +253,7 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
             assert!(!edited.exists());
         }
     }
-    if matches!(successor, Successor::Exact) {
+    if matches!(successor, Successor::Exact | Successor::Renamed) {
         assert_eq!(
             f.db.get_metadata(PRIMARY_KEY).await.unwrap().as_deref(),
             Some("destination-rank-proof"),
@@ -273,6 +291,20 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
             assert_eq!(historical_evidence(&f, &original), evidence);
             f = reopen_destination_fixture(f).await;
         }
+    } else if matches!(successor, Successor::DifferentPhoto) {
+        // The current files are B's. A is neither complete nor deleted. Its
+        // exact historical pair and selected pass remain the only retry owner.
+        assert_eq!(
+            f.db.get_metadata(PRIMARY_KEY).await.unwrap().as_deref(),
+            Some("destination-rank-proof"),
+            "{result:?}"
+        );
+        assert!(result.stats.selected_work_remaining && result.failed_count > 0);
+        assert!(!result.can_advance_database_checkpoint());
+        f = Box::pin(recover_omitted_lookup(
+            f, &config, &session, &server, &original,
+        ))
+        .await;
     } else {
         assert!(result.stats.selected_work_remaining);
         assert_eq!(
@@ -281,6 +313,17 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
         );
         assert_eq!(f.db.get_metadata(PRIMARY_KEY).await.unwrap(), None);
         assert!(has_deferred_hold("true"));
+        f = reopen_destination_fixture(f).await;
+        f.db.make_selection_retry_due(super::owner(), "asset-c".into())
+            .await
+            .unwrap();
+        let due = baseline_cycle(&f, &config, &session, ordinary_passes(&f)).await;
+        assert!(
+            due.stats.selected_work_remaining && due.failed_count > 0,
+            "{due:?}"
+        );
+        assert_eq!(f.db.get_metadata(PRIMARY_KEY).await.unwrap(), None);
+        assert_eq!(historical_evidence(&f, &original), evidence);
     }
     for album in ["A", "B"] {
         assert_eq!(
@@ -297,6 +340,133 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
         b"retained-sidecar"
     );
     server.verify().await;
+}
+
+fn ordinary_passes(f: &Fixture) -> Vec<AlbumPass> {
+    vec![destination_pass(f, "A"), destination_pass(f, "B")]
+}
+
+async fn recover_omitted_lookup(
+    mut f: Fixture,
+    config: &crate::config::Config,
+    session: &crate::auth::SharedSession,
+    server: &MockServer,
+    original: &str,
+) -> Fixture {
+    let evidence = historical_evidence(&f, original);
+    let retained = retained_inventory(&f);
+    // Interrupt the next zone cursor write after B was published and the
+    // earlier zone checkpoint committed. A and both verified B copies survive.
+    f.db.acquire_lock("inject quiet checkpoint fault")
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_quiet_zone BEFORE INSERT ON metadata
+             WHEN NEW.key='sync_token:PrimarySync' AND NEW.value='quiet-zone-cursor'
+             BEGIN SELECT RAISE(ABORT,'quiet zone commit interrupted'); END;",
+        )
+        .unwrap();
+    let interrupted = baseline_cycle(&f, config, session, ordinary_passes(&f)).await;
+    assert!(
+        interrupted.stats.state_write_failures > 0,
+        "{interrupted:?}"
+    );
+    assert_eq!(
+        f.db.get_metadata(PRIMARY_KEY).await.unwrap().as_deref(),
+        Some("destination-rank-proof")
+    );
+    assert_eq!(historical_evidence(&f, original), evidence);
+    f.db.acquire_lock("release quiet checkpoint fault")
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_quiet_zone")
+        .unwrap();
+    for due in [false, true, false, true] {
+        f = reopen_destination_fixture(f).await;
+        if due {
+            f.db.make_selection_retry_due(super::owner(), "asset-c".into())
+                .await
+                .unwrap();
+        }
+        let passes = ordinary_passes(&f);
+        assert_eq!(
+            crate::download::has_due_selection_work(&passes, &f.config, controls())
+                .await
+                .unwrap(),
+            Some(due)
+        );
+        f.session.lookup_names.lock().unwrap().clear();
+        let ranks = f.session.rank_calls.load(Ordering::SeqCst);
+        let quiet = baseline_cycle(&f, config, session, passes).await;
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert!(quiet.stats.selected_work_remaining && quiet.failed_count > 0);
+        assert!(!quiet.can_advance_database_checkpoint());
+        assert_eq!(
+            f.db.get_metadata(PRIMARY_KEY).await.unwrap().as_deref(),
+            Some("quiet-zone-cursor"),
+            "{quiet:?}"
+        );
+        assert_eq!(retained_inventory(&f), retained);
+        assert_eq!(historical_evidence(&f, original), evidence);
+        assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), ranks);
+        let lookups = f.session.lookup_names.lock().unwrap().clone();
+        assert_eq!(!lookups.is_empty(), due, "{lookups:?}");
+        assert!(
+            lookups
+                .iter()
+                .all(|name| matches!(name.as_str(), "asset-c" | "c"))
+        );
+    }
+    // A failed backoff write must remain due. The last committed cursor
+    // still reaches that same decision without another inventory.
+    f.db.make_selection_retry_due(super::owner(), "asset-c".into())
+        .await
+        .unwrap();
+    f.db.acquire_lock("interrupt deferred retry update").unwrap().execute_batch(
+            "CREATE TRIGGER fail_lookup_retry BEFORE UPDATE OF attempts ON provider_active_decisions
+             WHEN OLD.child='asset-c' AND NEW.attempts>OLD.attempts
+             BEGIN SELECT RAISE(ABORT,'deferred retry interrupted'); END;"
+        ).unwrap();
+    let failed = baseline_cycle(&f, config, session, ordinary_passes(&f)).await;
+    assert!(failed.stats.state_write_failures > 0, "{failed:?}");
+    assert!(!failed.can_advance_database_checkpoint());
+    assert_eq!(historical_evidence(&f, original), evidence);
+    assert_eq!(retained_inventory(&f), retained);
+    f.db.acquire_lock("release backoff fault")
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_lookup_retry")
+        .unwrap();
+    server.verify().await;
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/media"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(2)
+        .mount(server)
+        .await;
+    f = reopen_destination_fixture(f).await;
+    select(&f, "c", server);
+    f.session.records.lock().unwrap()[0]["fields"]["filenameEnc"]["value"] = json!("retained.jpg");
+    assert_eq!(
+        crate::download::has_due_selection_work(&ordinary_passes(&f), &f.config, controls())
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    let ranks = f.session.rank_calls.load(Ordering::SeqCst);
+    for downloads in [2, 0] {
+        let recovered = baseline_cycle(&f, config, session, ordinary_passes(&f)).await;
+        assert_eq!(recovered.stats.downloaded, downloads, "{recovered:?}");
+        assert_eq!(recovered.failed_count, 0, "{recovered:?}");
+        assert!(!recovered.stats.selected_work_remaining);
+        assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), ranks);
+        for album in ["A", "B"] {
+            assert_eq!(
+                std::fs::read(f.config.directory.join(album).join("retained.JPG")).unwrap(),
+                MEDIA
+            );
+        }
+        f = reopen_destination_fixture(f).await;
+    }
+    f
 }
 
 async fn baseline_cycle(
@@ -341,15 +511,16 @@ async fn baseline_cycle(
     .unwrap()
 }
 
-fn retained_inventory(f: &Fixture) -> (i64, i64, i64) {
+fn retained_inventory(f: &Fixture) -> (i64, i64, i64, i64) {
     f.db.acquire_lock("measuring retained inventory")
         .unwrap()
         .query_row(
             "SELECT (SELECT count(*) FROM provider_active_generations), \
                     (SELECT coalesce(sum(length(body)),0) FROM provider_selection_rank_pages), \
-                    (SELECT coalesce(sum(length(manifest)),0) FROM provider_active_decisions)",
+                    (SELECT coalesce(sum(length(manifest)),0) FROM provider_active_decisions), \
+                    (SELECT count(*) FROM provider_active_decisions)",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap()
 }
@@ -561,8 +732,9 @@ async fn settle_retained_fixture(
     let current = cycle(f).await;
     assert_eq!(current.stats.downloaded, selected_count, "{current:?}");
     assert_eq!(current.stats.failed, 0, "{current:?}");
+    assert!(!current.checkpoint.sync_token_blocked, "{current:?}");
     assert_eq!(
-        current.checkpoint.sync_token_blocked,
+        current.stats.selected_work_remaining,
         selected_count != original_count
     );
     original
@@ -617,7 +789,11 @@ async fn check_mixed_retained_lookup_batch(settled_count: u64, expected_lookups:
         use_paged_selection(&mut f);
         let result = cycle(&f).await;
         assert!(result.stats.selected_work_remaining, "{result:?}");
-        assert!(result.sync_token.is_none());
+        assert_eq!(
+            result.sync_token.as_deref(),
+            Some("quiet-zone-cursor"),
+            "{result:?}"
+        );
         assert_eq!(result.stats.downloaded, 0);
         let lookups = std::mem::take(&mut *f.session.lookup_names.lock().unwrap());
         if expected_lookup {
@@ -679,7 +855,7 @@ async fn retained_checkpoint_successor_profile() {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .unwrap();
-        let (_, rank_bytes, decision_bytes) = retained_inventory(&f);
+        let (_, rank_bytes, decision_bytes, _) = retained_inventory(&f);
         for _ in 0..3 {
             let start = Instant::now();
             assert!(
@@ -696,7 +872,7 @@ async fn retained_checkpoint_successor_profile() {
             let scheduler = start.elapsed();
             let start = Instant::now();
             assert!(
-                f.db.selection_checkpoint_hold(super::owner(), scope.clone(), hash.clone(), false)
+                f.db.selection_debt(super::owner(), scope.clone(), hash.clone(), false)
                     .await
                     .unwrap()
                     .is_none()

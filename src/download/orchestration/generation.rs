@@ -26,7 +26,7 @@ use crate::icloud::photos::{
 use crate::state::ReconciliationStateStore;
 use crate::state::db::provider_generations::{
     ActiveDecision, ActiveGeneration, AdmissionChecks, GenerationSpec, INDEPENDENT_ALBUM_COPIES,
-    MAX_GENERATION_BYTES, SelectionAttempt, SelectionCheckpointHold,
+    MAX_GENERATION_BYTES, SelectionAttempt, SelectionCheckpointHold, SelectionDebt,
 };
 use crate::state::db::provider_selection::{
     SelectionDecision, SelectionDestination, SelectionOutcome, SelectionPath,
@@ -39,10 +39,15 @@ const DEFERRED_REASON: &str = "selection_generation_deferred";
 #[error("Selected identity retry is not due")]
 pub(in crate::download) struct SelectionRetryDeferred;
 
+#[derive(Debug, thiserror::Error)]
+#[error("Retained selected photo lookup remains unresolved")]
+struct RetainedLookupUnavailable;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::download) enum SelectionConfirmationErrorClass {
     SessionExpired,
     RetryDeferred,
+    RetainedLookup,
     Refused,
 }
 
@@ -55,6 +60,8 @@ pub(in crate::download) fn classify_selection_confirmation_error(
         SelectionConfirmationErrorClass::SessionExpired
     } else if error.downcast_ref::<SelectionRetryDeferred>().is_some() {
         SelectionConfirmationErrorClass::RetryDeferred
+    } else if error.is::<RetainedLookupUnavailable>() {
+        SelectionConfirmationErrorClass::RetainedLookup
     } else {
         SelectionConfirmationErrorClass::Refused
     }
@@ -149,17 +156,13 @@ pub(super) async fn hold_retained_debt(
     let Some(context) = &config.selection_context else {
         return Ok(());
     };
-    if let Some(hold) = context.checkpoint_hold(config).await? {
+    if let Some(hold) = context.apply_debt(config, result, false).await? {
         tracing::warn!(
             diagnostic = "selection_checkpoint_hold_v1",
             blocker = hold.blocker,
             retained_generation = hold.retained_generation,
             "Unfinished selection work holds the provider checkpoint"
         );
-        result.block_incremental_token(DEFERRED_REASON);
-        result.checkpoint.scanned_generation = None;
-        result.stats.selected_work_remaining = true;
-        result.sync_token = None;
     }
     Ok(())
 }
@@ -353,24 +356,54 @@ pub(crate) struct SelectionRun {
 }
 
 impl SelectionContext {
-    async fn checkpoint_debt(&self, config: &DownloadConfig) -> Result<bool> {
-        Ok(self.checkpoint_hold(config).await?.is_some())
+    async fn has_work(&self, config: &DownloadConfig) -> Result<bool> {
+        Ok(self.debt(config).await?.is_some())
     }
 
-    async fn checkpoint_hold(
-        &self,
-        config: &DownloadConfig,
-    ) -> Result<Option<SelectionCheckpointHold>> {
+    async fn debt(&self, config: &DownloadConfig) -> Result<Option<SelectionDebt>> {
         Ok(self
             .capture
             .db
-            .selection_checkpoint_hold(
+            .selection_debt(
                 self.capture.owner.clone(),
                 self.scope.clone(),
                 self.config_hash.clone(),
                 config.post_sync_metadata,
             )
             .await?)
+    }
+
+    async fn apply_debt(
+        &self,
+        config: &DownloadConfig,
+        result: &mut SyncResult,
+        membership_removal: bool,
+    ) -> Result<Option<SelectionCheckpointHold>> {
+        let Some(debt) = self.debt(config).await? else {
+            return Ok(None);
+        };
+        result.stats.selected_work_remaining = true;
+        result.checkpoint.scanned_generation = None;
+        let hold = match debt {
+            SelectionDebt::Blocking(hold) => hold,
+            SelectionDebt::IndependentLookup
+                if !membership_removal
+                    && !config.inventory_reconciliation
+                    && !config.primary_layout_active
+                    && !config.provisional
+                    && !config.sparse_membership_due
+                    && !config.refresh_metadata =>
+            {
+                return Ok(None);
+            }
+            SelectionDebt::IndependentLookup => SelectionCheckpointHold {
+                blocker: "deferred_identity",
+                retained_generation: true,
+            },
+        };
+        result.block_incremental_token(DEFERRED_REASON);
+        result.sync_token = None;
+        Ok(Some(hold))
     }
     async fn include_durable_membership_deletions(
         &self,
@@ -914,7 +947,13 @@ impl SelectionRun {
             .context("Missing selection pass owner")?;
         let current = match prefetched {
             Some(current) if !retry_inventory => current,
-            _ => self.confirm_individually(album, observed).await?,
+            _ => match self.confirm_individually(album, observed).await {
+                Ok(current) => current,
+                Err(error) if self.fresh_confirmation && previous.is_some() => {
+                    return Err(error.context(RetainedLookupUnavailable));
+                }
+                Err(error) => return Err(error),
+            },
         };
         anyhow::ensure!(
             same_selected_facts(&current.asset, observed),
@@ -1807,8 +1846,7 @@ pub(crate) async fn has_due(
         .await?
         .is_some();
     Ok(Some(
-        (pending || retained)
-            && (!config.post_sync_metadata || context.checkpoint_debt(config).await?),
+        (pending || retained) && (!config.post_sync_metadata || context.has_work(config).await?),
     ))
 }
 
@@ -2030,10 +2068,13 @@ pub(super) async fn inventory(
     if !matches!(config.sync_mode, crate::download::SyncMode::Full)
         || membership_delta.has_membership_deletions()
     {
-        result.stats.selected_work_remaining = context.checkpoint_debt(config).await?;
-        if result.stats.selected_work_remaining {
-            result.block_incremental_token(DEFERRED_REASON);
-        }
+        context
+            .apply_debt(
+                config,
+                &mut result,
+                membership_delta.has_membership_deletions(),
+            )
+            .await?;
     }
     result.checkpoint.project(&mut result.stats);
     if !result.checkpoint.sync_token_blocked
@@ -2049,6 +2090,7 @@ pub(super) async fn inventory(
     }
     if covered
         && query_checkpoint_ready
+        && !result.stats.selected_work_remaining
         && !result.checkpoint.sync_token_blocked
         && result.stats.same_cycle_recovery_attempts == 0
         && !config.provisional
@@ -2636,7 +2678,7 @@ async fn replay(
     let local_only = config.post_sync_metadata
         && root.sealed
         && root.checkpoint_ready
-        && !context.checkpoint_debt(config).await?;
+        && !context.has_work(config).await?;
     let mut combined = if local_only {
         crate::download::pipeline::StreamingResult {
             enumeration_complete: true,
@@ -2686,10 +2728,7 @@ async fn replay(
             _ => DEFERRED_REASON,
         });
     }
-    result.stats.selected_work_remaining = context.checkpoint_debt(config).await?;
-    if result.stats.selected_work_remaining {
-        result.block_incremental_token(DEFERRED_REASON)
-    }
+    context.apply_debt(config, &mut result, false).await?;
     Ok(result)
 }
 
@@ -2908,6 +2947,9 @@ pub(super) async fn after_delta(
     };
     selected.outcome = merge_download_outcomes(&selected.outcome, &delta_result.outcome);
     selected.accumulate(&delta_result);
+    if delta.membership.has_membership_deletions() {
+        context.apply_debt(config, &mut selected, true).await?;
+    }
     if let Some(reason) = delta.token_unsafe_reason {
         // The observed delta refusal is more specific than a missing token
         // caused by the subsequent selected inventory. Keep every safety gate.
