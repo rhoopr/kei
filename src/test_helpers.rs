@@ -317,6 +317,70 @@ fn mount_type(base: &std::path::Path, variable: &str) -> String {
         .unwrap_or_else(|| panic!("{variable} is not under any mount"))
 }
 
+/// True when `base` accepts `RENAME_NOREPLACE`, which an album directory
+/// transition requires. Probe names are unique per thread so parallel tests
+/// cannot cancel each other, and only the errnos that mean "unsupported" answer
+/// false: any other failure panics, so a broken scratch filesystem cannot read
+/// as green coverage.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn directory_rename_supported_in(base: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let unique = format!(
+        ".kei-rename-probe-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    );
+    let from = base.join(format!("{unique}-from"));
+    let to = base.join(format!("{unique}-to"));
+    std::fs::create_dir(&from).expect("create the RENAME_NOREPLACE probe directory");
+    let from_c = std::ffi::CString::new(from.as_os_str().as_bytes()).unwrap();
+    let to_c = std::ffi::CString::new(to.as_os_str().as_bytes()).unwrap();
+    // SAFETY: both paths are valid NUL-terminated C strings, AT_FDCWD resolves
+    // them from the current working directory, and RENAME_NOREPLACE is the
+    // documented flag under test. No Rust reference outlives the call.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from_c.as_ptr(),
+            libc::AT_FDCWD,
+            to_c.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    let supported = if result == 0 {
+        true
+    } else {
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS) => false,
+            _ => panic!("cannot probe RENAME_NOREPLACE support: {error}"),
+        }
+    };
+    let _ = std::fs::remove_dir_all(&from);
+    let _ = std::fs::remove_dir_all(&to);
+    if !supported {
+        eprintln!(
+            "skipping an album directory transition: the filesystem rejects RENAME_NOREPLACE"
+        );
+    }
+    supported
+}
+
+/// The same probe against the process temp directory, which is where a test's
+/// scratch root lives unless it names another mount.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn directory_rename_supported() -> bool {
+    directory_rename_supported_in(&std::env::temp_dir())
+}
+
+/// Non-Linux hosts use their own atomic no-replace rename, so a directory
+/// transition always has the guarantee it needs.
+#[cfg(all(test, not(target_os = "linux")))]
+pub(crate) fn directory_rename_supported() -> bool {
+    true
+}
+
 #[cfg(test)]
 pub(crate) async fn start_wiremock_or_skip(test_name: &str) -> Option<wiremock::MockServer> {
     if skip_if_loopback_bind_blocked(test_name) {

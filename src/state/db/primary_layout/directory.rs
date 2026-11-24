@@ -97,17 +97,12 @@ pub(crate) struct AlbumDirectoryOperation {
     pub(crate) directories: Vec<AlbumDirectoryRoute>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) user_entries: Vec<AlbumUserEntry>,
-    /// Destination claims installed by the no-replace directory fallback. The
-    /// identity is durable before the plain rename that consumes the claim.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) claims: Vec<AlbumDirectoryClaim>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AlbumDirectoryClaim {
-    pub(crate) path: SelectionPath,
-    pub(crate) identity: FileIdentity,
+    /// Claims recorded by the build that installed a directory through a
+    /// journaled destination claim. Decoded but never written: such a journal
+    /// replays as a destination kei cannot prove, so the move refuses instead of
+    /// installing it.
+    #[serde(rename = "claims", default, skip_serializing)]
+    pub(crate) legacy_claims: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -492,40 +487,6 @@ pub(crate) fn relocated_path(
     ))
 }
 
-/// A claim may only occupy a destination this operation moves into, so journal
-/// evidence cannot authorize replacing an unrelated name.
-fn destination_claimed(
-    op: &AlbumDirectoryOperation,
-    path: &SelectionPath,
-) -> Result<bool, StateError> {
-    if path == &op.next.path || path == &op.old.path {
-        return Ok(true);
-    }
-    if op
-        .directories
-        .iter()
-        .any(|route| &route.next == path || &route.staged == path)
-    {
-        return Ok(true);
-    }
-    for entry in &op.user_entries {
-        if &relocated_path(op, &entry.path)? == path {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn validate_claims(op: &AlbumDirectoryOperation) -> Result<(), StateError> {
-    let mut claimed = std::collections::HashSet::new();
-    for claim in &op.claims {
-        if !destination_claimed(op, &claim.path)? || !claimed.insert(claim.path.key()?) {
-            return Err(invalid("invalid album destination claim"));
-        }
-    }
-    Ok(())
-}
-
 pub(in crate::state::db) fn load_operation(
     conn: &Connection,
     operation: &str,
@@ -628,7 +589,13 @@ pub(in crate::state::db) fn load_operation(
     {
         return Err(invalid("invalid album directory journal"));
     }
-    validate_claims(&op)?;
+    if !op.legacy_claims.is_empty() {
+        tracing::warn!(
+            operation = %operation,
+            claims = op.legacy_claims.len(),
+            "Album directory journal carries retired destination claims; its move will refuse"
+        );
+    }
     Ok((op, phase))
 }
 
@@ -981,49 +948,6 @@ impl SqliteStateDb {
         }).await
     }
 
-    /// Record the identity of a claim this operation installed at one of its
-    /// destinations before a plain rename replaces it. Replay uses the record to
-    /// recognise its own claim, and a different identity is never replaced.
-    pub(crate) async fn record_album_directory_claim(
-        &self,
-        owner: account::AccountOwner,
-        operation: String,
-        path: SelectionPath,
-        identity: FileIdentity,
-    ) -> Result<(), StateError> {
-        self.with_conn_mut("record_album_directory_claim", move |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            account::validate_authenticated(&tx, &owner)?;
-            let (mut op, phase) = load_operation(&tx, &operation)?;
-            if phase != "publishing" {
-                return Err(invalid("album directory is not publishing"));
-            }
-            if let Some(recorded) = op.claims.iter().find(|claim| claim.path == path) {
-                return if recorded.identity == identity {
-                    Ok(())
-                } else {
-                    Err(invalid("album destination claim changed"))
-                };
-            }
-            if !destination_claimed(&op, &path)? {
-                return Err(invalid(
-                    "album destination claim is not a journaled destination",
-                ));
-            }
-            op.claims.push(AlbumDirectoryClaim { path, identity });
-            let updated = tx.execute(
-                "UPDATE primary_layout_operations SET header=?2 WHERE operation=?1 AND phase='publishing'",
-                params![operation, encode(&op)?],
-            )?;
-            if updated != 1 {
-                return Err(invalid("album directory claim changed during publication"));
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-    }
-
     pub(crate) async fn album_directory_files(
         &self,
         owner: account::AccountOwner,
@@ -1130,9 +1054,7 @@ fn projection_operation(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AlbumDirectoryBinding, AlbumDirectoryClaim, AlbumDirectoryFallback, AlbumDirectoryOperation,
-    };
+    use super::{AlbumDirectoryBinding, AlbumDirectoryFallback, AlbumDirectoryOperation};
     use crate::fs_util::{ConfinedParents, ConfinedPath, FileIdentity};
     use crate::state::db::primary_layout::{decode, encode};
     use crate::state::db::provider_selection::SelectionPath;
@@ -1172,11 +1094,9 @@ mod tests {
         }
     }
 
-    /// `claims` is a conditional field on a `deny_unknown_fields` header with no
-    /// format bump: an empty list adds no bytes, an older header without the
-    /// field reopens, and a recorded claim survives the stored byte format.
+    /// A journal header round trips the destinations and its format marker.
     #[test]
-    fn album_directory_header_round_trips_claims_present_and_absent() {
+    fn album_directory_header_round_trips_its_destinations() {
         let root = tempfile::tempdir().unwrap();
         let old = root.path().join("media/Old");
         let next = root.path().join("media/New");
@@ -1184,7 +1104,7 @@ mod tests {
         std::fs::create_dir_all(&next).unwrap();
         let old_identity = identity(root.path(), &old);
         let next_identity = identity(root.path(), &next);
-        let mut op = AlbumDirectoryOperation {
+        let op = AlbumDirectoryOperation {
             format: 1,
             operation: "album-directory:0b7f4d0e-6b0e-4a49-8d3f-2f6f4c1c0f11".into(),
             old: binding(root.path(), &old, old_identity, 1, "Old"),
@@ -1193,40 +1113,32 @@ mod tests {
             staged_directory: None,
             directories: Vec::new(),
             user_entries: Vec::new(),
-            claims: Vec::new(),
+            legacy_claims: Vec::new(),
         };
 
-        let absent = encode(&op).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&absent).unwrap();
+        let encoded = encode(&op).unwrap();
+        let decoded: AlbumDirectoryOperation = decode(&encoded).unwrap();
+        assert_eq!(decoded.format, 1);
+        assert_eq!(decoded.old.path, SelectionPath::from_path(&old));
+        assert_eq!(decoded.next.path, SelectionPath::from_path(&next));
+        assert_eq!(decoded.old.identity, old_identity);
+        assert_eq!(decoded.next.identity, next_identity);
         assert!(
-            value.get("claims").is_none(),
-            "an empty claim list must not add a header field"
-        );
-        let decoded: AlbumDirectoryOperation = decode(&absent).unwrap();
-        assert_eq!(decoded.format, 1, "the claim field requires no format bump");
-        assert!(decoded.claims.is_empty());
-        let mut legacy = value.clone();
-        legacy.as_object_mut().unwrap().remove("claims");
-        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
-        let decoded: AlbumDirectoryOperation = decode(&legacy_bytes).unwrap();
-        assert!(
-            decoded.claims.is_empty(),
-            "a header written before the claim field must reopen"
+            !String::from_utf8_lossy(&encoded).contains("claims"),
+            "a retired claim field must never be written again"
         );
 
-        op.claims.push(AlbumDirectoryClaim {
-            path: SelectionPath::from_path(&next),
-            identity: next_identity,
-        });
-        let present = encode(&op).unwrap();
-        let decoded: AlbumDirectoryOperation = decode(&present).unwrap();
-        assert_eq!(decoded.claims.len(), 1);
-        assert_eq!(decoded.claims[0].path, SelectionPath::from_path(&next));
-        assert_eq!(decoded.claims[0].identity, next_identity);
-        let value: serde_json::Value = serde_json::from_slice(&present).unwrap();
-        assert_eq!(
-            value["claims"][0]["identity"],
-            serde_json::to_value(next_identity).unwrap()
+        // A header written by the build that recorded claims must still load,
+        // so replay refuses that destination instead of failing the database.
+        let mut legacy: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        legacy.as_object_mut().unwrap().insert(
+            "claims".into(),
+            serde_json::json!([{ "path": "media/New", "identity": {"device": 1, "inode": 2} }]),
         );
+        let legacy = serde_json::to_vec(&legacy).unwrap();
+        let decoded: AlbumDirectoryOperation = decode(&legacy).unwrap();
+        assert_eq!(decoded.format, 1);
+        assert_eq!(decoded.legacy_claims.len(), 1);
+        assert_eq!(decoded.old.path, SelectionPath::from_path(&old));
     }
 }

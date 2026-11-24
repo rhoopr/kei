@@ -157,7 +157,19 @@ pub(super) fn retire_published_temp_link(
 
         // A rename publication leaves no temporary name, so there is no link to
         // retire and nothing to verify.
+        let name = temp
+            .path()
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Published temporary name has no file name"))?;
+        let mut slot_name = std::ffi::OsString::from(".kei-retire-");
+        slot_name.push(name);
+        let slot = temp.sibling(&temp.path().with_file_name(slot_name))?;
         if !temp.entry_exists()? {
+            // A crash after taking the name into the slot leaves it behind with
+            // nothing else to reclaim it.
+            if slot.retained_entry_identity().ok() == Some(identity) {
+                slot.remove_verified(identity, crate::fs_util::RemovalKind::File)?;
+            }
             return Ok(());
         }
         anyhow::ensure!(
@@ -180,7 +192,32 @@ pub(super) fn retire_published_temp_link(
         // as `.nfsXXXX`, which would leave a stray second link on the published
         // file.
         drop(file);
-        temp.remove_verified(identity, crate::fs_util::RemovalKind::File)?;
+        // Take the temporary name into a slot this function alone names, then
+        // prove the slot holds the published entry. A writer that replaced the
+        // temporary name is moved into the slot and restored, never deleted.
+        anyhow::ensure!(
+            !slot.entry_exists()?,
+            "Retirement slot already holds an entry; retaining both entries"
+        );
+        platform::move_to_owned_slot_confined(temp, &slot)?;
+        if slot.retained_entry_identity()? != identity {
+            let restored = platform::move_to_owned_slot_confined(&slot, temp);
+            anyhow::bail!(
+                "Published temporary name changed while retiring; {}",
+                match restored {
+                    Ok(()) => "substituted entry restored".to_owned(),
+                    Err(_) => format!("substituted entry retained at {}", slot.path().display()),
+                }
+            );
+        }
+        // Re-prove the destination before the slot goes: a writer that replaced
+        // it must leave the bytes reachable here.
+        anyhow::ensure!(
+            destination.retained_entry_identity()? == identity,
+            "Published destination changed while retiring the temporary name; slot retained at {}",
+            slot.path().display()
+        );
+        slot.remove_verified(identity, crate::fs_util::RemovalKind::File)?;
         Ok(())
     }
     #[cfg(not(unix))]

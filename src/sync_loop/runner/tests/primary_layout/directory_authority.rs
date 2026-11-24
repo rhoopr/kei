@@ -118,6 +118,9 @@ async fn ordinary_metadata_ownership_survives_managed_adoption_and_clear() {
 #[cfg(unix)]
 #[tokio::test]
 async fn album_directory_move_retains_embedded_ownership_on_native_paths() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     use little_exif::{exif_tag::ExifTag, metadata::Metadata};
     use std::os::unix::ffi::OsStringExt;
     // The toolkit backend cannot open non-UTF-8 paths; the native build exercises them.
@@ -206,6 +209,9 @@ async fn album_directory_move_retains_embedded_ownership_on_native_paths() {
 
 #[tokio::test]
 async fn album_directory_exclusive_binding_renames_future_template_copies() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     for (template, prefix) in [("{album}", "media"), ("archive/{album}", "media/archive")] {
         let server = server().await;
         let root = tempfile::tempdir().unwrap();
@@ -289,6 +295,9 @@ async fn album_directory_exclusive_binding_renames_future_template_copies() {
 #[cfg(all(unix, not(target_os = "macos")))]
 #[tokio::test]
 async fn album_directory_native_root_preserves_native_publication_authority() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     use std::os::unix::ffi::OsStringExt;
     let server = server().await;
     let temp = tempfile::tempdir().unwrap();
@@ -321,6 +330,9 @@ async fn album_directory_native_root_preserves_native_publication_authority() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn album_directory_additional_routes_recover_after_installation() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let mut provider = records(&server, None);
@@ -385,6 +397,9 @@ async fn album_directory_additional_routes_recover_after_installation() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn album_directory_interrupted_move_follows_a_second_provider_rename() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     for resumed_name in ["Third", "Old"] {
         for (template, point, naming) in [
             ("{album}", "album-directory-planned", EditedNaming::Primary),
@@ -452,6 +467,9 @@ async fn album_directory_interrupted_move_follows_a_second_provider_rename() {
 
 #[tokio::test]
 async fn album_directory_native_move_accepts_new_current_resource() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     cycle_options(
@@ -486,6 +504,9 @@ async fn album_directory_native_move_accepts_new_current_resource() {
 
 #[tokio::test]
 async fn album_directory_preserved_native_copy_stays_out_of_user_entry_moves() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     cycle_options(
@@ -535,6 +556,9 @@ async fn album_directory_preserved_native_copy_stays_out_of_user_entry_moves() {
 
 #[tokio::test]
 async fn album_directory_landed_handoff_preserves_changes_and_second_rename() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     for replay_name in ["New", "Third"] {
         let server = server().await;
         let root = tempfile::tempdir().unwrap();
@@ -605,6 +629,9 @@ async fn album_directory_landed_handoff_preserves_changes_and_second_rename() {
 
 #[tokio::test]
 async fn album_directory_mixed_projection_retains_independent_smart_copy() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let provider = records(&server, None);
@@ -639,6 +666,9 @@ async fn album_directory_mixed_projection_retains_independent_smart_copy() {
 
 #[tokio::test]
 async fn album_directory_native_move_settles_current_authority_once() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let initial = records(&server, Some(("edit-one", EDIT_ONE)));

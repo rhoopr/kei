@@ -313,22 +313,25 @@ filesystem accepts `RENAME_NOREPLACE` that rename already refuses an occupied
 slot; otherwise the owner claims the slot with an exclusive hard link from the
 source and removes the source only after verifying the slot holds that entry.
 
-Moves between public names, including album directory transitions, user-entry
-moves and their restores, keep the no-replace rename where the filesystem
-supports it. NFS rejects that flag, so the owner falls back by entry type. A
-directory claims the destination with an exclusive empty directory, and the
-album-directory journal records that claim's identity before the plain rename
-replaces it. Replay recognises a destination that is an empty directory with
-the recorded identity as its own claim; an entry with any other identity is
-preserved and the move refuses, so the fallback never renames over a destination
-its record does not name. A regular file is hard-linked to the destination, and
-the source name is removed only after the destination is verified to hold that
-same identity. A second private link, at a name this call alone creates, keeps
-the bytes reachable while both names are proved and is removed only after those
-checks pass. A resumed move treats an existing destination link with the
-source's identity as its own earlier link and continues. A foreign writer that
-replaces the destination between the link and the removal therefore keeps the
-moved bytes under its own name instead of losing them.
+Moves between public names keep the no-replace rename where the filesystem
+supports it. NFS rejects that flag, so a move falls back by entry type. A regular
+file first takes a private recovery link whose name is derived from the
+destination, so a resumed move finds the same slot and only that evidence lets it
+adopt an existing destination link; a user's own link there is left alone. The
+destination parent is synced before the source name is consumed. The source name
+is then moved into a slot this operation owns and checked by identity, so a
+writer that replaced it is restored rather than unlinked, and the recovery link
+is removed only after those checks pass. A foreign writer that replaces the
+destination between the link and the removal therefore keeps the moved bytes
+under its own name instead of losing them.
+
+A directory is refused on such a filesystem. Installing one at a public name
+cannot be made to replace only kei's own empty claim: there is no atomic
+no-replace rename, and directories cannot be hard-linked. Album directory
+transitions, user-entry directory moves and their restores therefore fail with an
+error that names the missing guarantee, and the journal cancels or retains the
+transition rather than installing a name it cannot prove. File publication,
+alias retirement and user-entry file moves keep working through hard links.
 
 ## Destination reconciliation
 

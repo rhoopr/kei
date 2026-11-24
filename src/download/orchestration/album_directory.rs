@@ -28,13 +28,6 @@ fn sidecar(path: &Path) -> PathBuf {
     path.into()
 }
 
-fn claim_for(op: &AlbumDirectoryOperation, path: &Path) -> Option<crate::fs_util::FileIdentity> {
-    op.claims
-        .iter()
-        .find(|claim| claim.path.to_path() == path)
-        .map(|claim| claim.identity)
-}
-
 /// A destination collision can only be recovered by replanning from the
 /// journal's recorded source. Cancel only while that source still holds its
 /// journaled identity. The occupied destination is never removed, so the next
@@ -74,37 +67,16 @@ async fn user_entries_unmoved(root: &Path, op: &AlbumDirectoryOperation) -> Resu
     Ok(true)
 }
 
-/// Move one journaled entry. A directory claim is recorded in the journal
-/// before the plain rename consumes it, so replay recognises its own claim.
+/// Move one journaled entry. A directory needs an atomic no-replace rename, so a
+/// filesystem that rejects it refuses the move instead of installing a public
+/// name it cannot prove.
 async fn move_entry(
-    capture: &crate::icloud::photos::inbox::ShadowCapture,
-    operation: &str,
     root: &Path,
     source: &Path,
     destination: &Path,
     identity: crate::fs_util::FileIdentity,
-    claim: Option<crate::fs_util::FileIdentity>,
 ) -> Result<()> {
-    let mut claim = claim;
-    loop {
-        match primary_layout::move_album_entry(root, source, destination, identity, claim).await? {
-            primary_layout::AlbumMove::Moved => return Ok(()),
-            primary_layout::AlbumMove::Claimed(installed) => {
-                capture
-                    .db
-                    .record_album_directory_claim(
-                        capture.owner.clone(),
-                        operation.to_owned(),
-                        SelectionPath::from_path(destination),
-                        installed,
-                    )
-                    .await?;
-                #[cfg(all(test, target_os = "linux"))]
-                crate::test_helpers::process_death_point("album-directory-claim-recorded");
-                claim = Some(installed);
-            }
-        }
-    }
+    primary_layout::move_album_entry(root, source, destination, identity).await
 }
 
 async fn create_directory(root: PathBuf, path: PathBuf) -> Result<crate::fs_util::FileIdentity> {
@@ -408,7 +380,7 @@ pub(super) async fn prepare(
                 staged_directory: None,
                 directories: Vec::new(),
                 user_entries: Vec::new(),
-                claims: Vec::new(),
+                legacy_claims: Vec::new(),
             };
             let sources = capture
                 .db
@@ -531,13 +503,10 @@ pub(super) async fn prepare(
             // replanned from the unmoved anchor.
             for (index, route) in op.directories.iter().enumerate() {
                 let moved = move_entry(
-                    &capture,
-                    &op.operation,
                     &route_root,
                     &route.staged.to_path(),
                     &route.next.to_path(),
                     route.identity,
-                    claim_for(&op, &route.next.to_path()),
                 )
                 .await;
                 if let Err(error) = moved {
@@ -561,13 +530,10 @@ pub(super) async fn prepare(
                 .await?;
             if let Some(staged) = &op.staged_directory {
                 let installed = move_entry(
-                    &capture,
-                    &op.operation,
                     &root,
                     &staged.to_path(),
                     &op.next.path.to_path(),
                     op.next.identity,
-                    claim_for(&op, &op.next.path.to_path()),
                 )
                 .await;
                 if let Err(error) = installed {
@@ -605,16 +571,7 @@ pub(super) async fn prepare(
             // as replacement authority after this census.
             for entry in &op.user_entries {
                 let next = relocated_path(&op, &entry.path)?.to_path();
-                let moved = move_entry(
-                    &capture,
-                    &op.operation,
-                    &root,
-                    &entry.path.to_path(),
-                    &next,
-                    entry.identity,
-                    claim_for(&op, &next),
-                )
-                .await;
+                let moved = move_entry(&root, &entry.path.to_path(), &next, entry.identity).await;
                 if let Err(error) = moved {
                     // Cancel only while every entry is still at its source and
                     // no routed destination has landed, so no user tree is
@@ -666,13 +623,10 @@ pub(super) async fn prepare(
             }
         }
         let moved = move_entry(
-            &capture,
-            &op.operation,
             &root,
             &op.old.path.to_path(),
             &op.next.path.to_path(),
             op.old.identity,
-            claim_for(&op, &op.next.path.to_path()),
         )
         .await;
         if let Err(error) = moved {
@@ -709,13 +663,10 @@ pub(super) async fn prepare(
                     != file.sidecar
             {
                 let restored = move_entry(
-                    &capture,
-                    &op.operation,
                     &root,
                     &op.next.path.to_path(),
                     &op.old.path.to_path(),
                     op.old.identity,
-                    claim_for(&op, &op.old.path.to_path()),
                 )
                 .await;
                 if let Err(error) = restored {
@@ -978,7 +929,7 @@ async fn prepare_projection(
             staged_directory: None,
             directories: Vec::new(),
             user_entries: Vec::new(),
-            claims: Vec::new(),
+            legacy_claims: Vec::new(),
         };
         let sources = capture
             .db
@@ -1019,13 +970,10 @@ async fn prepare_projection(
     for (index, route) in op.directories.iter().enumerate() {
         anyhow::ensure!(!cancel.is_cancelled(), "Album projection interrupted");
         let moved = move_entry(
-            &capture,
-            &op.operation,
             &root,
             &route.staged.to_path(),
             &route.next.to_path(),
             route.identity,
-            claim_for(&op, &route.next.to_path()),
         )
         .await;
         if let Err(error) = moved {
@@ -1040,13 +988,10 @@ async fn prepare_projection(
                 // installed. Restore only the previously installed identities.
                 for previous in op.directories.iter().take(index).rev() {
                     move_entry(
-                        &capture,
-                        &op.operation,
                         &root,
                         &previous.next.to_path(),
                         &previous.staged.to_path(),
                         previous.identity,
-                        claim_for(&op, &previous.staged.to_path()),
                     )
                     .await?;
                 }

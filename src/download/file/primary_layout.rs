@@ -93,12 +93,20 @@ fn snapshot_blocking(root: &Path, path: &Path) -> Result<Option<LayoutFingerprin
 }
 
 fn snapshot_confined(confined: &ConfinedPath) -> Result<Option<LayoutFingerprint>> {
+    snapshot_confined_with_links(confined, 1)
+}
+
+/// Snapshot a confined regular entry that is expected to hold `links` names.
+fn snapshot_confined_with_links(
+    confined: &ConfinedPath,
+    links: u64,
+) -> Result<Option<LayoutFingerprint>> {
     let Some(mut file) = confined.open_optional_regular()? else {
         return Ok(None);
     };
     let identity = crate::fs_util::file_identity(&file)?;
     anyhow::ensure!(
-        crate::fs_util::file_link_count(&file)? == 1,
+        crate::fs_util::file_link_count(&file)? == links,
         "Primary layout refuses hardlinked media or sidecars"
     );
     let fingerprint =
@@ -118,16 +126,6 @@ pub(in crate::download) fn bytes_match(
     left.size == right.size && left.sha256 == right.sha256
 }
 
-/// Outcome of a journaled move between public names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::download) enum AlbumMove {
-    Moved,
-    /// The filesystem rejects `RENAME_NOREPLACE`. An exclusive empty directory
-    /// now claims the destination. Record this identity in the journal, then
-    /// repeat the move with it so a crash before the rename is recoverable.
-    Claimed(crate::fs_util::FileIdentity),
-}
-
 /// A failed `open_directory` for a regular file, which moves by link instead.
 fn is_regular_entry(error: &std::io::Error) -> bool {
     if error.kind() == std::io::ErrorKind::NotADirectory {
@@ -141,17 +139,16 @@ fn is_regular_entry(error: &std::io::Error) -> bool {
     false
 }
 
-/// Move one journaled album entry between public names. `claim` is the
-/// destination claim identity the journal recorded for this destination, so an
-/// interrupted fallback recognises its own empty claim and never replaces a
-/// substituted entry.
+/// Move one journaled album entry between public names. A regular file moves by
+/// link, with the destination proved before the source name is released. A
+/// directory needs the atomic no-replace rename, so a filesystem that rejects it
+/// refuses the move instead of installing a name it cannot prove.
 pub(in crate::download) async fn move_album_entry(
     root: &Path,
     source: &Path,
     destination: &Path,
     identity: crate::fs_util::FileIdentity,
-    claim: Option<crate::fs_util::FileIdentity>,
-) -> Result<AlbumMove> {
+) -> Result<()> {
     let (root, source, destination) = (root.to_owned(), source.to_owned(), destination.to_owned());
     tokio::task::spawn_blocking(move || {
         let source = ConfinedPath::open(&root, &source, ConfinedParents::Existing)?;
@@ -164,30 +161,20 @@ pub(in crate::download) async fn move_album_entry(
             }
             _ => ConfinedPath::open(&root, &destination, ConfinedParents::Create)?,
         };
-        let outcome = match source.open_directory() {
+        match source.open_directory() {
             Ok(directory) => {
                 anyhow::ensure!(
                     crate::fs_util::file_identity(&directory)? == identity,
                     "Album directory identity changed before rename"
                 );
-                let outcome = match super::platform::move_noreplace_journaled_confined(
-                    &source,
-                    &destination,
-                    claim,
-                )? {
-                    super::platform::JournaledMove::Moved => AlbumMove::Moved,
-                    super::platform::JournaledMove::Claimed(claimed) => AlbumMove::Claimed(claimed),
-                };
-                if outcome == AlbumMove::Moved {
-                    let installed = destination.open_directory()?;
-                    if crate::fs_util::file_identity(&installed)? != identity {
-                        // The moved entry is gone from this name. Leave the
-                        // substituted entry untouched; its bytes and any
-                        // retained copy belong to their current owners.
-                        anyhow::bail!("Album directory changed during rename");
-                    }
+                super::platform::move_noreplace_confined(&source, &destination)?;
+                let installed = destination.open_directory()?;
+                if crate::fs_util::file_identity(&installed)? != identity {
+                    // The moved entry is gone from this name. Leave the
+                    // substituted entry untouched; its bytes and any retained
+                    // copy belong to their current owners.
+                    anyhow::bail!("Album directory changed during rename");
                 }
-                outcome
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // The move already landed in an earlier attempt, for a file or a
@@ -196,7 +183,7 @@ pub(in crate::download) async fn move_album_entry(
                     destination.retained_entry_identity()? == identity,
                     "Album directory recovery target has another identity"
                 );
-                AlbumMove::Moved
+                super::platform::reclaim_move_slots(&source, &destination, identity)?;
             }
             Err(error) if is_regular_entry(&error) => {
                 anyhow::ensure!(
@@ -208,17 +195,14 @@ pub(in crate::download) async fn move_album_entry(
                     super::platform::move_noreplace_confined(&destination, &source)?;
                     anyhow::bail!("User album entry changed during movement");
                 }
-                AlbumMove::Moved
             }
             Err(error) => return Err(error.into()),
-        };
-        #[cfg(all(test, target_os = "linux"))]
-        if outcome == AlbumMove::Moved {
-            crate::test_helpers::process_death_point("album-directory-moved");
         }
+        #[cfg(all(test, target_os = "linux"))]
+        crate::test_helpers::process_death_point("album-directory-moved");
         source.sync_parent()?;
         destination.sync_parent()?;
-        Ok(outcome)
+        Ok(())
     })
     .await?
 }
@@ -636,14 +620,21 @@ impl RetirementEntry {
     /// A resumed move is complete only with exact saved bytes and an empty
     /// original slot. Every companion, including expected absence, participates.
     fn is_retired(&self) -> Result<bool> {
-        // An interrupted link-based retirement leaves both names on one inode.
-        // That is a move to finish, not a changed disposition, and the snapshots
-        // below refuse a second link before the move could complete.
-        if let (Ok(source), Ok(saved)) = (
-            self.source.retained_entry_identity(),
-            self.destination.retained_entry_identity(),
-        ) && source == saved
+        // A split link-based retirement is resumable only for a member the
+        // journal recorded as present, and only while the slot still holds that
+        // exact entry. An owned absence is never resumed into a move.
+        if self.expected.is_some()
+            && let (Ok(source), Ok(saved)) = (
+                self.source.retained_entry_identity(),
+                self.destination.retained_entry_identity(),
+            )
+            && source == saved
         {
+            let saved = snapshot_confined_with_links(&self.destination, 2)?;
+            anyhow::ensure!(
+                saved.as_ref() == self.expected.as_ref(),
+                "Retired member changed during a split retirement"
+            );
             return Ok(false);
         }
         let source = snapshot_confined(&self.source)?;
@@ -932,26 +923,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     async fn assert_album_directory_move_round_trips(root: &std::path::Path) {
-        use super::{AlbumMove, move_album_entry};
+        use super::move_album_entry;
         use crate::fs_util::{ConfinedParents, ConfinedPath};
-
-        async fn move_with_claim(
-            root: &std::path::Path,
-            source: &std::path::Path,
-            destination: &std::path::Path,
-            identity: crate::fs_util::FileIdentity,
-        ) {
-            let mut claim = None;
-            loop {
-                match move_album_entry(root, source, destination, identity, claim)
-                    .await
-                    .unwrap()
-                {
-                    AlbumMove::Moved => return,
-                    AlbumMove::Claimed(installed) => claim = Some(installed),
-                }
-            }
-        }
 
         let current = root.join("media/Old");
         let next = root.join("media/New");
@@ -961,7 +934,9 @@ mod tests {
             .unwrap()
             .entry_identity()
             .unwrap();
-        move_with_claim(root, &current, &next, identity).await;
+        move_album_entry(root, &current, &next, identity)
+            .await
+            .unwrap();
         assert!(!current.exists());
         assert_eq!(
             std::fs::read(next.join("user/note.txt")).unwrap(),
@@ -979,7 +954,9 @@ mod tests {
             1,
             "the move leaves exactly one directory name"
         );
-        move_with_claim(root, &next, &current, identity).await;
+        move_album_entry(root, &next, &current, identity)
+            .await
+            .unwrap();
         assert!(!next.exists());
         assert_eq!(
             std::fs::read(current.join("user/note.txt")).unwrap(),
@@ -999,115 +976,69 @@ mod tests {
         );
     }
 
+    /// True when the scratch filesystem accepts `RENAME_NOREPLACE`, which a
+    /// directory move needs. The scratch directory may itself be the export.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn album_directory_move_claims_and_verifies_when_noreplace_is_unsupported() {
-        let root = tempfile::tempdir().unwrap();
-        let _fallback = super::super::platform::ForcedLinkFallback::new(root.path());
-        assert_album_directory_move_round_trips(root.path()).await;
+    fn directory_move_supported(root: &std::path::Path) -> bool {
+        crate::test_helpers::directory_rename_supported_in(root)
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn nfs_album_directory_move_round_trips_on_the_export() {
+    async fn album_directory_move_round_trips_with_noreplace() {
+        let root = tempfile::tempdir().unwrap();
+        if !directory_move_supported(root.path()) {
+            return;
+        }
+        assert_album_directory_move_round_trips(root.path()).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_album_directory_move_refuses(root: &std::path::Path) {
+        use super::move_album_entry;
+        use crate::fs_util::{ConfinedParents, ConfinedPath};
+
+        let current = root.join("media/Old");
+        let next = root.join("media/New");
+        std::fs::create_dir_all(current.join("user")).unwrap();
+        std::fs::write(current.join("user/note.txt"), b"user bytes").unwrap();
+        let identity = ConfinedPath::open(root, &current, ConfinedParents::Existing)
+            .unwrap()
+            .entry_identity()
+            .unwrap();
+        let error = move_album_entry(root, &current, &next, identity)
+            .await
+            .expect_err("a directory move needs an atomic no-replace rename");
+        assert!(
+            format!("{error:#}").contains("atomic no-replace"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(current.join("user/note.txt")).unwrap(),
+            b"user bytes"
+        );
+        assert!(!next.exists(), "no destination name is created");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn album_directory_move_refuses_when_noreplace_is_unsupported() {
+        let root = tempfile::tempdir().unwrap();
+        let _fallback = super::super::platform::ForcedLinkFallback::new(root.path());
+        assert_album_directory_move_refuses(root.path()).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn nfs_album_directory_move_refuses_without_atomic_no_replace() {
         let Some(root) = crate::test_helpers::nfs_test_dir("nfs_album_directory_move") else {
             return;
         };
-        assert_album_directory_move_round_trips(root.path()).await;
+        assert_album_directory_move_refuses(root.path()).await;
     }
 
-    /// A replay after the claim was journaled recognises its own empty claim,
-    /// and a substituted empty directory is preserved instead of replaced.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn album_directory_replay_recognises_only_its_recorded_claim() {
-        use super::{AlbumMove, move_album_entry};
-        use crate::fs_util::{ConfinedParents, ConfinedPath};
-
-        let root = tempfile::tempdir().unwrap();
-        let _fallback = super::super::platform::ForcedLinkFallback::new(root.path());
-        let current = root.path().join("media/Old");
-        let next = root.path().join("media/New");
-        std::fs::create_dir_all(&current).unwrap();
-        std::fs::write(current.join("photo.jpg"), b"owned media").unwrap();
-        let identity = ConfinedPath::open(root.path(), &current, ConfinedParents::Existing)
-            .unwrap()
-            .entry_identity()
-            .unwrap();
-        let claim = match move_album_entry(root.path(), &current, &next, identity, None)
-            .await
-            .unwrap()
-        {
-            AlbumMove::Claimed(claim) => claim,
-            AlbumMove::Moved => panic!("the forced fallback must claim the destination"),
-        };
-        // The interruption left an empty claim whose identity the journal holds.
-        assert_eq!(std::fs::read_dir(&next).unwrap().count(), 0);
-        assert!(
-            ConfinedPath::open(root.path(), &next, ConfinedParents::Existing)
-                .unwrap()
-                .entry_identity()
-                .unwrap()
-                == claim
-        );
-        // A replay that recorded this claim completes the move.
-        assert_eq!(
-            move_album_entry(root.path(), &current, &next, identity, Some(claim))
-                .await
-                .unwrap(),
-            AlbumMove::Moved
-        );
-        assert!(!current.exists());
-        assert_eq!(
-            std::fs::read(next.join("photo.jpg")).unwrap(),
-            b"owned media"
-        );
-
-        // A second round with a substituted empty directory must refuse.
-        let other = root.path().join("media/Other");
-        let foreign = root.path().join("media/Foreign");
-        std::fs::create_dir_all(&other).unwrap();
-        std::fs::write(other.join("photo.jpg"), b"owned media").unwrap();
-        let other_identity = ConfinedPath::open(root.path(), &other, ConfinedParents::Existing)
-            .unwrap()
-            .entry_identity()
-            .unwrap();
-        let stale_claim =
-            match move_album_entry(root.path(), &other, &foreign, other_identity, None)
-                .await
-                .unwrap()
-            {
-                AlbumMove::Claimed(claim) => claim,
-                AlbumMove::Moved => panic!("the forced fallback must claim the destination"),
-            };
-        // A foreign empty directory replaces the claim: different identity, so
-        // the recorded claim must not authorize a rename over it.
-        let foreign_source = root.path().join("media/foreign-source");
-        std::fs::create_dir(&foreign_source).unwrap();
-        std::fs::rename(&foreign_source, &foreign).unwrap();
-        let foreign_identity = ConfinedPath::open(root.path(), &foreign, ConfinedParents::Existing)
-            .unwrap()
-            .entry_identity()
-            .unwrap();
-        assert_ne!(foreign_identity, stale_claim);
-        assert!(
-            move_album_entry(
-                root.path(),
-                &other,
-                &foreign,
-                other_identity,
-                Some(stale_claim)
-            )
-            .await
-            .is_err(),
-            "a substituted empty directory is preserved"
-        );
-        assert_eq!(std::fs::read_dir(&foreign).unwrap().count(), 0);
-        assert_eq!(
-            std::fs::read(other.join("photo.jpg")).unwrap(),
-            b"owned media"
-        );
-    }
+    // The directory claim mechanism is gone: a filesystem without an atomic
+    // no-replace rename refuses the move, covered by the refusal tests above.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn album_directory_move_refuses_an_occupied_destination_when_noreplace_is_unsupported() {
@@ -1127,7 +1058,7 @@ mod tests {
             .entry_identity()
             .unwrap();
         assert!(
-            move_album_entry(root.path(), &current, &next, identity, None)
+            move_album_entry(root.path(), &current, &next, identity)
                 .await
                 .is_err()
         );
@@ -1149,7 +1080,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn album_user_entry_move_links_and_verifies_when_noreplace_is_unsupported() {
-        use super::{AlbumMove, move_album_entry};
+        use super::move_album_entry;
         use crate::fs_util::{ConfinedParents, ConfinedPath};
         use std::os::unix::fs::MetadataExt;
 
@@ -1167,18 +1098,9 @@ mod tests {
         )
         .unwrap();
         let identity = source.entry_identity().unwrap();
-        assert_eq!(
-            move_album_entry(
-                root.path(),
-                source.path(),
-                &next.join("note.txt"),
-                identity,
-                None
-            )
+        move_album_entry(root.path(), source.path(), &next.join("note.txt"), identity)
             .await
-            .unwrap(),
-            AlbumMove::Moved
-        );
+            .unwrap();
         assert!(!current.join("note.txt").exists());
         assert_eq!(std::fs::read(next.join("note.txt")).unwrap(), b"user bytes");
         assert_eq!(

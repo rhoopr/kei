@@ -40,9 +40,9 @@ fn link_fallback_forced(path: &Path) -> bool {
 
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
-    /// Runs after the fallback verified the destination link and before it
-    /// removes the source name, so a test can substitute that destination.
-    static MOVE_DESTINATION_LINKED_HOOK: std::cell::Cell<Option<fn(&Path)>> =
+    /// Runs after the fallback proved the destination link and before it
+    /// consumes the source name, so a test can substitute either name.
+    static MOVE_DESTINATION_LINKED_HOOK: std::cell::Cell<Option<fn(&Path, &Path)>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -120,26 +120,32 @@ pub(in crate::download) fn move_layout_confined(
     }
 }
 
-/// Result of a move whose directory claim the caller journals before the
-/// plain rename that consumes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::download) enum JournaledMove {
-    Moved,
-    /// The filesystem rejects `RENAME_NOREPLACE`. An exclusive empty directory
-    /// now claims `destination`: journal this identity, then call again with it.
-    // Only the Linux claim path constructs this variant.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    Claimed(crate::fs_util::FileIdentity),
+/// Move `source` into a slot this operation owns. The caller proves the slot is
+/// absent first; a filesystem that rejects `RENAME_NOREPLACE` uses a plain
+/// rename, whose only exposure is an entry created at that hidden name in the
+/// same instant.
+pub(in crate::download) fn move_to_owned_slot_confined(
+    source: &ConfinedPath,
+    slot: &ConfinedPath,
+) -> std::io::Result<()> {
+    let moved = move_layout_confined(source, slot);
+    #[cfg(target_os = "linux")]
+    if let Err(error) = &moved
+        && is_renameat2_unsupported(error)
+    {
+        return renameat2_confined_blocking(source, slot, 0);
+    }
+    moved
 }
 
 /// Move between public names. A filesystem with `RENAME_NOREPLACE` keeps the
 /// atomic no-replace rename, so no foreign entry can be replaced unnoticed.
 ///
-/// NFS rejects that flag, so the fallback publishes the source entry under the
-/// destination name and proves that name before removing the source. Removing
-/// the source first would destroy the only bytes when a foreign writer replaces
-/// the destination in between. Directories need a journaled claim, so they move
-/// through [`move_noreplace_journaled_confined`].
+/// NFS rejects that flag. A regular file is then linked to the destination and
+/// its source name is removed only after that name is proved to hold the same
+/// entry. A directory is refused: installing one at a public name without any
+/// chance of replacing a foreign entry needs an atomic no-replace rename, and
+/// no other filesystem primitive provides it.
 pub(in crate::download) fn move_noreplace_confined(
     source: &ConfinedPath,
     destination: &ConfinedPath,
@@ -154,35 +160,9 @@ pub(in crate::download) fn move_noreplace_confined(
     moved
 }
 
-/// Move between public names where a caller journals the destination claim of
-/// a directory move before the plain rename consumes it. `claim` is the
-/// identity the journal recorded, so replay can recognise its own empty claim
-/// and a substituted entry is never replaced.
-pub(in crate::download) fn move_noreplace_journaled_confined(
-    source: &ConfinedPath,
-    destination: &ConfinedPath,
-    claim: Option<crate::fs_util::FileIdentity>,
-) -> std::io::Result<JournaledMove> {
-    #[cfg(target_os = "linux")]
-    if claim.is_some() {
-        // The recorded claim occupies the destination, so only the plain
-        // rename after verifying that claim can proceed.
-        return move_noreplace_journaled_without_renameat2(source, destination, claim);
-    }
-    let moved = move_layout_confined(source, destination);
-    #[cfg(target_os = "linux")]
-    if let Err(error) = &moved
-        && is_renameat2_unsupported(error)
-    {
-        return move_noreplace_journaled_without_renameat2(source, destination, claim);
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = claim;
-    moved.map(|()| JournaledMove::Moved)
-}
-
 /// A regular file is linked first, and its source name is removed only once the
-/// destination is verified to hold that same entry.
+/// destination is verified to hold that same entry. A directory is refused,
+/// because no primitive can install it without an atomic no-replace rename.
 #[cfg(target_os = "linux")]
 fn move_noreplace_without_renameat2(
     source: &ConfinedPath,
@@ -191,7 +171,8 @@ fn move_noreplace_without_renameat2(
     match source.open_directory() {
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "Moving a directory without RENAME_NOREPLACE needs a journaled destination claim",
+            "Moving a directory needs an atomic no-replace rename, which this filesystem \
+             does not provide",
         )),
         Err(error) if matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {
             move_linked_file_confined(source, destination)
@@ -200,24 +181,68 @@ fn move_noreplace_without_renameat2(
     }
 }
 
+/// Identity of `path` inside its retained parent, or `None` when the name is
+/// absent.
 #[cfg(target_os = "linux")]
-fn move_noreplace_journaled_without_renameat2(
-    source: &ConfinedPath,
-    destination: &ConfinedPath,
-    claim: Option<crate::fs_util::FileIdentity>,
-) -> std::io::Result<JournaledMove> {
-    match source.open_directory() {
-        Ok(_) => claim_directory_destination(source, destination, claim),
-        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {
-            move_linked_file_confined(source, destination).map(|()| JournaledMove::Moved)
-        }
+fn existing_identity(path: &ConfinedPath) -> std::io::Result<Option<crate::fs_util::FileIdentity>> {
+    match path.retained_entry_identity() {
+        Ok(identity) => Ok(Some(identity)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
 }
 
+/// Deterministic hidden sibling of `path`, derived from its name so a resumed
+/// attempt looks for the same slot instead of creating a second one.
+#[cfg(target_os = "linux")]
+fn sibling_slot(path: &ConfinedPath, prefix: &str) -> std::io::Result<ConfinedPath> {
+    let name = path
+        .path()
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("Move entry has no file name"))?;
+    let mut slot = std::ffi::OsString::from(prefix);
+    slot.push(name);
+    path.sibling(&path.path().with_file_name(slot))
+}
+
+/// Release the derived slots a completed move may have left behind, when each
+/// still holds `identity`. A resume that finds the destination proven and the
+/// source name gone never re-enters the move, so its residue is reclaimed here.
+#[cfg(target_os = "linux")]
+pub(in crate::download) fn reclaim_move_slots(
+    source: &ConfinedPath,
+    destination: &ConfinedPath,
+    identity: crate::fs_util::FileIdentity,
+) -> std::io::Result<()> {
+    for slot in [
+        sibling_slot(destination, ".kei-move-")?,
+        sibling_slot(source, ".kei-quarantine-")?,
+    ] {
+        if existing_identity(&slot)? == Some(identity) {
+            slot.remove_verified(identity, RemovalKind::File)?;
+        }
+    }
+    Ok(())
+}
+
+/// Non-Linux hosts move a file with one atomic rename, so no slot is created.
+#[cfg(not(target_os = "linux"))]
+pub(in crate::download) fn reclaim_move_slots(
+    _source: &ConfinedPath,
+    _destination: &ConfinedPath,
+    _identity: crate::fs_util::FileIdentity,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Publish a regular file under `destination` and prove both names before the
-/// source link is removed. A recovery link keeps the bytes reachable when a
-/// foreign writer replaces the destination during that proof.
+/// source name is consumed.
+///
+/// A destination link that already holds this entry is adopted only when the
+/// operation's own recovery slot does, so a user's pre-existing hard link is
+/// never mistaken for an interrupted attempt. The source name is taken into a
+/// slot this operation owns before its identity is checked, so a writer that
+/// replaced it is restored rather than unlinked.
 #[cfg(target_os = "linux")]
 fn move_linked_file_confined(
     source: &ConfinedPath,
@@ -226,11 +251,38 @@ fn move_linked_file_confined(
     // The retained parents are the authority: an ancestor may have moved since
     // these paths were opened.
     let identity = source.retained_entry_identity()?;
+    let recovery = sibling_slot(destination, ".kei-move-")?;
+    let quarantine = sibling_slot(source, ".kei-quarantine-")?;
+
+    // Create the recovery slot before the destination link: an interrupted move
+    // then always leaves the evidence that lets a resume adopt its own names,
+    // while a pre-existing user link has none.
+    let had_recovery = match existing_identity(&recovery)? {
+        Some(found) if found == identity => true,
+        Some(_) => {
+            return Err(std::io::Error::other(format!(
+                "Move recovery slot holds another entry; retained at {}",
+                recovery.path().display()
+            )));
+        }
+        None => {
+            // linkat refuses an existing name, so a foreign entry is never
+            // replaced by the slot.
+            hard_link_confined(source, &recovery)?;
+            false
+        }
+    };
+
     match hard_link_confined(source, destination) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            // A resumed attempt may already have linked this exact entry.
-            if destination.retained_entry_identity()? != identity {
+            if had_recovery && destination.retained_entry_identity()? == identity {
+                // This operation's own link from an earlier attempt.
+            } else {
+                if !had_recovery {
+                    // Do not leave the slot this call created behind.
+                    let _ = recovery.remove_verified(identity, RemovalKind::File);
+                }
                 return Err(error);
             }
         }
@@ -238,75 +290,56 @@ fn move_linked_file_confined(
     }
     #[cfg(all(test, target_os = "linux"))]
     crate::test_helpers::process_death_point("move-file-linked");
-    // A name this call alone owns: linkat refuses an existing name, so no
-    // foreign entry can be mistaken for the recovery copy.
-    let recovery = destination.sibling(
-        &destination
-            .path()
-            .with_file_name(format!(".kei-move-{}", uuid::Uuid::new_v4())),
-    )?;
-    hard_link_confined(source, &recovery)?;
+
     if destination.retained_entry_identity()? != identity {
         return Err(std::io::Error::other(format!(
             "Move destination no longer holds the moved entry; recovery copy retained at {}",
             recovery.path().display()
         )));
     }
+    // The destination entry must be durable before the source name is consumed.
+    destination.sync_parent()?;
     #[cfg(all(test, target_os = "linux"))]
     if let Some(hook) = MOVE_DESTINATION_LINKED_HOOK.with(std::cell::Cell::take) {
-        hook(destination.path());
+        hook(destination.path(), source.path());
     }
-    source.remove_verified(identity, RemovalKind::File)?;
+
+    match existing_identity(&quarantine)? {
+        // An earlier attempt already took the source name into this slot.
+        Some(found) if found == identity => {}
+        Some(_) => {
+            return Err(std::io::Error::other(format!(
+                "Move quarantine slot holds another entry; retained at {}",
+                quarantine.path().display()
+            )));
+        }
+        None => {
+            move_to_owned_slot_confined(source, &quarantine)?;
+            if quarantine.retained_entry_identity()? != identity {
+                // A writer replaced the source name after the proof. Restore its
+                // entry instead of unlinking it.
+                return Err(match move_to_owned_slot_confined(&quarantine, source) {
+                    Ok(()) => std::io::Error::other(
+                        "Move source name changed while moving; substituted entry restored",
+                    ),
+                    Err(_) => std::io::Error::other(format!(
+                        "Move source name changed while moving; substituted entry retained at {}",
+                        quarantine.path().display()
+                    )),
+                });
+            }
+        }
+    }
+    quarantine.remove_verified(identity, RemovalKind::File)?;
+    source.sync_parent()?;
     if destination.retained_entry_identity()? != identity {
         return Err(std::io::Error::other(format!(
             "Move destination changed after the source name was removed; recovery copy retained at {}",
             recovery.path().display()
         )));
     }
-    recovery.remove_verified(identity, RemovalKind::File)
-}
-
-/// Claim a directory destination with an exclusive empty directory whose
-/// identity the caller journals before the plain rename replaces it. A recorded
-/// claim is the only entry this fallback may rename over.
-#[cfg(target_os = "linux")]
-fn claim_directory_destination(
-    source: &ConfinedPath,
-    destination: &ConfinedPath,
-    claim: Option<crate::fs_util::FileIdentity>,
-) -> std::io::Result<JournaledMove> {
-    if let Some(claim) = claim {
-        let installed = destination.open_directory()?;
-        if crate::fs_util::file_identity(&installed)? != claim {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "Album directory destination no longer holds the recorded claim",
-            ));
-        }
-        // A non-empty or substituted entry is refused by the kernel here.
-        renameat2_confined_blocking(source, destination, 0)?;
-        return Ok(JournaledMove::Moved);
-    }
-    let directory = match destination.create_new_directory() {
-        Ok(directory) => directory,
-        Err(error)
-            if error.kind() == std::io::ErrorKind::AlreadyExists
-                || error.kind() == std::io::ErrorKind::NotADirectory =>
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "Album directory destination already holds a foreign entry",
-            ));
-        }
-        Err(error) => return Err(error),
-    };
-    let identity = crate::fs_util::file_identity(&directory)?;
-    if destination.retained_entry_identity()? != identity {
-        return Err(std::io::Error::other("New album directory claim changed"));
-    }
-    // The identity is journaled next, so the claim must survive a crash first.
-    destination.sync_parent()?;
-    Ok(JournaledMove::Claimed(identity))
+    recovery.remove_verified(identity, RemovalKind::File)?;
+    destination.sync_parent()
 }
 
 /// Move an obsolete alias into a private retirement slot. A filesystem without
@@ -814,7 +847,11 @@ mod linux_tests {
             std::fs::metadata(&source_name).unwrap().ino(),
             interrupted.ino()
         );
-        assert_eq!(interrupted.nlink(), 2, "both names survived the death");
+        assert_eq!(
+            interrupted.nlink(),
+            3,
+            "the source, destination and recovery names survived the death"
+        );
         assert_eq!(std::fs::read(&moved_name).unwrap(), b"user bytes");
 
         let _fallback = ForcedLinkFallback::new(root.path());
@@ -845,7 +882,7 @@ mod linux_tests {
         std::fs::write(album.join("note.txt"), b"user bytes").unwrap();
         let _fallback = ForcedLinkFallback::new(root.path());
         super::MOVE_DESTINATION_LINKED_HOOK.with(|hook| {
-            hook.set(Some(|destination: &Path| {
+            hook.set(Some(|destination: &Path, _source: &Path| {
                 std::fs::remove_file(destination).unwrap();
                 std::fs::write(destination, b"foreign bytes").unwrap();
             }))
@@ -881,6 +918,80 @@ mod linux_tests {
             std::fs::read_dir(&moved).unwrap().count(),
             2,
             "the substituted name and the recovery copy are both kept"
+        );
+    }
+
+    /// A link that existed before this move is a user's, not this operation's
+    /// earlier work, so the move refuses and leaves both names.
+    #[test]
+    fn move_refuses_a_preexisting_destination_link() {
+        let root = tempfile::tempdir().unwrap();
+        let album = root.path().join("album");
+        let moved = root.path().join("moved");
+        std::fs::create_dir(&album).unwrap();
+        std::fs::create_dir(&moved).unwrap();
+        std::fs::write(album.join("note.txt"), b"user bytes").unwrap();
+        std::fs::hard_link(album.join("note.txt"), moved.join("note.txt")).unwrap();
+        let _fallback = ForcedLinkFallback::new(root.path());
+
+        let error = move_noreplace_confined(
+            &open(root.path(), &album.join("note.txt")),
+            &open(root.path(), &moved.join("note.txt")),
+        )
+        .expect_err("a user's link is not this move's to adopt");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(album.join("note.txt")).unwrap(),
+            b"user bytes"
+        );
+        assert_eq!(
+            std::fs::read(moved.join("note.txt")).unwrap(),
+            b"user bytes"
+        );
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
+    }
+
+    /// A writer that replaces the source name after the proof keeps its entry:
+    /// the move takes the name into its own slot, finds another entry there and
+    /// puts it back instead of unlinking it.
+    #[test]
+    fn move_restores_a_source_substituted_after_the_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let album = root.path().join("album");
+        let moved = root.path().join("moved");
+        std::fs::create_dir(&album).unwrap();
+        std::fs::create_dir(&moved).unwrap();
+        std::fs::write(album.join("note.txt"), b"user bytes").unwrap();
+        let _fallback = ForcedLinkFallback::new(root.path());
+        super::MOVE_DESTINATION_LINKED_HOOK.with(|hook| {
+            hook.set(Some(|_destination: &Path, source: &Path| {
+                std::fs::remove_file(source).unwrap();
+                std::fs::write(source, b"foreign bytes").unwrap();
+            }))
+        });
+
+        let error = move_noreplace_confined(
+            &open(root.path(), &album.join("note.txt")),
+            &open(root.path(), &moved.join("note.txt")),
+        )
+        .expect_err("a substituted source refuses the move");
+
+        assert!(format!("{error}").contains("substituted entry"), "{error}");
+        assert_eq!(
+            std::fs::read(album.join("note.txt")).unwrap(),
+            b"foreign bytes",
+            "the writer's entry is back at its name"
+        );
+        assert_eq!(
+            std::fs::read(moved.join("note.txt")).unwrap(),
+            b"user bytes",
+            "the moved bytes stay published"
+        );
+        assert_eq!(
+            std::fs::read_dir(&moved).unwrap().count(),
+            2,
+            "the destination and the recovery copy are kept"
         );
     }
 }

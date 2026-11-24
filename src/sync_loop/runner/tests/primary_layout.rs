@@ -1817,6 +1817,9 @@ fn album_admitted_rows(root: &std::path::Path) -> Vec<(String, String, String, b
 
 #[tokio::test]
 async fn album_directory_conflicting_historical_receipt_does_not_veto_owned_rename() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let provider = records(&server, None);
@@ -1887,6 +1890,9 @@ async fn album_directory_conflicting_historical_receipt_does_not_veto_owned_rena
 
 #[tokio::test]
 async fn exclusive_album_directory_rename_carries_user_tree_and_preserves_old_receipts() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     for naming in [EditedNaming::Suffix, EditedNaming::Primary] {
         let server = server().await;
         let root = tempfile::tempdir().unwrap();
@@ -2057,6 +2063,9 @@ async fn album_directory_replaced_source_identity_refuses_before_movement() {
 
 #[tokio::test]
 async fn album_directory_first_binding_never_adopts_existing_directory() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let provider = records(&server, None);
@@ -2100,6 +2109,9 @@ async fn album_directory_first_binding_never_adopts_existing_directory() {
 
 #[tokio::test]
 async fn album_directory_modified_managed_media_stays_in_place() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let provider = records(&server, None);
@@ -2158,6 +2170,9 @@ async fn album_directory_modified_managed_media_stays_in_place() {
 
 #[tokio::test]
 async fn album_directory_legacy_paths_progress_without_claiming_user_tree() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let provider = records(&server, None);
@@ -2218,6 +2233,9 @@ async fn album_directory_legacy_paths_progress_without_claiming_user_tree() {
 
 #[tokio::test]
 async fn album_directory_fallback_failed_new_publication_keeps_local_copy_and_checkpoint_debt() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let provider = records(&server, None);
@@ -2284,6 +2302,9 @@ async fn album_directory_fallback_failed_new_publication_keeps_local_copy_and_ch
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn album_directory_missing_primary_preserves_owned_orphan_sidecar() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let provider = records(&server, None);
@@ -2390,6 +2411,9 @@ async fn album_directory_first_seen_legacy_rename_preserves_uncertain_paths() {
 
 #[tokio::test]
 async fn album_directory_projection_preserves_independent_selected_owner() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let provider = records(&server, None);
@@ -2461,6 +2485,9 @@ async fn album_directory_projection_preserves_independent_selected_owner() {
 
 #[tokio::test]
 async fn album_directory_projection_keeps_primary_rendition_policy_in_its_owner() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let mut options = album_directory_options("Old");
@@ -2504,6 +2531,9 @@ async fn album_directory_projection_keeps_primary_rendition_policy_in_its_owner(
 
 #[tokio::test]
 async fn album_directory_projection_template_changes_apply_only_to_future_files() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let mut provider = records(&server, None);
@@ -2573,6 +2603,9 @@ async fn album_directory_projection_template_changes_apply_only_to_future_files(
 
 #[tokio::test]
 async fn album_directory_per_file_projection_handles_dates_and_embedded_tokens() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     for template in ["%Y/{album}/%m-%3f", "%Y/photos-{album}-selected/%m"] {
         let server = server().await;
         let root = tempfile::tempdir().unwrap();
@@ -2670,6 +2703,9 @@ async fn album_directory_per_file_projection_handles_dates_and_embedded_tokens()
 
 #[tokio::test]
 async fn album_directory_date_templates_use_exclusive_or_per_file_transition() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     for (template, prefix, modified) in [
         ("{album}/%Y", "", false),
         ("{library}/{album}/%Y", "PrimarySync", true),
@@ -2737,6 +2773,9 @@ async fn album_directory_date_templates_use_exclusive_or_per_file_transition() {
 
 #[tokio::test]
 async fn album_directory_retained_edit_history_keeps_its_original_paths() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     for edit in [Some(("edit-one", EDIT_ONE)), Some(("edit-two", EDIT_TWO))] {
@@ -2792,6 +2831,9 @@ async fn album_directory_retained_edit_history_keeps_its_original_paths() {
 
 #[tokio::test]
 async fn album_directory_hierarchy_ancestor_change_uses_per_file_transition() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let provider = records(&server, None);
@@ -2842,6 +2884,9 @@ async fn album_directory_hierarchy_ancestor_change_uses_per_file_transition() {
 
 #[tokio::test]
 async fn album_directory_state_failure_after_move_recovers_without_rewriting_old_journals() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let provider = records(&server, None);
@@ -2969,139 +3014,19 @@ async fn kill_album_child(root: &std::path::Path, point: &str) {
     assert_eq!(child.wait().unwrap().signal(), Some(9));
 }
 
-/// A death between the claim's journal record and the rename that consumes it
-/// must resume through the recorded identity instead of colliding.
+// The recorded-claim death seam and its substituted-claim case are gone with the
+// claim mechanism: a directory move on a filesystem without an atomic
+// no-replace rename refuses, so a foreign destination name is never replaced.
+
+/// An occupied destination must not wedge the transition. A collision before any
+/// user entry moved cancels the unmoved journal, so the next census replans at a
+/// fresh ordinal.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn album_directory_nfs_claim_process_death_resumes_its_recorded_claim() {
-    let Some(root) = crate::test_helpers::nfs_test_dir("album_directory_claim_death") else {
+async fn album_directory_occupied_user_entry_cancels_the_unmoved_transition() {
+    if !crate::test_helpers::directory_rename_supported() {
         return;
-    };
-    let server = server().await;
-    let provider = records(&server, None);
-    cycle_options(
-        root.path(),
-        provider.clone(),
-        false,
-        EditedNaming::Primary,
-        album_directory_options("Old"),
-    )
-    .await;
-    std::fs::write(
-        root.path().join("fixture-owner"),
-        b"kei-synthetic-process-death",
-    )
-    .unwrap();
-    kill_album_child(root.path(), "album-directory-claim-recorded").await;
-    assert!(
-        root.path().join("media/New").is_dir(),
-        "the interrupted fallback left its claim at the destination"
-    );
-    assert_eq!(
-        std::fs::read_dir(root.path().join("media/New"))
-            .unwrap()
-            .count(),
-        0
-    );
-    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-    let header: Vec<u8> = conn
-        .query_row(
-            "SELECT header FROM primary_layout_operations WHERE policy='album-directory-v1' AND phase='publishing'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    drop(conn);
-    let op: crate::state::db::primary_layout::directory::AlbumDirectoryOperation =
-        serde_json::from_slice(&header).unwrap();
-    assert_eq!(
-        op.claims.len(),
-        1,
-        "this death seam is reachable only after the claim is journaled"
-    );
-    let claim_path = root.path().join("media/New");
-    assert_eq!(op.claims[0].path.to_path(), claim_path);
-    let installed = crate::fs_util::ConfinedPath::open(
-        root.path(),
-        &claim_path,
-        crate::fs_util::ConfinedParents::Existing,
-    )
-    .unwrap()
-    .entry_identity()
-    .unwrap();
-    assert_eq!(
-        op.claims[0].identity, installed,
-        "the journal records the installed claim's identity"
-    );
-    assert_bytes(&root.path().join("media/Old/IMG_0501.JPG"), ORIGINAL);
-    for quiet in [false, true, true] {
-        let (result, _) = cycle_options(
-            root.path(),
-            provider.clone(),
-            quiet,
-            EditedNaming::Primary,
-            album_directory_options("New"),
-        )
-        .await;
-        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
-        assert_bytes(&root.path().join("media/New/IMG_0501.JPG"), ORIGINAL);
-        assert!(!root.path().join("media/Old").exists());
-        assert!(!root.path().join("media/New (1)").exists());
     }
-}
-
-/// A foreign empty directory that replaced the recorded claim is preserved and
-/// the move refuses instead of renaming over it.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn album_directory_nfs_claim_process_death_preserves_a_substituted_directory() {
-    let Some(root) = crate::test_helpers::nfs_test_dir("album_directory_claim_substituted") else {
-        return;
-    };
-    let server = server().await;
-    let provider = records(&server, None);
-    cycle_options(
-        root.path(),
-        provider.clone(),
-        false,
-        EditedNaming::Primary,
-        album_directory_options("Old"),
-    )
-    .await;
-    std::fs::write(
-        root.path().join("fixture-owner"),
-        b"kei-synthetic-process-death",
-    )
-    .unwrap();
-    kill_album_child(root.path(), "album-directory-claim-recorded").await;
-    let foreign = root.path().join("media/foreign-claim");
-    std::fs::create_dir(&foreign).unwrap();
-    std::fs::rename(&foreign, root.path().join("media/New")).unwrap();
-    let result = try_cycle_options(
-        root.path(),
-        provider.clone(),
-        false,
-        EditedNaming::Primary,
-        album_directory_options("New"),
-    )
-    .await;
-    assert!(result.is_err(), "a substituted claim must refuse the move");
-    assert!(root.path().join("media/New").is_dir());
-    assert_eq!(
-        std::fs::read_dir(root.path().join("media/New"))
-            .unwrap()
-            .count(),
-        0
-    );
-    assert_bytes(&root.path().join("media/Old/IMG_0501.JPG"), ORIGINAL);
-}
-
-/// A destination claim that no journal record names must not wedge the
-/// transition. A collision before any user entry moved cancels the unmoved
-/// journal, so the next census replans at a fresh ordinal.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn album_directory_unrecorded_claim_cancels_the_unmoved_user_entry_transition() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
@@ -3184,6 +3109,9 @@ async fn album_directory_unrecorded_claim_cancels_the_unmoved_user_entry_transit
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn album_directory_projection_reopens_partial_routing_and_late_collision() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     for point in [
         "album-projection-planned",
         "album-projection-directory-published",
@@ -3286,6 +3214,9 @@ async fn album_directory_projection_reopens_partial_routing_and_late_collision()
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn album_directory_planned_move_reclassifies_a_later_local_edit() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let provider = records(&server, None);
@@ -3344,6 +3275,9 @@ async fn album_directory_planned_move_reclassifies_a_later_local_edit() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn album_directory_staged_fallback_reselects_a_racing_collision_once() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let provider = records(&server, None);
@@ -3400,6 +3334,9 @@ async fn album_directory_staged_fallback_reselects_a_racing_collision_once() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn album_directory_followon_sigkill_recovers_file_routing_and_missing_primary() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     for point in [
         "album-directory-before-journal",
         "album-directory-planned",
@@ -3472,6 +3409,9 @@ async fn album_directory_followon_sigkill_recovers_file_routing_and_missing_prim
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn album_directory_sigkill_reopens_planned_moved_and_durable_transitions() {
+    if !crate::test_helpers::directory_rename_supported() {
+        return;
+    }
     for point in [
         "album-directory-planned",
         "album-directory-moved",
