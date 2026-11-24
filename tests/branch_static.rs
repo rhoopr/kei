@@ -2174,6 +2174,7 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_srp_post_error",
         "classify_support_error",
         "classify_sync_auth_error",
+        "indexing_unavailable", // Provider-owned classifier for wrapped indexing failures.
         "is_session_error",
         "is_directory_collision",
         "is_operational_storage_error",
