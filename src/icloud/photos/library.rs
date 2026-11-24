@@ -17,6 +17,7 @@ use crate::state::types::HistoricalSourceState;
 
 const ALBUM_TREE_DEPTH_LIMIT: usize = 64;
 const ALBUM_TREE_RECORD_LIMIT: usize = 12_800;
+const INDEXING_RETRY_DELAYS_SECS: [u64; 2] = [5, 15];
 
 /// CloudKit zone name for the user's own (non-shared) library. Used as the
 /// fallback when a `zone_id` JSON object lacks `zoneName`, as the backfill
@@ -170,16 +171,38 @@ impl PhotoLibrary {
     /// hold before checking readiness again.
     pub(super) fn retain_provisional_readiness_from(&self, prior: &Self) {
         if !prior.last_indexing_finished() {
-            self.indexing_finished.store(false, Ordering::Relaxed);
+            self.retain_provisional_readiness();
         }
     }
 
+    pub(super) fn retain_provisional_readiness(&self) {
+        self.indexing_finished.store(false, Ordering::Relaxed);
+    }
+
     pub(crate) async fn check_indexing(&self) -> Result<bool, ICloudError> {
+        let mut delays = INDEXING_RETRY_DELAYS_SECS.into_iter();
+        loop {
+            match self.check_indexing_once().await {
+                Err(ICloudError::IndexingUnavailable(reason)) => {
+                    let Some(seconds) = delays.next() else {
+                        return Err(ICloudError::IndexingUnavailable(reason));
+                    };
+                    tracing::warn!(reason, seconds, "Retrying photo library readiness check");
+                    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Check readiness without indexing backoff. Closing checkpoint checks
+    /// cannot discard an unknown observation, and sparse lookups run per link.
+    pub(crate) async fn check_indexing_once(&self) -> Result<bool, ICloudError> {
         #[cfg(test)]
         if let Some(finished) = self.stub_indexing_finished {
             return Ok(finished);
         }
-        self.indexing_finished.store(false, Ordering::Relaxed);
+        self.retain_provisional_readiness();
         let url = format!(
             "{}/records/query?{}",
             self.service_endpoint,
@@ -209,17 +232,18 @@ impl PhotoLibrary {
                 .and_then(Value::as_str)
         });
         let Some(indexing_state) = indexing_state else {
-            return Err(ICloudError::Connection(
-                "Apple did not report whether the photo library is fully indexed; results may be incomplete".into(),
+            return Err(ICloudError::IndexingUnavailable(
+                "Apple did not report whether the photo library is fully indexed; results may be incomplete",
             ));
         };
         let finished = match indexing_state {
             "FINISHED" => true,
             "RUNNING" => false,
-            _ => return Err(ICloudError::Connection(
-                "Apple reported an unknown photo library indexing state; results may be incomplete"
-                    .into(),
-            )),
+            _ => {
+                return Err(ICloudError::IndexingUnavailable(
+                    "Apple reported an unknown photo library indexing state; results may be incomplete",
+                ));
+            }
         };
         self.indexing_finished.store(finished, Ordering::Relaxed);
         Ok(finished)
@@ -894,11 +918,13 @@ mod tests {
         assert!(!library.check_indexing().await.unwrap());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn indexing_state_missing_fails_library_initialization() {
+        let start = tokio::time::Instant::now();
         let err = new_library_with_indexing_response(json!({"records": []}))
             .await
             .unwrap_err();
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(20));
 
         assert!(
             err.to_string()

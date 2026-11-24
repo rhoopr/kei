@@ -284,15 +284,37 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     };
     api_retry_config.validate()?;
 
-    let (shared_session, mut photos_service, libraries) = super::session::initialize_libraries(
-        auth_result,
-        api_retry_config,
-        &config,
-        &password_provider,
-        &notifier,
-        input_mode,
-    )
-    .await?;
+    let shutdown_token = shutdown::install_signal_handler(sd_notifier, config.ui.personality_mode)?;
+    // Watch health must answer while authenticated discovery waits to retry.
+    // Bind before signaling readiness; cancel the listener on any startup exit.
+    let metrics_shutdown = shutdown_token.child_token();
+    let _metrics_guard = metrics_shutdown.clone().drop_guard();
+    let (metrics_handle, metrics_task) = if let Some(interval) = config.watch.interval {
+        let (handle, task, _addr) = crate::metrics::spawn_server(
+            config.server.bind,
+            config.server.port,
+            metrics_shutdown,
+            Some(chrono::Duration::seconds((interval * 2) as i64)),
+        )?;
+        (Some(handle), Some(task))
+    } else {
+        (None, None)
+    };
+    // Library discovery can take a watch interval to recover. Release the
+    // service manager's start job without exposing a partial sync plan.
+    let _watch_start = is_watch_mode.then(|| sd_notifier.start_worker(shutdown_token.clone()));
+    let (shared_session, mut photos_service, libraries) = tokio::select! {
+        biased;
+        () = shutdown_token.cancelled() => return Ok(()),
+        result = super::session::initialize_libraries(
+            auth_result,
+            api_retry_config,
+            &config,
+            &password_provider,
+            &notifier,
+            input_mode,
+        ) => result?,
+    };
     tracing::debug!(
         count = libraries.len(),
         zones = %libraries.iter().map(|l| l.zone_name().to_string()).collect::<Vec<_>>().join(", "),
@@ -517,7 +539,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         ),
     );
 
-    let shutdown_token = shutdown::install_signal_handler(sd_notifier, config.ui.personality_mode)?;
     photos_service.replay_catalog(&shutdown_token).await?;
     if shutdown_token.is_cancelled() {
         return Ok(());
@@ -578,33 +599,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         &build_download_config,
         enum_config_hash.as_ref(),
     )?;
-    sd_notifier.notify_ready();
-    let _systemd_watchdog_task = sd_notifier.start_watchdog_heartbeat(shutdown_token.clone());
+    let _one_shot_start =
+        (!is_watch_mode).then(|| sd_notifier.start_worker(shutdown_token.clone()));
     // Friendly-mode greeting. Lands above any future bar via
     // active_bar::with_suspended; no-op in off mode. Once per process.
     crate::personality::narration::greet_to_stderr(config.ui.personality_mode, is_watch_mode);
-
-    // Spawn the HTTP server (/healthz + /metrics) only in watch mode.
-    // A one-shot sync exits before anything could scrape /healthz, so there
-    // is no value in binding the port. In watch mode, flag /healthz as stale
-    // after two missed intervals so a single slow cycle doesn't flip to 503
-    // but a stuck main loop does.
-    // Binds synchronously so a misconfigured port fails at startup.
-    let staleness_threshold = config
-        .watch
-        .interval
-        .map(|secs| chrono::Duration::seconds((secs * 2) as i64));
-    let (metrics_handle, metrics_task) = if config.watch.interval.is_some() {
-        let (h, t, _addr) = crate::metrics::spawn_server(
-            config.server.bind,
-            config.server.port,
-            shutdown_token.clone(),
-            staleness_threshold,
-        )?;
-        (Some(h), Some(t))
-    } else {
-        (None, None)
-    };
 
     let mut health = health::HealthStatus::new();
     let cycle_reporter =
@@ -648,18 +647,19 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         // Readiness may change without changes/database events. Persist holds
         // before any shortcut and rebuild collection/pass scope while held so
         // a provisional album list cannot certify FINISHED reconciliation.
-        super::planning::refresh_indexing_library_plans_with_recovery(
-            &mut photos_service,
-            &libraries,
-            &config,
-            state_db
-                .as_deref()
-                .map(|db| db as &dyn download::DownloadStore),
-            &mut library_states,
-            &mut collection_context,
-            startup_db.as_deref().zip(account_owner.as_ref()),
-        )
-        .await?;
+        tokio::select! {
+            biased;
+            () = shutdown_token.cancelled() => break,
+            result = super::planning::refresh_indexing_library_plans_with_recovery(
+                &mut photos_service,
+                &libraries,
+                &config,
+                state_db.as_deref().map(|db| db as &dyn download::DownloadStore),
+                &mut library_states,
+                &mut collection_context,
+                startup_db.as_deref().zip(account_owner.as_ref()),
+            ) => result?,
+        }
 
         // In watch mode with incremental sync, use changes/database as a
         // cheap pre-check before refreshing album plans or running a sync.

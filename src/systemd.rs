@@ -40,6 +40,13 @@ impl SystemdNotifier {
         self.send_impl_ready();
     }
 
+    /// The worker is ready to run or retry. This doesn't certify a sync plan.
+    #[must_use]
+    pub(crate) fn start_worker(self, shutdown: CancellationToken) -> SystemdWatchdogTask {
+        self.notify_ready();
+        self.start_watchdog_heartbeat(shutdown)
+    }
+
     /// Send `STOPPING=1` to systemd (service shutting down).
     pub(crate) fn notify_stopping(self) {
         if !self.enabled {
@@ -204,6 +211,63 @@ mod tests {
         n.notify_stopping();
         n.notify_status("test");
         n.notify_watchdog();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn systemd_worker_is_ready_and_pings_while_discovery_waits() {
+        use std::os::unix::net::UnixDatagram;
+        use std::process::Command;
+
+        const CHILD: &str = "KEI_TEST_SYSTEMD_DISCOVERY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let notifier = SystemdNotifier::new(true);
+            let shutdown = CancellationToken::new();
+            let _watchdog = notifier.start_worker(shutdown.clone());
+            notifier.notify_status("Waiting for iCloud indexing readiness");
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            shutdown.cancel();
+            notifier.notify_stopping();
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notify");
+        let socket = UnixDatagram::bind(&path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "systemd::tests::systemd_worker_is_ready_and_pings_while_discovery_waits",
+            ])
+            .env(CHILD, "1")
+            .env("NOTIFY_SOCKET", &path)
+            .env("WATCHDOG_USEC", "2000000")
+            .env_remove("WATCHDOG_PID")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+
+        let mut messages = Vec::new();
+        loop {
+            let mut buffer = [0; 256];
+            let size = socket.recv(&mut buffer).unwrap();
+            let message = std::str::from_utf8(&buffer[..size]).unwrap().trim();
+            messages.push(message.to_owned());
+            if message == "STOPPING=1" {
+                break;
+            }
+        }
+        assert_eq!(messages[0], "READY=1");
+        assert_eq!(messages[1], "STATUS=Waiting for iCloud indexing readiness");
+        assert!(messages.iter().filter(|m| *m == "WATCHDOG=1").count() >= 2);
+        assert!(!messages.iter().any(|m| m.starts_with("EXTEND_TIMEOUT")));
     }
 
     #[test]

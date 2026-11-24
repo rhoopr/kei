@@ -159,12 +159,18 @@ pub(super) async fn refresh_needed_library_plans(
     consecutive_album_refresh_failures: &mut u32,
 ) {
     for lib_state in library_states {
-        if !lib_state.plan_needs_refresh {
+        if lib_state.indexing_deferred || !lib_state.plan_needs_refresh {
             continue;
         }
         if changed_zones.is_some_and(|zones| !zones.contains(&lib_state.zone_name)) {
             continue;
         }
+        let finished_before_scope = lib_state.library.last_indexing_finished()
+            && lib_state
+                .cross_zone_libraries
+                .iter()
+                .filter(|source| source.zone_name() != lib_state.zone_name)
+                .all(crate::icloud::photos::PhotoLibrary::last_indexing_finished);
 
         // Re-resolve albums per-library to discover newly created iCloud albums.
         // Full sync resolves unfiled album-member exclusions in the download
@@ -188,7 +194,8 @@ pub(super) async fn refresh_needed_library_plans(
                     .filter(|(zone, _)| zone == &lib_state.zone_name)
                     .map(|(_, binding)| binding.clone())
                     .collect();
-                lib_state.plan_is_stale = false;
+                // A later FINISHED probe can't certify a plan observed during RUNNING.
+                lib_state.plan_is_stale = !finished_before_scope;
                 lib_state.plan_needs_refresh = false;
                 *consecutive_album_refresh_failures = 0;
             }
@@ -413,6 +420,7 @@ pub(super) async fn resolve_library_plans_with_recovery(
                 .collect(),
             plan_is_stale: false,
             plan_needs_refresh: false,
+            indexing_deferred: false,
         });
     }
     warn_if_multi_library_paths_commingle(
@@ -461,10 +469,15 @@ pub(super) async fn refresh_indexing_library_plans_with_recovery(
 ) -> anyhow::Result<()> {
     let mut indexing_hold = false;
     let mut finished_before_scope = true;
-    for library in library_states.iter() {
-        let (finished, hold) =
-            crate::sync_cycle::prepare_library_indexing(library, state_db, config.runtime.dry_run)
-                .await?;
+    for library in library_states.iter_mut() {
+        library.indexing_deferred = false;
+        let Some((finished, hold)) =
+            crate::sync_cycle::indexing_for_cycle(library, state_db, config.runtime.dry_run)
+                .await?
+        else {
+            library.indexing_deferred = true;
+            continue;
+        };
         indexing_hold |= hold.is_some();
         if let Some(db) = state_db {
             indexing_hold |= db
@@ -475,6 +488,22 @@ pub(super) async fn refresh_indexing_library_plans_with_recovery(
                 .is_some();
         }
         finished_before_scope &= finished;
+    }
+    if library_states
+        .iter()
+        .any(|library| library.indexing_deferred)
+    {
+        for library in library_states {
+            if library.indexing_deferred || !library.cross_zone_libraries.is_empty() {
+                // Explicit album selection shares collection evidence across zones.
+                library.plan_is_stale = true;
+                library.plan_needs_refresh = false;
+            } else {
+                // Refresh the independent plan before this cycle can qualify it.
+                library.plan_needs_refresh = true;
+            }
+        }
+        return Ok(());
     }
     if indexing_hold {
         (*library_states, *collection_context) =

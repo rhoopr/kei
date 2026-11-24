@@ -400,34 +400,28 @@ pub(super) async fn authenticate_initial_session(
     notifier: &Notifier,
     input_mode: crate::InputMode,
 ) -> anyhow::Result<auth::AuthResult> {
-    let is_watch_mode = config.watch.interval.is_some();
-    if config.runtime.dry_run {
-        return authenticate_sync_session(config, password_provider, input_mode, None).await;
-    }
-    match authenticate_sync_session(config, password_provider, input_mode, None).await {
-        Ok(result) => Ok(result),
-        Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {
-            let expected_generation = auth::two_factor_generation(&e);
-            if !super::should_wait_for_2fa(is_watch_mode, &e) {
-                return Err(e);
-            }
-            notify_two_factor_required(config, notifier);
-            wait_and_retry_2fa(
-                &config.auth.cookie_directory,
-                &config.auth.username,
-                || {
-                    authenticate_sync_session(
-                        config,
-                        password_provider,
-                        input_mode,
-                        expected_generation,
-                    )
-                },
-                config.auth.domain.as_str(),
-            )
-            .await
+    authenticate_before_discovery(config, password_provider, notifier, input_mode, None).await
+}
+
+async fn authenticate_before_discovery(
+    config: &config::Config,
+    password_provider: &crate::password::PasswordProvider,
+    notifier: &Notifier,
+    input_mode: crate::InputMode,
+    expected_generation: Option<auth::session::SessionGeneration>,
+) -> anyhow::Result<auth::AuthResult> {
+    match authenticate_sync_session(config, password_provider, input_mode, expected_generation)
+        .await
+    {
+        Err(error)
+            if !config.runtime.dry_run
+                && super::should_wait_for_2fa(config.watch.interval.is_some(), &error) =>
+        {
+            let generation = auth::two_factor_generation(&error).or(expected_generation);
+            notify_and_wait_for_2fa(config, password_provider, notifier, input_mode, generation)
+                .await
         }
-        Err(e) => Err(e),
+        result => result,
     }
 }
 
@@ -456,57 +450,82 @@ pub(super) async fn initialize_libraries(
     let expected_principal = auth_result.session.principal().map(str::to_owned);
     let mut pending_auth = Some(auth_result);
     let mut retried_after_session_error = false;
+    let mut discovery_indexing = crate::icloud::photos::DiscoveryIndexing::default();
+    let systemd = crate::systemd::SystemdNotifier::new(
+        config.watch.notify_systemd && !config.runtime.dry_run,
+    );
     loop {
+        if is_watch_mode {
+            systemd.notify_status("Discovering iCloud Photos libraries");
+        }
         let this_auth = take_scoped_pending_auth(&mut pending_auth, expected_principal.as_deref())?;
         let released_generation = this_auth.session.generation();
         let init_result =
             init_photos_service(this_auth, api_retry_config, config.ui.personality_mode).await;
-        let (ss, mut ps) = match init_result {
-            Ok(pair) => pair,
-            Err(e) if should_retry_session_init(&e, retried_after_session_error) => {
-                tracing::warn!(
-                    error = %e,
-                    "CloudKit init failed with stale-session signature; retrying persisted-session authentication"
-                );
-                retried_after_session_error = true;
-                pending_auth = Some(
-                    reauth_after_session_error(
-                        config,
-                        password_provider,
-                        notifier,
-                        None,
-                        Some(released_generation),
-                        is_watch_mode,
-                        input_mode,
-                    )
-                    .await?,
-                );
-                continue;
+        let (error, live) = match init_result {
+            Err(error) => (error, None),
+            Ok((ss, mut ps)) => {
+                let discovery = async {
+                    let selected =
+                        resolve_libraries(&config.filters.selection.libraries, &mut ps).await?;
+                    // Planning needs the complete map. Qualify it before any
+                    // state writes so failed discovery can be retried as a unit.
+                    ps.all_libraries().await?;
+                    Ok(selected)
+                }
+                .await;
+                discovery_indexing.extend(ps.take_discovery_indexing());
+                match discovery {
+                    Ok(libraries) => {
+                        ps.retain_discovery_indexing(&discovery_indexing, &libraries);
+                        return Ok((ss, ps, libraries));
+                    }
+                    Err(error) => (error, Some((ss, ps))),
+                }
             }
-            Err(e) => return Err(e),
         };
-        match resolve_libraries(&config.filters.selection.libraries, &mut ps).await {
-            Ok(libs) => return Ok((ss, ps, libs)),
-            Err(e) if should_retry_session_init(&e, retried_after_session_error) => {
-                tracing::warn!(
-                    error = %e,
-                    "CloudKit returned stale-session signature; retrying persisted-session authentication"
-                );
-                retried_after_session_error = true;
-                pending_auth = Some(
-                    reauth_after_session_error(
-                        config,
-                        password_provider,
-                        notifier,
-                        Some((ss, ps)),
-                        None,
-                        is_watch_mode,
-                        input_mode,
-                    )
-                    .await?,
-                );
-            }
-            Err(e) => return Err(e),
+        if crate::icloud::error::ICloudError::indexing_unavailable(&error)
+            && let Some(seconds) = config.watch.interval
+        {
+            drop(live);
+            tracing::warn!(
+                seconds,
+                "Indexing readiness unavailable; deferring library discovery"
+            );
+            systemd.notify_status("Waiting for iCloud indexing readiness");
+            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+            pending_auth = Some(
+                authenticate_before_discovery(
+                    config,
+                    password_provider,
+                    notifier,
+                    input_mode,
+                    Some(released_generation),
+                )
+                .await?,
+            );
+            continue;
+        }
+        if should_retry_session_init(&error, retried_after_session_error) {
+            tracing::warn!(
+                %error,
+                "CloudKit returned stale-session signature; retrying persisted-session authentication"
+            );
+            retried_after_session_error = true;
+            pending_auth = Some(
+                reauth_after_session_error(
+                    config,
+                    password_provider,
+                    notifier,
+                    live,
+                    Some(released_generation),
+                    is_watch_mode,
+                    input_mode,
+                )
+                .await?,
+            );
+        } else {
+            return Err(error);
         }
     }
 }
@@ -1256,6 +1275,197 @@ mod tests {
             "iCDPEnabled": false,
         }))
         .expect("synthetic account data")
+    }
+
+    #[tokio::test]
+    async fn indexing_watch_startup_retries_discovery_after_exhaustion() {
+        indexing_watch_startup(RetryAuth::Cached).await;
+    }
+
+    #[tokio::test]
+    async fn indexing_watch_startup_waits_for_2fa_on_discovery_retry() {
+        indexing_watch_startup(RetryAuth::TwoFactor).await;
+    }
+
+    enum RetryAuth {
+        Cached,
+        TwoFactor,
+    }
+
+    async fn indexing_watch_startup(retry_auth: RetryAuth) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::Notify;
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+        use wiremock::matchers::{path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        struct TwoFaWaitStarted(Arc<Notify>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TwoFaWaitStarted {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let fields = event.metadata().fields();
+                if fields.field("wait_mode").is_some() && fields.field("poll_secs").is_some() {
+                    self.0.notify_one();
+                }
+            }
+        }
+
+        let server = crate::start_wiremock_or_skip!(
+            "indexing_watch_startup_retries_discovery_after_exhaustion"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let base = server.uri();
+        let username = "startup@example.invalid";
+        let data = synthetic_cloudkit_auth_account(&base, "fixture");
+        tokio::fs::write(
+            auth::session_file_path(directory.path(), username, "com"),
+            br#"{"session_token":"fixture"}"#,
+        )
+        .await
+        .unwrap();
+        let session =
+            auth::session::Session::new(directory.path(), username, "https://www.icloud.com", None)
+                .await
+                .unwrap();
+        let verified = Arc::new(AtomicBool::new(false));
+        if matches!(retry_auth, RetryAuth::TwoFactor) {
+            let verified = verified.clone();
+            let validated = serde_json::to_value(&data).unwrap();
+            Mock::given(path("/setup/ws/1/validate"))
+                .respond_with(move |_: &wiremock::Request| {
+                    if verified.load(Ordering::SeqCst) {
+                        ResponseTemplate::new(200).set_body_json(&validated)
+                    } else {
+                        ResponseTemplate::new(401)
+                    }
+                })
+                .expect(2)
+                .mount(&server)
+                .await;
+            let mut challenge = serde_json::to_value(&data).unwrap();
+            challenge["dsInfo"]["hsaVersion"] = serde_json::json!(2);
+            challenge["dsInfo"]["hasICloudQualifyingDevice"] = serde_json::json!(true);
+            challenge["hsaChallengeRequired"] = serde_json::json!(true);
+            Mock::given(path("/setup/ws/1/accountLogin"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(challenge))
+                .expect(1)
+                .mount(&server)
+                .await;
+        } else {
+            session.save_validation_cache(&data).await;
+        }
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        Mock::given(path_regex("/private/records/query$"))
+            .respond_with(move |_: &wiremock::Request| {
+                // Fail the first qualified probe and both retries. The next
+                // watch startup must rebuild the service before publishing it.
+                let n = probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let state = match n {
+                    0 => "RUNNING",
+                    1..=3 => "UNKNOWN",
+                    _ => "FINISHED",
+                };
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"records":[{"fields":{"state":{"value":state}}}]}),
+                )
+            })
+            .expect(8)
+            .mount(&server)
+            .await;
+        Mock::given(path_regex("/private/zones/list$")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}}]}))).expect(2).mount(&server).await;
+        Mock::given(path_regex("/shared/zones/list$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"zones":[]})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = make_run_cycle_config();
+        config.auth.username = username.to_owned();
+        config.auth.cookie_directory = directory.path().to_owned();
+        config.watch.interval = Some(1);
+        let password_provider: crate::password::PasswordProvider =
+            std::sync::Arc::new(|| panic!("indexing must not invalidate credentials"));
+        let notifier = crate::notifications::Notifier::new(None);
+        let initialize = crate::auth::endpoints::with_test_endpoint(
+            &base,
+            Box::pin(super::initialize_libraries(
+                auth::AuthResult {
+                    session,
+                    data: data.clone(),
+                    requires_2fa: false,
+                },
+                crate::retry::RetryConfig::default(),
+                &config,
+                &password_provider,
+                &notifier,
+                crate::InputMode::NoInput,
+            )),
+        );
+        let (_, mut service, selected) = if matches!(retry_auth, RetryAuth::TwoFactor) {
+            let waiting = Arc::new(Notify::new());
+            let subscriber = tracing_subscriber::registry().with(TwoFaWaitStarted(waiting.clone()));
+            let complete_2fa = async {
+                waiting.notified().await;
+                // Simulate submit-code's validation-cache-only handoff after
+                // the worker is waiting. Authentication will validate online
+                // again rather than trust the cache that woke it.
+                verified.store(true, Ordering::SeqCst);
+                let cache = serde_json::json!({
+                    "validated_at": chrono::Utc::now().timestamp(),
+                    "account_data": data,
+                });
+                tokio::fs::write(
+                    auth::validation_cache_file_path(directory.path(), username, "com"),
+                    serde_json::to_vec(&cache)?,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                tokio::try_join!(initialize.with_subscriber(subscriber), complete_2fa)
+            })
+            .await
+            .expect("discovery did not resume after 2FA")
+            .unwrap()
+            .0
+        } else {
+            initialize.await.unwrap()
+        };
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].is_qualified_private_primary());
+        assert!(!selected[0].last_indexing_finished());
+        let libraries = service.all_libraries().await.unwrap();
+        let [primary] = libraries.as_slice() else {
+            panic!("expected a single published library");
+        };
+        assert!(!primary.last_indexing_finished());
+        let state_path = directory.path().join("cycle.db");
+        let db = crate::state::SqliteStateDb::open(&state_path)
+            .await
+            .unwrap();
+        let cursor = crate::sync_cycle::sync_token_key(primary.zone_name());
+        let key = crate::sync_cycle::indexing_reconciliation_key(primary.zone_name());
+        db.set_metadata(&cursor, "trusted-before").await.unwrap();
+        let (finished, hold) =
+            crate::sync_cycle::prepare_indexing_reconciliation(primary, Some(&db), false)
+                .await
+                .unwrap();
+        assert!(finished);
+        assert_eq!(hold.as_deref(), Some("1"));
+        drop(db);
+        let db = crate::state::SqliteStateDb::open(&state_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_metadata(&cursor).await.unwrap().as_deref(),
+            Some("trusted-before")
+        );
+        assert_eq!(db.get_metadata(&key).await.unwrap().as_deref(), Some("1"));
+        server.verify().await;
     }
 
     #[tokio::test]

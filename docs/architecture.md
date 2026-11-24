@@ -48,6 +48,8 @@ Ordinary sync commits eligible provider checkpoints before draining the local me
 
 Keep the previous checkpoint on incomplete token proof, interruption, stale planning, or non-durable recovery. Unknown provider identity keeps work pending. A verified local copy does not prove that the provider deleted its source.
 
+Unknown indexing readiness before enumeration defers the affected library after two short retries. An unknown closing probe holds its checkpoint immediately. Independent libraries can advance their own checkpoints. Watch mode retries incomplete discovery before publishing a library map. See [checkpoint decisions and enumeration](architecture/checkpoints.md).
+
 Selection evidence limits apply to individual writes and validation operations. Retained history does not consume the next library's or restarted baseline's write allowance.
 
 Once selection freezes a destination, a downloaded receipt at a different path cannot satisfy it. With stable source evidence, a missing selected copy stays due until kei publishes it at the promised path or records proof that resolves that destination.

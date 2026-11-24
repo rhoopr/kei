@@ -376,7 +376,7 @@ pub(super) async fn check_changes_database(
         return WatchPrecheck::SkipAll;
     }
     for library in library_states {
-        if !library.library.last_indexing_finished() {
+        if library.indexing_deferred || !library.library.last_indexing_finished() {
             return WatchPrecheck::proceed_all();
         }
         for key in [

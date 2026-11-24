@@ -379,6 +379,7 @@ fn commingle_test_states(
                 deleted_album_bindings: Vec::new(),
                 plan_is_stale: false,
                 plan_needs_refresh: false,
+                indexing_deferred: false,
             }
         })
         .collect()

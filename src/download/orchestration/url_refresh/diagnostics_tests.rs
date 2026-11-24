@@ -1166,7 +1166,7 @@ async fn discovery_diagnostics_identify_qualified_primary_scope() {
     assert_ne!(projections[0], projections[1]);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn discovery_diagnostics_do_not_publish_after_failed_listing_or_indexing() {
     for fault in [
         "invalid_listing",

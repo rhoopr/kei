@@ -44,9 +44,111 @@ fn indexing_capture(db: &Arc<state::SqliteStateDb>) -> crate::icloud::photos::in
     crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), indexing_owner(), "com")
 }
 
+#[tokio::test]
+async fn indexing_watch_serves_startup_health_during_discovery() {
+    // The production runner installs signal handlers and hardens the process.
+    const CHILD: &str = "KEI_TEST_INDEXING_WATCH_HEALTH_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "sync_loop::runner::tests::indexing::indexing_watch_serves_startup_health_during_discovery"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        return;
+    }
+
+    use crate::auth::{self, session::Session};
+    let server =
+        crate::start_wiremock_or_skip!("indexing_watch_serves_startup_health_during_discovery");
+    let root = tempfile::tempdir().unwrap();
+    let username = "watch-health@example.invalid";
+    let base = server.uri();
+    let auth = serde_json::from_value(json!({
+        "dsInfo": {"dsid": "watch-health-fixture"},
+        "webservices": {"ckdatabasews": {"url": base}},
+    }))
+    .unwrap();
+    std::fs::write(
+        auth::session_file_path(root.path(), username, "com"),
+        br#"{"session_token":"fixture"}"#,
+    )
+    .unwrap();
+    let session = Session::new(root.path(), username, &base, None)
+        .await
+        .unwrap();
+    session.save_validation_cache(&auth).await;
+    drop(session);
+
+    let observed = Arc::new(tokio::sync::Notify::new());
+    let provider = observed.clone();
+    Mock::given(wiremock::matchers::path_regex("/private/records/query$"))
+        .respond_with(move |_: &wiremock::Request| {
+            provider.notify_one();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"records":[{"fields":{"state":{"value":"UNKNOWN"}}}]}))
+        })
+        .mount(&server)
+        .await;
+    let globals = crate::config::GlobalArgs {
+        config_source: Default::default(),
+        username: Some(username.to_owned()),
+        domain: None,
+        data_dir: Some(root.path().to_string_lossy().into_owned()),
+    };
+    let toml_config = serde_json::from_value(json!({
+        "config_version": 1,
+        "download": {"directory": root.path().join("media")},
+        "server": {"port": 0, "bind": "127.0.0.1"},
+        "watch": {"notify_systemd": false},
+    }))
+    .unwrap();
+    let args = crate::sync_loop::SyncArgs {
+        is_one_shot: false,
+        service_mode: true,
+        pw: Default::default(),
+        sync: Default::default(),
+        toml_config: Some(toml_config),
+        config_explicitly_set: false,
+        config_path: root.path().join("config.toml"),
+        redact_password: Arc::default(),
+        personality_mode: crate::personality::Mode::Off,
+        friendly_request: None,
+        input_mode: crate::InputMode::NoInput,
+    };
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+    let worker = auth::endpoints::with_test_endpoint(
+        &base,
+        Box::pin(crate::sync_loop::run_sync(&globals, args)),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::select! {
+            result = worker => panic!("worker exited during discovery: {result:?}"),
+            () = async {
+                observed.notified().await;
+                let port = capture.events().iter()
+                    .find(|event| event.message() == Some("HTTP server listening (serving /healthz and /metrics)"))
+                    .and_then(|event| event.field("port"))
+                    .expect("watch must bind before discovery")
+                    .to_owned();
+                let response = reqwest::get(format!("http://127.0.0.1:{port}/healthz")).await.unwrap();
+                assert_eq!(response.status(), 200);
+                assert_eq!(response.text().await.unwrap(), r#"{"status":"no sync cycle completed yet"}"#);
+            } => {}
+        }
+    }).await.expect("watch startup health check timed out");
+}
+
 #[derive(Clone)]
 struct IndexingSession {
     readiness: Arc<Mutex<&'static str>>,
+    readiness_probes: Arc<AtomicUsize>,
+    unknown_at_probe: Option<usize>,
+    unknown_observed: Arc<tokio::sync::Notify>,
     records: Arc<Vec<Value>>,
     queries: Arc<AtomicUsize>,
     changes: Arc<Mutex<Vec<String>>>,
@@ -64,9 +166,16 @@ impl PhotosSession for IndexingSession {
     async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
         let request: Value = serde_json::from_str(&body)?;
         if request["query"]["recordType"] == "CheckIndexingState" {
-            return Ok(
-                json!({"records":[{"fields":{"state":{"value":*self.readiness.lock().unwrap()}}}]}),
-            );
+            let probe = self.readiness_probes.fetch_add(1, Ordering::SeqCst) + 1;
+            let readiness = if self.unknown_at_probe == Some(probe) {
+                "UNKNOWN"
+            } else {
+                *self.readiness.lock().unwrap()
+            };
+            if readiness == "UNKNOWN" {
+                self.unknown_observed.notify_one();
+            }
+            return Ok(json!({"records":[{"fields":{"state":{"value":readiness}}}]}));
         }
         if request["query"]["recordType"] == "CPLAlbumByPositionLive" {
             let finished = *self.readiness.lock().unwrap() == "FINISHED";
@@ -83,6 +192,7 @@ impl PhotosSession for IndexingSession {
             return Ok(json!({"records":records}));
         }
         if url.contains("/changes/zone?") {
+            let scope = &request["zones"][0]["zoneID"];
             let cursor = request["zones"][0]["syncToken"]
                 .as_str()
                 .unwrap_or("<bootstrap>")
@@ -90,22 +200,18 @@ impl PhotosSession for IndexingSession {
             self.changes.lock().unwrap().push(cursor);
             if request["zones"][0]["syncToken"].is_null() {
                 return Ok(json!({"zones": [{
-                    "zoneID": {"zoneName": ZONE, "ownerRecordName": "_defaultOwner"},
+                    "zoneID": scope,
                     "records": self.records.as_ref(), "syncToken": "query-candidate", "moreComing": false
                 }]}));
             }
             if self.reject_cursor {
-                return Ok(
-                    json!({"zones":[{"zoneID":{"zoneName":ZONE,"ownerRecordName":"_defaultOwner"},
-                    "serverErrorCode":"BAD_REQUEST","reason":"expired retained cursor","syncToken":"","moreComing":false}]}),
-                );
+                return Ok(json!({"zones":[{"zoneID":scope,
+                    "serverErrorCode":"BAD_REQUEST","reason":"expired retained cursor","syncToken":"","moreComing":false}]}));
             }
             // Deliberately no events for omitted assets: only a full inventory
             // can recover them, even though every incremental request succeeds.
-            return Ok(
-                json!({"zones":[{"zoneID":{"zoneName":ZONE,"ownerRecordName":"_defaultOwner"},
-                "records":self.change_records.as_ref(),"syncToken":self.successor,"moreComing":false}]}),
-            );
+            return Ok(json!({"zones":[{"zoneID":scope,
+                "records":self.change_records.as_ref(),"syncToken":self.successor,"moreComing":false}]}));
         }
         if url.contains("/records/lookup?") {
             let records: Vec<_> = request["records"].as_array().unwrap().iter().map(|wanted| {
@@ -171,6 +277,9 @@ fn provider(readiness: &'static str, ids: &[&str], base: &str) -> IndexingSessio
         .collect();
     IndexingSession {
         readiness: Arc::new(Mutex::new(readiness)),
+        readiness_probes: Arc::default(),
+        unknown_at_probe: None,
+        unknown_observed: Arc::default(),
         records: Arc::new(records),
         queries: Arc::new(AtomicUsize::new(0)),
         changes: Arc::new(Mutex::new(Vec::new())),
@@ -514,7 +623,65 @@ async fn indexing_restart_recovers_omitted_assets_and_reuses_downloaded_files() 
     server.verify().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn indexing_unknown_recovers_in_cycle_or_cancels_during_backoff() {
+    for cancel_during_backoff in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let db = indexing_db(&root.path().join("state.db")).await;
+        let config = make_run_cycle_config();
+        db.set_metadata(CURSOR, "trusted-before").await.unwrap();
+        db.set_metadata(
+            ENUM_CONFIG_HASH_KEY,
+            &download::compute_config_hash(&config),
+        )
+        .await
+        .unwrap();
+        let provider = provider("FINISHED", &[], "");
+        let selected = library(&provider, &db).await;
+        *provider.readiness.lock().unwrap() = "UNKNOWN";
+        let (_dir, session) = make_shared_session_for_run_cycle().await;
+        let build = make_run_cycle_download_config_builder(root.path(), db.clone());
+        let cancel = CancellationToken::new();
+        let libraries = [&selected];
+        let cycle = run_cycle(
+            &libraries,
+            &config,
+            Some(db.as_ref()),
+            &build,
+            download::DownloadControls::download_hidden(),
+            &session,
+            &cancel,
+        );
+        let (result, ()) = tokio::join!(cycle, async {
+            provider.unknown_observed.notified().await;
+            if cancel_during_backoff {
+                cancel.cancel();
+            } else {
+                *provider.readiness.lock().unwrap() = "FINISHED";
+            }
+        });
+        let result = result.unwrap();
+        if cancel_during_backoff {
+            assert_eq!(provider.readiness_probes.load(Ordering::SeqCst), 2);
+            assert_eq!(provider.queries.load(Ordering::SeqCst), 0);
+            assert!(provider.changes.lock().unwrap().is_empty());
+            assert_eq!(
+                db.get_metadata(CURSOR).await.unwrap().as_deref(),
+                Some("trusted-before")
+            );
+            assert!(!result.can_advance_database_checkpoint());
+        } else {
+            assert_eq!(result.failed_count, 0);
+            assert_eq!(*provider.changes.lock().unwrap(), ["trusted-before"]);
+            assert_eq!(
+                db.get_metadata(CURSOR).await.unwrap().as_deref(),
+                Some("trusted-after")
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_and_cursor() {
     for fault in [
         "malformed",
@@ -522,6 +689,7 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
         "checkpoint_write",
         "regressed",
         "unknown",
+        "closing_unknown",
     ] {
         let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         let root = tempfile::tempdir().unwrap();
@@ -542,7 +710,9 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
             .await
             .unwrap();
             // Unknown marker payloads remain obligations; they are not ignored.
-            db.set_metadata(&hold, "future-version").await.unwrap();
+            if fault != "closing_unknown" {
+                db.set_metadata(&hold, "future-version").await.unwrap();
+            }
             let row = crate::test_helpers::TestAssetRecord::new("old")
                 .library(ZONE)
                 .build();
@@ -592,6 +762,11 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
         if fault == "regressed" {
             provider.regress_after_query = true;
         }
+        if fault == "closing_unknown" {
+            // Construction and the start of cycle see FINISHED. Retry would
+            // also see FINISHED, but cannot qualify the completed work.
+            provider.unknown_at_probe = Some(3);
+        }
         let library = library(&provider, &inner).await;
         if fault == "unknown" {
             *provider.readiness.lock().unwrap() = "UNKNOWN";
@@ -608,13 +783,18 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
             &cancel,
         )
         .await;
+        let result = result.unwrap();
+        assert!(!result.can_advance_database_checkpoint(), "{fault}");
         if fault == "unknown" {
-            assert!(result.is_err());
-        } else {
-            assert!(
-                !result.unwrap().can_advance_database_checkpoint(),
-                "{fault}"
-            );
+            assert!(result.failed_count > 0);
+            assert_eq!(provider.readiness_probes.load(Ordering::SeqCst), 4);
+            assert_eq!(provider.queries.load(Ordering::SeqCst), 0);
+            assert!(provider.changes.lock().unwrap().is_empty());
+        }
+        if fault == "closing_unknown" {
+            assert_eq!(result.failed_count, 1);
+            assert_eq!(provider.readiness_probes.load(Ordering::SeqCst), 3);
+            assert_eq!(*provider.changes.lock().unwrap(), ["trusted-before"]);
         }
         if fault == "checkpoint_write" {
             assert!(provider.queries.load(Ordering::SeqCst) > 0);
@@ -1063,6 +1243,160 @@ async fn indexing_normal_recovery_restores_failed_and_omitted_photos_across_rest
 }
 
 #[tokio::test]
+async fn indexing_ready_peer_reconciles_and_advances_while_neighbor_is_unknown() {
+    use crate::icloud::photos::PhotosService;
+    use crate::sync_loop::{planning, precheck};
+
+    const PEER: &str = "SharedSync-TEST";
+    const PEER_CURSOR: &str = "sync_token:SharedSync-TEST";
+    let root = tempfile::tempdir().unwrap();
+    let db = indexing_db(&root.path().join("state.db")).await;
+    let mut config = make_run_cycle_config();
+    config.filters.selection.albums = crate::selection::AlbumSelector::None;
+    config.filters.selection.unfiled = true;
+    config.filters.selection.libraries.shared_all = true;
+    let peer_hold = indexing_reconciliation_key(PEER);
+    let peer_replay = crate::sync_cycle::indexing_replay_key(PEER);
+    let primary_hold = indexing_reconciliation_key(ZONE);
+    for (key, value) in [
+        (CURSOR, "primary-before"),
+        (PEER_CURSOR, "peer-before"),
+        (&peer_hold, "1"),
+    ] {
+        db.set_metadata(key, value).await.unwrap();
+    }
+    let enum_hash = download::compute_config_hash(&config);
+    db.set_metadata(ENUM_CONFIG_HASH_KEY, &enum_hash)
+        .await
+        .unwrap();
+
+    let unknown = provider("FINISHED", &[], "");
+    let primary = library(&unknown, &db).await.library;
+    let ready = provider("FINISHED", &[], "");
+    let peer = PhotoLibrary::new(
+        "https://example.com".into(),
+        Arc::default(),
+        Box::new(ready.clone()),
+        Arc::new(json!({"zoneName":PEER,"ownerRecordName":"_defaultOwner"})),
+        "shared".into(),
+        retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    let libraries = vec![primary.clone(), peer.clone()];
+    let mut service = PhotosService::for_testing_with_libraries(
+        Box::new(unknown.clone()),
+        primary.clone(),
+        HashMap::from([(ZONE.to_owned(), primary)]),
+        HashMap::from([(PEER.to_owned(), peer)]),
+    );
+    service.set_shadow_capture(indexing_capture(&db));
+    let (mut states, mut context) =
+        planning::resolve_library_plans(&mut service, &libraries, &config)
+            .await
+            .unwrap();
+    assert_eq!(states.len(), 2);
+    assert!(states.iter().all(|s| s.cross_zone_libraries.is_empty()));
+    let (_dir, session) = make_shared_session_for_run_cycle().await;
+    let build = make_run_cycle_download_config_builder(root.path(), db.clone());
+    let scope =
+        precheck::DbPrecheckScope::from_config(&config, &states, &build, &enum_hash).unwrap();
+
+    *unknown.readiness.lock().unwrap() = "UNKNOWN";
+    tokio::time::pause();
+    let mut inventory_queries = 0;
+    for round in 0..3 {
+        if round > 0 {
+            for state in &mut states {
+                state.plan_needs_refresh = true;
+            }
+        }
+        planning::refresh_indexing_library_plans(
+            &mut service,
+            &libraries,
+            &config,
+            Some(db.as_ref()),
+            &mut states,
+            &mut context,
+        )
+        .await
+        .unwrap();
+        let precheck =
+            precheck::check_changes_database(Some(db.as_ref()), &states, &mut service, &scope)
+                .await;
+        assert_eq!(precheck, precheck::WatchPrecheck::proceed_all());
+        planning::refresh_needed_library_plans(
+            &mut states,
+            &config.filters.selection,
+            &context,
+            precheck.changed_zones(),
+            &mut 0,
+        )
+        .await;
+
+        let result = run_cycle(
+            &states.iter().collect::<Vec<_>>(),
+            &config,
+            Some(db.as_ref()),
+            &build,
+            download::DownloadControls::download_hidden(),
+            &session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failed_count, 1, "only the unknown library failed");
+        assert!(!result.can_advance_database_checkpoint());
+        assert_eq!(
+            db.get_metadata(CURSOR).await.unwrap().as_deref(),
+            Some("primary-before")
+        );
+        assert!(db.get_metadata(&primary_hold).await.unwrap().is_some());
+        assert_eq!(unknown.queries.load(Ordering::SeqCst), 0);
+        assert!(unknown.changes.lock().unwrap().is_empty());
+        assert!(db.get_metadata(&peer_hold).await.unwrap().is_none());
+        assert_eq!(
+            db.get_metadata(&peer_replay).await.unwrap().is_some(),
+            round == 0
+        );
+        assert_eq!(
+            db.get_metadata(PEER_CURSOR).await.unwrap().as_deref(),
+            Some(if round == 0 {
+                "peer-before"
+            } else {
+                "trusted-after"
+            })
+        );
+        let queries = ready.queries.load(Ordering::SeqCst);
+        if round == 0 {
+            assert!(queries > 0, "the peer qualified a full inventory");
+        } else if round == 1 {
+            // The held inventory can't activate a selection generation. The
+            // first trusted replay can build one for subsequent quiet wakes.
+            inventory_queries = queries;
+            assert_eq!(
+                db.get_summary()
+                    .await
+                    .unwrap()
+                    .provider_checkpoint_status
+                    .as_deref(),
+                Some("preserved"),
+                "the durable hold still applies to the aggregate status"
+            );
+        } else {
+            assert_eq!(
+                queries, inventory_queries,
+                "no peer inventory on a quiet wake"
+            );
+        }
+    }
+    assert_eq!(
+        *ready.changes.lock().unwrap(),
+        ["peer-before", "trusted-after"]
+    );
+}
+
+#[tokio::test]
 async fn indexing_running_plan_cannot_qualify_after_late_finished_probe() {
     use crate::icloud::photos::PhotosService;
     use crate::selection::AlbumSelector;
@@ -1107,8 +1441,65 @@ async fn indexing_running_plan_cannot_qualify_after_late_finished_probe() {
             .await
             .unwrap();
     assert_eq!(states[0].plan.passes.len(), 1);
-    transition.store(true, Ordering::SeqCst);
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    *provider.readiness.lock().unwrap() = "UNKNOWN";
+    tokio::time::pause();
+    let probes = provider.readiness_probes.load(Ordering::SeqCst);
+    crate::sync_loop::planning::refresh_indexing_library_plans(
+        &mut service,
+        &libraries,
+        &config,
+        Some(db.as_ref()),
+        &mut states,
+        &mut context,
+    )
+    .await
+    .unwrap();
+    assert!(states[0].indexing_deferred);
+    let build = make_run_cycle_download_config_builder(&media, db.clone());
+    let other_zone = "SharedSync-TEST";
+    let other_cursor = "sync_token:SharedSync-TEST";
+    db.set_metadata(other_cursor, "other-before").await.unwrap();
+    let independent = make_run_cycle_library_state_with_album(
+        other_zone,
+        other_cursor,
+        make_captured_cycle_album(
+            other_zone,
+            indexing_capture(&db),
+            Box::new(
+                crate::test_helpers::DynamicRecentPhotosSession::new(0)
+                    .with_zone(other_zone)
+                    .with_token("other-after"),
+            ),
+        ),
+    );
+    let deferred = run_cycle(
+        &[&states[0], &independent],
+        &config,
+        Some(db.as_ref()),
+        &build,
+        download::DownloadControls::download_hidden(),
+        &shared,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.get_metadata(other_cursor).await.unwrap().as_deref(),
+        Some("other-after")
+    );
+    assert!(deferred.failed_count > 0);
+    assert!(!deferred.can_advance_database_checkpoint());
+    assert_eq!(provider.readiness_probes.load(Ordering::SeqCst), probes + 3);
+    assert_eq!(provider.queries.load(Ordering::SeqCst), 0);
+    assert!(provider.changes.lock().unwrap().is_empty());
+    assert_eq!(
+        db.get_metadata(CURSOR).await.unwrap().as_deref(),
+        Some("trusted-before")
+    );
+    tokio::time::resume();
+    *provider.readiness.lock().unwrap() = "RUNNING";
+    transition.store(true, Ordering::SeqCst);
     for round in 0..2 {
         crate::sync_loop::planning::refresh_indexing_library_plans(
             &mut service,

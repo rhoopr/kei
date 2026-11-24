@@ -324,7 +324,12 @@ pub(crate) async fn recover(
     if cancel.is_cancelled() || !target.controls.run_mode.downloads_files() {
         return Ok(None);
     }
-    if !target.library.check_indexing().await?
+    let finished = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Ok(None),
+        result = target.library.check_indexing_once() => result?,
+    };
+    if !finished
         || db
             .get_metadata(&crate::sync_cycle::indexing_reconciliation_key(
                 &target.config.library,
@@ -503,7 +508,142 @@ fn validate_paths(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_paths;
+    use super::{recover, validate_paths};
+    use crate::download::{DownloadConfig, DownloadControls, SyncStats};
+    use crate::icloud::error::ICloudError;
+    use crate::icloud::photos::asset::SparseShareEvidence;
+    use crate::icloud::photos::{PhotoLibrary, PhotosSession};
+    use crate::retry::RetryConfig;
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    const SHARED_ZONE: &str = "SharedSync-sparse-regression";
+    const SHARED_OWNER: &str = "owner-sparse-regression";
+
+    /// The constructor sees FINISHED. Later probes see UNKNOWN.
+    #[derive(Clone)]
+    struct ReadinessSession(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl PhotosSession for ReadinessSession {
+        async fn post(
+            &self,
+            _url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            // No sparse lookup or other provider work may get past readiness.
+            let request: Value = serde_json::from_str(&body)?;
+            assert_eq!(request["query"]["recordType"], "CheckIndexingState");
+            assert_eq!(request["zoneID"]["zoneName"], SHARED_ZONE);
+            assert_eq!(request["zoneID"]["ownerRecordName"], SHARED_OWNER);
+            let probe = self.0.fetch_add(1, Ordering::SeqCst);
+            let state = if probe == 0 { "FINISHED" } else { "UNKNOWN" };
+            Ok(json!({"records": [{"fields": {"state": {"value": state}}}]}))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn linked_observation(child: &str) -> SparseShareEvidence {
+        let evidence = SparseShareEvidence::from_fields(&json!({
+            "isSparsePrivateRecord": {"type": "INT64", "value": 1},
+            "linkedShareRecordName": {"type": "STRING", "value": child},
+            "linkedShareZoneName": {"type": "STRING", "value": SHARED_ZONE},
+            "linkedShareZoneOwner": {"type": "REFERENCE", "value": {"recordName": SHARED_OWNER}},
+        }))
+        .expect("linked sparse share evidence");
+        assert!(matches!(evidence, SparseShareEvidence::Linked(_)));
+        evidence
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sparse_target_recovery_probes_readiness_once_per_linked_observation() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let library = PhotoLibrary::new(
+            "https://example.invalid".into(),
+            Arc::default(),
+            Box::new(ReadinessSession(probes.clone())),
+            Arc::new(json!({"zoneName": SHARED_ZONE, "ownerRecordName": SHARED_OWNER})),
+            "shared".into(),
+            RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        assert!(library.last_indexing_finished());
+        let album = library.all();
+
+        let mut config = DownloadConfig::test_default();
+        config.library = Arc::from(SHARED_ZONE);
+        config.state_db = Some(Arc::new(
+            crate::state::SqliteStateDb::open_in_memory().unwrap(),
+        ));
+        let target_config = Arc::new(config.clone());
+        config.sparse_targets = Arc::from([super::SelectedSparseTarget {
+            hidden_only: false,
+            scan: None,
+            library,
+            album,
+            config: target_config,
+            client: reqwest::Client::new(),
+            controls: DownloadControls::download_hidden(),
+        }]);
+
+        let cancel = CancellationToken::new();
+        let mut stats = SyncStats::default();
+        for child in ["sparse-child-one", "sparse-child-two"] {
+            let before = probes.load(Ordering::SeqCst);
+            let started = tokio::time::Instant::now();
+            let error =
+                match recover(&linked_observation(child), &config, &cancel, &mut stats).await {
+                    Ok(_) => panic!("UNKNOWN readiness must not yield a target proof"),
+                    Err(error) => error,
+                };
+            assert!(
+                matches!(
+                    error.downcast_ref::<ICloudError>(),
+                    Some(ICloudError::IndexingUnavailable(_))
+                ),
+                "unknown readiness must surface as a retryable indexing hold: {error}"
+            );
+            assert_eq!(
+                started.elapsed(),
+                Duration::ZERO,
+                "one recovery observation must not wait through the 5s/15s indexing backoff"
+            );
+            assert_eq!(
+                probes.load(Ordering::SeqCst),
+                before + 1,
+                "exactly one readiness request per recovery observation"
+            );
+        }
+
+        cancel.cancel();
+        assert!(
+            recover(
+                &linked_observation("sparse-child-three"),
+                &config,
+                &cancel,
+                &mut stats,
+            )
+            .await
+            .expect("cancellation is not a recovery error")
+            .is_none(),
+            "a cancelled recovery must not produce a target proof"
+        );
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            3,
+            "a cancelled recovery must short-circuit before the readiness probe"
+        );
+    }
+
     #[test]
     fn sparse_target_file_gate_rechecks_publication_and_companion_absence() {
         let root = tempfile::tempdir().unwrap();

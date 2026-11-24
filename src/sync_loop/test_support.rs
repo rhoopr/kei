@@ -363,6 +363,7 @@ pub(super) fn make_run_cycle_library_state_with_passes(
         deleted_album_bindings: Vec::new(),
         plan_is_stale: false,
         plan_needs_refresh: false,
+        indexing_deferred: false,
         cross_zone_libraries: Vec::new(),
     }
 }
@@ -1728,6 +1729,7 @@ pub(super) fn make_library_state(zone: &str, sync_token_key: &str) -> LibrarySta
         deleted_album_bindings: Vec::new(),
         plan_is_stale: false,
         plan_needs_refresh: false,
+        indexing_deferred: false,
         cross_zone_libraries: Vec::new(),
     }
 }
