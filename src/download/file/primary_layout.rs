@@ -708,18 +708,32 @@ fn restore_retirement(entries: &[RetirementEntry]) {
     // Retained directory capabilities prevent following a swapped parent.
     // Never replace a later writer; any failed restoration retains the saved
     // entry and the caller's durable journal for another recovery attempt.
+    // A restore that died after linking the public name is settled by retiring
+    // the saved name this journal owns, so a reopen reaches one link.
     for entry in entries.iter().filter(|entry| entry.expected.is_some()) {
-        // A restore that stopped after moving the entry back leaves one of its
-        // slots behind. Prove and retire it before deciding the public name is
-        // occupied, so a reopen reaches a settled single link.
-        if let Some(expected) = &entry.expected
-            && entry.source.retained_entry_identity().ok() == Some(expected.identity)
-        {
-            let _ = super::platform::reclaim_move_slots(
+        let Some(expected) = entry.expected.as_ref() else {
+            continue;
+        };
+        // A restore that stopped after linking the public name leaves the saved
+        // name and its slots behind. Only an entry this journal recorded is
+        // acted on.
+        if entry.source.retained_entry_identity().ok() == Some(expected.identity) {
+            if let Err(error) = super::platform::reclaim_move_slots(
                 &entry.destination,
                 &entry.source,
                 expected.identity,
-            );
+            ) {
+                tracing::warn!(%error, "Layout restore could not reclaim a move slot");
+            }
+            // The public name already holds the restored bytes, so the rollback
+            // settles on one link by retiring the saved name this journal owns.
+            #[cfg(target_os = "linux")]
+            if entry.destination.retained_entry_identity().ok() == Some(expected.identity)
+                && let Err(error) =
+                    super::platform::consume_owned_name(&entry.destination, expected.identity)
+            {
+                tracing::warn!(%error, "Layout restore could not retire the saved name");
+            }
         }
         if entry.destination.entry_exists().unwrap_or(false)
             && !entry.source.entry_exists().unwrap_or(true)
@@ -1190,6 +1204,118 @@ mod tests {
         );
         assert!(!slot.exists());
         assert_eq!(std::fs::read(&media).unwrap(), b"saved media");
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    #[test]
+    #[ignore = "parent-owned SIGKILL fixture"]
+    fn restore_process_death_child() {
+        use super::restore_retirement;
+
+        let root = std::path::PathBuf::from(
+            std::env::var_os("KEI_TEST_PROCESS_DEATH_ROOT").expect("dedicated fixture root"),
+        );
+        assert_eq!(
+            std::fs::read(root.join("fixture-owner")).unwrap(),
+            b"kei-synthetic-process-death"
+        );
+        let _fallback = super::super::platform::ForcedLinkFallback::new(&root);
+        let media = root.join("photo.jpg");
+        let retired = root.join("private/retired");
+        let expected = snapshot_blocking(&root, &retired).unwrap();
+        let entries = [RetirementEntry::open(&root, &media, &retired, expected).unwrap()];
+        restore_retirement(&entries);
+        panic!("restore child did not reach its process-death point");
+    }
+
+    /// A restore killed after linking the public name leaves the saved name and
+    /// its recovery slot behind. Reopening the layout operation proves those
+    /// names and settles the entry on one link at the restored public name.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn restore_process_death_after_linking_the_public_name_settles_on_one_link() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::process::ExitStatusExt;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("private")).unwrap();
+        let media = root.path().join("photo.jpg");
+        let retired = root.path().join("private/retired");
+        std::fs::write(&retired, b"saved media").unwrap();
+        std::fs::write(
+            root.path().join("fixture-owner"),
+            b"kei-synthetic-process-death",
+        )
+        .unwrap();
+        let expected = snapshot_blocking(root.path(), &retired).unwrap();
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "download::file::primary_layout::tests::restore_process_death_child",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("KEI_TEST_PROCESS_DEATH_ROOT", root.path())
+            .env("KEI_TEST_PROCESS_DEATH_POINT", "move-file-linked")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let ready = root.path().join("ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !ready.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("restore child exited before its process-death point: {status}");
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _status = child.wait().unwrap();
+                panic!("restore child did not reach its process-death point");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(&ready).unwrap(), "move-file-linked");
+        child.kill().unwrap();
+        assert_eq!(child.wait().unwrap().signal(), Some(9));
+
+        assert_eq!(
+            std::fs::metadata(&media).unwrap().ino(),
+            std::fs::metadata(&retired).unwrap().ino()
+        );
+        assert_eq!(
+            std::fs::metadata(&media).unwrap().nlink(),
+            3,
+            "the public, saved and recovery names survived the death"
+        );
+
+        let reopened = super::retire(
+            root.path(),
+            &media,
+            &retired,
+            expected.as_ref().unwrap(),
+            None,
+        )
+        .await;
+        assert!(
+            reopened.is_err(),
+            "the interrupted retirement is still reported"
+        );
+        assert_eq!(
+            std::fs::metadata(&media).unwrap().nlink(),
+            1,
+            "the reopen settles the entry on one link"
+        );
+        assert!(!retired.exists());
+        assert_eq!(std::fs::read(&media).unwrap(), b"saved media");
+        assert!(
+            std::fs::read_dir(root.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".kei-")),
+            "no slot residue remains"
+        );
     }
 
     #[test]

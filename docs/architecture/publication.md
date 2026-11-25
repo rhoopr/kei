@@ -316,14 +316,22 @@ source and removes the source only after verifying the slot holds that entry.
 Moves between public names keep the no-replace rename where the filesystem
 supports it. NFS rejects that flag, so a move falls back by entry type. A regular
 file first takes a private recovery link whose name is derived from the
-destination, so a resumed move finds the same slot and only that evidence lets it
-adopt an existing destination link; a user's own link there is left alone. The
+destination, so a resumed move finds the same slot and removes it once the move
+completes. An occupied destination name is never adopted: a user's hard link to
+the same inode is indistinguishable from one this operation installed, so the
+move refuses and leaves the source, destination and recovery names in place. The
 destination parent is synced before the source name is consumed. The source name
 is then moved into a slot this operation owns and checked by identity, so a
 writer that replaced it is restored rather than unlinked, and the recovery link
 is removed only after those checks pass. A foreign writer that replaces the
 destination between the link and the removal therefore keeps the moved bytes
 under its own name instead of losing them.
+
+A retirement rollback that stops after linking the public name leaves the saved
+name and its slot behind. The next retirement attempt proves those names against
+the journal's recorded entry, reclaims the slot and retires the saved name, so
+the rollback settles on one link at the public name instead of blocking the
+layout operation.
 
 A directory is refused on such a filesystem. Installing one at a public name
 cannot be made to replace only kei's own empty claim: there is no atomic
