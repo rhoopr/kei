@@ -715,16 +715,8 @@ fn restore_retirement(entries: &[RetirementEntry]) {
             continue;
         };
         // A restore that stopped after linking the public name leaves the saved
-        // name and its slots behind. Only an entry this journal recorded is
-        // acted on.
+        // name behind. Only an entry this journal recorded is acted on.
         if entry.source.retained_entry_identity().ok() == Some(expected.identity) {
-            if let Err(error) = super::platform::reclaim_move_slots(
-                &entry.destination,
-                &entry.source,
-                expected.identity,
-            ) {
-                tracing::warn!(%error, "Layout restore could not reclaim a move slot");
-            }
             // The public name already holds the restored bytes, so the rollback
             // settles on one link by retiring the saved name this journal owns.
             #[cfg(target_os = "linux")]
@@ -749,6 +741,17 @@ fn restore_retirement(entries: &[RetirementEntry]) {
                     "Layout retirement restoration remains unresolved; journal and saved entries retained"
                 );
             }
+        }
+        // A retirement that died after quarantining the public name leaves that
+        // slot behind, whether the restore just ran or completed earlier.
+        if entry.source.retained_entry_identity().ok() == Some(expected.identity)
+            && let Err(error) = super::platform::reclaim_move_slots(
+                &entry.destination,
+                &entry.source,
+                expected.identity,
+            )
+        {
+            tracing::warn!(%error, "Layout restore could not reclaim a move slot");
         }
     }
 }
@@ -1316,6 +1319,128 @@ mod tests {
                 .starts_with(".kei-")),
             "no slot residue remains"
         );
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    #[test]
+    #[ignore = "parent-owned SIGKILL fixture"]
+    fn retirement_process_death_child() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("KEI_TEST_PROCESS_DEATH_ROOT").expect("dedicated fixture root"),
+        );
+        assert_eq!(
+            std::fs::read(root.join("fixture-owner")).unwrap(),
+            b"kei-synthetic-process-death"
+        );
+        let _fallback = super::super::platform::ForcedLinkFallback::new(&root);
+        let media = root.join("photo.jpg");
+        let retired = root.join("private/retired");
+        let expected = snapshot_blocking(&root, &media).unwrap();
+        let entries = [RetirementEntry::open(&root, &media, &retired, expected).unwrap()];
+        retire_blocking(&entries).unwrap();
+        panic!("retirement child did not reach its process-death point");
+    }
+
+    /// A retirement killed after quarantining the public name leaves that slot
+    /// beside the retirement slot. The next attempt restores the public name and
+    /// releases the stale slot, and the following one completes the retirement.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn retirement_process_death_after_quarantine_settles_on_one_link() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::process::ExitStatusExt;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("private")).unwrap();
+        let media = root.path().join("photo.jpg");
+        let retired = root.path().join("private/retired");
+        std::fs::write(&media, b"saved media").unwrap();
+        std::fs::write(
+            root.path().join("fixture-owner"),
+            b"kei-synthetic-process-death",
+        )
+        .unwrap();
+        let expected = snapshot_blocking(root.path(), &media).unwrap();
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "download::file::primary_layout::tests::retirement_process_death_child",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("KEI_TEST_PROCESS_DEATH_ROOT", root.path())
+            .env("KEI_TEST_PROCESS_DEATH_POINT", "name-quarantined")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let ready = root.path().join("ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !ready.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("retirement child exited before its process-death point: {status}");
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _status = child.wait().unwrap();
+                panic!("retirement child did not reach its process-death point");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(&ready).unwrap(), "name-quarantined");
+        child.kill().unwrap();
+        assert_eq!(child.wait().unwrap().signal(), Some(9));
+
+        let quarantine = root.path().join(".kei-quarantine-photo.jpg");
+        assert!(!media.exists(), "the public name was consumed");
+        assert_eq!(
+            std::fs::metadata(&quarantine).unwrap().ino(),
+            std::fs::metadata(&retired).unwrap().ino()
+        );
+        assert_eq!(
+            std::fs::metadata(&retired).unwrap().nlink(),
+            2,
+            "the quarantine slot and the retirement slot hold the entry"
+        );
+
+        let first = super::retire(
+            root.path(),
+            &media,
+            &retired,
+            expected.as_ref().unwrap(),
+            None,
+        )
+        .await;
+        assert!(first.is_err(), "the interrupted retirement is reported");
+        assert_eq!(std::fs::read(&media).unwrap(), b"saved media");
+        assert_eq!(
+            std::fs::metadata(&media).unwrap().nlink(),
+            1,
+            "the reopen restores one link"
+        );
+        assert!(
+            !quarantine.exists(),
+            "the stale quarantine slot is reclaimed"
+        );
+        assert!(!retired.exists());
+
+        super::retire(
+            root.path(),
+            &media,
+            &retired,
+            expected.as_ref().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&retired).unwrap(), b"saved media");
+        assert_eq!(
+            std::fs::metadata(&retired).unwrap().nlink(),
+            1,
+            "the retirement completes on the next attempt"
+        );
+        assert!(!media.exists());
     }
 
     #[test]

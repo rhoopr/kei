@@ -167,10 +167,7 @@ pub(super) fn retire_published_temp_link(
         if !temp.entry_exists()? {
             // A crash after taking the name into the slot leaves it behind with
             // nothing else to reclaim it.
-            if slot.retained_entry_identity().ok() == Some(identity) {
-                slot.remove_verified(identity, crate::fs_util::RemovalKind::File)?;
-            }
-            return Ok(());
+            return reclaim_published_temp_slot(temp, identity);
         }
         anyhow::ensure!(
             temp.retained_entry_identity()? == identity
@@ -230,6 +227,27 @@ pub(super) fn retire_published_temp_link(
         let _ = (temp, destination, expected, identity);
         Ok(())
     }
+}
+
+/// Release the `.kei-retire-` sibling of `temp` when it still holds `identity`.
+/// A publication that dies after taking the name into that slot leaves it behind
+/// with no later retirement pass to reclaim it.
+#[cfg(unix)]
+pub(super) fn reclaim_published_temp_slot(
+    temp: &crate::fs_util::ConfinedPath,
+    identity: crate::fs_util::FileIdentity,
+) -> anyhow::Result<()> {
+    let name = temp
+        .path()
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Published temporary name has no file name"))?;
+    let mut slot_name = std::ffi::OsString::from(".kei-retire-");
+    slot_name.push(name);
+    let slot = temp.sibling(&temp.path().with_file_name(slot_name))?;
+    if slot.retained_entry_identity().ok() == Some(identity) {
+        slot.remove_verified(identity, crate::fs_util::RemovalKind::File)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

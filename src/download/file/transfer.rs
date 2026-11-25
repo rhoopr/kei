@@ -772,7 +772,7 @@ impl DownloadedFile {
             // rewalks the configured root after `self.retained` is replaced.
             let destination_link = final_confined.sibling(final_confined.path())?;
             Some((
-                retirement_temp,
+                retirement_temp.sibling(retirement_temp.path())?,
                 destination_link,
                 expected,
                 retirement_identity,
@@ -826,6 +826,15 @@ impl DownloadedFile {
                 super::retire_published_temp_link(&temp, &destination, expected, identity)
             })
             .await??;
+        }
+        // A publication that died after taking the temporary name into its
+        // retirement slot leaves that slot behind, and a resume publishes by a
+        // different route that never retires it. Release it now that the
+        // destination holds the same entry.
+        #[cfg(unix)]
+        if part != super::PartName::Linked {
+            let identity = file_identity(&self.retained.file)?;
+            super::reclaim_published_temp_slot(&retirement_temp, identity)?;
         }
         #[cfg(not(unix))]
         let _ = part;

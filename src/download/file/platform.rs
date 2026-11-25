@@ -251,9 +251,10 @@ fn sibling_slot(path: &ConfinedPath, prefix: &str) -> std::io::Result<ConfinedPa
     path.sibling(&path.path().with_file_name(slot))
 }
 
-/// Release the derived slots a completed move may have left behind, when each
-/// still holds `identity`. A resume that finds the destination proven and the
-/// source name gone never re-enters the move, so its residue is reclaimed here.
+/// Release the derived slots a completed move or retirement between `source`
+/// and `destination` may have left behind, when each still holds `identity`. A
+/// resume that finds the destination proven and the source name gone never
+/// re-enters the move, so its residue is reclaimed here.
 #[cfg(target_os = "linux")]
 pub(in crate::download) fn reclaim_move_slots(
     source: &ConfinedPath,
@@ -263,6 +264,8 @@ pub(in crate::download) fn reclaim_move_slots(
     for slot in [
         sibling_slot(destination, ".kei-move-")?,
         sibling_slot(source, ".kei-quarantine-")?,
+        // A retirement consumes `source`; a restore consumes `destination`.
+        sibling_slot(destination, ".kei-quarantine-")?,
     ] {
         if existing_identity(&slot)? == Some(identity) {
             slot.remove_verified(identity, RemovalKind::File)?;
@@ -319,6 +322,8 @@ pub(in crate::download) fn consume_owned_name(
             }
         }
     }
+    #[cfg(all(test, target_os = "linux"))]
+    crate::test_helpers::process_death_point("name-quarantined");
     quarantine.remove_verified(identity, RemovalKind::File)?;
     source.sync_parent()
 }

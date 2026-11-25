@@ -592,6 +592,46 @@ fn link_fallback_keeps_a_temporary_name_recreated_before_the_rollback() {
     );
 }
 
+/// A publication that died after moving the temporary name into its retirement
+/// slot leaves a second link. The next pass publishes through the existing
+/// destination and releases that slot.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn resume_reclaims_a_retirement_slot_left_by_an_interrupted_cleanup() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = TempDir::new().unwrap();
+    let jpeg_body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+    let client = StubDownloadClient::ok(&jpeg_body);
+    let download_path = dir.path().join("settled.jpg");
+    let part_path = dir.path().join("settled.part");
+    std::fs::write(&download_path, jpeg_body).unwrap();
+    let slot = dir.path().join(".kei-retire-settled.part");
+    std::fs::hard_link(&download_path, &slot).unwrap();
+    assert_eq!(std::fs::metadata(&download_path).unwrap().nlink(), 2);
+
+    attempt_download(
+        &client,
+        "http://stub",
+        &download_path,
+        &part_path,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(!slot.exists(), "the leftover retirement slot is reclaimed");
+    assert_eq!(
+        std::fs::metadata(&download_path).unwrap().nlink(),
+        1,
+        "the published file keeps one name"
+    );
+    assert_eq!(std::fs::read(&download_path).unwrap(), jpeg_body);
+}
+
 #[tokio::test]
 async fn attempt_download_skip_rename_leaves_part_file() {
     let jpeg_body = [0xFF, 0xD8, 0xFF, 0xE0];

@@ -305,8 +305,10 @@ file. Unlinking a file whose descriptor is still open leaves an NFS `.nfsXXXX`
 link and a second link count, so the owner closes every handle it holds before
 unlinking a temporary name. Retirement keeps the temporary name's confined
 parent, identity and verified bytes, checks both names against them, preserves a
-substituted entry and reports the failed cleanup. The hard-link refusal is
-unchanged.
+substituted entry and reports the failed cleanup. A cleanup that stops after
+moving the name into its retirement slot leaves that slot; the next publication
+that finds the destination already holding the bytes releases it. The hard-link
+refusal is unchanged.
 
 Alias retirement moves a managed primary into a private slot. Where the
 filesystem accepts `RENAME_NOREPLACE` that rename already refuses an occupied
@@ -322,16 +324,18 @@ the same inode is indistinguishable from one this operation installed, so the
 move refuses and leaves the source, destination and recovery names in place. The
 destination parent is synced before the source name is consumed. The source name
 is then moved into a slot this operation owns and checked by identity, so a
-writer that replaced it is restored rather than unlinked, and the recovery link
-is removed only after those checks pass. A foreign writer that replaces the
-destination between the link and the removal therefore keeps the moved bytes
-under its own name instead of losing them.
+writer that replaced it is never unlinked: it is restored with a no-replace
+rename where the filesystem provides one, and is otherwise kept in the slot. The
+recovery link is removed only after those checks pass. A foreign writer that
+replaces the destination between the link and the removal therefore keeps the
+moved bytes under its own name instead of losing them.
 
 A retirement rollback that stops after linking the public name leaves the saved
-name and its slot behind. The next retirement attempt proves those names against
-the journal's recorded entry, reclaims the slot and retires the saved name, so
-the rollback settles on one link at the public name instead of blocking the
-layout operation.
+name and its slot behind; one that stops after quarantining the public name also
+leaves that quarantined name. The next retirement attempt proves those names
+against the journal's recorded entry, reclaims the slots and finishes the
+rollback, so the operation settles on one link at the public name instead of
+blocking the layout operation.
 
 A directory is refused on such a filesystem. Installing one at a public name
 cannot be made to replace only kei's own empty claim: there is no atomic
