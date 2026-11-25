@@ -880,27 +880,63 @@ fn retry_until_journal_directory_is_gone(target: &std::path::Path) {
     recover_target(target).unwrap();
 }
 
+/// A writer replaces the directory name before the journal's own removal. Both
+/// directories coexist, so the recorded identity cannot be the new one.
+#[test]
+fn removal_retains_a_directory_replaced_before_the_first_attempt() {
+    let dir = TempDir::new().unwrap();
+    let journal = dir.path().join("journal");
+    let saved = dir.path().join("saved");
+    let replacement = dir.path().join("replacement");
+    fs::create_dir(&journal).unwrap();
+    let owned = confined(&journal).unwrap().entry_identity().unwrap();
+    fs::create_dir(&replacement).unwrap();
+    fs::rename(&journal, &saved).unwrap();
+    fs::rename(&replacement, &journal).unwrap();
+
+    let error = super::remove_owned_directory(&confined(&journal).unwrap(), owned)
+        .expect_err("a replaced directory is retained");
+
+    assert!(
+        format!("{error}").contains("Replacement directory holds the journal name"),
+        "{error}"
+    );
+    assert!(journal.exists(), "the replacement directory is kept");
+    assert!(saved.exists(), "the journal's own directory is untouched");
+}
+
+/// The server completes the removal but replies stale, a writer recreates the
+/// name, and the retry must not remove the replacement.
 #[test]
 fn removal_retains_a_directory_recreated_after_a_stale_reply() {
     let dir = TempDir::new().unwrap();
     let journal = dir.path().join("journal");
+    let saved = dir.path().join("saved");
+    let replacement = dir.path().join("replacement");
     fs::create_dir(&journal).unwrap();
     let owned = confined(&journal).unwrap().entry_identity().unwrap();
-    // The server completed the removal and replied stale, and a writer recreated
-    // the name before the retry. A filler takes the freed inode first, so the
-    // recreated directory cannot be mistaken for the one this journal owns.
-    fs::remove_dir(&journal).unwrap();
-    fs::create_dir(dir.path().join("filler")).unwrap();
-    fs::create_dir(&journal).unwrap();
+    fs::create_dir(&replacement).unwrap();
+    let mut first = true;
 
-    let error = super::remove_owned_directory(&confined(&journal).unwrap(), owned)
-        .expect_err("a recreated directory is retained");
+    let error = super::retry_stale(|_| {
+        if std::mem::take(&mut first) {
+            fs::rename(&journal, &saved).unwrap();
+            fs::rename(&replacement, &journal).unwrap();
+            return Err(std::io::Error::from_raw_os_error(libc::ESTALE).into());
+        }
+        super::remove_owned_directory(&confined(&journal).unwrap(), owned)
+    })
+    .expect_err("a recreated directory is retained");
 
     assert!(
         format!("{error}").contains("Replacement directory holds the journal name"),
         "{error}"
     );
     assert!(journal.exists(), "the recreated directory is kept");
+    assert!(
+        saved.exists(),
+        "the fixture keeps the original directory, so both identities stay distinct"
+    );
 }
 
 #[test]
