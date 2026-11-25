@@ -58,27 +58,38 @@ thread_local! {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+struct PlannedMutation {
+    point: &'static str,
+    mutate: fn(&Path),
+}
+
+#[cfg(all(test, target_os = "linux"))]
 thread_local! {
     /// Caller-chosen mutations, each at one named point, on this thread.
-    static RETIREMENT_MUTATION: std::cell::RefCell<Vec<(&'static str, fn(&Path))>> =
+    static RETIREMENT_MUTATION: std::cell::RefCell<Vec<PlannedMutation>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Plan one mutation at `point`, so a test can occupy a name between two checks.
 #[cfg(all(test, target_os = "linux"))]
 pub(in crate::download) fn plan_retirement_mutation(point: &'static str, mutate: fn(&Path)) {
-    RETIREMENT_MUTATION.with(|hook| hook.borrow_mut().push((point, mutate)));
+    RETIREMENT_MUTATION.with(|hook| {
+        hook.borrow_mut().push(PlannedMutation { point, mutate });
+    });
 }
 
 /// Run the planned mutation when this is its point.
 #[cfg(all(test, target_os = "linux"))]
 pub(in crate::download) fn retirement_point(point: &str, path: &Path) {
     let planned = RETIREMENT_MUTATION.with(|hook| {
-        let position = hook.borrow().iter().position(|(at, _)| *at == point)?;
+        let position = hook
+            .borrow()
+            .iter()
+            .position(|planned| planned.point == point)?;
         Some(hook.borrow_mut().remove(position))
     });
-    if let Some((_, mutate)) = planned {
-        mutate(path);
+    if let Some(planned) = planned {
+        (planned.mutate)(path);
     }
 }
 
