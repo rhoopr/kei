@@ -195,12 +195,17 @@ pub(super) fn retire_published_temp_link(
         // Take the temporary name into a slot this function alone names, then
         // prove the slot holds the published entry. A writer that replaced the
         // temporary name is moved into the slot and restored, never deleted.
+        #[cfg(all(test, target_os = "linux"))]
+        platform::retirement_point("temp-checked", temp.path());
         anyhow::ensure!(
             !slot.entry_exists()?,
             "Retirement slot already holds an entry; retaining both entries"
         );
         platform::move_to_owned_slot_confined(temp, &slot)?;
         if slot.retained_entry_identity()? != identity {
+            // Restore only where that cannot replace a newer entry.
+            #[cfg(all(test, target_os = "linux"))]
+            platform::retirement_point("temp-quarantined", temp.path());
             let restored = platform::move_layout_confined(&slot, temp);
             anyhow::bail!(
                 "Published temporary name changed while retiring; {}",

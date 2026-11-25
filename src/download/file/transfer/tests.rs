@@ -540,6 +540,58 @@ async fn link_fallback_preserves_a_substituted_temporary_name() {
     assert_eq!(std::fs::read(&download_path).unwrap(), jpeg_body);
 }
 
+/// A writer that replaces the temporary name after its identity checks, and
+/// recreates it again after that entry went into the retirement slot, keeps the
+/// recreated name; the substitute is retained and named in the error.
+#[cfg(target_os = "linux")]
+#[test]
+fn link_fallback_keeps_a_temporary_name_recreated_before_the_rollback() {
+    use super::super::fingerprint::fingerprint_regular_file_blocking;
+    use super::super::platform::{ForcedLinkFallback, plan_retirement_mutation};
+    use super::super::retire_published_temp_link;
+    use crate::fs_util::{ConfinedParents, ConfinedPath, file_identity};
+
+    let dir = TempDir::new().unwrap();
+    let _fallback = ForcedLinkFallback::new(dir.path());
+    let temp_path = dir.path().join("photo.part");
+    let destination_path = dir.path().join("photo.jpg");
+    std::fs::write(&destination_path, b"published bytes").unwrap();
+    std::fs::hard_link(&destination_path, &temp_path).unwrap();
+    let expected = fingerprint_regular_file_blocking(&destination_path).unwrap();
+    let identity = file_identity(&std::fs::File::open(&temp_path).unwrap()).unwrap();
+    plan_retirement_mutation("temp-checked", |temp: &Path| {
+        std::fs::remove_file(temp).unwrap();
+        std::fs::write(temp, b"foreign bytes").unwrap();
+    });
+    plan_retirement_mutation("temp-quarantined", |temp: &Path| {
+        std::fs::write(temp, b"later writer").unwrap();
+    });
+
+    let error = retire_published_temp_link(
+        &ConfinedPath::open(dir.path(), &temp_path, ConfinedParents::Existing).unwrap(),
+        &ConfinedPath::open(dir.path(), &destination_path, ConfinedParents::Existing).unwrap(),
+        expected,
+        identity,
+    )
+    .expect_err("a recreated temporary name is never replaced");
+
+    assert!(format!("{error}").contains("retained at"), "{error}");
+    assert_eq!(
+        std::fs::read(&temp_path).unwrap(),
+        b"later writer",
+        "the writer's recreated name survives"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join(".kei-retire-photo.part")).unwrap(),
+        b"foreign bytes",
+        "the substituted entry is retained in the retirement slot"
+    );
+    assert_eq!(
+        std::fs::read(&destination_path).unwrap(),
+        b"published bytes"
+    );
+}
+
 #[tokio::test]
 async fn attempt_download_skip_rename_leaves_part_file() {
     let jpeg_body = [0xFF, 0xD8, 0xFF, 0xE0];

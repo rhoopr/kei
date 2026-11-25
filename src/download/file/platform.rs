@@ -49,6 +49,39 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    /// Runs after the retirement slot is claimed and before the public name is
+    /// consumed, so a test can substitute that name.
+    static RETIRE_SOURCE_HOOK: std::cell::Cell<Option<fn(&Path)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    /// Caller-chosen mutations, each at one named point, on this thread.
+    static RETIREMENT_MUTATION: std::cell::RefCell<Vec<(&'static str, fn(&Path))>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Plan one mutation at `point`, so a test can occupy a name between two checks.
+#[cfg(all(test, target_os = "linux"))]
+pub(in crate::download) fn plan_retirement_mutation(point: &'static str, mutate: fn(&Path)) {
+    RETIREMENT_MUTATION.with(|hook| hook.borrow_mut().push((point, mutate)));
+}
+
+/// Run the planned mutation when this is its point.
+#[cfg(all(test, target_os = "linux"))]
+pub(in crate::download) fn retirement_point(point: &str, path: &Path) {
+    let planned = RETIREMENT_MUTATION.with(|hook| {
+        let position = hook.borrow().iter().position(|(at, _)| *at == point)?;
+        Some(hook.borrow_mut().remove(position))
+    });
+    if let Some((_, mutate)) = planned {
+        mutate(path);
+    }
+}
+
 /// Makes no-replace publication under `root` behave as on a filesystem that
 /// rejects `RENAME_NOREPLACE` (NFS) until dropped. Scoped to a path so parallel
 /// tests and blocking-pool threads are unaffected.
@@ -123,10 +156,10 @@ pub(in crate::download) fn move_layout_confined(
     }
 }
 
-/// Move `source` into a slot this operation owns. The slot is created
-/// exclusively first, so the plain rename can only replace a name this call
-/// created; a filesystem that accepts `RENAME_NOREPLACE` never needs the
-/// fallback at all.
+/// Move `source` into a slot this operation owns. Where the filesystem rejects
+/// `RENAME_NOREPLACE`, the slot is created exclusively first so the plain rename
+/// can only replace a name this call created; a filesystem that accepts the flag
+/// never needs that fallback.
 pub(in crate::download) fn move_to_owned_slot_confined(
     source: &ConfinedPath,
     slot: &ConfinedPath,
@@ -253,7 +286,7 @@ pub(in crate::download) fn reclaim_move_slots(
 /// replaced is restored with no-replace when the name is free, and otherwise
 /// kept in the slot.
 #[cfg(target_os = "linux")]
-fn consume_owned_name(
+pub(in crate::download) fn consume_owned_name(
     source: &ConfinedPath,
     identity: crate::fs_util::FileIdentity,
 ) -> std::io::Result<()> {
@@ -272,6 +305,8 @@ fn consume_owned_name(
             if quarantine.retained_entry_identity()? != identity {
                 // A writer replaced the name after the proof. Restore it only
                 // where that cannot replace a newer entry.
+                #[cfg(all(test, target_os = "linux"))]
+                retirement_point("consume-quarantined", source.path());
                 return Err(match move_layout_confined(&quarantine, source) {
                     Ok(()) => std::io::Error::other(
                         "Retired source name changed while moving; substituted entry restored",
@@ -291,11 +326,11 @@ fn consume_owned_name(
 /// Publish a regular file under `destination` and prove both names before the
 /// source name is consumed.
 ///
-/// A destination link that already holds this entry is adopted only when the
-/// operation's own recovery slot does, so a user's pre-existing hard link is
-/// never mistaken for an interrupted attempt. The source name is taken into a
-/// slot this operation owns before its identity is checked, so a writer that
-/// replaced it is restored rather than unlinked.
+/// An occupied destination name is never adopted: a user's hard link to the same
+/// entry cannot be told apart from one this operation installed, so the move
+/// refuses and keeps every name. The source name is taken into a slot this
+/// operation owns before its identity is checked, so a writer that replaced it is
+/// restored rather than unlinked.
 #[cfg(target_os = "linux")]
 fn move_linked_file_confined(
     source: &ConfinedPath,
@@ -400,10 +435,16 @@ pub(in crate::download) fn retire_layout_confined(
                 "Alias retirement slot no longer holds the retired entry",
             ));
         }
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(hook) = RETIRE_SOURCE_HOOK.with(std::cell::Cell::take) {
+            hook(source.path());
+        }
         if let Err(error) = consume_owned_name(source, identity) {
-            // The source still owns the bytes, so a failed retirement must not
-            // leave the extra slot name behind.
-            let _ = slot.remove_verified(identity, RemovalKind::File);
+            // The retired name still owns the bytes only while the source holds
+            // this entry. Otherwise the slot is the surviving copy.
+            if source.retained_entry_identity().ok() == Some(identity) {
+                let _ = slot.remove_verified(identity, RemovalKind::File);
+            }
             return Err(error);
         }
         if slot.retained_entry_identity()? != identity {
@@ -977,6 +1018,91 @@ mod linux_tests {
         );
         assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
         assert_eq!(std::fs::read(&moved_name).unwrap(), b"user bytes");
+    }
+
+    /// A writer that replaces the public alias after its slot was claimed keeps
+    /// its bytes, and the retired copy stays in the slot rather than being
+    /// removed with it.
+    #[test]
+    fn retirement_keeps_a_substituted_public_name_apart_from_the_retired_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let public = root.path().join("current.jpg");
+        let slot = root.path().join("history/.retired-slot");
+        std::fs::create_dir(root.path().join("history")).unwrap();
+        std::fs::write(&public, b"owned alias").unwrap();
+        let _fallback = ForcedLinkFallback::new(root.path());
+        super::RETIRE_SOURCE_HOOK.with(|hook| {
+            hook.set(Some(|source: &Path| {
+                std::fs::remove_file(source).unwrap();
+                std::fs::write(source, b"foreign bytes").unwrap();
+            }))
+        });
+
+        let error =
+            super::retire_layout_confined(&open(root.path(), &public), &open(root.path(), &slot))
+                .expect_err("a substituted public name is not unlinked");
+
+        assert!(format!("{error}").contains("substituted entry"), "{error}");
+        assert_eq!(
+            std::fs::read(&slot).unwrap(),
+            b"owned alias",
+            "the retired copy survives a failed consumption"
+        );
+        assert!(
+            !public.exists(),
+            "a no-replace restore the filesystem cannot perform leaves the name alone"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join(".kei-quarantine-current.jpg")).unwrap(),
+            b"foreign bytes",
+            "the writer's entry is kept in the quarantine slot"
+        );
+    }
+
+    /// A writer that recreates the public name after the substitute went into
+    /// quarantine keeps it: the rollback refuses an occupied name, so every
+    /// entry stays.
+    #[test]
+    fn move_keeps_a_public_name_recreated_before_the_rollback() {
+        let root = tempfile::tempdir().unwrap();
+        let album = root.path().join("album");
+        let moved = root.path().join("moved");
+        std::fs::create_dir(&album).unwrap();
+        std::fs::create_dir(&moved).unwrap();
+        std::fs::write(album.join("note.txt"), b"user bytes").unwrap();
+        let _fallback = ForcedLinkFallback::new(root.path());
+        super::MOVE_DESTINATION_LINKED_HOOK.with(|hook| {
+            hook.set(Some(|_destination: &Path, source: &Path| {
+                std::fs::remove_file(source).unwrap();
+                std::fs::write(source, b"foreign bytes").unwrap();
+            }))
+        });
+        super::plan_retirement_mutation("consume-quarantined", |source: &Path| {
+            std::fs::write(source, b"later writer").unwrap();
+        });
+
+        let error = move_noreplace_confined(
+            &open(root.path(), &album.join("note.txt")),
+            &open(root.path(), &moved.join("note.txt")),
+        )
+        .expect_err("a recreated public name is never replaced");
+
+        assert!(format!("{error}").contains("retained at"), "{error}");
+        assert_eq!(
+            std::fs::read(album.join("note.txt")).unwrap(),
+            b"later writer",
+            "the writer's recreated name survives"
+        );
+        assert_eq!(
+            std::fs::read(album.join(".kei-quarantine-note.txt")).unwrap(),
+            b"foreign bytes",
+            "the substituted entry is retained in the quarantine slot"
+        );
+        assert_eq!(
+            std::fs::read(moved.join("note.txt")).unwrap(),
+            b"user bytes",
+            "the moved bytes stay published"
+        );
     }
 
     /// A foreign writer that replaces the destination after the fallback proved
