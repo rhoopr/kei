@@ -371,11 +371,20 @@ fn move_linked_file_confined(
             // An existing destination can never be proven ours: a hard link a
             // user made to this inode is indistinguishable from one this
             // operation created. Leave both names in place and report it.
-            if !had_recovery {
+            let retained = if had_recovery {
+                format!("; recovery copy retained at {}", recovery.path().display())
+            } else {
                 // Do not leave the slot this call created behind.
                 let _ = recovery.remove_verified(identity, RemovalKind::File);
-            }
-            return Err(error);
+                String::new()
+            };
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "Move destination {} already holds a name this move cannot prove{retained}",
+                    destination.path().display()
+                ),
+            ));
         }
         Err(error) => return Err(error),
     }
@@ -935,6 +944,12 @@ mod linux_tests {
         .expect_err("an unproven destination link is never adopted");
 
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        let message = format!("{error}");
+        assert!(
+            message.contains(&moved_name.display().to_string())
+                && message.contains(".kei-move-note.txt"),
+            "the refusal names the destination and the retained recovery copy: {message}"
+        );
         assert_eq!(std::fs::read(&source_name).unwrap(), b"user bytes");
         assert_eq!(std::fs::read(&moved_name).unwrap(), b"user bytes");
         assert_eq!(
