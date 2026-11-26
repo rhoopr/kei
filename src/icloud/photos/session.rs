@@ -1,4 +1,4 @@
-use super::hydration_progress;
+use super::{error::ChangesBodyRejection, hydration_progress};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -127,9 +127,7 @@ pub trait PhotosSession: Send + Sync {
         let body = serde_json::to_vec(&self.post(url, body, headers).await?)?;
         anyhow::ensure!(
             body.len() <= super::inbox::MAX_CHANGES_PAGE_BYTES,
-            super::error::ShadowPageError::from(anyhow::anyhow!(
-                "Provider changes page exceeded the capture byte limit"
-            ))
+            ChangesBodyRejection::TooLarge.into_shadow_error()
         );
         Ok(body)
     }
@@ -181,17 +179,13 @@ impl PhotosSession for reqwest::Client {
             response
                 .content_length()
                 .is_none_or(|size| size <= limit as u64),
-            super::error::ShadowPageError::from(anyhow::anyhow!(
-                "Provider changes page exceeded the capture byte limit"
-            ))
+            ChangesBodyRejection::TooLarge.into_shadow_error()
         );
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await? {
             anyhow::ensure!(
                 chunk.len() <= limit.saturating_sub(bytes.len()),
-                super::error::ShadowPageError::from(anyhow::anyhow!(
-                    "Provider changes page exceeded the capture byte limit"
-                ))
+                ChangesBodyRejection::TooLarge.into_shadow_error()
             );
             bytes.extend_from_slice(&chunk);
         }
@@ -635,17 +629,42 @@ pub(crate) async fn retry_post_changes_body(
     headers: &[(&str, &str)],
     retry_config: &RetryConfig,
 ) -> anyhow::Result<Vec<u8>> {
+    retry_post_evidence_body(session, url, body, headers, retry_config, None).await
+}
+
+/// Keep the raw response and permit one explicitly requested missing owner
+/// item. The caller validates that record's identity and scope before use.
+pub(super) async fn retry_post_evidence_body(
+    session: &dyn PhotosSession,
+    url: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+    retry_config: &RetryConfig,
+    absent_item: Option<&str>,
+) -> anyhow::Result<Vec<u8>> {
     retry::retry_with_backoff(retry_config, classify_api_error, || async {
         let bytes = session
             .post_changes_body(url, body.to_owned(), headers)
             .await?;
         anyhow::ensure!(
             bytes.len() <= super::inbox::MAX_CHANGES_PAGE_BYTES,
-            super::error::ShadowPageError::from(anyhow::anyhow!(
-                "Provider changes page exceeded the capture byte limit"
-            ))
+            ChangesBodyRejection::TooLarge.into_shadow_error()
         );
-        let value = super::changes_json::parse(&bytes)?;
+        let mut value = super::changes_json::parse(&bytes)?;
+        if let Some(child) = absent_item
+            && let Some(records) = value.get_mut("records").and_then(Value::as_array_mut)
+            && let Some(record) = records.iter_mut().find(|record| {
+                record.get("recordName").and_then(Value::as_str) == Some(child)
+                    && matches!(
+                        record.get("serverErrorCode").and_then(Value::as_str),
+                        Some("UNKNOWN_ITEM" | "NOT_FOUND")
+                    )
+            })
+            && let Some(record) = record.as_object_mut()
+        {
+            // Change only the retry classifier's copy, never the proof bytes.
+            record.remove("serverErrorCode");
+        }
         check_cloudkit_errors(value)?;
         Ok(bytes)
     })
@@ -695,7 +714,7 @@ pub enum SyncTokenError {
     /// Token is invalid/corrupted — fall back to full enumeration
     #[error("The saved iCloud sync token is no longer valid: {reason}")]
     InvalidToken { reason: Box<str> },
-    /// Zone no longer exists — stop syncing this zone
+    /// The provider did not report the requested zone.
     #[error("Apple no longer reports iCloud Photos zone {zone_name}")]
     ZoneNotFound { zone_name: Box<str> },
     /// Unexpected zone-level error (e.g. `RETRY_LATER`, THROTTLED) —
@@ -901,6 +920,12 @@ mod tests {
         .unwrap_err();
         response.await.unwrap();
         assert!(error.to_string().contains("capture byte limit"));
+        assert_eq!(
+            ChangesBodyRejection::from_shadow_error(&error),
+            Some(ChangesBodyRejection::TooLarge)
+        );
+        assert!(matches!(classify_api_error(&error), RetryAction::Abort));
+        assert!(super::super::error::ReplayRefusal::from_shadow_error(&error).is_none());
     }
 
     #[tokio::test]
@@ -938,6 +963,11 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("capture byte limit"));
+        assert_eq!(
+            ChangesBodyRejection::from_shadow_error(&error),
+            Some(ChangesBodyRejection::TooLarge)
+        );
+        assert!(super::super::error::ReplayRefusal::from_shadow_error(&error).is_none());
         server.await.unwrap();
     }
 

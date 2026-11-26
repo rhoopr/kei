@@ -1776,14 +1776,8 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
                 &CancellationToken::new(),
             )
             .with_subscriber(tracing_subscriber::registry().with(recorder))
-            .await;
-            let result = if step == 2 {
-                let error = result.expect_err("blank source successor must be refused");
-                assert!(format!("{error:#}").contains("Missing changes/zone successor"));
-                None
-            } else {
-                Some(result.unwrap())
-            };
+            .await
+            .unwrap();
             assert_eq!(std::fs::read(&retained).unwrap(), BYTES, "step {step}");
             let rows = db.get_downloaded_page(0, 10).await.unwrap();
             assert_eq!(rows.len(), if step == 0 { 1 } else { 2 }, "step {step}");
@@ -1813,7 +1807,14 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
                     .is_some(),
                 step == 1 || step == 2
             );
-            let Some(result) = result else {
+            if step == 2 {
+                assert!(!result.can_advance_database_checkpoint());
+                assert_eq!(result.failed_count, 1);
+                assert_eq!(
+                    result.stats.sync_token_blocked_reason,
+                    Some("icloud_changes_missing_successor")
+                );
+                assert_eq!(result.stats.downloaded, 0);
                 assert_eq!(*source.changes.lock().unwrap(), ["trusted-before"]);
                 assert_eq!(
                     source.queries.load(Ordering::SeqCst),
@@ -1821,7 +1822,7 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
                     "a refused source successor cannot be replaced with a fresh query token"
                 );
                 continue;
-            };
+            }
             assert_eq!(
                 result.can_advance_database_checkpoint(),
                 step >= 3,

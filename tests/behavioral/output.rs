@@ -1071,17 +1071,17 @@ fn status_retained_checkpoint_holds_show_actionable_redacted_guidance_after_othe
         (
             hold(1),
             "await_retained_checkpoint_evidence",
-            "Retained cursor rejected. Recovery makes at most three automatic attempts, at least one hour apart; exhausted holds require authoritative retained-history evidence. Preserve the state database and media. Fresh inventory alone cannot resolve this hold.",
+            "The saved checkpoint could not be used. Kei retries recovery when due. Leave the database and media in place.",
         ),
         (
             hold(3),
-            "retained_checkpoint_retry_exhausted",
-            "Automatic retained-checkpoint recovery exhausted. Active source/configuration and historical work remain retained. Preserve the state database and media while obtaining authoritative retained-history evidence.",
+            "await_retained_checkpoint_evidence",
+            "The saved checkpoint could not be used. Kei retries recovery when due. Leave the database and media in place.",
         ),
         (
             format!("malformed-private-held-evidence:{private_cursor}"),
             "repair_retained_checkpoint_evidence",
-            "Retained recovery evidence is malformed or unsupported. Provider work is paused. Preserve the state database and media and restore validated recovery evidence before resuming.",
+            "An older checkpoint hold could not be read. Leave the database and media in place and run kei sync to check current coverage.",
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -1148,7 +1148,7 @@ fn status_retained_checkpoint_holds_show_actionable_redacted_guidance_after_othe
         );
         assert!(
             stdout.contains(
-                "Backup record: retained provider history is unavailable; recovery evidence is required"
+                "Backup record: a provider checkpoint is held; recorded coverage is incomplete"
             ),
             "{action}: {stdout}"
         );

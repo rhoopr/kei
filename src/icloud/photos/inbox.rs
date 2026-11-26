@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use serde_json::{Value, json};
 
 use crate::state::SqliteStateDb;
-use crate::state::db::{account::AccountOwner, provider_inbox::ObservedPage};
+use crate::state::db::{
+    account::AccountOwner,
+    provider_inbox::{CapturedPageId, ObservedPage},
+};
 
 /// Operational safety bounds. Unfinished observations are never evicted to fit.
 pub(crate) const MAX_CHANGES_PAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -117,7 +120,10 @@ impl ShadowCapture {
         Ok(Some(id))
     }
 
-    pub(crate) async fn capture(&self, page: ObservedPage) -> anyhow::Result<()> {
+    pub(crate) async fn capture(
+        &self,
+        page: ObservedPage,
+    ) -> anyhow::Result<Option<CapturedPageId>> {
         let after = self.recheck_after.load(Ordering::Relaxed);
         self.recheck_after.store(
             self.recheck_next(after).await?.unwrap_or(0),
@@ -130,7 +136,7 @@ impl ShadowCapture {
                 .validate_empty_poll(owner, page, realm)
                 .await
                 .map_err(|error| super::error::ShadowPageError::from(anyhow::Error::new(error)))?;
-            return Ok(());
+            return Ok(None);
         }
         let page = Arc::new(page);
         let capture = |final_attempt| {
@@ -160,7 +166,9 @@ impl ShadowCapture {
             .active_catalog_source(self.owner.clone(), id, MAX_CHANGES_PAGE_BYTES)
             .await
             .map_err(|error| super::error::ShadowPageError::from(anyhow::Error::new(error)))?;
-        let Some(source) = source else { return Ok(()) };
-        self.project(source).await
+        if let Some(source) = source {
+            self.project(source).await?;
+        }
+        Ok(Some(id))
     }
 }

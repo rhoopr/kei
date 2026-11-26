@@ -675,8 +675,7 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn inventory_expired_initial_and_replay_boundaries_finish_current_work_then_hold_across_reopens()
- {
+async fn inventory_replaces_expired_saved_cursor_but_not_rejected_terminal_replay() {
     for provider_owner in ["shared-owner", "_defaultOwner"] {
         for boundary in ["P", "S"] {
             let mut fixture =
@@ -684,6 +683,33 @@ async fn inventory_expired_initial_and_replay_boundaries_finish_current_work_the
             fixture.session.provider_owner = provider_owner;
             fixture.session.expired = Some(boundary);
             let result = fixture.cycle(false, CancellationToken::new()).await;
+            if boundary == "P" {
+                assert!(
+                    result.db_sync_token_advance_safe,
+                    "{provider_owner}: {result:?}"
+                );
+                assert_eq!(result.failed_count, 0, "{result:?}");
+                fixture.preserved(false).await;
+                let db = fixture.open().await;
+                assert_eq!(
+                    db.get_metadata(CURSOR).await.unwrap().as_deref(),
+                    Some("opaque-query-token")
+                );
+                assert_eq!(
+                    db.get_metadata(&format!("retained_checkpoint_hold:{ZONE}"))
+                        .await
+                        .unwrap(),
+                    None
+                );
+                drop(db);
+                for id in ["A", "B", "C", "D"] {
+                    assert_eq!(fixture.gets(id).await, 1);
+                }
+                let trace = fixture.session.trace.lock().unwrap().clone();
+                assert_eq!(trace.iter().filter(|entry| *entry == "rank:0").count(), 1);
+                fixture.quiet_twice(false).await;
+                continue;
+            }
             assert!(
                 !result.db_sync_token_advance_safe,
                 "{provider_owner}/{boundary}: {result:?}"
@@ -1219,7 +1245,7 @@ async fn inventory_state_write_failure_retains_request_and_successful_media() {
 }
 
 #[tokio::test]
-async fn inventory_missing_cursor_keeps_request_until_existing_first_run_activates() {
+async fn inventory_missing_cursor_retires_request_on_its_first_validated_scan() {
     let fixture = Fixture::new(b"missing cursor", Some("matching"), false, false).await;
     fixture
         .open()
@@ -1229,7 +1255,13 @@ async fn inventory_missing_cursor_keeps_request_until_existing_first_run_activat
         .unwrap();
     let first = fixture.cycle(false, CancellationToken::new()).await;
     assert_eq!(first.failed_count, 0, "{first:?}");
-    fixture.preserved(true).await;
+    fixture.preserved(false).await;
+    let db = fixture.open().await;
+    assert_eq!(
+        db.get_metadata(CURSOR).await.unwrap().as_deref(),
+        Some("opaque-query-token")
+    );
+    drop(db);
     assert!(
         !fixture
             .session
@@ -1239,9 +1271,6 @@ async fn inventory_missing_cursor_keeps_request_until_existing_first_run_activat
             .iter()
             .any(|entry| entry.starts_with("delta:"))
     );
-    let recovered = fixture.cycle(false, CancellationToken::new()).await;
-    assert_eq!(recovered.failed_count, 0, "{recovered:?}");
-    fixture.preserved(false).await;
     for id in ["A", "B", "C", "D"] {
         assert_eq!(fixture.gets(id).await, 1);
     }

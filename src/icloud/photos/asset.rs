@@ -270,6 +270,7 @@ pub struct PhotoAsset {
     // allocation via refcount bumps. Immutable after construction.
     asset_metadata: Arc<AssetMetadata>,
     hidden_membership: Option<bool>,
+    confirmed_favorite: bool,
     rendition_facts: Arc<[(VersionSizeKey, RenditionMetadata)]>,
     versions: VersionsMap,
     malformed_resources: Arc<[MalformedResource]>,
@@ -281,8 +282,8 @@ pub struct PhotoAsset {
     item_type_val: Option<AssetItemType>,
 }
 
-fn hidden_membership(fields: &Value) -> Option<bool> {
-    let field = fields.get("isHidden")?;
+fn binary_membership(fields: &Value, name: &str) -> Option<bool> {
+    let field = fields.get(name)?;
     if field
         .get("type")
         .is_some_and(|ty| !matches!(ty.as_str(), Some("INT64" | "NUMBER_INT64")))
@@ -686,7 +687,8 @@ impl PhotoAsset {
             asset_record_name,
             state_record_name: None,
             source_zone: None,
-            hidden_membership: hidden_membership(&asset_fields),
+            hidden_membership: binary_membership(&asset_fields, "isHidden"),
+            confirmed_favorite: binary_membership(&asset_fields, "isFavorite") == Some(true),
             filename,
             asset_metadata,
             rendition_facts,
@@ -766,7 +768,8 @@ impl PhotoAsset {
             asset_record_name: Arc::from(asset.record_name.as_str()),
             state_record_name: None,
             source_zone,
-            hidden_membership: hidden_membership(&asset.fields),
+            hidden_membership: binary_membership(&asset.fields, "isHidden"),
+            confirmed_favorite: binary_membership(&asset.fields, "isFavorite") == Some(true),
             filename,
             adjusted_still_modified,
             asset_metadata,
@@ -786,6 +789,12 @@ impl PhotoAsset {
 
     pub(crate) fn hidden_membership(&self) -> Option<bool> {
         self.hidden_membership
+    }
+
+    /// Metadata's permissive favorite flag cannot prove selected membership.
+    #[must_use]
+    pub(crate) fn confirms_favorite_membership(&self) -> bool {
+        self.confirmed_favorite
     }
 
     /// Project the selected provider rendition. Unsupported keys retain
@@ -1023,7 +1032,7 @@ fn parse_album_delta(record: &Record, reason: ChangeReason) -> ChangeEvent {
     event
 }
 
-fn parse_relation_record_name(record_name: &str) -> Option<(&str, &str)> {
+pub(super) fn parse_relation_record_name(record_name: &str) -> Option<(&str, &str)> {
     record_name
         .rsplit_once("-IN-")
         .filter(|(asset, container)| !asset.is_empty() && !container.is_empty())
@@ -1338,7 +1347,10 @@ mod tests {
             (json!({"value":2}), None),
             (json!(null), None),
         ] {
-            assert_eq!(hidden_membership(&json!({"isHidden": field})), expected);
+            assert_eq!(
+                binary_membership(&json!({"isHidden": field}), "isHidden"),
+                expected
+            );
         }
     }
 

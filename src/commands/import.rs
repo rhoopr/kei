@@ -1942,6 +1942,7 @@ mod wiremock_tests {
             legacy_preservation_allow_hardlinks: false,
             concurrent_downloads: 1,
             inventory_reconciliation: false,
+            inventory_checkpoint: Default::default(),
             post_sync_metadata: false,
             retry: RetryConfig::default(),
             live_photo_mode: LivePhotoMode::Both,

@@ -28,9 +28,9 @@ pub(crate) use filter::{AssetGroupings, determine_media_type};
 mod orchestration;
 
 pub(crate) use orchestration::config::{
-    DOWNLOAD_CONFIG_HASH_KEY, DownloadConfig, IndexingWindow, InventoryScope, compute_config_hash,
-    hash_download_config, hash_legacy_download_config, inventory_scope,
-    sync_coverage_fingerprint_json,
+    DOWNLOAD_CONFIG_HASH_KEY, DownloadConfig, IndexingWindow, InventoryCheckpointPolicy,
+    InventoryScope, compute_config_hash, hash_download_config, hash_legacy_download_config,
+    inventory_scope, sync_coverage_fingerprint_json,
 };
 pub(crate) use orchestration::context::{ClaimedLegacyMasterStates, DownloadContext};
 use orchestration::context::{RecordedLocalFile, preload_download_context};
@@ -46,8 +46,8 @@ pub(super) use orchestration::models::PRODUCER_ENUMERATION_INCOMPLETE_REASON;
 pub(crate) use orchestration::models::{
     CheckpointEvidence, DownloadControls, DownloadReporting, DownloadRunMode, DownloadStore,
     InventoryMeasurement, RecoveryAction, block_sync_token_for_metadata_capture,
-    block_sync_token_for_unresolved_identity, sync_token_blocked_explanation,
-    sync_token_blocked_source,
+    block_sync_token_for_unresolved_identity, replay_refusal_reason,
+    sync_token_blocked_explanation, sync_token_blocked_source,
 };
 pub use orchestration::models::{
     DownloadOutcome, FullEnumerationReason, SkipBreakdown, SyncMode, SyncResult, SyncStats,

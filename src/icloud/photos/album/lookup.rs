@@ -294,7 +294,7 @@ fn resolution_evidence(resolution: &RecordResolution) -> ResolutionEvidence {
 // Missing optional zone fields inherit the authenticated lookup request scope.
 // Every supplied field, including an owner, must agree. A bare or malformed
 // zone cannot redirect lookup to another account or library.
-fn lookup_zone_matches(actual: &Value, expected: &Value) -> bool {
+pub(super) fn lookup_zone_matches(actual: &Value, expected: &Value) -> bool {
     actual.as_object().is_some_and(|fields| {
         fields
             .get("zoneName")

@@ -46,7 +46,9 @@ pub(super) use progress::{format_duration, log_sync_summary};
     reason = "preserve the existing download-scoped facade path"
 )]
 pub(super) use streaming::stream_and_download_from_stream_with_context;
-pub(super) use streaming::{StreamRuntime, stream_and_download_from_stream};
+pub(super) use streaming::{
+    StreamRuntime, stream_and_download_from_stream, stream_selection_observations,
+};
 pub(super) use task::AUTH_ERROR_THRESHOLD;
 
 #[derive(Clone)]

@@ -337,6 +337,7 @@ async fn full_query_consecutive_empty_pages_prove_eof() {
 
 #[tokio::test]
 async fn offline_replay_retryable_error_page_fixture() {
+    use crate::icloud::photos::error::ReplayRefusal;
     use tokio_stream::StreamExt;
 
     let mock = MockPhotosFlow::new()
@@ -355,8 +356,11 @@ async fn offline_replay_retryable_error_page_fixture() {
 
     assert_eq!(errors.len(), 1);
     assert!(
-        errors[0].to_string().contains("RETRY_LATER"),
-        "retryable fixture should surface the CloudKit retry code: {}",
+        matches!(
+            ReplayRefusal::from_shadow_error(&errors[0]),
+            Some(ReplayRefusal::RetryLater)
+        ),
+        "RETRY_LATER must remain a typed zone-local refusal: {}",
         errors[0]
     );
     assert_eq!(

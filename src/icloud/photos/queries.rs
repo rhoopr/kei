@@ -276,6 +276,8 @@ pub(crate) fn build_changes_database_request(sync_token: Option<&str>) -> Value 
     }
 }
 
+pub(crate) const CHANGES_REPLAY_PAGE_SIZE: u32 = 200;
+
 /// Build the request body for `/changes/zone`.
 /// If `sync_token` is `None`, requests full history enumeration.
 /// If `Some`, requests changes since the token.

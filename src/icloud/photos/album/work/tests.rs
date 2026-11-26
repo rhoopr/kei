@@ -10,6 +10,48 @@ use anyhow::Result;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
+#[test]
+fn retained_album_proof_keeps_single_link_encoding_and_requires_the_complete_set() {
+    let zone = default_zone();
+    let pair_member = RawValue::from_string("{}".into()).unwrap();
+    let links: Vec<_> = ["album-a", "album-b"]
+        .into_iter()
+        .map(|container| ReplayAlbumLinkLookup {
+            record_name: format!("photo-IN-{container}"),
+            container: container.to_owned(),
+        })
+        .collect();
+    let tombstones: Vec<_> = links
+        .iter()
+        .map(|link| {
+            RawValue::from_string(json!({"recordName":link.record_name,"deleted":true}).to_string())
+                .unwrap()
+        })
+        .collect();
+    let matches = |body: &[u8], scope: &[ReplayAlbumLinkLookup]| {
+        replay_album_confirmation_matches(body, scope, "photo", &zone, ReplayAlbumLink::Removed)
+            .unwrap()
+    };
+    let single =
+        pair_confirmation_body(&pair_member, &pair_member, &[&tombstones[0]], None).unwrap();
+    let old_shape = format!(
+        r#"{{"records":[{{}},{{}}],"albumMembership":{}}}"#,
+        tombstones[0]
+    );
+    assert_eq!(single, old_shape.as_bytes());
+    assert!(matches(&single, &links[..1]));
+    assert!(!matches(&single, &links));
+    let both = pair_confirmation_body(
+        &pair_member,
+        &pair_member,
+        &[&tombstones[0], &tombstones[1]],
+        None,
+    )
+    .unwrap();
+    assert!(matches(&both, &links));
+    assert!(!matches(&both, &links[..1]));
+}
+
 #[derive(Clone, Default)]
 struct LookupSession {
     response: Arc<Mutex<Vec<u8>>>,

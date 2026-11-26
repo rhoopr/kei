@@ -31,7 +31,7 @@ impl RankCapture {
     }
 }
 
-fn validate_nested(value: &Value, zone: &Value) -> Result<()> {
+pub(super) fn validate_nested(value: &Value, zone: &Value) -> Result<()> {
     match value {
         Value::Object(fields) => {
             anyhow::ensure!(

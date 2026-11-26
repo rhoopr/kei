@@ -13,10 +13,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::commands::PassKind;
 use crate::download::DownloadConfig;
 use crate::download::orchestration::generation::SelectionPhase;
+use crate::icloud::photos::PhotoAlbum;
 use crate::icloud::photos::session::is_session_error;
-use crate::icloud::photos::{CurrentCatalogAsset, PhotoAlbum, PhotoAsset};
 
-type Observation = Result<(PhotoAsset, Option<CurrentCatalogAsset>)>;
+type Observation = Result<super::super::streaming::SelectionObservation>;
 const PARTIAL_BATCH_WAIT: Duration = Duration::from_millis(250);
 
 pub(super) fn prepare<S>(
@@ -28,7 +28,7 @@ pub(super) fn prepare<S>(
     impl Future<Output = ()> + use<S>,
 )
 where
-    S: Stream<Item = Result<PhotoAsset>> + Send,
+    S: Stream<Item = Observation> + Send,
 {
     let inventory = config
         .selection_run
@@ -40,9 +40,7 @@ where
         });
     let Some((run, key)) = inventory else {
         return (
-            source
-                .map(|result| result.map(|asset| (asset, None)))
-                .left_stream(),
+            source.left_stream(),
             future::Either::Left(future::ready(())),
         );
     };
@@ -84,7 +82,11 @@ where
                 if run.session_expired.load(Ordering::Relaxed) {
                     break;
                 }
-                let observations: Vec<_> = group.iter().filter_map(|r| r.as_ref().ok()).collect();
+                let observations: Vec<_> = group
+                    .iter()
+                    .filter_map(|r| r.as_ref().ok())
+                    .map(|(asset, _)| asset)
+                    .collect();
                 let mut proofs = match run.prefetch_unfiled(&key, &observations).await {
                     Ok(proofs) => proofs,
                     Err(error) if is_session_error(&error) => {
@@ -100,8 +102,9 @@ where
                     group
                         .into_iter()
                         .map(|r| {
-                            r.map(|asset| {
-                                let proof = proofs.remove(asset.asset_record_name());
+                            r.map(|(asset, proof)| {
+                                let proof =
+                                    proof.or_else(|| proofs.remove(asset.asset_record_name()));
                                 (asset, proof)
                             })
                         })

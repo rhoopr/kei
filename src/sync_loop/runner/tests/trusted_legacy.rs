@@ -723,6 +723,19 @@ async fn trusted_legacy_files_zero_get_reopen_and_quiet_followups() {
     );
 }
 
+fn assert_primary_bridge_held(result: &crate::sync_cycle::CycleResult) {
+    assert!(!result.can_advance_database_checkpoint(), "{result:?}");
+    assert_eq!(result.failed_count, 1);
+    assert_eq!(
+        result.stats.sync_token_blocked_zone.as_deref(),
+        Some("PrimarySync")
+    );
+    assert_eq!(
+        result.stats.sync_token_blocked_reason,
+        Some("icloud_changes_missing_successor")
+    );
+}
+
 #[tokio::test]
 async fn trusted_legacy_files_readiness_and_primary_bridge_still_hold() {
     for scenario in ["readiness", "primary"] {
@@ -747,14 +760,11 @@ async fn trusted_legacy_files_readiness_and_primary_bridge_still_hold() {
             );
         } else {
             f.prepare_primary_hold().await;
-            let error = f
+            let result = f
                 .cycle("primary-hold", CancellationToken::new(), true)
                 .await
-                .unwrap_err();
-            assert!(
-                format!("{error:#}").contains("Missing changes/zone successor"),
-                "{error:#}"
-            );
+                .unwrap();
+            assert_primary_bridge_held(&result);
             let db = open_fixture_db(&f.database).await;
             assert_eq!(
                 db.get_metadata("sync_token:PrimarySync")
@@ -1337,14 +1347,12 @@ async fn trusted_legacy_mixed_six_acceptance_with_primary_hold_downloads_and_reo
     };
     assert_eq!(before.as_deref(), Some("primary-before"));
     let (asset_id, provider_checksum) = add_independent_child(&mut f);
-    let error = f
+    let result = f
         .cycle("mixed-primary-hold", CancellationToken::new(), true)
         .await
-        .unwrap_err();
-    assert!(
-        format!("{error:#}").contains("Missing changes/zone successor"),
-        "{error:#}"
-    );
+        .unwrap();
+    assert_primary_bridge_held(&result);
+    assert_eq!(result.stats.downloaded, 1);
     assert_eq!(
         f.server.received_requests().await.unwrap().len(),
         1,
@@ -1383,14 +1391,12 @@ async fn trusted_legacy_mixed_six_acceptance_with_primary_hold_downloads_and_reo
         "no invented owners"
     );
     f.verify_old();
-    let error = f
+    let result = f
         .cycle("mixed-primary-hold-reopen", CancellationToken::new(), true)
         .await
-        .unwrap_err();
-    assert!(
-        format!("{error:#}").contains("Missing changes/zone successor"),
-        "{error:#}"
-    );
+        .unwrap();
+    assert_primary_bridge_held(&result);
+    assert_eq!(result.stats.downloaded, 0);
     assert_eq!(
         f.server.received_requests().await.unwrap().len(),
         1,

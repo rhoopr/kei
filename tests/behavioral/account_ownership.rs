@@ -1071,8 +1071,8 @@ async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quie
     for (kind, expected) in [
         ("write", "synthetic CLI receipt failure"),
         ("capacity", "inbox is full"),
-        ("identity", "Missing provider capture source identity"),
-        ("json", "Invalid or ambiguous provider changes JSON"),
+        ("identity", "icloud_changes_invalid_records"),
+        ("json", "icloud_changes_duplicate_json_keys"),
     ] {
         let failure = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let server = MockServer::start().await;
@@ -1130,6 +1130,7 @@ async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quie
             );
             let out = command(root, &account, &["sync", "--no-progress-bar"]);
             let diagnostics = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{kind}: {diagnostics}");
             assert!(diagnostics.contains(expected), "{kind}: {diagnostics}");
             assert!(
                 !diagnostics.contains("falling back to full enumeration"),

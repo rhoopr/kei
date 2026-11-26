@@ -2443,10 +2443,12 @@ async fn run_cycle_rejected_zone_page_preserves_cursor_debt_and_media_across_res
             .unwrap()
             .unwrap();
         if phase == 0 {
-            let error = result.expect_err("authenticated capture must reject a foreign-zone page");
-            assert!(
-                format!("{error:#}").contains("Unexpected changes/zone scope"),
-                "{error:#}"
+            let result = result.unwrap();
+            assert_eq!(result.failed_count, 1, "{result:?}");
+            assert!(!result.can_advance_database_checkpoint(), "{result:?}");
+            assert_eq!(
+                result.stats.sync_token_blocked_reason,
+                Some("icloud_changes_zone_name_mismatch")
             );
             assert_eq!(cursor, "saved");
             assert_eq!(summary.pending + summary.failed, 1);
@@ -2732,16 +2734,16 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
                 &shared_session,
                 &CancellationToken::new(),
             )
-            .await;
-            let result = if phase == 0 {
-                assert!(
-                    result.is_err(),
-                    "rejected source page must propagate its refusal"
+            .await
+            .unwrap();
+            if phase == 0 {
+                assert!(!result.can_advance_database_checkpoint(), "{result:?}");
+                assert_eq!(result.failed_count, 1, "{result:?}");
+                assert_eq!(
+                    result.stats.sync_token_blocked_reason,
+                    Some("icloud_changes_record_error")
                 );
-                None
-            } else {
-                Some(result.unwrap())
-            };
+            }
             drop(builder);
             drop(db);
             drop(inner);
@@ -2786,15 +2788,14 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
             if phase < 2 {
                 assert_eq!(cursor, "saved", "collecting={collecting} phase={phase}");
                 assert_eq!(summary.pending + summary.failed, 1);
-                if let Some(result) = &result {
-                    assert_eq!(phase, 1);
+                assert_eq!(result.stats.downloaded, 0);
+                if phase == 1 {
                     assert!(
                         result.can_advance_database_checkpoint(),
                         "empty current selection is complete: {result:?}"
                     );
                     assert_eq!(result.failed_count, 0);
                     assert_eq!(result.stats.assets_seen, 0);
-                    assert_eq!(result.stats.downloaded, 0);
                     assert!(!result.stats.identity_incomplete);
                 }
                 assert!(
@@ -2839,19 +2840,13 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
                     "recovery must download, not delete"
                 );
                 assert_eq!(summary.downloaded, 3);
-                assert_eq!(
-                    result.as_ref().unwrap().stats.downloaded,
-                    if phase == 2 { 2 } else { 0 }
-                );
+                assert_eq!(result.stats.downloaded, if phase == 2 { 2 } else { 0 });
                 assert_eq!(
                     server.received_requests().await.unwrap().len(),
                     2,
                     "current recovery publishes each source once across quiet reopens"
                 );
-                assert!(
-                    result.as_ref().unwrap().can_advance_database_checkpoint(),
-                    "{result:?}"
-                );
+                assert!(result.can_advance_database_checkpoint(), "{result:?}");
                 assert!(
                     db.get_metadata(&state::unresolved_identity_key("PrimarySync"))
                         .await
@@ -2880,7 +2875,6 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
                 );
             }
             if phase > 2 {
-                let result = result.as_ref().unwrap();
                 assert_eq!(result.stats.downloaded, 0);
                 assert_eq!(*requests.lock().unwrap(), ["delta:recovered"]);
                 assert!(result.stats.full_enumeration_reason.is_none());

@@ -37,8 +37,11 @@ download pipeline does not parse CloudKit records.
 - An enabled metadata setting authorizes later updates to its managed fields. Setup emits explicit choices; version-1 omissions and no-config runs stay disabled. Capture-timestamp replacement still requires explicit repair.
 - Preserve provider checkpoint gates across interruption, retry, partial work,
   config drift, and stale planning.
-- Unknown provider identity is durable retry evidence, not permission to delete
-  or forget work.
+- Keep safe current downloads moving even when a checkpoint cannot advance.
+  Keep current failures retryable without blocking unrelated work.
+- A validated current inventory can supersede obsolete planning. Preserve old
+  evidence and physical recovery records without requiring historical repair.
+  Unknown current identity remains retry evidence; absence is not deletion.
 - Keep provider quirks and record parsing in `src/icloud/`.
 - Keep trust-boundary validation and data-loss guards intact.
 - Never log passwords, cookies, bearer tokens, Apple IDs, or unredacted

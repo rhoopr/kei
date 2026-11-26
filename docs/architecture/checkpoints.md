@@ -4,6 +4,32 @@ A saved cursor says where a zone resumes. The inbox retains provider records nee
 
 ## Sync and provider checkpoints
 
+A rejected ordinary saved cursor can fall back to a full scan of the current selection. A complete scan with its own usable provider token can establish the next baseline. Rejection of a cursor issued by an earlier page is an incomplete delta, not an expired saved cursor, even if that page was empty. An unreadable historical hold does not prevent attempting current work. On failure, keep the saved cursor and any existing recovery evidence. A hold in an unselected library does not fail the current cycle. Guarded reconciliation and unresolved current identities keep their separate coverage requirements.
+
+Once the response matches the requested zone and owner, a zone-level server error holds that zone without starting a fallback scan, even if kei does not recognize the code. `BAD_REQUEST` on the first saved-cursor request is the exception that can allow a fresh baseline. `BAD_REQUEST` on a continuation holds the zone. Kei also holds the zone if replay lacks a usable next cursor.
+
+A live `changes/zone` response needs a JSON object with a `zones` array containing exactly one entry. A non-object JSON value such as `null`, a missing or non-array `zones` field, or zero or multiple entries holds the requesting library. Kei rejects a multi-entry response even if one entry matches the request. The sole entry must be an object containing a `zoneID` object with the requested zone name and any required owner. If the request omits the owner, the response can omit it too. A returned `ownerRecordName` must always be a nonblank string. A null or non-object entry, an invalid `zoneID`, or a name or owner mismatch makes kei reject the page before using its records, cursor, or error code. The hold applies to the library that made the request, even if the response names another selected library. Stored-page and database ownership checks keep their existing failure paths.
+
+A successful HTTP response with invalid or truncated JSON, or with duplicate JSON keys, holds the requesting library before capture. Kei rejects the entire body and does not select a value for a duplicate key. This hold applies only to live replay. Stored-page validation still rejects the same bodies.
+
+After validating the zone scope, kei rejects the entire page before capture or record processing if `records` is missing, isn't an array, or contains a non-object entry, an undecodable record, or a record-level error. Each record needs a nonblank `recordName`, including tombstones and unknown record types. If a record supplies its own `zoneID`, its zone name and any owner it supplies must match the page. Nested record references keep their own scope rules. The page also needs a boolean `moreComing`. If it is `true`, the successor must be a cursor not yet visited in that replay. An empty records array and an unchanged terminal cursor are still valid.
+
+On a page without a zone error, the optional `reason` must be absent, null, or a string. Any other value refuses the page. If the response reports a zone error, its code still determines how kei handles it.
+
+These refusals keep the saved cursor and retry work without a fallback scan. They are neither deletion evidence nor saved-cursor expiry. Earlier captured pages remain available for replay. The cycle stays incomplete and holds the database pre-check, but later libraries can still download and save their own cursors. A configuration bridge with any of these failures cannot promote its inventory token. Response-wide errors, HTTP 429, and HTTP 5xx responses keep their existing transport handling. Authentication and storage failures from work already in flight still stop the cycle. Scope validation still rejects foreign pages.
+
+Kei can back up new media from earlier accepted pages even when a later page is refused. It can use a standalone library-wide unfiled pass or eligible named albums whose media is in the same zone. These passes must be authenticated and have no exclusions. A fresh lookup must confirm the child and master. For a named album, the same lookup must confirm the exact live link to that container. If the accepted pages omit the link, a single retained link name for that child and album can target the lookup. The old link does not prove current membership. A missing, deleted, or mismatched result leaves that photo retryable without blocking verified peers. In a mixed selection, missing links do not establish unfiled placement.
+
+If the accepted pages contain the child but not its master, Kei looks up the pair by the child's retained master reference. The fresh master may fill the gap only if the fresh child agrees with the accepted child. A missing or changed pair leaves retry evidence and does not trigger a rescan.
+
+Favorites can save accepted media when selected alone or alongside just the library-wide unfiled pass. The same scoped lookup must confirm the pair and return an explicit `isFavorite=1` on the child. An absent, false, or malformed flag cannot qualify a Favorites copy. The unfiled pass checks the photo independently because smart-folder membership does not exclude it from unfiled. Each pass owns its destination, including when their folder templates match. Neither copy advances the held checkpoint.
+
+A standalone named album with one authenticated foreign media source can recover a relation-only candidate without scanning either zone. The album-zone lookup must return the exact live relation and an explicit `NOT_FOUND` or `UNKNOWN_ITEM` for the child. Kei then confirms the exact child and its referenced master in the bound media zone. The owner-zone absence only disambiguates the lookup. Missing or contradictory proof leaves retry evidence and cannot advance the checkpoint or authorize deletion.
+
+When the selection includes named albums and unfiled, the accepted pages must contain the exact link removal for every selected named album. One fresh lookup in the same zone must return all of those tombstones along with the matching photo and master. Kei leaves the photo retryable if any required record is missing or the full set cannot be verified in one lookup. This proof routes new media only; kei does not apply the removals to existing album copies.
+
+Kei can publish a verified new photo from the accepted pages even when metadata writing, refresh or repair is enabled. The download and its retries use the original media bytes and do not write a sidecar. Kei can record confirmed membership for the new photo, but the pages cannot authorize membership reconciliation, deletion, replacement, metadata writes or repairs. Managed layout still requires separate evidence. This replay cannot seal an inventory, retire earlier obligations, or advance a provider cursor.
+
 ```text
 sync_loop::run_sync
   -> resolve configuration, credentials, libraries, and pass plans
@@ -333,30 +359,31 @@ cross-zone recovery or checkpoint relaxation is added.
 
 ## Cursor rejection and advancement
 
-A complete inventory followed by an explicitly rejected retained cursor creates
+A reconciliation that still needs a retained replay can create
 `retained_checkpoint_hold:<zone>`. The versioned receipt contains a cursor
 fingerprint, requested enumeration/preservation policy hashes, an attempt count,
-and the next attempt deadline; it contains no provider identity or cursor value. Unchanged
-held zones defer provider, inventory and legacy preparation work for one hour.
-The initial rejection and two automatic retries form a finite budget of three
-attempts per boundary and policy. Exhausted holds perform no further provider
-work. Due attempts reserve their count and next deadline durably before requests,
-so interrupted or incomplete attempts consume a reservation. A failed reservation
-performs no provider work. Version-one receipts without a count retain one spent
-attempt. Malformed or unsupported receipts remain an actionable hold with no
-provider work. Genuine policy or active cursor changes permit bounded re-evaluation. Original assets, owner/date facts, legacy
-generations, transfer retries and sparse/deletion evidence remain intact.
+and the next attempt deadline; it contains no provider identity or cursor value.
+Matching holds defer work for up to one hour. A retry that is due reserves its
+next deadline durably before making requests, even if the attempt is later
+interrupted. A failed reservation makes no provider requests. The count is
+diagnostic; older receipts at the former cap retry when due. Malformed or
+unsupported receipts remain stored after a failed attempt but do not prevent
+current work. A different policy or saved cursor is not governed by the old
+deadline. Files, transfer retries and sparse/deletion evidence remain intact.
 
 A fresh inventory and its counts cannot establish lost historical deletion
-facts or resolve this hold. Permanently rejected boundaries remain actionable
-holds; this protocol does not rebootstrap them. A successful validated replay
+facts. If current work still requires replay, its prior boundary stays held.
+During configuration drift, if iCloud rejects the saved cursor on the first replay request, an unbounded, validated inventory can supply the staged checkpoint without a second scan. An accepted replay still supplies its own successor. A rejected continuation, unresolved current identity, incomplete inventory, or a stale plan does not qualify a replacement.
+
+A successful validated replay
 of the retained boundary removes the hold in the same transaction that stages
 or activates its successor. Transaction-time metadata comparisons fence both
 hold staging and checkpoint promotion against changes to the planned cursor
 and enumeration configuration, including the exact staged candidate read during
 aggregate promotion. Existing sparse generation validation
 still applies. Global configuration activation remains atomic across selected
-zones. Zone-local hold aggregation keeps status and backup safety truthful even
+zones. A staged inventory belongs to the proposed selection; the active
+configuration and cursors change together only at promotion. Zone-local hold aggregation keeps status and backup safety truthful even
 when another zone succeeds.
 
 Ordinary incremental producers carry validated changes/zone completion separately
@@ -526,7 +553,7 @@ Schema 37 seeds `inventory_reconciliation_required:<zone>` once from the existen
 
 Unresolved initial delta identity can still allow independently valid inventory jobs to finish, but vetoes qualification. Failed transfers, metadata, state writes, incomplete enumeration, cancellation, stale plans and readiness regression retain the request. The private generation delta path does not add an implicit inventory beside this attempt. Missing cursors use the ordinary first-run path and retain the request until a later guarded attempt is possible. Healthy completed files and all original historical evidence survive retries.
 
-An explicitly rejected cursor or supported static incremental fallback can still run the ordinary inventory, but cannot qualify the request without the guarded replay evidence. Completed inventory can feed the existing retained-checkpoint hold. A fallback error on the terminal replay does not start a second inventory or substitute a query token. Session, transient and durable-capture refusals keep their existing error routes.
+If iCloud rejects the saved cursor before returning current changes, an unbounded inventory can qualify the request with its own validated token instead. A static error or rejection of the terminal replay cannot substitute a query token. Neither starts a second inventory. Session, transient and durable-capture refusals keep their existing error routes.
 
 `sync_cycle.rs` retires qualified current work only after required enumeration/path configuration activation and a final FINISHED readiness check. `state/db/checkpoints.rs::commit_checkpoint_transition` compares the exact request value, accepted retained/offered cursor, active configuration hashes, absent pending hashes, and indexing/identity holds. The same transaction completes the inventory's deferred album-membership snapshots and removes the request. Failed comparison or transaction preserves both the request and prior membership; a rejected attempt cannot infer membership absence.
 

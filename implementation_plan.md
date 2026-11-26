@@ -1,5 +1,11 @@
 # v0.30 sync simplification implementation plan
 
+## Normal sync direction
+
+The [product charter](docs/product-charter.md) applies this fresh-start rule beyond the schema-38 transition. The normal owner should save verified current media independently of checkpoint eligibility. A validated full scan can establish authority for the current selection; the database retains useful local evidence and durable current retries, not a requirement to replay obsolete plans. Keep the last good checkpoint when current proof is incomplete. Do not infer deletion or authorize a file rewrite from a missing or inconsistent historical record.
+
+Deliver this in slices: make usable inventories recover an unusable prior cursor, remove obsolete scheduling and checkpoint gates, then verify ordinary recovery and restart through the production runner. A change must name the file-safety or current-work risk that justifies any check it keeps. The older implementation notes below are evidence, not a reason to preserve a conflicting design.
+
 ## Guiding decision: v0.30.0 is a fresh start
 
 User decision, 2026-11-14. This governs every slice and supersedes conflicting historical requirements, designs and delivery dependencies below. It records the required behavior, not completed implementation.

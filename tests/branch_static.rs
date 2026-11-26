@@ -2161,6 +2161,9 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_download_task_error",
         "classify_exit_error",
         "bridge_error_reason", // Provider-owned diagnostic for wrapped changes/zone failures.
+        "src/icloud/photos/album/changes.rs:classify_replay_page_refusal",
+        "src/icloud/photos/error.rs:from_shadow_error",
+        "src/icloud/photos/error.rs:saved_cursor_rejected",
         "classify_heif_metadata_limit",
         "classify_incremental_error",
         "classify_legacy_file_error",
@@ -2212,7 +2215,13 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
                     ));
                     continue;
                 };
-                if allowed.contains(name) {
+                let relative = path
+                    .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                    .unwrap_or(&path);
+                let scoped = format!("{}:{name}", relative.to_string_lossy().replace('\\', "/"));
+                if allowed.contains(&scoped) {
+                    observed.insert(scoped);
+                } else if allowed.contains(name) {
                     observed.insert(name.to_string());
                 } else {
                     violations.push(format!(

@@ -6,11 +6,11 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
 
-use crate::icloud::photos::SyncTokenError;
 use crate::icloud::photos::session::is_session_error as is_provider_session_error;
+use crate::icloud::photos::{SyncTokenError, error::saved_cursor_rejected};
 
 use super::cleanup::cleanup_orphan_part_files;
-use super::config::DownloadConfig;
+use super::config::{DownloadConfig, InventoryCheckpointPolicy};
 use super::context::backfill_asset_master_mappings_from_album_history;
 use super::full::{
     download_photos_full_with_reason, download_photos_full_with_token,
@@ -95,6 +95,20 @@ fn is_transient_reqwest_error(error: &reqwest::Error) -> bool {
         || error.is_connect()
 }
 
+fn replacement_inventory_config(
+    config: &Arc<DownloadConfig>,
+    error: &anyhow::Error,
+) -> Option<Arc<DownloadConfig>> {
+    (config.inventory_checkpoint == InventoryCheckpointPolicy::Baseline
+        && saved_cursor_rejected(error))
+    .then(|| {
+        Arc::new(DownloadConfig {
+            sync_mode: SyncMode::Full,
+            ..config.as_ref().clone()
+        })
+    })
+}
+
 /// Apply one incremental failure decision and preserve its checkpoint evidence.
 /// Captured selections retain their stricter state-refusal boundary and their
 /// existing inventory owner; ordinary selections retain their full-pass reason.
@@ -110,6 +124,11 @@ async fn finish_incremental_attempt(
         Ok(result) => return Ok(result),
         Err(error) => error,
     };
+    if config.inventory_checkpoint == InventoryCheckpointPolicy::RetainedBridge
+        && saved_cursor_rejected(&error)
+    {
+        return Err(error);
+    }
     let class = if config.selection_context.is_some() {
         classify_selection_incremental_error(&error)
     } else {
@@ -122,8 +141,13 @@ async fn finish_incremental_attempt(
         IncrementalErrorClass::TokenFallback | IncrementalErrorClass::StaticFallback => {}
     }
     let mut result = if config.selection_context.is_some() {
+        let replacement = replacement_inventory_config(config, &error);
         Box::pin(super::generation::inventory(
-            client, passes, config, controls, cancel,
+            client,
+            passes,
+            replacement.as_ref().unwrap_or(config),
+            controls,
+            cancel,
         ))
         .await?
     } else {
@@ -327,8 +351,8 @@ async fn download_photos_incremental_with_smart_folder_refresh(
     Ok(incremental_result)
 }
 
-/// Reuse the ordinary delta and inventory owners. Query tokens are EOF evidence
-/// only; the retained source cursor and terminal delta successors own replay.
+/// Bridge a usable retained cursor. If the provider rejects that starting
+/// cursor, a complete current inventory can establish a fresh baseline.
 async fn reconcile_inventory(
     client: &Client,
     passes: &[crate::commands::AlbumPass],
@@ -345,6 +369,7 @@ async fn reconcile_inventory(
         }
     };
     let mut rejected = false;
+    let mut replacement = None;
     let first =
         match download_photos_incremental(client, passes, config, prior, controls, cancel.clone())
             .await
@@ -366,6 +391,7 @@ async fn reconcile_inventory(
                 class @ (IncrementalErrorClass::TokenFallback
                 | IncrementalErrorClass::StaticFallback) => {
                     rejected = class == IncrementalErrorClass::TokenFallback;
+                    replacement = replacement_inventory_config(config, &error);
                     None
                 }
                 IncrementalErrorClass::SessionExpired
@@ -373,18 +399,33 @@ async fn reconcile_inventory(
                 | IncrementalErrorClass::CaptureRefused => return Err(error),
             },
         };
-    let mut inventory = if config.selection_context.is_some() {
+    let scan_config = replacement.as_ref().unwrap_or(config);
+    let mut inventory = if scan_config.selection_context.is_some() {
         Box::pin(super::generation::inventory(
             client,
             passes,
-            config,
+            scan_config,
             controls,
             cancel.clone(),
         ))
         .await?
     } else {
-        download_photos_full_with_token(client, passes, config, controls, cancel.clone()).await?
+        download_photos_full_with_token(client, passes, scan_config, controls, cancel.clone())
+            .await?
     };
+    if replacement.is_some()
+        && reconciliation_work_complete(&inventory)
+        && !inventory.checkpoint.sync_token_blocked
+        && inventory
+            .sync_token
+            .as_ref()
+            .is_some_and(|token| !token.trim().is_empty())
+        && !cancel.is_cancelled()
+    {
+        inventory.checkpoint.inventory_reconciliation_complete = true;
+        inventory.checkpoint.retained_token_rejected = true;
+        return Ok(inventory);
+    }
     // Current delta failures veto qualification, not independently identified
     // healthy inventory work. The retained source cursor still covers any
     // observation that the private generation owner has not admitted yet.

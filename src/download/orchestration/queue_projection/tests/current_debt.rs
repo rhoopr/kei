@@ -77,17 +77,17 @@ impl PhotosSession for SplitFirstScan {
 }
 
 #[tokio::test]
-async fn repaired_first_baseline_retains_independent_retry_across_a_zone_checkpoint() {
+async fn repaired_first_baseline_retires_an_omitted_plan() {
     check_repaired_baseline_after_deferral(Successor::DifferentPhoto {
-        recovered_stem: "retained",
+        fail_checkpoint: false,
     })
     .await;
 }
 
 #[tokio::test]
-async fn omitted_lookup_publishes_both_copies_after_filename_stem_change() {
+async fn baseline_inventory_authority_and_zone_checkpoint_commit_together() {
     check_repaired_baseline_after_deferral(Successor::DifferentPhoto {
-        recovered_stem: "restyled",
+        fail_checkpoint: true,
     })
     .await;
 }
@@ -103,13 +103,13 @@ async fn repaired_first_baseline_accepts_a_rename_before_path_admission() {
 }
 
 #[tokio::test]
-async fn repaired_first_baseline_keeps_hold_when_edited_url_becomes_alias() {
+async fn repaired_first_baseline_uses_current_edited_url_alias() {
     check_repaired_baseline_after_deferral(Successor::AliasedEdit).await;
 }
 
 #[cfg(feature = "xmp")]
 #[tokio::test]
-async fn repaired_first_baseline_keeps_hold_without_a_writer_for_the_omitted_photo() {
+async fn repaired_first_baseline_needs_no_writer_for_the_omitted_photo() {
     check_repaired_baseline_after_deferral(Successor::DifferentPhotoWithWriter).await;
 }
 
@@ -117,7 +117,7 @@ enum Successor {
     Exact,
     Renamed,
     DifferentPhoto {
-        recovered_stem: &'static str,
+        fail_checkpoint: bool,
     },
     #[cfg(feature = "xmp")]
     DifferentPhotoWithWriter,
@@ -184,17 +184,20 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
         Some("shared-after"),
         "{first:?}"
     );
-    let original: String = f
+    let (original, hash): (String, String) = f
         .db
         .acquire_lock("deferred selection")
         .unwrap()
         .query_row(
-            "SELECT generation FROM provider_active_decisions WHERE admission='deferred' LIMIT 1",
+            "SELECT g.id,g.config_hash FROM provider_active_decisions d
+             JOIN provider_active_generations g ON g.id=d.generation WHERE d.admission='deferred' LIMIT 1",
             [],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
     let evidence = historical_evidence(&f, &original);
+    let authority_key = format!("selection_inventory_v1:{hash}");
+    assert_eq!(f.db.get_metadata(&authority_key).await.unwrap(), None);
     let has_deferred_hold = |retained| {
         trace.contains_event(|event| {
             event.field("diagnostic") == Some("selection_checkpoint_hold_v1")
@@ -205,6 +208,10 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
     assert!(has_deferred_hold("false"));
 
     f = reopen_destination_fixture(f).await;
+    f.db.make_selection_retry_due(super::owner(), "asset-c".into())
+        .await
+        .unwrap();
+    f.session.lookup_names.lock().unwrap().clear();
     let master = match successor {
         Successor::DifferentPhoto { .. } => "m",
         #[cfg(feature = "xmp")]
@@ -245,6 +252,22 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
     split
         .album
         .set_shadow_capture(f.capture.clone(), Arc::from("private"));
+    let fail_checkpoint = matches!(
+        successor,
+        Successor::DifferentPhoto {
+            fail_checkpoint: true
+        }
+    );
+    if fail_checkpoint {
+        f.db.acquire_lock("inject inventory authority write failure")
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_inventory_authority BEFORE INSERT ON metadata
+                 WHEN NEW.key GLOB 'selection_inventory_v1:*'
+                 BEGIN SELECT RAISE(ABORT,'inventory checkpoint interrupted'); END;",
+            )
+            .unwrap();
+    }
     let result = baseline_cycle(
         &f,
         &config,
@@ -257,6 +280,16 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
     assert_eq!(result.stats.failed, 0);
     assert_eq!(result.stats.enumeration_errors, 0);
     assert!(!result.stats.identity_incomplete);
+    if master == "m" {
+        assert!(
+            f.session
+                .lookup_names
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|name| !matches!(name.as_str(), "asset-c" | "c"))
+        );
+    }
     let summary = f.db.get_summary().await.unwrap();
     assert_eq!((summary.pending, summary.failed), (0, 0));
     assert_eq!(historical_evidence(&f, &original), evidence);
@@ -266,81 +299,60 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
             assert!(!edited.exists());
         }
     }
-    if matches!(successor, Successor::Exact | Successor::Renamed) {
-        assert_eq!(
-            f.db.get_metadata(PRIMARY_KEY).await.unwrap().as_deref(),
-            Some("destination-rank-proof"),
-            "{result:?}"
-        );
-        assert!(!result.stats.selected_work_remaining);
-        assert!(!has_deferred_hold("true"));
-        let retained = retained_inventory(&f);
+    if fail_checkpoint {
+        assert!(result.stats.state_write_failures > 0, "{result:?}");
+        assert_eq!(f.db.get_metadata(&authority_key).await.unwrap(), None);
+        assert_eq!(f.db.get_metadata(PRIMARY_KEY).await.unwrap(), None);
+        f.db.acquire_lock("release inventory authority write failure")
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_inventory_authority")
+            .unwrap();
         f = reopen_destination_fixture(f).await;
-        // Revisit the held decision when it would otherwise be due. The
-        // settled history must not cause another lookup or rank inventory.
+        let retry = baseline_cycle(&f, &config, &session, ordinary_passes(&f)).await;
+        assert_eq!(retry.failed_count, 0, "{retry:?}");
+        assert_eq!(retry.stats.downloaded, 0, "{retry:?}");
+    }
+    assert_eq!(
+        f.db.get_metadata(PRIMARY_KEY).await.unwrap().as_deref(),
+        Some("destination-rank-proof"),
+        "{result:?}"
+    );
+    let accepted = f.db.get_metadata(&authority_key).await.unwrap().unwrap();
+    assert_ne!(accepted, original);
+    assert!(!result.stats.selected_work_remaining);
+    assert!(!has_deferred_hold("true"));
+    let retained = retained_inventory(&f);
+    for _ in 0..2 {
+        f = reopen_destination_fixture(f).await;
+        // Force the obsolete plan due. It must not restart a lookup, inventory
+        // or download on a quiet change feed.
         f.db.make_selection_retry_due(super::owner(), "asset-c".into())
             .await
             .unwrap();
-        for _ in 0..2 {
-            let requests = (
+        let requests = (
+            f.session.calls.load(Ordering::SeqCst),
+            f.session.rank_calls.load(Ordering::SeqCst),
+        );
+        let quiet = baseline_cycle(&f, &config, &session, ordinary_passes(&f)).await;
+        assert_eq!(quiet.failed_count, 0, "{quiet:?}");
+        assert!(!quiet.stats.selected_work_remaining);
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_eq!(
+            f.db.get_metadata(PRIMARY_KEY).await.unwrap().as_deref(),
+            Some("quiet-zone-cursor")
+        );
+        assert_eq!(
+            f.db.get_metadata(&authority_key).await.unwrap().as_deref(),
+            Some(accepted.as_str())
+        );
+        assert_eq!(
+            requests,
+            (
                 f.session.calls.load(Ordering::SeqCst),
                 f.session.rank_calls.load(Ordering::SeqCst),
-            );
-            let quiet = baseline_cycle(&f, &config, &session, ordinary_passes(&f)).await;
-            assert_eq!(quiet.failed_count, 0, "{quiet:?}");
-            assert!(!quiet.stats.selected_work_remaining);
-            assert_eq!(
-                f.db.get_metadata(PRIMARY_KEY).await.unwrap().as_deref(),
-                Some("quiet-zone-cursor")
-            );
-            assert_eq!(
-                requests,
-                (
-                    f.session.calls.load(Ordering::SeqCst),
-                    f.session.rank_calls.load(Ordering::SeqCst),
-                )
-            );
-            assert_eq!(retained_inventory(&f), retained);
-            assert_eq!(historical_evidence(&f, &original), evidence);
-            f = reopen_destination_fixture(f).await;
-        }
-    } else if let Successor::DifferentPhoto { recovered_stem } = successor {
-        // The current files are B's. A is neither complete nor deleted. Its
-        // exact historical pair and selected pass remain the only retry owner.
-        assert_eq!(
-            f.db.get_metadata(PRIMARY_KEY).await.unwrap().as_deref(),
-            Some("destination-rank-proof"),
-            "{result:?}"
+            )
         );
-        assert!(result.stats.selected_work_remaining && result.failed_count > 0);
-        assert!(!result.can_advance_database_checkpoint());
-        f = Box::pin(recover_omitted_lookup(
-            f,
-            &config,
-            &session,
-            &server,
-            &original,
-            recovered_stem,
-        ))
-        .await;
-    } else {
-        assert!(result.stats.selected_work_remaining);
-        assert_eq!(
-            result.stats.sync_token_blocked_reason,
-            Some("selection_generation_deferred")
-        );
-        assert_eq!(f.db.get_metadata(PRIMARY_KEY).await.unwrap(), None);
-        assert!(has_deferred_hold("true"));
-        f = reopen_destination_fixture(f).await;
-        f.db.make_selection_retry_due(super::owner(), "asset-c".into())
-            .await
-            .unwrap();
-        let due = baseline_cycle(&f, &config, &session, ordinary_passes(&f)).await;
-        assert!(
-            due.stats.selected_work_remaining && due.failed_count > 0,
-            "{due:?}"
-        );
-        assert_eq!(f.db.get_metadata(PRIMARY_KEY).await.unwrap(), None);
+        assert_eq!(retained_inventory(&f), retained);
         assert_eq!(historical_evidence(&f, &original), evidence);
     }
     for album in ["A", "B"] {
@@ -362,133 +374,6 @@ async fn check_repaired_baseline_after_deferral(successor: Successor) {
 
 fn ordinary_passes(f: &Fixture) -> Vec<AlbumPass> {
     vec![destination_pass(f, "A"), destination_pass(f, "B")]
-}
-
-async fn recover_omitted_lookup(
-    mut f: Fixture,
-    config: &crate::config::Config,
-    session: &crate::auth::SharedSession,
-    server: &MockServer,
-    original: &str,
-    recovered_stem: &str,
-) -> Fixture {
-    let evidence = historical_evidence(&f, original);
-    let retained = retained_inventory(&f);
-    // Interrupt the next zone cursor write after B was published and the
-    // earlier zone checkpoint committed. A and both verified B copies survive.
-    f.db.acquire_lock("inject quiet checkpoint fault")
-        .unwrap()
-        .execute_batch(
-            "CREATE TRIGGER fail_quiet_zone BEFORE INSERT ON metadata
-             WHEN NEW.key='sync_token:PrimarySync' AND NEW.value='quiet-zone-cursor'
-             BEGIN SELECT RAISE(ABORT,'quiet zone commit interrupted'); END;",
-        )
-        .unwrap();
-    let interrupted = baseline_cycle(&f, config, session, ordinary_passes(&f)).await;
-    assert!(
-        interrupted.stats.state_write_failures > 0,
-        "{interrupted:?}"
-    );
-    assert_eq!(
-        f.db.get_metadata(PRIMARY_KEY).await.unwrap().as_deref(),
-        Some("destination-rank-proof")
-    );
-    assert_eq!(historical_evidence(&f, original), evidence);
-    f.db.acquire_lock("release quiet checkpoint fault")
-        .unwrap()
-        .execute_batch("DROP TRIGGER fail_quiet_zone")
-        .unwrap();
-    for due in [false, true, false, true] {
-        f = reopen_destination_fixture(f).await;
-        if due {
-            f.db.make_selection_retry_due(super::owner(), "asset-c".into())
-                .await
-                .unwrap();
-        }
-        let passes = ordinary_passes(&f);
-        assert_eq!(
-            crate::download::has_due_selection_work(&passes, &f.config, controls())
-                .await
-                .unwrap(),
-            Some(due)
-        );
-        f.session.lookup_names.lock().unwrap().clear();
-        let ranks = f.session.rank_calls.load(Ordering::SeqCst);
-        let quiet = baseline_cycle(&f, config, session, passes).await;
-        assert_eq!(quiet.stats.downloaded, 0);
-        assert!(quiet.stats.selected_work_remaining && quiet.failed_count > 0);
-        assert!(!quiet.can_advance_database_checkpoint());
-        assert_eq!(
-            f.db.get_metadata(PRIMARY_KEY).await.unwrap().as_deref(),
-            Some("quiet-zone-cursor"),
-            "{quiet:?}"
-        );
-        assert_eq!(retained_inventory(&f), retained);
-        assert_eq!(historical_evidence(&f, original), evidence);
-        assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), ranks);
-        let lookups = f.session.lookup_names.lock().unwrap().clone();
-        assert_eq!(!lookups.is_empty(), due, "{lookups:?}");
-        assert!(
-            lookups
-                .iter()
-                .all(|name| matches!(name.as_str(), "asset-c" | "c"))
-        );
-    }
-    // A failed backoff write must remain due. The last committed cursor
-    // still reaches that same decision without another inventory.
-    f.db.make_selection_retry_due(super::owner(), "asset-c".into())
-        .await
-        .unwrap();
-    f.db.acquire_lock("interrupt deferred retry update").unwrap().execute_batch(
-            "CREATE TRIGGER fail_lookup_retry BEFORE UPDATE OF attempts ON provider_active_decisions
-             WHEN OLD.child='asset-c' AND NEW.attempts>OLD.attempts
-             BEGIN SELECT RAISE(ABORT,'deferred retry interrupted'); END;"
-        ).unwrap();
-    let failed = baseline_cycle(&f, config, session, ordinary_passes(&f)).await;
-    assert!(failed.stats.state_write_failures > 0, "{failed:?}");
-    assert!(!failed.can_advance_database_checkpoint());
-    assert_eq!(historical_evidence(&f, original), evidence);
-    assert_eq!(retained_inventory(&f), retained);
-    f.db.acquire_lock("release backoff fault")
-        .unwrap()
-        .execute_batch("DROP TRIGGER fail_lookup_retry")
-        .unwrap();
-    server.verify().await;
-    server.reset().await;
-    Mock::given(method("GET"))
-        .and(path("/media"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
-        .expect(2)
-        .mount(server)
-        .await;
-    f = reopen_destination_fixture(f).await;
-    select(&f, "c", server);
-    f.session.records.lock().unwrap()[0]["fields"]["filenameEnc"]["value"] =
-        json!(format!("{recovered_stem}.jpg"));
-    assert_eq!(
-        crate::download::has_due_selection_work(&ordinary_passes(&f), &f.config, controls())
-            .await
-            .unwrap(),
-        Some(true)
-    );
-    let ranks = f.session.rank_calls.load(Ordering::SeqCst);
-    let filename = format!("{recovered_stem}.JPG");
-    for downloads in [2, 0] {
-        let recovered = baseline_cycle(&f, config, session, ordinary_passes(&f)).await;
-        assert_eq!(recovered.stats.downloaded, downloads, "{recovered:?}");
-        assert_eq!(recovered.failed_count, 0, "{recovered:?}");
-        assert!(!recovered.stats.selected_work_remaining);
-        assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), ranks);
-        for album in ["A", "B"] {
-            let folder = f.config.directory.join(album);
-            assert_eq!(std::fs::read(folder.join(&filename)).unwrap(), MEDIA);
-            if recovered_stem != "retained" {
-                assert!(!folder.join("retained.JPG").exists());
-            }
-        }
-        f = reopen_destination_fixture(f).await;
-    }
-    f
 }
 
 async fn baseline_cycle(
@@ -894,7 +779,7 @@ async fn retained_checkpoint_successor_profile() {
             let scheduler = start.elapsed();
             let start = Instant::now();
             assert!(
-                f.db.selection_debt(super::owner(), scope.clone(), hash.clone(), false)
+                f.db.selection_debt(super::owner(), scope.clone(), hash.clone(), false, None)
                     .await
                     .unwrap()
                     .is_none()

@@ -25,10 +25,13 @@ pub use album::PhotoAlbum;
 #[cfg(test)]
 pub use album::PhotoAlbumConfig;
 pub(crate) use album::ProviderLookupError;
-#[cfg(test)]
 pub(crate) use album::catalog_observed_page;
 pub(crate) use album::classify_legacy_inventory_error;
-pub(crate) use album::work::{CurrentCatalogAsset, current_asset, same_selected_facts};
+pub(crate) use album::work::{
+    CurrentCatalogAsset, REPLAY_ALBUM_LINK_LIMIT, ReplayAlbumLink, ReplayAlbumLinkLookup,
+    accepted_child_matches_lookup, current_asset, replay_album_confirmation_matches,
+    replay_current_album_link, same_selected_facts,
+};
 pub(crate) use album::{
     ProviderRecordId, RecordLookupRequest, RecordResolution, RecordResolutionBatch,
 };
@@ -58,6 +61,17 @@ pub(crate) fn has_explicit_owner(owner: Option<&Value>) -> bool {
     owner
         .and_then(Value::as_str)
         .is_some_and(|owner| !owner.trim().is_empty())
+}
+
+pub(crate) fn is_library_wide_selection(scope: &Value) -> bool {
+    scope.get("list_type").and_then(Value::as_str) == Some(album::QUERY_ALL_LIST)
+        && scope.get("obj_type").and_then(Value::as_str) == Some(album::QUERY_ALL_OBJ)
+        && scope.get("query_filter").is_some_and(Value::is_null)
+        && scope.get("container_id").is_some_and(Value::is_null)
+        && scope
+            .get("cross_zone_sources")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
 }
 
 /// Diagnostic morphology never establishes scope authority or returns identity.

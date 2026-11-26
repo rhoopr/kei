@@ -1,6 +1,7 @@
 //! Atomic source indexing, separate from queue consumption and checkpoints.
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rustc_hash::FxHashMap;
 
 use super::provider_inbox::{CapturedPageId, StoredPage, load_page};
 use super::{SqliteStateDb, account};
@@ -8,6 +9,52 @@ use crate::state::error::StateError;
 use crate::support::{StorageComponent, StorageOutcome};
 
 pub(crate) const PROJECTOR_VERSION: i64 = 1;
+
+impl SqliteStateDb {
+    /// Return exact lookup keys, not membership authority. The original page
+    /// does not need to be reopened: only a fresh scoped link can select media.
+    pub(crate) async fn retained_album_link_hints(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        container: String,
+        children: Vec<String>,
+    ) -> Result<FxHashMap<String, String>, StateError> {
+        self.with_conn("reading retained album lookup keys", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            account::validate_authenticated(&tx, &owner)?;
+            let children = serde_json::to_string(&children)
+                .map_err(|_invalid| StateError::ProviderCatalogInvalid)?;
+            let hints = {
+                let mut statement = tx.prepare(
+                    "SELECT child.target_record_name,MIN(r.record_name)
+                     FROM provider_shadow_pages p
+                     JOIN account_owner o ON o.account_key=p.account_key AND o.provider_key=p.provider_key
+                     JOIN provider_catalog_pages c ON c.page_id=p.id AND c.body_hash=p.body_hash
+                     JOIN provider_catalog_records r ON r.page_id=c.page_id
+                     JOIN provider_catalog_references album
+                       ON (album.page_id,album.ordinal)=(r.page_id,r.ordinal)
+                          AND album.field_path='/fields/containerId/value'
+                     JOIN provider_catalog_references child
+                       ON (child.page_id,child.ordinal)=(r.page_id,r.ordinal)
+                          AND child.field_path='/fields/itemId/value'
+                     WHERE p.scope=?1 AND album.target_record_name=?2 AND c.projector_version=?3
+                       AND r.kind='relation' AND r.deleted=0 AND length(trim(r.record_name))>0
+                       AND child.target_record_name IN (SELECT value FROM json_each(?4))
+                     GROUP BY child.target_record_name
+                     HAVING MIN(r.record_name)=MAX(r.record_name)",
+                )?;
+                statement.query_map(
+                    params![scope, container, PROJECTOR_VERSION, children],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?.collect::<Result<_, _>>()?
+            };
+            tx.commit()?;
+            Ok(hints)
+        })
+        .await
+    }
+}
 
 pub(crate) struct CatalogRecord {
     pub(crate) kind: &'static str,

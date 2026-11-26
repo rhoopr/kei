@@ -1405,16 +1405,17 @@ async fn historical_records_do_not_relax_current_identity_enumeration_cancellati
         if fault == "cancel" {
             f.session.cancel = Some(cancel.clone());
         }
-        let result = f.try_cycle(cancel, fault == "stale", false).await;
+        let result = f.try_cycle(cancel, fault == "stale", false).await.unwrap();
+        assert!(
+            !result.can_advance_database_checkpoint(),
+            "{fault}: {result:?}"
+        );
         if fault == "enumeration" {
-            assert!(
-                result.is_err(),
-                "malformed current page must be refused: {result:?}"
-            );
-        } else {
-            assert!(
-                !result.as_ref().unwrap().can_advance_database_checkpoint(),
-                "{fault}: {result:?}"
+            assert_eq!(result.failed_count, 1);
+            assert_eq!(result.stats.sync_token_blocked_zone.as_deref(), Some(ZONE));
+            assert_eq!(
+                result.stats.sync_token_blocked_reason,
+                Some("icloud_changes_invalid_continuation_flag")
             );
         }
         let db = f.open().await;
@@ -1423,7 +1424,7 @@ async fn historical_records_do_not_relax_current_identity_enumeration_cancellati
             Some("before")
         );
         if fault == "identity" {
-            assert!(result.as_ref().unwrap().failed_count > 0);
+            assert!(result.failed_count > 0);
             assert!(
                 db.get_metadata(&state::unresolved_identity_key(ZONE))
                     .await

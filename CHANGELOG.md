@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- When iCloud rejects a saved sync position, a complete scan can establish a new starting point for the selected photos. Files and unfinished downloads from earlier runs stay protected.
+- When iCloud stops returning usable changes partway through a sync, kei can still save photos it independently verifies and keep other libraries moving. The affected library retries from its last good position. Metadata and repair settings do not block a verified new copy or authorize rewriting an existing one during that recovery.
+- Selecting Favorites and unfiled together now preserves both destinations during recovery. Only a photo freshly confirmed as a favorite gets the Favorites copy.
+
+### Fixed
+
+- An expired download URL no longer stops unrelated transfers during a full sync. Kei can recover a library's sync position once the selected work that held it is resolved.
+- Watch mode retries unavailable iCloud indexing status instead of ending the service run.
+- A replaced edited primary now gets the edit time as its file modification time. Thanks to [@bobsoppe](https://github.com/bobsoppe) ([#1068](https://github.com/rhoopr/kei/pull/1068)).
+
 ## [0.30.0-beta.3] - 2026-11-23
 
 See the [v0.30 upgrade checklist](docs/upgrade.md) before opening an existing backup with this beta.

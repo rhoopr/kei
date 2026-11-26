@@ -12,15 +12,76 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 const DELETION_VALIDATION_PAGE_SIZE: u32 = 200;
 use super::{ChangeStream, PhotoAlbum};
+use crate::icloud::photos::SyncTokenError;
 use crate::icloud::photos::asset::{ChangeEvent, DeltaRecordBuffer};
 use crate::icloud::photos::cloudkit;
 use crate::icloud::photos::cloudkit::ChangesZoneResponse;
+use crate::icloud::photos::error::{AcceptedReplay, ChangesBodyRejection, ReplayRefusal};
 use crate::icloud::photos::hydration_progress;
-use crate::icloud::photos::queries::{build_changes_zone_request, encode_params};
+use crate::icloud::photos::queries::{
+    CHANGES_REPLAY_PAGE_SIZE, build_changes_zone_request, encode_params,
+};
 use crate::icloud::photos::session;
 use crate::icloud::photos::session::check_changes_zone_error;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// Only the live replay boundary can turn this scope rejection into a zone hold.
+#[derive(Debug, thiserror::Error)]
+enum ZoneScopeMismatch {
+    #[error("Missing or invalid zones field in changes/zone response")]
+    InvalidZonesField,
+    #[error("Empty changes/zone results")]
+    EmptyResults,
+    #[error("Multiple changes/zone results")]
+    MultipleResults,
+    #[error("Missing or invalid changes/zone identity")]
+    InvalidIdentity,
+    #[error("Unexpected changes/zone scope")]
+    Name,
+    #[error("Unexpected changes/zone scope")]
+    Owner,
+    #[error("Unexpected changes/zone record scope")]
+    Record,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Missing changes/zone record identity")]
+struct MissingRecordIdentity;
+
+/// Only an initial invalid token is eligible for saved-cursor fallback.
+fn classify_replay_page_refusal(
+    error: &anyhow::Error,
+    continuation: bool,
+) -> Option<ReplayRefusal> {
+    if error.is::<MissingRecordIdentity>() {
+        return Some(ReplayRefusal::InvalidRecords);
+    }
+    if let Some(mismatch) = error.downcast_ref::<ZoneScopeMismatch>() {
+        return Some(match mismatch {
+            ZoneScopeMismatch::InvalidZonesField => ReplayRefusal::InvalidZonesField,
+            ZoneScopeMismatch::EmptyResults => ReplayRefusal::EmptyZoneResults,
+            ZoneScopeMismatch::MultipleResults => ReplayRefusal::MultipleZoneResults,
+            ZoneScopeMismatch::InvalidIdentity => ReplayRefusal::InvalidZoneIdentity,
+            ZoneScopeMismatch::Name => ReplayRefusal::ZoneNameMismatch,
+            ZoneScopeMismatch::Owner => ReplayRefusal::ZoneOwnerMismatch,
+            ZoneScopeMismatch::Record => ReplayRefusal::RecordScopeMismatch,
+        });
+    }
+    if let Some(
+        refusal @ (ReplayRefusal::InvalidContinuationFlag
+        | ReplayRefusal::InvalidReason
+        | ReplayRefusal::InvalidRecords
+        | ReplayRefusal::RecordError),
+    ) = error.downcast_ref::<ReplayRefusal>()
+    {
+        return Some(*refusal);
+    }
+    error
+        .downcast_ref::<SyncTokenError>()
+        .filter(|error| continuation || !matches!(error, SyncTokenError::InvalidToken { .. }))
+        .map(ReplayRefusal::from_zone_error)
+}
 
 /// A complete, scoped page checked before pairing, callbacks or cursor acceptance.
 #[must_use]
@@ -32,27 +93,43 @@ struct ValidatedChangesPage {
 }
 
 impl ValidatedChangesPage {
-    fn parse(response: Value, requested_zone: &Value) -> anyhow::Result<Self> {
-        let zones = response
-            .get("zones")
-            .and_then(Value::as_array)
-            .filter(|zones| zones.len() == 1)
-            .context("Invalid changes/zone cardinality")?;
-        let zone = zones.first().context("Missing changes/zone result")?;
-        let zone_id = zone
-            .get("zoneID")
-            .context("Missing changes/zone identity")?;
+    fn parse(mut response: Value, requested_zone: &Value) -> anyhow::Result<Self> {
         let requested_name = requested_zone
             .get("zoneName")
             .and_then(Value::as_str)
             .filter(|name| !name.trim().is_empty())
             .context("Missing requested zone identity")?;
+        let zones = response
+            .get_mut("zones")
+            .and_then(Value::as_array_mut)
+            .ok_or(ZoneScopeMismatch::InvalidZonesField)?;
+        let zone = match zones.as_mut_slice() {
+            [zone] => zone,
+            [] => anyhow::bail!(ZoneScopeMismatch::EmptyResults),
+            _ => anyhow::bail!(ZoneScopeMismatch::MultipleResults),
+        };
+        let zone = zone
+            .as_object_mut()
+            .ok_or(ZoneScopeMismatch::InvalidIdentity)?;
+        let zone_id = zone
+            .get("zoneID")
+            .and_then(Value::as_object)
+            .ok_or(ZoneScopeMismatch::InvalidIdentity)?;
+        let returned_name = zone_id.get("zoneName").and_then(Value::as_str);
         anyhow::ensure!(
-            zone_id.get("zoneName").and_then(Value::as_str) == Some(requested_name)
-                && requested_zone
-                    .get("ownerRecordName")
-                    .is_none_or(|owner| zone_id.get("ownerRecordName") == Some(owner)),
-            "Unexpected changes/zone scope"
+            returned_name == Some(requested_name),
+            ZoneScopeMismatch::Name
+        );
+        let returned_owner = zone_id.get("ownerRecordName");
+        anyhow::ensure!(
+            returned_owner.is_none() || super::super::has_explicit_owner(returned_owner),
+            ZoneScopeMismatch::InvalidIdentity
+        );
+        anyhow::ensure!(
+            requested_zone
+                .get("ownerRecordName")
+                .is_none_or(|owner| returned_owner == Some(owner)),
+            ZoneScopeMismatch::Owner
         );
         // Error responses can legitimately omit records and contain an empty token.
         // Preserve typed fallback classification without exposing provider values.
@@ -67,22 +144,31 @@ impl ValidatedChangesPage {
             };
             check_changes_zone_error(Some(code), None, "requested zone")?;
         }
-        let records = zone
-            .get("records")
-            .and_then(Value::as_array)
-            .context("Missing or invalid changes/zone records")?;
+        let zone_scope = Value::Object(zone_id.clone());
+        // Decode records separately so a malformed envelope keeps its own error.
+        let Some(Value::Array(records)) = zone.remove("records") else {
+            anyhow::bail!(ReplayRefusal::InvalidRecords);
+        };
         anyhow::ensure!(
             records
                 .iter()
                 .all(|record| record.get("serverErrorCode").is_none_or(Value::is_null)),
-            "Changes/zone record failed"
+            ReplayRefusal::RecordError
         );
-        let zone_scope = zone_id.clone();
         anyhow::ensure!(
             zone.get("syncToken")
                 .and_then(Value::as_str)
                 .is_some_and(|token| !token.trim().is_empty()),
-            crate::icloud::photos::error::MissingZoneSuccessor
+            ReplayRefusal::MissingSuccessor
+        );
+        anyhow::ensure!(
+            zone.get("moreComing").is_some_and(Value::is_boolean),
+            ReplayRefusal::InvalidContinuationFlag
+        );
+        anyhow::ensure!(
+            zone.get("reason")
+                .is_none_or(|reason| reason.is_null() || reason.is_string()),
+            ReplayRefusal::InvalidReason
         );
         let response: ChangesZoneResponse = serde_json::from_value(response)
             .map_err(|_invalid_shape| anyhow::anyhow!("Invalid changes/zone page shape"))?;
@@ -91,56 +177,43 @@ impl ValidatedChangesPage {
             .into_iter()
             .next()
             .context("Missing changes/zone result")?;
+        for record in &records {
+            anyhow::ensure!(record.is_object(), ReplayRefusal::InvalidRecords);
+            if let Some(scope) = record.get("zoneID") {
+                anyhow::ensure!(
+                    scope.get("zoneName") == zone_scope.get("zoneName")
+                        && scope
+                            .get("ownerRecordName")
+                            .is_none_or(|owner| zone_scope.get("ownerRecordName") == Some(owner)),
+                    ZoneScopeMismatch::Record
+                );
+            }
+        }
+        let records: Vec<cloudkit::Record> = serde_json::from_value(Value::Array(records))
+            .map_err(|_invalid_records| ReplayRefusal::InvalidRecords)?;
+        anyhow::ensure!(
+            records
+                .iter()
+                .all(|record| !record.record_name.trim().is_empty()),
+            MissingRecordIdentity
+        );
         Ok(Self {
             zone_scope,
-            records: zone.records,
+            records,
             sync_token: zone.sync_token,
             more_coming: zone.more_coming,
         })
     }
 
+    /// Attach the same original bytes used to validate this page.
     fn observed_page(
         &self,
         body: Vec<u8>,
         scope: String,
         request_cursor: &str,
-    ) -> anyhow::Result<crate::state::db::provider_inbox::ObservedPage> {
+    ) -> crate::state::db::provider_inbox::ObservedPage {
         use crate::state::db::provider_inbox::{ObservedPage, SourceIdentity};
-        let response = super::super::changes_json::parse(&body)?;
-        let records = response
-            .get("zones")
-            .and_then(Value::as_array)
-            .and_then(|zones| zones.first())
-            .and_then(|zone| zone.get("records"))
-            .and_then(Value::as_array)
-            .context("Missing capture records")?;
-        for record in records {
-            anyhow::ensure!(
-                record
-                    .get("recordName")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| !name.trim().is_empty()),
-                "Missing provider capture source identity"
-            );
-            if let Some(zone) = record.get("zoneID") {
-                anyhow::ensure!(
-                    zone.get("zoneName") == self.zone_scope.get("zoneName")
-                        && zone
-                            .get("ownerRecordName")
-                            .is_none_or(
-                                |owner| self.zone_scope.get("ownerRecordName") == Some(owner)
-                            ),
-                    "Unexpected provider capture source scope"
-                );
-            }
-        }
-        anyhow::ensure!(
-            self.zone_scope
-                .get("ownerRecordName")
-                .is_none_or(|owner| owner.as_str().is_some_and(|name| !name.trim().is_empty())),
-            "Missing provider capture zone owner"
-        );
-        Ok(ObservedPage {
+        ObservedPage {
             scope,
             request_cursor: request_cursor.to_owned(),
             successor: self.sync_token.clone(),
@@ -156,14 +229,13 @@ impl ValidatedChangesPage {
                     deleted: record.deleted.unwrap_or(false),
                 })
                 .collect(),
-        })
+        }
     }
 
-    fn check_continuation(&self, visited: &mut FxHashSet<String>) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.more_coming || visited.insert(self.sync_token.clone()),
-            "Non-progressing changes/zone continuation"
-        );
+    fn check_continuation(&self, visited: &mut FxHashSet<String>) -> Result<(), ReplayRefusal> {
+        if self.more_coming && !visited.insert(self.sync_token.clone()) {
+            return Err(ReplayRefusal::RepeatedContinuation);
+        }
         Ok(())
     }
 }
@@ -191,7 +263,7 @@ pub(crate) fn catalog_observed_page(
             && (!page.more_coming || page.sync_token != request_cursor),
         "Invalid catalog source continuation"
     );
-    page.observed_page(body, scope.to_owned(), request_cursor)
+    Ok(page.observed_page(body, scope.to_owned(), request_cursor))
 }
 
 /// Validate original album-owner membership observations before durable capture.
@@ -213,14 +285,7 @@ pub(super) fn validated_membership_page(request: &Value, body: &[u8]) -> anyhow:
         "Unsupported membership owner"
     );
     let mut response = super::super::changes_json::parse(body)?;
-    let parsed = ValidatedChangesPage::parse(response.clone(), zone)?;
-    anyhow::ensure!(
-        parsed
-            .records
-            .iter()
-            .all(|record| !record.record_name.trim().is_empty()),
-        "Missing membership source identity"
-    );
+    let _validated = ValidatedChangesPage::parse(response.clone(), zone)?;
     let records = response
         .pointer("/zones/0/records")
         .context("Missing membership records")?
@@ -364,10 +429,6 @@ impl PhotoAlbum {
             )?;
             zone.check_continuation(&mut visited)?;
             for record in &zone.records {
-                anyhow::ensure!(
-                    !record.record_name.trim().is_empty(),
-                    "Missing source validation record identity"
-                );
                 visit(record);
             }
             anyhow::ensure!(
@@ -416,6 +477,7 @@ impl PhotoAlbum {
             let mut buffer = DeltaRecordBuffer::new();
             let mut current_token = initial_token;
             let mut raw_records_observed = false;
+            let mut accepted = Vec::new();
             let mut visited = FxHashSet::from_iter([current_token.clone()]);
             let shadow_error = |error| {
                 super::super::error::classify_shadow_page_error(error, shadow_capture.is_some())
@@ -432,8 +494,12 @@ impl PhotoAlbum {
                     let _ = token_tx.send(current_token);
                     return;
                 }
-                let body =
-                    build_changes_zone_request(&zone_id, Some(&current_token), 200).to_string();
+                let body = build_changes_zone_request(
+                    &zone_id,
+                    Some(&current_token),
+                    CHANGES_REPLAY_PAGE_SIZE,
+                )
+                .to_string();
                 tracing::debug!(target: "kei::icloud::photos::album",
                     album = %album_name,
                     "changes/zone request"
@@ -455,7 +521,15 @@ impl PhotoAlbum {
                         &retry_config,
                     ) => match result {
                         Ok(body) => body,
-                        Err(error) => break Some(error),
+                        Err(error) => {
+                            let refusal = match ChangesBodyRejection::from_shadow_error(&error) {
+                                Some(ChangesBodyRejection::TooLarge) => ReplayRefusal::OversizedBody,
+                                Some(ChangesBodyRejection::Malformed) => ReplayRefusal::MalformedJson,
+                                Some(ChangesBodyRejection::DuplicateKeys) => ReplayRefusal::DuplicateJsonKeys,
+                                None => break Some(error),
+                            };
+                            break Some(refusal.into_shadow_error());
+                        }
                     },
                 };
 
@@ -465,31 +539,39 @@ impl PhotoAlbum {
                 };
                 let zone_result = match ValidatedChangesPage::parse(response, &zone_id) {
                     Ok(page) => page,
-                    Err(error) => break Some(shadow_error(error)),
+                    Err(error) => {
+                        // Even an empty accepted page adds to visited.
+                        break Some(
+                            match classify_replay_page_refusal(&error, visited.len() > 1) {
+                                Some(refusal) => refusal.into_shadow_error(),
+                                None => shadow_error(error),
+                            },
+                        );
+                    }
                 };
-                if let Err(error) = zone_result.check_continuation(&mut visited) {
-                    break Some(shadow_error(error));
+                if let Err(refusal) = zone_result.check_continuation(&mut visited) {
+                    break Some(refusal.into_shadow_error());
                 }
 
                 // Unknown record types can disappear during pairing. Observe
                 // the validated raw page, not the resulting ChangeEvents.
                 raw_records_observed |= !zone_result.records.is_empty();
                 if let Some((capture, database)) = &shadow_capture {
-                    let page = capture
-                        .scope(database, &zone_result.zone_scope)
-                        .and_then(|scope| {
-                            zone_result.observed_page(raw_body, scope, &current_token)
-                        });
-                    let page = match page {
-                        Ok(page) => page,
+                    let scope = match capture.scope(database, &zone_result.zone_scope) {
+                        Ok(scope) => scope,
                         Err(error) => break Some(shadow_error(error)),
                     };
                     if tx.is_closed() {
                         let _ = token_tx.send(current_token);
                         return;
                     }
-                    if let Err(error) = capture.capture(page).await {
-                        break Some(shadow_error(error));
+                    let page = zone_result.observed_page(raw_body, scope, &current_token);
+                    match capture.capture(page).await {
+                        Ok(Some(id)) if zone_result.more_coming => {
+                            accepted.push(id);
+                        }
+                        Ok(_) => {}
+                        Err(error) => break Some(shadow_error(error)),
                     }
                 }
 
@@ -534,7 +616,7 @@ impl PhotoAlbum {
             }
 
             if let Some(e) = stream_error {
-                let _ = tx.send(Err(e)).await;
+                let _ = tx.send(Err(AcceptedReplay::attach(e, accepted))).await;
             } else if !tx.is_closed() {
                 let _ = completion_tx.send(raw_records_observed);
             }
@@ -583,7 +665,8 @@ mod tests {
         assert!(completion.await.is_err());
     }
 
-    use super::{CancellationToken, FxHashSet, ProviderRecordId, Value};
+    use super::{CancellationToken, FxHashSet, ProviderRecordId, ReplayRefusal, Value};
+    use crate::icloud::photos::error::{bridge_error_reason, saved_cursor_rejected};
     use crate::icloud::photos::session::PhotosSession;
     use std::sync::{Arc, Mutex};
     #[tokio::test]
@@ -744,12 +827,51 @@ mod tests {
             page["zones"][0]["records"] = records;
             bad_pages.push(page);
         }
-        for (key, value) in [
-            ("zoneName", "private-wrong-zone"),
-            ("ownerRecordName", "private-wrong-owner"),
+        for record in [
+            json!(42),
+            json!(["private-positional-record", "CPLAsset", null, true]),
+            json!({"recordName": "private-asset", "deleted": "private-invalid-type"}),
+            json!({"recordType": "FutureProviderType"}),
+            json!({"recordName": "", "recordType": "FutureProviderType"}),
+            json!({"recordName": " \t", "recordType": "CPLAsset", "deleted": true}),
+            json!({"recordName": null, "recordType": "CPLAsset", "deleted": true}),
         ] {
             let mut page = valid.clone();
-            page["zones"][0]["zoneID"][key] = json!(value);
+            page["zones"][0]["records"]
+                .as_array_mut()
+                .unwrap()
+                .push(record);
+            bad_pages.push(page);
+        }
+        let invalid_records_cases = bad_pages.len();
+        let mut missing_flag = valid.clone();
+        missing_flag["zones"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("moreComing");
+        bad_pages.push(missing_flag);
+        for flag in [Value::Null, json!(42), json!("private-false")] {
+            let mut page = valid.clone();
+            page["zones"][0]["moreComing"] = flag;
+            bad_pages.push(page);
+        }
+        let invalid_flag_cases = invalid_records_cases..bad_pages.len();
+        for reason in [json!(42), json!({"detail": "private-reason-detail"})] {
+            let mut page = valid.clone();
+            page["zones"][0]["reason"] = reason;
+            bad_pages.push(page);
+        }
+        let invalid_reason_cases = invalid_flag_cases.end..bad_pages.len();
+        // Foreign content cannot grant replay or saved-cursor authority.
+        for (field, malformed) in [
+            ("moreComing", Value::Null),
+            ("reason", json!(42)),
+            ("serverErrorCode", json!("FUTURE_ZONE_FAILURE")),
+            ("serverErrorCode", json!("BAD_REQUEST")),
+        ] {
+            let mut page = valid.clone();
+            page["zones"][0]["zoneID"]["ownerRecordName"] = json!("private-wrong-owner");
+            page["zones"][0][field] = malformed;
             bad_pages.push(page);
         }
         let mut missing_owner = valid.clone();
@@ -758,13 +880,78 @@ mod tests {
             .unwrap()
             .remove("ownerRecordName");
         bad_pages.push(missing_owner);
+        let owner_mismatch_cases = invalid_reason_cases.end..bad_pages.len();
+        for (field, malformed) in [
+            ("records", Value::Null),
+            ("serverErrorCode", json!("BAD_REQUEST")),
+        ] {
+            let mut wrong_zone = valid.clone();
+            wrong_zone["zones"][0]["zoneID"]["zoneName"] = json!("private-wrong-zone");
+            wrong_zone["zones"][0][field] = malformed;
+            bad_pages.push(wrong_zone);
+        }
+        let mut missing_name = valid.clone();
+        missing_name["zones"][0]["zoneID"]
+            .as_object_mut()
+            .unwrap()
+            .remove("zoneName");
+        missing_name["zones"][0]["serverErrorCode"] = json!("BAD_REQUEST");
+        bad_pages.push(missing_name);
+        for name in [Value::Null, json!(" "), json!(42)] {
+            let mut page = valid.clone();
+            page["zones"][0]["zoneID"]["zoneName"] = name;
+            bad_pages.push(page);
+        }
+        let name_mismatch_cases = owner_mismatch_cases.end..bad_pages.len();
+        let mut missing_identity = valid.clone();
+        missing_identity["zones"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("zoneID");
+        missing_identity["zones"][0]["serverErrorCode"] = json!("BAD_REQUEST");
+        bad_pages.push(missing_identity);
+        for identity in [Value::Null, json!("private-malformed-zone"), json!([])] {
+            let mut page = valid.clone();
+            page["zones"][0]["zoneID"] = identity;
+            bad_pages.push(page);
+        }
+        for entry in [
+            Value::Null,
+            json!("private-malformed-zone-entry"),
+            json!([]),
+        ] {
+            bad_pages.push(json!({"zones": [entry]}));
+        }
+        let invalid_identity_cases = name_mismatch_cases.end..bad_pages.len();
+        let empty_zones_case = bad_pages.len();
+        bad_pages.push(json!({
+            "zones": [], "syncToken": "private-unscoped-successor", "moreComing": false
+        }));
+        let multiple_zones_case = bad_pages.len();
         let mut extra_zone = valid.clone();
         extra_zone["zones"]
             .as_array_mut()
             .unwrap()
             .push(valid["zones"][0].clone());
         bad_pages.push(extra_zone);
-        bad_pages.push(json!({"zones": []}));
+        bad_pages.extend([
+            json!({"zones": null, "syncToken": "private-unscoped-successor"}),
+            json!({}),
+            json!({"zones": {"zoneName": "private-non-array"}}),
+            Value::Null,
+            json!([{"zones": []}]),
+            json!("private-non-object-response"),
+        ]);
+        let invalid_zones_cases = multiple_zones_case + 1..bad_pages.len();
+        for scope in [
+            json!({"zoneName": "private-wrong-record-zone"}),
+            json!({"zoneName": "PrimarySync", "ownerRecordName": "private-wrong-record-owner"}),
+        ] {
+            let mut page = valid.clone();
+            page["zones"][0]["records"][1]["zoneID"] = scope;
+            bad_pages.push(page);
+        }
+        let record_scope_cases = invalid_zones_cases.end..bad_pages.len();
         let mut record_error = valid.clone();
         record_error["zones"][0]["records"]
             .as_array_mut()
@@ -795,6 +982,67 @@ mod tests {
                 accepted_bad_pages.push(index);
             }
             for error in items.into_iter().filter_map(Result::err) {
+                if index < invalid_records_cases {
+                    assert!(matches!(
+                        ReplayRefusal::from_shadow_error(&error),
+                        Some(ReplayRefusal::InvalidRecords)
+                    ));
+                    assert!(!saved_cursor_rejected(&error));
+                } else if invalid_flag_cases.contains(&index) {
+                    assert!(matches!(
+                        ReplayRefusal::from_shadow_error(&error),
+                        Some(ReplayRefusal::InvalidContinuationFlag)
+                    ));
+                    assert!(!saved_cursor_rejected(&error));
+                } else if invalid_reason_cases.contains(&index) {
+                    assert!(matches!(
+                        ReplayRefusal::from_shadow_error(&error),
+                        Some(ReplayRefusal::InvalidReason)
+                    ));
+                    assert!(!saved_cursor_rejected(&error));
+                } else if owner_mismatch_cases.contains(&index) {
+                    assert!(matches!(
+                        ReplayRefusal::from_shadow_error(&error),
+                        Some(ReplayRefusal::ZoneOwnerMismatch)
+                    ));
+                    assert!(!saved_cursor_rejected(&error));
+                } else if name_mismatch_cases.contains(&index) {
+                    assert!(matches!(
+                        ReplayRefusal::from_shadow_error(&error),
+                        Some(ReplayRefusal::ZoneNameMismatch)
+                    ));
+                    assert!(!saved_cursor_rejected(&error));
+                } else if invalid_identity_cases.contains(&index) {
+                    assert!(matches!(
+                        ReplayRefusal::from_shadow_error(&error),
+                        Some(ReplayRefusal::InvalidZoneIdentity)
+                    ));
+                    assert!(!saved_cursor_rejected(&error));
+                } else if index == empty_zones_case {
+                    assert!(matches!(
+                        ReplayRefusal::from_shadow_error(&error),
+                        Some(ReplayRefusal::EmptyZoneResults)
+                    ));
+                    assert!(!saved_cursor_rejected(&error));
+                } else if index == multiple_zones_case {
+                    assert!(matches!(
+                        ReplayRefusal::from_shadow_error(&error),
+                        Some(ReplayRefusal::MultipleZoneResults)
+                    ));
+                    assert!(!saved_cursor_rejected(&error));
+                } else if invalid_zones_cases.contains(&index) {
+                    assert!(matches!(
+                        ReplayRefusal::from_shadow_error(&error),
+                        Some(ReplayRefusal::InvalidZonesField)
+                    ));
+                    assert!(!saved_cursor_rejected(&error));
+                } else if record_scope_cases.contains(&index) {
+                    assert!(matches!(
+                        ReplayRefusal::from_shadow_error(&error),
+                        Some(ReplayRefusal::RecordScopeMismatch)
+                    ));
+                    assert!(!saved_cursor_rejected(&error));
+                }
                 let diagnostic = format!("{error:#}");
                 assert!(
                     !diagnostic.contains("private-"),
@@ -806,6 +1054,94 @@ mod tests {
             accepted_bad_pages.is_empty(),
             "accepted malformed cases: {accepted_bad_pages:?}"
         );
+    }
+
+    #[test]
+    fn stored_page_scope_mismatch_is_not_a_live_replay_refusal() {
+        let valid = canned_changes_page(&[], "next", false);
+        let scope = json!({"zone": valid["zones"][0]["zoneID"].clone()}).to_string();
+        let assert_not_live = |page: Value| {
+            let error =
+                super::catalog_observed_page(serde_json::to_vec(&page).unwrap(), &scope, "saved")
+                    .unwrap_err();
+            assert!(error.is::<super::ZoneScopeMismatch>());
+            let error = crate::icloud::photos::error::classify_shadow_page_error(error, true);
+            assert!(ReplayRefusal::from_shadow_error(&error).is_none());
+            assert!(!format!("{error:#}").contains("private-foreign-scope"));
+        };
+        for (field, value) in [
+            ("zoneName", Some("private-foreign-scope")),
+            ("zoneName", None),
+            ("ownerRecordName", Some("private-foreign-scope")),
+            ("zoneID", None),
+        ] {
+            let mut page = valid.clone();
+            let entry = &mut page["zones"][0];
+            let fields = if field == "zoneID" {
+                entry.as_object_mut().unwrap()
+            } else {
+                entry["zoneID"].as_object_mut().unwrap()
+            };
+            if let Some(value) = value {
+                fields.insert(field.to_owned(), json!(value));
+            } else {
+                fields.remove(field);
+            }
+            assert_not_live(page);
+        }
+        assert_not_live(json!({"zones": []}));
+        assert_not_live(json!({"zones": null}));
+        assert_not_live(json!({"zones": [null]}));
+        assert_not_live(json!({}));
+        assert_not_live(Value::Null);
+        let entry = &valid["zones"][0];
+        assert_not_live(json!({"zones": [entry, entry]}));
+        assert_not_live(canned_changes_page(
+            &[json!({"recordName": "record", "zoneID": {"zoneName": "private-foreign-scope"}})],
+            "next",
+            false,
+        ));
+    }
+
+    #[test]
+    fn returned_owner_is_optional_for_an_ownerless_request_but_must_be_valid_if_present() {
+        let requested_zone = json!({"zoneName": "PrimarySync"});
+        let mut page = canned_changes_page(&[], "next", false);
+        assert!(super::ValidatedChangesPage::parse(page.clone(), &requested_zone).is_ok());
+        page["zones"][0]["zoneID"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ownerRecordName");
+        assert!(super::ValidatedChangesPage::parse(page.clone(), &requested_zone).is_ok());
+
+        // A malformed owner cannot let BAD_REQUEST expire the saved cursor.
+        page["zones"][0]["serverErrorCode"] = json!("BAD_REQUEST");
+        for owner in [Value::Null, json!(""), json!(" \t"), json!(42), json!({})] {
+            page["zones"][0]["zoneID"]["ownerRecordName"] = owner;
+            let error = super::ValidatedChangesPage::parse(page.clone(), &requested_zone)
+                .err()
+                .expect("malformed owner must reject the response");
+            assert!(matches!(
+                error.downcast_ref::<super::ZoneScopeMismatch>(),
+                Some(super::ZoneScopeMismatch::InvalidIdentity)
+            ));
+        }
+    }
+
+    #[test]
+    fn stored_page_missing_record_identity_is_not_a_live_replay_refusal() {
+        let page = canned_changes_page(
+            &[json!({"recordName": " \t", "deleted": true})],
+            "next",
+            false,
+        );
+        let scope = json!({"zone": page["zones"][0]["zoneID"].clone()}).to_string();
+        let error =
+            super::catalog_observed_page(serde_json::to_vec(&page).unwrap(), &scope, "saved")
+                .unwrap_err();
+        assert!(error.is::<super::MissingRecordIdentity>());
+        let error = crate::icloud::photos::error::classify_shadow_page_error(error, true);
+        assert!(ReplayRefusal::from_shadow_error(&error).is_none());
     }
 
     #[tokio::test]
@@ -833,18 +1169,23 @@ mod tests {
     async fn normal_changes_accepts_terminal_unchanged_token_and_unknown_records() {
         use tokio_stream::StreamExt;
 
-        for records in [
-            vec![],
-            vec![json!({
-                "recordName": "unknown-record", "recordType": "FutureProviderType", "fields": {"unknown": 1}
-            })],
+        for (records, reason) in [
+            (vec![], None),
+            (vec![], Some(Value::Null)),
+            (
+                vec![json!({
+                    "recordName": "unknown-record", "recordType": "FutureProviderType",
+                    "zoneID": {"zoneName": "PrimarySync"},
+                    "fields": {"reference": {"value": {"zoneID": {"zoneName": "OtherZone"}}}}
+                })],
+                Some(json!("private-reason-text")),
+            ),
         ] {
-            let album = make_album_with_session(
-                100,
-                Box::new(
-                    MockPhotosSession::new().ok(canned_changes_page(&records, "saved", false)),
-                ),
-            );
+            let mut page = canned_changes_page(&records, "saved", false);
+            if let Some(reason) = reason {
+                page["zones"][0]["reason"] = reason;
+            }
+            let album = make_album_with_session(100, Box::new(MockPhotosSession::new().ok(page)));
             let (stream, token_rx) = album.changes_stream("saved");
             let items: Vec<_> = stream.collect().await;
             assert!(items.iter().all(Result::is_ok));
@@ -1077,12 +1418,205 @@ mod tests {
         assert_eq!(&*events[0].record_name, "master-1");
         assert_eq!(&*events[1].record_name, "master-2");
         assert_eq!(errors.len(), 1, "should have exactly one error from page 3");
+        assert!(matches!(
+            ReplayRefusal::from_shadow_error(&errors[0]),
+            Some(ReplayRefusal::RejectedContinuation)
+        ));
+        assert!(!saved_cursor_rejected(&errors[0]));
+        assert_eq!(bridge_error_reason(&errors[0]), "continuation_rejected");
 
         let token = token_rx.await.expect("oneshot should not be dropped");
         assert_eq!(
             token, "token-page2",
             "should preserve last-good token from page 2, not initial or error page"
         );
+    }
+
+    #[tokio::test]
+    async fn scoped_replay_refusals_are_not_saved_cursor_expiry() {
+        use tokio_stream::StreamExt;
+
+        for (code, reason, after_empty_page) in [
+            ("BAD_REQUEST", "continuation_rejected", true),
+            ("ZONE_NOT_FOUND", "zone_not_found", true),
+            ("ZONE_NOT_FOUND", "zone_not_found", false),
+            ("RETRY_LATER", "retry_later", true),
+            ("RETRY_LATER", "retry_later", false),
+            ("SERVER_INTERNAL_ERROR", "server_error", true),
+            ("SERVER_INTERNAL_ERROR", "server_error", false),
+            ("THROTTLED", "throttled", true),
+            ("THROTTLED", "throttled", false),
+            ("FUTURE_ZONE_FAILURE", "unrecognized_zone_error", true),
+            ("FUTURE_ZONE_FAILURE", "unrecognized_zone_error", false),
+        ] {
+            let mut mock = MockPhotosSession::new();
+            if after_empty_page {
+                mock = mock.ok(canned_changes_page(&[], "continuation", true));
+            }
+            let mock = mock.ok(json!({"zones": [{
+                "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                "serverErrorCode": code,
+                "reason": {"detail": "private-provider-detail"}
+            }]}));
+            let album = make_album_with_session(100, Box::new(mock));
+            let (mut stream, _last_token, completion) =
+                album.changes_stream_with_completion("saved");
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert!(ReplayRefusal::from_shadow_error(&error).is_some(), "{code}");
+            assert_eq!(bridge_error_reason(&error), reason);
+            assert!(!saved_cursor_rejected(&error), "{code}");
+            assert!(completion.await.is_err(), "{code}");
+            let diagnostic = format!("{error:#}");
+            assert!(!diagnostic.contains(code));
+            assert!(!diagnostic.contains("private-provider-detail"));
+        }
+    }
+
+    #[tokio::test]
+    async fn unchanged_terminal_cursor_is_valid_but_repeated_continuation_is_refused() {
+        use tokio_stream::StreamExt;
+
+        for more_coming in [false, true] {
+            let records = if more_coming {
+                vec![
+                    json!({"recordName": "rejected-delete", "recordType": "CPLAsset", "deleted": true}),
+                ]
+            } else {
+                Vec::new()
+            };
+            let mock =
+                MockPhotosSession::new().ok(canned_changes_page(&records, "saved", more_coming));
+            let album = make_album_with_session(100, Box::new(mock));
+            let (mut stream, token, completion) = album.changes_stream_with_completion("saved");
+            if more_coming {
+                let error = stream.next().await.unwrap().unwrap_err();
+                assert!(matches!(
+                    ReplayRefusal::from_shadow_error(&error),
+                    Some(ReplayRefusal::RepeatedContinuation)
+                ));
+                assert!(!saved_cursor_rejected(&error));
+            }
+            assert!(stream.next().await.is_none());
+            assert_eq!(token.await.unwrap(), "saved");
+            assert_eq!(completion.await.ok(), (!more_coming).then_some(false));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_wide_errors_keep_transport_retry_classification() {
+        use crate::icloud::photos::session::CloudKitServerError;
+        use crate::retry::RetryConfig;
+        use tokio_stream::StreamExt;
+
+        let max_retries = RetryConfig::default().max_retries;
+        for (code, retries, after_empty_page) in [
+            ("RETRY_LATER", max_retries, true),
+            ("RETRY_LATER", max_retries, false),
+            ("THROTTLED", max_retries, true),
+            ("THROTTLED", max_retries, false),
+            ("SERVER_INTERNAL_ERROR", 0, true),
+            ("SERVER_INTERNAL_ERROR", 0, false),
+            ("ZONE_NOT_FOUND", 0, false),
+            ("FUTURE_ZONE_FAILURE", 0, true),
+            ("FUTURE_ZONE_FAILURE", 0, false),
+        ] {
+            let mut mock = MockPhotosSession::new();
+            if after_empty_page {
+                mock = mock.ok(canned_changes_page(&[], "continuation", true));
+            }
+            for attempt in 0..=retries {
+                mock = mock.ok(json!({"serverErrorCode": code, "reason": attempt.to_string()}));
+            }
+            // This would succeed if the transport retried one time too many.
+            let mock = mock.ok(canned_changes_page(&[], "unexpected", false));
+            let album = make_album_with_session(100, Box::new(mock));
+            let (mut stream, _last_token, completion) =
+                album.changes_stream_with_completion("saved");
+            let error = stream.next().await.unwrap().unwrap_err();
+            let server_error = error.downcast_ref::<CloudKitServerError>().unwrap();
+            assert_eq!(server_error.code.as_ref(), code);
+            assert_eq!(
+                server_error.retryable,
+                matches!(code, "RETRY_LATER" | "THROTTLED")
+            );
+            assert_eq!(server_error.service_not_activated, code == "ZONE_NOT_FOUND");
+            assert_eq!(server_error.reason.parse::<u32>().unwrap(), retries);
+            assert!(ReplayRefusal::from_shadow_error(&error).is_none());
+            assert!(completion.await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn http_503_after_an_accepted_page_stays_a_transport_error() {
+        assert_http_replay_error(503, "SERVER_INTERNAL_ERROR", Some("continuation")).await;
+        assert_http_replay_error(503, "FUTURE_ZONE_FAILURE", Some("continuation")).await;
+    }
+
+    #[tokio::test]
+    async fn http_503_on_first_replay_stays_a_transport_error() {
+        assert_http_replay_error(503, "SERVER_INTERNAL_ERROR", None).await;
+    }
+
+    #[tokio::test]
+    async fn http_429_after_an_accepted_page_stays_a_transport_error() {
+        assert_http_replay_error(429, "THROTTLED", Some("continuation")).await;
+    }
+
+    #[tokio::test]
+    async fn http_429_on_first_replay_stays_a_transport_error() {
+        assert_http_replay_error(429, "THROTTLED", None).await;
+    }
+
+    async fn assert_http_replay_error(status: u16, code: &str, continuation: Option<&str>) {
+        use crate::icloud::photos::session::HttpStatusError;
+        use crate::retry::RetryConfig;
+        use std::time::Duration;
+        use tokio_stream::StreamExt;
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        if let Some(cursor) = continuation {
+            let accepted = canned_changes_page(&[], cursor, true);
+            Mock::given(method("POST"))
+                .and(path("/changes/zone"))
+                .and(body_string_contains(r#""syncToken":"saved""#))
+                .respond_with(ResponseTemplate::new(200).set_body_json(accepted))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let cursor = continuation.unwrap_or("saved");
+        let refused = json!({"zones": [{
+            "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+            "serverErrorCode": code
+        }]});
+        Mock::given(method("POST"))
+            .and(path("/changes/zone"))
+            .and(body_string_contains(format!(r#""syncToken":"{cursor}""#)))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("Retry-After", "5")
+                    .set_body_json(refused),
+            )
+            .expect(3)
+            .mount(&server)
+            .await;
+        let mut album = make_album_with_session(100, Box::new(reqwest::Client::new()));
+        album.service_endpoint = Arc::from(server.uri());
+        album.retry_config = RetryConfig {
+            max_retries: 2,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let (mut stream, _last_token, completion) = album.changes_stream_with_completion("saved");
+        let error = stream.next().await.unwrap().unwrap_err();
+        let http = error.downcast_ref::<HttpStatusError>().unwrap();
+        assert_eq!(http.status, status);
+        assert_eq!(http.retry_after, Some(Duration::from_secs(5)));
+        assert!(ReplayRefusal::from_shadow_error(&error).is_none());
+        assert!(completion.await.is_err());
+        server.verify().await;
     }
 
     #[tokio::test]
@@ -1155,6 +1689,7 @@ mod tests {
         let sync_err = err
             .downcast_ref::<SyncTokenError>()
             .expect("error should downcast to SyncTokenError");
+        assert!(saved_cursor_rejected(&err));
 
         match sync_err {
             SyncTokenError::InvalidToken { reason } => {

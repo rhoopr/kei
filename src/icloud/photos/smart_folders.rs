@@ -42,6 +42,29 @@ pub(crate) fn sensitive_smart_folder_names() -> impl Iterator<Item = &'static st
         .map(|(name, _)| name)
 }
 
+fn favorites() -> FolderDef {
+    FolderDef {
+        obj_type: "CPLAssetInSmartAlbumByAssetDate:Favorite",
+        list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
+        query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "FAVORITE"))),
+        is_sensitive: false,
+    }
+}
+
+/// Limit direct membership confirmation to the exact built-in same-zone query.
+pub(crate) fn is_favorites_selection(scope: &Value) -> bool {
+    let definition = favorites();
+    scope["name"] == "Favorites"
+        && scope["list_type"] == definition.list_type
+        && scope["obj_type"] == definition.obj_type
+        && scope.get("query_filter") == definition.query_filter.as_deref()
+        && scope.get("container_id").is_some_and(Value::is_null)
+        && scope
+            .get("cross_zone_sources")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+}
+
 pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
     vec![
         (
@@ -80,15 +103,7 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
                 is_sensitive: false,
             },
         ),
-        (
-            "Favorites",
-            FolderDef {
-                obj_type: "CPLAssetInSmartAlbumByAssetDate:Favorite",
-                list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
-                query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "FAVORITE"))),
-                is_sensitive: false,
-            },
-        ),
+        ("Favorites", favorites()),
         (
             "Panoramas",
             FolderDef {

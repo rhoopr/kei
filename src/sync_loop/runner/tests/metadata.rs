@@ -5189,11 +5189,12 @@ async fn exercise_legacy_child_cycles_with_provenance(
                     AmbiguousChildFault::PreserveMissingDelta
                         | AmbiguousChildFault::PreserveBlankDelta
                 ) {
-                    let error = format!("{:#}", result.unwrap_err());
-                    assert!(
-                        error.contains("Invalid changes/zone page shape")
-                            || error == "Missing changes/zone successor",
-                        "{error}"
+                    let result = result.unwrap();
+                    assert_eq!(result.failed_count, 1, "{result:?}");
+                    assert!(!result.can_advance_database_checkpoint(), "{result:?}");
+                    assert_eq!(
+                        result.stats.sync_token_blocked_reason,
+                        Some("icloud_changes_missing_successor")
                     );
                     let reopened = state::SqliteStateDb::open(&database).await.unwrap();
                     assert_eq!(

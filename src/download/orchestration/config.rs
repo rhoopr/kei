@@ -463,6 +463,16 @@ pub(crate) enum IndexingWindow {
     ReplayedTo(String),
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum InventoryCheckpointPolicy {
+    #[default]
+    Ordinary,
+    /// A complete standalone inventory can establish authority for its selection.
+    Baseline,
+    /// Reuse the already completed inventory if the saved cursor is rejected.
+    RetainedBridge,
+}
+
 /// Subset of application config consumed by the download engine.
 /// Decoupled from CLI parsing so the engine can be tested independently.
 #[derive(Clone)]
@@ -472,6 +482,7 @@ pub(crate) struct DownloadConfig {
     pub(crate) post_sync_metadata: bool,
     /// One upgrade-requested inventory guarded by retained-cursor replay.
     pub(crate) inventory_reconciliation: bool,
+    pub(crate) inventory_checkpoint: InventoryCheckpointPolicy,
     /// A due sparse source in another selected zone needs a fresh membership scan.
     pub(crate) sparse_membership_due: bool,
     pub(crate) sparse_targets: Arc<[crate::download::sparse_target::SelectedSparseTarget]>,
@@ -712,6 +723,7 @@ impl DownloadConfig {
         use rustc_hash::FxHashSet;
         Self {
             inventory_reconciliation: false,
+            inventory_checkpoint: InventoryCheckpointPolicy::Ordinary,
             post_sync_metadata: false,
             directory: Arc::from(Path::new("/nonexistent/download_filter_tests")),
             folder_structure: "{:%Y/%m/%d}".to_string(),

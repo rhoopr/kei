@@ -804,12 +804,15 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
             &shared_session,
             &CancellationToken::new(),
         )
-        .await;
+        .await
+        .unwrap();
+        assert_eq!(result.db_sync_token_advance_safe, advance);
         if bridge.is_empty() {
-            let error = result.expect_err("blank bridge successor must remain a provider refusal");
-            assert!(format!("{error:#}").contains("Missing changes/zone successor"));
-        } else {
-            assert_eq!(result.unwrap().db_sync_token_advance_safe, advance);
+            assert_eq!(result.failed_count, 1);
+            assert_eq!(
+                result.stats.sync_token_blocked_reason,
+                Some("icloud_changes_missing_successor")
+            );
         }
         // Provider calls prove bridge reachability: cycle 0 never completes
         // its inventory cursor, cycle 3 has no inventory at all and replays
@@ -910,19 +913,16 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
         "{}",
         cycles[1]
     );
-    // Strict source parsing returns an error before bridge/combined completion
-    // diagnostics. Initial query coverage is still visible, never reported as
-    // a completed source replay. The durable hold is checked above.
-    assert!(
-        !cycles[1]["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|diagnostic| {
-                diagnostic["kind"] == "support_pass_completion_v1"
-                    && (diagnostic["fields"]["component"] == "combined"
-                        || diagnostic["fields"]["completed_delta_replay"] == true)
-            })
+    // The refused bridge contributes neither a successor nor replay completion.
+    assert_eq!(
+        component(1, "delta_bridge")["completed_delta_replay"],
+        false
+    );
+    assert_eq!(component(1, "delta_bridge")["token_present"], false);
+    assert_eq!(component(1, "combined")["sync_token_blocked"], true);
+    assert_eq!(
+        component(1, "combined")["sync_token_blocked_reason"],
+        "icloud_changes_missing_successor"
     );
     assert_eq!(component(2, "delta_bridge")["token_present"], true);
     assert_eq!(component(2, "combined")["sync_token_blocked"], false);

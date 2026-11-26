@@ -517,10 +517,12 @@ silly-rename mechanism or physical NAS behavior.
 ## Strict changes/zone pages
 
 `normal_changes_rejects_entire_malformed_page_before_emission` exercises missing,
-null and non-array records, zone cardinality and owner scope, mixed nested record
-errors, and unusable tokens. Continuation-cycle and valid empty/unknown-record
-controls run beside it. Both incremental consumer strategies reject a malformed
-later page containing downloadable work through their production entry point.
+null and non-array `records`, non-object and undecodable entries, zone cardinality
+and owner scope, mixed record errors, unusable tokens, and invalid `moreComing`
+and `reason`.
+Continuation-cycle and valid empty/unknown-record controls run beside it. Both
+incremental consumer strategies reject a malformed later page containing
+downloadable work through their production entry point.
 The earlier valid page downloads once through streaming; collecting leaves it
 replayable. Neither strategy downloads records from the rejected page.
 
@@ -529,8 +531,8 @@ seeds file-backed SQLite with a checkpoint, downloaded media and pending retry
 work. It rejects a later wrongly scoped page, reopens the database between cycles,
 checks a quiet provider delta and the watch local-work bypass, resolves the retry
 with explicit provider deletion evidence, then checks an unchanged cycle. Existing
-media bytes remain intact and no cycle publishes another file. The synthetic
-fallback cannot provide authoritative completion during the malformed cycle.
+media bytes remain intact and no cycle publishes another file. The refusal holds
+the saved checkpoint without starting an inventory.
 
 `run_cycle_rejected_page_replays_downloads_exactly_once_across_restart` runs both
 strategies with a bundled JPEG served by a local HTTP fixture. It seeds a real
@@ -759,7 +761,87 @@ The durable-container fixture starts from ordinary native publication, persists 
 
 `cargo test --lib pending_peer_progresses_during_partial_failure_without_extra_same_cycle_attempts` exercises ordinary incremental dispatch with a missing recorded pending destination and an unrelated new transfer failure. The pending peer completes during the failing cycle; the failed source transfer recovers after reopen, followed by two quiet reopened cycles. The fixture checks exact media GET counts, bytes and pending/failed/completed rows. Authentication, interruption, state-write, checkpoint, identity, enumeration and unmatched-count controls retain pending work without HTTP transfers. Composed results preserve retry exclusions.
 
+`missing_zone_successor_preserves_retry_and_allows_later_library_download` checks a blank replay successor against file-backed state. The first library keeps its cursor, exact failed-transfer row, and historical media and sidecar. The later library publishes verified bytes and advances its own cursor. Two SQLite reopens keep the database pre-check held without repeat downloads.
+
+The `continuation_preserves_retry_and_allows_later_library_download` tests repeat that proof after an accepted page for missing cursors, rejected cursors, `ZONE_NOT_FOUND`, scoped `RETRY_LATER`, scoped `SERVER_INTERNAL_ERROR`, and scoped `THROTTLED`. Capture keeps the accepted page and refuses the next page without applying its tombstone. A session failure at the same point stops the later library. `streaming_refused_continuation_keeps_publication_and_storage_evidence` covers the same refusals with an earlier file already in the pipeline, with and without a blocked destination. The `continuation_cannot_promote_configuration_inventory` cases check that a complete scan cannot replace the active cursor or config hash after a refused continuation during the bridge.
+
+`response_wide_errors_keep_transport_retry_classification` checks that response-wide `RETRY_LATER` and `THROTTLED` still exhaust the transport retry budget. Response-wide `SERVER_INTERNAL_ERROR` and unrecognized codes remain nonretryable transport errors. The HTTP 429 and 503 controls check that retries still end in an HTTP error even when the response body contains a refusal for the requested zone.
+
+The `first_replay_preserves_retry_and_allows_later_library_download` tests check scoped `ZONE_NOT_FOUND`, `THROTTLED`, `RETRY_LATER`, and `SERVER_INTERNAL_ERROR` on the saved cursor, before any page is captured. They require zero inventory requests for the held zone. The missing-zone case also verifies that a tombstone in the refused response does not mark the media deleted. The configuration bridge controls check that a completed scan cannot replace the cursor. Tests cover response-wide errors and HTTP 429 and 503 on the first request too.
+
+`repeated_or_cyclic_continuation_preserves_retry_and_allows_later_library_download` covers a cursor repeating itself or cycling back to the saved cursor. Only the accepted page is captured, the refused tombstone is ignored, and the affected zone makes no fallback inventory requests. The healthy library downloads once and checkpoints across SQLite reopens. The adapter control distinguishes a repeated continuation from a valid unchanged terminal cursor.
+
+`record_error_on_continuation_preserves_retry_and_allows_later_library_download` covers a record error next to a valid tombstone on the same page. The affected zone keeps its saved cursor, accepted page, and retry row without capturing the refused page, applying the tombstone, or scanning. The healthy library publishes once and checkpoints. The configuration bridge control checks that a record error also prevents promotion after a completed inventory.
+
+`invalid_records_on_continuation_preserves_retry_and_allows_later_library_download` covers missing `records` and a tombstone object where an array is required. Across two SQLite reopens, only the accepted page is captured, the affected cursor and retry row stay unchanged, and the affected zone never scans. The healthy library verifies and publishes once and saves its cursor. The configuration bridge control checks that an invalid `records` field blocks inventory promotion.
+
+`non_object_record_on_continuation_preserves_retry_and_allows_later_library_download` repeats the two-library restart check with a valid tombstone next to a non-object entry in the records array. Kei refuses the whole page, so the tombstone has no effect.
+
+`invalid_continuation_flag_preserves_retry_and_allows_later_library_download` covers an omitted `moreComing` and a string `"false"`. Both refusals leave only the accepted page in capture, hold the saved cursor and retry row across reopens, and let the healthy library download and checkpoint without a fallback scan for the affected zone.
+
+`invalid_reason_on_continuation_preserves_retry_and_allows_later_library_download` covers an object in the optional `reason` field on an otherwise valid page. Kei refuses the whole page, ignores its tombstone, and keeps the cursor and retry row without scanning. The healthy library downloads and checkpoints across reopens.
+
+`unrecognized_zone_error_on_continuation_preserves_retry_and_allows_later_library_download` covers a new error code on a validated zone response with a usable-looking successor and tombstone. Kei keeps the accepted page, saved cursor and retry row without capturing the refused page or scanning. The healthy library downloads and checkpoints. Adapter checks cover the first request, response-wide errors, and rejection of a foreign owner.
+
+`wrong_owner_on_continuation_preserves_retry_and_allows_later_library_download` returns the requested zone name with a different owner, a plausible successor, and a tombstone. Kei captures only the earlier accepted page, holds the requested zone without scanning, and lets the healthy library download and save its cursor. The adapter rejects a foreign first-request `BAD_REQUEST` without treating it as saved-cursor expiry. A stored-page owner mismatch remains a separate failure.
+
+`wrong_zone_on_continuation_preserves_retry_and_allows_later_library_download` returns the healthy library's zone name in reply to the affected library's continuation request. Neither library captures or applies that page. The requested library keeps its cursor and retry row without scanning, and the healthy library downloads once and checkpoints from its own response.
+
+`missing_zone_name_on_continuation_preserves_retry_and_allows_later_library_download` omits `zoneName` from the continuation's `zoneID` object. Kei rejects the page without capturing it, using its tombstone, or scanning. The requested library keeps its saved cursor and retry row across reopens, and the healthy library still downloads and checkpoints.
+
+`missing_zone_id_on_continuation_preserves_retry_and_allows_later_library_download` omits `zoneID` from the continuation itself. The accepted page, saved cursor, and retry row survive reopens without capturing the refused page or scanning. The healthy library downloads once and checkpoints. The adapter also rejects null and non-object IDs.
+
+`empty_zones_on_continuation_preserves_retry_and_allows_later_library_download` returns `{"zones":[]}` after an accepted page. No empty continuation is captured, the requesting library keeps its cursor and retry row without a fallback scan, and the healthy library downloads once and checkpoints. A valid scoped page with an empty `records` array is still accepted.
+
+`multiple_zones_on_continuation_preserves_retry_and_allows_later_library_download` returns entries for both selected libraries in response to one library's continuation request. Neither entry is captured or applied. The requesting library keeps its cursor and retry row without scanning, and the healthy library downloads and checkpoints from its own response.
+
+`null_zones_on_continuation_preserves_retry_and_allows_later_library_download` returns `{"zones":null}` after an accepted page. Kei keeps the requesting library's cursor and retry row without capturing the response or scanning. The healthy library downloads once and checkpoints. The adapter also rejects omitted and other non-array `zones` fields.
+
+`null_zone_entry_on_continuation_preserves_retry_and_allows_later_library_download` returns `{"zones":[null]}` after an accepted page. The requesting library keeps its cursor and retry row without capturing the response or scanning. The healthy library downloads and checkpoints from its own response.
+
+`null_response_on_continuation_preserves_retry_and_allows_later_library_download` returns JSON `null` after an accepted page. The requesting library keeps its cursor and retry row across reopens without capturing `null` or scanning. The healthy library downloads once and checkpoints. The adapter also rejects other non-object JSON values.
+
+`malformed_json_on_http_continuation_preserves_retry_and_allows_later_library_download` serves truncated JSON over HTTP 200 after an accepted page. The requesting library keeps its saved cursor, accepted page, and retry row without capturing the malformed response or scanning. The healthy library downloads and checkpoints from its own response.
+
+`duplicate_json_keys_on_http_continuation_preserve_retry_and_allow_later_library_download` serves two `zoneName` keys over HTTP 200 after an accepted page. Neither value gives the response authority. The requesting library keeps its cursor and retry row without capture or scanning, and the healthy library downloads and checkpoints from its own response.
+
+`oversized_body_on_http_continuation_preserves_retry_and_allows_later_library_download` serves valid JSON one byte over the 16 MiB limit after an accepted page. Kei stops before parsing or capture, keeps the cursor and retry row without scanning, and lets the healthy library download and checkpoint. The transport tests also exercise the cap on chunked responses without a declared length.
+
+`foreign_record_zone_on_continuation_preserves_retry_and_allows_later_library_download` returns a correctly scoped page containing one local tombstone and one from the healthy library. Neither record is captured or applied. The requesting library keeps its cursor and retry row without a scan, while the healthy library downloads and checkpoints from its own response.
+
+`blank_record_name_on_continuation_preserves_retry_and_allows_later_library_download` puts a whitespace-only record name after a valid tombstone on the same page. Kei rejects both records before capture or application, keeps the requesting library's cursor and retry row without a scan, and lets the healthy library download and checkpoint.
+
+`malformed_owner_on_ownerless_continuation_is_scoped_before_capture` omits the request owner at the live replay adapter and returns a whitespace-only owner in the continuation. Only the earlier page is captured, and the saved cursor and retry row stay unchanged. Writable sync still requires an authenticated request owner. `malformed_owner_on_continuation_preserves_retry_and_allows_later_library_download` covers that writable path: a malformed response holds the requesting library without a fallback scan while the other library downloads and checkpoints.
+
+`downloads_accepted_page_media_and_healthy_library_after_continuation_refusal` serves distinct photos for two libraries. A rejected continuation holds the affected library's cursor and retry row without a scan. Both files verify, the healthy library checkpoints, and reopening twice does not fetch either file again. `continuation_refusal_does_not_publish_an_asset_changed_after_capture` changes the accepted asset's size in the paired lookup. Kei leaves that file unwritten while the healthy library still finishes.
+
+`refused_continuation_cannot_authorize_optional_writes` changes a previously downloaded photo's caption and capture date on an accepted page. Embedded writing, sidecar writing, metadata refresh, timestamp replacement and truncated-file repair each get a fresh peer on the same page. Each run downloads the peer once with its original bytes and no sidecar. Two reopens preserve the existing media and sidecar bytes and mtimes, destination receipt, retry row and saved cursor without downloading the peer again.
+
+`refused_continuation_recovers_interrupted_media_receipt_after_reopen` interrupts SQLite finalization after the new photo reaches disk. The next run completes the receipt from the published file. Across two reopens there is no second GET, the file's mtime stays unchanged, and neither the library cursor nor the database checkpoint can advance.
+
+The `named_album_photo_` cases send a photo and its album link on the accepted page. The current lookup returns the same link, a tombstone, or a link to another container. Only the matching link allows a verified file in the named album. All three cases preserve the saved cursor and exact retry row, advance the healthy library, start no rescan, and fetch no duplicate files on two SQLite reopens.
+
+`retained_named_album_link_requires_current_membership_when_accepted_page_omits_it` captures an opaque album link in an earlier page, then leaves the historical response body unreadable. On a later replay the accepted page contains only the photo and master. One exact lookup of all three records saves the album copy only if the link still matches. An omitted link or one pointing to another album leaves a durable retry. Two SQLite reopens check bytes, no duplicate download, no rescan, the unchanged cursor and earlier retry row, and healthy-library progress.
+
+`accepted_favorite_requires_explicit_current_smart_folder_membership` selects the built-in Favorites folder. The accepted child is marked favorite, but the lookup independently returns `1`, omits the flag, returns `0`, or returns `2`. Only `1` saves verified bytes in Favorites. The other replies leave a durable retry. Two SQLite reopens check no repeat download, no rescan, unchanged prior retry and checkpoints, and healthy-library progress.
+
+`mixed_favorites_unfiled_replay_checks_each_destination_independently` runs Favorites and unfiled in both orders and with colliding folder templates. A confirmed favorite gets two distinct verified destinations. A nonfavorite gets only the unfiled copy. A fresh malformed favorite flag leaves a Favorites retry while the unfiled copy succeeds. Two reopens check that neither file downloads again.
+
+`foreign_album_replay_requires_current_link_and_exact_bound_media` captures a live relation without media records. It requires the current relation and explicit owner-zone item absence before looking up the exact pair in the bound media zone. An omitted link, omitted owner item, live owner-zone namesake, omitted foreign master, or wrong media scope leaves a durable retry and no file. The valid case verifies the album file and its media-zone ownership. Two SQLite reopens check the frozen binding, no repeat download, no rescan, a held checkpoint, and healthy-library progress.
+
+`mixed_albums_save_verified_photo_and_defer_unresolved_peer_after_continuation_refusal` selects two albums and unfiled in the same library. The first album's link is removed at lookup. Its photo stays retryable without an album or unfiled download. The second album's verified photo downloads once. The affected cursor and prior retry row remain unchanged on two reopens, and the healthy library still checkpoints.
+
+`overlapping_albums_each_require_a_current_link_after_continuation_refusal` selects the same photo in two albums. With two current links, both paths get their own verified file and receipt. When the second link is removed, only the first file is saved. Neither case rescans, changes the held cursor or prior retry row, or fetches another copy after two reopens.
+
+`mixed_unfiled_requires_a_confirmed_removal_after_continuation_refusal` selects unfiled and one named album. The accepted page contains the photo and an exact album-link tombstone. Returning that tombstone in the fresh lookup saves one verified unfiled copy; omitting it leaves a durable retry without a file. Neither case starts a rescan or advances the affected cursor, and two reopens preserve the result.
+
+`mixed_unfiled_with_two_albums_requires_both_current_removals` requires both exact tombstones in the lookup. Omitting either one keeps the photo retryable across two reopens without writing a file. When both verify, kei downloads one copy to unfiled. The saved cursor and earlier retry row remain unchanged, no rescan runs, and the healthy library still checkpoints.
+
+`accepted_child_without_master_requires_the_exact_current_pair` captures a child without its master. One fresh lookup of the exact child and referenced master can qualify a download. An omitted master or a changed child leaves a durable retry without a file. The fixture checks both reopens, the held cursor, no rescan, and healthy-library progress.
+
 `cargo test --lib fresh_start_ -- --test-threads=1` checks the schema-38 fresh-start boundary. The production-cycle fixture starts with existing media and sidecar bytes, completed peers and a failed transfer, then damages historical planning payloads and sparse identity evidence. It checks that retirement preserves historical bytes, starts a full enumeration, keeps a current transfer failure checkpoint-blocking, and completes the retry without downloading completed peers again. A separate process reopens the same database for two quiet cycles. Other controls cover transaction rollback, retirement before old payload compaction and recovery of an interrupted primary publication. The ignored restart worker is invoked by its parent test.
+
+`cargo test --lib current_debt::` also checks baselines on already-current schema state. A current unresolved lookup holds the first scan. A later complete scan can commit without replaying the old plan even when it is due. The fixture checks rollback when writing the new authority fails, preservation of existing media and historical evidence, and two quiet SQLite reopens without another lookup or download.
 
 Provider-inbox upgrade tests seed historical alias rows with uninterpretable certificate bytes and check exact preservation of the alias, original observation hash and representative body. Current raw capture must succeed, reuse equivalent observations at zero spare capacity through two reopens, and still reject corrupted current bytes. The retired alias reader and compaction algorithm have no execution tests. Other upgrade fixtures check full inboxes, oversized historical projections and inconsistent dependencies. Current capacity and catalog-refusal telemetry retain production-path coverage.
 
@@ -1505,11 +1587,11 @@ existing files and current-child receipts remain populated. The source-arrival
 control uses account-bound shadow capture and independent mutable provider
 state, then asserts actual retained source observations after valid replay.
 Historical policy-excluded transfers retain their attempt/error receipts.
-`retained_checkpoint_reopened_hold_preserves_actual_failed_transfer_history`
-independently seeds a failed transfer after the first hold and proves exact row
-preservation on deferred/exhausted reopen. Ordinary active transfer preparation
-keeps its existing retry-reset behavior. Malformed/unsupported receipt controls
-prove zero provider requests while retaining the original raw evidence;
+`retained_checkpoint_previously_exhausted_recovers_with_current_retry_intact`
+seeds a failed transfer and a receipt at the old cap. It proves the deadline
+survives reopen, a due attempt can commit the successor, and two quiet cycles
+leave the exact failed row and installed files unchanged. Malformed/unsupported
+receipt controls permit current inventory while retaining the original evidence;
 `retained_checkpoint_hold_round_trip_and_version_one_migration` checks receipt
 serialization and the default attempt count for existing version-one receipts.
 
@@ -1518,7 +1600,8 @@ serialization and the default attempt count for existing version-one receipts.
 | #897: eligibility drift, legacy preservation, sparse/unresolved identity with permanent retained rejection and valid fresh inventory | `retained_checkpoint_expiry_holds_all_trigger_classes_and_quiet_reopen` covers all three triggers, complete fresh anchors, unchanged historical state and redacted holds. |
 | #897: reopen, original owners/dates/bytes and retry/deletion uncertainty, independent scan-time changes | The trigger matrix checks exact SQLite rows and media after reopen; `retained_checkpoint_provider_change_during_scan_remains_replayable_then_is_durable` injects source changes independently after the first snapshot; `retained_checkpoint_expiry_controls_never_promote_or_clear_debt` injects durable sparse work through a separate connection. |
 | #897: cancellation, partial inventory, state-write failure, stale staging/promotion | `retained_checkpoint_expiry_controls_never_promote_or_clear_debt` covers incomplete/cancelled inventory, hold insertion failure, stale plans and independent cursor/config mutations. `retained_checkpoint_due_retry_write_failure_prevents_every_provider_request` and `retained_checkpoint_due_interrupted_inventory_consumes_attempt_without_promotion` cover reserved retries. `retained_checkpoint_metadata_fence_rolls_back_stale_plans` proves transactional rollback; `retained_checkpoint_candidate_changed_at_promotion_preserves_concurrent_state` fences the staged value itself; mixed-pass checkpoint-write controls prove atomic configuration activation. |
-| #897: bounded eventual recovery or truthful unresolved hold and quiet cycles | The permanent matrix spends attempts 1/2/3 then proves zero provider work after exhausted reopen even with a past deadline. `retained_checkpoint_hold_valid_old_replay_recovers_then_two_quiet_reopens` supplies valid original-boundary replay and proves atomic successor/config promotion followed by two unchanged cycles. This proves retained replay recovery, not permanent-expiry rebootstrap. |
+| #897: paced retries, recovery and quiet cycles | The trigger matrix verifies a fourth attempt when due and no repeated work before its deadline. `retained_checkpoint_previously_exhausted_recovers_with_current_retry_intact` proves recovery and quiet reopens from a receipt at the old cap. These tests do not assert recovery of historical deletion facts. |
+| Configuration drift with initial cursor rejection | `rejected_config_drift_cursor_promotes_fresh_inventory_atomically` checks one inventory, an injected failure during aggregate promotion, exact staged-cursor reuse after reopen, preserved retry rows and media, and two quiet incremental cycles. |
 | #897: existing bridge/fallback and unaffected-zone progress | Existing `run_cycle_enum_config_drift_atomically_promotes_bridged_checkpoint` and ordinary invalid-token fallback controls remain. `retained_checkpoint_held_zone_does_not_block_clean_zone_or_clear_aggregate_hold` proves independent progress and truthful aggregate state without clearing held debt. |
 | #924: valid unfiled delta plus Hidden refresh, exact successor, atomic hash promotion and quiet reopen | `mixed_valid_delta_hidden_refresh_promotes_inventory_bridge_then_quiet_reopen` uses actual pass definitions; `mixed_valid_delta_hidden_refresh_clears_retained_identity_marker_without_extra_replay` pins mixed-pass classification. |
 | #924: distinguish expiry, valid delta, missing successor, failed smart refresh, cancellation and state-write failure | `retained_token_fallback_distinguishes_expiry_from_missing_successor` checks typed fallback classification. `mixed_delta_hidden_refresh_preserves_vetoes_then_recovers_after_reopen` checks five vetoes and staged-successor recovery. Existing `incremental_sync_skips_smaller_metadata_rewritten_file` checks ordinary collecting provenance; model composition tests reject query-token substitution. |

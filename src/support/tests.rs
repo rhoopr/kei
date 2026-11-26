@@ -196,12 +196,32 @@ fn owning_checkpoint_decisions_survive_support_allowlist_without_tokens() {
             fields
         );
     }
-    assert_eq!(
-        super::privacy::stats(
-            &serde_json::json!({"sync_token_blocked_reason":"inventory_delta_bridge_failed"})
-        )["sync_token_blocked_reason"],
-        "inventory_delta_bridge_failed"
-    );
+    for reason in [
+        "inventory_delta_bridge_failed",
+        "icloud_changes_invalid_records",
+        "icloud_changes_invalid_continuation_flag",
+        "icloud_changes_invalid_reason",
+        "icloud_changes_unrecognized_zone_error",
+        "icloud_changes_oversized_body",
+        "icloud_changes_malformed_json",
+        "icloud_changes_duplicate_json_keys",
+        "icloud_changes_invalid_zones_field",
+        "icloud_changes_empty_zone_results",
+        "icloud_changes_multiple_zone_results",
+        "icloud_changes_invalid_zone_identity",
+        "icloud_changes_zone_name_mismatch",
+        "icloud_changes_zone_owner_mismatch",
+        "icloud_changes_record_scope_mismatch",
+        "icloud_changes_server_internal_error",
+        "icloud_changes_zone_throttled",
+    ] {
+        let stats = super::privacy::stats(&json!({"sync_token_blocked_reason":reason}));
+        assert_eq!(stats["sync_token_blocked_reason"], reason);
+    }
+    assert!(!privacy::fixed_label(
+        "icloud_changes_private_provider_response"
+    ));
+    assert!(!privacy::fixed_label("duplicate_json_keys"));
 }
 
 #[test]
@@ -368,10 +388,80 @@ fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
 
 #[test]
 fn bridge_history_rejects_arbitrary_error_text() {
-    let fields =
-        json!({"outcome":"failed", "reason":"PRIVATE provider response", "token":"PRIVATE"});
-    let safe = privacy::diagnostic("support_delta_bridge_v1", fields.as_object().unwrap()).unwrap();
-    assert_eq!(serde_json::Value::Object(safe), json!({"outcome":"failed"}));
+    for (reason, expected) in [
+        (
+            "invalid_records",
+            json!({"outcome":"failed", "reason":"invalid_records"}),
+        ),
+        (
+            "invalid_continuation_flag",
+            json!({"outcome":"failed", "reason":"invalid_continuation_flag"}),
+        ),
+        (
+            "invalid_reason",
+            json!({"outcome":"failed", "reason":"invalid_reason"}),
+        ),
+        (
+            "unrecognized_zone_error",
+            json!({"outcome":"failed", "reason":"unrecognized_zone_error"}),
+        ),
+        (
+            "oversized_body",
+            json!({"outcome":"failed", "reason":"oversized_body"}),
+        ),
+        (
+            "malformed_json",
+            json!({"outcome":"failed", "reason":"malformed_json"}),
+        ),
+        (
+            "duplicate_json_keys",
+            json!({"outcome":"failed", "reason":"duplicate_json_keys"}),
+        ),
+        (
+            "invalid_zones_field",
+            json!({"outcome":"failed", "reason":"invalid_zones_field"}),
+        ),
+        (
+            "empty_zone_results",
+            json!({"outcome":"failed", "reason":"empty_zone_results"}),
+        ),
+        (
+            "multiple_zone_results",
+            json!({"outcome":"failed", "reason":"multiple_zone_results"}),
+        ),
+        (
+            "invalid_zone_identity",
+            json!({"outcome":"failed", "reason":"invalid_zone_identity"}),
+        ),
+        (
+            "zone_name_mismatch",
+            json!({"outcome":"failed", "reason":"zone_name_mismatch"}),
+        ),
+        (
+            "zone_owner_mismatch",
+            json!({"outcome":"failed", "reason":"zone_owner_mismatch"}),
+        ),
+        (
+            "record_scope_mismatch",
+            json!({"outcome":"failed", "reason":"record_scope_mismatch"}),
+        ),
+        (
+            "server_error",
+            json!({"outcome":"failed", "reason":"server_error"}),
+        ),
+        (
+            "throttled",
+            json!({"outcome":"failed", "reason":"throttled"}),
+        ),
+        ("server_internal_error", json!({"outcome":"failed"})),
+        ("zone_throttled", json!({"outcome":"failed"})),
+        ("PRIVATE provider response", json!({"outcome":"failed"})),
+    ] {
+        let fields = json!({"outcome":"failed", "reason":reason, "token":"PRIVATE"});
+        let safe =
+            privacy::diagnostic("support_delta_bridge_v1", fields.as_object().unwrap()).unwrap();
+        assert_eq!(serde_json::Value::Object(safe), expected);
+    }
 }
 
 #[test]

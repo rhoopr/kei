@@ -472,6 +472,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         Arc::new(download::DownloadConfig {
             post_sync_metadata,
             inventory_reconciliation: false,
+            inventory_checkpoint: Default::default(),
             directory: Arc::clone(&cfg_directory),
             folder_structure: config.download.folder_structure.clone(),
             folder_structure_albums: Arc::clone(&cfg_folder_structure_albums),

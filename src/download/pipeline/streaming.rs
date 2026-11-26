@@ -117,6 +117,35 @@ where
         + Send
         + 'static,
 {
+    stream_selection_observations(
+        download_client,
+        combined.map(|result| result.map(|asset| (asset, None))),
+        config,
+        controls,
+        total,
+        shutdown_token,
+        runtime,
+    )
+    .await
+}
+
+pub(in crate::download) type SelectionObservation = (
+    crate::icloud::photos::PhotoAsset,
+    Option<crate::icloud::photos::CurrentCatalogAsset>,
+);
+
+pub(in crate::download) async fn stream_selection_observations<S>(
+    download_client: &Client,
+    combined: S,
+    config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
+    total: u64,
+    shutdown_token: CancellationToken,
+    runtime: StreamRuntime,
+) -> Result<StreamingResult>
+where
+    S: futures_util::Stream<Item = anyhow::Result<SelectionObservation>> + Send + 'static,
+{
     let reporting = controls.reporting;
 
     // When the caller passes a `shared_pb`, they own its lifecycle (we only
@@ -165,7 +194,7 @@ where
     let identity_config = Arc::clone(config);
     let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
     let combined = combined.map(move |result| {
-        result.map(|asset| {
+        result.map(|(asset, proof)| {
             let library = asset.source_zone().unwrap_or(default_library.as_ref());
             let state_record_name = if !matches!(
                 is_asset_filtered(&asset, identity_config.as_ref()),
@@ -179,7 +208,7 @@ where
             } else {
                 identity_download_ctx.select_existing_asset_state_record_name(library, &asset)
             };
-            asset.with_state_record_name(state_record_name)
+            (asset.with_state_record_name(state_record_name), proof)
         })
     });
 
@@ -197,7 +226,7 @@ where
                 break;
             }
             match result {
-                Ok(asset) => {
+                Ok((asset, _proof)) => {
                     if is_asset_filtered(&asset, config.as_ref()).is_some() {
                         continue;
                     }
@@ -296,7 +325,7 @@ where
                 break;
             }
             match result {
-                Ok(asset) => {
+                Ok((asset, _proof)) => {
                     let plan = match task_planner.plan_download_asset(&asset, config).await {
                         Ok(plan) => plan,
                         Err(error) if config.primary_layout_preview => {

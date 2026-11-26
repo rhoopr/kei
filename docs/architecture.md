@@ -34,7 +34,9 @@ For each asset, kei reads the retry deadline and any retained selection decision
 
 Replay scheduling looks for due work, then validates the decisions in the selected window before advancing its replay cursor. An empty search does not prove checkpoint readiness: the checkpoint debt check still validates the scope. The download producer loads path reservations and receipts on its first asset, so empty album streams can finish without building a path planner.
 
-A standalone full inventory checks retained debt at dispatch before returning a checkpoint or completed-scan marker. Inventory also checks debt earlier when a membership deletion or an incremental replay can act on its result before dispatch finishes.
+A standalone full inventory that establishes a zone's baseline checks work from the current selection, not older plans for that selection. Its generation and zone cursor commit together. Retained path ownership and prepared publication still protect local files. Incremental refreshes and inventories that require a retained-cursor bridge keep their existing coverage checks.
+
+If a continuation is refused, Kei can still save newly verified media from accepted pages in a standalone unfiled pass or in eligible named albums within a mixed selection. Each named album needs fresh proof of its own link. Neither publication nor membership proof advances the held cursor.
 
 After indexing finishes, a quiet zone change feed can establish coverage across disagreeing album query tokens. Qualification retains the trusted cursor for replay. See [checkpoint decisions and enumeration](architecture/checkpoints.md).
 
@@ -46,7 +48,9 @@ Ordinary sync commits eligible provider checkpoints before draining the local me
 
 ## Data-safety invariants
 
-Keep the previous checkpoint on incomplete token proof, interruption, stale planning, or non-durable recovery. Unknown provider identity keeps work pending. A verified local copy does not prove that the provider deleted its source.
+Keep publication, current work and checkpoint decisions separate. A hold on the checkpoint does not stop independently verified downloads. An item failure keeps that item retryable; it does not stop unrelated work unless the failure makes that work unsafe too.
+
+Keep the previous checkpoint on incomplete token proof, interruption, stale planning, or non-durable recovery. A validated full inventory can replace older planning for the selection it covers. Historical uncertainty alone does not require repair before current progress. Unknown **current** provider identity keeps work pending. A missing observation or verified local copy does not prove that the provider deleted its source.
 
 Unknown indexing readiness before enumeration defers the affected library after two short retries. An unknown closing probe holds its checkpoint immediately. Independent libraries can advance their own checkpoints. Watch mode retries incomplete discovery before publishing a library map. See [checkpoint decisions and enumeration](architecture/checkpoints.md).
 
@@ -74,7 +78,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs`, `src/download/pipeline.rs` | Replacement requires exact path and fingerprint authorization from explicit fingerprint-confirmed or truncated repair, the per-copy local replacement policy, or a journaled managed-layout handover with independent preservation evidence. Timestamp-based authorization also guards the observed local mtime through publication. A no-replace collision succeeds only when the verified `.part` and destination bytes are identical. Different or unverifiable bytes retain retry evidence and cannot reach metadata writes or downloaded finalization. |
 | `TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP` | `src/download/orchestration/cleanup.rs`, `src/download/pipeline.rs`, `src/fs_util.rs`, `src/state/db.rs` | Orphan cleanup deletes only an exact stale path claimed in durable state. It retains verified filesystem handles through removal and never follows a directory or file symlink. Normal completion and graceful interruption retire the claim. |
 | `SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE` | `src/sync_cycle.rs` | The database pre-check token advances only after a successful non-dry-run cycle with a current pass plan. |
-| `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/orchestration/` | A zone checkpoint needs complete source coverage. A lookup that can retry from its retained child/master pair may advance with the zone; it still blocks one-shot success and the database pre-check. |
+| `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/orchestration/` | A zone checkpoint needs complete current source coverage and durable recovery for unfinished current work. A validated baseline supersedes obsolete plans, not physical recovery records. A lookup that can retry from its retained child/master pair may advance with the zone; it still blocks one-shot success and the database pre-check. |
 | `MALFORMED_REQUIRED_ASSET_FIELDS_BLOCK_CHECKPOINT` | `src/icloud/photos/asset.rs`, `src/icloud/photos/album/fetch.rs`, `src/icloud/photos/album/lookup.rs`, `src/download/orchestration/incremental.rs`, `src/sync_cycle.rs` | A live asset with a missing or invalid required identity or capture date blocks its zone checkpoint before filtering or path planning. |
 | `UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING` | `src/download/retry.rs` | Inconclusive provider identity retains the pending row and records verification evidence. |
 | `POLICY_EXCLUDED_REQUIRES_EXPLICIT_SOURCE_DELETION` | `src/download/retry.rs`, `src/state/db.rs` | Policy-excluded rows become source-deleted only after targeted provider deletion evidence. Present or inconclusive responses retain them outside actionable pending work. |

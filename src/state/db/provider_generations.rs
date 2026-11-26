@@ -16,7 +16,10 @@ use sha2::{Digest, Sha256};
 use super::asset_writes::upsert_asset_row;
 use super::contracts::PreservedLocal;
 use super::membership::refresh_asset_album_groupings_tx;
-use super::provider_selection::{SelectionDecision, SelectionDestination, SelectionOutcome};
+use super::provider_inbox::{CapturedPageId, load_page};
+use super::provider_selection::{
+    SelectionDecision, SelectionDestination, SelectionMediaSource, SelectionOutcome,
+};
 use super::rows::{decode_asset_date, encode_asset_date};
 use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
@@ -32,6 +35,11 @@ pub(crate) use writer_output::WriterKey;
 // Limit one generation evidence write; retained history never spends this allowance.
 pub(crate) const MAX_GENERATION_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const INDEPENDENT_ALBUM_COPIES: &str = "independent_album_copies";
+const ACCEPTED_REPLAY_COVERAGE: &str = "accepted_unfiled_replay";
+const ACCEPTED_ALBUM_REPLAY_COVERAGE: &str = "accepted_named_album_replay";
+const ACCEPTED_FAVORITES_REPLAY_COVERAGE: &str = "accepted_favorites_replay";
+const MIXED_FAVORITES_REPLAY: &str = "accepted_favorites_unfiled_replay";
+const ACCEPTED_FOREIGN_REPLAY_COVERAGE: &str = "accepted_foreign_album_replay";
 const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 // Original serialized inputs per validation operation, not an allocator or disk bound.
 const MAX_VALIDATION_BYTES: usize = 512 * 1024 * 1024;
@@ -464,6 +472,182 @@ pub(crate) struct GenerationSpec {
     pub(crate) metadata_flags: u16,
 }
 
+impl GenerationSpec {
+    pub(crate) fn is_accepted_replay(&self) -> bool {
+        matches!(
+            self.profile.get("coverage").and_then(Value::as_str),
+            Some(
+                ACCEPTED_REPLAY_COVERAGE
+                    | ACCEPTED_ALBUM_REPLAY_COVERAGE
+                    | ACCEPTED_FAVORITES_REPLAY_COVERAGE
+                    | MIXED_FAVORITES_REPLAY
+                    | ACCEPTED_FOREIGN_REPLAY_COVERAGE
+            )
+        )
+    }
+
+    pub(crate) fn mixed_favorites_replay(&self) -> bool {
+        self.profile.get("coverage").and_then(Value::as_str) == Some(MIXED_FAVORITES_REPLAY)
+    }
+
+    pub(crate) fn is_accepted_favorites(&self, key: &str) -> bool {
+        self.is_accepted_replay()
+            && pass_from_profile(&self.profile, key).is_some_and(is_replay_favorites_pass)
+    }
+
+    pub(crate) fn accepted_foreign_replay(&self, key: &str) -> Option<SelectionMediaSource> {
+        if self.profile.get("coverage").and_then(Value::as_str)
+            != Some(ACCEPTED_FOREIGN_REPLAY_COVERAGE)
+        {
+            return None;
+        }
+        foreign_album_source(pass_from_profile(&self.profile, key)?)
+    }
+
+    pub(crate) fn accepted_album_container(&self, key: &str) -> Option<&str> {
+        if self.profile.get("coverage").and_then(Value::as_str)
+            != Some(ACCEPTED_ALBUM_REPLAY_COVERAGE)
+        {
+            return None;
+        }
+        accepted_album_container(pass_from_profile(&self.profile, key)?)
+    }
+
+    pub(crate) fn accepted_album_requirement(
+        &self,
+        key: &str,
+    ) -> Option<(Vec<&str>, crate::icloud::photos::ReplayAlbumLink)> {
+        use crate::icloud::photos::ReplayAlbumLink;
+        if !self.is_accepted_replay() {
+            return None;
+        }
+        if self.accepted_foreign_replay(key).is_some() {
+            let container = pass_from_profile(&self.profile, key)?
+                .pointer("/scope/container_id")?
+                .as_str()?;
+            return Some((vec![container], ReplayAlbumLink::Foreign));
+        }
+        if let Some(container) = self.accepted_album_container(key) {
+            return Some((vec![container], ReplayAlbumLink::Live));
+        }
+        if !is_replay_unfiled_pass(pass_from_profile(&self.profile, key)?) {
+            return None;
+        }
+        mixed_unfiled_albums(self.profile.get("passes")?.as_array()?)
+            .map(|containers| (containers, ReplayAlbumLink::Removed))
+    }
+}
+
+pub(crate) fn accepted_replay_coverage(profile: &Value) -> Option<&'static str> {
+    if !has_no_replay_excludes(profile) {
+        return None;
+    }
+    let passes = profile.get("passes")?.as_array()?;
+    passes
+        .iter()
+        .find_map(|pass| replay_pass_coverage(pass, passes))
+}
+
+pub(crate) fn accepted_replay_pass(profile: &Value, key: &str) -> bool {
+    profile
+        .get("passes")
+        .and_then(Value::as_array)
+        .zip(pass_from_profile(profile, key))
+        .is_some_and(|(passes, pass)| replay_pass_coverage(pass, passes).is_some())
+}
+
+fn replay_pass_coverage(pass: &Value, passes: &[Value]) -> Option<&'static str> {
+    if let [a, b] = passes
+        && ((is_replay_favorites_pass(a) && is_replay_unfiled_pass(b))
+            || (is_replay_favorites_pass(b) && is_replay_unfiled_pass(a)))
+    {
+        return Some(MIXED_FAVORITES_REPLAY);
+    }
+    if accepted_album_container(pass).is_some() {
+        return Some(ACCEPTED_ALBUM_REPLAY_COVERAGE);
+    }
+    if passes.len() == 1 && foreign_album_source(pass).is_some() {
+        return Some(ACCEPTED_FOREIGN_REPLAY_COVERAGE);
+    }
+    if passes.len() == 1 && is_replay_favorites_pass(pass) {
+        return Some(ACCEPTED_FAVORITES_REPLAY_COVERAGE);
+    }
+    if !is_replay_unfiled_pass(pass) {
+        return None;
+    }
+    if passes.len() == 1 {
+        return Some(ACCEPTED_REPLAY_COVERAGE);
+    }
+    mixed_unfiled_albums(passes).map(|_| ACCEPTED_ALBUM_REPLAY_COVERAGE)
+}
+
+fn is_replay_favorites_pass(pass: &Value) -> bool {
+    pass.get("kind").and_then(Value::as_str) == Some("SmartFolder")
+        && has_no_replay_excludes(pass)
+        && pass
+            .get("scope")
+            .is_some_and(crate::icloud::photos::smart_folders::is_favorites_selection)
+}
+
+fn is_replay_unfiled_pass(pass: &Value) -> bool {
+    pass.get("kind").and_then(Value::as_str) == Some("Unfiled")
+        && has_no_replay_excludes(pass)
+        && pass
+            .get("scope")
+            .is_some_and(crate::icloud::photos::is_library_wide_selection)
+}
+
+// Every selected named album must be covered. Smart folders do not contribute
+// exclusions. Keep the complete check within one targeted lookup.
+fn mixed_unfiled_albums(passes: &[Value]) -> Option<Vec<&str>> {
+    let mut albums = passes
+        .iter()
+        .filter(|pass| pass.get("kind").and_then(Value::as_str) == Some("Album"))
+        .map(accepted_album_container)
+        .collect::<Option<Vec<_>>>()?;
+    albums.sort_unstable();
+    albums.dedup();
+    (1..=crate::icloud::photos::REPLAY_ALBUM_LINK_LIMIT)
+        .contains(&albums.len())
+        .then_some(albums)
+}
+
+fn has_no_replay_excludes(profile: &Value) -> bool {
+    profile
+        .get("excludes")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+}
+
+fn accepted_album_container(pass: &Value) -> Option<&str> {
+    let scope = pass.get("scope")?;
+    let container = scope.get("container_id")?.as_str()?;
+    (pass.get("kind").and_then(Value::as_str) == Some("Album")
+        && has_no_replay_excludes(pass)
+        && scope.get("cross_zone_sources")?.as_array()?.is_empty()
+        && crate::icloud::photos::selected_album_name(scope).is_some())
+    .then_some(container)
+}
+
+fn foreign_album_source(pass: &Value) -> Option<SelectionMediaSource> {
+    let scope = pass.get("scope")?;
+    let [source] = pass.get("media_sources")?.as_array()?.as_slice() else {
+        return None;
+    };
+    let [declared] = scope.get("cross_zone_sources")?.as_array()?.as_slice() else {
+        return None;
+    };
+    if pass["kind"] != "Album"
+        || !has_no_replay_excludes(pass)
+        || source.get("zone") != declared.get("zone")
+        || source.pointer("/zone/zoneName") == scope.pointer("/zone/zoneName")
+    {
+        return None;
+    }
+    crate::icloud::photos::selected_album_name(scope)?;
+    serde_json::from_value(source.clone()).ok()
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ActiveGeneration {
     pub(crate) id: String,
@@ -666,6 +850,13 @@ fn validate_media_source(
     root: &ActiveGeneration,
     manifest: &ActiveDecision,
 ) -> Result<(), StateError> {
+    if let Some(binding) = root
+        .spec
+        .accepted_foreign_replay(&manifest.decision.pass_key)
+        && manifest.decision.media_source.as_ref() != Some(&binding)
+    {
+        return invalid();
+    }
     let Some(source) = &manifest.decision.media_source else {
         return Ok(());
     };
@@ -880,7 +1071,9 @@ fn validate_spec(spec: &GenerationSpec) -> Result<(), StateError> {
         || [&spec.config_hash, &spec.basis]
             .iter()
             .any(|v| v.len() != 64 || !v.bytes().all(|b| b.is_ascii_hexdigit()))
-        || spec.profile.get("coverage").and_then(Value::as_str) != Some("observed_selection_window")
+        || !(spec.is_accepted_replay()
+            || spec.profile.get("coverage").and_then(Value::as_str)
+                == Some("observed_selection_window"))
         || spec
             .profile
             .get(INDEPENDENT_ALBUM_COPIES)
@@ -908,6 +1101,13 @@ fn validate_spec(spec: &GenerationSpec) -> Result<(), StateError> {
         .filter_map(|p| p.get("key").and_then(Value::as_str))
         .collect();
     if keys.len() != passes.len() {
+        return invalid();
+    }
+    if spec.is_accepted_replay()
+        && (spec.metadata_enabled
+            || accepted_replay_coverage(&spec.profile)
+                != spec.profile.get("coverage").and_then(Value::as_str))
+    {
         return invalid();
     }
     Ok(())
@@ -1003,6 +1203,9 @@ fn load_generation(conn: &Connection, id: &str) -> Result<ActiveGeneration, Stat
     let spec: GenerationSpec =
         serde_json::from_slice(&bytes).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
     validate_spec(&spec)?;
+    if spec.is_accepted_replay() && sealed {
+        return invalid();
+    }
     validate_deleted_selection(conn, &spec)?;
     let metadata_enabled: bool = conn.query_row(
         "SELECT metadata_enabled FROM provider_active_generations WHERE id=?1",
@@ -1082,18 +1285,32 @@ fn validate_generation_headers(conn: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
-fn validate_scope_decisions(conn: &Connection, scope: &str) -> Result<(), StateError> {
+fn validate_scope_decisions(
+    conn: &Connection,
+    scope: &str,
+    replacement: Option<(&str, &str)>,
+) -> Result<(), StateError> {
     // Each caller holds one transaction. Check every header before trusting
     // its scope, then reuse that validated header for this generation's rows.
-    let mut generations = conn.prepare("SELECT id FROM provider_active_generations ORDER BY id")?;
+    let mut generations = conn.prepare(&format!(
+        "SELECT g.id, ({SUPERSEDED_SELECTION}) FROM provider_active_generations g ORDER BY g.id"
+    ))?;
     let mut decisions = conn.prepare(
-        "SELECT pass_key,child FROM provider_active_decisions WHERE generation=?1 ORDER BY pass_key,child",
+        "SELECT d.pass_key,d.child FROM provider_active_decisions d WHERE d.generation=?1
+         AND (NOT ?2 OR EXISTS(SELECT 1 FROM provider_active_destinations w
+             WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child
+               AND w.prepared_hash IS NOT NULL))
+         ORDER BY d.pass_key,d.child",
     )?;
     let mut roots = generations.query([])?;
     while let Some(row) = roots.next()? {
         let root = load_generation(conn, &row.get::<_, String>(0)?)?;
         if root.spec.scope == scope {
-            let mut rows = decisions.query([&root.id])?;
+            let historical = row.get::<_, bool>(1)?
+                || replacement.is_some_and(|(config, generation)| {
+                    root.spec.config_hash == config && root.id != generation
+                });
+            let mut rows = decisions.query(params![root.id, historical])?;
             while let Some(row) = rows.next()? {
                 load_decision_with_sources(
                     conn,
@@ -1255,15 +1472,15 @@ fn check_write_charge(additional: u64, capacity: u64) -> Result<(), StateError> 
 }
 
 fn pass<'a>(root: &'a ActiveGeneration, key: &str) -> Result<&'a Value, StateError> {
-    root.spec
-        .profile
-        .get("passes")
-        .and_then(Value::as_array)
-        .and_then(|p| {
-            p.iter()
-                .find(|p| p.get("key").and_then(Value::as_str) == Some(key))
-        })
-        .ok_or(StateError::ProviderSelectionInvalid)
+    pass_from_profile(&root.spec.profile, key).ok_or(StateError::ProviderSelectionInvalid)
+}
+
+fn pass_from_profile<'a>(profile: &'a Value, key: &str) -> Option<&'a Value> {
+    profile
+        .get("passes")?
+        .as_array()?
+        .iter()
+        .find(|pass| pass.get("key").and_then(Value::as_str) == Some(key))
 }
 
 #[cfg(test)]
@@ -1317,24 +1534,25 @@ fn load_rank(
         let (count, bytes) = metrics.get();
         metrics.set((count + 1, bytes + body.len()));
     });
-    let response = crate::icloud::photos::validated_selection_page(&request, &body)
-        .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+    let response = selection_source_response(root, &request, &body)?;
     let records = response
         .get("records")
         .and_then(Value::as_array)
         .ok_or(StateError::ProviderSelectionInvalid)?;
     let mut statement = conn.prepare("SELECT ordinal,record_name,record_type,deleted FROM provider_selection_rank_records WHERE page_id=?1 ORDER BY ordinal")?;
     let mut rows = statement.query([page])?;
-    let membership_container = if request.get("zones").is_some() {
-        Some(
-            pass(root, &key)?
-                .pointer("/scope/container_id")
-                .and_then(Value::as_str)
-                .ok_or(StateError::ProviderSelectionInvalid)?,
-        )
-    } else {
-        None
-    };
+    let foreign = root.spec.accepted_foreign_replay(&key).is_some();
+    let membership_container =
+        if (foreign || !root.spec.is_accepted_replay()) && request.get("zones").is_some() {
+            Some(
+                pass(root, &key)?
+                    .pointer("/scope/container_id")
+                    .and_then(Value::as_str)
+                    .ok_or(StateError::ProviderSelectionInvalid)?,
+            )
+        } else {
+            None
+        };
     let mut selected_children = Vec::with_capacity(records.len());
     let mut observed_relation = false;
     for (ordinal, record) in records.iter().enumerate() {
@@ -1360,8 +1578,25 @@ fn load_rank(
             return invalid();
         }
         let child = if let Some(container) = membership_container {
-            crate::icloud::photos::selection_membership_child(record, container, &root.spec.zone)
+            if foreign {
+                crate::icloud::photos::ReplayAlbumLink::Live.child(
+                    record,
+                    container,
+                    &root.spec.zone,
+                )
+            } else {
+                crate::icloud::photos::selection_membership_child(
+                    record,
+                    container,
+                    &root.spec.zone,
+                )
                 .map_err(|_invalid| StateError::ProviderSelectionInvalid)?
+            }
+        } else if root.spec.is_accepted_replay()
+            && (kind != Some("CPLAsset")
+                || record.get("deleted").and_then(Value::as_bool) == Some(true))
+        {
+            None
         } else {
             record.get("recordName").and_then(Value::as_str)
         };
@@ -1516,6 +1751,28 @@ fn validate_rank_request(
     key: &str,
     request: &Value,
 ) -> Result<(), StateError> {
+    if root.spec.is_accepted_replay() {
+        if !accepted_replay_pass(&root.spec.profile, key) {
+            return invalid();
+        }
+        let Some(cursor) = request
+            .pointer("/zones/0/syncToken")
+            .and_then(Value::as_str)
+            .filter(|cursor| !cursor.trim().is_empty())
+        else {
+            return invalid();
+        };
+        if request
+            != &crate::icloud::photos::queries::build_changes_zone_request(
+                &root.spec.zone,
+                Some(cursor),
+                crate::icloud::photos::queries::CHANGES_REPLAY_PAGE_SIZE,
+            )
+        {
+            return invalid();
+        }
+        return Ok(());
+    }
     let query = if key == "global-frontier" {
         serde_json::json!({"list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted","query_filter":null})
     } else {
@@ -1569,6 +1826,85 @@ fn validate_rank_request(
         return invalid();
     }
     Ok(())
+}
+
+fn selection_source_response(
+    root: &ActiveGeneration,
+    request: &Value,
+    body: &[u8],
+) -> Result<Value, StateError> {
+    let response = crate::icloud::photos::validated_selection_page(request, body)
+        .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+    if root.spec.is_accepted_replay()
+        && response
+            .pointer("/zones/0/moreComing")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return invalid();
+    }
+    Ok(response)
+}
+
+fn capture_selection_source(
+    tx: &rusqlite::Transaction<'_>,
+    root: &ActiveGeneration,
+    key: &str,
+    request: &Value,
+    body: &[u8],
+    capacity: u64,
+) -> Result<String, StateError> {
+    validate_rank_request(root, key, request)?;
+    let response = selection_source_response(root, request, body)?;
+    let generation = &root.id;
+    let request = encode(request)?;
+    let request_hash = digest(&request);
+    let body_hash = digest(body);
+    let id = digest(&encode(&(generation, key, &request_hash, &body_hash))?);
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM provider_selection_rank_pages WHERE id=?1)",
+        [&id],
+        |row| row.get(0),
+    )?;
+    if exists {
+        load_rank_proof(tx, root, &id)?;
+        return Ok(id);
+    }
+    if root.sealed {
+        return invalid();
+    }
+    let records = response
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    let has_relation = records.iter().any(|record| {
+        record.get("recordType").and_then(Value::as_str) == Some("CPLContainerRelation")
+    });
+    let indexed_bytes = records
+        .iter()
+        .map(|record| {
+            record
+                .get("recordName")
+                .and_then(Value::as_str)
+                .map_or(0, str::len)
+                + record
+                    .get("recordType")
+                    .and_then(Value::as_str)
+                    .map_or(0, str::len)
+                + id.len()
+                + 32
+        })
+        .sum::<usize>();
+    let charged = u64::try_from(
+        request.len() + body.len() + generation.len() + key.len() + id.len() + indexed_bytes + 256,
+    )
+    .map_err(|_invalid| StateError::ProviderSelectionFull)?;
+    check_write_charge(charged, capacity)?;
+    tx.execute("INSERT INTO provider_selection_rank_pages(id,generation,pass_key,request,request_hash,body,body_hash,charged_bytes,has_relation) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![id,generation,key,request,request_hash,body,body_hash,i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?,has_relation])?;
+    for (ordinal, record) in records.iter().enumerate() {
+        tx.execute("INSERT INTO provider_selection_rank_records(page_id,ordinal,record_name,record_type,deleted) VALUES(?1,?2,?3,?4,?5)",params![id,i64::try_from(ordinal).map_err(|_invalid|StateError::ProviderSelectionFull)?,record.get("recordName").and_then(Value::as_str),record.get("recordType").and_then(Value::as_str),record.get("deleted").and_then(Value::as_bool).unwrap_or(false)])?;
+    }
+    Ok(id)
 }
 
 fn outcome_name(outcome: SelectionOutcome) -> &'static str {
@@ -1661,7 +1997,7 @@ fn validate_decision_with_pages(
         {
             return invalid();
         }
-        if !verify_body {
+        if !verify_body && !root.spec.is_accepted_replay() {
             let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_selection_rank_records r JOIN provider_selection_rank_pages p ON p.id=r.page_id WHERE p.generation=?1 AND p.pass_key=?2 AND r.page_id=?3 AND r.ordinal=?4 AND r.record_name=?5 AND r.record_type IS NOT 'CPLContainerRelation')",params![root.id,decision.pass_key,source.page_id,source.ordinal,decision.child],|r|r.get(0))?;
             if valid {
                 continue;
@@ -1670,6 +2006,23 @@ fn validate_decision_with_pages(
         pages.verify_source(source, &decision.pass_key, &decision.child)?;
     }
     let photo = confirmed_decision_asset(manifest, root)?;
+    if root.spec.is_accepted_favorites(&decision.pass_key)
+        && decision.outcome == SelectionOutcome::Selected
+        && !photo
+            .as_ref()
+            .is_some_and(crate::icloud::photos::PhotoAsset::confirms_favorite_membership)
+    {
+        return invalid();
+    }
+    if root
+        .spec
+        .accepted_album_requirement(&decision.pass_key)
+        .is_some()
+        && decision.outcome == SelectionOutcome::Selected
+        && !accepted_album_proof_matches(conn, root, decision, decision.confirmation.as_deref())?
+    {
+        return invalid();
+    }
     if manifest.state_id != decision.child {
         let Some(master) = decision.master.as_deref() else {
             return invalid();
@@ -1787,13 +2140,13 @@ impl SqliteStateDb {
             let conn=&tx;
             validate_generation_headers(conn)?;
             let current=basis(conn,&scope)?;
-            let mut id:Option<String>=conn.query_row("SELECT id FROM provider_active_generations WHERE scope=?1 AND config_hash=?2 AND basis=?3 ORDER BY created_at DESC,id DESC LIMIT 1",params![scope,config_hash,current],|r|r.get(0)).optional()?;
+            let mut id:Option<String>=conn.query_row(&format!("SELECT g.id FROM provider_active_generations g WHERE {CURRENT_SELECTION_CONFIGURATION} AND NOT ({SUPERSEDED_SELECTION}) AND g.basis=?3 ORDER BY g.created_at DESC,g.id DESC LIMIT 1"),params![scope,config_hash,current],|r|r.get(0)).optional()?;
             if id.is_none() {
                 let without_deletes=dependency_basis(conn,&scope,EmptySelectionDeletes::IgnoreAppliedAssetDeletes)?;
                 // Reuse only a sealed, checkpoint-ready empty query proof.
                 // Keep its original basis and seal unchanged. Deleting an
                 // already-known asset cannot introduce membership into it.
-                id=conn.query_row("SELECT g.id FROM provider_active_generations g WHERE g.scope=?1 AND g.config_hash=?2 AND g.basis=?3 AND g.sealed=1 AND g.checkpoint_ready=1 AND NOT EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id) ORDER BY g.created_at DESC,g.id DESC LIMIT 1",params![scope,config_hash,without_deletes],|r|r.get(0)).optional()?;
+                id=conn.query_row(&format!("SELECT g.id FROM provider_active_generations g WHERE {CURRENT_SELECTION_CONFIGURATION} AND NOT ({SUPERSEDED_SELECTION}) AND g.basis=?3 AND g.sealed=1 AND g.checkpoint_ready=1 AND NOT EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id) ORDER BY g.created_at DESC,g.id DESC LIMIT 1"),params![scope,config_hash,without_deletes],|r|r.get(0)).optional()?;
             }
             let root=id.map(|id|load_generation(conn,&id)).transpose()?;
             if let Some(root)=&root && root.sealed {
@@ -1824,12 +2177,12 @@ impl SqliteStateDb {
         self.with_conn_mut("starting selection generation",move|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;validate_spec(&spec)?;validate_current_deleted_selection(&tx,&spec)?;
             if basis(&tx,&spec.scope)?!=spec.basis {return Err(StateError::ProviderWorkConflict("selection_basis_changed"))}
-            freeze_interrupted_groupings(&tx, &spec.scope)?;
+            if !spec.is_accepted_replay() { freeze_interrupted_groupings(&tx, &spec.scope)?; }
             let bytes=encode(&spec)?;let (account,provider)=owner_keys(&tx)?;
             let id=format!("{:032x}",rand::random::<u128>());
             let charged=u64::try_from(bytes.len()+id.len()+account.len()+provider.len()+spec.scope.len()+spec.config_hash.len()+spec.basis.len()+128).map_err(|_invalid|StateError::ProviderSelectionFull)?;
             check_write_charge(charged,capacity)?;
-            tx.execute("INSERT INTO provider_active_generations(id,account_key,provider_key,scope,config_hash,basis,specification,specification_hash,created_at,charged_bytes,metadata_enabled) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![id,account,provider,spec.scope,spec.config_hash,spec.basis,bytes,digest(&bytes),Utc::now().timestamp_millis(),i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?,spec.metadata_enabled])?;
+            tx.execute("INSERT INTO provider_active_generations(id,account_key,provider_key,scope,config_hash,basis,specification,specification_hash,created_at,charged_bytes,metadata_enabled) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,max(?9,coalesce((SELECT max(created_at)+1 FROM provider_active_generations WHERE scope=?4 AND config_hash=?5),?9)),?10,?11)",params![id,account,provider,spec.scope,spec.config_hash,spec.basis,bytes,digest(&bytes),Utc::now().timestamp_millis(),i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?,spec.metadata_enabled])?;
             let out=load_generation(&tx,&id)?;tx.commit()?;Ok(out)
         }).await
     }
@@ -1843,25 +2196,89 @@ impl SqliteStateDb {
         body: Vec<u8>,
         capacity: u64,
     ) -> Result<(), StateError> {
-        self.with_conn_mut("capturing scoped selection rank page",move|conn|{
-            let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
-            let root=load_generation(&tx,&generation)?;validate_rank_request(&root,&key,&request)?;
-            let response=crate::icloud::photos::validated_selection_page(&request,&body).map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
-            let request=encode(&request)?;let request_hash=digest(&request);let body_hash=digest(&body);
-            let id=digest(&encode(&(&generation,&key,&request_hash,&body_hash))?);
-            let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_selection_rank_pages WHERE id=?1)",[&id],|r|r.get(0))?;
-            if exists {load_rank_proof(&tx,&root,&id)?;tx.commit()?;return Ok(())}
-            if root.sealed {return invalid()}
-            let records=response.get("records").and_then(Value::as_array).ok_or(StateError::ProviderSelectionInvalid)?;
-            let has_relation=records.iter().any(|record|record.get("recordType").and_then(Value::as_str)==Some("CPLContainerRelation"));
-            let charged=u64::try_from(request.len()+body.len()+generation.len()+key.len()+id.len()+records.iter().map(|r|r.get("recordName").and_then(Value::as_str).map_or(0,str::len)+r.get("recordType").and_then(Value::as_str).map_or(0,str::len)+id.len()+32).sum::<usize>()+256).map_err(|_invalid|StateError::ProviderSelectionFull)?;
-            check_write_charge(charged,capacity)?;
-            tx.execute("INSERT INTO provider_selection_rank_pages(id,generation,pass_key,request,request_hash,body,body_hash,charged_bytes,has_relation) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![id,generation,key,request,request_hash,body,body_hash,i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?,has_relation])?;
-            for (ordinal,record) in records.iter().enumerate() {
-                tx.execute("INSERT INTO provider_selection_rank_records(page_id,ordinal,record_name,record_type,deleted) VALUES(?1,?2,?3,?4,?5)",params![id,i64::try_from(ordinal).map_err(|_invalid|StateError::ProviderSelectionFull)?,record.get("recordName").and_then(Value::as_str),record.get("recordType").and_then(Value::as_str),record.get("deleted").and_then(Value::as_bool).unwrap_or(false)])?;
+        self.with_conn_mut("capturing scoped selection rank page", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            account::validate_authenticated(&tx, &owner)?;
+            let root = load_generation(&tx, &generation)?;
+            if root.spec.is_accepted_replay() {
+                return invalid();
             }
-            tx.commit()?;Ok(())
-        }).await
+            capture_selection_source(&tx, &root, &key, &request, &body, capacity)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Attach only an accepted, account-owned inbox page, never synthesized records.
+    pub(crate) async fn capture_selection_replay_page(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        key: String,
+        id: CapturedPageId,
+    ) -> Result<Vec<String>, StateError> {
+        self.with_conn_mut("linking accepted replay evidence", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            account::validate_authenticated(&tx, &owner)?;
+            let root = load_generation(&tx, &generation)?;
+            if !root.spec.is_accepted_replay() {
+                return invalid();
+            }
+            if tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_finished_changes WHERE page_id=?1)",
+                [id.0],
+                |row| row.get::<_, bool>(0),
+            )? {
+                return Ok(Vec::new());
+            }
+            let source = load_page(&tx, id, MAX_CHUNK_BYTES)?;
+            let page = source.page;
+            if page.scope != root.spec.scope
+                || !page.more_coming
+                || page.request_cursor == page.successor
+                || crate::icloud::photos::catalog_observed_page(
+                    page.body.clone(),
+                    &page.scope,
+                    &page.request_cursor,
+                )
+                .map_err(|_invalid| StateError::ProviderSelectionInvalid)?
+                    != page
+            {
+                return invalid();
+            }
+            let request = crate::icloud::photos::queries::build_changes_zone_request(
+                &root.spec.zone,
+                Some(&page.request_cursor),
+                crate::icloud::photos::queries::CHANGES_REPLAY_PAGE_SIZE,
+            );
+            let rank = capture_selection_source(
+                &tx,
+                &root,
+                &key,
+                &request,
+                &page.body,
+                MAX_GENERATION_BYTES,
+            )?;
+            let children = if root.spec.accepted_foreign_replay(&key).is_some() {
+                load_rank_proof(&tx, &root, &rank)?
+                    .selected_children
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            } else {
+                page.identities
+                    .into_iter()
+                    .filter(|identity| {
+                        identity.record_type.as_deref() == Some("CPLAsset") && !identity.deleted
+                    })
+                    .map(|identity| identity.name)
+                    .collect()
+            };
+            tx.commit()?;
+            Ok(children)
+        })
+        .await
     }
 
     pub(crate) async fn selection_rank_sources(
@@ -1873,6 +2290,27 @@ impl SqliteStateDb {
     ) -> Result<Vec<RankSource>, StateError> {
         self.selection_rank_sources_with_budget(owner, generation, key, child, MAX_VALIDATION_BYTES)
             .await
+    }
+
+    pub(crate) async fn accepted_album_links(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        key: String,
+        child: String,
+    ) -> Result<Option<Vec<crate::icloud::photos::ReplayAlbumLinkLookup>>, StateError> {
+        self.with_conn("reading accepted album links", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            account::validate_authenticated(&tx, &owner)?;
+            let root = load_generation(&tx, &generation)?;
+            let links = accepted_album_links(&tx, &root, &key, &child)?;
+            tx.commit()?;
+            Ok(match links {
+                AcceptedAlbumLinks::Exact(links) => Some(links),
+                AcceptedAlbumLinks::Missing | AcceptedAlbumLinks::Ambiguous => None,
+            })
+        })
+        .await
     }
 
     pub(crate) async fn selection_rank_sources_with_budget(
@@ -2379,7 +2817,23 @@ fn observed_asset_matching(
         else {
             return Ok(None);
         };
-        let page_ids:Vec<String>=conn.prepare("SELECT DISTINCT p.id FROM provider_selection_rank_records r JOIN provider_selection_rank_pages p ON p.id=r.page_id WHERE p.generation=?1 AND r.record_name=?2 ORDER BY p.id LIMIT 65")?.query_map(params![root.id,master],|r|r.get(0))?.collect::<Result<_,_>>()?;
+        let page_ids: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT p.id FROM provider_selection_rank_records r
+             JOIN provider_selection_rank_pages p ON p.id=r.page_id
+             WHERE p.generation=?1 AND r.record_name=?2 AND (NOT ?3 OR p.pass_key=?4)
+             ORDER BY p.id LIMIT 65",
+            )?
+            .query_map(
+                params![
+                    root.id,
+                    master,
+                    root.spec.is_accepted_replay(),
+                    manifest.decision.pass_key
+                ],
+                |row| row.get(0),
+            )?
+            .collect::<Result<_, _>>()?;
         if page_ids.is_empty() || page_ids.len() > 64 {
             return Ok(None);
         }
@@ -2411,6 +2865,379 @@ fn observed_asset_matching(
         }
     }
     Ok(observed)
+}
+
+fn accepted_child_matches_current(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    key: &str,
+    fresh: &[u8],
+    current: &crate::icloud::photos::PhotoAsset,
+) -> Result<bool, StateError> {
+    let child = current.asset_record_name();
+    let master = current.id();
+    if !root.spec.is_accepted_replay()
+        || !accepted_replay_pass(&root.spec.profile, key)
+        || current.metadata().is_hidden
+        || current.metadata().is_deleted
+    {
+        return Ok(false);
+    }
+    // A lookup can supply a missing master, not replace captured master
+    // evidence or undo a captured tombstone.
+    let blocked: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM provider_selection_rank_records r
+         JOIN provider_selection_rank_pages p ON p.id=r.page_id
+         WHERE p.generation=?1 AND p.pass_key=?2
+           AND (r.record_name=?3 OR (r.record_name=?4 AND r.deleted=1)))",
+        params![root.id, key, master, child],
+        |row| row.get(0),
+    )?;
+    if blocked {
+        return Ok(false);
+    }
+    let mut statement = conn.prepare(
+        "SELECT r.page_id,r.ordinal FROM provider_selection_rank_records r
+         JOIN provider_selection_rank_pages p ON p.id=r.page_id
+         WHERE p.generation=?1 AND p.pass_key=?2 AND r.record_name=?3",
+    )?;
+    let mut rows = statement.query(params![root.id, key, child])?;
+    let mut pages = RankPages::new(conn, root);
+    let mut matched = false;
+    while let Some(row) = rows.next()? {
+        let (_, page) = pages.load(&row.get::<_, String>(0)?)?;
+        let ordinal = row.get::<_, u32>(1)? as usize;
+        let record = page
+            .get("records")
+            .and_then(Value::as_array)
+            .and_then(|records| records.get(ordinal))
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        if !crate::icloud::photos::accepted_child_matches_lookup(
+            record,
+            fresh,
+            current,
+            &root.spec.zone,
+        )
+        .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+        matched = true;
+    }
+    Ok(matched)
+}
+
+impl SqliteStateDb {
+    pub(crate) async fn qualify_accepted_child_lookup(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        key: String,
+        lookup: crate::icloud::photos::CurrentCatalogAsset,
+    ) -> Result<Option<crate::icloud::photos::CurrentCatalogAsset>, StateError> {
+        self.with_conn("checking exact accepted child lookup", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            account::validate_authenticated(&tx, &owner)?;
+            let root = load_generation(&tx, &generation)?;
+            let qualified =
+                accepted_child_matches_current(&tx, &root, &key, &lookup.body, &lookup.asset)?;
+            tx.commit()?;
+            Ok(qualified.then_some(lookup))
+        })
+        .await
+    }
+}
+
+fn accepted_replay_eligibility(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    manifest: &ActiveDecision,
+    fresh: Option<&[u8]>,
+) -> Result<bool, StateError> {
+    let decision = &manifest.decision;
+    let (Some(fresh), Some(master)) = (fresh, decision.master.as_deref()) else {
+        return Ok(false);
+    };
+    let foreign = root
+        .spec
+        .accepted_foreign_replay(&decision.pass_key)
+        .is_some();
+    if !foreign && manifest.media_zone(root) != &root.spec.zone {
+        return Ok(false);
+    }
+    if root
+        .spec
+        .accepted_album_requirement(&decision.pass_key)
+        .is_some()
+        && decision.confirmation.as_deref() != Some(fresh)
+        && !accepted_album_proof_matches(conn, root, decision, Some(fresh))?
+    {
+        return Ok(false);
+    }
+    let deleted: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM provider_selection_rank_records r
+         JOIN provider_selection_rank_pages p ON p.id=r.page_id
+          WHERE p.generation=?1 AND ((r.record_name IN (?2,?3) AND r.deleted=1)
+             OR (?4 AND r.record_name=?2)))",
+        params![root.id, decision.child, master, foreign],
+        |row| row.get(0),
+    )?;
+    if deleted {
+        return Ok(false);
+    }
+    let agrees = crate::icloud::photos::same_selected_facts;
+    let current = crate::icloud::photos::current_asset(
+        fresh,
+        &decision.child,
+        master,
+        manifest.media_zone(root),
+    )
+    .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+    if current.metadata().is_hidden
+        || current.metadata().is_deleted
+        || (root.spec.is_accepted_favorites(&decision.pass_key)
+            && !current.confirms_favorite_membership())
+        || !confirmed_decision_asset(manifest, root)?
+            .is_some_and(|selected| agrees(&selected, &current))
+    {
+        return Ok(false);
+    }
+    if foreign {
+        // Every retained source was validated as an original membership
+        // relation. The distinct media facts come only from the bound lookup.
+        return Ok(true);
+    }
+    match observed_asset_matching(conn, root, manifest, agrees)? {
+        Some(observed) => Ok(agrees(&observed, &current)),
+        None => accepted_child_matches_current(conn, root, &decision.pass_key, fresh, &current),
+    }
+}
+
+/// A sibling can share the catalog entry, never its membership or destination
+/// proof. Check that this generation admitted the rendition and that no newer
+/// work changed the catalog facts before admitting another physical copy.
+fn can_share_accepted_album_asset(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    manifest: &ActiveDecision,
+    records: &[AssetRecord],
+) -> Result<bool, StateError> {
+    let decision = &manifest.decision;
+    let container = root.spec.accepted_album_container(&decision.pass_key);
+    if container.is_none() && !root.spec.mixed_favorites_replay() {
+        return Ok(false);
+    }
+    if manifest.state_id != decision.child
+        || records.is_empty()
+        || root.spec.profile.get(INDEPENDENT_ALBUM_COPIES) != Some(&Value::Bool(true))
+    {
+        return Ok(false);
+    }
+    let mut current = conn.prepare_cached(
+        "SELECT EXISTS(
+            SELECT 1 FROM assets a JOIN asset_master_mappings m
+              ON m.library=a.library AND m.asset_record_name=a.id
+            WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND m.master_record_name=?4
+              AND a.checksum=?5 AND a.size_bytes=?6 AND a.metadata_hash=?7
+              AND a.created_at IS ?8 AND a.added_at IS ?9 AND a.is_deleted=0
+              AND a.status IN ('pending','failed','downloaded')
+              AND a.capture_repair_metadata_hash IS NULL)",
+    )?;
+    for record in records {
+        if !current.query_row(
+            params![
+                record.library,
+                record.id,
+                record.version_size.as_str(),
+                decision.master,
+                record.checksum,
+                i64::try_from(record.size_bytes).ok(),
+                record.metadata.metadata_hash,
+                encode_asset_date(record.created_at),
+                record.added_at.map(encode_asset_date)
+            ],
+            |row| row.get::<_, bool>(0),
+        )? {
+            return Ok(false);
+        }
+    }
+    let mut siblings = conn.prepare_cached(
+        "SELECT pass_key FROM provider_active_decisions
+         WHERE generation=?1 AND child=?2 AND pass_key<>?3 AND admission='admitted'",
+    )?;
+    let keys = siblings.query_map(params![root.id, decision.child, decision.pass_key], |row| {
+        row.get::<_, String>(0)
+    })?;
+    for key in keys {
+        let key = key?;
+        if !root.spec.mixed_favorites_replay()
+            && root
+                .spec
+                .accepted_album_container(&key)
+                .is_none_or(|other| Some(other) == container)
+        {
+            continue;
+        }
+        let prior = load_decision(conn, root, &key, &decision.child)?;
+        if prior.state_id == manifest.state_id
+            && prior.decision.master == decision.master
+            && prior.media_zone(root) == manifest.media_zone(root)
+            && decision.destinations.iter().all(|destination| {
+                prior.decision.destinations.iter().any(|other| {
+                    other.version_size == destination.version_size
+                        && other.checksum == destination.checksum
+                        && other.size == destination.size
+                        && other.metadata_hash == destination.metadata_hash
+                })
+            })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+enum AcceptedAlbumLinks {
+    Exact(Vec<crate::icloud::photos::ReplayAlbumLinkLookup>),
+    Missing,
+    Ambiguous,
+}
+
+fn accepted_album_links(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    key: &str,
+    child: &str,
+) -> Result<AcceptedAlbumLinks, StateError> {
+    let (containers, status) = root
+        .spec
+        .accepted_album_requirement(key)
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    let foreign = matches!(status, crate::icloud::photos::ReplayAlbumLink::Foreign);
+    let mut statement = conn.prepare(
+        "SELECT id FROM provider_selection_rank_pages
+         WHERE generation=?1 AND pass_key=?2 AND (has_relation=1 OR ?3)",
+    )?;
+    let ids = statement.query_map(
+        params![
+            root.id,
+            key,
+            !matches!(status, crate::icloud::photos::ReplayAlbumLink::Live)
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    let mut links: Vec<Option<String>> = vec![None; containers.len()];
+    let mut refused_names = HashSet::new();
+    for id in ids {
+        let page = load_rank(conn, root, &id?)?;
+        let records = page
+            .response
+            .get("records")
+            .and_then(Value::as_array)
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        for record in records {
+            for (container, link) in containers.iter().zip(&mut links) {
+                if status.child(record, container, &root.spec.zone) != Some(child) {
+                    if foreign {
+                        if crate::icloud::photos::ReplayAlbumLink::Removed.child(
+                            record,
+                            container,
+                            &root.spec.zone,
+                        ) == Some(child)
+                        {
+                            return Ok(AcceptedAlbumLinks::Ambiguous);
+                        }
+                        if let Some(name) = record.get("recordName").and_then(Value::as_str) {
+                            refused_names.insert(name.to_owned());
+                        }
+                    }
+                    continue;
+                }
+                let name = record
+                    .get("recordName")
+                    .and_then(Value::as_str)
+                    .ok_or(StateError::ProviderSelectionInvalid)?;
+                if link.as_deref().is_some_and(|prior| prior != name) {
+                    return Ok(AcceptedAlbumLinks::Ambiguous);
+                }
+                *link = Some(name.to_owned());
+            }
+        }
+    }
+    if links
+        .iter()
+        .flatten()
+        .any(|name| refused_names.contains(name))
+    {
+        return Ok(AcceptedAlbumLinks::Ambiguous);
+    }
+    let exact = containers
+        .into_iter()
+        .zip(links)
+        .map(|(container, name)| {
+            Some(crate::icloud::photos::ReplayAlbumLinkLookup {
+                record_name: name?,
+                container: container.to_owned(),
+            })
+        })
+        .collect::<Option<_>>();
+    Ok(exact.map_or(AcceptedAlbumLinks::Missing, AcceptedAlbumLinks::Exact))
+}
+
+fn accepted_album_proof_matches(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    decision: &SelectionDecision,
+    confirmation: Option<&[u8]>,
+) -> Result<bool, StateError> {
+    let key = &decision.pass_key;
+    let child = &decision.child;
+    let (Some((containers, status)), Some(body)) =
+        (root.spec.accepted_album_requirement(key), confirmation)
+    else {
+        return Ok(false);
+    };
+    match accepted_album_links(conn, root, key, child)? {
+        AcceptedAlbumLinks::Exact(links) => {
+            crate::icloud::photos::replay_album_confirmation_matches(
+                body,
+                &links,
+                child,
+                &root.spec.zone,
+                status,
+            )
+            .map_err(|_invalid| StateError::ProviderSelectionInvalid)
+        }
+        AcceptedAlbumLinks::Missing
+            if matches!(status, crate::icloud::photos::ReplayAlbumLink::Live) =>
+        {
+            let ([container], Some(master)) = (containers.as_slice(), decision.master.as_deref())
+            else {
+                return invalid();
+            };
+            let Some(name) = crate::icloud::photos::replay_current_album_link(
+                body,
+                container,
+                child,
+                master,
+                &root.spec.zone,
+            )
+            .map_err(|_invalid| StateError::ProviderSelectionInvalid)?
+            else {
+                return Ok(false);
+            };
+            // The lookup fills a gap. It cannot replace a captured record,
+            // including an opaque tombstone that lacks relation fields.
+            Ok(conn.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM provider_selection_rank_records r
+                 JOIN provider_selection_rank_pages p ON p.id=r.page_id
+                 WHERE p.generation=?1 AND p.pass_key=?2 AND r.record_name=?3)",
+                params![root.id, key, name],
+                |row| row.get(0),
+            )?)
+        }
+        AcceptedAlbumLinks::Missing | AcceptedAlbumLinks::Ambiguous => Ok(false),
+    }
 }
 
 /// Revisions may differ during first inventory, but all retained observations
@@ -2598,7 +3425,7 @@ impl SqliteStateDb {
             // Discovery is not a checkpoint decision. Validate the selected
             // root here and the due manifests when claiming the replay window.
             let mut candidates=conn.prepare(&format!("SELECT g.id, EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=g.id AND {UNFINISHED} AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child AND d.next_retry_at<=?4)) AS destination_due
-                FROM provider_active_generations g WHERE {CURRENT_SELECTION_CONFIGURATION} AND g.id<>?3
+                FROM provider_active_generations g WHERE {CURRENT_SELECTION_CONFIGURATION} AND g.id<>?3 AND NOT ({SUPERSEDED_SELECTION})
                 AND (destination_due OR EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.admission='deferred' AND d.next_retry_at<=?4))
                 ORDER BY g.last_replayed_at,g.created_at,g.id"))?;
             let now=Utc::now().timestamp();
@@ -2822,6 +3649,21 @@ impl SqliteStateDb {
             validate_decision(&tx,&root,&manifest,true)?;validate_records(&root,&manifest,&records)?;
             let d=&manifest.decision;let bytes=encode(&manifest)?;let hash=digest(&bytes);
             let existing:Option<(Vec<u8>,String)>=tx.query_row("SELECT manifest,admission FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let mut share_catalog_entry = false;
+            if root.spec.is_accepted_replay() && d.outcome == SelectionOutcome::Selected {
+                if !accepted_replay_eligibility(&tx, &root, &manifest, fresh_confirmation.as_deref())? {
+                    return Ok(GenerationProjection { admitted: false, reason: "accepted_replay_identity_unresolved".to_owned() });
+                }
+                if existing.as_ref().is_none_or(|(_, admission)| admission != "admitted") {
+                    let present: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id IN (?2,?3))",params![manifest.media_zone(&root).get("zoneName").and_then(Value::as_str),manifest.state_id,d.child],|row|row.get(0))?;
+                    if present {
+                        share_catalog_entry = can_share_accepted_album_asset(&tx, &root, &manifest, &records)?;
+                        if !share_catalog_entry {
+                            return Ok(GenerationProjection { admitted: false, reason: "accepted_replay_existing_asset".to_owned() });
+                        }
+                    }
+                }
+            }
             let mut resolving=false;
             if let Some((previous,admission))=&existing {
                 let old=load_decision(&tx,&root,&d.pass_key,&d.child)?;
@@ -2857,10 +3699,13 @@ impl SqliteStateDb {
                         };
                     }
                     if !membership_only && observed.as_ref().is_none_or(|observed|!agrees(observed,&current)) {
+                        // The accepted replay gate above already matched every
+                        // retained child, including sources in the old decision.
                         let recovered = !changed_basis && d.outcome == SelectionOutcome::Selected
-                            && fresh_confirmation.as_deref() == d.confirmation.as_deref()
-                            && inventory_observation.as_ref().is_some_and(|rank|crate::icloud::photos::same_selected_facts(rank,&current))
-                            && first_inventory_identity_matches(&tx,&root,&old,&current)?;
+                            && (root.spec.is_accepted_replay()
+                                || (fresh_confirmation.as_deref() == d.confirmation.as_deref()
+                                    && inventory_observation.as_ref().is_some_and(|rank|crate::icloud::photos::same_selected_facts(rank,&current))
+                                    && first_inventory_identity_matches(&tx,&root,&old,&current)?));
                         if !recovered {
                             defer_attempt(&tx,&root,&d.pass_key,&d.child)?;tx.commit()?;
                             return Ok(GenerationProjection {admitted:false,reason:"original_selected_facts_unresolved".to_owned()});
@@ -2882,7 +3727,7 @@ impl SqliteStateDb {
             // confirmed selected declarations whose original blocker cleared.
             // Already admitted replay returned above; conflicts leave frozen
             // declarations unchanged through transaction rollback.
-            if root.spec.profile.get(INDEPENDENT_ALBUM_COPIES)==Some(&Value::Bool(true)) && matches!(pass(&root,&d.pass_key)?.get("kind").and_then(Value::as_str), Some("Album" | "SmartFolder")) {
+            if root.spec.profile.get(INDEPENDENT_ALBUM_COPIES)==Some(&Value::Bool(true)) && (root.spec.mixed_favorites_replay() || matches!(pass(&root,&d.pass_key)?.get("kind").and_then(Value::as_str), Some("Album" | "SmartFolder"))) {
                 for destination in &d.destinations {
                     if album_path_claimed(&tx, &root.spec.scope, &d.pass_key, &destination.path)? {
                         return Err(StateError::ProviderWorkConflict("album_path_claimed"));
@@ -2950,16 +3795,18 @@ impl SqliteStateDb {
             refresh_admission_hash(&tx,&root,&d.pass_key,&d.child)?;
             if admitted {
                 let library=manifest.media_zone(&root).get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?;
-                let now=Utc::now().timestamp();
-                for record in &records {
-                    let drift:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND version_size=?3 AND metadata_hash IS NOT ?4)",params![record.library,record.id,record.version_size.as_str(),record.metadata.metadata_hash],|r|r.get(0))?;
-                    upsert_asset_row(&tx,record,now)?;
-                    if drift && root.spec.metadata_enabled {
-                        tx.execute("UPDATE assets SET metadata_write_failed_at=COALESCE(metadata_write_failed_at,?4) WHERE library=?1 AND id=?2 AND version_size=?3",params![record.library,record.id,record.version_size.as_str(),now])?;
-                        tx.execute("UPDATE asset_metadata_paths SET metadata_write_failed_at=COALESCE(metadata_write_failed_at,?4) WHERE library=?1 AND id=?2 AND version_size=?3",params![record.library,record.id,record.version_size.as_str(),now])?;
+                if !share_catalog_entry {
+                    let now=Utc::now().timestamp();
+                    for record in &records {
+                        let drift:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND version_size=?3 AND metadata_hash IS NOT ?4)",params![record.library,record.id,record.version_size.as_str(),record.metadata.metadata_hash],|r|r.get(0))?;
+                        upsert_asset_row(&tx,record,now)?;
+                        if drift && root.spec.metadata_enabled {
+                            tx.execute("UPDATE assets SET metadata_write_failed_at=COALESCE(metadata_write_failed_at,?4) WHERE library=?1 AND id=?2 AND version_size=?3",params![record.library,record.id,record.version_size.as_str(),now])?;
+                            tx.execute("UPDATE asset_metadata_paths SET metadata_write_failed_at=COALESCE(metadata_write_failed_at,?4) WHERE library=?1 AND id=?2 AND version_size=?3",params![record.library,record.id,record.version_size.as_str(),now])?;
+                        }
                     }
+                    tx.execute("INSERT INTO asset_master_mappings(library,asset_record_name,master_record_name,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(library,asset_record_name) DO UPDATE SET master_record_name=excluded.master_record_name,updated_at=excluded.updated_at",params![library,d.child,d.master,now])?;
                 }
-                tx.execute("INSERT INTO asset_master_mappings(library,asset_record_name,master_record_name,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(library,asset_record_name) DO UPDATE SET master_record_name=excluded.master_record_name,updated_at=excluded.updated_at",params![library,d.child,d.master,now])?;
                 let inserted_album = if let Some(album)=album {
                     tx.execute("INSERT OR IGNORE INTO asset_albums(library,asset_id,album_name,source) VALUES(?1,?2,?3,'icloud')",params![library,manifest.state_id,album])? > 0
                 } else {false};
@@ -2986,6 +3833,7 @@ impl SqliteStateDb {
         self.with_conn_mut("sealing observed selection coverage",move|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
             let root=load_generation(&tx,&generation)?;
+            if root.spec.is_accepted_replay() { return invalid(); }
             validate_current_deleted_selection(&tx,&root.spec)?;
             if basis(&tx,&root.spec.scope)?!=root.spec.basis {return Err(StateError::ProviderWorkConflict("selection_basis_changed"))}
             if !root.sealed {
@@ -3794,6 +4642,31 @@ fn validate_identity_decisions(
 // Retry scheduling and checkpoint debt share current configuration authority.
 // This predicate must not narrow admission or physical publication guards.
 const CURRENT_SELECTION_CONFIGURATION: &str = "g.scope=?1 AND g.config_hash=?2";
+
+#[derive(Debug)]
+pub(crate) struct SelectionInventory {
+    pub(crate) config_hash: String,
+    pub(crate) generation: String,
+}
+
+impl SelectionInventory {
+    #[must_use]
+    pub(crate) fn into_metadata_update(self) -> (String, String) {
+        (
+            format!("selection_inventory_v1:{}", self.config_hash),
+            self.generation,
+        )
+    }
+}
+
+// Old plans remain available for ownership and publication checks, but not for
+// ordinary scheduling. The checkpoint transaction installs this boundary.
+const SUPERSEDED_SELECTION: &str = "EXISTS(
+    SELECT 1 FROM metadata m JOIN provider_active_generations baseline ON baseline.id=m.value
+    WHERE m.key='selection_inventory_v1:'||g.config_hash
+      AND baseline.scope=g.scope AND baseline.config_hash=g.config_hash
+      AND baseline.sealed=1 AND baseline.checkpoint_ready=1
+      AND (baseline.created_at,baseline.id)>(g.created_at,g.id))";
 
 fn commit_observed_destination(
     tx: rusqlite::Transaction<'_>,
@@ -4760,12 +5633,14 @@ fn album_path_claimed(
         }
         let (generation, previous_key, child) = row?;
         let root = load_generation(conn, &generation)?;
-        if matches!(
-            pass(&root, &previous_key)?
-                .get("kind")
-                .and_then(Value::as_str),
-            Some("Album" | "SmartFolder")
-        ) {
+        if root.spec.mixed_favorites_replay()
+            || matches!(
+                pass(&root, &previous_key)?
+                    .get("kind")
+                    .and_then(Value::as_str),
+                Some("Album" | "SmartFolder")
+            )
+        {
             load_decision(conn, &root, &previous_key, &child)?;
             // A committed/pending managed family keeps its own physical slot.
             // Legacy aliases remain historical source proof; another current
@@ -5022,7 +5897,7 @@ impl SqliteStateDb {
         config_hash: String,
     ) -> Result<bool, StateError> {
         Ok(self
-            .selection_debt(owner, scope, config_hash, false)
+            .selection_debt(owner, scope, config_hash, false, None)
             .await?
             .is_some())
     }
@@ -5037,7 +5912,8 @@ impl SqliteStateDb {
         config_hash: String,
     ) -> Result<bool, StateError> {
         Ok(matches!(
-            self.selection_debt(owner, scope, config_hash, true).await?,
+            self.selection_debt(owner, scope, config_hash, true, None)
+                .await?,
             Some(SelectionDebt::Blocking(_))
         ))
     }
@@ -5070,12 +5946,20 @@ impl SqliteStateDb {
         scope: String,
         config_hash: String,
         local_writer_available: bool,
+        replacement: Option<String>,
     ) -> Result<Option<SelectionDebt>, StateError> {
         self.with_conn("inspecting retained selection debt",move|conn|{
             let tx=conn.unchecked_transaction()?;
             account::validate_authenticated(&tx,&owner)?;
             let conn=&tx;
-            validate_scope_decisions(conn, &scope)?;
+            if let Some(id) = &replacement {
+                let latest: Option<String> = conn.query_row(LATEST_LOCAL_GENERATION, params![scope,config_hash], |r| r.get(0)).optional()?;
+                let root = load_generation(conn, id)?;
+                if latest.as_deref() != Some(id.as_str()) || !root.sealed || !root.checkpoint_ready {
+                    return invalid();
+                }
+            }
+            validate_scope_decisions(conn, &scope, replacement.as_deref().map(|id| (config_hash.as_str(),id)))?;
             // A prepared output can already be on disk while its receipt is
             // unfinished. Preserve its fence at an overlapping selected path,
             // even if current writer options differ. Historical planned paths
@@ -5084,11 +5968,12 @@ impl SqliteStateDb {
             // destinations. Keep historical confirmations for future matching
             // selections without charging them to the current checkpoint.
             let retained = format!("g.id IS NOT ({LATEST_LOCAL_GENERATION})");
+            let eligible = format!("g.id=?3 OR (?3 IS NULL AND NOT ({SUPERSEDED_SELECTION}))");
             let mut independent = None;
             let mut latest = None;
             {
-                let mut stmt=conn.prepare(&format!("SELECT d.reason='current_lookup_unresolved', {retained},g.id,d.pass_key,d.child FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE {CURRENT_SELECTION_CONFIGURATION} AND d.admission='deferred'"))?;
-                let mut rows=stmt.query(params![scope,config_hash])?;
+                let mut stmt=conn.prepare(&format!("SELECT d.reason='current_lookup_unresolved', {retained},g.id,d.pass_key,d.child FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE {CURRENT_SELECTION_CONFIGURATION} AND ({eligible}) AND d.admission='deferred'"))?;
+                let mut rows=stmt.query(params![scope,config_hash,replacement])?;
                 while let Some(row)=rows.next()? {
                     let lookup=row.get::<_,bool>(0)?;
                     let retained_generation=row.get(1)?;
@@ -5125,10 +6010,10 @@ impl SqliteStateDb {
                     })))
                 }
             }
-            let debt=format!("FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND (g.config_hash=?2 OR (w.prepared_hash IS NOT NULL AND EXISTS(SELECT 1 FROM provider_active_destinations selected JOIN provider_active_generations current ON current.id=selected.generation WHERE current.scope=?1 AND current.config_hash=?2 AND selected.admitted=1 AND selected.path=w.path))) AND {UNFINISHED}
+            let debt=format!("FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND ((g.config_hash=?2 AND (({eligible}) OR w.prepared_hash IS NOT NULL)) OR (w.prepared_hash IS NOT NULL AND EXISTS(SELECT 1 FROM provider_active_destinations selected JOIN provider_active_generations current ON current.id=selected.generation WHERE current.scope=?1 AND current.config_hash=?2 AND selected.admitted=1 AND selected.path=w.path))) AND {UNFINISHED}
                 AND NOT (w.confirmed_repair IS NOT NULL AND w.prepared_hash IS NULL AND EXISTS(SELECT 1 FROM provider_active_generations newer WHERE newer.scope=g.scope AND newer.config_hash=g.config_hash AND newer.created_at>g.created_at AND newer.sealed=1 AND newer.checkpoint_ready=1))");
             let destination_fields = format!("w.prepared_hash IS NOT NULL, w.confirmed_repair IS NOT NULL, (w.verified_media=0 AND w.preserved_local IS NULL), {retained}");
-            let unfinished = conn.query_row(&format!("SELECT {destination_fields} {debt} LIMIT 1"),params![scope,config_hash],|r|SelectionCheckpointHold::destination(r,0)).optional()?;
+            let unfinished = conn.query_row(&format!("SELECT {destination_fields} {debt} LIMIT 1"),params![scope,config_hash,replacement],|r|SelectionCheckpointHold::destination(r,0)).optional()?;
             if unfinished.is_none() || !local_writer_available {return Ok(unfinished.map(SelectionDebt::Blocking).or(independent))}
             // Refresh the local preservation cache before opening the destination
             // cursor: rebuilding its TEMP schema would invalidate a live cursor.
@@ -5154,7 +6039,7 @@ impl SqliteStateDb {
                     AND n.local_checksum=w.local_checksum AND n.source_checksum IS w.source_checksum
                     AND (w.generation=n.generation OR (w.prepared_hash IS NULL AND n.prepared_hash IS NULL)))
                 THEN w.grouping_hash END,w.path,{destination_fields} {debt}"))?;
-            let mut rows=stmt.query(params![scope,config_hash])?;
+            let mut rows=stmt.query(params![scope,config_hash,replacement])?;
             while let Some(r)=rows.next()? {
                 let blocked=|| Ok(Some(SelectionDebt::Blocking(SelectionCheckpointHold::destination(r,4)?)));
                 let Some(group)=r.get::<_,Option<String>>(2)? else {return blocked()};

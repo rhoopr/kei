@@ -1091,6 +1091,7 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
     #[derive(Clone)]
     struct FallbackSession {
         expired: bool,
+        accept_first_page: bool,
         deltas: Arc<AtomicUsize>,
     }
     #[async_trait::async_trait]
@@ -1102,13 +1103,18 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
             if url.contains("/changes/zone?") {
-                self.deltas.fetch_add(1, Ordering::SeqCst);
+                let page = self.deltas.fetch_add(1, Ordering::SeqCst);
                 let mut zone = json!({
                     "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
                     "moreComing": false,
                     "records": []
                 });
-                if self.expired {
+                if self.accept_first_page && page == 0 {
+                    zone["records"] =
+                        json!([{"recordName":"observed","recordType":"FutureOpaque"}]);
+                    zone["syncToken"] = json!("continuation");
+                    zone["moreComing"] = json!(true);
+                } else if self.expired {
                     zone["serverErrorCode"] = json!("BAD_REQUEST");
                 }
                 return Ok(json!({"zones": [zone]}));
@@ -1124,9 +1130,10 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
             Box::new(self.clone())
         }
     }
-    for expired in [false, true] {
+    for (expired, accept_first_page) in [(false, false), (true, false), (true, true)] {
         let directory = TempDir::new().unwrap();
         let mut config = incremental_test_config(&directory);
+        config.inventory_checkpoint = super::InventoryCheckpointPolicy::Baseline;
         let db =
             super::super::test_support::open_fixture_db(&directory.path().join("state.db")).await;
         config.state_db = Some(db.clone());
@@ -1136,6 +1143,7 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
             "",
             Box::new(FallbackSession {
                 expired,
+                accept_first_page,
                 deltas: deltas.clone(),
             }),
         )];
@@ -1160,6 +1168,16 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
             CancellationToken::new(),
         )
         .await;
+        if accept_first_page {
+            assert!(
+                result
+                    .unwrap_err()
+                    .is::<crate::icloud::photos::error::ShadowPageError>(),
+                "a rejected continuation must retain the current partial replay"
+            );
+            assert_eq!(deltas.load(Ordering::SeqCst), 2);
+            continue;
+        }
         if !expired {
             // Original-page capture must reject a malformed successor rather
             // than infer token expiry from missing protocol evidence.

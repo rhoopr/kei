@@ -346,9 +346,10 @@ impl SqliteStateDb {
                 for value in values {
                     let value = value?;
                     let candidate = crate::sync_cycle::retained_checkpoint_hold_action(&value);
-                    if candidate == "repair_retained_checkpoint_evidence"
-                        || (candidate == "retained_checkpoint_retry_exhausted" && action != "repair_retained_checkpoint_evidence")
-                    { action = candidate; }
+                    if candidate == "repair_retained_checkpoint_evidence" {
+                        action = candidate;
+                        break;
+                    }
                 }
                 last_recovery_action = Some(action.to_owned());
             }

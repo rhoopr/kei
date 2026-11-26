@@ -6,31 +6,45 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use reqwest::Client;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use super::config::{DownloadConfig, IndexingWindow, hash_download_config};
-use super::delta::{IncrementalDeltaSummary, MembershipDelta};
+use super::config::{
+    DownloadConfig, IndexingWindow, InventoryCheckpointPolicy, hash_download_config,
+};
+use super::delta::{IncrementalDeltaState, IncrementalDeltaSummary, MembershipDelta};
 use super::models::{
     DownloadControls, DownloadOutcome, SyncResult, SyncStats,
     block_sync_token_for_incremental_delta, merge_download_outcomes,
 };
 use crate::commands::{AlbumPass, PassKind};
 use crate::download::filter;
+use crate::download::metadata_rewrite::CaptureTimestampRepair;
+use crate::download::pipeline::{
+    AUTH_ERROR_THRESHOLD, StreamRuntime, StreamingResult, build_download_result,
+    stream_selection_observations,
+};
 use crate::download::planner::{AssetTaskPlan, SelectionPathEvidence, TaskPlanner};
+use crate::icloud::photos::asset::ChangeEvent;
 use crate::icloud::photos::{
-    PhotoAlbum, PhotoAsset, current_asset, inbox::ShadowCapture, same_selected_facts,
+    PhotoAlbum, PhotoAsset, ReplayAlbumLink, ReplayAlbumLinkLookup, current_asset,
+    inbox::ShadowCapture, same_selected_facts,
 };
 use crate::state::ReconciliationStateStore;
 use crate::state::db::provider_generations::{
     ActiveDecision, ActiveGeneration, AdmissionChecks, GenerationSpec, INDEPENDENT_ALBUM_COPIES,
     MAX_GENERATION_BYTES, SelectionAttempt, SelectionCheckpointHold, SelectionDebt,
+    SelectionInventory, accepted_replay_coverage, accepted_replay_pass,
 };
+use crate::state::db::provider_inbox::CapturedPageId;
 use crate::state::db::provider_selection::{
     SelectionDecision, SelectionDestination, SelectionOutcome, SelectionPath,
 };
+use crate::types::ChangeReason;
 
 const MAX_REPLAY_DECISIONS: u32 = 64;
 const DEFERRED_REASON: &str = "selection_generation_deferred";
@@ -357,10 +371,14 @@ pub(crate) struct SelectionRun {
 
 impl SelectionContext {
     async fn has_work(&self, config: &DownloadConfig) -> Result<bool> {
-        Ok(self.debt(config).await?.is_some())
+        Ok(self.debt(config, None).await?.is_some())
     }
 
-    async fn debt(&self, config: &DownloadConfig) -> Result<Option<SelectionDebt>> {
+    async fn debt(
+        &self,
+        config: &DownloadConfig,
+        inventory: Option<&SelectionInventory>,
+    ) -> Result<Option<SelectionDebt>> {
         Ok(self
             .capture
             .db
@@ -369,6 +387,7 @@ impl SelectionContext {
                 self.scope.clone(),
                 self.config_hash.clone(),
                 config.post_sync_metadata,
+                inventory.map(|inventory| inventory.generation.clone()),
             )
             .await?)
     }
@@ -379,7 +398,10 @@ impl SelectionContext {
         result: &mut SyncResult,
         membership_removal: bool,
     ) -> Result<Option<SelectionCheckpointHold>> {
-        let Some(debt) = self.debt(config).await? else {
+        let Some(debt) = self
+            .debt(config, result.checkpoint.selection_inventory.as_ref())
+            .await?
+        else {
             return Ok(None);
         };
         result.stats.selected_work_remaining = true;
@@ -543,17 +565,22 @@ impl SelectionContext {
                 .begin_selection_generation(self.capture.owner.clone(), spec, MAX_GENERATION_BYTES)
                 .await?
         };
+        let accepted_replay = root.spec.is_accepted_replay();
         Ok(Arc::new(SelectionRun {
             capture: self.capture.clone(),
             root,
-            phase: SelectionPhase::Inventory,
+            phase: if accepted_replay {
+                SelectionPhase::Execution
+            } else {
+                SelectionPhase::Inventory
+            },
             albums: passes
                 .iter()
                 .map(|pass| (pass_key(pass), pass.album.clone()))
                 .collect(),
             held: AtomicBool::new(false),
             session_expired: AtomicBool::new(false),
-            fresh_confirmation: false,
+            fresh_confirmation: accepted_replay,
             retry_sources: Arc::clone(&self.retry_sources),
         }))
     }
@@ -665,10 +692,11 @@ impl SelectionRun {
     #[must_use]
     pub(in crate::download) fn independent_album(&self, config: &DownloadConfig) -> bool {
         self.root.spec.profile.get(INDEPENDENT_ALBUM_COPIES) == Some(&Value::Bool(true))
-            && matches!(
-                config.primary_layout_pass_kind,
-                Some(PassKind::Album | PassKind::SmartFolder)
-            )
+            && (self.root.spec.mixed_favorites_replay()
+                || matches!(
+                    config.primary_layout_pass_kind,
+                    Some(PassKind::Album | PassKind::SmartFolder)
+                ))
     }
 
     /// Qualify a later album before concurrent producers can choose the same
@@ -916,7 +944,10 @@ impl SelectionRun {
                     .albums
                     .get(key)
                     .context("Missing retained selection pass owner")?;
-                let current = self.confirm_individually(album, &retained).await?;
+                let current = match prefetched {
+                    Some(current) => current,
+                    None => self.confirm_individually(key, album, &retained).await?,
+                };
                 anyhow::ensure!(
                     same_selected_facts(&retained, &current.asset),
                     "Retained selected generation differs from current proof"
@@ -947,7 +978,7 @@ impl SelectionRun {
             .context("Missing selection pass owner")?;
         let current = match prefetched {
             Some(current) if !retry_inventory => current,
-            _ => match self.confirm_individually(album, observed).await {
+            _ => match self.confirm_individually(key, album, observed).await {
                 Ok(current) => current,
                 Err(error) if self.fresh_confirmation && previous.is_some() => {
                     return Err(error.context(RetainedLookupUnavailable));
@@ -971,6 +1002,7 @@ impl SelectionRun {
 
     async fn confirm_individually(
         &self,
+        key: &str,
         album: &PhotoAlbum,
         observed: &PhotoAsset,
     ) -> Result<crate::icloud::photos::CurrentCatalogAsset> {
@@ -978,7 +1010,150 @@ impl SelectionRun {
             !self.session_expired.load(Ordering::Relaxed),
             "Selection confirmation stopped after provider session expiry"
         );
-        album.confirm_selected_asset(observed).await
+        if !self.root.spec.is_accepted_replay() {
+            return album.confirm_selected_asset(observed).await;
+        }
+        anyhow::ensure!(
+            observed
+                .source_zone()
+                .is_none_or(|zone| zone == album.zone_name()),
+            "Accepted replay photo belongs to a different zone"
+        );
+        self.confirm_replay_identity(
+            key,
+            album,
+            observed.asset_record_name(),
+            Some(observed.id()),
+        )
+        .await
+    }
+
+    async fn confirm_replay_identity(
+        &self,
+        key: &str,
+        album: &PhotoAlbum,
+        child: &str,
+        master: Option<&str>,
+    ) -> Result<crate::icloud::photos::CurrentCatalogAsset> {
+        let master = master.filter(|name| !name.trim().is_empty() && *name != child);
+        if let Some((_, status)) = self.root.spec.accepted_album_requirement(key) {
+            let mut links = self
+                .capture
+                .db
+                .accepted_album_links(
+                    self.capture.owner.clone(),
+                    self.root.id.clone(),
+                    key.to_owned(),
+                    child.to_owned(),
+                )
+                .await?
+                .context("Accepted replay did not give all required album links")?;
+            if let Some(binding) = self.root.spec.accepted_foreign_replay(key) {
+                anyhow::ensure!(links.len() == 1, "Ambiguous foreign album link");
+                return album
+                    .confirm_foreign_replay_album_asset(child, links.remove(0), &binding)
+                    .await;
+            }
+            album
+                .confirm_replay_album_asset(
+                    child,
+                    master.context("Missing replay master")?,
+                    links,
+                    status,
+                )
+                .await
+        } else {
+            let current = album
+                .confirm_replay_pair(child, master.context("Missing replay master")?)
+                .await?;
+            anyhow::ensure!(
+                !self.root.spec.is_accepted_favorites(key)
+                    || current.asset.confirms_favorite_membership(),
+                "Current lookup did not confirm Favorites membership"
+            );
+            Ok(current)
+        }
+    }
+
+    async fn confirm_replay_observation(
+        &self,
+        key: &str,
+        child: &str,
+        master: Option<&str>,
+        observed: Option<&PhotoAsset>,
+        retained_link: Option<ReplayAlbumLinkLookup>,
+    ) -> Result<Option<crate::icloud::photos::CurrentCatalogAsset>> {
+        let attempt = self
+            .capture
+            .db
+            .selection_attempt(
+                self.capture.owner.clone(),
+                self.root.id.clone(),
+                key.to_owned(),
+                child.to_owned(),
+            )
+            .await?;
+        if !matches!(attempt, SelectionAttempt::Due(_)) {
+            return Ok(None);
+        }
+        let album = self
+            .albums
+            .get(key)
+            .context("Missing accepted replay pass")?;
+        let confirmation = match retained_link {
+            Some(link) => {
+                album
+                    .confirm_replay_album_asset(
+                        child,
+                        master.context("Missing replay master")?,
+                        vec![link],
+                        ReplayAlbumLink::Live,
+                    )
+                    .await
+            }
+            None => {
+                self.confirm_replay_identity(key, album, child, master)
+                    .await
+            }
+        };
+        match confirmation {
+            Ok(lookup) => {
+                let qualified = match observed {
+                    Some(observed) => (!lookup.asset.metadata().is_hidden
+                        && !lookup.asset.metadata().is_deleted
+                        && same_selected_facts(observed, &lookup.asset))
+                    .then_some(lookup),
+                    None if master.is_none() => (!lookup.asset.metadata().is_hidden
+                        && !lookup.asset.metadata().is_deleted)
+                        .then_some(lookup),
+                    None => {
+                        self.capture
+                            .db
+                            .qualify_accepted_child_lookup(
+                                self.capture.owner.clone(),
+                                self.root.id.clone(),
+                                key.to_owned(),
+                                lookup,
+                            )
+                            .await?
+                    }
+                };
+                if qualified.is_some() {
+                    return Ok(qualified);
+                }
+            }
+            Err(error)
+                if crate::icloud::photos::session::is_session_error(&error)
+                    || error.is::<crate::state::error::StateError>() =>
+            {
+                return Err(error);
+            }
+            Err(_) => {}
+        }
+        self.held.store(true, Ordering::Relaxed);
+        self.defer_confirmation(key, child.to_owned(), observed)
+            .await?;
+        Ok(None)
     }
 
     /// Account for an unresolved current identity without creating queue work.
@@ -1028,7 +1203,8 @@ impl SelectionRun {
                         .context("Missing selected media owner")?
                         .selected_media_source(asset)
                 })
-                .transpose()?;
+                .transpose()?
+                .or_else(|| self.root.spec.accepted_foreign_replay(key));
             (
                 self.capture
                     .db
@@ -1417,7 +1593,7 @@ impl SelectionRun {
                 // A retained catalog lookup proves the asset still exists, not
                 // that it belongs to this pass today. Only the current pass
                 // may act on a destination's explicit replacement authority.
-                if self.fresh_confirmation {
+                if self.fresh_confirmation || self.root.spec.is_accepted_replay() {
                     return Ok(false);
                 }
                 if planner.managed_layout_session().is_none()
@@ -1511,6 +1687,9 @@ impl SelectionRun {
                     )
                     .await?;
                 if reused {
+                    continue;
+                }
+                if self.root.spec.is_accepted_replay() {
                     continue;
                 }
                 let established = self
@@ -1662,7 +1841,8 @@ impl SelectionRun {
         config: &DownloadConfig,
         planner: &mut TaskPlanner,
     ) -> Result<Option<AssetTaskPlan>> {
-        if config.primary_layout_active
+        if self.root.spec.is_accepted_replay()
+            || config.primary_layout_active
             || config.edited_naming == crate::types::EditedNaming::Primary
             || planner.managed_layout_session().is_some()
             || filter::is_asset_filtered(asset, config).is_some()
@@ -1892,7 +2072,10 @@ pub(super) async fn inventory(
         selection_run: Some(run.clone()),
         ..config.as_ref().clone()
     });
-    let mut retained = if config.primary_layout_active {
+    let rebaseline = config.inventory_checkpoint
+        == super::config::InventoryCheckpointPolicy::Baseline
+        && matches!(config.sync_mode, crate::download::SyncMode::Full);
+    let mut retained = if rebaseline || config.primary_layout_active {
         crate::download::pipeline::StreamingResult {
             enumeration_complete: true,
             ..crate::download::pipeline::StreamingResult::default()
@@ -1929,6 +2112,7 @@ pub(super) async fn inventory(
     ))
     .await?;
     if config.primary_layout_active
+        && !rebaseline
         && !result.stats.storage_failed
         && !cancel.is_cancelled()
         && !run.session_expired.load(Ordering::Relaxed)
@@ -2052,6 +2236,12 @@ pub(super) async fn inventory(
     if run.held.load(Ordering::Relaxed) {
         result.checkpoint.identity_incomplete = true;
         result.block_incremental_token(DEFERRED_REASON)
+    }
+    if rebaseline && covered && query_checkpoint_ready {
+        result.checkpoint.selection_inventory = Some(SelectionInventory {
+            config_hash: context.config_hash.clone(),
+            generation: run.root.id.clone(),
+        });
     }
     let mut membership_delta = context
         .inventory_membership_delta
@@ -2805,6 +2995,315 @@ async fn replay_destinations(
         }
     }
     Ok(())
+}
+
+pub(super) fn supports_accepted_replay(
+    config: &DownloadConfig,
+    controls: DownloadControls,
+) -> bool {
+    config
+        .selection_context
+        .as_ref()
+        .is_some_and(|context| accepted_replay_coverage(&context.profile).is_some())
+        && config.exclude_asset_ids.is_empty()
+        && controls.run_mode.downloads_files()
+        && config.inventory_checkpoint != InventoryCheckpointPolicy::RetainedBridge
+        && !config.inventory_reconciliation
+        && config.indexing_inventory_cursor.is_none()
+        && !config.primary_layout_active
+}
+
+#[derive(Clone)]
+enum AcceptedReplayCandidate {
+    Paired(PhotoAsset),
+    Child { child: Box<str>, master: Box<str> },
+    Foreign(Box<str>),
+}
+
+impl AcceptedReplayCandidate {
+    fn from_event(event: &ChangeEvent) -> Option<Self> {
+        if let Some(asset) = IncrementalDeltaState::created_asset(event) {
+            return (!asset.metadata().is_hidden && !asset.metadata().is_deleted)
+                .then(|| Self::Paired(asset.clone()));
+        }
+        if event.reason != ChangeReason::Created
+            || event.record_type.as_deref() != Some("CPLAsset")
+            || event.sparse_share.is_some()
+            || event.token_unsafe_reason.is_some()
+        {
+            return None;
+        }
+        Some(Self::Child {
+            child: event.record_name.clone(),
+            master: event.master_record_name.clone()?,
+        })
+    }
+
+    fn child(&self) -> &str {
+        match self {
+            Self::Paired(asset) => asset.asset_record_name(),
+            Self::Child { child, .. } => child,
+            Self::Foreign(child) => child,
+        }
+    }
+}
+
+/// Publish only independently confirmed media from the accepted prefix. This
+/// separate generation cannot supply a selection inventory or a successor.
+pub(super) async fn publish_accepted_replay(
+    client: &Client,
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+    cancel: CancellationToken,
+    pages: &[CapturedPageId],
+    events: &[ChangeEvent],
+) -> Result<Option<SyncResult>> {
+    if pages.is_empty() || cancel.is_cancelled() {
+        return Ok(None);
+    }
+    let mut context = config
+        .selection_context
+        .as_deref()
+        .context("Missing accepted replay context")?
+        .clone();
+    let coverage = accepted_replay_coverage(&context.profile)
+        .context("Selection cannot use accepted replay evidence")?;
+    let assets: Vec<_> = events
+        .iter()
+        .filter_map(AcceptedReplayCandidate::from_event)
+        .collect();
+    if assets.is_empty() && !matches!(passes, [pass] if pass.album.has_cross_zone_hydration()) {
+        return Ok(None);
+    }
+    // A captured link routes a candidate, not an authorized download.
+    let mut members: FxHashMap<&str, FxHashSet<&str>> = FxHashMap::default();
+    let mut departures = FxHashMap::<&str, FxHashSet<&str>>::default();
+    let captured_names: FxHashSet<_> = events
+        .iter()
+        .map(|event| event.record_name.as_ref())
+        .collect();
+    for link in events.iter().filter_map(|event| event.relation.as_ref()) {
+        let candidates = if link.is_deleted {
+            &mut departures
+        } else {
+            &mut members
+        };
+        candidates
+            .entry(&link.container_id)
+            .or_default()
+            .insert(&link.asset_record_name);
+    }
+    let page_ids: Vec<_> = pages.iter().map(|id| id.0).collect();
+    context.config_hash = digest(&serde_json::to_vec(&(
+        coverage,
+        &context.config_hash,
+        page_ids,
+    ))?);
+    *context
+        .profile
+        .get_mut("coverage")
+        .context("Missing selection coverage")? = json!(coverage);
+    // Keep the requested selection's fingerprint and paths. This page only
+    // authorizes new media, including when a failed transfer is retried.
+    let config = Arc::new(DownloadConfig {
+        metadata: Default::default(),
+        refresh_metadata: false,
+        capture_timestamp_repair: CaptureTimestampRepair::Preserve,
+        repair_truncated: false,
+        ..config.clone()
+    });
+    let run = context.start(passes, &config).await?;
+    let started = Instant::now();
+    let mut combined = StreamingResult {
+        enumeration_complete: true,
+        ..StreamingResult::default()
+    };
+    let mut attempted = false;
+    'passes: for pass in passes {
+        if cancel.is_cancelled()
+            || combined.storage_failed
+            || combined.state_write_failures > 0
+            || combined.provider_auth_errors > 0
+            || combined.auth_errors >= AUTH_ERROR_THRESHOLD
+        {
+            break;
+        }
+        let key = pass_key(pass);
+        if !accepted_replay_pass(&context.profile, &key) {
+            continue;
+        }
+        let requirement = run.root.spec.accepted_album_requirement(&key);
+        let foreign;
+        let assets = if let Some((containers, ReplayAlbumLink::Foreign)) = &requirement {
+            let [container] = containers.as_slice() else {
+                anyhow::bail!("Ambiguous foreign album requirement");
+            };
+            foreign = members
+                .get(container)
+                .into_iter()
+                .flatten()
+                .filter(|&&child| {
+                    !captured_names.contains(child)
+                        && !departures
+                            .get(container)
+                            .is_some_and(|links| links.contains(child))
+                })
+                .map(|&child| AcceptedReplayCandidate::Foreign(child.into()))
+                .collect();
+            &foreign
+        } else {
+            &assets
+        };
+        let mut retained = FxHashMap::default();
+        if let Some((containers, ReplayAlbumLink::Live)) = &requirement
+            && let [container] = containers.as_slice()
+        {
+            let known = members.get(container);
+            let removed = departures.get(container);
+            let missing: Vec<_> = assets
+                .iter()
+                .map(AcceptedReplayCandidate::child)
+                .filter(|child| known.is_none_or(|links| !links.contains(child)))
+                .filter(|child| removed.is_none_or(|links| !links.contains(child)))
+                .map(str::to_owned)
+                .collect();
+            if !missing.is_empty() {
+                for (child, record_name) in run
+                    .capture
+                    .db
+                    .retained_album_link_hints(
+                        run.capture.owner.clone(),
+                        run.root.spec.scope.clone(),
+                        (*container).to_owned(),
+                        missing,
+                    )
+                    .await?
+                {
+                    if !captured_names.contains(record_name.as_str()) {
+                        retained.insert(
+                            child,
+                            ReplayAlbumLinkLookup {
+                                record_name,
+                                container: (*container).to_owned(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        let mut candidates: Vec<_> = assets
+            .iter()
+            .filter(|candidate| {
+                !run.root.spec.is_accepted_favorites(&key)
+                    || !matches!(candidate, AcceptedReplayCandidate::Paired(asset) if !asset.metadata().is_favorite)
+            })
+            .filter(|asset| {
+                retained.contains_key(asset.child())
+                    || requirement.as_ref().is_none_or(|(containers, status)| {
+                        let links = match status {
+                            ReplayAlbumLink::Live | ReplayAlbumLink::Foreign => &members,
+                            ReplayAlbumLink::Removed => &departures,
+                        };
+                        // A partial set still needs a retry decision. Only
+                        // complete evidence can admit a copy.
+                        containers.iter().any(|container| {
+                            links
+                                .get(container)
+                                .is_some_and(|children| children.contains(asset.child()))
+                        })
+                    })
+            })
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        let mut children = FxHashSet::default();
+        for &page in pages {
+            if cancel.is_cancelled() {
+                break 'passes;
+            }
+            children.extend(
+                run.capture
+                    .db
+                    .capture_selection_replay_page(
+                        run.capture.owner.clone(),
+                        run.root.id.clone(),
+                        key.clone(),
+                        page,
+                    )
+                    .await?,
+            );
+        }
+        candidates.retain(|asset| children.contains(asset.child()));
+        if candidates.is_empty() {
+            continue;
+        }
+        attempted = true;
+        let effective = Arc::new(DownloadConfig {
+            selection_run: Some(run.clone()),
+            selection_pass: Some(key.clone()),
+            ..config.with_pass(pass)
+        });
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .map(|asset| (asset.clone(), retained.remove(asset.child())))
+            .collect();
+        let resolve = run.clone();
+        let observations =
+            futures_util::stream::iter(candidates).filter_map(move |(candidate, hint)| {
+                let run = resolve.clone();
+                let key = key.clone();
+                async move {
+                    let confirmation = match candidate {
+                        AcceptedReplayCandidate::Paired(asset) => {
+                            let Some(hint) = hint else {
+                                return Some(Ok((asset, None)));
+                            };
+                            run.confirm_replay_observation(
+                                &key,
+                                asset.asset_record_name(),
+                                Some(asset.id()),
+                                Some(&asset),
+                                Some(hint),
+                            )
+                            .await
+                        }
+                        AcceptedReplayCandidate::Child { child, master } => {
+                            run.confirm_replay_observation(&key, &child, Some(&master), None, hint)
+                                .await
+                        }
+                        AcceptedReplayCandidate::Foreign(child) => {
+                            run.confirm_replay_observation(&key, &child, None, None, None)
+                                .await
+                        }
+                    };
+                    confirmation
+                        .map(|current| current.map(|proof| (proof.asset.clone(), Some(proof))))
+                        .transpose()
+                }
+            });
+        let mut work = Box::pin(stream_selection_observations(
+            client,
+            observations,
+            &effective,
+            controls,
+            0,
+            cancel.clone(),
+            StreamRuntime::new(None, None).deferring_metadata_drain(),
+        ))
+        .await?;
+        run.remember_retry_sources(&work.failed, passes).await?;
+        combined.recap.merge(std::mem::take(&mut work.recap));
+        combined.rate_limit_observations += work.rate_limit_observations;
+        super::models::merge_streaming_result(&mut combined, work);
+    }
+    if !attempted {
+        return Ok(None);
+    }
+    Ok(Some(
+        build_download_result(client, passes, &config, controls, combined, started, cancel).await?,
+    ))
 }
 
 /// Reuse the existing completed-delta/full-selection veto composition. The

@@ -233,7 +233,7 @@ pub(super) fn spawn_stream_download_producer<S>(
     shared: StreamPipelineShared,
 ) -> StreamProducer
 where
-    S: futures_util::Stream<Item = anyhow::Result<crate::icloud::photos::PhotoAsset>>
+    S: futures_util::Stream<Item = anyhow::Result<super::streaming::SelectionObservation>>
         + Send
         + 'static,
 {
@@ -466,8 +466,15 @@ where
                                     }
                                     SelectionConfirmationErrorClass::RetryDeferred => {}
                                 }
-                                enum_errors_producer
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                // A refused replay already owns the source hold.
+                                // A mismatching individual lookup is retry work,
+                                // not a second enumeration failure.
+                                if !run.root.spec.is_accepted_replay()
+                                    || error.is::<crate::state::error::StateError>()
+                                {
+                                    enum_errors_producer
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 run.held.store(true, std::sync::atomic::Ordering::Relaxed);
                                 tracing::warn!(target: "kei::download::pipeline", %error,
                                     "Current selection confirmation refused producer mutation");
@@ -1274,6 +1281,17 @@ where
                     }
                 }
                 Err(e) => {
+                    if config
+                        .selection_run
+                        .as_ref()
+                        .is_some_and(|run| run.root.spec.is_accepted_replay())
+                        && e.is::<crate::state::error::StateError>()
+                    {
+                        state_write_failures_producer
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::error!(%e, "Could not verify retained selection state");
+                        break;
+                    }
                     enum_errors_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if is_provider_session_error(&e) {
                         provider_auth_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

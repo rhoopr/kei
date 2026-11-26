@@ -21,6 +21,8 @@ use crate::download::pipeline::{
 };
 use crate::download::{filter, metadata_rewrite, planner};
 use crate::icloud::photos::PhotoAsset;
+use crate::icloud::photos::asset::ChangeEvent;
+use crate::icloud::photos::error::AcceptedReplay;
 use crate::icloud::photos::session::is_session_error as is_provider_session_error;
 use crate::types::ChangeReason;
 
@@ -37,7 +39,7 @@ use super::delta::{
 use super::models::{
     ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON, DownloadControls, DownloadOutcome, DownloadRunMode,
     PROVIDER_METADATA_STATE_WRITE_FAILED_REASON, SkipBreakdown, SyncResult, SyncStats,
-    block_sync_token_for_incremental_delta, merge_download_outcomes,
+    block_sync_token_for_incremental_delta, merge_download_outcomes, replay_refusal_reason,
 };
 use super::selection::{
     IncrementalPassRouting, build_pass_configs, route_incremental_asset_to_passes,
@@ -102,8 +104,16 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             };
             let Some(result) = result else { break };
             let event = match result {
-                Err(error) if is_provider_session_error(&error) => {
-                    delta.summary.auth_errors += 1;
+                Ok(event) => event,
+                Err(error) => {
+                    if is_provider_session_error(&error) {
+                        delta.summary.auth_errors += 1;
+                    } else if let Some(reason) = replay_refusal_reason(&error) {
+                        delta.summary.token_unsafe_reason.get_or_insert(reason);
+                    } else {
+                        return Err(error);
+                    }
+                    // Finalize already-streamed work and keep its failure evidence.
                     tokio::select! {
                         biased;
                         () = shutdown_token.cancelled() => {},
@@ -111,7 +121,6 @@ fn stream_incremental_assets_for_single_unfiled_pass(
                     }
                     return Ok(delta.summary);
                 }
-                other => other?,
             };
             delta.observe_event(&event);
             delta.persist_asset_mapping(&event, &config).await;
@@ -408,7 +417,7 @@ pub(super) async fn download_photos_incremental_collecting(
     controls: DownloadControls,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
-    download_photos_incremental_collecting_inner(
+    Box::pin(download_photos_incremental_collecting_inner(
         download_client,
         passes,
         config,
@@ -416,7 +425,7 @@ pub(super) async fn download_photos_incremental_collecting(
         controls,
         shutdown_token,
         INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER,
-    )
+    ))
     .await
 }
 
@@ -559,7 +568,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     // that prevents assets already in some user album from downloading
     // twice) can be applied downstream.
     let mut downloadable_assets: Vec<(PhotoAsset, usize)> = Vec::new();
-    let mut change_events = Vec::new();
+    let mut change_events: Vec<ChangeEvent> = Vec::new();
     let mut first_download_url_obtained_at: Option<Instant> = None;
     let mut delta = IncrementalDeltaState::new(passes);
     let routing = IncrementalPassRouting::from_passes(passes);
@@ -583,7 +592,41 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 result = change_stream.next() => result,
             };
             let Some(result) = result else { break };
-            let event = result?;
+            let event = match result {
+                Ok(event) => event,
+                Err(error) => {
+                    let (Some(reason), Some(prefix)) = (
+                        replay_refusal_reason(&error),
+                        AcceptedReplay::from_shadow_error(&error),
+                    ) else {
+                        return Err(error);
+                    };
+                    if !super::generation::supports_accepted_replay(config, controls) {
+                        return Err(error);
+                    }
+                    drop(change_stream);
+                    let Some(mut partial) = Box::pin(super::generation::publish_accepted_replay(
+                        download_client,
+                        passes,
+                        config,
+                        controls,
+                        shutdown_token,
+                        &prefix.pages,
+                        &change_events,
+                    ))
+                    .await?
+                    else {
+                        return Err(error);
+                    };
+                    // Publication is useful progress, never a complete delta.
+                    partial.outcome = merge_download_outcomes(
+                        &partial.outcome,
+                        &DownloadOutcome::PartialFailure { failed_count: 1 },
+                    );
+                    partial.block_incremental_token(reason);
+                    return Ok(partial);
+                }
+            };
             if first_download_url_obtained_at.is_none() && event.asset.is_some() {
                 first_download_url_obtained_at = Some(Instant::now());
             }

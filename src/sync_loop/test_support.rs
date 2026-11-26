@@ -210,7 +210,7 @@ pub(super) fn make_named_full_album_with_boxed_session(
     name: &str,
     session: Box<dyn crate::icloud::photos::PhotosSession>,
 ) -> crate::icloud::photos::PhotoAlbum {
-    make_cycle_album(zone, name, session, None)
+    make_cycle_album(zone, name, session, None, None)
 }
 
 fn cycle_fixture_owner() -> state::db::account::AccountOwner {
@@ -250,15 +250,73 @@ pub(super) fn make_named_owned_cycle_album(
         zone,
         name,
         session,
-        Some((
-            crate::icloud::photos::inbox::ShadowCapture::new(
-                db.clone(),
-                cycle_fixture_owner(),
-                "com",
-            ),
-            Arc::from(database),
-        )),
+        Some((cycle_fixture_capture(db), Arc::from(database))),
+        None,
     )
+}
+
+pub(super) fn make_owned_cycle_container_album(
+    db: &Arc<state::SqliteStateDb>,
+    zone: &str,
+    name: &str,
+    container: &str,
+    session: Box<dyn PhotosSession>,
+) -> crate::icloud::photos::PhotoAlbum {
+    make_cycle_album(
+        zone,
+        name,
+        session,
+        Some((cycle_fixture_capture(db), Arc::from("private"))),
+        Some(container),
+    )
+}
+
+pub(super) fn make_owned_cycle_smart_folder(
+    db: &Arc<state::SqliteStateDb>,
+    zone: &str,
+    name: &str,
+    session: Box<dyn PhotosSession>,
+) -> crate::icloud::photos::PhotoAlbum {
+    let (_, definition) = crate::icloud::photos::smart_folders::smart_folders()
+        .into_iter()
+        .find(|(folder, _)| *folder == name)
+        .unwrap();
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::default(),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from(name),
+            list_type: Arc::from(definition.list_type),
+            obj_type: Arc::from(definition.obj_type),
+            query_filter: definition.query_filter,
+            page_size: 100,
+            zone_id: Arc::new(
+                serde_json::json!({"zoneName":zone,"ownerRecordName":"_defaultOwner"}),
+            ),
+            retry_config: retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        session,
+    );
+    album.set_shadow_capture(cycle_fixture_capture(db), Arc::from("private"));
+    album
+}
+
+pub(super) fn make_owned_cycle_album_without_request_owner(
+    db: &Arc<state::SqliteStateDb>,
+    zone: &str,
+    session: Box<dyn PhotosSession>,
+) -> crate::icloud::photos::PhotoAlbum {
+    let mut album = make_full_album_with_boxed_session(zone, session);
+    album.set_shadow_capture(cycle_fixture_capture(db), Arc::from("private"));
+    album
+}
+
+fn cycle_fixture_capture(
+    db: &Arc<state::SqliteStateDb>,
+) -> crate::icloud::photos::inbox::ShadowCapture {
+    crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), cycle_fixture_owner(), "com")
 }
 
 pub(crate) fn make_captured_cycle_album(
@@ -271,6 +329,7 @@ pub(crate) fn make_captured_cycle_album(
         "TestAlbum",
         session,
         Some((capture, Arc::from("private"))),
+        None,
     )
 }
 
@@ -279,6 +338,7 @@ fn make_cycle_album(
     name: &str,
     session: Box<dyn crate::icloud::photos::PhotosSession>,
     capture: Option<(crate::icloud::photos::inbox::ShadowCapture, Arc<str>)>,
+    container: Option<&str>,
 ) -> crate::icloud::photos::PhotoAlbum {
     use serde_json::json;
     let zone_id = if capture.is_some() {
@@ -291,13 +351,22 @@ fn make_cycle_album(
             params: Arc::new(std::collections::HashMap::new()),
             service_endpoint: Arc::from("https://example.com"),
             name: Arc::from(name),
-            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
-            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
-            query_filter: None,
+            list_type: Arc::from(if container.is_some() {
+                "CPLContainerRelationLiveByAssetDate"
+            } else {
+                "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"
+            }),
+            obj_type: container.map_or_else(
+                || Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                |id| Arc::from(format!("CPLContainerRelationNotDeletedByAssetDate:{id}")),
+            ),
+            query_filter: container.map(|id| {
+                Arc::new(json!([{"fieldName":"parentId","comparator":"EQUALS","fieldValue":{"type":"STRING","value":id}}]))
+            }),
             page_size: 100,
             zone_id: Arc::new(zone_id),
             retry_config: retry::RetryConfig::default(),
-            container_id: None,
+            container_id: container.map(Arc::from),
             cross_zone_sources: Vec::new(),
         },
         session,

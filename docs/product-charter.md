@@ -34,6 +34,14 @@ destructive cleanup, provider-to-provider sync, or downstream upload workflows.
 - Local file changes are opt-in. Capturing metadata in the state database is
   safe by default. Rewriting, deleting, or pruning local files needs an explicit
   user action.
+- A backup should save every currently selected item it can verify. A failed
+  item stays retryable; it does not disqualify healthy items or libraries.
+- The database and sync tokens avoid repeat work. Keep media progress and
+  checkpoint progress separate. If the provider cannot supply a trustworthy
+  cursor, keep the last good one and still save the media kei can verify.
+- A complete, validated inventory can establish a new baseline for its
+  selection. Older plans remain evidence, not work that must be replayed or
+  reconciled. Absence from a scan is not proof of deletion.
 - Sync should be explainable. A user should be able to tell what kei scanned,
   what it downloaded, what failed, and whether the next run can continue safely.
 - Headless operation is first-class. Watch mode, Docker, service managers,
@@ -46,9 +54,10 @@ destructive cleanup, provider-to-provider sync, or downstream upload workflows.
 
 ## Current focus
 
-The near-term requirement is stability and reliability. No new product surface
-should be prioritized until normal sync, interrupted-run recovery, reporting,
-retry behavior, token safety, and support paths feel rock solid.
+Make normal sync and recovery productive without operator intervention. Prefer
+removing a check that only reconciles obsolete state over adding another way
+to satisfy it. Keep checks that protect local files, validate current provider
+evidence, or keep current work reachable after restart.
 
 Backup confidence is the user-visible proof of that reliability.
 

@@ -4,6 +4,7 @@ use crate::download::pipeline::StreamingResult;
 use crate::download::{filter, recap};
 use crate::icloud::photos::ProviderRecordId;
 use crate::icloud::photos::asset::MALFORMED_REQUIRED_ASSET_FIELDS_REASON;
+use crate::icloud::photos::error::ReplayRefusal;
 use crate::state::SparseIdentityStore;
 use crate::state::{
     DownloadContextStateStore, DownloadStateStore, MembershipStore, MetadataRewriteStore,
@@ -212,6 +213,8 @@ pub(crate) struct InventoryMeasurement {
 pub(crate) struct CheckpointEvidence {
     /// Only the inventory owner can supply a freshly scanned selection root.
     pub(crate) scanned_generation: Option<(super::config::InventoryScope, String)>,
+    pub(crate) selection_inventory:
+        Option<crate::state::db::provider_generations::SelectionInventory>,
     pub(crate) inventory_reconciliation_complete: bool,
     /// Every fresh ordered path-selection query
     /// reached proven EOF with usable unanimous tokens, but the selected work
@@ -734,6 +737,10 @@ const PAGINATION_SHORTFALL_REASON: &str = "pagination_shortfall";
 
 pub(super) const ICLOUD_ALBUM_COUNT_ERROR_REASON: &str = "icloud_album_count_error";
 
+pub(crate) fn replay_refusal_reason(error: &anyhow::Error) -> Option<&'static str> {
+    ReplayRefusal::from_shadow_error(error).map(ReplayRefusal::checkpoint_reason)
+}
+
 pub(crate) const PRODUCER_ENUMERATION_INCOMPLETE_REASON: &str = "producer_enumeration_incomplete";
 
 pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
@@ -765,11 +772,15 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
         | UNPARSABLE_RELATION_DELTA_REASON
         | UNKNOWN_ALBUM_RELATION_ASSET_REASON
         | UNKNOWN_ALBUM_RELATION_CONTAINER_REASON => "icloud",
+        _ if ReplayRefusal::checkpoint_explanation(reason).is_some() => "icloud",
         _ => "unknown",
     }
 }
 
 pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
+    if let Some(explanation) = ReplayRefusal::checkpoint_explanation(reason) {
+        return explanation;
+    }
     match reason {
         "selection_generation_deferred" => {
             "kei retained unfinished selected destination or identity work, so it held token advancement"
@@ -849,13 +860,10 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
             "kei could not refresh every pending retry target; the rows remain durable for a later cycle"
         }
         "retained_checkpoint_hold_invalid" => {
-            "retained recovery evidence is malformed or unsupported; kei preserved the hold without provider work; restore validated recovery evidence from the preserved state before resuming"
+            "an older checkpoint hold could not be read; run normal sync to check current coverage"
         }
-        "retained_checkpoint_retry_exhausted" => {
-            "automatic retained-checkpoint recovery is exhausted; active source state and historical work remain retained; obtain authoritative retained-history evidence before resuming recovery"
-        }
-        "retained_checkpoint_expired" => {
-            "the provider rejected the retained checkpoint; kei preserved local history with a bounded automatic retry budget; authoritative retained-history evidence is required to resolve an exhausted hold"
+        "retained_checkpoint_retry_exhausted" | "retained_checkpoint_expired" => {
+            "the provider rejected the saved checkpoint; kei keeps the checkpoint and recovery evidence and retries when due"
         }
         "sync_token_unavailable" | "sync_token_missing" => {
             "no usable sync token was available at the end of the cycle"
@@ -965,7 +973,6 @@ pub(crate) enum RecoveryAction {
     RevalidateRecords(Vec<ProviderRecordId>),
     ReplayFromPriorToken,
     AwaitRetainedCheckpointEvidence,
-    RetainedCheckpointRetryExhausted,
     RepairRetainedCheckpointEvidence,
     ReconcileInventory(FullEnumerationReason),
     Reauthenticate,
@@ -980,7 +987,6 @@ impl RecoveryAction {
             Self::RevalidateRecords(_) => "revalidate_records",
             Self::ReplayFromPriorToken => "replay_from_prior_token",
             Self::AwaitRetainedCheckpointEvidence => "await_retained_checkpoint_evidence",
-            Self::RetainedCheckpointRetryExhausted => "retained_checkpoint_retry_exhausted",
             Self::RepairRetainedCheckpointEvidence => "repair_retained_checkpoint_evidence",
             Self::ReconcileInventory(_) => "reconcile_inventory",
             Self::Reauthenticate => "reauthenticate",

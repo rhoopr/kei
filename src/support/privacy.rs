@@ -1,6 +1,8 @@
 //! Export allowlist. Raw input, log messages and error text never enter the wire format.
 use serde_json::{Map, Value};
 
+use crate::icloud::photos::error::ReplayRefusal;
+
 pub(super) const NUMERIC_STATS: &[&str] = &[
     "assets_seen",
     "api_total_at_start",
@@ -621,7 +623,7 @@ fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
     if kind == "support_delta_bridge_v1" {
         return match key {
             "outcome" => matches!(label, Some("started" | "failed")),
-            "reason" => matches!(label, Some("missing_successor" | "replay_error")),
+            "reason" => label.is_some_and(ReplayRefusal::is_bridge_reason),
             _ => false,
         };
     }
@@ -760,7 +762,7 @@ pub(super) fn diagnostic(kind: &str, fields: &Map<String, Value>) -> Option<Map<
 }
 
 pub(crate) fn fixed_label(value: &str) -> bool {
-    LABELS.contains(&value)
+    LABELS.contains(&value) || ReplayRefusal::checkpoint_explanation(value).is_some()
 }
 
 const LABELS: &[&str] = &[

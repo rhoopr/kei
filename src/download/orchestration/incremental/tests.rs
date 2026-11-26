@@ -3209,10 +3209,26 @@ async fn malformed_delta_page_rejected_by_streaming_and_collecting_consumers() {
         config.state_db = Some(db.clone());
         let result =
             run_incremental_strategy(collecting, &[pass], &Arc::new(config), "saved").await;
-        assert!(
-            result.is_err(),
-            "collecting={collecting}: malformed page completed"
-        );
+        if collecting {
+            let error = result.expect_err("collecting must refuse the incomplete delta");
+            assert_eq!(
+                crate::icloud::photos::error::bridge_error_reason(&error),
+                "record_error"
+            );
+        } else {
+            let result = result.unwrap();
+            assert!(matches!(
+                result.outcome,
+                DownloadOutcome::PartialFailure { .. }
+            ));
+            assert_eq!(result.sync_token, None);
+            assert!(!result.checkpoint.completed_delta_replay);
+            assert_eq!(result.stats.downloaded, 1);
+            assert_eq!(
+                result.stats.sync_token_blocked_reason,
+                Some("icloud_changes_record_error")
+            );
+        }
         assert_eq!(
             db.get_metadata("sync_token:PrimarySync")
                 .await
@@ -3231,6 +3247,99 @@ async fn malformed_delta_page_rejected_by_streaming_and_collecting_consumers() {
                 bytes
             );
             assert_eq!(db.get_all_known_ids().await.unwrap().len(), 1);
+        }
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn streaming_refused_continuation_keeps_publication_and_storage_evidence() {
+    use super::super::test_support::{open_fixture_db, selected_pass_with_session};
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let refusals = [
+        (None, "icloud_changes_missing_successor"),
+        (Some("BAD_REQUEST"), "icloud_changes_continuation_rejected"),
+        (Some("ZONE_NOT_FOUND"), "icloud_changes_zone_not_found"),
+        (Some("RETRY_LATER"), "icloud_changes_retry_later"),
+        (
+            Some("SERVER_INTERNAL_ERROR"),
+            "icloud_changes_server_internal_error",
+        ),
+        (
+            Some("FUTURE_ZONE_FAILURE"),
+            "icloud_changes_unrecognized_zone_error",
+        ),
+        (Some("THROTTLED"), "icloud_changes_zone_throttled"),
+    ];
+    for (storage_blocked, (code, reason)) in [false, true]
+        .into_iter()
+        .flat_map(|blocked| refusals.map(|refusal| (blocked, refusal)))
+    {
+        let dir = TempDir::new().unwrap();
+        let db = open_fixture_db(&dir.path().join("state.db")).await;
+        let server = crate::start_wiremock_or_skip!();
+        let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+        Mock::given(method("GET"))
+            .and(path("/accepted.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+            .expect(u64::from(!storage_blocked))
+            .mount(&server)
+            .await;
+        let mut records = incremental_photo_records_with_url(
+            "EARLIER",
+            "earlier.jpg",
+            &format!("{}/accepted.jpg", server.uri()),
+            bytes.len() as u64,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes)));
+        let page = |records, token, more| {
+            json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+                "records":records,"syncToken":token,"moreComing":more}]})
+        };
+        let mut refused = page(Vec::new(), "", false);
+        if let Some(code) = code {
+            refused["zones"][0]["serverErrorCode"] = json!(code);
+        }
+        let session = crate::test_helpers::MockPhotosSession::new()
+            .ok(page(records, "accepted-page", true))
+            .ok(refused);
+        let pass = selected_pass_with_session(&db, "", Box::new(session));
+        let mut config = incremental_test_config(&dir);
+        config.state_db = Some(db.clone());
+        config.folder_structure = "destination".to_owned();
+        let destination = dir.path().join("destination");
+        if storage_blocked {
+            std::fs::write(&destination, b"unrelated file").unwrap();
+        }
+        let result = run_incremental_strategy(false, &[pass], &Arc::new(config), "saved")
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { .. }
+        ));
+        assert_eq!(result.sync_token, None);
+        assert!(!result.checkpoint.completed_delta_replay);
+        assert_eq!(
+            result.checkpoint.storage_failed, storage_blocked,
+            "{result:?}"
+        );
+        assert_eq!(result.stats.downloaded, usize::from(!storage_blocked));
+        let published = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(published.len(), usize::from(!storage_blocked));
+        if storage_blocked {
+            assert_eq!(std::fs::read(destination).unwrap(), b"unrelated file");
+        } else {
+            assert_eq!(result.stats.enumeration_errors, 1);
+            assert_eq!(result.stats.sync_token_blocked_reason, Some(reason));
+            let path = published[0].local_path.as_ref().unwrap();
+            assert!(path.starts_with(&destination), "{path:?}");
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
         }
         server.verify().await;
     }
