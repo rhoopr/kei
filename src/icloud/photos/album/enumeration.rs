@@ -47,8 +47,8 @@ impl PhotoAlbum {
 
     /// Shared implementation for `photo_stream` and `photo_stream_with_token`.
     ///
-    /// When `fetcher_sync_tokens` is `Some`, each fetcher appends its last
-    /// observed `syncToken` to the shared token list.
+    /// When `fetcher_sync_tokens` is `Some`, each fetcher reports whether its
+    /// observed positions agree before they can supply a shared token.
     ///
     /// Returns the stream and all spawned fetcher `JoinHandle`s.
     pub(super) fn photo_stream_inner(

@@ -37,8 +37,8 @@ use crate::icloud::photos::{
 use crate::state::ReconciliationStateStore;
 use crate::state::db::provider_generations::{
     ActiveDecision, ActiveGeneration, AdmissionChecks, GenerationSpec, INDEPENDENT_ALBUM_COPIES,
-    MAX_GENERATION_BYTES, SelectionAttempt, SelectionCheckpointHold, SelectionDebt,
-    SelectionInventory, accepted_replay_coverage, accepted_replay_pass,
+    MAX_GENERATION_BYTES, ReplayPageCapture, SelectionAttempt, SelectionCheckpointHold,
+    SelectionDebt, SelectionInventory, accepted_replay_coverage, accepted_replay_pass,
 };
 use crate::state::db::provider_inbox::CapturedPageId;
 use crate::state::db::provider_selection::{
@@ -3223,17 +3223,35 @@ pub(super) async fn publish_accepted_replay(
             if cancel.is_cancelled() {
                 break 'passes;
             }
-            children.extend(
-                run.capture
-                    .db
-                    .capture_selection_replay_page(
-                        run.capture.owner.clone(),
-                        run.root.id.clone(),
-                        key.clone(),
-                        page,
-                    )
-                    .await?,
-            );
+            let capture = |body| {
+                run.capture.db.capture_selection_replay_page(
+                    run.capture.owner.clone(),
+                    run.root.id.clone(),
+                    key.clone(),
+                    page,
+                    body,
+                )
+            };
+            let evidence = match capture(None).await? {
+                ReplayPageCapture::Released(cursor) => {
+                    let reply = tokio::select! {
+                        biased;
+                        ()=cancel.cancelled()=>break 'passes,
+                        reply=pass.album.reread_replay_page(&cursor)=>reply,
+                    };
+                    match reply {
+                        Ok(body) => capture(Some(body)).await?,
+                        Err(error) if crate::icloud::photos::session::is_session_error(&error) => {
+                            return Err(error);
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                evidence => evidence,
+            };
+            if let ReplayPageCapture::Captured(ids) = evidence {
+                children.extend(ids);
+            }
         }
         candidates.retain(|asset| children.contains(asset.child()));
         if candidates.is_empty() {

@@ -2409,6 +2409,22 @@ async fn run_cycle_inner(
                 }
             }
             SourceCheckpointDecision::Preserve { reason, recovery } => {
+                // The scan may have published every file while failing to
+                // establish a provider position. Report the failed operation
+                // without counting a successful transfer as a failed asset.
+                if reason == CheckpointHoldReason::TokenProofIncomplete
+                    && matches!(sync_result.outcome, download::DownloadOutcome::Success)
+                    && matches!(
+                        sync_result.stats.sync_token_blocked_reason,
+                        Some(
+                            "icloud_sync_token_missing"
+                                | "icloud_blank_sync_token"
+                                | "icloud_sync_token_mismatch"
+                        )
+                    )
+                {
+                    cycle_failed_count = cycle_failed_count.saturating_add(1);
+                }
                 checkpoint_hold_action = Some(recovery.as_str());
                 crate::metrics::record_checkpoint_decision("preserved", reason.as_str());
                 db_sync_token_advance_safe = false;

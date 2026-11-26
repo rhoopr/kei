@@ -196,6 +196,7 @@ async fn download_pass_invalid_unknown_media_marks_failed_not_downloaded() {
 
     let server = crate::start_wiremock_or_skip!();
     let body = b"not media bytes";
+    let (logs, _guard) = crate::test_helpers::TracingCapture::install();
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
         .mount(&server)
@@ -254,6 +255,14 @@ async fn download_pass_invalid_unknown_media_marks_failed_not_downloaded() {
 
     assert_eq!(result.failed.len(), 1);
     assert_eq!(db.call_count(), 0, "invalid media must not mark_downloaded");
+    assert!(logs.contains_event(|event| event.message() == Some("Download failed")));
+    assert!(!logs.contains_event(|event| {
+        event.level <= tracing::Level::INFO
+            && event
+                .fields
+                .values()
+                .any(|value| value.contains("UNKNOWN_MEDIA"))
+    }));
     assert_eq!(
         db.failed_call_count(),
         1,

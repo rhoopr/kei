@@ -12,6 +12,8 @@ pub(crate) struct ShadowPageError(#[from] anyhow::Error);
 /// A raw body rejection that only live replay may turn into a library hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(super) enum ChangesBodyRejection {
+    #[error("Unsuccessful provider response")]
+    UnsuccessfulStatus,
     #[error("Provider changes page exceeded the capture byte limit")]
     TooLarge,
     #[error("Invalid or ambiguous provider changes JSON")]
@@ -74,6 +76,9 @@ macro_rules! replay_refusals {
 
 // Columns: error text, checkpoint suffix, bridge label, checkpoint explanation.
 replay_refusals! {
+    UnsuccessfulResponse: "iCloud Photos replay did not return a successful response",
+        "unsuccessful_response", "unsuccessful_response",
+        "iCloud did not return a successful changes page; kei will retry from the saved checkpoint";
     OversizedBody: "iCloud Photos replay response exceeded the byte limit",
         "oversized_body", "oversized_body",
         "iCloud returned a response over kei's replay byte limit; kei will retry from the saved checkpoint";

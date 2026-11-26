@@ -162,7 +162,9 @@ async fn run_cycle_true_token_unsafe_condition_still_warns() {
     .await
     .unwrap();
 
-    assert_eq!(result.failed_count, 0);
+    assert_eq!(result.failed_count, 1);
+    assert_eq!(result.stats.failed, 0);
+    assert!(!result.can_advance_database_checkpoint());
     assert!(result.stats.sync_token_blocked);
     assert_eq!(
         result.stats.sync_token_blocked_reason,

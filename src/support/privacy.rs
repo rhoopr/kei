@@ -1065,6 +1065,7 @@ const LABELS: &[&str] = &[
     "consumer_dropped",
     "malformed_record",
     "unpaired_records",
+    "conflicting_tokens",
     "collecting",
     "streaming",
     "full",

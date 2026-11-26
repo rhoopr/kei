@@ -20,6 +20,7 @@ pub(super) async fn await_fetcher_handles(handles: Vec<JoinHandle<()>>) -> bool 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EnumerationFailure {
+    ConflictingTokens,
     FetcherError,
     ConsumerDropped,
     MalformedRecord,
@@ -84,6 +85,7 @@ impl FetcherSyncTokenCapture {
                 "completion": match completion {
                     EnumerationCompletion::ProvenEof => "proven_eof",
                     EnumerationCompletion::UserBoundReached => "user_bound",
+                    EnumerationCompletion::Incomplete(EnumerationFailure::ConflictingTokens) => "conflicting_tokens",
                     EnumerationCompletion::Incomplete(EnumerationFailure::FetcherError) => "fetcher_error",
                     EnumerationCompletion::Incomplete(EnumerationFailure::ConsumerDropped) => "consumer_dropped",
                     EnumerationCompletion::Incomplete(EnumerationFailure::MalformedRecord) => "malformed_record",

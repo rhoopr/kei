@@ -286,14 +286,15 @@ async fn run_cycle_destination_replaced_after_enumeration_reports_partial_failur
         .find(|event| {
             event.level == tracing::Level::ERROR
                 && event.message() == Some("Download failed")
-                && event.field("asset_id") == Some(asset_record_name.as_str())
+                && event.field("path").is_some_and(|path| path.contains(&root))
         })
         .unwrap_or_else(|| panic!("missing structured download failure event: {events:?}"));
     assert!(
-        failure_event
-            .field("path")
-            .is_some_and(|path| path.contains(&root)),
-        "download failure event should include path under {root}, got {failure_event:?}"
+        !failure_event
+            .fields
+            .values()
+            .any(|value| value.contains(&asset_record_name)),
+        "download failure must identify the local path without exposing the provider child"
     );
 
     if download_root.is_file() {

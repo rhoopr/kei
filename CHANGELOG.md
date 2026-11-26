@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Sync report JSON now uses version `"4"`. Failed rows have report-local labels and a short error category or HTTP status. The report uses a label for the account, masks named libraries, and omits local paths, folder templates and album names. Consumers should no longer join failure entries to SQLite by `id`.
 - When iCloud rejects a saved sync position, a complete scan can establish a new starting point for the selected photos. Files and unfinished downloads from earlier runs stay protected.
 - When iCloud stops returning usable changes partway through a sync, kei can still save photos it independently verifies and keep other libraries moving. The affected library retries from its last good position. Metadata and repair settings do not block a verified new copy or authorize rewriting an existing one during that recovery.
 - Selecting Favorites and unfiled together now preserves both destinations during recovery. Only a photo freshly confirmed as a favorite gets the Favorites copy.

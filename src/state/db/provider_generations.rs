@@ -846,6 +846,11 @@ pub(crate) enum SelectionAttempt {
     Deferred,
 }
 
+pub(crate) enum ReplayPageCapture {
+    Captured(Vec<String>),
+    Released(String),
+}
+
 fn validate_media_source(
     root: &ActiveGeneration,
     manifest: &ActiveDecision,
@@ -2217,7 +2222,8 @@ impl SqliteStateDb {
         generation: String,
         key: String,
         id: CapturedPageId,
-    ) -> Result<Vec<String>, StateError> {
+        refreshed: Option<Vec<u8>>,
+    ) -> Result<ReplayPageCapture, StateError> {
         self.with_conn_mut("linking accepted replay evidence", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             account::validate_authenticated(&tx, &owner)?;
@@ -2225,15 +2231,46 @@ impl SqliteStateDb {
             if !root.spec.is_accepted_replay() {
                 return invalid();
             }
-            if tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM provider_finished_changes WHERE page_id=?1)",
-                [id.0],
-                |row| row.get::<_, bool>(0),
-            )? {
-                return Ok(Vec::new());
-            }
-            let source = load_page(&tx, id, MAX_CHUNK_BYTES)?;
-            let page = source.page;
+            let page = if super::provider_inbox::released(&tx, id.0)? {
+                let cursor: String = tx.query_row(
+                    "SELECT p.request_cursor FROM provider_shadow_pages p
+                     JOIN account_owner a USING(account_key,provider_key)
+                     WHERE a.singleton=1 AND p.id=?1 AND p.scope=?2 AND p.more_coming=1",
+                    params![id.0, root.spec.scope],
+                    |row| row.get(0),
+                )?;
+                // A sibling pass or a previous replay can already have kept
+                // this exact original. Reuse its bytes, not its admission.
+                let body = match refreshed {
+                    Some(body) => body,
+                    None => {
+                        let original: Option<Vec<u8>> = tx
+                            .query_row(
+                                "SELECT p.body FROM provider_selection_rank_pages p
+                             JOIN provider_shadow_pages s ON s.id=?1 AND s.body_hash=p.body_hash
+                             WHERE p.generation=?2 AND length(p.body)<=?3 LIMIT 1",
+                                params![id.0, root.id, MAX_CHUNK_BYTES as i64],
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+                        let Some(body) = original else {
+                            return Ok(ReplayPageCapture::Released(cursor));
+                        };
+                        body
+                    }
+                };
+                let Ok(page) =
+                    crate::icloud::photos::catalog_observed_page(body, &root.spec.scope, &cursor)
+                else {
+                    return Ok(ReplayPageCapture::Captured(Vec::new()));
+                };
+                if !super::provider_inbox::matches_released_body(&tx, id, &page)? {
+                    return Ok(ReplayPageCapture::Captured(Vec::new()));
+                }
+                page
+            } else {
+                load_page(&tx, id, MAX_CHUNK_BYTES)?.page
+            };
             if page.scope != root.spec.scope
                 || !page.more_coming
                 || page.request_cursor == page.successor
@@ -2276,7 +2313,7 @@ impl SqliteStateDb {
                     .collect()
             };
             tx.commit()?;
-            Ok(children)
+            Ok(ReplayPageCapture::Captured(children))
         })
         .await
     }
@@ -3013,9 +3050,8 @@ fn accepted_replay_eligibility(
     }
 }
 
-/// A sibling can share the catalog entry, never its membership or destination
-/// proof. Check that this generation admitted the rendition and that no newer
-/// work changed the catalog facts before admitting another physical copy.
+/// Share only unchanged catalog facts. A previous independent publication or
+/// a sibling admitted in this generation supplies no proof for the new path.
 fn can_share_accepted_album_asset(
     conn: &Connection,
     root: &ActiveGeneration,
@@ -3024,9 +3060,6 @@ fn can_share_accepted_album_asset(
 ) -> Result<bool, StateError> {
     let decision = &manifest.decision;
     let container = root.spec.accepted_album_container(&decision.pass_key);
-    if container.is_none() && !root.spec.mixed_favorites_replay() {
-        return Ok(false);
-    }
     if manifest.state_id != decision.child
         || records.is_empty()
         || root.spec.profile.get(INDEPENDENT_ALBUM_COPIES) != Some(&Value::Bool(true))
@@ -3060,6 +3093,54 @@ fn can_share_accepted_album_asset(
         )? {
             return Ok(false);
         }
+    }
+    // A previous verified publication can identify the catalog rendition
+    // without granting membership or completion to this new destination.
+    // Match the bound media database and owner as well as the zone name.
+    let scope = decision
+        .media_source
+        .as_ref()
+        .map_or(root.spec.scope.as_str(), |s| &s.scope);
+    let mut published = conn.prepare_cached(
+        "SELECT d.generation,d.pass_key FROM provider_active_destinations d
+         JOIN provider_active_generations g ON g.id=d.generation
+         JOIN provider_active_decisions p USING(generation,pass_key,child)
+         WHERE COALESCE(json_extract(CAST(p.manifest AS TEXT),'$.decision.media_source.scope'),g.scope)=?1
+           AND d.library=?2 AND d.child=?3 AND d.asset_id=?3 AND d.master=?4
+           AND d.version_size=?5 AND d.checksum=?6 AND d.size_bytes=?7
+           AND d.admitted=1 AND d.verified_media=1 AND d.path<>?8 AND d.pass_key<>?9
+         ORDER BY g.created_at DESC LIMIT 1",
+    )?;
+    let mut prior_copy = !decision.destinations.is_empty();
+    for destination in &decision.destinations {
+        let previous: Option<(String, String)> = published
+            .query_row(
+                params![
+                    scope,
+                    manifest.media_zone(root)["zoneName"].as_str(),
+                    decision.child,
+                    decision.master,
+                    destination.version_size,
+                    destination.checksum,
+                    i64::try_from(destination.size).ok(),
+                    destination.path.key()?,
+                    decision.pass_key
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((generation, key)) = previous else {
+            prior_copy = false;
+            break;
+        };
+        let published_root = load_generation(conn, &generation)?;
+        load_decision_with_sources(conn, &published_root, &key, &decision.child, false)?;
+    }
+    if prior_copy {
+        return Ok(true);
+    }
+    if container.is_none() && !root.spec.mixed_favorites_replay() {
+        return Ok(false);
     }
     let mut siblings = conn.prepare_cached(
         "SELECT pass_key FROM provider_active_decisions

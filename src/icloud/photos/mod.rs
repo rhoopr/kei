@@ -582,6 +582,34 @@ impl PhotosService {
             &self.retry_config,
         )
         .await?;
+        {
+            anyhow::ensure!(
+                response.get("serverErrorCode").is_none_or(Value::is_null),
+                "changes/database returned a top-level provider error"
+            );
+            let zones = response
+                .get("zones")
+                .and_then(Value::as_array)
+                .context("Missing or invalid changes/database zone list")?;
+            anyhow::ensure!(
+                zones.iter().all(|zone| {
+                    zone.get("zoneID")
+                        .and_then(|id| id.get("zoneName"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.trim().is_empty())
+                        && zone.get("serverErrorCode").is_none_or(Value::is_null)
+                        && zone.get("reason").is_none_or(Value::is_null)
+                }),
+                "changes/database returned a malformed zone identity or zone error"
+            );
+            anyhow::ensure!(
+                response
+                    .get("syncToken")
+                    .and_then(Value::as_str)
+                    .is_some_and(|token| !token.trim().is_empty()),
+                "changes/database returned a blank database sync token"
+            );
+        }
         let parsed: ChangesDatabaseResponse = serde_json::from_value(response)
             .context("Could not read Apple's changes/database response")?;
         Ok(parsed)

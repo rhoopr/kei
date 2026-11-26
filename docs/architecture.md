@@ -52,6 +52,8 @@ Keep publication, current work and checkpoint decisions separate. A hold on the 
 
 Keep the previous checkpoint on incomplete token proof, interruption, stale planning, or non-durable recovery. A validated full inventory can replace older planning for the selection it covers. Historical uncertainty alone does not require repair before current progress. Unknown **current** provider identity keeps work pending. A missing observation or verified local copy does not prove that the provider deleted its source.
 
+A verified copy in a prior album can establish catalog identity. Current selection evidence and an independent destination receipt still govern each new copy. Missing required provider position evidence makes the cycle a partial failure even if every transfer succeeded.
+
 Unknown indexing readiness before enumeration defers the affected library after two short retries. An unknown closing probe holds its checkpoint immediately. Independent libraries can advance their own checkpoints. Watch mode retries incomplete discovery before publishing a library map. See [checkpoint decisions and enumeration](architecture/checkpoints.md).
 
 Selection evidence limits apply to individual writes and validation operations. Retained history does not consume the next library's or restarted baseline's write allowance.

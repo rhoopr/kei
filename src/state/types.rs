@@ -655,6 +655,9 @@ impl AssetRecord {
 /// Statistics for a single sync run.
 #[derive(Debug, Clone, Default)]
 pub struct SyncRunStats {
+    /// The completed cycle reported partial failure, including a checkpoint
+    /// failure with no failed file transfers.
+    pub partial_failure: bool,
     /// Number of assets seen during the sync.
     pub assets_seen: u64,
     /// Number of assets successfully downloaded.

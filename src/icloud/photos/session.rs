@@ -230,6 +230,11 @@ async fn post_response(
     let resp = builder.send().await?;
     let status = resp.status();
 
+    // An unfollowed redirect can carry a success-shaped body. It is not a
+    // successful CloudKit response. Keep the typed 4xx/5xx handling below.
+    if !status.is_success() && !status.is_client_error() && !status.is_server_error() {
+        return Err(ChangesBodyRejection::UnsuccessfulStatus.into_shadow_error());
+    }
     if status.is_client_error() || status.is_server_error() {
         let url = resp.url().to_string();
         let retry_after = parse_retry_after_header(resp.headers(), RETRY_AFTER_MAX);
@@ -446,6 +451,20 @@ fn is_service_not_activated(code: &str, reason: &str) -> bool {
 /// Check a `CloudKit` JSON response for `serverErrorCode` or per-record errors.
 /// Returns `Err` if a server error is found, `Ok(response)` otherwise.
 fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
+    // A malformed error beside records and a token is still an error. This
+    // also protects ordinary rank queries that do not capture original pages.
+    let malformed_code = |item: &Value| {
+        item.get("serverErrorCode")
+            .is_some_and(|code| !code.is_null() && !code.is_string())
+    };
+    anyhow::ensure!(
+        !malformed_code(&response)
+            && !response
+                .get("records")
+                .and_then(Value::as_array)
+                .is_some_and(|records| records.iter().any(malformed_code)),
+        super::error::ReplayRefusal::UnsuccessfulResponse
+    );
     // Top-level serverErrorCode (e.g. from CAS Op-Lock)
     if let Some(code) = response.get("serverErrorCode").and_then(Value::as_str) {
         let reason = response
@@ -1045,6 +1064,16 @@ mod tests {
         let result = check_cloudkit_errors(response.clone());
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), response);
+    }
+
+    #[test]
+    fn success_shaped_rank_pages_cannot_hide_malformed_error_codes() {
+        for response in [
+            serde_json::json!({"records": [], "syncToken": "plausible", "serverErrorCode": {}}),
+            serde_json::json!({"records": [{"recordName": "peer", "serverErrorCode": false}], "syncToken": "plausible"}),
+        ] {
+            assert!(check_cloudkit_errors(response).is_err());
+        }
     }
 
     #[test]

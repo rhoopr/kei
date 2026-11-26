@@ -4,13 +4,15 @@
 //! (monitoring tools, Home Assistant, webhooks). In watch mode the file is
 //! overwritten every cycle — it's the current cycle's state, not a history log.
 //!
-//! # Schema v3
+//! # Schema v4
 //!
-//! v3 adds metadata-capture revision and repair progress to `stats`.
+//! Failed rows have report-local labels. Account names, provider IDs, stored
+//! error text, and free-form paths, templates and album names are private.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::download::SyncStats;
 use crate::fs_util::atomic_install;
@@ -20,6 +22,17 @@ use crate::state::AssetRecord;
 /// failures doesn't blow up the report JSON. The tail count is preserved in
 /// `failed_assets_truncated`.
 pub(crate) const FAILED_ASSETS_CAP: usize = 200;
+pub(crate) const REPORT_VERSION: &str = "4";
+
+pub(crate) fn library_label(value: &str) -> String {
+    match value {
+        "PrimarySync" | "all" | "primary" | "shared" | "none" => value.to_owned(),
+        _ => {
+            let hash = format!("{:x}", Sha256::digest(value.as_bytes()));
+            format!("library-{hash:.16}")
+        }
+    }
+}
 
 /// Structured per-asset failure entry for operators to consume without
 /// grepping the log. Populated from the state DB after the sync cycle
@@ -32,11 +45,22 @@ pub(crate) struct FailedAssetEntry {
 }
 
 impl FailedAssetEntry {
-    pub(crate) fn from_record(r: &AssetRecord) -> Self {
+    pub(crate) fn from_record(index: usize, r: &AssetRecord) -> Self {
         Self {
-            id: r.id.to_string(),
+            id: format!("failure-{}", index + 1),
             version_size: r.version_size.as_str().to_string(),
-            error_message: r.last_error.clone(),
+            error_message: r.last_error.as_deref().map(|text| {
+                // The message may contain a signed URL, an account name or a
+                // provider response. Only copy the numeric HTTP status.
+                text.strip_prefix("Apple returned HTTP ")
+                    .and_then(|rest| rest.split_once(" while downloading "))
+                    .and_then(|(code, _path)| code.parse::<u16>().ok())
+                    .filter(|code| (100..=599).contains(code))
+                    .map_or_else(
+                        || "Transfer failed".to_owned(),
+                        |code| format!("HTTP {code}"),
+                    )
+            }),
         }
     }
 }
@@ -81,9 +105,8 @@ const fn is_zero_usize(n: &usize) -> bool {
 /// bump the report schema version.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RunOptions {
+    #[serde(serialize_with = "serialize_account_label")]
     pub username: String,
-    pub download_dir: PathBuf,
-    pub folder_structure: String,
     pub resolution: String,
     pub live_photo_mode: String,
     pub live_resolution: String,
@@ -94,7 +117,6 @@ pub(crate) struct RunOptions {
     pub raw_policy: String,
     pub file_match_policy: String,
     pub force_resolution: bool,
-    pub albums: Vec<String>,
     pub library: String,
     pub media: Vec<crate::config::MediaKind>,
     pub skip_videos: bool,
@@ -112,13 +134,18 @@ pub(crate) struct RunOptions {
     pub dry_run: bool,
 }
 
+fn serialize_account_label<S: serde::Serializer>(
+    _: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str("configured-account")
+}
+
 impl RunOptions {
     /// Build from the resolved Config. Only includes user-facing settings.
     pub(crate) fn from_config(config: &crate::config::Config) -> Self {
         Self {
             username: config.auth.username.clone(),
-            download_dir: config.download.directory.clone(),
-            folder_structure: config.download.folder_structure.clone(),
             resolution: format!("{:?}", config.photos.resolution).to_lowercase(),
             live_photo_mode: format!("{:?}", config.photos.live_photo_mode).to_lowercase(),
             live_resolution: format!("{:?}", config.photos.live_resolution).to_lowercase(),
@@ -132,8 +159,15 @@ impl RunOptions {
             },
             file_match_policy: format!("{:?}", config.photos.file_match_policy).to_lowercase(),
             force_resolution: config.photos.force_resolution,
-            albums: config.filters.selection.albums.to_raw(),
-            library: config.filters.selection.libraries.to_raw().join(","),
+            library: config
+                .filters
+                .selection
+                .libraries
+                .to_raw()
+                .iter()
+                .map(|name| library_label(name))
+                .collect::<Vec<_>>()
+                .join(","),
             media: config.filters.media.to_kinds(),
             skip_videos: config.filters.skip_videos,
             skip_photos: config.filters.skip_photos,
@@ -218,15 +252,13 @@ mod tests {
     #[test]
     fn report_serialization_roundtrip() {
         let report = SyncReport {
-            version: "3",
+            version: REPORT_VERSION,
             kei_version: "0.7.12",
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "success".to_string(),
             options: RunOptions {
                 set_exif_orientation: false,
                 username: "user@example.com".to_string(),
-                download_dir: PathBuf::from("/photos"),
-                folder_structure: "{:%Y/%m/%d}".to_string(),
                 resolution: "original".to_string(),
                 live_photo_mode: "original".to_string(),
                 live_resolution: "original".to_string(),
@@ -236,7 +268,6 @@ mod tests {
                 raw_policy: "as-is".to_string(),
                 force_resolution: false,
                 file_match_policy: "name-size-dedup".to_string(),
-                albums: vec!["Favorites".to_string()],
                 library: "personal".to_string(),
                 media: crate::config::MediaSelection::all().to_kinds(),
                 skip_videos: false,
@@ -288,7 +319,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&report).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
 
-        assert_eq!(parsed["version"], "3");
+        assert_eq!(parsed["version"], "4");
         assert_eq!(parsed["status"], "success");
         assert_eq!(parsed["stats"]["downloaded"], 50);
         assert_eq!(parsed["stats"]["api_total_at_start"], 405);
@@ -303,7 +334,7 @@ mod tests {
         assert_eq!(parsed["stats"]["inventory_drop_current_total"], 405);
         assert_eq!(parsed["stats"]["inventory_drop_library"], "PrimarySync");
         assert_eq!(parsed["stats"]["skipped"]["by_state"], 300);
-        assert_eq!(parsed["options"]["username"], "user@example.com");
+        assert_eq!(parsed["options"]["username"], "configured-account");
         assert!(
             parsed["options"]["set_exif_datetime"]
                 .as_bool()
@@ -312,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn run_options_from_config_uses_schema_v2_option_names() {
+    fn run_options_from_config_omits_private_free_text() {
         let download_dir = tempfile::tempdir().expect("download dir");
         let globals = crate::config::GlobalArgs {
             config_source: Default::default(),
@@ -337,22 +368,21 @@ mod tests {
         .expect("build config");
 
         let options = RunOptions::from_config(&config);
-        assert_eq!(options.download_dir, download_dir.path());
         assert_eq!(options.threads, 6);
 
         let json = serde_json::to_value(&options).expect("serialize options");
-        assert_eq!(
-            json["download_dir"],
-            download_dir.path().display().to_string()
-        );
+        for key in ["download_dir", "folder_structure", "albums"] {
+            assert!(json.get(key).is_none());
+        }
+        assert!(!json.to_string().contains("report@example.com"));
         assert_eq!(json["threads"], 6);
         assert!(
             json.get("directory").is_none(),
-            "schema v3 must not emit the legacy options.directory key"
+            "must not emit the legacy options.directory key"
         );
         assert!(
             json.get("threads_num").is_none(),
-            "schema v3 must not emit the legacy options.threads_num key"
+            "must not emit the legacy options.threads_num key"
         );
     }
 
@@ -405,15 +435,13 @@ mod tests {
         // and is_zero_usize on failed_assets_truncated must keep clean-run
         // reports free of both fields.
         let report = SyncReport {
-            version: "3",
+            version: REPORT_VERSION,
             kei_version: "test",
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "success".to_string(),
             options: RunOptions {
                 set_exif_orientation: false,
                 username: "u".to_string(),
-                download_dir: PathBuf::from("/x"),
-                folder_structure: String::new(),
                 resolution: String::new(),
                 live_photo_mode: String::new(),
                 live_resolution: String::new(),
@@ -423,7 +451,6 @@ mod tests {
                 raw_policy: String::new(),
                 force_resolution: false,
                 file_match_policy: String::new(),
-                albums: vec![],
                 library: String::new(),
                 media: crate::config::MediaSelection::all().to_kinds(),
                 skip_videos: false,
@@ -457,20 +484,18 @@ mod tests {
     #[test]
     fn failed_assets_serialize_when_present() {
         let entry = FailedAssetEntry {
-            id: "ASSET_1".to_string(),
+            id: "failure-1".to_string(),
             version_size: "original".to_string(),
             error_message: Some("HTTP 429".to_string()),
         };
         let report = SyncReport {
-            version: "3",
+            version: REPORT_VERSION,
             kei_version: "test",
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "partial_failure".to_string(),
             options: RunOptions {
                 set_exif_orientation: false,
                 username: "u".to_string(),
-                download_dir: PathBuf::from("/x"),
-                folder_structure: String::new(),
                 resolution: String::new(),
                 live_photo_mode: String::new(),
                 live_resolution: String::new(),
@@ -480,7 +505,6 @@ mod tests {
                 raw_policy: String::new(),
                 force_resolution: false,
                 file_match_policy: String::new(),
-                albums: vec![],
                 library: String::new(),
                 media: crate::config::MediaSelection::all().to_kinds(),
                 skip_videos: false,
@@ -505,7 +529,7 @@ mod tests {
         };
         let parsed: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
-        assert_eq!(parsed["failed_assets"][0]["id"], "ASSET_1");
+        assert_eq!(parsed["failed_assets"][0]["id"], "failure-1");
         assert_eq!(parsed["failed_assets"][0]["version_size"], "original");
         assert_eq!(parsed["failed_assets"][0]["error_message"], "HTTP 429");
         assert!(parsed["failed_assets_truncated"].is_null());
@@ -514,15 +538,13 @@ mod tests {
     #[test]
     fn failed_assets_truncated_emitted_when_nonzero() {
         let report = SyncReport {
-            version: "3",
+            version: REPORT_VERSION,
             kei_version: "test",
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "partial_failure".to_string(),
             options: RunOptions {
                 set_exif_orientation: false,
                 username: "u".to_string(),
-                download_dir: PathBuf::from("/x"),
-                folder_structure: String::new(),
                 resolution: String::new(),
                 live_photo_mode: String::new(),
                 live_resolution: String::new(),
@@ -532,7 +554,6 @@ mod tests {
                 raw_policy: String::new(),
                 force_resolution: false,
                 file_match_policy: String::new(),
-                albums: vec![],
                 library: String::new(),
                 media: crate::config::MediaSelection::all().to_kinds(),
                 skip_videos: false,
@@ -567,15 +588,13 @@ mod tests {
         let path = dir.path().join("report.json");
 
         let report = SyncReport {
-            version: "3",
+            version: REPORT_VERSION,
             kei_version: "0.7.12",
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "success".to_string(),
             options: RunOptions {
                 set_exif_orientation: false,
                 username: "test@example.com".to_string(),
-                download_dir: PathBuf::from("/tmp/photos"),
-                folder_structure: "{:%Y/%m/%d}".to_string(),
                 resolution: "original".to_string(),
                 live_photo_mode: "original".to_string(),
                 live_resolution: "original".to_string(),
@@ -585,7 +604,6 @@ mod tests {
                 raw_policy: "as-is".to_string(),
                 force_resolution: false,
                 file_match_policy: "name-size-dedup".to_string(),
-                albums: vec![],
                 library: "personal".to_string(),
                 media: crate::config::MediaSelection::all().to_kinds(),
                 skip_videos: false,
@@ -610,7 +628,7 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
-        assert_eq!(parsed["version"], "3");
-        assert_eq!(parsed["options"]["username"], "test@example.com");
+        assert_eq!(parsed["version"], "4");
+        assert_eq!(parsed["options"]["username"], "configured-account");
     }
 }

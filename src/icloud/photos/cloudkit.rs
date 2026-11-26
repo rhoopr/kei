@@ -77,7 +77,9 @@ pub(crate) struct Record {
 pub(crate) struct ChangesDatabaseResponse {
     pub sync_token: String,
     pub more_coming: bool,
-    #[serde(default)]
+    /// Required: a missing `zones` field is not equivalent to an explicit
+    /// empty list. Callers treat an absent or malformed list as an unusable
+    /// pre-check and fall back to a full cycle rather than skipping.
     pub zones: Vec<ChangedZoneInfo>,
 }
 
@@ -308,17 +310,14 @@ mod tests {
     }
 
     #[test]
-    fn changes_database_response_missing_zones_defaults_empty() {
+    fn changes_database_response_missing_zones_is_rejected() {
         let json = r#"{
             "syncToken": "db-token-no-zones",
             "moreComing": false
         }"#;
-        let resp: ChangesDatabaseResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.sync_token, "db-token-no-zones");
-        assert!(!resp.more_coming);
         assert!(
-            resp.zones.is_empty(),
-            "missing zones must parse as an empty changes list"
+            serde_json::from_str::<ChangesDatabaseResponse>(json).is_err(),
+            "missing zones must not parse as an empty changes list"
         );
     }
 

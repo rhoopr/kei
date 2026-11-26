@@ -196,6 +196,33 @@ fn checked_released_replay(
     Ok(true)
 }
 
+/// A released page's catalog receipt never proves today's membership. Match
+/// the re-read body against its original observation, allowing only the
+/// existing transport normalization for refreshed signed URLs.
+pub(super) fn matches_released_body(
+    conn: &Connection,
+    id: CapturedPageId,
+    page: &ObservedPage,
+) -> Result<bool, StateError> {
+    let (account, provider, hash): (String, String, String) = conn.query_row(
+        "SELECT account_key,provider_key,body_hash FROM provider_shadow_pages WHERE id=?1",
+        [id.0],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    if format!("{:x}", Sha256::digest(&page.body)) != hash {
+        let Some(evidence) = crate::icloud::photos::transport_evidence::capture_evidence(page)
+            .map_err(|_invalid| StateError::ProviderInboxInvalid)?
+        else {
+            return Ok(false);
+        };
+        let key = canonical_key(&account, &provider, page, &evidence)?;
+        if !conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_transport_canonical WHERE page_id=?1 AND version=?2 AND canonical_sha=?3)",params![id.0,evidence.version,key],|r|r.get::<_,bool>(0))? {
+            return Ok(false);
+        }
+    }
+    checked_released_replay(conn, id.0, page)
+}
+
 impl SqliteStateDb {
     #[cfg(test)]
     pub(crate) async fn capture_shadow_page(

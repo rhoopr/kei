@@ -71,9 +71,9 @@ async fn offline_replay_full_pass_fixture() {
 #[tokio::test]
 async fn offline_replay_paginated_full_pass_fixture() {
     let mock = MockPhotosFlow::new()
-        .query_photo_page("master-replay-page-1", Some("token-page-1"))
-        .query_photo_page("master-replay-page-2", Some("token-page-2"))
-        .empty_query_page(Some("token-page-2"))
+        .query_photo_page("master-replay-page-1", Some("stable-position"))
+        .query_photo_page("master-replay-page-2", Some("stable-position"))
+        .empty_query_page(None)
         .build();
     let album = make_album_with_session(1, Box::new(mock));
 
@@ -82,7 +82,7 @@ async fn offline_replay_paginated_full_pass_fixture() {
     assert_eq!(drain_photo_stream_count(stream).await, 2);
     assert_eq!(
         token_rx.await.expect("sync token sender").as_deref(),
-        Some("token-page-2")
+        Some("stable-position")
     );
 }
 

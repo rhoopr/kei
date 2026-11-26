@@ -84,7 +84,6 @@ pub(super) fn log_interrupted_download(
 ) {
     pb.suspend(|| {
         tracing::info!(target: "kei::download::pipeline",
-            asset_id = %task.asset_id,
             path = %task.download_path.display(),
             error = %error,
             "Download interrupted before final publish"

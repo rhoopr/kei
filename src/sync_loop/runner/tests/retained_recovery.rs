@@ -69,6 +69,8 @@ enum Fault {
     NullZoneEntryOnContinuation,
     NullResponseOnContinuation,
     MalformedJsonOnContinuation,
+    MalformedResponseError,
+    RedirectOnContinuation,
     DuplicateJsonKeysOnContinuation,
     OversizedBodyOnContinuation,
     WrongOwnerOnContinuation,
@@ -529,6 +531,8 @@ impl PhotosSession for RetainedSession {
                     | Fault::NullZoneEntryOnContinuation
                     | Fault::NullResponseOnContinuation
                     | Fault::MalformedJsonOnContinuation
+                    | Fault::MalformedResponseError
+                    | Fault::RedirectOnContinuation
                     | Fault::DuplicateJsonKeysOnContinuation
                     | Fault::OversizedBodyOnContinuation
                     | Fault::WrongOwnerOnContinuation
@@ -1918,6 +1922,13 @@ async fn malformed_json_on_http_continuation_preserves_retry_and_allows_later_li
 }
 
 #[tokio::test]
+async fn success_shaped_errors_cannot_replace_a_saved_checkpoint() {
+    for fault in [Fault::MalformedResponseError, Fault::RedirectOnContinuation] {
+        assert_zone_replay_isolation(fault).await;
+    }
+}
+
+#[tokio::test]
 async fn duplicate_json_keys_on_http_continuation_preserve_retry_and_allow_later_library_download()
 {
     assert_zone_replay_isolation(Fault::DuplicateJsonKeysOnContinuation).await;
@@ -2032,6 +2043,53 @@ async fn authentication_failure_on_continuation_stops_later_library_download() {
 }
 
 async fn assert_zone_replay_isolation(fault: Fault) {
+    Box::pin(check_replay_with_prior_album(fault, None)).await;
+}
+
+#[tokio::test]
+async fn verified_prior_album_preserves_its_copy_while_new_destinations_publish() {
+    for media in [
+        AcceptedMedia::OverlapWithRemovedLink,
+        AcceptedMedia::FavoritesUnfiled {
+            unfiled_first: true,
+            favorite: FavoriteLookup::Current,
+            same_folder: false,
+        },
+        AcceptedMedia::TwoAlbumRemovals { missing: None },
+        AcceptedMedia::TwoAlbumRemovals {
+            missing: Some(REMOVED_LINK),
+        },
+        AcceptedMedia::TwoAlbumRemovals {
+            missing: Some(SECOND_REMOVED_LINK),
+        },
+        AcceptedMedia::ForeignAlbum(ForeignLookup::Current),
+        AcceptedMedia::ForeignAlbum(ForeignLookup::WrongMediaScope),
+        AcceptedMedia::FavoritesUnfiled {
+            unfiled_first: false,
+            favorite: FavoriteLookup::Unmarked,
+            same_folder: false,
+        },
+    ] {
+        Box::pin(check_replay_with_prior_album(
+            Fault::RejectedContinuationAfterMedia(media),
+            Some(if matches!(media, AcceptedMedia::ForeignAlbum(_)) {
+                "shared"
+            } else {
+                "private"
+            }),
+        ))
+        .await;
+    }
+    // The zone name alone does not identify a database. A namesake private
+    // receipt must not authorize reuse of the catalog row for shared media.
+    Box::pin(check_replay_with_prior_album(
+        Fault::RejectedContinuationAfterMedia(AcceptedMedia::ForeignAlbum(ForeignLookup::Current)),
+        Some("private"),
+    ))
+    .await;
+}
+
+async fn check_replay_with_prior_album(fault: Fault, prior_database: Option<&str>) {
     use base64::Engine as _;
     use rusqlite::types::Value as SqlValue;
     use sha2::{Digest, Sha256};
@@ -2137,30 +2195,35 @@ async fn assert_zone_replay_isolation(fault: Fault) {
                 | AcceptedMedia::ForeignAlbum(_)
         )
     );
-    let verified_accepted = matches!(
-        fault,
-        Fault::RejectedContinuationAfterMedia(
-            AcceptedMedia::Confirmed
-                | AcceptedMedia::CurrentAlbumMember
-                | AcceptedMedia::MixedAlbums
-                | AcceptedMedia::OverlappingAlbums
-                | AcceptedMedia::OverlapWithRemovedLink
-                | AcceptedMedia::ConfirmedUnfiled
-                | AcceptedMedia::TwoAlbumRemovals { missing: None }
-                | AcceptedMedia::MissingMaster(MissingMasterLookup::Confirmed)
-                | AcceptedMedia::RetainedLink(RetainedLinkLookup::Current)
-                | AcceptedMedia::Favorites(FavoriteLookup::Current)
-                | AcceptedMedia::FavoritesUnfiled { .. }
-                | AcceptedMedia::ForeignAlbum(ForeignLookup::Current)
-        )
-    );
+    let verified_accepted = (foreign.is_none() || prior_database != Some("private"))
+        && matches!(
+            fault,
+            Fault::RejectedContinuationAfterMedia(
+                AcceptedMedia::Confirmed
+                    | AcceptedMedia::CurrentAlbumMember
+                    | AcceptedMedia::MixedAlbums
+                    | AcceptedMedia::OverlappingAlbums
+                    | AcceptedMedia::OverlapWithRemovedLink
+                    | AcceptedMedia::ConfirmedUnfiled
+                    | AcceptedMedia::TwoAlbumRemovals { missing: None }
+                    | AcceptedMedia::MissingMaster(MissingMasterLookup::Confirmed)
+                    | AcceptedMedia::RetainedLink(RetainedLinkLookup::Current)
+                    | AcceptedMedia::Favorites(FavoriteLookup::Current)
+                    | AcceptedMedia::FavoritesUnfiled { .. }
+                    | AcceptedMedia::ForeignAlbum(ForeignLookup::Current)
+            )
+        );
     let accepted_media = if matches!(fault, Fault::RejectedContinuationAfterMedia(_)) {
         let bytes = include_bytes!("../../../../tests/data/media/metadata.jpg").to_vec();
         let checksum = Sha256::digest(&bytes);
         Mock::given(method("GET"))
             .and(path("/accepted.jpg"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
-            .expect(u64::from(verified_accepted) + u64::from(second_copy))
+            .expect(
+                u64::from(verified_accepted)
+                    + u64::from(second_copy)
+                    + u64::from(prior_database.is_some()),
+            )
             .mount(&server)
             .await;
         let mut page = full_album_page_with_download(
@@ -2234,6 +2297,17 @@ async fn assert_zone_replay_isolation(fault: Fault) {
         None
     };
     let refused_body = match fault {
+        Fault::MalformedResponseError | Fault::RedirectOnContinuation => {
+            let mut body = json!({"zones":[{
+                "zoneID":{"zoneName":ZONE,"ownerRecordName":"_defaultOwner"},
+                "records":[{"recordName":"asset-HISTORY","deleted":true}],
+                "syncToken":"untrusted-position","moreComing":false
+            }]});
+            if fault == Fault::MalformedResponseError {
+                body["serverErrorCode"] = json!({"malformed":true});
+            }
+            Some(serde_json::to_vec(&body).unwrap())
+        }
         Fault::MalformedJsonOnContinuation => {
             Some(br#"{"zones":[{"private-truncated-response""#.to_vec())
         }
@@ -2262,9 +2336,13 @@ async fn assert_zone_replay_isolation(fault: Fault) {
                 r#""syncToken":"{CONTINUATION}""#
             )))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(body)
-                    .insert_header("Content-Type", "application/json"),
+                ResponseTemplate::new(if fault == Fault::RedirectOnContinuation {
+                    300
+                } else {
+                    200
+                })
+                .set_body_bytes(body)
+                .insert_header("Content-Type", "application/json"),
             )
             .expect(3)
             .mount(&server)
@@ -2304,6 +2382,79 @@ async fn assert_zone_replay_isolation(fault: Fault) {
     };
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
 
+    let old_file = fixture.media.join(UNRESOLVED_ALBUM).join("accepted.JPG");
+    const PRIOR_PATH_RECEIPT: &str = "SELECT * FROM provider_active_destinations WHERE compat_path LIKE '%/Unresolved Album/accepted.JPG'";
+    let sidecar = old_file.with_added_extension("xmp");
+    let snapshot = |p: &Path| {
+        (
+            std::fs::read(p).unwrap(),
+            std::fs::metadata(p).unwrap().modified().unwrap(),
+        )
+    };
+    let prior = if let Some(database) = prior_database {
+        let (bytes, records) = accepted_media.as_ref().unwrap();
+        let db = open_owned_cycle_db(&fixture.database).await;
+        let zone = if foreign.is_some() {
+            FOREIGN_ZONE
+        } else {
+            ZONE
+        };
+        let mut pair = records[..2].to_vec();
+        pair[1]["fields"]["masterRef"]["value"]["zoneID"]["zoneName"] = json!(zone);
+        let session = MutableCaptureSession {
+            zone,
+            token: "prior-good",
+            cancel_after_lookup: None,
+            records: Arc::new(std::sync::Mutex::new(pair)),
+            repair_requests: Default::default(),
+        };
+        let mut album = make_owned_cycle_container_album(
+            &db,
+            zone,
+            UNRESOLVED_ALBUM,
+            UNRESOLVED_CONTAINER,
+            Box::new(session),
+        );
+        let (capture, _, _) = album.current_selection_scope().unwrap().unwrap();
+        album.set_shadow_capture(capture, database.into());
+        let pass = AlbumPass {
+            kind: PassKind::Album,
+            album,
+            exclude_ids: Arc::default(),
+        };
+        let cfg = make_run_cycle_download_config_builder_with_options(
+            &fixture.media,
+            db.clone(),
+            RunCycleDownloadConfigOptions {
+                per_pass_paths: true,
+                ..Default::default()
+            },
+        )(
+            download::SyncMode::Full,
+            Arc::default(),
+            Arc::default(),
+            zone.into(),
+        );
+        let saved = download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &[pass],
+            cfg,
+            download::DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.stats.downloaded, 1);
+        assert_eq!(std::fs::read(&old_file).unwrap(), *bytes);
+        std::fs::write(&sidecar, b"retained sidecar").unwrap();
+        Some((
+            snapshot(&old_file),
+            snapshot(&sidecar),
+            rows(&fixture.database, PRIOR_PATH_RECEIPT),
+        ))
+    } else {
+        None
+    };
     for cycle in 0..3 {
         let db = open_owned_cycle_db(&fixture.database).await;
         let cancel = CancellationToken::new();
@@ -2467,6 +2618,8 @@ async fn assert_zone_replay_isolation(fault: Fault) {
                         "icloud_changes_invalid_zones_field"
                     }
                     Fault::MalformedJsonOnContinuation => "icloud_changes_malformed_json",
+                    Fault::MalformedResponseError | Fault::RedirectOnContinuation =>
+                        "icloud_changes_unsuccessful_response",
                     Fault::DuplicateJsonKeysOnContinuation => "icloud_changes_duplicate_json_keys",
                     Fault::OversizedBodyOnContinuation => "icloud_changes_oversized_body",
                     Fault::WrongOwnerOnContinuation => "icloud_changes_zone_owner_mismatch",
@@ -2503,7 +2656,12 @@ async fn assert_zone_replay_isolation(fault: Fault) {
             assert!(result.stats.full_enumeration_reason.is_none());
             assert_eq!(result.stats.api_total_at_start, None);
         }
-        assert_eq!(provider.retained.load(Ordering::SeqCst), 1);
+        let compacted_rereads =
+            usize::from(prior_database.is_some() && favorite_mix.is_some() && cycle == 0);
+        assert_eq!(
+            provider.retained.load(Ordering::SeqCst),
+            1 + compacted_rereads
+        );
         assert_eq!(provider.inventories.load(Ordering::SeqCst), 0);
         assert_eq!(db.get_metadata(HOLD_KEY).await.unwrap(), None);
         let page_count = 1 + usize::from(!first_page_refusal);
@@ -2514,7 +2672,7 @@ async fn assert_zone_replay_isolation(fault: Fault) {
         };
         assert_eq!(
             provider.requests.load(Ordering::SeqCst),
-            page_count + lookups
+            page_count + lookups + compacted_rereads
         );
         assert_eq!(
             db.get_metadata(CURSOR_KEY).await.unwrap().as_deref(),
@@ -2579,6 +2737,54 @@ async fn assert_zone_replay_isolation(fault: Fault) {
                     .unwrap(),
                 fixture.bytes
             );
+        }
+        if let Some(prior) = &prior {
+            assert_eq!(snapshot(&old_file), prior.0);
+            assert_eq!(snapshot(&sidecar), prior.1);
+            assert_eq!(rows(&fixture.database, PRIOR_PATH_RECEIPT), prior.2);
+            assert_eq!(prior.2.len(), 1);
+            let folders: &[&str] = if !verified_accepted {
+                &[]
+            } else if favorite_mix.is_some() && !second_copy {
+                &["unfiled"]
+            } else if favorite_mix.is_some() {
+                &[FAVORITES, "unfiled"]
+            } else if mixed_unfiled {
+                &["2023/11/14"]
+            } else {
+                &[ACCEPTED_ALBUM]
+            };
+            let gets = server
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.url.path() == "/accepted.jpg")
+                .count();
+            assert_eq!(gets, 1 + folders.len(), "{fault:?} cycle {cycle}");
+            for folder in [FAVORITES, "unfiled", "2023/11/14", ACCEPTED_ALBUM] {
+                assert_eq!(
+                    fixture.media.join(folder).join("accepted.JPG").exists(),
+                    folders.contains(&folder),
+                    "{fault:?} cycle {cycle}: {folder}"
+                );
+            }
+            for folder in folders {
+                let path = fixture.media.join(folder).join("accepted.JPG");
+                assert_eq!(
+                    std::fs::read(&path).unwrap_or_else(|e| panic!("{fault:?} {path:?}: {e}")),
+                    prior.0.0
+                );
+                let conn = rusqlite::Connection::open(&fixture.database).unwrap();
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM provider_active_destinations WHERE compat_path=?1 AND verified_media=1 AND child='asset-accepted-page-master'",[path.to_str().unwrap()],|r| r.get::<_,i64>(0)).unwrap(),1);
+            }
+            assert_eq!(
+                result.stats.downloaded,
+                usize::from(cycle == 0) * (1 + folders.len()),
+                "{fault:?}"
+            );
+            fixture.assert_preserved();
+            continue;
         }
         if let Some((bytes, _)) = &accepted_media {
             let child = format!("asset-{ACCEPTED_MASTER}");

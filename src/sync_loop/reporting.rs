@@ -20,6 +20,11 @@ pub(super) fn merge_refresh_tail_outcome(
 
 fn sync_run_stats_from_cycle(cycle_result: &crate::sync_cycle::CycleResult) -> state::SyncRunStats {
     state::SyncRunStats {
+        partial_failure: crate::cycle_reporter::classify_cycle(
+            &cycle_result.stats,
+            cycle_result.failed_count,
+            cycle_result.session_expired,
+        ) == crate::cycle_reporter::CycleStatus::Failed,
         assets_seen: cycle_result.stats.assets_seen,
         assets_downloaded: u64::try_from(cycle_result.stats.downloaded).unwrap_or(u64::MAX),
         assets_failed: u64::try_from(cycle_result.stats.failed).unwrap_or(u64::MAX),

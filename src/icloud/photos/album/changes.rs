@@ -72,7 +72,9 @@ fn classify_replay_page_refusal(
         refusal @ (ReplayRefusal::InvalidContinuationFlag
         | ReplayRefusal::InvalidReason
         | ReplayRefusal::InvalidRecords
-        | ReplayRefusal::RecordError),
+        | ReplayRefusal::RecordError
+        | ReplayRefusal::UnsuccessfulResponse
+        | ReplayRefusal::MissingSuccessor),
     ) = error.downcast_ref::<ReplayRefusal>()
     {
         return Some(*refusal);
@@ -94,6 +96,10 @@ struct ValidatedChangesPage {
 
 impl ValidatedChangesPage {
     fn parse(mut response: Value, requested_zone: &Value) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            response.get("serverErrorCode").is_none_or(Value::is_null),
+            ReplayRefusal::UnsuccessfulResponse
+        );
         let requested_name = requested_zone
             .get("zoneName")
             .and_then(Value::as_str)
@@ -298,6 +304,25 @@ pub(super) fn validated_membership_page(request: &Value, body: &[u8]) -> anyhow:
 }
 
 impl PhotoAlbum {
+    /// Read just the compacted page at its original position. The state owner
+    /// matches the body to its durable receipt before it can supply a candidate.
+    pub(crate) async fn reread_replay_page(&self, cursor: &str) -> anyhow::Result<Vec<u8>> {
+        let url = format!(
+            "{}/changes/zone?{}",
+            self.service_endpoint,
+            encode_params(&self.params)
+        );
+        let request =
+            build_changes_zone_request(&self.zone_id, Some(cursor), CHANGES_REPLAY_PAGE_SIZE);
+        session::retry_post_changes_body(
+            self.session.as_ref(),
+            &url,
+            &request.to_string(),
+            &[("Content-type", "text/plain")],
+            &self.retry_config,
+        )
+        .await
+    }
     pub(super) async fn scan_changes_zone<F>(&self, mut on_record: F) -> anyhow::Result<()>
     where
         F: FnMut(cloudkit::Record) -> bool,
@@ -523,6 +548,7 @@ impl PhotoAlbum {
                         Ok(body) => body,
                         Err(error) => {
                             let refusal = match ChangesBodyRejection::from_shadow_error(&error) {
+                                Some(ChangesBodyRejection::UnsuccessfulStatus) => ReplayRefusal::UnsuccessfulResponse,
                                 Some(ChangesBodyRejection::TooLarge) => ReplayRefusal::OversizedBody,
                                 Some(ChangesBodyRejection::Malformed) => ReplayRefusal::MalformedJson,
                                 Some(ChangesBodyRejection::DuplicateKeys) => ReplayRefusal::DuplicateJsonKeys,

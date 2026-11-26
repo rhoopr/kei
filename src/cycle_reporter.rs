@@ -255,7 +255,7 @@ where
         let summary = crate::personality::summary::FinalSummary {
             downloaded: downloaded_u64,
             skipped_total: u64::try_from(skipped_total).unwrap_or(u64::MAX),
-            failed: u64::try_from(input.failed_count).unwrap_or(u64::MAX),
+            failed: u64::try_from(input.stats.failed).unwrap_or(u64::MAX),
             elapsed: input.elapsed,
             library_totals,
         };
@@ -323,8 +323,16 @@ where
                 }
             }
         }
+        stats.sync_token_blocked_zone = stats
+            .sync_token_blocked_zone
+            .as_deref()
+            .map(report::library_label);
+        stats.inventory_drop_library = stats
+            .inventory_drop_library
+            .as_deref()
+            .map(report::library_label);
         let report = report::SyncReport {
-            version: "3",
+            version: report::REPORT_VERSION,
             kei_version: env!("CARGO_PKG_VERSION"),
             timestamp: chrono::Utc::now().to_rfc3339(),
             status: input.status.as_report_str().to_string(),
@@ -359,7 +367,8 @@ where
                     let truncated = total_usize.saturating_sub(report::FAILED_ASSETS_CAP);
                     let entries = records
                         .iter()
-                        .map(report::FailedAssetEntry::from_record)
+                        .enumerate()
+                        .map(|(index, record)| report::FailedAssetEntry::from_record(index, record))
                         .collect();
                     (entries, truncated)
                 }
@@ -387,7 +396,11 @@ where
             ),
             CycleStatus::Failed => self.notifier.notify(
                 notifications::Event::SyncFailed,
-                &format!("{} sync failures", input.failed_count),
+                &format!(
+                    "{} sync failure{}",
+                    input.failed_count,
+                    if input.failed_count == 1 { "" } else { "s" }
+                ),
                 &self.run_options.username,
                 Some(&notification_data),
                 self.report_path,
@@ -861,14 +874,14 @@ mod tests {
                     sync_token_unique_values: Some(0),
                     ..SyncStats::default()
                 },
-                failed_count: 0,
+                failed_count: 1,
                 session_expired: false,
-                expected_report_status: "success",
+                expected_report_status: "partial_failure",
                 expected_health_failures: 0,
                 expected_health_error: None,
-                expected_notification: "sync_complete",
-                expected_notification_message: "Sync completed successfully",
-                expected_db_status: "complete",
+                expected_notification: "sync_failed",
+                expected_notification_message: "1 sync failure",
+                expected_db_status: "partial_failure",
                 expected_db_assets_failed: 0,
                 expected_db_enumeration_errors: 0,
                 expected_metrics: &[
@@ -891,7 +904,7 @@ mod tests {
                 expected_health_error: None,
                 expected_notification: "sync_failed",
                 expected_notification_message: "2 sync failures",
-                expected_db_status: "complete",
+                expected_db_status: "partial_failure",
                 expected_db_assets_failed: 0,
                 expected_db_enumeration_errors: 2,
                 expected_metrics: &[
@@ -913,7 +926,7 @@ mod tests {
                 expected_health_error: None,
                 expected_notification: "sync_failed",
                 expected_notification_message: "3 sync failures",
-                expected_db_status: "complete",
+                expected_db_status: "partial_failure",
                 expected_db_assets_failed: 3,
                 expected_db_enumeration_errors: 0,
                 expected_metrics: &[
@@ -944,6 +957,7 @@ mod tests {
             db.complete_sync_run(
                 run_id,
                 &state::SyncRunStats {
+                    partial_failure: case.failed_count > 0,
                     assets_seen: case.stats.assets_seen,
                     assets_downloaded: u64::try_from(case.stats.downloaded).unwrap(),
                     assets_failed: u64::try_from(case.stats.failed).unwrap(),
@@ -1135,7 +1149,7 @@ mod tests {
         db.upsert_seen(&failed_record)
             .await
             .expect("upsert failed row");
-        db.mark_failed("PrimarySync", "FAILED_OLD", "original", "old failure")
+        db.mark_failed("PrimarySync", "FAILED_OLD", "original", "Apple returned HTTP 404 while downloading https://private-canary.invalid/FAILED_OLD?token=private-token")
             .await
             .expect("mark failed");
         let reporter = reporter_with_db(dir.path(), Some(&report_path), &notifier, &db);
@@ -1143,6 +1157,7 @@ mod tests {
         let stats = SyncStats {
             downloaded: 1,
             failed: 0,
+            inventory_drop_library: Some("SharedSync-private-canary".to_owned()),
             ..SyncStats::default()
         };
 
@@ -1151,11 +1166,23 @@ mod tests {
         let report_json = parse_json(&report_path);
         assert_eq!(report_json["status"], "success");
         assert_eq!(report_json["stats"]["failed"], 0);
-        assert_eq!(report_json["failed_assets"][0]["id"], "FAILED_OLD");
-        assert_eq!(
-            report_json["failed_assets"][0]["error_message"],
-            "old failure"
+        assert_eq!(report_json["failed_assets"][0]["id"], "failure-1");
+        assert_eq!(report_json["failed_assets"][0]["error_message"], "HTTP 404");
+        assert!(
+            report_json["stats"]["inventory_drop_library"]
+                .as_str()
+                .unwrap()
+                .starts_with("library-")
         );
+        let body = std::fs::read_to_string(&report_path).unwrap();
+        for private in [
+            "private-canary",
+            "private-token",
+            "FAILED_OLD",
+            "reporter@example.com",
+        ] {
+            assert!(!body.contains(private));
+        }
     }
 
     #[tokio::test]
@@ -1168,7 +1195,12 @@ mod tests {
                 let id = format!("FAIL_{index:03}");
                 let record = crate::test_helpers::TestAssetRecord::new(&id).build();
                 db.upsert_seen(&record).await.unwrap();
-                db.mark_failed("PrimarySync", &id, "original", "fixture failure")
+                let message = if index == count {
+                    "Apple returned HTTP 410 while downloading private-name"
+                } else {
+                    "fixture failure"
+                };
+                db.mark_failed("PrimarySync", &id, "original", message)
                     .await
                     .unwrap();
                 db.backdate_last_seen(&id, 1_000 + i64::from(index));
@@ -1193,8 +1225,8 @@ mod tests {
                 report_cycle(&reporter, &mut health, &stats, 3, false).await;
                 let report = parse_json(&report_path);
                 let sample = report["failed_assets"].as_array().unwrap();
-                let expected: Vec<_> = (0..count).rev().take(200).map(|index| {
-                    serde_json::json!({"id": format!("FAIL_{index:03}"), "version_size": "original", "error_message": "fixture failure"})
+                let expected: Vec<_> = (1..=count).take(200).map(|index| {
+                    serde_json::json!({"id": format!("failure-{index}"), "version_size": "original", "error_message": "Transfer failed"})
                 }).collect();
                 assert_eq!(sample, &expected, "count={count}");
                 if count == 201 {

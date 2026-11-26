@@ -691,6 +691,8 @@ impl SqliteStateDb {
         let interrupted_i32 = i32::from(stats.interrupted);
         let status = if stats.interrupted {
             "interrupted"
+        } else if stats.partial_failure {
+            "partial_failure"
         } else {
             "complete"
         };

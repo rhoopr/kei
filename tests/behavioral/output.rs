@@ -65,7 +65,7 @@ friendly = false
 
     let body = std::fs::read_to_string(&report_path).expect("sync_report.json");
     let json: serde_json::Value = serde_json::from_str(&body).expect("valid report JSON");
-    assert_eq!(json["version"], "3", "schema version");
+    assert_eq!(json["version"], "4", "schema version");
     assert!(json["kei_version"].as_str().is_some_and(|v| !v.is_empty()));
     assert!(
         json["timestamp"]
@@ -75,12 +75,10 @@ friendly = false
         json["timestamp"]
     );
     assert_eq!(json["status"], "success");
-    assert_eq!(json["options"]["username"], username);
-    assert_eq!(
-        json["options"]["download_dir"],
-        download_dir.display().to_string()
-    );
-    assert_eq!(json["options"]["folder_structure"], "%Y/%m/%d");
+    assert_eq!(json["options"]["username"], "configured-account");
+    assert!(!body.contains(username));
+    assert!(!body.contains(download_dir.to_str().unwrap()));
+    assert!(json["options"].get("folder_structure").is_none());
     assert_eq!(json["options"]["threads"], 3);
     assert_eq!(
         json["options"]["media"],

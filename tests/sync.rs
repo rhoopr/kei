@@ -919,7 +919,7 @@ fn sync_report_json_writes_valid_schema() {
 
         let body = std::fs::read_to_string(&report_path).expect("report file");
         let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-        assert_eq!(json["version"], "3", "schema version");
+        assert_eq!(json["version"], "4", "schema version");
         assert!(json["kei_version"].is_string(), "kei_version present");
         assert!(json["timestamp"].is_string(), "timestamp present");
         let status = json["status"].as_str().expect("status string");
@@ -928,7 +928,8 @@ fn sync_report_json_writes_valid_schema() {
             "unexpected status: {status}"
         );
         assert!(json["options"].is_object(), "options object");
-        assert_eq!(json["options"]["username"], username.as_str());
+        assert_eq!(json["options"]["username"], "configured-account");
+        assert!(!body.contains(username.as_str()));
         assert!(json["stats"].is_object(), "stats object");
     });
 }

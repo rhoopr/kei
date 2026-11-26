@@ -673,7 +673,7 @@ pub(in crate::download) async fn build_download_result(
         + usize::from(enumeration_incomplete);
     if total_failures > 0 {
         for task in &remaining_failed {
-            tracing::error!(target: "kei::download::pipeline", asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");
+            tracing::error!(target: "kei::download::pipeline", path = %task.download_path.display(), "Download failed");
         }
     }
 

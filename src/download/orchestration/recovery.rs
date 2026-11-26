@@ -120,7 +120,7 @@ async fn run_targeted_recovery_pass(
     let failed = pass_result.failed.len();
     if failed > 0 {
         for task in &pass_result.failed {
-            tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Targeted retry failed");
+            tracing::error!(path = %task.download_path.display(), "Targeted retry failed");
         }
     }
     let remaining_unmatched = unmatched;

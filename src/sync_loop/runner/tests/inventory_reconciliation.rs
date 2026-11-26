@@ -242,7 +242,13 @@ impl PhotosSession for InventorySession {
             let token = self
                 .query_tokens
                 .map_or("opaque-query-token", |(first, later)| {
-                    if offset == 0 { first } else { later }
+                    // The provider changes once between pages. Subsequent
+                    // inventories, including rank zero, see the new position.
+                    if self.page_change.lock().unwrap().is_some() {
+                        first
+                    } else {
+                        later
+                    }
                 });
             let records = self.apply_overlay(records);
             return Ok(json!({"records":records,"syncToken":token}));

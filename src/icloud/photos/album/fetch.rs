@@ -157,6 +157,7 @@ impl PhotoAlbum {
             let mut offset = start_offset;
             let mut total_sent: u64 = 0;
             let mut last_sync_token: Option<String> = None;
+            let mut conflicting_tokens = false;
             let mut saw_blank_sync_token = false;
             let mut pending_masters: FxHashMap<String, cloudkit::Record> = FxHashMap::default();
             let mut pending_assets: FxHashMap<String, Vec<cloudkit::Record>> = FxHashMap::default();
@@ -288,8 +289,10 @@ impl PhotoAlbum {
                             offset,
                             "Fetcher response contained blank syncToken; treating as unavailable"
                         );
+                    } else if let Some(previous) = &last_sync_token {
+                        conflicting_tokens |= previous != token;
                     } else {
-                        last_sync_token = Some(trimmed.to_string());
+                        last_sync_token = Some(token.to_owned());
                     }
                 }
 
@@ -607,11 +610,14 @@ impl PhotoAlbum {
                 if stopped_for_limit {
                     shared.suppress();
                 }
+                conflicting_tokens |= saw_blank_sync_token && last_sync_token.is_some();
                 let token = last_sync_token.or_else(|| {
                     (saw_blank_sync_token && behavior.preserve_blank_sync_tokens_for_diagnostics)
                         .then(String::new)
                 });
-                let completion = if malformed_record {
+                let completion = if conflicting_tokens {
+                    EnumerationCompletion::Incomplete(EnumerationFailure::ConflictingTokens)
+                } else if malformed_record {
                     EnumerationCompletion::Incomplete(EnumerationFailure::MalformedRecord)
                 } else if enumeration_incomplete {
                     EnumerationCompletion::Incomplete(EnumerationFailure::UnpairedRecords)

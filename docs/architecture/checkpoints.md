@@ -231,7 +231,7 @@ Status aggregates all markers. Selected zones with markers bypass watch-mode
 no-change shortcuts. Retry debt remains visible as incomplete backup work but
 does not fail process health, including during skipped watch cycles.
 Intentional bounded checkpoint holds alone are not failures. The marker keys
-remain in metadata; JSON report version 3 is unchanged.
+remain in metadata and are not exported as report fields.
 
 Current destination debt is reported separately from checkpoint permission. The generation owner reads its existing selected-work debt after execution; the cycle owner makes one-shot sync fail while that work remains, including retries whose deadline has not arrived. Reports and notifications retain the partial-failure outcome. `cycle_reporter.rs` independently reports operational health: transfer and provider retry debt stay healthy, while state-access, storage or authentication blockers make `/healthz` fail immediately. Storage errors in transfer workers and metadata-only rewrites stop further file work for that cycle, retain unfinished tasks and markers, and leave watch mode running. These observations add no durable queue or checkpoint permission.
 
@@ -560,6 +560,23 @@ If iCloud rejects the saved cursor before returning current changes, an unbounde
 Request retirement writes no source checkpoint. A fixed-date selection can complete this current obligation while its excluded tail still holds the zone/database checkpoint. Sparse identity, expired-cursor and retained provider-work gates remain independent; a qualified request can retire while another hold remains. Legacy coverage certification is retired and cannot supply or veto checkpoint permission. This flow proves neither a provider snapshot nor complete historical deletion coverage, and never authorizes local media deletion.
 
 ## Checkpoint advancement
+
+Rank pages that supply a zone position must agree, including pages from the
+same fetcher. An empty tail may omit the position. A failed HTTP response or a
+changes page with an error envelope cannot supply a successor. Watch requires
+an explicit database zone list before skipping selected work. A blank database
+successor cannot replace the saved position.
+
+When a continuation fails, a verified publication in another album can
+identify an unchanged catalog rendition. The new destination still needs
+current selection evidence and its own publication receipt. If the inbox
+already released an accepted page's bytes, replay can reread its original
+cursor and match the page to its durable receipt before using its records.
+Neither the old publication nor that reread advances the checkpoint.
+
+A required inventory position that is missing, blank or contradictory makes
+the run a partial failure. The run records the files that actually transferred;
+a checkpoint failure does not increment the failed-file count.
 
 `SyncResult.checkpoint` carries the per-zone completion, interruption, state
 durability, identity, and token-block evidence. The source-checkpoint classifier

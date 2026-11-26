@@ -2205,7 +2205,7 @@ async fn full_sync_filtered_sibling_cannot_displace_legacy_master_owner_next_cyc
 #[derive(Clone)]
 struct DiagnosticMismatchSession {
     initial_token: &'static str,
-    queries: Arc<AtomicUsize>,
+    scans: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -2213,13 +2213,21 @@ impl PhotosSession for DiagnosticMismatchSession {
     async fn post(
         &self,
         url: &str,
-        _body: String,
+        body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
         if url.contains("/internal/records/query/batch") {
             return Ok(json!({"batch":[{"records":[{"fields":{"itemCount":{"value":0}}}]}]}));
         }
-        let token = if self.queries.fetch_add(1, Ordering::SeqCst) < 6 {
+        let request: Value = serde_json::from_str(&body)?;
+        let filters = request["query"]["filterBy"].as_array().unwrap();
+        if filters
+            .iter()
+            .any(|f| f["fieldName"] == "startRank" && f["fieldValue"]["value"] == 0)
+        {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+        }
+        let token = if self.scans.load(Ordering::SeqCst) <= 1 {
             self.initial_token
         } else {
             "PRIVATE_REPAIRED_TOKEN"
@@ -2245,7 +2253,7 @@ async fn support_history_keeps_initial_mismatch_and_repaired_token_counts_at_inf
                 &format!("PRIVATE_ALBUM_{index}"),
                 Box::new(DiagnosticMismatchSession {
                     initial_token: token,
-                    queries: Arc::new(AtomicUsize::new(0)),
+                    scans: Arc::new(AtomicUsize::new(0)),
                 }),
             ),
             exclude_ids: Arc::new(FxHashSet::default()),

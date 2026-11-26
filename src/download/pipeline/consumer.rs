@@ -168,7 +168,6 @@ pub(super) async fn consume_stream_download_tasks(
                     exif_failures += 1;
                     pb.suspend(|| {
                         tracing::error!(target: "kei::download::pipeline",
-                            asset_id = %task.asset_id,
                             path = %task.download_path.display(),
                             "Metadata write failed after download; marker set for retry on next sync"
                         );
@@ -192,7 +191,7 @@ pub(super) async fn consume_stream_download_tasks(
                         DownloadedFinalization::Deferred { write, error } => {
                             pb.suspend(|| {
                                 tracing::warn!(target: "kei::download::pipeline",
-                                    asset_id = %task.asset_id,
+                                    path = %task.download_path.display(),
                                     error = %error,
                                     "State write failed, deferring for retry"
                                 );
@@ -223,7 +222,6 @@ pub(super) async fn consume_stream_download_tasks(
                     pipeline_shutdown.cancel();
                     tracing::error!(
                         target: "kei::download::pipeline",
-                        asset_id = %task.asset_id,
                         path = %task.download_path.display(),
                         "Metadata storage unavailable; stopping file work for this cycle"
                     );
@@ -273,7 +271,7 @@ pub(super) async fn consume_stream_download_tasks(
                     }
                     DownloadTaskErrorClass::Other => {
                         pb.suspend(|| {
-                            tracing::error!(target: "kei::download::pipeline", asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
+                            tracing::error!(target: "kei::download::pipeline", path = %task.download_path.display(), error = %e, "Download failed");
                         });
                     }
                     DownloadTaskErrorClass::Storage => {
@@ -289,7 +287,7 @@ pub(super) async fn consume_stream_download_tasks(
                 {
                     failure_state_writes += 1;
                     tracing::warn!(target: "kei::download::pipeline",
-                        asset_id = %task.asset_id,
+                        path = %task.download_path.display(),
                         error = %e,
                         "Failed to mark failure"
                     );

@@ -79,10 +79,10 @@ async fn test_photo_stream_with_token_blank_sync_token_treated_as_none() {
 }
 
 #[tokio::test]
-async fn test_photo_stream_with_token_last_token_wins() {
+async fn conflicting_query_pages_deliver_both_assets_without_a_checkpoint() {
     use tokio_stream::StreamExt;
 
-    // Two pages with different syncTokens — last one should be captured.
+    // Both photos remain useful even when the pages disagree about the zone.
     // page_size=1 so each page yields 1 master record and the fetcher
     // advances offset by 1.
     let mock = MockPhotosFlow::new()
@@ -103,7 +103,7 @@ async fn test_photo_stream_with_token_last_token_wins() {
     assert_eq!(count, 2);
 
     let token = token_rx.await.expect("oneshot should not be dropped");
-    assert_eq!(token.as_deref(), Some("st-second"));
+    assert_eq!(token, None);
 }
 
 #[derive(Clone, Debug)]

@@ -1334,7 +1334,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     // Log failed downloads before the summary
     if failed > 0 {
         for task in &pass_result.failed {
-            tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");
+            tracing::error!(path = %task.download_path.display(), "Download failed");
         }
     }
 

@@ -78,7 +78,9 @@ pre-admission logical charges. Historical selection and compaction fields remain
 URL or arbitrary error text, and remain subject to queue loss and bounded
 history retention. Unknown observations stay explicitly unavailable.
 
-History and export schema version 1 are separate from report version 3 and state schema 42. Raw reports and databases are never packaged. Interrupted writes preserve the previous history; read errors and limits appear as partial evidence. See [the operator guide](../support-export.md) for limits and unavailable evidence.
+History and export schema version 1 are separate from sync report version 4 and the state schema. Raw reports and databases are never packaged. Interrupted writes preserve the previous history; read errors and limits appear as partial evidence. See [the operator guide](../support-export.md) for limits and unavailable evidence.
+
+The optional sync report labels each sampled failure by its position in that report. The label is not a database key. The error field contains an HTTP status or a fixed description, never stored error text. The account has a fixed label and named libraries use digest labels; `PrimarySync` stays recognizable. Paths, folder templates and album names are omitted. Counts and retry evidence still come from the original state rows.
 
 ### Explicit missing-reference inventory diagnostic
 

@@ -427,6 +427,94 @@ async fn check_changes_database_empty_zones_skip_without_advancing_scoped_db_tok
     assert_eq!(stored.token, "db-tok-prev");
 }
 
+/// Malformed or inconclusive `changes/database` responses are not evidence of
+/// an empty change list. Every case falls back to the full cycle and keeps the
+/// seeded token.
+#[tokio::test]
+async fn check_changes_database_malformed_responses_proceed_all_and_retain_token() {
+    use serde_json::json;
+    let cases = [
+        (
+            "absent zones",
+            json!({"syncToken": "db-tok-new", "moreComing": false}),
+        ),
+        (
+            "blank token with selected change",
+            json!({
+                "syncToken": "   ",
+                "moreComing": false,
+                "zones": [{"zoneID": {"zoneName": "PrimarySync"}, "syncToken": "ps-tok"}]
+            }),
+        ),
+        (
+            "blank token with unselected change",
+            json!({
+                "syncToken": "",
+                "moreComing": false,
+                "zones": [{"zoneID": {"zoneName": "SharedSync-ABCD"}, "syncToken": "ss-tok"}]
+            }),
+        ),
+        (
+            "blank zone identity",
+            json!({
+                "syncToken": "db-tok-new",
+                "moreComing": false,
+                "zones": [{"zoneID": {"zoneName": "   "}, "syncToken": "z-tok"}]
+            }),
+        ),
+        (
+            "nested zone error",
+            json!({
+                "syncToken": "db-tok-new",
+                "moreComing": false,
+                "zones": [{
+                    "zoneID": {"zoneName": "PrimarySync"},
+                    "syncToken": "z-tok",
+                    "serverErrorCode": "BAD_REQUEST"
+                }]
+            }),
+        ),
+        (
+            "top-level provider error",
+            json!({
+                "syncToken": "db-tok-new",
+                "moreComing": false,
+                "serverErrorCode": "BAD_REQUEST",
+                "zones": []
+            }),
+        ),
+    ];
+
+    for (label, response) in cases {
+        let session = crate::test_helpers::MockPhotosSession::new().ok(response);
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope =
+            test_precheck_scope_for_states(std::slice::from_ref(&lib_state), "scope-malformed");
+        seed_scoped_db_token(db.as_ref(), &scope, "db-tok-prev").await;
+
+        let precheck =
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc, &scope)
+                .await;
+
+        assert_eq!(
+            precheck,
+            WatchPrecheck::proceed_all(),
+            "{label} must fall back to the full cycle"
+        );
+        assert!(precheck.should_sync_zone("PrimarySync"), "{label}");
+        let stored = read_scoped_db_token(db.as_ref(), &scope)
+            .await
+            .expect("seeded token should still be present");
+        assert_eq!(stored.token, "db-tok-prev", "{label}");
+    }
+}
+
 /// A non-empty zones list MUST NOT skip — even
 /// when more_coming=false. This is the real-work path; pinning it
 /// alongside the skip path catches a flipped branch in either
